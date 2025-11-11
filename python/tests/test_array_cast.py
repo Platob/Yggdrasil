@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timezone
 from pathlib import Path
 import sys
 
@@ -178,6 +179,24 @@ def test_string_to_time_preserves_fractional_seconds(registry: ArrowCastRegistry
         "12:30:00.123456",
         "05:15:30.654321",
     ]
+
+
+def test_timezone_resolution_falls_back_to_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yggdrasil.data.arrow.array_cast as array_cast
+
+    try:
+        from zoneinfo import ZoneInfoNotFoundError as _ZoneInfoNotFoundError
+    except ImportError:  # pragma: no cover - Python < 3.9
+        pytest.skip("zoneinfo is not available")
+
+    class DummyZoneInfo:
+        def __call__(self, name: str):
+            raise _ZoneInfoNotFoundError(name)
+
+    monkeypatch.setattr(array_cast, "ZoneInfo", DummyZoneInfo(), raising=False)
+
+    resolved = array_cast._resolve_timezone("UTC")
+    assert resolved is timezone.utc
 
 
 def test_cli_arrow_cast_outputs_json(capsys: pytest.CaptureFixture[str]) -> None:
