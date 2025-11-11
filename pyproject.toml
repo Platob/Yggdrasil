@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yggdrasil"
+version = "0.1.0"
+description = "Python utilities for the Yggdrasil multi-language repository."
+readme = "README.md"
+authors = [{ name = "Yggdrasil Contributors" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "pyarrow>=13",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/yggdrasil"
+Repository = "https://github.com/example/yggdrasil"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
