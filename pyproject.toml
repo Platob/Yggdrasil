@@ -14,25 +14,12 @@ dependencies = [
     "pyarrow>=13",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.4",
-    "mypy>=1.8",
-    "ruff>=0.1",
-]
-test = [
-    "pytest>=7.4",
-]
-
 [project.urls]
 Homepage = "https://github.com/example/yggdrasil"
 Repository = "https://github.com/example/yggdrasil"
 
-[project.scripts]
-yggdrasil = "yggdrasil.cli:main"
-
 [tool.setuptools]
-package-dir = { "" = "python/src" }
+package-dir = { "" = "python" }
 
 [tool.setuptools.packages.find]
-where = ["python/src"]
+where = ["python"]
