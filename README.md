@@ -2,7 +2,7 @@
 
 Yggdrasil is a multi-language research playground. Every language-specific
 implementation lives in its own top-level directory. The Python package resides
-in `python/src/` and is designed to be installed directly from this repository using
+in `python/` and is designed to be installed directly from this repository using
 `pip` and the `git+https` scheme.
 
 ## Installing the Python utilities
@@ -16,7 +16,7 @@ pip install "yggdrasil @ git+https://github.com/example/yggdrasil.git"
 
 Because the packaging metadata is provided at the repository root, no extra
 `subdirectory` hints are required even though the importable code lives under
-`python/src/`.
+`python/`.
 
 After installation the package exposes a small Arrow-centric helper that you can
 try out from the command line:
@@ -30,8 +30,7 @@ metadata shared across language boundaries.
 
 ## Repository layout
 
-- `python/src/` – Source for the distributable Python package.
-- `python/tests/` – In-repo pytest suite for the Python utilities.
+- `python/` – Source for the distributable Python package.
 - `cpp/`, `rust/`, … – Additional language implementations can be added beside
   `python/` as the project grows.
 

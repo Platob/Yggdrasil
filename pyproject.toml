@@ -19,7 +19,7 @@ Homepage = "https://github.com/example/yggdrasil"
 Repository = "https://github.com/example/yggdrasil"
 
 [tool.setuptools]
-package-dir = { "" = "python/src" }
+package-dir = { "" = "python" }
 
 [tool.setuptools.packages.find]
-where = ["python/src"]
+where = ["python"]
