@@ -99,7 +99,7 @@ def test_string_to_timestamp_with_timezone(registry: ArrowCastRegistry) -> None:
         "2024-01-01T03:00:00+03:00",
     ])
 
-    cast_array = caster.cast(array)
+    cast_array = caster.cast(array, )
 
     assert cast_array.type.equals(pa.timestamp("s", tz="UTC"))
     assert [value.isoformat() for value in cast_array.to_pylist()] == [

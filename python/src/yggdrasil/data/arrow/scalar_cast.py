@@ -119,8 +119,16 @@ class ArrowScalarCastRegistry:
         for caster in self._casters.values():
             yield caster.source_field, caster.target_field
 
+    def _safe_type(self, obj: pa.DataType | pa.Field):
+        if isinstance(obj, pa.DataType):
+            return obj
+        return obj.type
+
     def _key(self, source_field: pa.Field, target_field: pa.Field) -> Tuple[str, str]:
-        return str(source_field.type), str(target_field.type)
+        return (
+            str(self._safe_type(source_field)),
+            str(self._safe_type(target_field))
+        )
 
 
 __all__ = ["ArrowScalarCaster", "ArrowScalarCastRegistry"]

@@ -32,6 +32,6 @@ def test_data_format_metadata_round_trip() -> None:
 
     assert stamped_table.schema.metadata is not None
     metadata = {key.decode(): value.decode() for key, value in stamped_table.schema.metadata.items()}
-    assert metadata["name"] == "ledger"
-    assert metadata["mime_type"] == "application/x-ledger+json"
+    assert metadata["name"] == "character-roster"
+    assert metadata["mime_type"] == "application/x-yggdrasil+json"
     assert metadata["version"] == "2.1"
