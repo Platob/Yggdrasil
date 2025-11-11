@@ -7,10 +7,9 @@ from datetime import date, datetime, time, timezone
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
 try:
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover - Python < 3.9
     ZoneInfo = None  # type: ignore[misc, assignment]
-    ZoneInfoNotFoundError = None  # type: ignore[misc, assignment]
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -287,25 +286,14 @@ def _parse_iso_time(value: str) -> time:
 def _resolve_timezone(name: str | None):
     if name is None:
         return None
-
-    normalised = name.strip()
-    if not normalised:
-        raise ValueError("Time zone name cannot be empty")
-
-    upper = normalised.upper()
-    if upper in {"UTC", "UT", "GMT", "Z"}:
+    if name.upper() == "UTC":
         return timezone.utc
-
     if ZoneInfo is None:  # pragma: no cover - Python < 3.9
         raise ValueError(
             "Time zone support requires the zoneinfo module to be available"
         )
     try:
-        return ZoneInfo(normalised)
-    except ZoneInfoNotFoundError as exc:
-        if upper == "UTC":
-            return timezone.utc
-        raise ValueError(f"Unsupported time zone: {name}") from exc
+        return ZoneInfo(name)
     except Exception as exc:  # pragma: no cover - defensive
         raise ValueError(f"Unsupported time zone: {name}") from exc
 
