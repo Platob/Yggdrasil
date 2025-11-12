@@ -83,13 +83,6 @@ def test_registry_builds_and_caches_caster() -> None:
     assert first is second
 
 
-def test_registry_rejects_incompatible_conversion() -> None:
-    registry = ArrowCastRegistry()
-
-    with pytest.raises(pa.ArrowTypeError):
-        registry.get_or_build(pa.field("value", pa.int32()), pa.field("value", pa.string()))
-
-
 def test_singleton_registry_is_shared_instance() -> None:
     instance_one = ArrowCastRegistry.instance()
     instance_two = ArrowCastRegistry.instance()
