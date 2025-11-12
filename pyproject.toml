@@ -20,6 +20,10 @@ dependencies = [
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
 
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+addopts = "-ra"
+
 [tool.setuptools]
 package-dir = { "" = "python/src" }
 
