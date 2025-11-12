@@ -25,13 +25,33 @@ class ArrowUtility:
         return pa.field("value", obj, nullable=True)
 
     @staticmethod
+    def get_nested_fields(dtype: ArrowDataTypeOrField) -> list[pa.Field]:
+        dtype = ArrowUtility.ensure_arrow_type(dtype)
+
+        if not pa_types.is_nested(dtype):
+            return []
+
+        if pa_types.is_list(dtype) or pa_types.is_large_list(dtype):
+            return [dtype.value_field]
+        if pa_types.is_map(dtype):
+            return [dtype.key_field, dtype.value_field]
+        if pa_types.is_struct(dtype):
+            return dtype.fields
+
+        raise pa.ArrowTypeError(f"Cannot get nested fields from {dtype}")
+
+    @staticmethod
     def can_convert_arrow_fields(
         source_field: ArrowDataTypeOrField,
         target_field: ArrowDataTypeOrField,
         safe: bool | None = None,
+        check_names: bool | None = None
     ) -> bool:
         source_field = ArrowUtility.ensure_arrow_field(source_field)
         target_field = ArrowUtility.ensure_arrow_field(target_field)
+
+        if check_names and source_field.name != target_field.name:
+            return False
 
         source_type = ArrowUtility.ensure_arrow_type(source_field)
         target_type = ArrowUtility.ensure_arrow_type(target_field)
@@ -39,51 +59,27 @@ class ArrowUtility:
         if source_type.equals(target_type):
             return True
 
-        if pa.types.is_string(source_type):
-            if safe:
-                return pa.types.is_string(target_type)
-            return True
+        if safe:
+            if pa.types.is_string(source_type) and pa.types.is_string(target_type):
+                return True
+            if pa_types.is_integer(source_type) and pa_types.is_integer(target_type):
+                return True
+            if pa_types.is_floating(source_type) and pa_types.is_floating(target_type):
+                return True
+            if pa_types.is_decimal(source_type) and pa_types.is_decimal(target_type):
+                return True
+            if pa_types.is_nested(source_type) and pa_types.is_nested(target_type):
+                source_fields = ArrowUtility.get_nested_fields(source_type)
+                target_fields = ArrowUtility.get_nested_fields(target_type)
 
-        if pa_types.is_integer(source_type) and pa_types.is_integer(target_type):
-            return True
-
-        if pa_types.is_floating(source_type) and pa_types.is_floating(target_type):
-            return True
-
-        if (
-            (pa_types.is_list(source_type) or pa_types.is_large_list(source_type) or pa_types.is_fixed_size_list(source_type))
-            and (
-                pa_types.is_list(target_type)
-                or pa_types.is_large_list(target_type)
-                or pa_types.is_fixed_size_list(target_type)
-            )
-        ):
-            return ArrowUtility.can_convert_arrow_fields(
-                source_type.value_field,
-                target_type.value_field,
-                safe=safe,
-            )
-
-        if pa_types.is_struct(source_type) and pa_types.is_struct(target_type):
-            if source_type.num_fields != target_type.num_fields:
-                return False
-
-            source_children = {field.name: field for field in source_type}
-            target_children = {field.name: field for field in target_type}
-
-            if source_children.keys() != target_children.keys():
-                return False
-
-            return all(
-                ArrowUtility.can_convert_arrow_fields(
-                    source_children[name],
-                    target_children[name],
-                    safe=safe,
+                return all(
+                    ArrowUtility.can_convert_arrow_fields(s, t, check_names=check_names)
+                    for s, t in zip(source_fields, target_fields)
                 )
-                for name in source_children
-            )
 
-        return False
+            return False
+
+        return True
 
 
 @dataclasses.dataclass(frozen=True)
