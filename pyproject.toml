@@ -24,4 +24,4 @@ Repository = "https://github.com/Platob/Yggdrasil"
 package-dir = { "" = "python/src" }
 
 [tool.setuptools.packages.find]
-where = ["python"]
+where = ["python/src"]
