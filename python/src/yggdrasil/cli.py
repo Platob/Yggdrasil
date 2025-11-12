@@ -8,7 +8,7 @@ from typing import Iterable, Sequence
 
 import pyarrow as pa
 
-from .data.arrow import ArrowArrayCastRegistry
+from .data.arrow import ARROW_CAST_REGISTRY
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_arrow_cast(values: Iterable[int]) -> dict[str, object]:
-    registry = ArrowArrayCastRegistry()
+    registry = ARROW_CAST_REGISTRY
     source_field = pa.field("values", pa.list_(pa.int32()))
     target_field = pa.field("values", pa.list_(pa.int64()))
 

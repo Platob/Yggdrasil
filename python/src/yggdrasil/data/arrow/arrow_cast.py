@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import dataclasses
-from typing import Tuple, Dict
+from typing import ClassVar
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -26,7 +28,7 @@ class ArrowUtility:
     def can_convert_arrow_fields(
         source_field: ArrowDataTypeOrField,
         target_field: ArrowDataTypeOrField,
-        safe: bool | None = None
+        safe: bool | None = None,
     ) -> bool:
         source_field = ArrowUtility.ensure_arrow_field(source_field)
         target_field = ArrowUtility.ensure_arrow_field(target_field)
@@ -50,11 +52,16 @@ class ArrowUtility:
 
         if (
             (pa_types.is_list(source_type) or pa_types.is_large_list(source_type) or pa_types.is_fixed_size_list(source_type))
-            and (pa_types.is_list(target_type) or pa_types.is_large_list(target_type) or pa_types.is_fixed_size_list(target_type))
+            and (
+                pa_types.is_list(target_type)
+                or pa_types.is_large_list(target_type)
+                or pa_types.is_fixed_size_list(target_type)
+            )
         ):
             return ArrowUtility.can_convert_arrow_fields(
-                source_type.value_field, target_type.value_field,
-                safe=safe
+                source_type.value_field,
+                target_type.value_field,
+                safe=safe,
             )
 
         if pa_types.is_struct(source_type) and pa_types.is_struct(target_type):
@@ -71,7 +78,7 @@ class ArrowUtility:
                 ArrowUtility.can_convert_arrow_fields(
                     source_children[name],
                     target_children[name],
-                    safe=safe
+                    safe=safe,
                 )
                 for name in source_children
             )
@@ -82,6 +89,7 @@ class ArrowUtility:
 @dataclasses.dataclass(frozen=True)
 class ArrowCaster:
     """Cast :class:`pyarrow.Scalar` instances between two declared fields."""
+
     source_field: pa.Field
     target_field: pa.Field
 
@@ -90,7 +98,7 @@ class ArrowCaster:
         arr: ArrayLike,
         target_type: ArrowDataTypeOrField | None = None,
         safe: bool | None = None,
-        memory_pool: pa.MemoryPool | None = None
+        memory_pool: pa.MemoryPool | None = None,
     ):
         checked_target_type = ArrowUtility.ensure_arrow_type(target_type or self.target_field)
 
@@ -98,7 +106,7 @@ class ArrowCaster:
             arr=arr,
             target_type=checked_target_type,
             safe=safe,
-            memory_pool=memory_pool
+            memory_pool=memory_pool,
         )
 
     def cast_scalar(
@@ -106,49 +114,77 @@ class ArrowCaster:
         scalar: pa.Scalar,
         target_type: ArrowDataTypeOrField | None = None,
         safe: bool | None = None,
-        memory_pool: pa.MemoryPool | None = None
+        memory_pool: pa.MemoryPool | None = None,
     ):
         checked_target_type = ArrowUtility.ensure_arrow_type(target_type or self.target_field)
 
         return scalar.cast(
             target_type=checked_target_type,
             safe=safe,
-            memory_pool=memory_pool
+            memory_pool=memory_pool,
         )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class ArrowCastRegistry:
-    cache: Dict[(str, str), ArrowCaster] = dataclasses.field(default_factory=dict)
+    cache: dict[tuple[str, str], ArrowCaster] = dataclasses.field(default_factory=dict)
+    _instance: ClassVar[ArrowCastRegistry | None] = None
 
     @staticmethod
-    def inner_key(source_field: ArrowDataTypeOrField, target_field: ArrowDataTypeOrField) -> Tuple[str, str]:
+    def inner_key(source_field: ArrowDataTypeOrField, target_field: ArrowDataTypeOrField) -> tuple[str, str]:
         return (
             str(ArrowUtility.ensure_arrow_type(source_field)),
-            str(ArrowUtility.ensure_arrow_type(target_field))
+            str(ArrowUtility.ensure_arrow_type(target_field)),
         )
 
-    def get_caster(
+    def register(self, caster: ArrowCaster) -> ArrowCaster:
+        key = self.inner_key(caster.source_field, caster.target_field)
+        self.cache[key] = caster
+        return caster
+
+    def get(
         self,
         source_field: ArrowDataTypeOrField,
         target_field: ArrowDataTypeOrField,
-        safe: bool | None = None
-    ):
-        if not ArrowUtility.can_convert_arrow_fields(source_field, target_field):
+    ) -> ArrowCaster | None:
+        key = self.inner_key(source_field, target_field)
+        return self.cache.get(key)
+
+    def get_or_build(
+        self,
+        source_field: ArrowDataTypeOrField,
+        target_field: ArrowDataTypeOrField,
+        safe: bool | None = None,
+    ) -> ArrowCaster:
+        if not ArrowUtility.can_convert_arrow_fields(source_field, target_field, safe=safe):
             safe_str = " safely" if safe else ""
             raise pa.ArrowTypeError(
-                f"Cannot convert {source_field} to {source_field}{safe_str}"
+                f"Cannot convert {source_field} to {target_field}{safe_str}"
             )
 
-        key = self.inner_key(source_field, target_field)
-        found = self.cache.get(key)
-        if found:
-            return found
+        source_field = ArrowUtility.ensure_arrow_field(source_field)
+        target_field = ArrowUtility.ensure_arrow_field(target_field)
 
-        raise pa.ArrowTypeError(f"No caster found from {source_field} to {source_field}")
+        cached = self.get(source_field, target_field)
+        if cached is not None:
+            return cached
+
+        caster = ArrowCaster(source_field=source_field, target_field=target_field)
+        return self.register(caster)
+
+    @classmethod
+    def instance(cls) -> ArrowCastRegistry:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
 
 __all__ = [
     "ArrowCaster",
-    "ArrowCastRegistry"
+    "ArrowCastRegistry",
+    "ArrowUtility",
+    "ARROW_CAST_REGISTRY",
 ]
+
+
+ARROW_CAST_REGISTRY = ArrowCastRegistry.instance()
