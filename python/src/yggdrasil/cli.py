@@ -8,8 +8,7 @@ from typing import Iterable, Sequence
 
 import pyarrow as pa
 
-from .data.arrow import ArrowCastRegistry
-from .example import demo_table, greet
+from .data.arrow import ArrowArrayCastRegistry
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,12 +40,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_greet(name: str) -> str:
-    return greet(name)
-
-
 def _run_arrow_cast(values: Iterable[int]) -> dict[str, object]:
-    registry = ArrowCastRegistry()
+    registry = ArrowArrayCastRegistry()
     source_field = pa.field("values", pa.list_(pa.int32()))
     target_field = pa.field("values", pa.list_(pa.int64()))
 
@@ -61,22 +56,13 @@ def _run_arrow_cast(values: Iterable[int]) -> dict[str, object]:
     }
 
 
-def _run_demo_table() -> list[dict[str, object]]:
-    table = demo_table([("Freya", 1), ("Odin", 2)])
-    return list(table.to_pylist())
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "greet":
-        print(_run_greet(args.name))
-    elif args.command == "arrow-cast":
+    if args.command == "arrow-cast":
         payload = _run_arrow_cast(args.values)
         print(json.dumps(payload, indent=2))
-    elif args.command == "demo-table":
-        print(json.dumps(_run_demo_table(), indent=2))
     else:
         parser.error(f"Unsupported command: {args.command}")
         return 2
