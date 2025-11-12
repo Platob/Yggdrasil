@@ -11,7 +11,7 @@ To install the Python helpers straight from the repository, point `pip` at the
 Git URL:
 
 ```bash
-pip install "yggdrasil @ git+https://github.com/example/yggdrasil.git"
+pip install "yggdrasil @ git+https://github.com/Platob/Yggdrasil.git"
 ```
 
 Because the packaging metadata is provided at the repository root, no extra
