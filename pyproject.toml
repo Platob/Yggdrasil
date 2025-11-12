@@ -12,15 +12,16 @@ license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
     "pyarrow>=13",
+    "polars",
     "tzdata"
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/yggdrasil"
-Repository = "https://github.com/example/yggdrasil"
+Homepage = "https://github.com/Platob/Yggdrasil"
+Repository = "https://github.com/Platob/Yggdrasil"
 
 [tool.setuptools]
-package-dir = { "" = "python" }
+package-dir = { "" = "python/src" }
 
 [tool.setuptools.packages.find]
 where = ["python"]
