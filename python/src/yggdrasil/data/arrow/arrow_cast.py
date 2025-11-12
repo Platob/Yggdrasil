@@ -85,7 +85,6 @@ class ArrowUtility:
 @dataclasses.dataclass(frozen=True)
 class ArrowCaster:
     """Cast :class:`pyarrow.Scalar` instances between two declared fields."""
-
     source_field: pa.Field
     target_field: pa.Field
 
