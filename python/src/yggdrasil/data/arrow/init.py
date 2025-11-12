@@ -1,6 +1,9 @@
 import os
 import ssl
+import sys
 from pathlib import Path
+
+from pyarrow.lib import Mapping
 
 _WINDOWS_ZONES_URL = (
     "https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml"
@@ -86,7 +89,10 @@ def ensure_windows_zones_xml(
     return str(path)
 
 
-def configure_tzdata_for_arrow(preferred_dir: str | None = None) -> str:
+def configure_tzdata_for_arrow(
+    environment: Mapping | None = None,
+    preferred_dir: str | None = None
+) -> str:
     """
     Returns tzdir path and sets env so Arrow & zoneinfo can find it.
     Order:
@@ -94,8 +100,7 @@ def configure_tzdata_for_arrow(preferred_dir: str | None = None) -> str:
       2) installed PyPI tzdata package
       3) fallback to %USERPROFILE%\\Downloads\\tzdata (Windows default)
     """
-    import os, sys
-    from pathlib import Path
+    environment = environment or os.environ
 
     # 1) explicit path
     if preferred_dir and Path(preferred_dir).is_dir():
@@ -119,13 +124,11 @@ def configure_tzdata_for_arrow(preferred_dir: str | None = None) -> str:
     if sys.platform == "win32":
         ensure_windows_zones_xml(tzdir)
 
-    os.environ["TZDIR"] = str(tzdir)
-    os.environ["ARROW_TIMEZONE_DATABASE"] = str(tzdir)
+    environment["TZDIR"] = str(tzdir)
+    environment["ARROW_TIMEZONE_DATABASE"] = str(tzdir)
     return str(tzdir)
 
 
 __all__ = [
     "configure_tzdata_for_arrow"
 ]
-
-configure_tzdata_for_arrow()
