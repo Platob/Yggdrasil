@@ -11,6 +11,12 @@ import polars as pl
 
 from ..data_cast import DataCaster, DataUtility, DATA_CAST_REGISTRY
 
+# Import logging
+from ...logging import get_logger
+
+# Create module-level logger
+logger = get_logger(__name__)
+
 
 # Type variable for implementing generic writer with specific config type
 ConfigT = TypeVar('ConfigT')
@@ -117,12 +123,14 @@ class DataWriter(Generic[ConfigT], abc.ABC):
         Returns:
             pl.DataFrame: Coerced DataFrame.
         """
+        logger.debug(f"Coercing DataFrame with {len(df)} rows to match schema with {len(schema)} columns")
         result = df
 
         # Process column mappings and type conversions
         for col_name, target_dtype in schema.items():
             if col_name not in result.columns:
                 # Skip columns in the schema that aren't in the DataFrame
+                logger.debug(f"Column {col_name} in schema but not in DataFrame, skipping")
                 continue
 
             # Get the source data type
@@ -130,8 +138,10 @@ class DataWriter(Generic[ConfigT], abc.ABC):
 
             if source_dtype == target_dtype:
                 # No conversion needed
+                logger.debug(f"Column {col_name} already has correct type {target_dtype}, skipping")
                 continue
 
+            logger.debug(f"Converting column {col_name} from {source_dtype} to {target_dtype}")
             # Get or build a caster
             try:
                 caster = DATA_CAST_REGISTRY.get_or_build(
@@ -145,10 +155,12 @@ class DataWriter(Generic[ConfigT], abc.ABC):
                 result = result.with_columns(
                     caster.cast_series(result.get_column(col_name))
                 )
+                logger.debug(f"Successfully converted column {col_name}")
 
-            except ValueError:
+            except ValueError as e:
                 # If we can't safely cast, we'll leave the column as-is and log a warning
-                # In a real implementation, you might want to add logging or raise an exception
+                logger.warning(f"Failed to convert column {col_name} from {source_dtype} to {target_dtype}: {e}")
                 pass
 
+        logger.info(f"Finished coercing DataFrame to schema, resulted in {len(result)} rows")
         return result

@@ -8,6 +8,12 @@ from typing import Any, Dict, List, Optional, TypeVar, Union, Callable, Generic
 
 import polars as pl
 
+# Import logging
+from ...logging import get_logger
+
+# Create module-level logger
+logger = get_logger(__name__)
+
 # Type variable for implementing generic reader with specific config type
 ConfigT = TypeVar('ConfigT')
 
@@ -35,27 +41,33 @@ class ReaderPredicate:
             ReaderPredicate: The corresponding predicate instance.
         """
         pred_type = expr.get("type")
+        logger.debug(f"Converting predicate expression of type '{pred_type}'")
 
         if pred_type == "column_predicate":
-            return ColumnPredicate(
-                column=expr["column"],
-                op=expr["op"],
-                value=expr["value"]
-            )
+            column = expr["column"]
+            op = expr["op"]
+            value = expr["value"]
+            logger.debug(f"Creating column predicate: {column} {op} {value}")
+            return ColumnPredicate(column=column, op=op, value=value)
         elif pred_type == "and":
+            logger.debug(f"Creating AND predicate with {len(expr['predicates'])} conditions")
             return AndPredicate([
                 cls.from_expression(pred) for pred in expr["predicates"]
             ])
         elif pred_type == "or":
+            logger.debug(f"Creating OR predicate with {len(expr['predicates'])} conditions")
             return OrPredicate([
                 cls.from_expression(pred) for pred in expr["predicates"]
             ])
         elif pred_type == "not":
+            logger.debug("Creating NOT predicate")
             return NotPredicate(
                 cls.from_expression(expr["predicate"])
             )
         else:
-            raise ValueError(f"Unknown predicate type: {pred_type}")
+            error_msg = f"Unknown predicate type: {pred_type}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
 
 @dataclasses.dataclass

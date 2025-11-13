@@ -6,13 +6,21 @@ from typing import ClassVar, TYPE_CHECKING, Any, Union, Optional, List, Dict, Tu
 # Make Polars the primary dependency
 import polars as pl
 
+# Import logging
+from ..logging import get_logger
+
+# Create module-level logger
+logger = get_logger(__name__)
+
 # Conditionally import pyarrow for interoperability
 try:
     import pyarrow as pa
     import pyarrow.compute as pc
     HAS_ARROW = True
+    logger.info("PyArrow is available, enabling Arrow interoperability")
 except ImportError:
     HAS_ARROW = False
+    logger.warning("PyArrow not available, Arrow interoperability disabled")
     pa = Any  # type: ignore
     pc = Any  # type: ignore
 
@@ -198,18 +206,25 @@ class DataCaster:
         """Cast a series to the target data type."""
         target = target_dtype or self.target_dtype
 
+        logger.debug(
+            f"Casting series from {getattr(series, 'dtype', 'unknown')} to {target}"
+        )
+
         # Handle Arrow arrays by converting to Polars first
         if HAS_ARROW and isinstance(series, (pa.Array, pa.ChunkedArray)):
+            logger.debug("Converting Arrow array to Polars Series")
             series = pl.Series.from_arrow(series)
 
         # Ensure we have a Polars Series
         if not isinstance(series, pl.Series):
+            logger.error(f"Expected pl.Series or arrow array, got {type(series)}")
             raise TypeError(f"Expected pl.Series or arrow array, got {type(series)}")
 
         # Keep original name if series has one, otherwise use target name
         name = series.name if series.name else self.target_name
 
         # Perform the cast
+        logger.debug(f"Performing cast to {target} for series '{name}'")
         return series.cast(target)
 
     def cast_scalar(
@@ -221,12 +236,18 @@ class DataCaster:
         """Cast a scalar value to the target data type."""
         target = target_dtype or self.target_dtype
 
+        logger.debug(
+            f"Casting scalar value {value} from {self.source_dtype} to {target}"
+        )
+
         # Create a temporary series, cast it, and extract the scalar
         temp_series = pl.Series(self.source_name, [value], dtype=self.source_dtype)
         cast_series = self.cast_series(temp_series, target_dtype=target, safe=safe)
 
         # Return the scalar value
-        return cast_series[0]
+        result = cast_series[0]
+        logger.debug(f"Cast result: {result}")
+        return result
 
 
 @dataclasses.dataclass
@@ -265,14 +286,20 @@ class DataCastRegistry:
         safe: bool = False,
     ) -> DataCaster:
         """Get an existing caster or create a new one."""
+        logger.debug(f"Looking up caster for {source_dtype} -> {target_dtype}")
+
         if not DataUtility.can_convert_types(source_dtype, target_dtype, safe=safe):
             safe_str = " safely" if safe else ""
-            raise ValueError(f"Cannot convert {source_dtype} to {target_dtype}{safe_str}")
+            error_msg = f"Cannot convert {source_dtype} to {target_dtype}{safe_str}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         cached = self.get(source_dtype, target_dtype)
         if cached is not None:
+            logger.debug(f"Using cached caster for {source_dtype} -> {target_dtype}")
             return cached
 
+        logger.info(f"Creating new caster for {source_dtype} -> {target_dtype}")
         caster = DataCaster(
             source_dtype=source_dtype,
             target_dtype=target_dtype,
@@ -285,6 +312,7 @@ class DataCastRegistry:
     def instance(cls) -> DataCastRegistry:
         """Get the singleton instance."""
         if cls._instance is None:
+            logger.debug("Creating singleton DataCastRegistry instance")
             cls._instance = cls()
         return cls._instance
 

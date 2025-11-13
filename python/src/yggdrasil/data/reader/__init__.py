@@ -1,5 +1,10 @@
 """Reader implementations for Yggdrasil data."""
 
+from ...logging import get_logger
+
+# Create module-level logger
+logger = get_logger(__name__)
+
 from .base import (
     DataReader,
     ReadOptions,
@@ -16,7 +21,9 @@ from .base import (
 # Import Delta reader if available
 try:
     from .delta import DeltaReader, DeltaReaderConfig
+    logger.debug("Successfully imported Delta reader")
 except ImportError:
+    logger.debug("Delta reader not available")
     pass
 
 __all__ = [
