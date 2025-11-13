@@ -11,12 +11,12 @@ authors = [{ name = "Yggdrasil Contributors" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
-    "pyarrow>=13",
-    "polars",
+    "polars>=0.20.0",
     "tzdata"
 ]
 
 [project.optional-dependencies]
+arrow = ["pyarrow>=13"]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",

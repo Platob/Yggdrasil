@@ -1,6 +1,6 @@
 # Yggdrasil
 
-Yggdrasil is a multi-language research playground focused on data processing and interoperability. The Python package provides utilities for working with Apache Arrow, type conversions, and data handling.
+Yggdrasil is a multi-language research playground focused on data processing and interoperability. The Python package provides utilities for working with Polars, type conversions, and data handling.
 
 ## Quick Start
 
@@ -49,25 +49,50 @@ pytest
 
 ## Features
 
-### Arrow Data Utilities
+### Data Casting Utilities
 
-Yggdrasil provides tools for working with Apache Arrow data types:
+Yggdrasil provides tools for working with Polars data types:
+
+```python
+import polars as pl
+from yggdrasil.data import DATA_CAST_REGISTRY
+
+# Example: Cast a series from int32 to int64
+source_dtype = pl.Int32
+target_dtype = pl.Int64
+
+caster = DATA_CAST_REGISTRY.get_or_build(source_dtype, target_dtype)
+series = pl.Series("values", [1, 2, 3], dtype=source_dtype)
+cast_series = caster.cast_series(series)
+
+print(f"Source type: {source_dtype}")
+print(f"Target type: {target_dtype}")
+print(f"Values: {cast_series.to_list()}")
+```
+
+### Optional Arrow Support
+
+Arrow interoperability is available as an optional dependency:
+
+```bash
+pip install "yggdrasil[arrow] @ git+https://github.com/Platob/Yggdrasil.git"
+```
+
+With Arrow support installed, the `SeriesLike` type can accept Arrow arrays:
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.arrow import ARROW_CAST_REGISTRY
+import polars as pl
+from yggdrasil.data import DataCaster
 
-# Example: Cast an array from int32 to int64
-source_field = pa.field("values", pa.list_(pa.int32()))
-target_field = pa.field("values", pa.list_(pa.int64()))
+# Create an Arrow array
+arr = pa.array([1, 2, 3], type=pa.int32())
 
-caster = ARROW_CAST_REGISTRY.get_or_build(source_field, target_field)
-array = pa.array([[1, 2, 3]], type=source_field.type)
-cast_array = caster.cast_array(array)
+# Set up the caster
+caster = DataCaster(source_dtype=pl.Int32, target_dtype=pl.Int64)
 
-print(f"Source type: {source_field.type}")
-print(f"Target type: {target_field.type}")
-print(f"Values: {cast_array.to_pylist()}")
+# Cast the Arrow array (automatically converts to Polars)
+cast_series = caster.cast_series(arr)
 ```
 
 ### CLI Commands
@@ -78,17 +103,22 @@ Yggdrasil comes with useful command line tools:
 # Get version info
 python -m yggdrasil --version
 
-# Arrow casting example
-python -m yggdrasil arrow-cast 1 2 3 4 5
+# Data casting example
+python -m yggdrasil data-cast 1 2 3 4 5
+
+# Show a demo table
+python -m yggdrasil demo-table
 ```
 
 ## Requirements
 
 - Python 3.9 or later
 - Dependencies:
-  - pyarrow >= 13.0
-  - polars
+  - polars >= 0.20.0
   - tzdata
+
+- Optional Dependencies:
+  - pyarrow >= 13.0 (for Arrow interoperability)
 
 ## Project Structure
 
@@ -98,9 +128,8 @@ Yggdrasil/
 │   ├── src/
 │   │   └── yggdrasil/
 │   │       ├── data/
-│   │       │   └── arrow/
-│   │       │       ├── arrow_cast.py
-│   │       │       └── init.py
+│   │       │   ├── data_cast.py
+│   │       │   └── __init__.py
 │   │       └── cli.py
 │   └── tests/
 └── README.md
