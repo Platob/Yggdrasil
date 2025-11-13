@@ -31,16 +31,9 @@ from .writer import (
 
 # Conditionally import Delta classes if available
 try:
-    from .delta_io import (
-        DeltaReader,
-        DeltaWriter,
-        DeltaReaderConfig,
-        DeltaWriterConfig,
-        HAS_DELTA,
-        # Backward compatibility
-        create_delta_reader,
-        create_delta_writer,
-    )
+    from .delta_common import HAS_DELTA
+    from .delta_reader import DeltaReader, DeltaReaderConfig
+    from .delta_writer import DeltaWriter, DeltaWriterConfig
 except ImportError:
     HAS_DELTA = False
 
@@ -75,6 +68,4 @@ __all__ = [
     "DeltaReaderConfig",
     "DeltaWriterConfig",
     "HAS_DELTA",
-    "create_delta_reader",
-    "create_delta_writer",
 ]
