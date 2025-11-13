@@ -121,10 +121,18 @@ def test_is_nested_type() -> None:
     # Test with List type
     assert DataUtility.is_nested_type(pl.List)
 
+    # Test with Struct type
+    assert DataUtility.is_nested_type(pl.Struct)
+
     # Test with parametrized list type
     if hasattr(pl, "list_"):  # Check if this feature exists in the installed polars version
         list_int = pl.list_(pl.Int32)
         assert DataUtility.is_nested_type(list_int)
+
+    # Test with parametrized struct type
+    if hasattr(pl, "struct"):
+        struct_type = pl.struct({"name": pl.Utf8, "age": pl.Int32})
+        assert DataUtility.is_nested_type(struct_type)
 
 
 def test_get_inner_type() -> None:
@@ -152,6 +160,26 @@ def test_get_nested_fields() -> None:
         assert fields[0][0] == "_inner"
         assert fields[0][1] == pl.Int32
 
+    # Test with struct types if available
+    if hasattr(pl, "struct"):
+        # Create a struct type
+        struct_type = pl.struct({"name": pl.Utf8, "age": pl.Int32})
+
+        # Get fields from the struct
+        fields = DataUtility.get_nested_fields(struct_type)
+
+        # Should have two fields: name and age
+        assert len(fields) == 2
+
+        # Check field names and types
+        name_field = next((f for f in fields if f[0] == "name"), None)
+        age_field = next((f for f in fields if f[0] == "age"), None)
+
+        assert name_field is not None
+        assert age_field is not None
+        assert name_field[1] == pl.Utf8
+        assert age_field[1] == pl.Int32
+
 
 def test_can_convert_types_with_nested_types() -> None:
     """Test DataUtility.can_convert_types with nested types."""
@@ -171,6 +199,42 @@ def test_can_convert_types_with_nested_types() -> None:
         # List to non-list should not be convertible
         assert not DataUtility.can_convert_types(list_int32, pl.Int32)
         assert not DataUtility.can_convert_types(pl.Int32, list_int32)
+
+    # Test with struct types if available
+    if hasattr(pl, "struct"):
+        # Create struct types
+        struct1 = pl.struct({"name": pl.Utf8, "age": pl.Int32})
+        struct2 = pl.struct({"name": pl.Utf8, "age": pl.Int64})
+        struct3 = pl.struct({"name": pl.Utf8, "salary": pl.Float64})
+
+        # Same struct should be convertible
+        assert DataUtility.can_convert_types(struct1, struct1)
+
+        # Struct with wider numeric types should be safely convertible
+        assert DataUtility.can_convert_types(struct1, struct2, safe=True)
+
+        # Struct with different field names should not be convertible when check_names=True
+        assert not DataUtility.can_convert_types(struct1, struct3, safe=True, check_names=True)
+
+        # Struct to non-struct should not be convertible
+        assert not DataUtility.can_convert_types(struct1, pl.Int32)
+        assert not DataUtility.can_convert_types(pl.Int32, struct1)
+
+    # Test with map/dict types if available (depends on Polars version)
+    if hasattr(pl, "map"):
+        # Create map types
+        map_str_int = pl.map(pl.Utf8, pl.Int32)
+        map_str_int64 = pl.map(pl.Utf8, pl.Int64)
+        map_int_str = pl.map(pl.Int32, pl.Utf8)
+
+        # Same map type should be convertible
+        assert DataUtility.can_convert_types(map_str_int, map_str_int)
+
+        # Map with wider value type should be safely convertible
+        assert DataUtility.can_convert_types(map_str_int, map_str_int64, safe=True)
+
+        # Different key types should not be safely convertible
+        assert not DataUtility.can_convert_types(map_str_int, map_int_str, safe=True)
 
 
 def test_cast_series_with_list_type() -> None:
@@ -192,3 +256,59 @@ def test_cast_series_with_list_type() -> None:
         # Check the result
         assert cast_series.dtype == target_dtype
         assert cast_series.to_list() == [[1, 2], [3, 4]]
+
+
+def test_cast_series_with_struct_type() -> None:
+    """Test casting series with struct types."""
+    if hasattr(pl, "struct"):
+        # Create struct types
+        source_dtype = pl.struct({"name": pl.Utf8, "age": pl.Int32})
+        target_dtype = pl.struct({"name": pl.Utf8, "age": pl.Int64})
+
+        # Create a caster
+        caster = DataCaster(source_dtype=source_dtype, target_dtype=target_dtype)
+
+        # Create a series with struct data
+        data = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
+        series = pl.Series("people", data, dtype=source_dtype)
+
+        # Cast the series
+        cast_series = caster.cast_series(series)
+
+        # Check the result
+        assert cast_series.dtype == target_dtype
+        # Extract the struct values
+        result_data = cast_series.to_list()
+        assert len(result_data) == 2
+        assert result_data[0]["name"] == "Alice"
+        assert result_data[0]["age"] == 30
+        assert result_data[1]["name"] == "Bob"
+        assert result_data[1]["age"] == 25
+
+
+def test_cast_series_with_map_type() -> None:
+    """Test casting series with map types."""
+    if hasattr(pl, "map"):
+        # Create map types
+        source_dtype = pl.map(pl.Utf8, pl.Int32)
+        target_dtype = pl.map(pl.Utf8, pl.Int64)
+
+        # Create a caster
+        caster = DataCaster(source_dtype=source_dtype, target_dtype=target_dtype)
+
+        # Create a series with map data
+        data = [{"name": 30, "age": 25}, {"Alice": 35, "Bob": 40}]
+        series = pl.Series("mappings", data, dtype=source_dtype)
+
+        # Cast the series
+        cast_series = caster.cast_series(series)
+
+        # Check the result
+        assert cast_series.dtype == target_dtype
+        # Extract the map values
+        result_data = cast_series.to_list()
+        assert len(result_data) == 2
+        assert result_data[0]["name"] == 30
+        assert result_data[0]["age"] == 25
+        assert result_data[1]["Alice"] == 35
+        assert result_data[1]["Bob"] == 40
