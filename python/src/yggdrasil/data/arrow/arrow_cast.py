@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar
+from typing import ClassVar, TYPE_CHECKING, Any, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.types as pa_types
 
+# Conditionally import polars to avoid hard dependency
+if TYPE_CHECKING:
+    try:
+        import polars as pl
+        HAS_POLARS = True
+    except ImportError:
+        HAS_POLARS = False
+        pl = Any  # type: ignore
+else:
+    try:
+        import polars as pl
+        HAS_POLARS = True
+    except ImportError:
+        HAS_POLARS = False
+        pl = None  # type: ignore
+
 ArrowDataTypeOrField = pa.DataType | pa.Field
-ArrayLike = pa.Array | pa.ChunkedArray
+# Include Polars Series in ArrayLike
+ArrayLike = Union[pa.Array, pa.ChunkedArray, "pl.Series"]
 
 
 class ArrowUtility:
@@ -98,6 +115,10 @@ class ArrowCaster:
     ):
         checked_target_type = ArrowUtility.ensure_arrow_type(target_type or self.target_field)
 
+        # Handle Polars Series - convert to Arrow array first
+        if HAS_POLARS and isinstance(arr, pl.Series):
+            arr = arr.to_arrow()
+
         return pc.cast(
             arr=arr,
             target_type=checked_target_type,
@@ -180,6 +201,9 @@ __all__ = [
     "ArrowCastRegistry",
     "ArrowUtility",
     "ARROW_CAST_REGISTRY",
+    "ArrowDataTypeOrField",
+    "ArrayLike",
+    "HAS_POLARS",
 ]
 
 
