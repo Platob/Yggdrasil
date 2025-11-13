@@ -70,6 +70,74 @@ print(f"Target type: {target_dtype}")
 print(f"Values: {cast_series.to_list()}")
 ```
 
+### Abstract Reader/Writer Framework
+
+Yggdrasil provides a powerful abstract framework for creating readers and writers for different data sources:
+
+#### Reading Data with Predicate Pushdown
+
+The reader framework allows filtering data at the source using predicate pushdown:
+
+```python
+import polars as pl
+from yggdrasil.data import (
+    ReadOptions, eq, gt, and_, or_, not_,
+    DeltaReaderConfig, DeltaReader
+)
+
+# Create a Delta reader with configuration
+config = DeltaReaderConfig(table_path="/path/to/delta/table")
+reader = DeltaReader(config)
+
+# Create read options with predicates
+options = ReadOptions(
+    columns=["id", "name", "region", "sales"],
+    limit=1000,
+    predicate=and_(
+        eq("region", "europe"),
+        gt("sales", 10000)
+    )
+)
+
+# Read data with predicate pushdown
+df = reader.to_polars(options)
+```
+
+#### Writing Data with Schema Enforcement
+
+The writer framework supports different write modes and schema enforcement:
+
+```python
+import polars as pl
+from yggdrasil.data import (
+    WriteOptions, WriteMode,
+    DeltaWriterConfig, DeltaWriter
+)
+
+# Create a Delta writer with configuration
+config = DeltaWriterConfig(table_path="/path/to/delta/table")
+writer = DeltaWriter(config)
+
+# Create a sample DataFrame
+df = pl.DataFrame({
+    "id": [1, 2, 3],
+    "name": ["Alice", "Bob", "Charlie"],
+    "country": ["US", "UK", "FR"]
+})
+
+# Create write options
+options = WriteOptions(
+    mode=WriteMode.APPEND,
+    partition_by=["country"],
+    schema_evolution=True,
+    coerce_to_schema=True,
+    column_mapping={"user_id": "id", "user_name": "name"}
+)
+
+# Write data with options
+result = writer.from_polars(df, options)
+```
+
 ### Delta Lake Integration
 
 Yggdrasil provides support for reading and writing Delta Lake tables with Polars:
@@ -82,15 +150,32 @@ pip install "yggdrasil[delta] @ git+https://github.com/Platob/Yggdrasil.git"
 
 ```python
 import polars as pl
-from yggdrasil.data import DeltaReader
+from yggdrasil.data import (
+    ReadOptions, eq, gt,
+    DeltaReaderConfig, DeltaReader
+)
 
-# Read a Delta table into a Polars DataFrame
-reader = DeltaReader(
+# Method 1: Using the abstract reader interface
+config = DeltaReaderConfig(table_path="/path/to/delta/table")
+reader = DeltaReader(config)
+
+options = ReadOptions(
+    columns=["id", "name"],
+    predicate=eq("region", "europe"),
+    limit=1000
+)
+
+df = reader.to_polars(options)
+
+# Method 2: Using the compatibility function
+from yggdrasil.data import create_delta_reader
+
+reader = create_delta_reader(
     table_path="/path/to/delta/table",
-    filter_column="region",  # Optional: Filter by column
-    filter_value="europe",   # Optional: Filter value
-    columns=["id", "name"],  # Optional: Select specific columns
-    limit=1000               # Optional: Limit number of rows
+    filter_column="region",
+    filter_value="europe",
+    columns=["id", "name"],
+    limit=1000
 )
 
 # Read the table
@@ -106,7 +191,10 @@ print(f"Partition columns: {metadata['partition_columns']}")
 
 ```python
 import polars as pl
-from yggdrasil.data import DeltaWriter
+from yggdrasil.data import (
+    WriteOptions, WriteMode,
+    DeltaWriterConfig, DeltaWriter
+)
 
 # Create a sample DataFrame
 df = pl.DataFrame({
@@ -115,12 +203,27 @@ df = pl.DataFrame({
     "country": ["US", "UK", "FR"]
 })
 
-# Create a new Delta table
-writer = DeltaWriter(
+# Method 1: Using the abstract writer interface
+config = DeltaWriterConfig(table_path="/path/to/delta/table")
+writer = DeltaWriter(config)
+
+options = WriteOptions(
+    mode=WriteMode.APPEND,
+    partition_by=["country"],
+    schema_evolution=True
+)
+
+# Write the DataFrame to Delta
+result = writer.from_polars(df, options)
+
+# Method 2: Using the compatibility function
+from yggdrasil.data import create_delta_writer
+
+writer = create_delta_writer(
     table_path="/path/to/delta/table",
-    mode="append",               # Options: "error", "append", "overwrite", "ignore"
-    partition_by=["country"],    # Optional: Partition the table
-    schema_evolution=True        # Optional: Allow schema changes in append mode
+    mode="append",
+    partition_by=["country"],
+    schema_evolution=True
 )
 
 # Write the DataFrame to Delta
@@ -189,11 +292,14 @@ Yggdrasil/
 │   │       ├── data/
 │   │       │   ├── data_cast.py
 │   │       │   ├── delta_io.py
+│   │       │   ├── reader.py
+│   │       │   ├── writer.py
 │   │       │   └── __init__.py
 │   │       └── cli.py
 │   └── tests/
 │       ├── test_data_cast.py
-│       └── test_delta_io.py
+│       ├── test_delta_io.py
+│       └── test_reader_writer.py
 └── README.md
 ```
 
