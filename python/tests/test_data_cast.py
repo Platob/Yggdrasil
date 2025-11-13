@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from typing import List
 
 import polars as pl
 import pytest
@@ -106,3 +107,88 @@ def test_singleton_registry_is_shared_instance() -> None:
 
     assert instance_one is instance_two
     assert DATA_CAST_REGISTRY is instance_one
+
+
+# Tests for nested type handling
+
+def test_is_nested_type() -> None:
+    """Test DataUtility.is_nested_type method."""
+    # Test with simple types
+    assert not DataUtility.is_nested_type(pl.Int32)
+    assert not DataUtility.is_nested_type(pl.Float64)
+    assert not DataUtility.is_nested_type(pl.Utf8)
+
+    # Test with List type
+    assert DataUtility.is_nested_type(pl.List)
+
+    # Test with parametrized list type
+    if hasattr(pl, "list_"):  # Check if this feature exists in the installed polars version
+        list_int = pl.list_(pl.Int32)
+        assert DataUtility.is_nested_type(list_int)
+
+
+def test_get_inner_type() -> None:
+    """Test DataUtility.get_inner_type method."""
+    # Test with non-nested types
+    assert DataUtility.get_inner_type(pl.Int32) is None
+
+    # Test with list types if available
+    if hasattr(pl, "list_"):
+        list_int = pl.list_(pl.Int32)
+        inner_type = DataUtility.get_inner_type(list_int)
+        assert inner_type == pl.Int32
+
+
+def test_get_nested_fields() -> None:
+    """Test DataUtility.get_nested_fields method."""
+    # Simple types have no nested fields
+    assert len(DataUtility.get_nested_fields(pl.Int32)) == 0
+
+    # Test with list types if available
+    if hasattr(pl, "list_"):
+        list_int = pl.list_(pl.Int32)
+        fields = DataUtility.get_nested_fields(list_int)
+        assert len(fields) == 1
+        assert fields[0][0] == "_inner"
+        assert fields[0][1] == pl.Int32
+
+
+def test_can_convert_types_with_nested_types() -> None:
+    """Test DataUtility.can_convert_types with nested types."""
+    # Test with list types if available
+    if hasattr(pl, "list_"):
+        # Same list types should be convertible
+        list_int32 = pl.list_(pl.Int32)
+        assert DataUtility.can_convert_types(list_int32, list_int32)
+
+        # List of Int32 to List of Int64 should be safely convertible
+        list_int64 = pl.list_(pl.Int64)
+        assert DataUtility.can_convert_types(list_int32, list_int64, safe=True)
+
+        # List of Int64 to List of Int32 should not be safely convertible
+        assert not DataUtility.can_convert_types(list_int64, list_int32, safe=True)
+
+        # List to non-list should not be convertible
+        assert not DataUtility.can_convert_types(list_int32, pl.Int32)
+        assert not DataUtility.can_convert_types(pl.Int32, list_int32)
+
+
+def test_cast_series_with_list_type() -> None:
+    """Test casting series with list types."""
+    if hasattr(pl, "list_"):
+        # Create list types
+        source_dtype = pl.list_(pl.Int32)
+        target_dtype = pl.list_(pl.Int64)
+
+        # Create a caster
+        caster = DataCaster(source_dtype=source_dtype, target_dtype=target_dtype)
+
+        # Create a series with nested data
+        series = pl.Series("nested", [[1, 2], [3, 4]], dtype=source_dtype)
+
+        # Cast the series
+        cast_series = caster.cast_series(series)
+
+        # Check the result
+        assert cast_series.dtype == target_dtype
+        assert cast_series.to_list() == [[1, 2], [3, 4]]

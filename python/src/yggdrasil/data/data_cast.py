@@ -38,18 +38,54 @@ class DataUtility:
         return pl.Series(name=name, values=[], dtype=dtype)
 
     @staticmethod
-    def get_nested_fields(dtype: DataType) -> List[Tuple[str, DataType]]:
-        """Get nested fields for complex types like Struct."""
-        if dtype == pl.Struct:
-            # For struct types, return field definitions
-            # This is a placeholder - actual implementation would depend on the struct definition
-            return []
-        elif dtype in (pl.List, pl.Array):
-            # For list types, we'd need the inner type
-            # This is a placeholder
-            return []
+    def is_nested_type(dtype: DataType) -> bool:
+        """Check if the data type is a nested type (Struct, List, etc.)."""
+        nested_types = {pl.Struct, pl.List, pl.Array}
+        # Check if it's a struct type
+        if hasattr(dtype, "fields"):
+            return True
+        # Handle List types
+        if isinstance(dtype, type) and dtype in nested_types:
+            return True
+        # For parametrized list types
+        if hasattr(dtype, "dtype") and hasattr(dtype, "__class__") and dtype.__class__.__name__ in ("List", "Array"):
+            return True
+        # For dictionary/map types
+        if hasattr(dtype, "key_type") and hasattr(dtype, "value_type"):
+            return True
+        return False
 
-        # Not a nested type
+    @staticmethod
+    def get_inner_type(dtype: DataType) -> Optional[DataType]:
+        """Extract the inner type from a list or array type."""
+        if hasattr(dtype, "dtype"):  # For parametrized list types
+            return dtype.dtype
+        return None
+
+    @staticmethod
+    def get_nested_fields(dtype: DataType) -> List[Tuple[str, DataType]]:
+        """Get nested fields for complex types like Struct, List, Array, and Map.
+
+        Returns:
+            List of (name, type) tuples representing the nested fields.
+        """
+        # Handle Struct types with explicit fields
+        if hasattr(dtype, "fields"):
+            return [(field.name, field.dtype) for field in dtype.fields]
+
+        # Handle List types (returns inner type with "_inner" name)
+        inner_type = DataUtility.get_inner_type(dtype)
+        if inner_type is not None:
+            return [("_inner", inner_type)]
+
+        # Handle Map/Dictionary types
+        if hasattr(dtype, "key_type") and hasattr(dtype, "value_type"):
+            return [
+                ("_key", dtype.key_type),
+                ("_value", dtype.value_type)
+            ]
+
+        # Not a nested type or unrecognized nested type
         return []
 
     @staticmethod
@@ -57,6 +93,7 @@ class DataUtility:
         source_dtype: DataType,
         target_dtype: DataType,
         safe: bool = False,
+        check_names: bool = False,
     ) -> bool:
         """Check if source type can be cast to target type."""
         # Same type is always convertible
@@ -73,6 +110,37 @@ class DataUtility:
         float_types = (pl.Float32, pl.Float64)
         string_types = (pl.Utf8, pl.String)
 
+        # Handle nested types
+        source_nested = DataUtility.is_nested_type(source_dtype)
+        target_nested = DataUtility.is_nested_type(target_dtype)
+
+        if source_nested and target_nested:
+            # Both are nested types, compare their structures
+            source_fields = DataUtility.get_nested_fields(source_dtype)
+            target_fields = DataUtility.get_nested_fields(target_dtype)
+
+            # Basic structure check: same number of fields
+            if len(source_fields) != len(target_fields):
+                return False
+
+            # Check if fields can be converted
+            for (s_name, s_type), (t_name, t_type) in zip(source_fields, target_fields):
+                # Check field names if required
+                if check_names and s_name != t_name and not s_name.startswith("_") and not t_name.startswith("_"):
+                    return False
+
+                # Check if field types are compatible
+                if not DataUtility.can_convert_types(s_type, t_type, safe=safe, check_names=check_names):
+                    return False
+
+            # All fields passed the checks
+            return True
+
+        # One is nested, one is not
+        if source_nested != target_nested:
+            return False
+
+        # Handle primitive type conversions in safe mode
         if safe:
             # Integer to integer (same signedness or widening)
             if source_dtype in int_types and target_dtype in int_types:
@@ -99,6 +167,11 @@ class DataUtility:
 
             # Any numeric to float64 is safe
             if source_dtype in numeric_types and target_dtype == pl.Float64:
+                return True
+
+            # Boolean type conversions
+            if source_dtype == pl.Boolean and target_dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                                                             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}:
                 return True
 
             return False
