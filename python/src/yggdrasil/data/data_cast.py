@@ -28,11 +28,8 @@ class DataUtility:
     def ensure_polars_type(dtype: DataType | str) -> DataType:
         """Convert string representation to Polars DataType if needed."""
         if isinstance(dtype, str):
-            # Convert string to polars data type
-            try:
-                return getattr(pl, dtype)
-            except AttributeError:
-                raise ValueError(f"Invalid Polars data type: {dtype}")
+            # String lookup is not implemented yet
+            raise ValueError(f"String lookup not implemented yet. Received: {dtype}")
         return dtype
 
     @staticmethod
