@@ -13,7 +13,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 from yggdrasil.data import (
     DataReader,
     ReadOptions,
-    ReaderPredicate,
+    FilterPredicate,
     ColumnPredicate,
     AndPredicate,
     OrPredicate,
@@ -42,7 +42,7 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
         self.config = config
         self._data = data if data is not None else pl.DataFrame()
 
-    def to_polars(self, options: Optional[ReadOptions] = None) -> pl.DataFrame:
+    def read_polars(self, options: Optional[ReadOptions] = None) -> pl.DataFrame:
         """Read data into a Polars DataFrame."""
         df = self._data
 
@@ -62,7 +62,7 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
 
         return df
 
-    def _apply_predicate(self, df: pl.DataFrame, predicate: ReaderPredicate) -> pl.DataFrame:
+    def _apply_predicate(self, df: pl.DataFrame, predicate: FilterPredicate) -> pl.DataFrame:
         """Apply a predicate to filter a DataFrame."""
         expr_dict = predicate.to_expression()
 
@@ -91,7 +91,7 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
         elif expr_dict["type"] == "and":
             result = df
             for pred_dict in expr_dict["predicates"]:
-                pred = ReaderPredicate.from_expression(pred_dict)
+                pred = FilterPredicate.from_expression(pred_dict)
                 result = self._apply_predicate(result, pred)
             return result
 
@@ -99,7 +99,7 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
             # For OR, directly build expressions and combine them
             filters = []
             for pred_dict in expr_dict["predicates"]:
-                pred = ReaderPredicate.from_expression(pred_dict)
+                pred = FilterPredicate.from_expression(pred_dict)
                 if pred_dict["type"] == "column_predicate":
                     col = pred_dict["column"]
                     op = pred_dict["op"]
@@ -136,7 +136,7 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
             return df
 
         elif expr_dict["type"] == "not":
-            pred = ReaderPredicate.from_expression(expr_dict["predicate"])
+            pred = FilterPredicate.from_expression(expr_dict["predicate"])
             if expr_dict["predicate"]["type"] == "column_predicate":
                 col = expr_dict["predicate"]["column"]
                 op = expr_dict["predicate"]["op"]
@@ -206,7 +206,7 @@ class MemoryWriter(DataWriter[MemoryWriterConfig]):
         self._write_count = 0
         self._schema = None
 
-    def from_polars(
+    def write_polars(
         self, df: pl.DataFrame, options: Optional[WriteOptions] = None
     ) -> Dict[str, Any]:
         """Write a Polars DataFrame to memory."""
@@ -276,7 +276,7 @@ def test_reader_predicate_expression():
     assert expr1["value"] == 30
 
     # Convert back to predicate
-    pred1_recovered = ReaderPredicate.from_expression(expr1)
+    pred1_recovered = FilterPredicate.from_expression(expr1)
     assert isinstance(pred1_recovered, ColumnPredicate)
     assert pred1_recovered.column == "age"
     assert pred1_recovered.op == "eq"
@@ -319,54 +319,54 @@ def test_memory_reader():
     reader = MemoryReader(MemoryReaderConfig(), df)
 
     # Test reading without options
-    result = reader.to_polars()
+    result = reader.read_polars()
     assert len(result) == 5
     assert result.columns == ["id", "name", "age", "salary"]
 
     # Test reading with column selection
     options = ReadOptions(columns=["id", "name"])
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 5
     assert result.columns == ["id", "name"]
 
     # Test reading with limit
     options = ReadOptions(limit=2)
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 2
 
     # Test reading with filtering (equals)
     options = ReadOptions(predicate=eq("name", "Bob"))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 1
     assert result["name"][0] == "Bob"
 
     # Test reading with filtering (greater than)
     options = ReadOptions(predicate=gt("age", 35))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 2
     assert all(age > 35 for age in result["age"])
 
     # Test reading with filtering (AND)
     options = ReadOptions(predicate=and_(gt("age", 30), lt("salary", 80000)))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 1
     assert result["name"][0] == "Charlie"
 
     # Test reading with filtering (OR)
     options = ReadOptions(predicate=or_(eq("name", "Alice"), eq("name", "Eve")))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 2
     assert set(result["name"].to_list()) == {"Alice", "Eve"}
 
     # Test reading with filtering (NOT)
     options = ReadOptions(predicate=not_(eq("name", "Bob")))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 4
     assert "Bob" not in result["name"].to_list()
 
     # Test reading with filtering (IN)
     options = ReadOptions(predicate=is_in("name", ["Alice", "Bob"]))
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 2
     assert set(result["name"].to_list()) == {"Alice", "Bob"}
 
@@ -376,7 +376,7 @@ def test_memory_reader():
         limit=2,
         predicate=gt("age", 30)
     )
-    result = reader.to_polars(options)
+    result = reader.read_polars(options)
     assert len(result) == 2
     assert result.columns == ["id", "name", "age"]
     assert all(age > 30 for age in result["age"])
@@ -405,7 +405,7 @@ def test_memory_writer():
     assert writer.get_schema() is None
 
     # Test writing data
-    result = writer.from_polars(df1)
+    result = writer.write_polars(df1)
     assert result["status"] == "success"
     assert result["num_rows"] == 3
     assert writer.exists()
@@ -419,21 +419,21 @@ def test_memory_writer():
 
     # Test error mode
     with pytest.raises(ValueError):
-        writer.from_polars(df2, WriteOptions(mode=WriteMode.ERROR))
+        writer.write_polars(df2, WriteOptions(mode=WriteMode.ERROR))
 
     # Test ignore mode
-    result = writer.from_polars(df2, WriteOptions(mode=WriteMode.IGNORE))
+    result = writer.write_polars(df2, WriteOptions(mode=WriteMode.IGNORE))
     assert result["status"] == "skipped"
     assert writer.get_data().shape == (3, 3)  # Still the original data
 
     # Test append mode
-    result = writer.from_polars(df2, WriteOptions(mode=WriteMode.APPEND))
+    result = writer.write_polars(df2, WriteOptions(mode=WriteMode.APPEND))
     assert result["status"] == "success"
     assert result["operation"] == "append"
     assert writer.get_data().shape == (5, 3)  # Combined data
 
     # Test overwrite mode
-    result = writer.from_polars(df2, WriteOptions(mode=WriteMode.OVERWRITE))
+    result = writer.write_polars(df2, WriteOptions(mode=WriteMode.OVERWRITE))
     assert result["status"] == "success"
     assert result["operation"] == "overwrite"
     assert writer.get_data().shape == (2, 3)  # Only the new data
@@ -445,7 +445,7 @@ def test_memory_writer():
         "user_age": [50, 55],
     })
 
-    result = writer.from_polars(
+    result = writer.write_polars(
         df3,
         WriteOptions(
             mode=WriteMode.APPEND,
