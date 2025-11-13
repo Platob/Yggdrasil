@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import polars as pl
 
 # Import abstract reader class
-from .reader import DataReader, ReadOptions, ReaderPredicate
+from .base import DataReader, ReadOptions, ReaderPredicate
 
 # Conditionally import delta and pyarrow for interoperability
 try:

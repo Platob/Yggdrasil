@@ -9,7 +9,7 @@ from .data_cast import (
     SeriesLike,
 )
 
-# Import abstract reader/writer classes
+# Re-export reader and writer modules
 from .reader import (
     DataReader,
     ReadOptions,
@@ -21,19 +21,23 @@ from .reader import (
     # Helper functions for predicates
     eq, gt, lt, gte, lte, ne, is_in, not_in,
     and_, or_, not_,
+    # Implementations
+    DeltaReader,
+    DeltaReaderConfig,
 )
 
 from .writer import (
     DataWriter,
     WriteOptions,
     WriteMode,
+    # Implementations
+    DeltaWriter,
+    DeltaWriterConfig,
 )
 
-# Conditionally import Delta classes if available
+# Determine if Delta Lake is available
 try:
-    from .delta_common import HAS_DELTA
-    from .delta_reader import DeltaReader, DeltaReaderConfig
-    from .delta_writer import DeltaWriter, DeltaWriterConfig
+    from .reader.delta import HAS_DELTA
 except ImportError:
     HAS_DELTA = False
 

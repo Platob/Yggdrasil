@@ -25,7 +25,7 @@ from yggdrasil.data import (
     eq, gt, lt, gte, lte, ne, is_in, not_in,
     and_, or_, not_
 )
-from yggdrasil.data.reader import ConfigT
+from yggdrasil.data.reader.base import ConfigT
 
 
 # Test implementation of DataReader for testing
@@ -37,10 +37,10 @@ class MemoryReaderConfig:
 class MemoryReader(DataReader[MemoryReaderConfig]):
     """In-memory reader for testing."""
 
-    def __init__(self, config: MemoryReaderConfig, data: pl.DataFrame = None):
+    def __init__(self, config: MemoryReaderConfig, data: Optional[pl.DataFrame] = None):
         """Initialize with test data."""
         self.config = config
-        self._data = data or pl.DataFrame()
+        self._data = data if data is not None else pl.DataFrame()
 
     def to_polars(self, options: Optional[ReadOptions] = None) -> pl.DataFrame:
         """Read data into a Polars DataFrame."""
@@ -96,27 +96,87 @@ class MemoryReader(DataReader[MemoryReaderConfig]):
             return result
 
         elif expr_dict["type"] == "or":
-            # For OR, we need to union the results of each predicate
-            mask = pl.lit(False)
+            # For OR, directly build expressions and combine them
+            filters = []
             for pred_dict in expr_dict["predicates"]:
                 pred = ReaderPredicate.from_expression(pred_dict)
-                expr_result = self._apply_predicate(df, pred)
-                if len(expr_result) > 0:
-                    # Get indices of matching rows
-                    indices = expr_result.row_index().to_list()
-                    # Update mask
-                    mask = mask | pl.col("index").is_in(indices)
+                if pred_dict["type"] == "column_predicate":
+                    col = pred_dict["column"]
+                    op = pred_dict["op"]
+                    val = pred_dict["value"]
 
-            # Apply the combined mask
-            return df.with_row_index().filter(mask).drop("index")
+                    if op == "eq":
+                        filters.append(pl.col(col) == val)
+                    elif op == "gt":
+                        filters.append(pl.col(col) > val)
+                    elif op == "lt":
+                        filters.append(pl.col(col) < val)
+                    elif op == "gte":
+                        filters.append(pl.col(col) >= val)
+                    elif op == "lte":
+                        filters.append(pl.col(col) <= val)
+                    elif op == "ne":
+                        filters.append(pl.col(col) != val)
+                    elif op == "in":
+                        filters.append(pl.col(col).is_in(val))
+                    elif op == "not_in":
+                        filters.append(~pl.col(col).is_in(val))
+
+            # Combine all expressions with OR
+            combined_filter = None
+            for f in filters:
+                if combined_filter is None:
+                    combined_filter = f
+                else:
+                    combined_filter = combined_filter | f
+
+            # Apply the combined filter
+            if combined_filter is not None:
+                return df.filter(combined_filter)
+            return df
 
         elif expr_dict["type"] == "not":
             pred = ReaderPredicate.from_expression(expr_dict["predicate"])
-            filtered_df = self._apply_predicate(df, pred)
+            if expr_dict["predicate"]["type"] == "column_predicate":
+                col = expr_dict["predicate"]["column"]
+                op = expr_dict["predicate"]["op"]
+                val = expr_dict["predicate"]["value"]
 
-            # Find the indices that were filtered out
-            filtered_indices = filtered_df.row_index().to_list()
-            return df.with_row_index().filter(~pl.col("index").is_in(filtered_indices)).drop("index")
+                # Negate the condition directly
+                if op == "eq":
+                    return df.filter(pl.col(col) != val)
+                elif op == "gt":
+                    return df.filter(pl.col(col) <= val)
+                elif op == "lt":
+                    return df.filter(pl.col(col) >= val)
+                elif op == "gte":
+                    return df.filter(pl.col(col) < val)
+                elif op == "lte":
+                    return df.filter(pl.col(col) > val)
+                elif op == "ne":
+                    return df.filter(pl.col(col) == val)
+                elif op == "in":
+                    return df.filter(~pl.col(col).is_in(val))
+                elif op == "not_in":
+                    return df.filter(pl.col(col).is_in(val))
+
+            # For complex conditions, we can use the full DataFrame approach
+            # but avoid using row index methods
+            filtered_df = self._apply_predicate(df, pred)
+            # Get a unique identifier for each row (for complex cases)
+            # Use all columns to identify rows uniquely
+            columns_to_join = df.columns
+            all_columns_expr = [pl.col(col) for col in columns_to_join]
+
+            # Create unique identifiers for rows in filtered and original dataframes
+            filtered_keys = filtered_df.select(all_columns_expr).hash_rows()
+            all_keys = df.select(all_columns_expr).hash_rows()
+
+            # Find rows in original dataframe that are not in filtered dataframe
+            filtered_keys_set = set(filtered_keys.to_list())
+            result = df.with_columns(pl.lit(all_keys).alias("__tmp_hash"))
+            result = result.filter(~pl.col("__tmp_hash").is_in(filtered_keys_set))
+            return result.drop("__tmp_hash")
 
         return df
 

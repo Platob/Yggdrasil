@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import polars as pl
 
 # Import abstract writer class
-from .writer import DataWriter, WriteOptions, WriteMode
+from .base import DataWriter, WriteOptions, WriteMode
 
 # Conditionally import delta and pyarrow for interoperability
 try:

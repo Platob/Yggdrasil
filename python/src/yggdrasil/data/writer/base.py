@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, TypeVar, Generic, Union, Type
 
 import polars as pl
 
-from .data_cast import DataCaster, DataUtility, DATA_CAST_REGISTRY
+from ..data_cast import DataCaster, DataUtility, DATA_CAST_REGISTRY
 
 
 # Type variable for implementing generic writer with specific config type
