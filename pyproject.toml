@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 arrow = ["pyarrow>=13"]
+delta = ["pyarrow>=13", "deltalake>=0.9.0"]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",
