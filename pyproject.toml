@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+spark = ["pyspark>=3"]
 delta = ["deltalake>=0.9.0"]
 dev = [
     "pytest>=7",

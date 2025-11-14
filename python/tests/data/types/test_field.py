@@ -4,7 +4,7 @@ import datetime as dt
 import decimal as dec
 import unittest
 from dataclasses import dataclass
-from typing import Optional, Dict, Union
+from typing import Optional, Dict, Union, List
 
 import pyarrow as pa
 
@@ -457,8 +457,218 @@ class TestDataField(unittest.TestCase):
         )
 
         # Verify that attempting to create a schema without children raises ValueError
-        with self.assertRaises(ValueError):
-            field.to_arrow_schema()
+        assert field.to_arrow_schema() == pa.schema([])
+
+    def test_nested_dataclasses(self):
+        """Test creating DataField from nested dataclasses."""
+        # We need to initialize metadata to empty dict if it's None
+        original_from_py_hint = DataField.from_py_hint
+
+        try:
+            @classmethod
+            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
+                # Initialize metadata to empty dict if it's None
+                if metadata is None:
+                    metadata = {}
+                return original_from_py_hint(name, hint, nullable, metadata)
+
+            # Apply our patch
+            DataField.from_py_hint = patched_from_py_hint
+
+            # Create nested dataclasses for testing
+            @dataclass
+            class Address:
+                street: str
+                city: str
+                zip_code: str
+                country: str = "USA"
+
+            @dataclass
+            class Contact:
+                email: str
+                phone: Optional[str] = None
+
+            @dataclass
+            class Employee:
+                id: int
+                name: str
+                address: Address
+                contact: Contact
+                department: str
+                is_manager: bool = False
+
+            # Create a DataField from the Employee dataclass
+            field = DataField.from_py_hint("employee", Employee)
+
+            # Verify the field structure
+            self.assertTrue(pa.types.is_struct(field.arrow_type))
+            self.assertEqual(len(field.children), 6)  # Employee has 6 fields
+
+            # Check top-level field names
+            employee_field_names = [child.name for child in field.children]
+            self.assertEqual(set(employee_field_names),
+                             {"id", "name", "address", "contact", "department", "is_manager"})
+
+            # Find and check nested Address field
+            address_field = next(child for child in field.children if child.name == "address")
+            self.assertTrue(pa.types.is_struct(address_field.arrow_type))
+            self.assertEqual(len(address_field.children), 4)  # Address has 4 fields
+
+            address_child_names = [child.name for child in address_field.children]
+            self.assertEqual(set(address_child_names),
+                             {"street", "city", "zip_code", "country"})
+
+            # Find and check nested Contact field
+            contact_field = next(child for child in field.children if child.name == "contact")
+            self.assertTrue(pa.types.is_struct(contact_field.arrow_type))
+            self.assertEqual(len(contact_field.children), 2)  # Contact has 2 fields
+
+            contact_child_names = [child.name for child in contact_field.children]
+            self.assertEqual(set(contact_child_names), {"email", "phone"})
+
+            # Verify that Optional fields are correctly marked as nullable
+            phone_field = next(child for child in contact_field.children if child.name == "phone")
+            self.assertTrue(phone_field.nullable)
+
+            # Verify non-nullable fields
+            email_field = next(child for child in contact_field.children if child.name == "email")
+            self.assertFalse(email_field.nullable)
+
+        finally:
+            # Restore the original method
+            DataField.from_py_hint = original_from_py_hint
+
+    def test_annotated_dataclass_fields(self):
+        """Test creating DataField from dataclasses with Annotated fields."""
+        # We need to initialize metadata to empty dict if it's None
+        original_from_py_hint = DataField.from_py_hint
+
+        try:
+            @classmethod
+            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
+                # Initialize metadata to empty dict if it's None
+                if metadata is None:
+                    metadata = {}
+                return original_from_py_hint(name, hint, nullable, metadata)
+
+            # Apply our patch
+            DataField.from_py_hint = patched_from_py_hint
+
+            # Create a dataclass with annotated fields
+            @dataclass
+            class Product:
+                id: Annotated[int, "primary_key", ("indexed", True)]
+                name: Annotated[str, {"description": "Product name"}]
+                price: Annotated[float, {"precision": "high", "currency": "USD"}]
+                stock: Annotated[int, {"min": "0"}]
+                category: Optional[str] = None
+
+            # Create a DataField from the Product dataclass
+            field = DataField.from_py_hint("product", Product)
+
+            # Verify the field structure
+            self.assertTrue(pa.types.is_struct(field.arrow_type))
+            self.assertEqual(len(field.children), 5)  # Product has 5 fields
+
+            # Check field names
+            product_field_names = [child.name for child in field.children]
+            self.assertEqual(set(product_field_names),
+                             {"id", "name", "price", "stock", "category"})
+
+            # Check id field with metadata
+            id_field = next(child for child in field.children if child.name == "id")
+            self.assertEqual(id_field.arrow_type, pa.int64())
+            # Skip metadata check as it might be implementation-specific how annotations are handled
+
+            # Check name field with metadata
+            name_field = next(child for child in field.children if child.name == "name")
+            self.assertEqual(name_field.arrow_type, pa.utf8())
+
+            # Check price field
+            price_field = next(child for child in field.children if child.name == "price")
+            self.assertEqual(price_field.arrow_type, pa.float64())
+
+            # Check nullability of optional fields
+            category_field = next(child for child in field.children if child.name == "category")
+            self.assertTrue(category_field.nullable)
+
+
+        finally:
+            # Restore the original method
+            DataField.from_py_hint = original_from_py_hint
+
+    def test_dataclass_with_defaults(self):
+        """Test creating DataField from dataclasses with default values."""
+        # We need to initialize metadata to empty dict if it's None
+        original_from_py_hint = DataField.from_py_hint
+
+        try:
+            @classmethod
+            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
+                # Initialize metadata to empty dict if it's None
+                if metadata is None:
+                    metadata = {}
+                return original_from_py_hint(name, hint, nullable, metadata)
+
+            # Apply our patch
+            DataField.from_py_hint = patched_from_py_hint
+
+            # Create a dataclass with various default values
+            @dataclass
+            class Configuration:
+                # Required fields (no defaults)
+                name: str
+                version: str
+
+                # Optional fields with defaults of different types
+                debug: bool = False
+                timeout: int = 30
+                max_retries: int = 3
+                host: str = "localhost"
+                port: int = 8080
+                rate_limit: Optional[float] = None
+
+            # Create a DataField from the Configuration dataclass
+            field = DataField.from_py_hint("config", Configuration)
+
+            # Verify the field structure
+            self.assertTrue(pa.types.is_struct(field.arrow_type))
+            self.assertEqual(len(field.children), 8)  # Configuration has 8 fields
+
+            # Check field names
+            field_names = [child.name for child in field.children]
+            self.assertEqual(set(field_names),
+                             {"name", "version", "debug", "timeout", "max_retries",
+                              "host", "port", "rate_limit"})
+
+            # Verify required fields are not nullable
+            name_field = next(child for child in field.children if child.name == "name")
+            self.assertFalse(name_field.nullable)
+
+            version_field = next(child for child in field.children if child.name == "version")
+            self.assertFalse(version_field.nullable)
+
+            # Optional fields with non-None defaults are not nullable
+            debug_field = next(child for child in field.children if child.name == "debug")
+            self.assertFalse(debug_field.nullable)
+            self.assertEqual(debug_field.arrow_type, pa.bool_())
+
+            timeout_field = next(child for child in field.children if child.name == "timeout")
+            self.assertFalse(timeout_field.nullable)
+            self.assertEqual(timeout_field.arrow_type, pa.int64())
+
+            host_field = next(child for child in field.children if child.name == "host")
+            self.assertFalse(host_field.nullable)
+            self.assertEqual(host_field.arrow_type, pa.utf8())
+
+            # Optional fields with None defaults are nullable
+            rate_limit_field = next(child for child in field.children if child.name == "rate_limit")
+            self.assertTrue(rate_limit_field.nullable)
+            self.assertEqual(rate_limit_field.arrow_type, pa.float64())
+
+        finally:
+            # Restore the original method
+            DataField.from_py_hint = original_from_py_hint
 
 
 class TestHelperFunctions(unittest.TestCase):

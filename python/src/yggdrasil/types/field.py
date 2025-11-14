@@ -32,12 +32,14 @@ try:
 except ImportError:
     raise ImportError("PyArrow is required for arrow_dataclass. Install it with 'pip install pyarrow'.")
 
+from .spark_utils import HAVE_SPARK, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
+
 __all__ = [
     "DataField",
     "Annotated",
     "merge_dicts",
     "safe_str",
-    "annotation_args_to_metadata"
+    "annotation_args_to_metadata",
 ]
 
 T = TypeVar("T")
@@ -203,8 +205,8 @@ class DataField:
             raise TypeError(f"Cannot create DataField from Python type hint {hint}")
 
         metadata = safe_metadata_str(metadata)
-        time_unit = metadata.pop("unit", None)
-        time_zone = metadata.pop("tz", None)
+        time_unit = metadata.pop("unit", metadata.pop("timeunit", None))
+        time_zone = metadata.pop("tz", metadata.pop("timezone", None))
 
         if time_unit:
             if pa.types.is_timestamp(arrow_type):
@@ -245,21 +247,234 @@ class DataField:
 
         return cls.from_arrow_field(field)
 
+    @classmethod
+    def from_spark_field(cls, spark_field) -> "DataField":
+        """Create a DataField from a Spark StructField.
+
+        Args:
+            spark_field: A PySpark StructField
+
+        Returns:
+            A DataField instance with the corresponding PyArrow type
+
+        Raises:
+            ImportError: If PySpark is not installed
+            TypeError: If the Spark type cannot be converted to a PyArrow type
+        """
+        if not HAVE_SPARK:
+            raise ImportError("PySpark is required for from_spark_field. Install it with 'pip install pyspark'.")
+
+        name = spark_field.name
+        nullable = spark_field.nullable
+        metadata = spark_field.metadata if hasattr(spark_field, "metadata") else None
+        arrow_type = spark_to_arrow_type(spark_field.dataType)
+
+        return cls(name=name, arrow_type=arrow_type, nullable=nullable,
+                  metadata=safe_metadata_str(metadata) if metadata else None,
+                  children=None)
+
+    # Properties
+    def __eq__(self, other):
+        return self.name == other.name and self.arrow_type == other.arrow_type
+
+    def __hash__(self):
+        return hash((self.name, self.arrow_type))
+
+    def __repr__(self):
+        return f"DataField(name={self.name}, arrow_type={self.arrow_type}, nullable={self.nullable}, metadata={self.metadata}, children={self.children})"
+
+    def is_primitive(self):
+        return pa.types.is_primitive(self.arrow_type)
+
+    def is_nested(self):
+        return pa.types.is_nested(self.arrow_type)
+
+    def is_list(self):
+        return pa.types.is_list(self.children) or pa.types.is_large_list(self.children)
+
+    def is_map(self):
+        return pa.types.is_map(self)
+
+    def is_struct(self):
+        return pa.types.is_struct(self)
+
     # Transform to
     def to_arrow_field(self) -> pa.Field:
         return pa.field(name=self.name, type=self.arrow_type, metadata=self.metadata, nullable=self.nullable)
 
-    def to_arrow_schema(self):
-        if not self.children:
-            raise ValueError(f"Cannot convert {self} to pyarrow schema, no children found")
-
-        arrow_fields = [
+    def to_arrow_schema(self) -> pa.Schema:
+        return pa.schema([
             field.to_arrow_field()
-            for field in self.children
-        ]
+            for field in self.children or []
+        ], metadata=self.metadata)
 
-        return pa.schema(arrow_fields, metadata=self.metadata)
+    def to_spark_field(self) -> spark_types.StructField:
+        """Convert this DataField to a Spark StructField.
 
-    # This is a placeholder for a future implementation
-    def cast_arrow_array(self, arr: pa.Array | pa.ChunkedArray) -> pa.Array | pa.ChunkedArray:
-        return arr
+        Returns:
+            A PySpark StructField object with the equivalent type.
+
+        Raises:
+            ImportError: If PySpark is not installed
+            TypeError: If the arrow_type cannot be converted to a Spark type
+        """
+        if not HAVE_SPARK:
+            raise ImportError("PySpark is required for to_spark_field. Install it with 'pip install pyspark'.")
+
+        spark_type = None
+        primitives = {
+            pa.utf8(): spark_types.StringType(),
+            pa.binary(): spark_types.BinaryType(),
+            pa.int8(): spark_types.IntegerType(),
+            pa.int16(): spark_types.IntegerType(),
+            pa.int32(): spark_types.IntegerType(),
+            pa.int64(): spark_types.LongType(),
+            pa.float32(): spark_types.FloatType(),
+            pa.float64(): spark_types.DoubleType(),
+        }
+        md = self.metadata.copy() or {}
+
+        # Convert PyArrow type to Spark type
+        if self.is_primitive():
+            spark_type = primitives[self.arrow_type]
+
+            if not spark_type:
+                if pa.types.is_decimal(self.arrow_type):
+                    spark_type = spark_types.DecimalType(self.arrow_type.precision, self.arrow_type.scale)
+                elif pa.types.is_timestamp(self.arrow_type):
+                    md["timeunit"] = self.arrow_type.unit
+
+                    if self.arrow_type.tz:
+                        spark_type = spark_types.TimestampType()
+                        md["timezone"] = self.arrow_type.unit
+                    else:
+                        spark_type = spark_types.TimestampNTZType()
+                elif pa.types.is_time(self.arrow_type):
+                    md["timeunit"] = self.arrow_type.unit
+                    spark_type = spark_types.IntegerType() if pa.types.is_time32(self.arrow_type) else spark_types.LongType()
+        else:
+            if self.is_struct():
+                spark_type = spark_types.StructType([
+                    _.to_spark_field()
+                    for _ in self.children
+                ])
+            elif self.is_list():
+                item_field: DataField = self.children[0]
+                item_spark = item_field.to_spark_field()
+                spark_type = spark_types.ArrayType(item_spark.dataType, containsNull=item_field.nullable)
+            elif self.is_map():
+                key_field: DataField = self.children[0]
+                key_spark = key_field.to_spark_field()
+
+                value_field: DataField = self.children[1]
+                value_spark = value_field.to_spark_field()
+
+                spark_type = spark_types.MapType(key_spark.dataType, value_spark.dataType, valueContainsNull=value_field.nullable)
+
+        if spark_type is None:
+            raise TypeError(f"Cannot convert {self.arrow_type} to Spark type")
+
+        # Create and return a Spark StructField
+        return spark_types.StructField(
+            name=self.name,
+            dataType=spark_type,
+            nullable=self.nullable,
+            metadata=md
+        )
+
+    def cast_spark_column(
+        self,
+        column_field: spark_types.StructField,
+        column: spark_sql.Column,
+    ) -> spark_sql.Column:
+        """Cast a Spark Column from one DataField type to another."""
+        if not HAVE_SPARK:
+            raise ImportError(
+                "PySpark is required for cast_spark_column. "
+                "Install it with 'pip install pyspark'."
+            )
+
+        # Target Spark field (what this DataField wants)
+        target_field: spark_types.StructField = self.to_spark_field()
+
+        casted = cast_nested_spark_field(
+            column,
+            source_field=column_field,
+            target_field=target_field,
+        )
+
+        # Keep the field name consistent with this DataField
+        return casted.alias(self.name)
+
+    def cast_spark_dataframe(self, df: spark_sql.DataFrame) -> spark_sql.DataFrame:
+        """Cast a Spark DataFrame to match this DataField's schema.
+
+        This method handles field name matching (case-insensitive), type casting,
+        and handling missing or extra columns.
+
+        Args:
+            df: The source Spark DataFrame to cast
+
+        Returns:
+            A new Spark DataFrame with columns cast to the appropriate types
+
+        Raises:
+            ImportError: If PySpark is not installed
+            ValueError: If required fields are missing from the DataFrame
+        """
+        if not HAVE_SPARK:
+            raise ImportError("PySpark is required for cast_spark_dataframe. Install it with 'pip install pyspark'.")
+
+        if not self.is_struct():
+            raise TypeError(f"Cannot cast DataFrame to non-struct type {self}")
+
+        if not self.children:
+            return df
+
+        # Get original column names
+        original_columns = df.columns
+        columns_lower = [col.lower() for col in original_columns]
+
+        # Create mappings between field names in both directions
+        # Map target field name -> source column name
+        field_to_col_map = {}
+
+        # Process each target field and find matching source column
+        for field in self.children:
+            field_name_lower = field.name.lower()
+
+            # Look for case-insensitive match
+            if field_name_lower in columns_lower:
+                idx = columns_lower.index(field_name_lower)
+                source_col_name = original_columns[idx]
+                field_to_col_map[field.name] = source_col_name
+
+        # Check if we have all required fields
+        missing_fields = [field.name for field in self.children
+                         if field.name not in field_to_col_map and not field.nullable]
+
+        if missing_fields:
+            raise ValueError(f"Required fields missing from DataFrame: {', '.join(missing_fields)}")
+
+        # Build the select expressions for the output DataFrame
+        select_exprs = []
+
+        # Process each target field
+        for field in self.children:
+            target_spark_field = field.to_spark_field()
+
+            if field.name in field_to_col_map:
+                # Field exists in source, cast it
+                source_col_name = field_to_col_map[field.name]
+                source_col = df[source_col_name]
+                source_field = df.schema[source_col_name]
+
+                casted_col = cast_nested_spark_field(column=source_col, source_field=source_field, target_field=target_spark_field)
+                select_exprs.append(casted_col)
+            else:
+                # Field is missing in source, add a null column
+                null_lit = spark_functions.lit(None).cast(target_spark_field.dataType).alias(field.name)
+                select_exprs.append(null_lit)
+
+        # Create and return the new DataFrame with the casted columns
+        return df.select(*select_exprs)
