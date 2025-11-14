@@ -81,13 +81,13 @@ def spark_to_arrow_type(spark_type):
         # Complex types with recursive conversion
         spark_types.ArrayType: lambda t: pa.list_(cls._spark_to_arrow_type(t.elementType)),
         spark_types.MapType: lambda t: pa.map_(
-            cls._spark_to_arrow_type(t.keyType),
-            cls._spark_to_arrow_type(t.valueType)
+            spark_to_arrow_type(t.keyType),
+            spark_to_arrow_type(t.valueType)
         ),
         spark_types.StructType: lambda t: pa.struct([
             pa.field(
                 field.name,
-                cls._spark_to_arrow_type(field.dataType),
+                spark_to_arrow_type(field.dataType),
                 field.nullable
             )
             for field in t.fields
