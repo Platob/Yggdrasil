@@ -313,7 +313,7 @@ class TestDataField(unittest.TestCase):
             name="fixed_size_list",
             metadata={"fixed_size": "3"}
         )
-        self.assertTrue(pa.types.is_list(field.arrow_type))
+        self.assertTrue(pa.types.is_fixed_size_list(field.arrow_type))
         self.assertEqual(field.arrow_type.list_size, 3)
         item_field = field.children[0]
         self.assertEqual(item_field.arrow_type, pa.int64())
