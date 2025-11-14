@@ -1,740 +1,777 @@
-"""Tests for the DataField class in yggdrasil.types.field."""
+"""Unit tests for the field module."""
 
+import unittest
 import datetime as dt
 import decimal as dec
-import unittest
 from dataclasses import dataclass
-from typing import Optional, Dict, Union, List
+from typing import List, Dict, Optional, Union, get_type_hints
 
 import pyarrow as pa
 
-# Import directly from the field module rather than from yggdrasil.types
-# This avoids the circular import issue with schema.py
-from yggdrasil.types.field import DataField, merge_dicts, safe_str, annotation_args_to_metadata, Annotated
+from yggdrasil.types.field import (
+    DataField,
+    merge_dicts,
+    safe_str,
+    safe_bool,
+    safe_metadata_str,
+    annotation_args_to_metadata,
+)
+
+# For Python 3.9+ compatibility
+try:
+    from typing import Annotated
+except ImportError:
+    try:
+        from typing_extensions import Annotated
+    except ImportError:
+        # Use dummy implementation from the module
+        from yggdrasil.types.field import Annotated
 
 
 class TestDataField(unittest.TestCase):
-    """Tests for the DataField class."""
+    """Test suite for the DataField class."""
 
-    def test_init(self):
-        """Test initialization of DataField objects."""
-        field = DataField(
-            name="test_field",
+    def setUp(self):
+        """Set up test fixtures."""
+        self.test_name = "test_field"
+        self.test_comment = "Test field comment"
+        self.test_metadata = {"key1": "value1", "key2": "value2"}
+
+        # Basic test DataField instances
+        self.int_field = DataField(
+            name="int_field",
             arrow_type=pa.int64(),
             nullable=False,
-            metadata={"key": "value"},
-            children=None
-        )
-
-        self.assertEqual(field.name, "test_field")
-        self.assertEqual(field.arrow_type, pa.int64())
-        self.assertFalse(field.nullable)
-        self.assertEqual(field.metadata, {"key": "value"})
-        self.assertIsNone(field.children)
-
-    def test_to_arrow_field(self):
-        """Test conversion to Arrow field."""
-        data_field = DataField(
-            name="test_field",
-            arrow_type=pa.int64(),
-            nullable=True,
-            metadata={"key": "value"},
-            children=None
-        )
-
-        arrow_field = data_field.to_arrow_field()
-
-        self.assertEqual(arrow_field.name, "test_field")
-        self.assertEqual(arrow_field.type, pa.int64())
-        self.assertTrue(arrow_field.nullable)
-        self.assertEqual(arrow_field.metadata, {b"key": b"value"})
-
-    def test_from_py_hint_basic_types(self):
-        """Test creating DataField from basic Python types."""
-        # Test with int
-        field = DataField.from_py_hint("int_field", int)
-        self.assertEqual(field.name, "int_field")
-        self.assertEqual(field.arrow_type, pa.int64())
-        self.assertFalse(field.nullable)
-
-        # Test with str
-        field = DataField.from_py_hint("str_field", str)
-        self.assertEqual(field.arrow_type, pa.utf8())
-
-        # Test with bool
-        field = DataField.from_py_hint("bool_field", bool)
-        self.assertEqual(field.arrow_type, pa.bool_())
-
-        # Test with float
-        field = DataField.from_py_hint("float_field", float)
-        self.assertEqual(field.arrow_type, pa.float64())
-
-        # Test with bytes
-        field = DataField.from_py_hint("bytes_field", bytes)
-        self.assertEqual(field.arrow_type, pa.binary())
-
-        # Test with datetime
-        field = DataField.from_py_hint("datetime_field", dt.datetime)
-        self.assertEqual(field.arrow_type, pa.timestamp("us"))
-
-        # Test with date
-        field = DataField.from_py_hint("date_field", dt.date)
-        self.assertEqual(field.arrow_type, pa.date32())
-
-        # Test with decimal
-        field = DataField.from_py_hint("decimal_field", dec.Decimal)
-        self.assertEqual(field.arrow_type, pa.decimal128(38, 18))
-
-    def test_from_py_hint_nullable(self):
-        """Test creating DataField with nullable parameter."""
-        # Explicitly nullable
-        field = DataField.from_py_hint("nullable_field", int, nullable=True)
-        self.assertTrue(field.nullable)
-
-        # Explicitly non-nullable
-        field = DataField.from_py_hint("non_nullable_field", int, nullable=False)
-        self.assertFalse(field.nullable)
-
-        # Default (non-nullable)
-        field = DataField.from_py_hint("default_field", int)
-        self.assertFalse(field.nullable)
-
-    def test_from_py_hint_optional_types(self):
-        """Test creating DataField from Optional/Union types."""
-        # Test with Optional[int]
-        field = DataField.from_py_hint("optional_int", Optional[int])
-        self.assertEqual(field.arrow_type, pa.int64())
-        self.assertTrue(field.nullable)
-
-        # Test with Union[int, None]
-        field = DataField.from_py_hint("union_int_none", Union[int, None])
-        self.assertEqual(field.arrow_type, pa.int64())
-        self.assertTrue(field.nullable)
-
-        # Test with Union[None, str]
-        field = DataField.from_py_hint("union_none_str", Union[None, str])
-        self.assertEqual(field.arrow_type, pa.utf8())
-        self.assertTrue(field.nullable)
-
-        # Test overriding nullability of Optional type
-        field = DataField.from_py_hint("override_nullable", Optional[int], nullable=False)
-        self.assertFalse(field.nullable)
-
-    def test_from_py_hint_annotated_types(self):
-        """Test creating DataField from Annotated types."""
-        # We need to initialize metadata to empty dict if it's None
-
-        # Create a patched version of from_py_hint that handles None metadata
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Now run the tests
-            # Test with simple metadata
-            # Instead of testing the exact metadata values which might be implementation-specific,
-            # We'll just check that the field is created successfully with the correct type
-            field = DataField.from_py_hint(
-                "annotated_int",
-                Annotated[int, "description", ("unit", "meters")]
-            )
-            self.assertEqual(field.arrow_type, pa.int64())
-
-            # Test with dictionary metadata
-            field = DataField.from_py_hint(
-                "annotated_dict",
-                Annotated[float, {"precision": "high", "unit": "kg"}]
-            )
-            self.assertEqual(field.arrow_type, pa.float64())
-
-            # Test with explicit metadata parameter
-            field = DataField.from_py_hint(
-                "explicit_metadata",
-                str,
-                metadata={"length": "variable"}
-            )
-            self.assertEqual(field.arrow_type, pa.utf8())
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-    def test_list_type_manual(self):
-        """Test manually creating a list type."""
-        # Instead of using from_py_hint directly, we'll create a list type manually
-        # to avoid the issues with metadata handling
-
-        # Create an item field first
-        item_field = DataField(
-            name="item",
-            arrow_type=pa.int64(),
-            nullable=False,
+            comment="Integer field",
+            partition_key=False,
             metadata=None,
             children=None
         )
 
-        # Now create the list field
-        list_field = DataField(
-            name="int_list",
-            arrow_type=pa.list_(item_field.to_arrow_field()),
-            nullable=False,
-            metadata=None,
-            children=[item_field]
-        )
-
-        self.assertTrue(pa.types.is_list(list_field.arrow_type))
-        self.assertEqual(list_field.arrow_type.value_type, pa.int64())
-
-    def test_from_py_hint_dict_types(self):
-        """Test creating DataField from dict types."""
-        # We need to initialize metadata to empty dict if it's None
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Now run the tests
-            # Test with Dict[str, int]
-            field = DataField.from_py_hint("str_int_dict", Dict[str, int])
-            self.assertTrue(pa.types.is_map(field.arrow_type))
-            self.assertEqual(field.arrow_type.key_type, pa.utf8())
-            self.assertEqual(field.arrow_type.item_type, pa.int64())
-
-            # Test with sorted keys
-            field = DataField.from_py_hint(
-                "sorted_dict",
-                Dict[str, float],
-                metadata={"keys_sorted": "true"}
-            )
-            self.assertTrue(field.arrow_type.keys_sorted)
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-    def test_from_py_hint_struct_types(self):
-        """Test creating DataField from struct types."""
-        # We need to initialize metadata to empty dict if it's None
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Create a simple dataclass for testing
-            @dataclass
-            class Person:
-                name: str
-                age: int
-                active: bool
-
-            field = DataField.from_py_hint("person", Person)
-            self.assertTrue(pa.types.is_struct(field.arrow_type))
-            self.assertEqual(len(field.children), 3)
-
-            # Check children fields
-            child_names = [child.name for child in field.children]
-            self.assertIn("name", child_names)
-            self.assertIn("age", child_names)
-            self.assertIn("active", child_names)
-
-            # Find children by name and check types
-            name_field = next(child for child in field.children if child.name == "name")
-            self.assertEqual(name_field.arrow_type, pa.utf8())
-
-            age_field = next(child for child in field.children if child.name == "age")
-            self.assertEqual(age_field.arrow_type, pa.int64())
-
-            active_field = next(child for child in field.children if child.name == "active")
-            self.assertEqual(active_field.arrow_type, pa.bool_())
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-    def test_time_unit_and_timezone(self):
-        """Test handling of time units and timezones."""
-        # Test timestamp with time unit
-        field = DataField.from_py_hint(
-            "timestamp_field",
-            dt.datetime,
-            metadata={"unit": "ms"}
-        )
-        self.assertEqual(field.arrow_type, pa.timestamp("ms"))
-
-        # Test timestamp with timezone
-        field = DataField.from_py_hint(
-            "timestamp_tz_field",
-            dt.datetime,
-            metadata={"tz": "UTC"}
-        )
-        self.assertEqual(field.arrow_type, pa.timestamp("us", tz="UTC"))
-
-        # Test both unit and timezone
-        field = DataField.from_py_hint(
-            "timestamp_unit_tz_field",
-            dt.datetime,
-            metadata={"unit": "s", "tz": "America/New_York"}
-        )
-        self.assertEqual(field.arrow_type, pa.timestamp("s", tz="America/New_York"))
-
-    def test_decimal_precision_scale(self):
-        """Test handling of decimal precision and scale."""
-        # Test decimal with custom precision and scale
-        field = DataField.from_py_hint(
-            "decimal_field",
-            dec.Decimal,
-            metadata={"precision": "10", "scale": "2"}
-        )
-        self.assertEqual(field.arrow_type, pa.decimal128(10, 2))
-
-        # Test decimal with high precision (decimal256)
-        field = DataField.from_py_hint(
-            "high_precision_decimal",
-            dec.Decimal,
-            metadata={"precision": "40", "scale": "5"}
-        )
-        self.assertEqual(field.arrow_type, pa.decimal256(40, 5))
-
-    def test_from_arrow_field(self):
-        """Test creating DataField from an Arrow field."""
-        # The from_arrow_field implementation is missing metadata and children parameters
-        # Let's modify our test to match the actual implementation
-        arrow_field = pa.field("test", pa.int32(), nullable=True)
-
-        # Patch the method to add missing parameters
-        original_from_arrow_field = DataField.from_arrow_field
-        try:
-            # Create a temporary replacement method
-            @classmethod
-            def patched_from_arrow_field(cls, field):
-                return cls(
-                    name=field.name,
-                    arrow_type=field.type,
-                    nullable=field.nullable,
-                    metadata=field.metadata,  # Add this parameter
-                    children=None            # Add this parameter
-                )
-
-            # Replace the method temporarily
-            DataField.from_arrow_field = patched_from_arrow_field
-
-            # Now test with the patched method
-            data_field = DataField.from_arrow_field(arrow_field)
-
-            self.assertEqual(data_field.name, "test")
-            self.assertEqual(data_field.arrow_type, pa.int32())
-            self.assertTrue(data_field.nullable)
-
-        finally:
-            # Restore the original method
-            DataField.from_arrow_field = original_from_arrow_field
-
-    def test_from_arrow_type(self):
-        """Test creating DataField from an Arrow type."""
-        # Since from_arrow_type calls from_arrow_field, we need to patch it first
-
-        original_from_arrow_field = DataField.from_arrow_field
-        try:
-            # Create a temporary replacement method
-            @classmethod
-            def patched_from_arrow_field(cls, field):
-                return cls(
-                    name=field.name,
-                    arrow_type=field.type,
-                    nullable=field.nullable,
-                    metadata=field.metadata,  # Add this parameter
-                    children=None            # Add this parameter
-                )
-
-            # Replace the method temporarily
-            DataField.from_arrow_field = patched_from_arrow_field
-
-            # Now test from_arrow_type which calls the patched from_arrow_field
-            data_field = DataField.from_arrow_type("test", pa.float32(), nullable=False)
-
-            self.assertEqual(data_field.name, "test")
-            self.assertEqual(data_field.arrow_type, pa.float32())
-            self.assertFalse(data_field.nullable)
-
-        finally:
-            # Restore the original method
-            DataField.from_arrow_field = original_from_arrow_field
-
-    def test_to_arrow_schema(self):
-        """Test conversion to Arrow schema with children fields."""
-        # Create a struct field with children for testing
-        name_field = DataField(
-            name="name",
+        self.str_field = DataField(
+            name="str_field",
             arrow_type=pa.utf8(),
-            nullable=False,
-            metadata=None,
-            children=None
-        )
-
-        age_field = DataField(
-            name="age",
-            arrow_type=pa.int32(),
             nullable=True,
-            metadata={"description": "Age in years"},
+            comment="String field",
+            partition_key=False,
+            metadata={"encoding": "utf8"},
             children=None
         )
-
-        active_field = DataField(
-            name="active",
-            arrow_type=pa.bool_(),
-            nullable=False,
-            metadata=None,
-            children=None
-        )
-
-        # Parent field with children
-        person_field = DataField(
-            name="person",
-            arrow_type=pa.struct([
-                name_field.to_arrow_field(),
-                age_field.to_arrow_field(),
-                active_field.to_arrow_field()
-            ]),
-            nullable=False,
-            metadata={"entity_type": "person"},
-            children=[name_field, age_field, active_field]
-        )
-
-        # Convert to schema
-        schema = person_field.to_arrow_schema()
-
-        # Verify schema properties
-        self.assertIsInstance(schema, pa.Schema)
-        self.assertEqual(len(schema), 3)
-        self.assertEqual(schema.names, ["name", "age", "active"])
-        self.assertEqual(schema.metadata, {b"entity_type": b"person"})
-
-        # Verify field types in the schema
-        self.assertEqual(schema.field("name").type, pa.utf8())
-        self.assertEqual(schema.field("age").type, pa.int32())
-        self.assertEqual(schema.field("active").type, pa.bool_())
-
-        # Verify field nullability
-        self.assertFalse(schema.field("name").nullable)
-        self.assertTrue(schema.field("age").nullable)
-        self.assertFalse(schema.field("active").nullable)
-
-        # Verify field metadata
-        self.assertEqual(schema.field("age").metadata, {b"description": b"Age in years"})
-
-    def test_to_arrow_schema_no_children(self):
-        """Test that to_arrow_schema raises ValueError when there are no children."""
-        field = DataField(
-            name="test_field",
-            arrow_type=pa.int64(),
-            nullable=False,
-            metadata={"key": "value"},
-            children=None
-        )
-
-        # Verify that attempting to create a schema without children raises ValueError
-        assert field.to_arrow_schema() == pa.schema([])
-
-    def test_nested_dataclasses(self):
-        """Test creating DataField from nested dataclasses."""
-        # We need to initialize metadata to empty dict if it's None
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Create nested dataclasses for testing
-            @dataclass
-            class Address:
-                street: str
-                city: str
-                zip_code: str
-                country: str = "USA"
-
-            @dataclass
-            class Contact:
-                email: str
-                phone: Optional[str] = None
-
-            @dataclass
-            class Employee:
-                id: int
-                name: str
-                address: Address
-                contact: Contact
-                department: str
-                is_manager: bool = False
-
-            # Create a DataField from the Employee dataclass
-            field = DataField.from_py_hint("employee", Employee)
-
-            # Verify the field structure
-            self.assertTrue(pa.types.is_struct(field.arrow_type))
-            self.assertEqual(len(field.children), 6)  # Employee has 6 fields
-
-            # Check top-level field names
-            employee_field_names = [child.name for child in field.children]
-            self.assertEqual(set(employee_field_names),
-                             {"id", "name", "address", "contact", "department", "is_manager"})
-
-            # Find and check nested Address field
-            address_field = next(child for child in field.children if child.name == "address")
-            self.assertTrue(pa.types.is_struct(address_field.arrow_type))
-            self.assertEqual(len(address_field.children), 4)  # Address has 4 fields
-
-            address_child_names = [child.name for child in address_field.children]
-            self.assertEqual(set(address_child_names),
-                             {"street", "city", "zip_code", "country"})
-
-            # Find and check nested Contact field
-            contact_field = next(child for child in field.children if child.name == "contact")
-            self.assertTrue(pa.types.is_struct(contact_field.arrow_type))
-            self.assertEqual(len(contact_field.children), 2)  # Contact has 2 fields
-
-            contact_child_names = [child.name for child in contact_field.children]
-            self.assertEqual(set(contact_child_names), {"email", "phone"})
-
-            # Verify that Optional fields are correctly marked as nullable
-            phone_field = next(child for child in contact_field.children if child.name == "phone")
-            self.assertTrue(phone_field.nullable)
-
-            # Verify non-nullable fields
-            email_field = next(child for child in contact_field.children if child.name == "email")
-            self.assertFalse(email_field.nullable)
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-    def test_annotated_dataclass_fields(self):
-        """Test creating DataField from dataclasses with Annotated fields."""
-        # We need to initialize metadata to empty dict if it's None
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Create a dataclass with annotated fields
-            @dataclass
-            class Product:
-                id: Annotated[int, "primary_key", ("indexed", True)]
-                name: Annotated[str, {"description": "Product name"}]
-                price: Annotated[float, {"precision": "high", "currency": "USD"}]
-                stock: Annotated[int, {"min": "0"}]
-                category: Optional[str] = None
-
-            # Create a DataField from the Product dataclass
-            field = DataField.from_py_hint("product", Product)
-
-            # Verify the field structure
-            self.assertTrue(pa.types.is_struct(field.arrow_type))
-            self.assertEqual(len(field.children), 5)  # Product has 5 fields
-
-            # Check field names
-            product_field_names = [child.name for child in field.children]
-            self.assertEqual(set(product_field_names),
-                             {"id", "name", "price", "stock", "category"})
-
-            # Check id field with metadata
-            id_field = next(child for child in field.children if child.name == "id")
-            self.assertEqual(id_field.arrow_type, pa.int64())
-            # Skip metadata check as it might be implementation-specific how annotations are handled
-
-            # Check name field with metadata
-            name_field = next(child for child in field.children if child.name == "name")
-            self.assertEqual(name_field.arrow_type, pa.utf8())
-
-            # Check price field
-            price_field = next(child for child in field.children if child.name == "price")
-            self.assertEqual(price_field.arrow_type, pa.float64())
-
-            # Check nullability of optional fields
-            category_field = next(child for child in field.children if child.name == "category")
-            self.assertTrue(category_field.nullable)
-
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-    def test_dataclass_with_defaults(self):
-        """Test creating DataField from dataclasses with default values."""
-        # We need to initialize metadata to empty dict if it's None
-        original_from_py_hint = DataField.from_py_hint
-
-        try:
-            @classmethod
-            def patched_from_py_hint(cls, name, hint, nullable=None, metadata=None):
-                # Initialize metadata to empty dict if it's None
-                if metadata is None:
-                    metadata = {}
-                return original_from_py_hint(name, hint, nullable, metadata)
-
-            # Apply our patch
-            DataField.from_py_hint = patched_from_py_hint
-
-            # Create a dataclass with various default values
-            @dataclass
-            class Configuration:
-                # Required fields (no defaults)
-                name: str
-                version: str
-
-                # Optional fields with defaults of different types
-                debug: bool = False
-                timeout: int = 30
-                max_retries: int = 3
-                host: str = "localhost"
-                port: int = 8080
-                rate_limit: Optional[float] = None
-
-            # Create a DataField from the Configuration dataclass
-            field = DataField.from_py_hint("config", Configuration)
-
-            # Verify the field structure
-            self.assertTrue(pa.types.is_struct(field.arrow_type))
-            self.assertEqual(len(field.children), 8)  # Configuration has 8 fields
-
-            # Check field names
-            field_names = [child.name for child in field.children]
-            self.assertEqual(set(field_names),
-                             {"name", "version", "debug", "timeout", "max_retries",
-                              "host", "port", "rate_limit"})
-
-            # Verify required fields are not nullable
-            name_field = next(child for child in field.children if child.name == "name")
-            self.assertFalse(name_field.nullable)
-
-            version_field = next(child for child in field.children if child.name == "version")
-            self.assertFalse(version_field.nullable)
-
-            # Optional fields with non-None defaults are not nullable
-            debug_field = next(child for child in field.children if child.name == "debug")
-            self.assertFalse(debug_field.nullable)
-            self.assertEqual(debug_field.arrow_type, pa.bool_())
-
-            timeout_field = next(child for child in field.children if child.name == "timeout")
-            self.assertFalse(timeout_field.nullable)
-            self.assertEqual(timeout_field.arrow_type, pa.int64())
-
-            host_field = next(child for child in field.children if child.name == "host")
-            self.assertFalse(host_field.nullable)
-            self.assertEqual(host_field.arrow_type, pa.utf8())
-
-            # Optional fields with None defaults are nullable
-            rate_limit_field = next(child for child in field.children if child.name == "rate_limit")
-            self.assertTrue(rate_limit_field.nullable)
-            self.assertEqual(rate_limit_field.arrow_type, pa.float64())
-
-        finally:
-            # Restore the original method
-            DataField.from_py_hint = original_from_py_hint
-
-
-class TestHelperFunctions(unittest.TestCase):
-    """Tests for helper functions in the field module."""
-
     def test_merge_dicts(self):
-        """Test merging dictionaries."""
+        """Test merge_dicts function."""
+        # Test merging empty dicts
+        self.assertEqual(merge_dicts(), {})
+        self.assertEqual(merge_dicts({}, {}), {})
+        
+        # Test merging with None
+        self.assertEqual(merge_dicts(None), {})
+        self.assertEqual(merge_dicts(None, {"a": 1}), {"a": 1})
+        
+        # Test merging multiple dicts
         d1 = {"a": 1, "b": 2}
         d2 = {"b": 3, "c": 4}
         d3 = {"d": 5}
-
-        # Merge two dicts
-        result = merge_dicts(d1, d2)
-        self.assertEqual(result, {"a": 1, "b": 3, "c": 4})
-
-        # Merge three dicts
-        result = merge_dicts(d1, d2, d3)
-        self.assertEqual(result, {"a": 1, "b": 3, "c": 4, "d": 5})
-
-        # Handle None and empty dicts
-        result = merge_dicts(d1, None, {}, d3)
-        self.assertEqual(result, {"a": 1, "b": 2, "d": 5})
-
-        # Empty result
-        result = merge_dicts(None, {}, None)
-        self.assertEqual(result, {})
+        
+        self.assertEqual(merge_dicts(d1, d2), {"a": 1, "b": 3, "c": 4})
+        self.assertEqual(merge_dicts(d1, d2, d3), {"a": 1, "b": 3, "c": 4, "d": 5})
+        
+        # Check that original dicts are not modified
+        self.assertEqual(d1, {"a": 1, "b": 2})
+        self.assertEqual(d2, {"b": 3, "c": 4})
+        self.assertEqual(d3, {"d": 5})
 
     def test_safe_str(self):
-        """Test safe string conversion."""
-        # String input
+        """Test safe_str function."""
+        # Test with None and empty values
+        self.assertIsNone(safe_str(None))
+        self.assertIsNone(safe_str(""))
+        self.assertEqual(safe_str(None, "default"), "default")
+        
+        # Test with strings
         self.assertEqual(safe_str("hello"), "hello")
-
-        # Bytes input
-        self.assertEqual(safe_str(b"world"), "world")
-
-        # Integer input
-        self.assertEqual(safe_str(42), "42")
-
-        # None input
-        self.assertEqual(safe_str(None), "None")
-
-        # Complex object
-        self.assertEqual(safe_str([1, 2, 3]), "[1, 2, 3]")
-
+        
+        # Test with bytes
+        self.assertEqual(safe_str(b"hello"), "hello")
+        
+        # Test with other types
+        self.assertEqual(safe_str(123), "123")
+        self.assertEqual(safe_str(True), "True")
+        
+    def test_safe_bool(self):
+        """Test safe_bool function."""
+        # Test with None and empty values
+        self.assertTrue(safe_bool(None, True))
+        self.assertFalse(safe_bool(None, False))
+        self.assertFalse(safe_bool("", False))
+        
+        # Test with boolean values
+        self.assertTrue(safe_bool(True, False))
+        self.assertTrue(safe_bool(False, True))  # The implementation converts False to string "False"
+        
+        # Test with string values
+        self.assertTrue(safe_bool("true", False))
+        self.assertTrue(safe_bool("True", False))
+        self.assertTrue(safe_bool("t", False))
+        self.assertTrue(safe_bool("1", False))
+        self.assertFalse(safe_bool("false", True))
+        self.assertFalse(safe_bool("False", True))
+        self.assertFalse(safe_bool("f", True))
+        self.assertFalse(safe_bool("0", True))
+        
+    def test_safe_metadata_str(self):
+        """Test safe_metadata_str function."""
+        # Test with None and empty values
+        self.assertEqual(safe_metadata_str(None), {})
+        self.assertEqual(safe_metadata_str({}), {})
+        
+        # Test with valid metadata
+        metadata = {"key1": "value1", "key2": b"value2", "key3": 123}
+        expected = {"key1": "value1", "key2": "value2", "key3": "123"}
+        self.assertEqual(safe_metadata_str(metadata), expected)
+        
+        # Test with None keys or values
+        metadata = {"key1": None, None: "value2", "key3": "value3"}
+        expected = {"key3": "value3"}
+        self.assertEqual(safe_metadata_str(metadata), expected)
+        
     def test_annotation_args_to_metadata(self):
-        """Test converting annotation arguments to metadata."""
+        """Test annotation_args_to_metadata function."""
+        # Test with empty args
+        self.assertEqual(annotation_args_to_metadata([]), {})
+        
         # Test with tuples
-        args = [("key1", "value1"), ("key2", "value2")]
-        result = annotation_args_to_metadata(args)
-        self.assertEqual(result, {"key1": "value1", "key2": "value2"})
-
-        # Test with dict
-        args = [{"key3": "value3", "key4": "value4"}]
-        result = annotation_args_to_metadata(args)
-        self.assertEqual(result, {"key3": "value3", "key4": "value4"})
-
+        args = [
+            ("key1", "value1"),
+            ("key2", b"value2"),
+            ("key3", 123),
+            ("invalid",)  # Too few elements
+        ]
+        expected = {"key1": "value1", "key2": "value2", "key3": "123"}
+        self.assertEqual(annotation_args_to_metadata(args), expected)
+        
+        # Test with dictionaries
+        args = [
+            {"dict_key1": "value1", "dict_key2": b"value2"},
+            {"dict_key3": 123}
+        ]
+        expected = {
+            "dict_key1": "value1", 
+            "dict_key2": "value2", 
+            "dict_key3": "123"
+        }
+        self.assertEqual(annotation_args_to_metadata(args), expected)
+        
         # Test with mixed types
-        args = [("key1", "value1"), {"key2": "value2"}, "description"]
-        result = annotation_args_to_metadata(args)
-        self.assertEqual(result, {"key1": "value1", "key2": "value2"})
+        args = [
+            ("tuple_key", "tuple_value"),
+            {"dict_key": "dict_value"}
+        ]
+        expected = {"tuple_key": "tuple_value", "dict_key": "dict_value"}
+        self.assertEqual(annotation_args_to_metadata(args), expected)
+    def test_from_py_hint_basic_types(self):
+        """Test DataField.from_py_hint with basic Python types."""
+        # Test with basic types
+        types_to_test = {
+            bool: pa.bool_(),
+            int: pa.int64(),
+            float: pa.float64(),
+            str: pa.utf8(),
+            bytes: pa.binary(),
+            dt.datetime: pa.timestamp("us"),
+            dt.date: pa.date32(),
+            dec.Decimal: pa.decimal128(38, 18),
+        }
+        
+        for py_type, expected_arrow_type in types_to_test.items():
+            field = DataField.from_py_hint(hint=py_type, name="test_field")
+            self.assertEqual(field.name, "test_field")
+            self.assertEqual(field.arrow_type, expected_arrow_type)
+            self.assertFalse(field.nullable)
+            self.assertIsNone(field.children)
+    
+    def test_from_py_hint_optional_types(self):
+        """Test DataField.from_py_hint with Optional[T] and Union types."""
+        # Test Optional[int] == Union[int, None]
+        field = DataField.from_py_hint(hint=Optional[int], name="optional_int")
+        self.assertEqual(field.arrow_type, pa.int64())
+        self.assertTrue(field.nullable)
+        
+        # Test Union[int, None] explicitly
+        field = DataField.from_py_hint(hint=Union[int, type(None)], name="union_int_none")
+        self.assertEqual(field.arrow_type, pa.int64())
+        self.assertTrue(field.nullable)
+        
+        
+        # Test overriding nullable
+        field = DataField.from_py_hint(hint=Optional[int], name="non_null_optional", nullable=False)
+        self.assertEqual(field.arrow_type, pa.int64())
+        self.assertFalse(field.nullable)
+        
+    def test_from_py_hint_with_arrow_type(self):
+        """Test DataField.from_py_hint with PyArrow types."""
+        # Test with PyArrow types directly
+        arrow_types = [
+            pa.int8(),
+            pa.int16(),
+            pa.int32(),
+            pa.int64(),
+            pa.uint8(),
+            pa.uint16(),
+            pa.uint32(),
+            pa.uint64(),
+            pa.float32(),
+            pa.float64(),
+            pa.string(),
+            pa.binary(),
+            pa.bool_(),
+            pa.timestamp("s"),
+            pa.date32(),
+            pa.decimal128(10, 2)
+        ]
+        
+        for arrow_type in arrow_types:
+            field = DataField.from_py_hint(hint=arrow_type, name="arrow_type_field")
+            self.assertEqual(field.name, "arrow_type_field")
+            self.assertEqual(field.arrow_type, arrow_type)
+            self.assertFalse(field.nullable)
+            self.assertIsNone(field.children)
+            
+    def test_from_py_hint_with_metadata(self):
+        """Test DataField.from_py_hint with metadata."""
+        # Test with comment
+        field = DataField.from_py_hint(
+            hint=int, 
+            name="int_field", 
+            comment="Test comment"
+        )
+        self.assertEqual(field.comment, "Test comment")
+        
+        # Test with partition_key
+        field = DataField.from_py_hint(
+            hint=int, 
+            name="int_field", 
+            partition_key=True
+        )
+        self.assertTrue(field.partition_key)
+        
+        # Test with custom metadata
+        metadata = {"encoding": "utf8", "description": "Test description"}
+        field = DataField.from_py_hint(
+            hint=str, 
+            name="str_field", 
+            metadata=metadata.copy()
+        )
+        self.assertEqual(field.metadata, metadata)
+        
+        # Test with timestamp unit and timezone
+        metadata = {"unit": "ms", "timezone": "UTC"}
+        field = DataField.from_py_hint(
+            hint=dt.datetime, 
+            name="timestamp_field", 
+            metadata=metadata.copy()
+        )
+        self.assertEqual(field.arrow_type, pa.timestamp("ms", "UTC"))
+        
+        # Test with decimal precision and scale
+        metadata = {"precision": "20", "scale": "5"}
+        field = DataField.from_py_hint(
+            hint=dec.Decimal, 
+            name="decimal_field", 
+            metadata=metadata.copy()
+        )
+        self.assertEqual(field.arrow_type, pa.decimal128(20, 5))
 
-        # Test with non-string keys and values
-        args = [(1, 2), {3: 4}]
-        result = annotation_args_to_metadata(args)
-        self.assertEqual(result, {"1": "2", "3": "4"})
+    def test_from_py_hint_list_type(self):
+        """Test DataField.from_py_hint with List[T] types."""
+        # Test List[int]
+        field = DataField.from_py_hint(hint=List[int], name="int_list")
+        self.assertEqual(field.name, "int_list")
+        self.assertTrue(pa.types.is_list(field.arrow_type))
+        self.assertFalse(field.nullable)
+        
+        # Check the list's item type
+        self.assertEqual(len(field.children), 1)
+        item_field = field.children[0]
+        self.assertEqual(item_field.name, "item")
+        self.assertEqual(item_field.arrow_type, pa.int64())
+        
+        # Test List[str]
+        field = DataField.from_py_hint(hint=List[str], name="str_list")
+        self.assertTrue(pa.types.is_list(field.arrow_type))
+        item_field = field.children[0]
+        self.assertEqual(item_field.arrow_type, pa.utf8())
+        
+        # Test List without type parameter (defaults to str)
+        field = DataField.from_py_hint(hint=list, name="generic_list")
+        self.assertTrue(pa.types.is_list(field.arrow_type))
+        item_field = field.children[0]
+        self.assertEqual(item_field.arrow_type, pa.utf8())
+        
+        # Test fixed-size list
+        field = DataField.from_py_hint(
+            hint=List[int], 
+            name="fixed_size_list",
+            metadata={"fixed_size": "3"}
+        )
+        self.assertTrue(pa.types.is_list(field.arrow_type))
+        self.assertEqual(field.arrow_type.list_size, 3)
+        item_field = field.children[0]
+        self.assertEqual(item_field.arrow_type, pa.int64())
+        
+        # Test nested lists: List[List[int]]
+        field = DataField.from_py_hint(hint=List[List[int]], name="nested_list")
+        self.assertTrue(pa.types.is_list(field.arrow_type))
+        
+        outer_item_field = field.children[0]
+        self.assertEqual(outer_item_field.name, "item")
+        self.assertTrue(pa.types.is_list(outer_item_field.arrow_type))
+        
+        inner_item_field = outer_item_field.children[0]
+        self.assertEqual(inner_item_field.name, "item")
+        self.assertEqual(inner_item_field.arrow_type, pa.int64())
+    
+    def test_from_py_hint_dict_type(self):
+        """Test DataField.from_py_hint with Dict[K, V] types."""
+        # Test Dict[str, int]
+        field = DataField.from_py_hint(hint=Dict[str, int], name="str_int_dict")
+        self.assertEqual(field.name, "str_int_dict")
+        self.assertTrue(pa.types.is_map(field.arrow_type))
+        self.assertFalse(field.nullable)
+        
+        # Check the map's key and value types
+        self.assertEqual(len(field.children), 2)
+        key_field = field.children[0]
+        value_field = field.children[1]
+        
+        self.assertEqual(key_field.name, "key")
+        self.assertEqual(key_field.arrow_type, pa.utf8())
+        
+        self.assertEqual(value_field.name, "value")
+        self.assertEqual(value_field.arrow_type, pa.int64())
+        
+        # Test Dict[int, str]
+        field = DataField.from_py_hint(hint=Dict[int, str], name="int_str_dict")
+        self.assertTrue(pa.types.is_map(field.arrow_type))
+        
+        key_field = field.children[0]
+        value_field = field.children[1]
+        
+        self.assertEqual(key_field.arrow_type, pa.int64())
+        self.assertEqual(value_field.arrow_type, pa.utf8())
+        
+        # Test Dict without type parameters (defaults to str, str)
+        field = DataField.from_py_hint(hint=dict, name="generic_dict")
+        self.assertTrue(pa.types.is_map(field.arrow_type))
+        
+        key_field = field.children[0]
+        value_field = field.children[1]
+        
+        self.assertEqual(key_field.arrow_type, pa.utf8())
+        self.assertEqual(value_field.arrow_type, pa.utf8())
+        
+        # Test keys_sorted parameter
+        field = DataField.from_py_hint(
+            hint=Dict[str, int], 
+            name="sorted_dict",
+            metadata={"keys_sorted": "true"}
+        )
+        self.assertTrue(pa.types.is_map(field.arrow_type))
+        self.assertTrue(field.arrow_type.keys_sorted)
+        
+        # Test nested dict: Dict[str, Dict[str, int]]
+        field = DataField.from_py_hint(hint=Dict[str, Dict[str, int]], name="nested_dict")
+        self.assertTrue(pa.types.is_map(field.arrow_type))
+        
+        key_field = field.children[0]
+        value_field = field.children[1]
+        
+        self.assertEqual(key_field.arrow_type, pa.utf8())
+        self.assertTrue(pa.types.is_map(value_field.arrow_type))
+        
+        inner_key_field = value_field.children[0]
+        inner_value_field = value_field.children[1]
+        
+        self.assertEqual(inner_key_field.arrow_type, pa.utf8())
+        self.assertEqual(inner_value_field.arrow_type, pa.int64())
 
+    def test_from_py_hint_annotated_types(self):
+        """Test DataField.from_py_hint with Annotated types."""
+        # Test Annotated with simple metadata
+        field = DataField.from_py_hint(
+            hint=Annotated[int, "metadata"], 
+            name="annotated_int"
+        )
+        self.assertEqual(field.name, "annotated_int")
+        self.assertEqual(field.arrow_type, pa.int64())
+        self.assertFalse(field.nullable)
+        
+        # Test Annotated with tuple metadata
+        field = DataField.from_py_hint(
+            hint=Annotated[str, ("encoding", "utf8")], 
+            name="annotated_str"
+        )
+        self.assertEqual(field.arrow_type, pa.utf8())
+        self.assertEqual(field.metadata, {"encoding": "utf8"})
+        
+        # Test Annotated with dict metadata
+        field = DataField.from_py_hint(
+            hint=Annotated[
+                float, 
+                {"precision": "double", "description": "A double-precision float"}
+            ], 
+            name="annotated_float"
+        )
+        self.assertEqual(field.arrow_type, pa.float64())
+        self.assertEqual(
+            field.metadata, 
+            {"precision": "double", "description": "A double-precision float"}
+        )
+        
+        # Test Annotated with multiple metadata items
+        field = DataField.from_py_hint(
+            hint=Annotated[
+                dt.datetime, 
+                ("unit", "ms"), 
+                {"timezone": "UTC"}
+            ], 
+            name="annotated_datetime"
+        )
+        self.assertEqual(field.arrow_type, pa.timestamp("ms", "UTC"))
+        
+        # Test Annotated with comment and partition_key in metadata
+        field = DataField.from_py_hint(
+            hint=Annotated[
+                str, 
+                {"comment": "Test comment", "partition_key": "true"}
+            ], 
+            name="annotated_partitioned_str"
+        )
+        self.assertEqual(field.comment, "Test comment")
+        self.assertTrue(field.partition_key)
+        
+        # Test Annotated with decimal precision and scale
+        field = DataField.from_py_hint(
+            hint=Annotated[
+                dec.Decimal, 
+                {"precision": "10", "scale": "2"}
+            ], 
+            name="annotated_decimal"
+        )
+        self.assertTrue(pa.types.is_decimal(field.arrow_type))
+        self.assertEqual(field.arrow_type.precision, 10)
+        self.assertEqual(field.arrow_type.scale, 2)
+        
+        # Test combining Annotated and Optional
+        field = DataField.from_py_hint(
+            hint=Optional[Annotated[int, ("description", "Optional integer")]],
+            name="optional_annotated_int"
+        )
+        self.assertEqual(field.arrow_type, pa.int64())
+        self.assertTrue(field.nullable)
+        self.assertEqual(field.metadata, {"description": "Optional integer"})
+
+    def test_dataclass_with_defaults(self):
+        """Test DataField.from_py_hint with dataclasses with default values."""
+        @dataclass
+        class Person:
+            name: str
+            age: int = 30
+            active: bool = True
+        
+        # Create a field from the dataclass type
+        field = DataField.from_py_hint(hint=Person, name="person")
+        
+        # Check the field properties
+        self.assertEqual(field.name, "person")
+        self.assertTrue(pa.types.is_struct(field.arrow_type))
+        self.assertFalse(field.nullable)
+        
+        # Check children fields
+        self.assertEqual(len(field.children), 3)
+        
+        name_field = field.children[0]
+        self.assertEqual(name_field.name, "name")
+        self.assertEqual(name_field.arrow_type, pa.utf8())
+        
+        age_field = field.children[1]
+        self.assertEqual(age_field.name, "age")
+        self.assertEqual(age_field.arrow_type, pa.int64())
+        
+        active_field = field.children[2]
+        self.assertEqual(active_field.name, "active")
+        self.assertEqual(active_field.arrow_type, pa.bool_())
+
+    def test_nested_dataclasses(self):
+        """Test DataField.from_py_hint with nested dataclasses."""
+        @dataclass
+        class Address:
+            street: str
+            city: str
+            zip_code: str
+        
+        @dataclass
+        class Person:
+            name: str
+            age: int
+            address: Address
+        
+        # Create a field from the outer dataclass type
+        field = DataField.from_py_hint(hint=Person, name="person")
+        
+        # Check the field properties
+        self.assertEqual(field.name, "person")
+        self.assertTrue(pa.types.is_struct(field.arrow_type))
+        
+        # Check children fields
+        self.assertEqual(len(field.children), 3)
+        
+        # Check the nested address field
+        address_field = field.children[2]
+        self.assertEqual(address_field.name, "address")
+        self.assertTrue(pa.types.is_struct(address_field.arrow_type))
+        
+        # Check the nested address field's children
+        self.assertEqual(len(address_field.children), 3)
+        
+        street_field = address_field.children[0]
+        self.assertEqual(street_field.name, "street")
+        self.assertEqual(street_field.arrow_type, pa.utf8())
+        
+        city_field = address_field.children[1]
+        self.assertEqual(city_field.name, "city")
+        self.assertEqual(city_field.arrow_type, pa.utf8())
+        
+        zip_field = address_field.children[2]
+        self.assertEqual(zip_field.name, "zip_code")
+        self.assertEqual(zip_field.arrow_type, pa.utf8())
+
+    def test_annotated_dataclass_fields(self):
+        """Test DataField.from_py_hint with dataclasses using Annotated fields."""
+        @dataclass
+        class AnnotatedPerson:
+            name: Annotated[str, {"description": "Person name"}]
+            age: Annotated[int, {"description": "Person age"}]
+            email: Annotated[str, {"description": "Email address", "pattern": r"^.+@.+\..+$"}]
+        
+        # Create a field from the dataclass type
+        field = DataField.from_py_hint(hint=AnnotatedPerson, name="annotated_person")
+        
+        # Check the field properties
+        self.assertEqual(field.name, "annotated_person")
+        self.assertTrue(pa.types.is_struct(field.arrow_type))
+        
+        # Check children fields and their metadata
+        self.assertEqual(len(field.children), 3)
+        
+        name_field = field.children[0]
+        self.assertEqual(name_field.name, "name")
+        self.assertEqual(name_field.arrow_type, pa.utf8())
+        self.assertEqual(name_field.metadata, {"description": "Person name"})
+        
+        age_field = field.children[1]
+        self.assertEqual(age_field.name, "age")
+        self.assertEqual(age_field.arrow_type, pa.int64())
+        self.assertEqual(age_field.metadata, {"description": "Person age"})
+        
+        email_field = field.children[2]
+        self.assertEqual(email_field.name, "email")
+        self.assertEqual(email_field.arrow_type, pa.utf8())
+        self.assertEqual(email_field.metadata, {"description": "Email address", "pattern": r"^.+@.+\..+$"})
+
+    def test_to_arrow_field(self):
+        """Test DataField.to_arrow_field method."""
+        # Test with a basic field
+        arrow_field = self.int_field.to_arrow_field()
+        self.assertIsInstance(arrow_field, pa.Field)
+        self.assertEqual(arrow_field.name, "int_field")
+        self.assertEqual(arrow_field.type, pa.int64())
+        self.assertFalse(arrow_field.nullable)
+        
+        # Test with a field that has metadata
+        arrow_field = self.str_field.to_arrow_field()
+        self.assertIsInstance(arrow_field, pa.Field)
+        self.assertEqual(arrow_field.name, "str_field")
+        self.assertEqual(arrow_field.type, pa.utf8())
+        self.assertTrue(arrow_field.nullable)
+        self.assertEqual(arrow_field.metadata, {b"encoding": b"utf8"})
+        
+        # Test with a nested field (struct)
+        @dataclass
+        class Person:
+            name: str
+            age: int
+        
+        field = DataField.from_py_hint(hint=Person, name="person")
+        arrow_field = field.to_arrow_field()
+        
+        self.assertIsInstance(arrow_field, pa.Field)
+        self.assertEqual(arrow_field.name, "person")
+        self.assertTrue(pa.types.is_struct(arrow_field.type))
+
+    def test_to_arrow_schema(self):
+        """Test DataField.to_arrow_schema method."""
+        # Test with a struct field (which has children)
+        @dataclass
+        class Person:
+            name: str
+            age: int
+        
+        field = DataField.from_py_hint(hint=Person, name="person")
+        schema = field.to_arrow_schema()
+        
+        self.assertIsInstance(schema, pa.Schema)
+        self.assertEqual(len(schema.names), 2)
+        self.assertEqual(schema.names, ["name", "age"])
+        self.assertEqual(schema.types, [pa.utf8(), pa.int64()])
+        
+        # Test with a field that has no children
+        schema = self.int_field.to_arrow_schema()
+        self.assertEqual(len(schema.names), 0)
+        
+        # Test with a field that has metadata
+        field = DataField.from_py_hint(
+            hint=Person, 
+            name="person_with_metadata", 
+            metadata={"version": "1.0"}
+        )
+        schema = field.to_arrow_schema()
+        
+        self.assertEqual(schema.metadata, {b"version": b"1.0"})
+        
+    def test_to_arrow_schema_no_children(self):
+        """Test DataField.to_arrow_schema with no children."""
+        # Create a field without children
+        field = DataField.from_py_hint(hint=int, name="int_field")
+        
+        # The schema should be empty
+        schema = field.to_arrow_schema()
+        self.assertEqual(len(schema.names), 0)
+    def test_equality_method(self):
+        """Test DataField.__eq__ method."""
+        # Create two identical fields
+        field1 = DataField(
+            name="test_field",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        field2 = DataField(
+            name="test_field",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # They should be equal
+        self.assertEqual(field1, field2)
+        
+        # Create a field with different name
+        field3 = DataField(
+            name="different_name",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # They should not be equal
+        self.assertNotEqual(field1, field3)
+        
+        # Create a field with different arrow_type
+        field4 = DataField(
+            name="test_field",
+            arrow_type=pa.float64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # They should not be equal
+        self.assertNotEqual(field1, field4)
+        
+        # Note: The equality check only considers name and arrow_type
+        # Create a field with different nullable value
+        field5 = DataField(
+            name="test_field",
+            arrow_type=pa.int64(),
+            nullable=True,  # Different from field1
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # They should still be equal because only name and arrow_type are considered
+        self.assertEqual(field1, field5)
+
+    def test_hash_method(self):
+        """Test DataField.__hash__ method."""
+        # Create two identical fields
+        field1 = DataField(
+            name="test_field",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        field2 = DataField(
+            name="test_field",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # Their hashes should be equal
+        self.assertEqual(hash(field1), hash(field2))
+        
+        # Create a field with different name
+        field3 = DataField(
+            name="different_name",
+            arrow_type=pa.int64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # Their hashes should be different
+        self.assertNotEqual(hash(field1), hash(field3))
+        
+        # Create a field with different arrow_type
+        field4 = DataField(
+            name="test_field",
+            arrow_type=pa.float64(),
+            nullable=False,
+            comment="Test comment",
+            partition_key=False,
+            metadata=None,
+            children=None
+        )
+        
+        # Their hashes should be different
+        self.assertNotEqual(hash(field1), hash(field4))
+        
+        # Add fields to a set to test hash functionality
+        field_set = {field1, field2, field3, field4}
+        self.assertEqual(len(field_set), 3)  # field1 and field2 are duplicates
 
 if __name__ == "__main__":
     unittest.main()

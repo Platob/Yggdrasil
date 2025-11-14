@@ -79,7 +79,7 @@ def spark_to_arrow_type(spark_type):
         spark_types.DecimalType: lambda t: pa.decimal128(t.precision, t.scale),
 
         # Complex types with recursive conversion
-        spark_types.ArrayType: lambda t: pa.list_(cls._spark_to_arrow_type(t.elementType)),
+        spark_types.ArrayType: lambda t: pa.list_(spark_to_arrow_type(t.elementType)),
         spark_types.MapType: lambda t: pa.map_(
             spark_to_arrow_type(t.keyType),
             spark_to_arrow_type(t.valueType)
