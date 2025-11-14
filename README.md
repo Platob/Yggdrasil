@@ -4,76 +4,17 @@ Yggdrasil is a multi-language research playground focused on data processing and
 
 ## Overview
 
-This project aims to bridge the gap between Python's type system and Arrow-based data processing frameworks, creating a seamless development experience for data engineering tasks. It leverages modern Python features like type annotations and dataclasses to provide type safety while enabling high-performance data processing.
+This project bridges the gap between Python's type system and Arrow-based data processing frameworks, creating a seamless development experience for data engineering tasks. It leverages modern Python features like type annotations and dataclasses to provide type safety while enabling high-performance data processing.
 
 ## Features
 
-### Arrow DataClass
-
-The `arrow_dataclass` decorator extends Python's dataclasses with PyArrow schema support, enabling seamless integration between Python's type annotations and Arrow's type system. This makes it easy to define structured data that can be efficiently serialized and deserialized with PyArrow.
-
-Key features:
-- Automatic schema inference from Python type hints
-- Non-nullable fields by default
-- Nullable support for Optional types and Union with None
-- Support for collections (List, Dict, Set, Tuple)
-- Support for nested dataclasses
-- Customizable field metadata
-- Type overrides for fine-grained control
-
-Example usage:
-
-```python
-from typing import List, Optional
-from yggdrasil.types import arrow_dataclass, field
-
-@arrow_dataclass
-class User:
-    user_id: int
-    username: str
-    email: str
-    active: bool = True
-    bio: Optional[str] = None  # Optional fields are nullable
-    age: int = field(
-        default=0,
-        arrow_metadata={"description": "User age in years"}
-    )
-
-# Access the generated Arrow schema
-schema = User.__arrow_schema__
-print(schema)
-```
-
-## Project Structure
-
-The project is organized as follows:
-
-```
-yggdrasil/
-├── python/               # Python package
-│   ├── src/              # Source code
-│   │   └── yggdrasil/    # Main package
-│   │       ├── types/    # Type definition and conversion
-│   │       │   ├── field.py   # DataField implementation
-│   │       │   └── schema.py  # DataSchema implementation
-│   │       ├── data/     # Data handling utilities
-│   │       └── logging.py # Logging configuration
-│   └── tests/            # Test suite
-└── README.md            # This file
-```
-
-## Key Components
-
-### Types Module
-
-The `yggdrasil.types` module provides:
-
-- **DataField**: A representation of a field in an Arrow schema, with support for converting Python type hints to Arrow data types
-- **DataSchema**: A collection of DataFields forming a complete schema, created from Python classes or existing Arrow schemas
-
-### Logging
-
-The package includes a configurable logging system that sets up appropriate handlers and formatters for consistent log output across the application.
+- **Type-Safe Data Processing**: Convert between Python type hints and Arrow schemas with complete type safety
+- **Dataclass Integration**: Easily work with typed dataclasses that automatically map to Arrow schemas
+- **Framework Interoperability**: Seamless conversions between PyArrow, Polars, and PySpark (optional)
+- **Declarative Schema Definitions**: Define schemas using familiar Python type annotations
+- **Support for Nested Types**: Handle complex nested structures with lists, maps, and nested objects
+- **Metadata Annotations**: Add rich metadata to fields using Python's Annotated type
+- **Delta Lake Integration**: Optional support for working with Delta Lake tables
 
 ## Quick Start
 
@@ -120,6 +61,152 @@ pip install -e .[dev]
 pytest
 ```
 
+### Optional Dependencies
+
+Choose the appropriate extras based on your needs:
+
+```bash
+# For Spark integration
+pip install "yggdrasil @ git+https://github.com/Platob/Yggdrasil.git#egg=yggdrasil[spark]"
+
+# For Delta Lake integration
+pip install "yggdrasil @ git+https://github.com/Platob/Yggdrasil.git#egg=yggdrasil[delta]"
+
+# For both Spark and Delta Lake
+pip install "yggdrasil @ git+https://github.com/Platob/Yggdrasil.git#egg=yggdrasil[spark,delta]"
+
+# For development (includes testing tools and Delta Lake)
+pip install "yggdrasil @ git+https://github.com/Platob/Yggdrasil.git#egg=yggdrasil[dev]"
+```
+
+## Usage Examples
+
+### Basic Type Conversion
+
+Convert Python types to PyArrow schema using DataField:
+
+```python
+from dataclasses import dataclass
+from typing import List, Optional
+from yggdrasil.types.field import DataField
+
+# Define a simple Python dataclass
+@dataclass
+class Person:
+    name: str
+    age: int
+    email: Optional[str] = None
+
+# Create a DataField from the Python type
+field = DataField.from_py_hint("person", Person)
+
+# Convert to Arrow schema
+arrow_schema = field.to_arrow_schema()
+print(arrow_schema)
+```
+
+### Using Metadata with Annotated Types
+
+Enrich your schemas with metadata using Python's Annotated type:
+
+```python
+from dataclasses import dataclass
+from typing import Annotated
+from yggdrasil.types.field import DataField, Annotated
+
+@dataclass
+class Product:
+    id: Annotated[int, "primary_key", ("indexed", True)]
+    name: Annotated[str, {"description": "Product name"}]
+    price: Annotated[float, {"precision": "high", "currency": "USD"}]
+    stock: int
+
+# Create a DataField with metadata
+field = DataField.from_py_hint("product", Product)
+
+# Access the enriched schema
+arrow_field = field.to_arrow_field()
+print(arrow_field)
+```
+
+### Working with Nested Structures
+
+Easily handle complex nested data:
+
+```python
+from dataclasses import dataclass
+from typing import List, Dict
+from yggdrasil.types.field import DataField
+
+@dataclass
+class Address:
+    street: str
+    city: str
+    postal_code: str
+
+@dataclass
+class Customer:
+    id: int
+    name: str
+    addresses: List[Address]
+    preferences: Dict[str, str]
+
+# Create a DataField from the nested structure
+field = DataField.from_py_hint("customer", Customer)
+
+# Convert to Arrow schema
+arrow_schema = field.to_arrow_schema()
+print(arrow_schema)
+```
+
+### Integration with PySpark (optional)
+
+Convert between PyArrow and PySpark schemas:
+
+```python
+from dataclasses import dataclass
+from yggdrasil.types.field import DataField
+
+@dataclass
+class Record:
+    id: int
+    name: str
+    value: float
+
+# Create a DataField
+field = DataField.from_py_hint("record", Record)
+
+# Convert to Spark schema
+spark_field = field.to_spark_field()
+print(spark_field)
+
+# Create Spark DataFrame with the schema
+spark_df = spark.createDataFrame(data, schema=spark_field.dataType)
+```
+
+## Core Components
+
+### DataField
+
+The `DataField` class is the central component of Yggdrasil, providing conversion between Python types, PyArrow, and optionally PySpark. Key methods include:
+
+- `from_py_hint(name, hint, nullable=None, metadata=None)`: Create a DataField from a Python type hint
+- `from_arrow_field(field)`: Create a DataField from a PyArrow field
+- `from_spark_field(spark_field)`: Create a DataField from a PySpark StructField
+- `to_arrow_field()`: Convert to a PyArrow field
+- `to_arrow_schema()`: Convert to a PyArrow schema (for struct types with children)
+- `to_spark_field()`: Convert to a PySpark StructField
+
+## Architecture
+
+Yggdrasil follows a modular design with these core components:
+
+- **types module**: Contains the core type conversion functionality
+  - `field.py`: Implements the DataField class for type conversions
+  - `spark_utils.py`: Optional utilities for PySpark integration
+- **data module**: Provides higher-level data handling capabilities
+- **utils module**: Common utilities and helper functions
+
 ## Dependencies
 
 The core dependencies of Yggdrasil include:
@@ -130,6 +217,7 @@ The core dependencies of Yggdrasil include:
 
 Optional dependencies:
 
+- **PySpark**: For Spark integration (included in `[spark]` extras)
 - **deltalake**: Support for working with Delta Lake tables (included in `[delta]` and `[dev]` extras)
 
 ## Development
