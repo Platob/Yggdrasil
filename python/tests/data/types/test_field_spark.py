@@ -110,6 +110,7 @@ if SKIP_SPARK_TESTS:
 
     logger.warning(f"Spark tests will be SKIPPED. Reason: {SKIP_REASON}")
 else:
+    SKIP_REASON = ""
     logger.info("All dependencies available - Spark tests will RUN")
     logger.debug(f"PySpark version: {pyspark.__version__}, Java available: {HAVE_JAVA}")
 

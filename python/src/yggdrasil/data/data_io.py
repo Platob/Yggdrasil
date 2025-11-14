@@ -11,6 +11,11 @@ from yggdrasil.data.table_location import TableLocation
 from ..types.field import DataField
 from ..utils.spark_utils import spark_sql
 
+try:
+    from delta.tables import DeltaTable
+except ImportError:
+    DeltaTable = None
+
 
 class SaveMode(Enum):
     Overwrite = "overwrite"
@@ -37,49 +42,12 @@ class DataIO(ABC):
         return cls.__spark
 
     @abstractmethod
-    def create_table(self, location: TableLocation) -> DataField:
-        """
-        Get the DataField representing the schema of the data.
-
-        Args:
-            location: The TableLocation object representing the data location.
-        Returns:
-            DataField: The field representing the schema of the data.
-        """
-        pass
-
-    @abstractmethod
-    def delete_table(self, location: TableLocation) -> DataField:
-        """
-        Get the DataField representing the schema of the data.
-
-        Args:
-            location: The TableLocation object representing the data location.
-        Returns:
-            DataField: The field representing the schema of the data.
-        """
-        pass
-
-    @abstractmethod
     def get_schema(self, location: TableLocation) -> DataField:
         """
         Get the DataField representing the schema of the data.
 
         Args:
             location: The TableLocation object representing the data location.
-        Returns:
-            DataField: The field representing the schema of the data.
-        """
-        pass
-
-    @abstractmethod
-    def update_table(self, location: TableLocation, schema: DataField) -> DataField:
-        """
-        Get the DataField representing the schema of the data.
-
-        Args:
-            location: The TableLocation object representing the data location.
-            schema: The DataField representing the schema of the data.
         Returns:
             DataField: The field representing the schema of the data.
         """

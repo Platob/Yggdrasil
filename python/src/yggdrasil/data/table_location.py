@@ -61,4 +61,5 @@ class TableLocation:
             self.table_name
         ])
 
-
+    def delta_table_name(self):
+        return self.sql_full_name(decorator="`", separator=".")
