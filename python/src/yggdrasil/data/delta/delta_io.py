@@ -15,6 +15,7 @@ __all__ = [
     "DeltaIO"
 ]
 
+
 class DeltaIO(DataIO):
 
     def __init__(
