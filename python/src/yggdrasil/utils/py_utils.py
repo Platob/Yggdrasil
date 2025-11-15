@@ -1,7 +1,7 @@
+import datetime as dt
 import decimal
 import json
 import sys
-import datetime as dt
 from json import JSONDecodeError
 from typing import Any, Optional, Iterable, Callable
 
@@ -12,14 +12,7 @@ else:
     try:
         from typing_extensions import Annotated
     except ImportError:
-        # Define a dummy Annotated for backward compatibility
-        class _AnnotatedAlias:
-            def __class_getitem__(cls, params):
-                if not isinstance(params, tuple):
-                    params = (params,)
-                return params[0]  # Return the original type
-
-        Annotated = _AnnotatedAlias()
+        Annotated = None
 
 __all__ = [
     "Annotated",

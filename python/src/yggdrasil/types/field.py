@@ -11,11 +11,14 @@ from dataclasses import dataclass
 from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union
 
 import polars as pl
+import pyarrow as pa
+
+from ..utils.fake_module import make_fake_module
 
 try:
-    import pyarrow as pa
+    import pandas
 except ImportError:
-    raise ImportError("PyArrow is required for arrow_dataclass. Install it with 'pip install pyarrow'.")
+    pandas = make_fake_module(module_name="pandas")
 
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..utils.spark_utils import HAVE_SPARK, ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
@@ -667,3 +670,13 @@ class DataField:
         pldf = pl.from_pandas(df, include_index=bool(df.index.name))
 
         return self.cast_polars_dataframe(pldf).to_pandas()
+
+    def cast_dataframe(self, df):
+        if isinstance(df, (pa.RecordBatch, pa.Table)):
+            return self.cast_arrow(df)
+        elif isinstance(df, pandas.DataFrame):
+            return self.cast_pandas(df)
+        elif isinstance(df, spark_sql.DataFrame):
+            return self.cast_spark_dataframe(df)
+
+        raise ValueError(f"Cannot cast {df} with {self}")

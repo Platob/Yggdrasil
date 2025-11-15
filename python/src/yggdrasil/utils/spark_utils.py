@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from .fake_module import make_fake_module
+
 if TYPE_CHECKING:
     # These are only imported for type-checkers / IDEs.
     import pyspark.sql as spark_sql
@@ -39,10 +41,10 @@ try:
     }
 
 except ImportError:
-    spark = None
-    spark_sql = None
-    spark_types = None
-    spark_functions = None
+    spark = make_fake_module(module_name="spark")
+    spark_sql = make_fake_module(module_name="spark_sql")
+    spark_types = make_fake_module(module_name="spark_types")
+    spark_functions = make_fake_module(module_name="spark_functions")
 
     HAVE_SPARK = False
 
