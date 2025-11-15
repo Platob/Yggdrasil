@@ -15,7 +15,7 @@ try:
 except ImportError:
     raise ImportError("PyArrow is required for arrow_dataclass. Install it with 'pip install pyarrow'.")
 
-from ..utils.py_utils import Annotated, safe_dict, safe_str, safe_bytes, merge_dicts
+from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..utils.spark_utils import HAVE_SPARK, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
 
 __all__ = [
@@ -85,7 +85,61 @@ class DataField:
                     f"Cannot initialize nested arrow type {self.arrow_type} without children set"
                 )
 
+            if children:
+                children = [_.refine() for _ in children]
+
             object.__setattr__(self, "children", children)
+
+    def refine(self):
+        object.__setattr__(self, "comment", self.metadata.pop("comment", self.comment))
+
+        if pa.types.is_timestamp(self.arrow_type):
+            timeunit = self.metadata.pop("timeunit", self.arrow_type.unit)
+            timezone = self.metadata.pop("timezone", self.arrow_type.tz)
+
+            if self.arrow_type.unit != timeunit or self.arrow_type.tz != timezone:
+                arrow_type = pa.timestamp(unit=timeunit, tz=timezone)
+                object.__setattr__(self, "arrow_type", arrow_type)
+        elif pa.types.is_time(self.arrow_type):
+            timeunit = self.metadata.pop("timeunit", self.arrow_type.unit)
+
+            if timeunit != self.arrow_type.unit:
+                arrow_type = pa.time32(timeunit) if timeunit in ("s", "ms") else pa.time64(timeunit)
+                object.__setattr__(self, "arrow_type", arrow_type)
+        elif pa.types.is_decimal(self.arrow_type):
+            precision = int(self.metadata.pop("precision", self.arrow_type.precision))
+            scale = int(self.metadata.pop("scale", self.arrow_type.scale))
+
+            if self.arrow_type.precision != precision or self.arrow_type.scale != scale:
+                arrow_type = pa.decimal128(precision, scale) if precision <= 38 else pa.decimal256(precision, scale)
+                object.__setattr__(self, "arrow_type", arrow_type)
+        elif pa.types.is_map(self.arrow_type):
+            keys_sorted = safe_bool(
+                self.metadata.pop("keys_sorted", self.arrow_type.keys_sorted),
+                default=False
+            )
+
+            if self.arrow_type.keys_sorted != keys_sorted:
+                map_type: pa.MapType = self.arrow_type
+                arrow_type = pa.map_(
+                    map_type.key_field,
+                    map_type.item_field,
+                    keys_sorted=keys_sorted
+                )
+                object.__setattr__(self, "arrow_type", arrow_type)
+        elif pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type):
+            fixed_size = safe_int(
+                self.metadata.pop("fixed_size", -1),
+                default=-1
+            )
+
+            if fixed_size > 0:
+                list_type: pa.ListType = self.arrow_type
+                arrow_type = pa.list_(list_type.value_field, fixed_size)
+                object.__setattr__(self, "arrow_type", arrow_type)
+
+        return self
+
 
     @classmethod
     def from_py_hint(
@@ -160,13 +214,6 @@ class DataField:
             # It's already a PyArrow type
             arrow_type = hint
         elif origin is list or hint is list:
-            fixed_size = metadata.pop("fixed_size", None)
-            if fixed_size:
-                fixed_size = int(fixed_size)
-                fixed_size = fixed_size if fixed_size > 0 else -1
-            else:
-                fixed_size = -1
-
             # Handle list[T]
             if args and len(args) > 0:
                 item_hint = args[0]
@@ -182,11 +229,8 @@ class DataField:
                 # Default to list of strings
                 item_field = cls.from_arrow_type(name="item", dtype=pa.utf8(), nullable=True)
 
-            arrow_type = pa.list_(item_field.to_arrow_field(), fixed_size)
+            arrow_type = pa.list_(item_field.to_arrow_field())
         elif origin is dict or hint is dict:
-            keys_sorted = metadata.pop("keys_sorted", "false")
-            keys_sorted = str(keys_sorted).lower().startswith("t") if keys_sorted else False
-
             # Handle dict[K, V]
             if args and len(args) == 2:
                 key_type, value_type = args
@@ -208,7 +252,7 @@ class DataField:
                 key_field = cls.from_arrow_type(name="key", dtype=pa.utf8(), nullable=False)
                 value_field = cls.from_arrow_type(name="value", dtype=pa.utf8(), nullable=True)
 
-            arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field(), keys_sorted=keys_sorted)
+            arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field())
         else:
             type_hints = get_type_hints(hint, include_extras=True)
             children_fields = [
@@ -221,30 +265,6 @@ class DataField:
         if arrow_type is None:
             raise TypeError(f"Cannot create DataField from Python type hint {hint}")
 
-        time_unit = metadata.pop("timeunit", None)
-        time_zone = metadata.pop("timezone", None)
-        comment = metadata.pop("comment", comment)
-
-        if time_unit:
-            if pa.types.is_timestamp(arrow_type):
-                if arrow_type.unit != time_unit:
-                    arrow_type = pa.timestamp(time_unit)
-            elif pa.types.is_timestamp(arrow_type):
-                if arrow_type.unit != time_unit:
-                    arrow_type = pa.time32(time_unit) if time_unit in {"s", "ms"} else pa.time64(time_unit)
-
-        if time_zone:
-            if pa.types.is_timestamp(arrow_type):
-                if arrow_type.tz != time_zone:
-                    arrow_type = pa.timestamp(arrow_type.unit, tz=time_zone)
-
-        if pa.types.is_decimal(arrow_type):
-            precision = int(metadata.pop("precision", arrow_type.precision))
-            scale = int(metadata.pop("scale", arrow_type.scale))
-
-            if arrow_type.precision != precision or arrow_type.scale != scale:
-                arrow_type = pa.decimal128(precision, scale) if precision <= 38 else pa.decimal256(precision, scale)
-
         if nullable is None:
             nullable = False
 
@@ -255,7 +275,7 @@ class DataField:
             comment=comment,
             children=children_fields or None,
             metadata=metadata
-        )
+        ).refine()
 
     @classmethod
     def from_arrow_field(cls, field: pa.Field) -> "DataField":
@@ -293,18 +313,17 @@ class DataField:
 
         name = spark_field.name
         nullable = spark_field.nullable
-        metadata = spark_field.metadata if hasattr(spark_field, "metadata") else None
+        metadata = getattr(spark_field, "metadata", {})
         arrow_type = spark_to_arrow_type(spark_field.dataType)
-        comment = safe_str(metadata.pop("comment", None))
 
         return cls(
             name=name,
             arrow_type=arrow_type,
             nullable=nullable,
-            comment=comment,
+            comment=None,
             metadata=metadata,
             children=None
-        )
+        ).refine()
 
     @classmethod
     def from_spark_type(cls, name: str, spark_type: spark_types.DataType, nullable: bool, metadata: dict[str, str] = None) -> "DataField":

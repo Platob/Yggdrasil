@@ -27,6 +27,7 @@ __all__ = [
     "safe_bytes",
     "safe_bool",
     "safe_dict",
+    "safe_int",
     "merge_dicts"
 ]
 
@@ -92,6 +93,19 @@ def safe_bool(obj: Any, default = None) -> Optional[bool]:
             return default
 
     return bool(obj)
+
+
+def safe_int(obj: Any, default = None) -> Optional[int]:
+    if not obj:
+        return default
+
+    if isinstance(obj, int):
+        return obj
+
+    if isinstance(obj, bool):
+        return 1 if obj else 0
+
+    return int(obj)
 
 
 def safe_dict(

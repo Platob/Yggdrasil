@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Tuple
 
 import pyarrow as pa
+
+from src.yggdrasil.utils.py_utils import safe_dict, safe_str
 
 if TYPE_CHECKING:
     # These are only imported for type-checkers / IDEs.
@@ -47,7 +49,7 @@ __all__ = [
 ]
 
 
-def spark_to_arrow_type(spark_type):
+def spark_to_arrow_type(spark_type: spark_types.DataType):
     """Convert a Spark type to a PyArrow type.
 
     Args:
@@ -82,13 +84,14 @@ def spark_to_arrow_type(spark_type):
         spark_types.ArrayType: lambda t: pa.list_(spark_to_arrow_type(t.elementType)),
         spark_types.MapType: lambda t: pa.map_(
             spark_to_arrow_type(t.keyType),
-            spark_to_arrow_type(t.valueType)
+            spark_to_arrow_type(t.valueType),
         ),
         spark_types.StructType: lambda t: pa.struct([
             pa.field(
                 field.name,
                 spark_to_arrow_type(field.dataType),
-                field.nullable
+                field.nullable,
+                metadata=field.metadata
             )
             for field in t.fields
         ])
