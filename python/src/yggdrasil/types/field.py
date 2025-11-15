@@ -7,39 +7,20 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal as dec
-import sys
 from dataclasses import dataclass
-from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union, Iterable, Optional
-
-# Annotated is available in Python 3.9+
-if sys.version_info >= (3, 9):
-    from typing import Annotated
-else:
-    try:
-        from typing_extensions import Annotated
-    except ImportError:
-        # Define a dummy Annotated for backward compatibility
-        class _AnnotatedAlias:
-            def __class_getitem__(cls, params):
-                if not isinstance(params, tuple):
-                    params = (params,)
-                return params[0]  # Return the original type
-
-        Annotated = _AnnotatedAlias()
+from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union
 
 try:
     import pyarrow as pa
 except ImportError:
     raise ImportError("PyArrow is required for arrow_dataclass. Install it with 'pip install pyarrow'.")
 
-from yggdrasil.utils.spark_utils import HAVE_SPARK, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
+from ..utils.py_utils import Annotated, safe_dict, safe_str, safe_bytes, merge_dicts
+from ..utils.spark_utils import HAVE_SPARK, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
 
 __all__ = [
     "DataField",
     "Annotated",
-    "merge_dicts",
-    "safe_str",
-    "annotation_args_to_metadata",
 ]
 
 T = TypeVar("T")
@@ -59,75 +40,52 @@ _PYTHON_TO_ARROW_TYPE_MAP = {
 }
 
 
-def annotation_args_to_metadata(args: Iterable) -> dict[str, str]:
-    md = {}
-    for arg in args:
-        if isinstance(arg, tuple):
-            if len(arg) == 2:
-                md[safe_str(arg[0])] = safe_str(arg[1])
-        elif isinstance(arg, dict):
-            for k, v in arg.items():
-                md[safe_str(k)] = safe_str(v)
-
-    return md
-
-def merge_dicts(*dicts: dict) -> dict:
-    merged = {}
-
-    for d in dicts:
-        if d:
-            merged.update(d)
-
-    return merged
-
-
-def safe_str(obj: Any, default = None) -> Optional[str]:
-    if not obj:
-        return default
-
-    if isinstance(obj, str):
-        return obj
-
-    if isinstance(obj, bytes):
-        return obj.decode("utf-8")
-
-    return str(obj)
-
-
-def safe_bool(obj: Any, default: bool) -> Optional[bool]:
-    if not obj:
-        return default
-
-    if isinstance(obj, bool):
-        return obj
-
-    if isinstance(obj, str):
-        l = obj.lower()
-        return l.startswith("t") or l.startswith("1")
-
-    return safe_bool(str(obj), default)
-
-
-def safe_metadata_str(md: dict) -> dict[str, str]:
-    if not md:
-        return {}
-
-    return {
-        safe_str(k): safe_str(v)
-        for k, v in md.items()
-        if k and v
-    }
-
-
 @dataclass(frozen=True)
 class DataField:
     name: str
     arrow_type: pa.DataType
     nullable: bool
     comment: str | None
-    partition_key: bool
-    metadata: dict[str, str] | None
+    metadata: dict[str, str]
     children: list[DataField] | None
+
+    def __post_init__(self):
+        checked_metadata = safe_dict(
+            self.metadata, default={},
+            check_key=safe_str, check_value=safe_str
+        )
+        object.__setattr__(self, "metadata", checked_metadata)
+
+        checked_comment = safe_str(self.comment, default=None)
+        object.__setattr__(self, "comment", checked_comment)
+
+        if pa.types.is_nested(self.arrow_type) and not self.children:
+            if pa.types.is_struct(self.arrow_type):
+                children = [
+                    self.from_arrow_field(f)
+                    for f in self.arrow_type
+                ]
+            elif (
+                pa.types.is_list(self.arrow_type)
+                or pa.types.is_large_list(self.arrow_type)
+                or pa.types.is_fixed_size_list(self.arrow_type)
+            ):
+                list_type: pa.ListType = self.arrow_type
+                children = [
+                    self.from_arrow_field(field=list_type.value_field)
+                ]
+            elif pa.types.is_map(self.arrow_type):
+                map_type: pa.MapType = self.arrow_type
+                children = [
+                    self.from_arrow_field(field=map_type.key_field),
+                    self.from_arrow_field(field=map_type.item_field)
+                ]
+            else:
+                raise ValueError(
+                    f"Cannot initialize nested arrow type {self.arrow_type} without children set"
+                )
+
+            object.__setattr__(self, "children", children)
 
     @classmethod
     def from_py_hint(
@@ -136,7 +94,6 @@ class DataField:
         name: str | None = None,
         nullable: bool | None = None,
         comment: str | None = None,
-        partition_key: bool | None = None,
         metadata: dict[str, str] | None = None,
     ) -> "DataField":
         """
@@ -147,7 +104,6 @@ class DataField:
             hint: Python type hint (e.g. int, str, list[int], Annotated[int, "metadata"])
             nullable: Whether the field can be null
             comment: Optional comment
-            partition_key: Whether the field can be partitioned
             metadata: Optional metadata for the field
 
         Returns:
@@ -156,20 +112,20 @@ class DataField:
         # Handle Annotated[T, ...] - extract the base type and metadata
         origin = get_origin(hint)
         args = get_args(hint)
-        metadata = metadata or {}
 
         # Handle Annotated type
         if origin is Annotated:
             if args and len(args) >= 2:
                 base_type = args[0]  # The original type
-                field_metadata = annotation_args_to_metadata(args[1:])
+                field_metadata = safe_dict(args[1:], raise_error=False)
                 return cls.from_py_hint(
                     name=name,
                     hint=base_type,
                     nullable=nullable,
                     comment=comment,
-                    partition_key=partition_key,
-                    metadata=merge_dicts(field_metadata, metadata)
+                    metadata=merge_dicts(
+                        dicts=[field_metadata, metadata]
+                    )
                 )
 
             raise TypeError(f"Cannot create DataField from Python type hint {hint}")
@@ -188,13 +144,15 @@ class DataField:
                     hint=base_type,
                     nullable=nullable,
                     comment=comment,
-                    partition_key=partition_key,
                     metadata=metadata
                 )
 
         arrow_type = None
         children_fields = None
-
+        metadata = safe_dict(
+            metadata, default={},
+            check_key=safe_str, check_value=safe_str
+        )
         # Check if it's a direct mapping from Python type to Arrow type
         if hint in _PYTHON_TO_ARROW_TYPE_MAP:
             arrow_type = _PYTHON_TO_ARROW_TYPE_MAP[hint]
@@ -202,8 +160,12 @@ class DataField:
             # It's already a PyArrow type
             arrow_type = hint
         elif origin is list or hint is list:
-            fixed_size = int(metadata.pop("fixed_size", 0))
-            fixed_size = fixed_size if fixed_size > 0 else -1
+            fixed_size = metadata.pop("fixed_size", None)
+            if fixed_size:
+                fixed_size = int(fixed_size)
+                fixed_size = fixed_size if fixed_size > 0 else -1
+            else:
+                fixed_size = -1
 
             # Handle list[T]
             if args and len(args) > 0:
@@ -213,7 +175,6 @@ class DataField:
                     hint=item_hint,
                     nullable=None,
                     comment=None,
-                    partition_key=None,
                     metadata=None
                 )
 
@@ -222,7 +183,6 @@ class DataField:
                 item_field = cls.from_arrow_type(name="item", dtype=pa.utf8(), nullable=True)
 
             arrow_type = pa.list_(item_field.to_arrow_field(), fixed_size)
-            children_fields = [item_field]
         elif origin is dict or hint is dict:
             keys_sorted = metadata.pop("keys_sorted", "false")
             keys_sorted = str(keys_sorted).lower().startswith("t") if keys_sorted else False
@@ -235,7 +195,6 @@ class DataField:
                     hint=key_type,
                     nullable=False,
                     comment=None,
-                    partition_key=None,
                     metadata=None
                 )
                 value_field = cls.from_py_hint(
@@ -243,14 +202,12 @@ class DataField:
                     hint=value_type,
                     nullable=None,
                     comment=None,
-                    partition_key=None,
                     metadata=None
                 )
             else:
                 key_field = cls.from_arrow_type(name="key", dtype=pa.utf8(), nullable=False)
                 value_field = cls.from_arrow_type(name="value", dtype=pa.utf8(), nullable=True)
 
-            children_fields = [key_field, value_field]
             arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field(), keys_sorted=keys_sorted)
         else:
             type_hints = get_type_hints(hint, include_extras=True)
@@ -264,12 +221,9 @@ class DataField:
         if arrow_type is None:
             raise TypeError(f"Cannot create DataField from Python type hint {hint}")
 
-        metadata = safe_metadata_str(metadata)
-        time_unit = metadata.pop("unit", metadata.pop("timeunit", None))
-        time_zone = metadata.pop("tz", metadata.pop("timezone", None))
-
+        time_unit = metadata.pop("timeunit", None)
+        time_zone = metadata.pop("timezone", None)
         comment = metadata.pop("comment", comment)
-        partition_key = safe_bool(metadata.pop("partition_key", partition_key), default=False)
 
         if time_unit:
             if pa.types.is_timestamp(arrow_type):
@@ -299,7 +253,6 @@ class DataField:
             arrow_type=arrow_type,
             nullable=nullable,
             comment=comment,
-            partition_key=partition_key or False,
             children=children_fields or None,
             metadata=metadata
         )
@@ -311,9 +264,8 @@ class DataField:
             arrow_type=field.type,
             nullable=field.nullable,
             comment=None,
-            partition_key=False,
             children=None,
-            metadata=safe_metadata_str(field.metadata) if field.metadata is not None else None,
+            metadata=field.metadata,
         )
 
     @classmethod
@@ -344,15 +296,13 @@ class DataField:
         metadata = spark_field.metadata if hasattr(spark_field, "metadata") else None
         arrow_type = spark_to_arrow_type(spark_field.dataType)
         comment = safe_str(metadata.pop("comment", None))
-        partition_key = safe_bool(metadata.pop("partition_key", False), default=False)
 
         return cls(
             name=name,
             arrow_type=arrow_type,
             nullable=nullable,
             comment=comment,
-            partition_key=partition_key,
-            metadata=safe_metadata_str(metadata) if metadata else None,
+            metadata=metadata,
             children=None
         )
 
@@ -407,7 +357,10 @@ class DataField:
 
     # Transform to
     def to_arrow_field(self) -> pa.Field:
-        return pa.field(name=self.name, type=self.arrow_type, metadata=self.metadata, nullable=self.nullable)
+        return pa.field(
+            name=self.name, type=self.arrow_type,
+            metadata=self.metadata, nullable=self.nullable
+        )
 
     def to_arrow_schema(self) -> pa.Schema:
         return pa.schema([

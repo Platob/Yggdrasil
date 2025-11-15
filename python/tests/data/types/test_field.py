@@ -1,20 +1,14 @@
 """Unit tests for the field module."""
 
-import unittest
 import datetime as dt
 import decimal as dec
+import unittest
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Union, get_type_hints
+from typing import List, Dict, Optional, Union
 
 import pyarrow as pa
-
 from yggdrasil.types.field import (
     DataField,
-    merge_dicts,
-    safe_str,
-    safe_bool,
-    safe_metadata_str,
-    annotation_args_to_metadata,
 )
 
 # For Python 3.9+ compatibility
@@ -43,7 +37,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Integer field",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -53,121 +46,10 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.utf8(),
             nullable=True,
             comment="String field",
-            partition_key=False,
             metadata={"encoding": "utf8"},
             children=None
         )
-    def test_merge_dicts(self):
-        """Test merge_dicts function."""
-        # Test merging empty dicts
-        self.assertEqual(merge_dicts(), {})
-        self.assertEqual(merge_dicts({}, {}), {})
-        
-        # Test merging with None
-        self.assertEqual(merge_dicts(None), {})
-        self.assertEqual(merge_dicts(None, {"a": 1}), {"a": 1})
-        
-        # Test merging multiple dicts
-        d1 = {"a": 1, "b": 2}
-        d2 = {"b": 3, "c": 4}
-        d3 = {"d": 5}
-        
-        self.assertEqual(merge_dicts(d1, d2), {"a": 1, "b": 3, "c": 4})
-        self.assertEqual(merge_dicts(d1, d2, d3), {"a": 1, "b": 3, "c": 4, "d": 5})
-        
-        # Check that original dicts are not modified
-        self.assertEqual(d1, {"a": 1, "b": 2})
-        self.assertEqual(d2, {"b": 3, "c": 4})
-        self.assertEqual(d3, {"d": 5})
 
-    def test_safe_str(self):
-        """Test safe_str function."""
-        # Test with None and empty values
-        self.assertIsNone(safe_str(None))
-        self.assertIsNone(safe_str(""))
-        self.assertEqual(safe_str(None, "default"), "default")
-        
-        # Test with strings
-        self.assertEqual(safe_str("hello"), "hello")
-        
-        # Test with bytes
-        self.assertEqual(safe_str(b"hello"), "hello")
-        
-        # Test with other types
-        self.assertEqual(safe_str(123), "123")
-        self.assertEqual(safe_str(True), "True")
-        
-    def test_safe_bool(self):
-        """Test safe_bool function."""
-        # Test with None and empty values
-        self.assertTrue(safe_bool(None, True))
-        self.assertFalse(safe_bool(None, False))
-        self.assertFalse(safe_bool("", False))
-        
-        # Test with boolean values
-        self.assertTrue(safe_bool(True, False))
-        self.assertTrue(safe_bool(False, True))  # The implementation converts False to string "False"
-        
-        # Test with string values
-        self.assertTrue(safe_bool("true", False))
-        self.assertTrue(safe_bool("True", False))
-        self.assertTrue(safe_bool("t", False))
-        self.assertTrue(safe_bool("1", False))
-        self.assertFalse(safe_bool("false", True))
-        self.assertFalse(safe_bool("False", True))
-        self.assertFalse(safe_bool("f", True))
-        self.assertFalse(safe_bool("0", True))
-        
-    def test_safe_metadata_str(self):
-        """Test safe_metadata_str function."""
-        # Test with None and empty values
-        self.assertEqual(safe_metadata_str(None), {})
-        self.assertEqual(safe_metadata_str({}), {})
-        
-        # Test with valid metadata
-        metadata = {"key1": "value1", "key2": b"value2", "key3": 123}
-        expected = {"key1": "value1", "key2": "value2", "key3": "123"}
-        self.assertEqual(safe_metadata_str(metadata), expected)
-        
-        # Test with None keys or values
-        metadata = {"key1": None, None: "value2", "key3": "value3"}
-        expected = {"key3": "value3"}
-        self.assertEqual(safe_metadata_str(metadata), expected)
-        
-    def test_annotation_args_to_metadata(self):
-        """Test annotation_args_to_metadata function."""
-        # Test with empty args
-        self.assertEqual(annotation_args_to_metadata([]), {})
-        
-        # Test with tuples
-        args = [
-            ("key1", "value1"),
-            ("key2", b"value2"),
-            ("key3", 123),
-            ("invalid",)  # Too few elements
-        ]
-        expected = {"key1": "value1", "key2": "value2", "key3": "123"}
-        self.assertEqual(annotation_args_to_metadata(args), expected)
-        
-        # Test with dictionaries
-        args = [
-            {"dict_key1": "value1", "dict_key2": b"value2"},
-            {"dict_key3": 123}
-        ]
-        expected = {
-            "dict_key1": "value1", 
-            "dict_key2": "value2", 
-            "dict_key3": "123"
-        }
-        self.assertEqual(annotation_args_to_metadata(args), expected)
-        
-        # Test with mixed types
-        args = [
-            ("tuple_key", "tuple_value"),
-            {"dict_key": "dict_value"}
-        ]
-        expected = {"tuple_key": "tuple_value", "dict_key": "dict_value"}
-        self.assertEqual(annotation_args_to_metadata(args), expected)
     def test_from_py_hint_basic_types(self):
         """Test DataField.from_py_hint with basic Python types."""
         # Test with basic types
@@ -250,10 +132,8 @@ class TestDataField(unittest.TestCase):
         field = DataField.from_py_hint(
             hint=int, 
             name="int_field", 
-            partition_key=True
         )
-        self.assertTrue(field.partition_key)
-        
+
         # Test with custom metadata
         metadata = {"encoding": "utf8", "description": "Test description"}
         field = DataField.from_py_hint(
@@ -264,7 +144,7 @@ class TestDataField(unittest.TestCase):
         self.assertEqual(field.metadata, metadata)
         
         # Test with timestamp unit and timezone
-        metadata = {"unit": "ms", "timezone": "UTC"}
+        metadata = {"timeunit": "ms", "timezone": "UTC"}
         field = DataField.from_py_hint(
             hint=dt.datetime, 
             name="timestamp_field", 
@@ -431,7 +311,7 @@ class TestDataField(unittest.TestCase):
         field = DataField.from_py_hint(
             hint=Annotated[
                 dt.datetime, 
-                ("unit", "ms"), 
+                ("timeunit", "ms"),
                 {"timezone": "UTC"}
             ], 
             name="annotated_datetime"
@@ -447,8 +327,7 @@ class TestDataField(unittest.TestCase):
             name="annotated_partitioned_str"
         )
         self.assertEqual(field.comment, "Test comment")
-        self.assertTrue(field.partition_key)
-        
+
         # Test Annotated with decimal precision and scale
         field = DataField.from_py_hint(
             hint=Annotated[
@@ -630,7 +509,7 @@ class TestDataField(unittest.TestCase):
         
         # Test with a field that has metadata
         field = DataField.from_py_hint(
-            hint=Person, 
+            hint=Person,
             name="person_with_metadata", 
             metadata={"version": "1.0"}
         )
@@ -646,6 +525,7 @@ class TestDataField(unittest.TestCase):
         # The schema should be empty
         schema = field.to_arrow_schema()
         self.assertEqual(len(schema.names), 0)
+
     def test_equality_method(self):
         """Test DataField.__eq__ method."""
         # Create two identical fields
@@ -654,7 +534,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -664,7 +543,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -678,7 +556,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -692,7 +569,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.float64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -707,7 +583,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=True,  # Different from field1
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -723,7 +598,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -733,7 +607,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -747,7 +620,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.int64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
@@ -761,7 +633,6 @@ class TestDataField(unittest.TestCase):
             arrow_type=pa.float64(),
             nullable=False,
             comment="Test comment",
-            partition_key=False,
             metadata=None,
             children=None
         )
