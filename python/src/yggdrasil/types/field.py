@@ -10,6 +10,8 @@ import decimal as dec
 from dataclasses import dataclass
 from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union
 
+import polars as pl
+
 try:
     import pyarrow as pa
 except ImportError:
@@ -461,6 +463,37 @@ class DataField:
             metadata=md
         )
 
+    def to_polars_field(self) -> pl.Field:
+        polars_type = None
+        primitives = {
+            pa.utf8(): pl.Utf8,
+            pa.binary(): pl.Binary(),
+            pa.int8(): pl.Int8(),
+            pa.int16(): pl.Int16(),
+            pa.int32(): pl.Int32(),
+            pa.int64(): pl.Int64(),
+            pa.float32(): pl.Float32(),
+            pa.float64(): pl.Float64(),
+        }
+
+        if self.is_primitive():
+            polars_type = primitives.get(self.arrow_type)
+        else:
+            if self.is_struct():
+                polars_type = pl.Struct(
+                    fields=[
+                        _.to_polars_field()
+                        for _ in self.children
+                    ]
+                )
+            elif self.is_list():
+                polars_type = pl.List(inner=self.children[0].to_polars_field().dtype)
+
+        if not polars_type:
+            raise ValueError(f"Cannot convert {self} to polars field")
+
+        return pl.Field(name=self.name, dtype=polars_type)
+
     def cast_spark_column(
         self,
         column_field: spark_types.StructField,
@@ -557,3 +590,61 @@ class DataField:
 
         # Create and return the new DataFrame with the casted columns
         return df.select(*select_exprs)
+
+    # --------------------------- Polars support ---------------------------
+    def cast_polars_column(self, series: "pl.Series") -> "pl.Series":
+        """Cast a Polars Series to match this DataField's Arrow type.
+
+        This is a best-effort cast and will raise if Polars is not available.
+        For nested types (struct/list) the function will attempt to map to appropriate
+        Polars dtypes where possible.
+        """
+        target_field = self.to_polars_field()
+        casted = None
+
+        if casted is None:
+            casted = series.cast(target_field.dtype)
+
+        return casted.alias(target_field.name)
+
+    def cast_polars_dataframe(self, df: "pl.DataFrame") -> "pl.DataFrame":
+        """Cast a Polars DataFrame to match this DataField's schema (when this DataField is a struct).
+
+        Behavior mirrors cast_spark_dataframe: case-insensitive field matching, required fields check,
+        and casting via cast_polars_column for each matched column. Missing nullable fields are filled with nulls.
+        """
+        if not self.is_struct():
+            raise TypeError(f"Cannot cast DataFrame to non-struct type {self}")
+
+        if not self.children:
+            return df
+
+        original_columns = df.columns
+        columns_lower = [c.lower() for c in original_columns]
+
+        # mapping target field name -> source column name
+        field_to_col_map = {}
+        for field in self.children:
+            fname_lower = field.name.lower()
+            if fname_lower in columns_lower:
+                idx = columns_lower.index(fname_lower)
+                field_to_col_map[field.name] = original_columns[idx]
+
+        missing_fields = [field.name for field in self.children if
+                          field.name not in field_to_col_map and not field.nullable]
+        if missing_fields:
+            raise ValueError(f"Required fields missing from DataFrame: {', '.join(missing_fields)}")
+
+        exprs = []
+        for field in self.children:
+            if field.name in field_to_col_map:
+                src = field_to_col_map[field.name]
+                casted = field.cast_polars_column(df[src])
+            else:
+                target_field = self.to_polars_field()
+                casted = pl.lit(None).cast(target_field.dtype).alias(field.name)
+
+            exprs.append(casted)
+
+        # build and return new dataframe; use select to preserve order
+        return df.select(*exprs)

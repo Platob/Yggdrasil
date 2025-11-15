@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
-
-from src.yggdrasil.utils.py_utils import safe_dict, safe_str
 
 if TYPE_CHECKING:
     # These are only imported for type-checkers / IDEs.
