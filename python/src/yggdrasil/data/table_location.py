@@ -2,6 +2,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+__all__ = [
+    "TableLocation"
+]
+
+
 @dataclass(frozen=True)
 class TableLocation:
     full_path: str

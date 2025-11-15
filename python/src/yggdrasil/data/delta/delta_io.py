@@ -11,6 +11,10 @@ except ImportError:
     DeltaTable = None
 
 
+__all__ = [
+    "DeltaIO"
+]
+
 class DeltaIO(DataIO):
 
     def __init__(

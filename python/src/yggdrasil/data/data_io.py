@@ -16,6 +16,10 @@ try:
 except ImportError:
     DeltaTable = None
 
+__all__ = [
+    "SaveMode",
+    "DataIO"
+]
 
 class SaveMode(Enum):
     Overwrite = "overwrite"
