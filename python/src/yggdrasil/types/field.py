@@ -368,13 +368,13 @@ class DataField:
         return pa.types.is_nested(self.arrow_type)
 
     def is_list(self):
-        return pa.types.is_list(self.children) or pa.types.is_large_list(self.children)
+        return pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type)
 
     def is_map(self):
-        return pa.types.is_map(self)
+        return pa.types.is_map(self.arrow_type)
 
     def is_struct(self):
-        return pa.types.is_struct(self)
+        return pa.types.is_struct(self.arrow_type)
 
     # Transform to
     def to_arrow_field(self) -> pa.Field:
