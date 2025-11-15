@@ -364,6 +364,18 @@ class DataField:
     def is_primitive(self):
         return not self.is_nested()
 
+    def is_decimal(self):
+        return pa.types.is_decimal(self.arrow_type)
+
+    def is_timestamp(self):
+        return pa.types.is_timestamp(self.arrow_type) or pa.types.is_date64(self.arrow_type)
+
+    def is_date(self):
+        return pa.types.is_date32(self.arrow_type)
+
+    def is_time(self):
+        return pa.types.is_time(self.arrow_type)
+
     def is_nested(self):
         return pa.types.is_nested(self.arrow_type)
 
@@ -453,7 +465,6 @@ class DataField:
         )
 
     def to_polars_field(self) -> pl.Field:
-        polars_type = None
         primitives = {
             pa.utf8(): pl.Utf8,
             pa.binary(): pl.Binary(),
@@ -464,11 +475,20 @@ class DataField:
             pa.float32(): pl.Float32(),
             pa.float64(): pl.Float64(),
         }
+        polars_type = primitives.get(self.arrow_type)
 
-        if self.is_primitive():
-            polars_type = primitives.get(self.arrow_type)
-        else:
-            if self.is_struct():
+        if not polars_type:
+            if self.is_timestamp():
+                polars_type = pl.Datetime(
+                    time_unit=self.arrow_type.unit, time_zone=self.arrow_type.tz
+                )
+            elif self.is_date():
+                polars_type = pl.Date()
+            elif self.is_time():
+                polars_type = pl.Time()
+            elif self.is_decimal():
+                polars_type = pl.Decimal(self.arrow_type.precision, self.arrow_type.scale)
+            elif self.is_struct():
                 polars_type = pl.Struct(
                     fields=[
                         _.to_polars_field()
@@ -637,3 +657,13 @@ class DataField:
 
         # build and return new dataframe; use select to preserve order
         return df.select(*exprs)
+
+    def cast_arrow(self, df):
+        pldf = pl.from_arrow(df)
+
+        return self.cast_polars_dataframe(pldf).to_arrow()
+
+    def cast_pandas(self, df):
+        pldf = pl.from_pandas(df, include_index=bool(df.index.name))
+
+        return self.cast_polars_dataframe(pldf).to_pandas()
