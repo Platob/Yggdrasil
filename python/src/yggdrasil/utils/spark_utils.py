@@ -23,6 +23,20 @@ try:
     StructField = spark_types.StructField
     ArrayType = spark_types.ArrayType
     MapType = spark_types.MapType
+    ARROW_TYPE_TO_SPARK_TYPE = {
+        pa.utf8(): spark_types.StringType(),
+        pa.binary(): spark_types.BinaryType(),
+        pa.int8(): spark_types.ByteType(),
+        pa.int16(): spark_types.IntegerType(),
+        pa.int32(): spark_types.IntegerType(),
+        pa.int64(): spark_types.LongType(),
+        pa.float32(): spark_types.FloatType(),
+        pa.float64(): spark_types.DoubleType(),
+        pa.date32(): spark_types.DateType(),
+        pa.date64(): spark_types.TimestampType(),
+        pa.decimal128(38,18): spark_types.DecimalType(38,18),
+        pa.timestamp("ns"): spark_types.TimestampNTZType(),
+    }
 
 except ImportError:
     spark = None
@@ -37,10 +51,11 @@ except ImportError:
     StructField = None
     ArrayType = None
     MapType = None
-    DataType = None
+    ARROW_TYPE_TO_SPARK_TYPE = {}
 
 __all__ = [
     "HAVE_SPARK",
+    "ARROW_TYPE_TO_SPARK_TYPE",
     "spark", "spark_sql", "spark_types", "spark_functions",
     "spark_to_arrow_type",
     "cast_nested_spark_field",

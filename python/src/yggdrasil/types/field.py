@@ -18,7 +18,7 @@ except ImportError:
     raise ImportError("PyArrow is required for arrow_dataclass. Install it with 'pip install pyarrow'.")
 
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
-from ..utils.spark_utils import HAVE_SPARK, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
+from ..utils.spark_utils import HAVE_SPARK, ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
 
 __all__ = [
     "DataField",
@@ -402,24 +402,12 @@ class DataField:
         if not HAVE_SPARK:
             raise ImportError("PySpark is required for to_spark_field. Install it with 'pip install pyspark'.")
 
-        spark_type = None
-        primitives = {
-            pa.utf8(): spark_types.StringType(),
-            pa.binary(): spark_types.BinaryType(),
-            pa.int8(): spark_types.IntegerType(),
-            pa.int16(): spark_types.IntegerType(),
-            pa.int32(): spark_types.IntegerType(),
-            pa.int64(): spark_types.LongType(),
-            pa.float32(): spark_types.FloatType(),
-            pa.float64(): spark_types.DoubleType(),
-        }
+        spark_type = ARROW_TYPE_TO_SPARK_TYPE.get(self.arrow_type)
         md = self.metadata.copy() or {}
 
         # Convert PyArrow type to Spark type
-        if self.is_primitive():
-            spark_type = primitives[self.arrow_type]
-
-            if not spark_type:
+        if not spark_type:
+            if self.is_primitive():
                 if pa.types.is_decimal(self.arrow_type):
                     spark_type = spark_types.DecimalType(self.arrow_type.precision, self.arrow_type.scale)
                 elif pa.types.is_timestamp(self.arrow_type):
@@ -432,25 +420,26 @@ class DataField:
                         spark_type = spark_types.TimestampNTZType()
                 elif pa.types.is_time(self.arrow_type):
                     md["timeunit"] = self.arrow_type.unit
-                    spark_type = spark_types.IntegerType() if pa.types.is_time32(self.arrow_type) else spark_types.LongType()
-        else:
-            if self.is_struct():
-                spark_type = spark_types.StructType([
-                    _.to_spark_field()
-                    for _ in self.children
-                ])
-            elif self.is_list():
-                item_field: DataField = self.children[0]
-                item_spark = item_field.to_spark_field()
-                spark_type = spark_types.ArrayType(item_spark.dataType, containsNull=item_field.nullable)
-            elif self.is_map():
-                key_field: DataField = self.children[0]
-                key_spark = key_field.to_spark_field()
+                    spark_type = spark_types.IntegerType() if pa.types.is_time32(
+                        self.arrow_type) else spark_types.LongType()
+            else:
+                if self.is_struct():
+                    spark_type = spark_types.StructType([
+                        _.to_spark_field()
+                        for _ in self.children
+                    ])
+                elif self.is_list():
+                    item_field: DataField = self.children[0]
+                    item_spark = item_field.to_spark_field()
+                    spark_type = spark_types.ArrayType(item_spark.dataType, containsNull=item_field.nullable)
+                elif self.is_map():
+                    key_field: DataField = self.children[0]
+                    key_spark = key_field.to_spark_field()
 
-                value_field: DataField = self.children[1]
-                value_spark = value_field.to_spark_field()
+                    value_field: DataField = self.children[1]
+                    value_spark = value_field.to_spark_field()
 
-                spark_type = spark_types.MapType(key_spark.dataType, value_spark.dataType, valueContainsNull=value_field.nullable)
+                    spark_type = spark_types.MapType(key_spark.dataType, value_spark.dataType, valueContainsNull=value_field.nullable)
 
         if spark_type is None:
             raise TypeError(f"Cannot convert {self.arrow_type} to Spark type")
