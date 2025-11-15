@@ -362,7 +362,7 @@ class DataField:
         return f"DataField(name={self.name}, arrow_type={self.arrow_type}, nullable={self.nullable}, metadata={self.metadata}, children={self.children})"
 
     def is_primitive(self):
-        return pa.types.is_primitive(self.arrow_type)
+        return not self.is_nested()
 
     def is_nested(self):
         return pa.types.is_nested(self.arrow_type)
