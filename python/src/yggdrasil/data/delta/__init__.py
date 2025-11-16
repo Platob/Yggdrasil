@@ -1,1 +1,1 @@
-from .delta_io import DeltaIO
+from .delta_io import DeltaTableIO

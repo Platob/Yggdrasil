@@ -1,3 +1,3 @@
-from .data_io import DataIO, SaveMode
+from .data_io import DataTableIO, SaveMode
 from .table_location import TableLocation
 from .delta import *

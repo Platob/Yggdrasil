@@ -1,9 +1,10 @@
 from typing import Optional
 
-from ..data_io import DataIO, SaveMode
+from ..data_io import DataTableIO, SaveMode
 from ..table_location import TableLocation
 from ...types import DataField
 from ...utils.py_utils import safe_dict, safe_str
+from ...utils.arrow_utils import safe_arrow_tabular
 from ...utils.spark_utils import spark_sql, safe_spark_dataframe
 
 try:
@@ -13,104 +14,43 @@ except ImportError:
 
 
 __all__ = [
-    "DeltaIO"
+    "DeltaTableIO"
 ]
 
 
-class DeltaIO(DataIO):
-
-    def __init__(
-        self,
-        spark: spark_sql.SparkSession
+class DeltaTableIO(DataTableIO):
+    @classmethod
+    def get_spark_delta_table(
+        cls,
+        location: TableLocation,
+        spark_session: spark_sql.SparkSession
     ):
-        self.spark = spark
+        location = TableLocation.parse_any(location)
 
-    def get_delta_table(self, location: TableLocation):
-        return DeltaTable.forName(self.spark, location.delta_table_name())
+        if location.entitiy:
+            return DeltaTable.forName(
+                spark_session,
+                location.entitiy.delta_table_full_name()
+            )
+        return DeltaTable.forPath(
+            spark_session,
+            location.fs_path
+        )
 
-    def get_schema(self, location: TableLocation) -> DataField:
-        df = self.get_delta_table(location).toDF()
+    @classmethod
+    def load_schema(cls, location: TableLocation) -> DataField:
+        df = cls.get_spark_delta_table(location, cls.get_spark()).toDF()
 
         return DataField.from_spark_type(
-            name=location.table_name, spark_type=df.schema,
+            name=location.entitiy.table_name,
+            spark_type=df.schema,
             nullable=False,
             metadata=None
         )
 
-    def delete_table(self, location: TableLocation) -> DataField:
-        full_name = location.sql_full_name(decorator="`", separator=".")
-
-        self.spark.sql(f"DELETE TABLE IF EXISTS {full_name}")
-
-    def read_spark(
-        self,
-        location: TableLocation,
-        schema: Optional[DataField] = None,
-        **kwargs
-    ) -> spark_sql.DataFrame:
-        """
-        Read a Delta table (supports Unity Catalog qualified names).
-        Accepts optional kwargs that are passed as reader options (e.g., versionAsOf, timestampAsOf).
-        If `schema` is supplied it will be used to cast the returned DataFrame via DataField.cast_spark_dataframe.
-        """
-        full_name = location.delta_table_name()
-
-        # Use Spark's table reader for catalog-qualified Delta tables.
-        # Accept reader options via kwargs (e.g., versionAsOf=123, timestampAsOf="2023-01-01")
-        reader = self.spark.read.format("delta")
-        for k, v in kwargs.items():
-            # spark expects option values as str for many options; leave flexibility to caller
-            reader = reader.option(k, v)
-
-        try:
-            df = reader.table(full_name)
-        except Exception:
-            # Fallback: try to read by path if TableLocation provides one via sql_full_name
-            # This is a best-effort fallback; if it fails we'll re-raise the original error.
-            try:
-                path = location.full_path  # may or may not exist on TableLocation
-            except Exception:
-                raise
-            df = reader.load(path)
-
-        if schema is not None:
-            df = schema.cast_spark_dataframe(df)
-
-        return df
-
-    def _write_spark(
-        self,
-        location: TableLocation,
-        df: spark_sql.DataFrame,
-        mode: SaveMode = SaveMode.Overwrite,
-        **kwargs
-    ) -> None:
-        """
-        Write DataFrame to Delta using saveAsTable for catalog-qualified names.
-        kwargs are forwarded to the writer as options (e.g., mergeSchema="true", path="...").
-        """
-        full_name = location.delta_table_name()
-
-        # Map SaveMode enum -> spark mode string. If SaveMode provides .name, rely on that.
-        try:
-            spark_mode = mode.name.lower()
-        except Exception:
-            # Fallback to string conversion
-            spark_mode = str(mode).lower()
-
-        writer = df.write.format("delta").mode(spark_mode)
-
-        # forward writer options
-        for k, v in kwargs.items():
-            writer = writer.option(k, v)
-
-        # Use saveAsTable for Unity Catalog / managed/external table names
-        writer.saveAsTable(full_name)
-
     def unity_catalog_write(
         self,
         df, *,
-        location: TableLocation,
         mode: str,
         overwrite_schema: bool | None = None,
         match_keys: list[str] = None,
@@ -129,6 +69,12 @@ class DeltaIO(DataIO):
         - CREATE TABLE IF NOT EXISTS (with schema from df).
         - Optionally OPTIMIZE ZORDER and VACUUM.
         """
+        if self.schema and not isinstance(df, spark_sql.DataFrame):
+            df = self.schema.cast_arrow_tabular(df)
+
+        spark_session = self.get_spark()
+        df = safe_spark_dataframe(df, spark_session=spark_session)
+
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_keys:
             for k in match_keys:
@@ -137,23 +83,27 @@ class DeltaIO(DataIO):
 
             df = df.dropna(subset=list(match_keys))  # enforce keys not null
 
-        schema = self.get_schema(location)
-        df = schema.cast(df)
-        df = safe_spark_dataframe(df, spark_session=self.spark)
-        full_name = location.delta_table_name()
         spark_options = safe_dict(spark_options, default={}, check_key=safe_str)
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"
 
-        # --- Ensure catalog/schema exist (Unity Catalog) ---
-        if location.catalog_name and create_catalog_if_missing:
-            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{location.catalog_name}`")
-        if location.schema_name and create_schema_if_missing:
-            self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{location.catalog_name}`.`{location.schema_name}`")
+        entity_object = self.location.entitiy
+        save_path = self.location.entitiy.delta_table_full_name() if self.location.entitiy else self.location.fs_path
+
+        if entity_object:
+            # --- Ensure catalog/schema exist (Unity Catalog) ---
+            if entity_object.catalog_name and create_catalog_if_missing:
+                spark_session.sql(f"CREATE CATALOG IF NOT EXISTS `{entity_object.catalog_name}`")
+
+            if entity_object.schema_name and create_schema_if_missing:
+                spark_session.sql(f"CREATE SCHEMA IF NOT EXISTS `{entity_object.catalog_name}`.`{entity_object.schema_name}`")
 
         # --- Merge (upsert) ---
         try:
-            target = self.get_delta_table(location)
+            target = self.get_spark_delta_table(
+                location=self.location,
+                spark_session=spark_session
+            )
         except Exception:
             # target will remain None if table doesn't exist
             target = None
@@ -174,18 +124,29 @@ class DeltaIO(DataIO):
             # No match keys provided or target does not exist -> simple write/create behavior.
             if target is None:
                 # Table doesn't exist: create it with df schema
-                df.write.format("delta").mode("overwrite").options(**spark_options).saveAsTable(full_name)
+                (
+                    df.write.format("delta")
+                    .mode("overwrite")
+                    .options(**spark_options)
+                    .saveAsTable(save_path)
+                )
             else:
                 # Table exists but no match key specified: append incoming rows.
                 # This cannot be idempotent; caller should provide match_keys for upserts.
-                df.write.format("delta").mode(mode).options(**spark_options).saveAsTable(full_name)
+                (
+                    df
+                    .write.format("delta").mode(mode)
+                    .options(**spark_options)
+                    .saveAsTable(save_path)
+                )
 
         # --- Optimize: Z-ORDER for faster lookups by composite key (Databricks) ---
-        if optimize_after_merge and zorder_cols:
-            cols = ", ".join([f"`{c}`" for c in zorder_cols])
-            self.spark.sql(f"OPTIMIZE {full_name} ZORDER BY ({cols})")
+        if target:
+            if optimize_after_merge and zorder_cols:
+                # pass columns as varargs
+                target.optimize().executeZOrderBy(*zorder_cols)
 
-        # --- Optional VACUUM ---
-        if vacuum_hours is not None:
-            # Beware data retention policies; set to a safe value or use default 7 days
-            self.spark.sql(f"VACUUM {full_name} RETAIN {vacuum_hours} HOURS")
+            # --- Optional VACUUM ---
+            if vacuum_hours is not None:
+                # Beware data retention policies; set to a safe value or use default 7 days
+                target.vacuum(vacuum_hours)

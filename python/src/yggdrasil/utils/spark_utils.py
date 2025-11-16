@@ -4,14 +4,12 @@ from typing import Any
 
 import polars as pl
 import pyarrow as pa
-import pandas as pd
-
 import pyspark as spark
 import pyspark.sql as spark_sql
 import pyspark.sql.functions as spark_functions
 import pyspark.sql.types as spark_types
 
-from yggdrasil.utils.arrow_utils import safe_arrow_tabular
+from .arrow_utils import safe_arrow_tabular
 
 ARROW_TYPE_TO_SPARK_TYPE = {
     pa.bool_(): spark_types.BooleanType(),

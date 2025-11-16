@@ -1,16 +1,13 @@
 # fake_module.py
 import sys
-import logging
 from types import ModuleType
 from typing import Any
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-__all__ = ["make_fake_module"]
+__all__ = ["make_fake_module", "FakeObject", "FakeModule"]
 
 
-class _FakeValue:
+class FakeObject:
     __slots__ = ("_name", "_inner")  # _inner will store monkey-patched attributes
 
     def __hash__(self):
@@ -20,13 +17,12 @@ class _FakeValue:
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_inner", {})  # store any dynamically assigned attributes
 
-    def __getattr__(self, item: str) -> "_FakeValue":
+    def __getattr__(self, item: str) -> "FakeObject":
         inner = object.__getattribute__(self, "_inner")
         if item in inner:
             return inner[item]  # return previously set monkey-patched value
         name = object.__getattribute__(self, "_name")
-        logger.debug("Accessing attribute %s on fake value %s", item, name)
-        val = _FakeValue(f"{name}.{item}" if name else item)
+        val = FakeObject(f"{name}.{item}" if name else item)
         inner[item] = val  # cache so repeated access returns the same
         return val
 
@@ -67,7 +63,7 @@ class _FakeValue:
         name = object.__getattribute__(self, "_name")
         if key in inner:
             return inner[key]
-        val = _FakeValue(f"{name}[{key}]" if name else f"[{key}]")
+        val = FakeObject(f"{name}[{key}]" if name else f"[{key}]")
         inner[key] = val
         return val
 
@@ -88,14 +84,13 @@ class FakeModule(ModuleType):
         super().__init__(name)
         self.__dict__["_fake_strict"] = bool(strict)
         self.__dict__["__is_fake_module__"] = True
-        logger.info("Created fake module: %s, strict=%s", name, strict)
 
     def __getattr__(self, name: str):
         if name in self.__dict__:
             return self.__dict__[name]
         if self.__dict__.get("_fake_strict", False):
             return None
-        return _FakeValue(name)
+        return FakeObject(name)
 
     def __setattr__(self, name: str, value):
         super().__setattr__(name, value)
@@ -110,11 +105,9 @@ def make_fake_module(module_name: str, strict: bool = False, inject: bool = True
     - inject: if True, insert into sys.modules
     """
     if module_name in sys.modules:
-        logger.info("Module %s already exists, skipping fake creation", module_name)
         return sys.modules[module_name]
 
     fake = FakeModule(module_name, strict=strict)
     if inject:
         sys.modules[module_name] = fake
-        logger.info("Injected fake module %s into sys.modules", module_name)
     return fake

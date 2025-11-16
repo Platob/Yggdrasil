@@ -3,6 +3,7 @@ Abstract DataWriter class for writing data in different formats.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Optional
 
@@ -17,35 +18,44 @@ except ImportError:
 
 __all__ = [
     "SaveMode",
-    "DataIO"
+    "DataTableIO"
 ]
+
 
 class SaveMode(StrEnum):
     Overwrite = "overwrite"
     Append = "append"
 
 
-class DataIO(ABC):
+@dataclass(frozen=True)
+class DataTableIO(ABC):
     """
     Abstract base class for data writers.
 
     Implementations should provide methods to write data from polars and spark
     dataframes to various destinations.
     """
-    __spark: spark_sql.SparkSession = None
+    location: TableLocation
+    schema: DataField | None
+
+    def __post_init__(self):
+        setattr(self, "location", TableLocation.parse_any(self.location))
+
+        if self.schema:
+            setattr(self, "schema", DataField.parse_any(self.schema))
 
     @classmethod
     def get_spark(cls):
-        if cls.__spark is None:
-            cls.__spark = spark_sql.SparkSession.getActiveSession()
+        session = spark_sql.SparkSession.getActiveSession()
 
-        if not cls.__spark:
+        if not session:
             raise ValueError(f"No spark session available for {cls.__name__}")
 
-        return cls.__spark
+        return session
 
+    @classmethod
     @abstractmethod
-    def get_schema(self, location: TableLocation) -> DataField:
+    def load_schema(cls, location: TableLocation) -> DataField:
         """
         Get the DataField representing the schema of the data.
 
@@ -53,68 +63,5 @@ class DataIO(ABC):
             location: The TableLocation object representing the data location.
         Returns:
             DataField: The field representing the schema of the data.
-        """
-        pass
-
-    @abstractmethod
-    def read_spark(
-        self,
-        location: TableLocation,
-        schema: Optional[DataField] = None,
-        **kwargs
-    ) -> spark_sql.DataFrame:
-        """
-        Write data from a spark DataFrame.
-
-        Args:
-            location: TableLocation
-            schema: DataField to select as or select all
-            **kwargs: Additional arguments for the writer.
-        """
-        pass
-
-    def write_spark(
-        self,
-        location: TableLocation,
-        df: spark_sql.DataFrame,
-        mode: SaveMode = SaveMode.Overwrite,
-        **kwargs
-    ) -> None:
-        """
-        Write data from a spark DataFrame.
-
-        Args:
-            location: TableLocation
-            df: The spark DataFrame to write.
-            mode: The mode to write the data to.
-            **kwargs: Additional arguments for the writer.
-        """
-        target_schema = self.get_schema(location)
-        casted = target_schema.cast_spark_dataframe(df)
-
-        return self._write_spark(
-            location=location,
-            df=casted,
-            mode=mode,
-            **kwargs
-        )
-
-
-    @abstractmethod
-    def _write_spark(
-        self,
-        location: TableLocation,
-        df: spark_sql.DataFrame,
-        mode: SaveMode = SaveMode.Overwrite,
-        **kwargs
-    ) -> None:
-        """
-        Write data from a spark DataFrame.
-
-        Args:
-            location: TableLocation
-            df: The spark DataFrame to write.
-            mode: The mode to write the data to.
-            **kwargs: Additional arguments for the writer.
         """
         pass

@@ -6,7 +6,7 @@ This module provides a decorator for creating dataclasses with PyArrow schema in
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union
+from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union, Iterable
 
 import pandas
 import polars as pl
@@ -133,6 +133,46 @@ class DataField:
             object.__setattr__(self, "children", [_.refine() for _ in self.children])
 
         return self
+
+    @classmethod
+    def parse_any(cls, obj: Any) -> DataField:
+        if isinstance(obj, DataField):
+            return DataField
+        if isinstance(obj, pa.Field):
+            return cls.from_arrow_field(obj)
+        if isinstance(obj, pa.DataType):
+            return cls.from_arrow_type(name=str(obj), dtype=obj)
+        if isinstance(obj, pa.Schema):
+            return cls.from_arrow_schema(obj)
+        return cls.from_py_hint(obj)
+
+    @classmethod
+    def from_children(
+        cls,
+        fields: Iterable[DataField],
+        name: str | None = None,
+        nullable: bool = False,
+        comment: str | None = None,
+        metadata: dict | None = None
+    ):
+        if not fields:
+            raise ValueError("Cannot build DataField from nothing")
+
+        children = [
+            cls.parse_any(_) for _ in fields
+        ]
+        arrow_type = pa.struct([
+            _.to_arrow_field() for _ in children
+        ])
+
+        return DataField(
+            name=name or "root",
+            arrow_type=arrow_type,
+            nullable=nullable,
+            children=children,
+            comment=comment,
+            metadata=metadata
+        ).refine()
 
 
     @classmethod
