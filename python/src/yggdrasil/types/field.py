@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular, ArrowArrayLike, \
     get_child_array
+from ..utils.polars_utils import polars_to_arrow_type
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
     spark_sql, spark_functions, safe_spark_dataframe
@@ -334,7 +335,7 @@ class DataField:
             comment=None,
             children=None,
             metadata=field.metadata,
-        )
+        ).refine()
 
     @classmethod
     def from_arrow_schema(
@@ -364,6 +365,16 @@ class DataField:
         )
 
         return cls.from_arrow_field(field)
+
+    @classmethod
+    def from_polars_field(cls, field: pl.Field):
+        arrow_type = polars_to_arrow_type(field.dtype)
+
+        return cls.from_arrow_type(
+            name=field.name,
+            dtype=arrow_type,
+            nullable=True
+        )
 
     @classmethod
     def from_spark_field(cls, spark_field: spark_types.StructField) -> "DataField":
