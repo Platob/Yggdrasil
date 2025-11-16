@@ -201,11 +201,15 @@ def merge_dicts(dicts: Iterable, default = None) -> Optional[dict]:
 def index_of(
     collection: list[str],
     value: str,
+    strict_names: bool | None = None,
     raise_error: bool = True
 ) -> int:
     try:
         return collection.index(value)
     except ValueError:
+        if strict_names:
+            raise ValueError(f"Cannot find '{value}' in {collection}")
+
         idx = 0
 
         for item in collection:

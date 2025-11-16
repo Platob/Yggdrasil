@@ -538,7 +538,8 @@ class DataField:
     def cast_spark_dataframe(
         self,
         df: spark_sql.DataFrame,
-        safe: bool | None = None
+        safe: bool | None = None,
+        strict_names: bool | None = None,
     ) -> spark_sql.DataFrame:
         """Cast a Spark DataFrame to match this DataField's schema.
 
@@ -548,6 +549,7 @@ class DataField:
         Args:
             df: The source Spark DataFrame to cast
             safe: Safe cast
+            strict_names: Strict name select
 
         Returns:
             A new Spark DataFrame with columns cast to the appropriate types
@@ -641,7 +643,8 @@ class DataField:
     def cast_polars_dataframe(
         self,
         df: "pl.DataFrame",
-        safe: bool | None = None
+        safe: bool | None = None,
+        strict_names: bool | None = None,
     ) -> "pl.DataFrame":
         """Cast a Polars DataFrame to match this DataField's schema (when this DataField is a struct).
 
@@ -688,6 +691,7 @@ class DataField:
         self,
         arr: ArrowArrayLike,
         safe: bool | None = None,
+        strict_names: bool | None = None,
         memory_pool: pa.MemoryPool | None = None,
         use_polars: bool | None = True
     ) -> ArrowArrayLike:
@@ -787,6 +791,7 @@ class DataField:
         self,
         df: ArrowTabular,
         safe: bool | None = None,
+        strict_names: bool | None = None,
         memory_pool: pa.MemoryPool | None = None
     ) -> ArrowTabular:
         """
@@ -825,24 +830,26 @@ class DataField:
         self,
         df,
         safe: bool | None = None,
+        strict_names: bool | None = None,
     ):
         table = pa.Table.from_pandas(df, preserve_index=bool(df.index.name))
-        return self.cast_arrow_tabular(table, safe=safe).to_pandas()
+        return self.cast_arrow_tabular(table, safe=safe, strict_names=strict_names).to_pandas()
 
     def cast(
         self,
         df,
         safe: bool | None = None,
+        strict_names: bool | None = None,
     ):
         if isinstance(df, (pa.RecordBatch, pa.Table)):
-            return self.cast_arrow_tabular(df, safe=safe)
+            return self.cast_arrow_tabular(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, (pa.Array, pa.ChunkedArray)):
-            return self.cast_arrow_array(df, safe=safe)
+            return self.cast_arrow_array(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, pl.DataFrame):
-            return self.cast_polars_dataframe(df, safe=safe)
+            return self.cast_polars_dataframe(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, pandas.DataFrame):
-            return self.cast_pandas_dataframe(df, safe=safe)
+            return self.cast_pandas_dataframe(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, spark_sql.DataFrame):
-            return self.cast_spark_dataframe(df, safe=safe)
+            return self.cast_spark_dataframe(df, safe=safe, strict_names=strict_names)
 
         raise ValueError(f"Cannot cast {df} with {self}")

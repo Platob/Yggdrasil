@@ -1,8 +1,10 @@
+import functools
 import decimal as dec
 import datetime as dt
 import pyarrow as pa
 import polars as pl
 import pandas as pd
+import numpy as np
 
 from .py_utils import index_of
 
@@ -43,7 +45,7 @@ ARROW_DEFAULT_SCALARS: dict[pa.DataType, pa.Scalar] = {
     pa.uint16(): pa.scalar(0, pa.uint16()),
     pa.uint32(): pa.scalar(0, pa.uint32()),
     pa.uint64(): pa.scalar(0, pa.uint64()),
-    pa.float16(): pa.scalar(0.0, pa.float16()),
+    pa.float16(): pa.scalar(np.float16(0), pa.float16()),
     pa.float32(): pa.scalar(0.0, pa.float32()),
     pa.float64(): pa.scalar(0.0, pa.float64()),
 }
@@ -66,11 +68,40 @@ def safe_arrow_tabular(obj) -> ArrowTabular:
     raise TypeError(f"Cannot convert {type(obj)} to arrow Table or RecordBatch")
 
 
+def apply_arrow_array_like(func):
+    """
+    Decorator: if the first argument is a ChunkedArray, apply `func` to each chunk
+    and return a ChunkedArray; otherwise apply directly to the array.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not args:
+            raise ValueError("Function must have at least one positional argument")
+
+        first_arg = args[0]
+
+        if isinstance(first_arg, pa.ChunkedArray):
+            # apply func to each chunk
+            chunks = [
+                func(chunk, *args[1:], **kwargs)
+                for chunk in first_arg.chunks
+            ]
+            # reconstruct chunked array
+            return pa.chunked_array(chunks, type=first_arg.type)
+        elif isinstance(first_arg, pa.Array):
+            return func(*args, **kwargs)
+        else:
+            raise TypeError(f"Expected pa.Array or pa.ChunkedArray, got {type(first_arg)}")
+
+    return wrapper
+
+
+@apply_arrow_array_like
 def get_child_array(
-    field: pa.Field,
     arr: ArrowArrayLike | pa.StructArray,
+    field: pa.Field,
     index: int | None = None,
-    safe: bool | None = None,
+    strict_names: bool | None = None,
     default: pa.Scalar | None = None,
     memory_pool: pa.MemoryPool | None = None
 ) -> ArrowArrayLike:
@@ -78,23 +109,15 @@ def get_child_array(
     arrow_type: pa.StructType = field.type
 
     if not index or index < 0:
-        index = index_of(collection=arrow_type.names, value=field.name, raise_error=False)
+        index = index_of(
+            collection=arrow_type.names, value=field.name,
+            strict_names=strict_names,
+            raise_error=False
+        )
 
         if index < 0:
-            if safe:
+            if strict_names:
                 raise pa.ArrowInvalid(f"Cannot find '{field.name}' in {arrow_type}")
-
-
-            if isinstance(arr, pa.ChunkedArray):
-                return pa.chunked_array([
-                    array_nulls(
-                        field=field,
-                        size=array_length(chunk),
-                        default=default,
-                        memory_pool=memory_pool
-                    )
-                    for chunk in arr.chunks
-                ])
 
             return array_nulls(
                 field=field,
