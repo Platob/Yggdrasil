@@ -129,6 +129,9 @@ class DataField:
                 arrow_type = pa.list_(list_type.value_field, fixed_size)
                 object.__setattr__(self, "arrow_type", arrow_type)
 
+        if self.children:
+            object.__setattr__(self, "children", [_.refine() for _ in self.children])
+
         return self
 
 
