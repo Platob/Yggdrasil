@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import polars
 import pyarrow as pa
 
 from .fake_module import make_fake_module
@@ -62,6 +63,28 @@ __all__ = [
     "spark_to_arrow_type",
     "cast_nested_spark_field",
 ]
+
+
+# Monkey patch
+def toPolars(self: spark_sql.DataFrame):
+    from ..types import DataField
+
+    schema = DataField.from_spark_type(
+        name="root",
+        spark_type=self.schema,
+        nullable=False,
+        metadata=None
+    )
+    arrow_table: pa.Table = self.toArrow()
+    polars_field: polars.Field = schema.to_polars_field()
+    polars_type: polars.Struct = polars_field.dtype
+    polars_schema = {
+        field.name: field.dtype
+        for field in polars_type.fields
+    }
+    return polars.from_arrow(arrow_table, schema=polars_schema)
+
+setattr(spark_sql.DataFrame, "toPolars", toPolars)
 
 
 def spark_to_arrow_type(spark_type: spark_types.DataType):

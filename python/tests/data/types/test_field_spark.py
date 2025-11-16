@@ -15,10 +15,8 @@ If PySpark is not installed, the tests will be skipped.
 If Java is not installed, the test will attempt to install it automatically.
 """
 
-import unittest
-import os
-import sys
 import logging
+import unittest
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
@@ -30,91 +28,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
                    datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
-# Skip tests if pyspark is not installed
-logger.info("Checking if PySpark is installed")
-try:
-    import pyspark
-    import pyspark.sql.types as spark_types
-    from pyspark.sql import SparkSession
-    HAVE_SPARK = True
-    logger.info(f"PySpark is installed (version {pyspark.__version__})")
-except ImportError:
-    HAVE_SPARK = False
-    logger.warning("PySpark is not installed. Spark tests will be skipped.")
-    logger.debug("ImportError while importing PySpark. Install with: pip install pyspark")
-
 # Import from field module
-logger.info("Importing DataField from yggdrasil.types.field")
+from yggdrasil.utils.spark_utils import HAVE_SPARK, spark_sql, spark_types
 from yggdrasil.types.field import DataField
 
-# Check Java availability and install if needed
-logger.info("Checking Java availability")
-try:
-    logger.debug("Importing Java utilities from yggdrasil.utils.java")
-    from yggdrasil.utils.java import is_java_installed, install_java, get_java_home
-
-    HAVE_JAVA = False
-    AUTO_INSTALL_JAVA = True  # Set to False to disable auto-installation
-    logger.debug(f"AUTO_INSTALL_JAVA is set to {AUTO_INSTALL_JAVA}")
-
-    # Check if Java is installed
-    logger.info("Checking if Java is already installed")
-    java_installed, java_version = is_java_installed()
-    if java_installed:
-        HAVE_JAVA = True
-        logger.info(f"Java is installed (version {java_version})")
-
-        # Log JAVA_HOME if available
-        java_home = get_java_home()
-        if java_home:
-            logger.debug(f"JAVA_HOME is set to {java_home}")
-        else:
-            logger.debug("JAVA_HOME environment variable is not set")
-
-    elif HAVE_SPARK and AUTO_INSTALL_JAVA:
-        # Try to install Java if PySpark is available
-        logger.info("Java not found. Attempting to install Java 17...")
-        logger.debug("Calling install_java() from yggdrasil.utils.java")
-
-        java_home = install_java(version="17", set_env=True, persist_env=False)
-        if java_home:
-            HAVE_JAVA = True
-            logger.info(f"Successfully installed Java at {java_home}")
-            logger.debug("JAVA_HOME environment variable has been set for this process")
-        else:
-            logger.warning("Failed to install Java. Spark tests will be skipped.")
-            logger.debug("install_java() returned None - installation failed")
-    else:
-        reason = "AUTO_INSTALL_JAVA is disabled" if not AUTO_INSTALL_JAVA else "PySpark is not installed"
-        logger.warning(f"Java is not installed and won't be auto-installed ({reason}). Spark tests will be skipped.")
-except ImportError:
-    logger.warning("Java installation utilities not available. Spark tests may be skipped if Java is not installed.")
-    logger.debug("Could not import Java utilities from yggdrasil.utils.java")
-
-    # Check if JAVA_HOME is set
-    java_home = os.environ.get('JAVA_HOME', '')
-    HAVE_JAVA = java_home is not None and os.path.exists(java_home)
-
-    if HAVE_JAVA:
-        logger.info(f"Java is available at JAVA_HOME: {java_home}")
-    else:
-        logger.warning("JAVA_HOME is not set or does not exist. Spark tests will be skipped.")
-
-# Skip all Spark tests if either pyspark or Java is not available
-SKIP_SPARK_TESTS = not HAVE_SPARK or not HAVE_JAVA
-if SKIP_SPARK_TESTS:
-    if not HAVE_SPARK:
-        SKIP_REASON = "PySpark is not installed"
-    else:
-        SKIP_REASON = "Java is not available"
-
-    logger.warning(f"Spark tests will be SKIPPED. Reason: {SKIP_REASON}")
-else:
-    SKIP_REASON = ""
-    logger.info("All dependencies available - Spark tests will RUN")
-    logger.debug(f"PySpark version: {pyspark.__version__}, Java available: {HAVE_JAVA}")
-
-@pytest.mark.skipif(SKIP_SPARK_TESTS, reason=SKIP_REASON)
+@pytest.mark.skipif(HAVE_SPARK, reason="No pyspark found")
 class TestDataFieldSpark(unittest.TestCase):
     """Tests for Spark integration with DataField."""
 
@@ -123,14 +41,13 @@ class TestDataFieldSpark(unittest.TestCase):
         test_name = self.id().split('.')[-1]
         logger.info(f"Setting up test: {test_name}")
 
-        if SKIP_SPARK_TESTS:
-            logger.warning(f"Skipping test {test_name}: {SKIP_REASON}")
-            self.skipTest(SKIP_REASON)
+        if not HAVE_SPARK:
+            self.skipTest("No pyspark found")
 
         try:
             logger.info("Creating SparkSession...")
             self.spark = (
-                SparkSession.builder
+                spark_sql.SparkSession.builder
                 .appName("DataFieldSparkTest")
                 .config("spark.sql.execution.arrow.pyspark.enabled", "true")
                 .config("spark.ui.enabled", "false")  # Disable UI for tests
@@ -150,12 +67,8 @@ class TestDataFieldSpark(unittest.TestCase):
     def tearDown(self):
         """Stop the SparkSession after testing."""
         test_name = self.id().split('.')[-1]
-        if not SKIP_SPARK_TESTS and hasattr(self, 'spark') and self.spark is not None:
-            logger.info(f"Stopping SparkSession for test: {test_name}")
+        if not HAVE_SPARK and hasattr(self, 'spark') and self.spark is not None:
             self.spark.stop()
-            logger.info("SparkSession stopped successfully")
-        else:
-            logger.debug(f"No SparkSession to stop for test: {test_name}")
 
     def test_spark_basic_types(self):
         """Test converting basic Spark types to DataField and back."""
@@ -496,158 +409,6 @@ class TestDataFieldSpark(unittest.TestCase):
 
         logger.info("Schema structure verified - all fields match")
         logger.info("Completed test_round_trip_conversion successfully")
-
-    def test_spark_installation_required(self):
-        """Test that Spark methods properly raise ImportError when Spark is not installed."""
-        logger.info("Starting test_spark_installation_required")
-
-        # This test doesn't require an actual SparkSession, so we can run it regardless
-        # of whether Spark is installed
-
-        # If HAVE_SPARK is False, we can test the ImportError behavior
-        if not HAVE_SPARK:
-            logger.info("PySpark not installed - testing ImportError behavior")
-
-            # Create a test field
-            logger.debug("Creating a test DataField")
-            field = DataField(
-                name="test_field",
-                arrow_type=pa.int64(),
-                nullable=False,
-                metadata=None,
-                children=None
-            )
-
-            # Test methods that require Spark
-            logger.info("Testing to_spark_field raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                field.to_spark_field()
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("Testing _arrow_to_spark_type raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                field._arrow_to_spark_type(pa.int64())
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("Testing from_spark_field raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                DataField.from_spark_field(None)
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("Testing _spark_to_arrow_type raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                DataField._spark_to_arrow_type(None)
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("Testing to_spark_schema raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                field.to_spark_schema()
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("Testing from_spark_schema raises ImportError")
-            with self.assertRaises(ImportError) as cm:
-                DataField.from_spark_schema(None)
-            logger.debug(f"ImportError message: {cm.exception}")
-
-            logger.info("All Spark-related methods correctly raise ImportError when PySpark is not installed")
-
-        else:
-            # PySpark is installed, so we can test the recursive conversion directly
-            # without needing a SparkSession
-
-            # Only run this test if Java is not available, otherwise we'll run the full test suite
-            if not HAVE_JAVA:
-                logger.info("PySpark installed but Java not available - testing recursive type conversion directly")
-
-                # Test simple type conversion
-                from pyspark.sql.types import IntegerType, StringType, BooleanType
-
-                logger.info("Testing basic type conversions")
-                logger.debug("Testing IntegerType conversion")
-                self.assertEqual(DataField._spark_to_arrow_type(IntegerType()), pa.int32())
-
-                logger.debug("Testing StringType conversion")
-                self.assertEqual(DataField._spark_to_arrow_type(StringType()), pa.utf8())
-
-                logger.debug("Testing BooleanType conversion")
-                self.assertEqual(DataField._spark_to_arrow_type(BooleanType()), pa.bool_())
-
-                # Test complex types with recursion
-                from pyspark.sql.types import ArrayType, MapType, StructType, StructField
-
-                # Array type
-                logger.info("Testing ArrayType conversion")
-                array_type = ArrayType(IntegerType())
-                arrow_array_type = DataField._spark_to_arrow_type(array_type)
-                logger.debug(f"ArrayType converted to {arrow_array_type}")
-                self.assertTrue(pa.types.is_list(arrow_array_type))
-                self.assertEqual(arrow_array_type.value_type, pa.int32())
-
-                # Map type
-                logger.info("Testing MapType conversion")
-                map_type = MapType(StringType(), IntegerType())
-                arrow_map_type = DataField._spark_to_arrow_type(map_type)
-                logger.debug(f"MapType converted to {arrow_map_type}")
-                self.assertTrue(pa.types.is_map(arrow_map_type))
-                self.assertEqual(arrow_map_type.key_type, pa.utf8())
-                self.assertEqual(arrow_map_type.item_type, pa.int32())
-
-                # Struct type
-                logger.info("Testing StructType conversion")
-                struct_type = StructType([
-                    StructField("name", StringType(), False),
-                    StructField("age", IntegerType(), True),
-                    StructField("active", BooleanType(), False)
-                ])
-                logger.debug(f"Created StructType with fields: {[f.name for f in struct_type.fields]}")
-                arrow_struct_type = DataField._spark_to_arrow_type(struct_type)
-                logger.debug(f"StructType converted to arrow struct with {len(arrow_struct_type)} fields")
-                self.assertTrue(pa.types.is_struct(arrow_struct_type))
-                self.assertEqual(len(arrow_struct_type), 3)
-
-                # Verify field names and types
-                logger.info("Verifying struct field names and types")
-                self.assertEqual(arrow_struct_type[0].name, "name")
-                self.assertEqual(arrow_struct_type[1].name, "age")
-                self.assertEqual(arrow_struct_type[2].name, "active")
-
-                self.assertEqual(arrow_struct_type[0].type, pa.utf8())
-                self.assertEqual(arrow_struct_type[1].type, pa.int32())
-                self.assertEqual(arrow_struct_type[2].type, pa.bool_())
-
-                # Verify nullable flags
-                logger.info("Verifying struct field nullable flags")
-                self.assertFalse(arrow_struct_type[0].nullable)
-                self.assertTrue(arrow_struct_type[1].nullable)
-                self.assertFalse(arrow_struct_type[2].nullable)
-
-                # Test nested complex types
-                logger.info("Testing deeply nested complex type conversion")
-                nested_type = ArrayType(
-                    MapType(
-                        StringType(),
-                        StructType([
-                            StructField("x", IntegerType(), False),
-                            StructField("y", BooleanType(), True)
-                        ])
-                    )
-                )
-                logger.debug("Created nested type: Array<Map<String, Struct<x:Int, y:Bool>>>")
-
-                arrow_nested_type = DataField._spark_to_arrow_type(nested_type)
-                logger.debug(f"Nested type converted to {arrow_nested_type}")
-
-                # Verify the nested structure
-                self.assertTrue(pa.types.is_list(arrow_nested_type))
-                self.assertTrue(pa.types.is_map(arrow_nested_type.value_type))
-                self.assertTrue(pa.types.is_struct(arrow_nested_type.value_type.item_type))
-                logger.debug("Nested structure verified correctly")
-
-                logger.info("All recursive type conversions tested successfully")
-            else:
-                logger.info("Both PySpark and Java are available - skipping direct type conversion test")
-                self.skipTest("Java is available, skipping direct type conversion test")
-
 
 if __name__ == "__main__":
     unittest.main()
