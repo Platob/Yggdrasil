@@ -714,8 +714,8 @@ class DataField:
                 arrays=[
                     child.cast_arrow_array(
                         get_child_array(
+                            arr,
                             field=child.to_arrow_field(),
-                            arr=arr,
                             safe=safe,
                             memory_pool=memory_pool
                         ),
