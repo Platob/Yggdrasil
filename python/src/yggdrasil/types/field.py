@@ -12,9 +12,11 @@ import pandas
 import polars as pl
 import pyarrow as pa
 
+from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular, ArrowArrayLike, \
+    get_child_array
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
-from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular
-from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
+from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
+    spark_sql, spark_functions
 
 __all__ = [
     "DataField",
@@ -684,11 +686,11 @@ class DataField:
 
     def cast_arrow_array(
         self,
-        arr: pa.Array | pa.ChunkedArray,
+        arr: ArrowArrayLike,
         safe: bool | None = None,
         memory_pool: pa.MemoryPool | None = None,
         use_polars: bool | None = True
-    ):
+    ) -> ArrowArrayLike:
         if arr.type == self.arrow_type:
             return arr
 
@@ -703,6 +705,25 @@ class DataField:
         source_field = self.from_arrow_type(name="arr", dtype=arr.type, nullable=True)
         casted = None
 
+        if self.is_struct():
+            casted = pa.StructArray.from_arrays(
+                arrays=[
+                    child.cast_arrow_array(
+                        get_child_array(
+                            field=child.to_arrow_field(),
+                            arr=arr,
+                            safe=safe,
+                            memory_pool=memory_pool
+                        ),
+                        safe=safe,
+                        memory_pool=memory_pool,
+                        use_polars=use_polars
+                    )
+                    for idx, child in enumerate(self.children)
+                ],
+                memory_pool=memory_pool,
+                type=self.arrow_type
+            )
         if self.is_list_like():
             target_item_field = self.children[0]
 

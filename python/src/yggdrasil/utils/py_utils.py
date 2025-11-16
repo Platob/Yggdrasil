@@ -21,7 +21,8 @@ __all__ = [
     "safe_bool",
     "safe_dict",
     "safe_int",
-    "merge_dicts"
+    "merge_dicts",
+    "index_of"
 ]
 
 TRUE_STR_VALUES = {"True", "true", "1", "Yes", "yes"}
@@ -195,6 +196,27 @@ def merge_dicts(dicts: Iterable, default = None) -> Optional[dict]:
             merged.update(d)
 
     return merged or default
+
+
+def index_of(
+    collection: list[str],
+    value: str,
+    raise_error: bool = True
+) -> int:
+    try:
+        return collection.index(value)
+    except ValueError:
+        idx = 0
+
+        for item in collection:
+            if safe_str(value).casefold() == safe_str(item).casefold():
+                return idx
+            idx += 1
+
+        if raise_error:
+            raise ValueError(f"Cannot find '{value}' in {collection}")
+
+        return -1
 
 
 def is_py_scalar(obj: Any) -> bool:
