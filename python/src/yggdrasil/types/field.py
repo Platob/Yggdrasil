@@ -766,7 +766,7 @@ class DataField:
                     safe=safe,
                     memory_pool=memory_pool
                 )
-                key_values: list[pa.Array] = key_values.flatten(pool=memory_pool)
+                key_values: list[pa.Array] = key_values.flatten(memory_pool=memory_pool)
                 casted = pa.MapArray.from_arrays(
                     offsets=list_array.offsets,
                     keys=key_values[0],
