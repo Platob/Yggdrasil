@@ -719,10 +719,11 @@ class DataField:
                         get_child_array(
                             arr,
                             field=child.to_arrow_field(),
-                            safe=safe,
+                            strict_names=strict_names,
                             memory_pool=memory_pool
                         ),
                         safe=safe,
+                        strict_names=strict_names,
                         memory_pool=memory_pool,
                         use_polars=use_polars
                     )
