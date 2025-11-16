@@ -17,17 +17,32 @@ __all__ = [
     "DeltaTableIO"
 ]
 
+
 @dataclass
 class DeltaTableIO(DataTableIO):
     spark: spark_sql.SparkSession | None
 
     @classmethod
-    def parse_any(cls, path: Any):
+    def parse_any(
+        cls,
+        path: Any,
+        schema: DataField | None = None,
+        spark_session: spark_sql.SparkSession | None = None
+    ):
         location = TableLocation.parse_any(path)
+
+        if not schema:
+            try:
+                schema = cls.load_schema(
+                    location=location,
+                    spark_session=spark_session
+                )
+            except Exception:
+                pass
 
         return DeltaTableIO(
             location=location,
-            schema=None,
+            schema=schema,
             spark=cls.get_spark(raise_error=False)
         )
 
@@ -50,8 +65,15 @@ class DeltaTableIO(DataTableIO):
         )
 
     @classmethod
-    def load_schema(cls, location: TableLocation) -> DataField:
-        df = cls.get_spark_delta_table(location, cls.get_spark()).toDF()
+    def load_schema(
+        cls,
+        location: TableLocation,
+        spark_session: spark_sql.SparkSession | None = None
+    ) -> DataField:
+        df = cls.get_spark_delta_table(
+            location,
+            spark_session=spark_session or cls.get_spark()
+        ).toDF()
 
         return DataField.from_spark_type(
             name=location.entity.table_name,
