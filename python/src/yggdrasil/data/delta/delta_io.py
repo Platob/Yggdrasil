@@ -134,17 +134,16 @@ class DeltaIO(DataIO):
 
             df = df.dropna(subset=list(match_keys))  # enforce keys not null
 
-        spark = df.sparkSession
         schema = self.get_schema(location)
         df = schema.cast(df)
-        df = safe_spark_dataframe(df, spark_session=spark)
+        df = safe_spark_dataframe(df, spark_session=self.spark)
         full_name = location.delta_table_name()
 
         # --- Ensure catalog/schema exist (Unity Catalog) ---
         if location.catalog_name and create_catalog_if_missing:
-            spark.sql(f"CREATE CATALOG IF NOT EXISTS `{location.catalog_name}`")
+            self.spark.sql(f"CREATE CATALOG IF NOT EXISTS `{location.catalog_name}`")
         if location.schema_name and create_schema_if_missing:
-            spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{location.catalog_name}`.`{location.schema_name}`")
+            self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{location.catalog_name}`.`{location.schema_name}`")
 
         # --- Merge (upsert) ---
         target = None
@@ -179,9 +178,9 @@ class DeltaIO(DataIO):
         # --- Optimize: Z-ORDER for faster lookups by composite key (Databricks) ---
         if optimize_after_merge and zorder_cols:
             cols = ", ".join([f"`{c}`" for c in zorder_cols])
-            spark.sql(f"OPTIMIZE {full_name} ZORDER BY ({cols})")
+            self.spark.sql(f"OPTIMIZE {full_name} ZORDER BY ({cols})")
 
         # --- Optional VACUUM ---
         if vacuum_hours is not None:
             # Beware data retention policies; set to a safe value or use default 7 days
-            spark.sql(f"VACUUM {full_name} RETAIN {vacuum_hours} HOURS")
+            self.spark.sql(f"VACUUM {full_name} RETAIN {vacuum_hours} HOURS")
