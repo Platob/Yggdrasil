@@ -16,7 +16,9 @@ from yggdrasil.utils.arrow_utils import safe_arrow_tabular
 ARROW_TYPE_TO_SPARK_TYPE = {
     pa.bool_(): spark_types.BooleanType(),
     pa.utf8(): spark_types.StringType(),
+    pa.large_string(): spark_types.StringType(),
     pa.binary(): spark_types.BinaryType(),
+    pa.large_binary(): spark_types.BinaryType(),
     pa.int8(): spark_types.ByteType(),
     pa.int16(): spark_types.IntegerType(),
     pa.int32(): spark_types.IntegerType(),
@@ -64,6 +66,7 @@ __all__ = [
     "spark", "spark_sql", "spark_types", "spark_functions",
     "spark_to_arrow_type",
     "cast_nested_spark_field",
+    "safe_spark_dataframe"
 ]
 
 
