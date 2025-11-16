@@ -3,6 +3,7 @@ from typing import Optional
 from ..data_io import DataIO, SaveMode
 from ..table_location import TableLocation
 from ...types import DataField
+from ...utils.py_utils import safe_dict, safe_str
 from ...utils.spark_utils import spark_sql, safe_spark_dataframe
 
 try:
@@ -111,12 +112,14 @@ class DeltaIO(DataIO):
         df, *,
         location: TableLocation,
         mode: str,
+        overwrite_schema: bool | None = None,
         match_keys: list[str] = None,
         zorder_cols: list[str] = None,
         create_catalog_if_missing: bool = False,
         create_schema_if_missing: bool = True,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
+        spark_options: dict[str, str] | None = None
     ) -> None:
         """
         Idempotent upsert (MERGE) of df into a Delta table in Unity Catalog.
@@ -138,6 +141,9 @@ class DeltaIO(DataIO):
         df = schema.cast(df)
         df = safe_spark_dataframe(df, spark_session=self.spark)
         full_name = location.delta_table_name()
+        spark_options = safe_dict(spark_options, default={}, check_key=safe_str)
+        if overwrite_schema:
+            spark_options["overwriteSchema"] = "true"
 
         # --- Ensure catalog/schema exist (Unity Catalog) ---
         if location.catalog_name and create_catalog_if_missing:
@@ -146,7 +152,6 @@ class DeltaIO(DataIO):
             self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{location.catalog_name}`.`{location.schema_name}`")
 
         # --- Merge (upsert) ---
-        target = None
         try:
             target = self.get_delta_table(location)
         except Exception:
@@ -169,11 +174,11 @@ class DeltaIO(DataIO):
             # No match keys provided or target does not exist -> simple write/create behavior.
             if target is None:
                 # Table doesn't exist: create it with df schema
-                df.write.format("delta").mode("overwrite").saveAsTable(full_name)
+                df.write.format("delta").mode("overwrite").options(**spark_options).saveAsTable(full_name)
             else:
                 # Table exists but no match key specified: append incoming rows.
                 # This cannot be idempotent; caller should provide match_keys for upserts.
-                df.write.format("delta").mode(mode).saveAsTable(full_name)
+                df.write.format("delta").mode(mode).options(**spark_options).saveAsTable(full_name)
 
         # --- Optimize: Z-ORDER for faster lookups by composite key (Databricks) ---
         if optimize_after_merge and zorder_cols:
