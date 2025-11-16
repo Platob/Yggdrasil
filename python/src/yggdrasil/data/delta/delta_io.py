@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 from ..data_io import DataTableIO
 from ..table_location import TableLocation
@@ -21,7 +22,7 @@ class DeltaTableIO(DataTableIO):
     spark: spark_sql.SparkSession | None
 
     @classmethod
-    def parse_any(cls, path: str):
+    def parse_any(cls, path: Any):
         location = TableLocation.parse_any(path)
 
         return DeltaTableIO(
@@ -38,10 +39,10 @@ class DeltaTableIO(DataTableIO):
     ):
         location = TableLocation.parse_any(location)
 
-        if location.entitiy:
+        if location.entity:
             return DeltaTable.forName(
                 spark_session,
-                location.entitiy.delta_table_full_name()
+                location.entity.delta_table_full_name()
             )
         return DeltaTable.forPath(
             spark_session,
@@ -53,7 +54,7 @@ class DeltaTableIO(DataTableIO):
         df = cls.get_spark_delta_table(location, cls.get_spark()).toDF()
 
         return DataField.from_spark_type(
-            name=location.entitiy.table_name,
+            name=location.entity.table_name,
             spark_type=df.schema,
             nullable=False,
             metadata=None
@@ -98,8 +99,8 @@ class DeltaTableIO(DataTableIO):
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"
 
-        entity_object = self.location.entitiy
-        save_path = self.location.entitiy.delta_table_full_name() if self.location.entitiy else self.location.fs_path
+        entity_object = self.location.entity
+        save_path = self.location.entity.delta_table_full_name() if self.location.entity else self.location.fs_path
 
         if entity_object:
             # --- Ensure catalog/schema exist (Unity Catalog) ---

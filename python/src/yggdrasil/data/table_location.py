@@ -1,7 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Optional
-
+from typing import Optional, Any
 
 __all__ = [
     "TableLocation",
@@ -84,10 +83,10 @@ class CatalogSchemaTable:
 @dataclass(frozen=True)
 class TableLocation:
     fs_path: str | None
-    entitiy: CatalogSchemaTable | None
+    entity: CatalogSchemaTable | None
 
     @classmethod
-    def parse_any(cls, obj: "TableLocation" | str) -> "TableLocation":
+    def parse_any(cls, obj: Any) -> "TableLocation":
         if isinstance(obj, TableLocation):
             return obj
 
@@ -97,7 +96,7 @@ class TableLocation:
         obj = obj.replace("\\", "/")
 
         if "/" in obj:
-            return cls(fs_path=obj, entitiy=None)
+            return cls(fs_path=obj, entity=None)
 
         sql_table = CatalogSchemaTable.parse(obj)
-        return cls(fs_path=None, entitiy=sql_table)
+        return cls(fs_path=None, entity=sql_table)
