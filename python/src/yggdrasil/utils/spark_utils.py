@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import polars
+from typing import Any
+
+import polars as pl
 import pyarrow as pa
+import pandas as pd
 
 import pyspark as spark
 import pyspark.sql as spark_sql
 import pyspark.sql.functions as spark_functions
 import pyspark.sql.types as spark_types
+
+from yggdrasil.utils.arrow_utils import safe_arrow_tabular
 
 ARROW_TYPE_TO_SPARK_TYPE = {
     pa.bool_(): spark_types.BooleanType(),
@@ -22,6 +27,38 @@ ARROW_TYPE_TO_SPARK_TYPE = {
     pa.date64(): spark_types.TimestampType(),
 }
 
+SPARK_TO_ARROW_TYPE_MAP = {
+    spark_types.BooleanType: lambda _: pa.bool_(),
+    spark_types.ByteType: lambda _: pa.int8(),
+    spark_types.ShortType: lambda _: pa.int16(),
+    spark_types.IntegerType: lambda _: pa.int32(),
+    spark_types.LongType: lambda _: pa.int64(),
+    spark_types.FloatType: lambda _: pa.float32(),
+    spark_types.DoubleType: lambda _: pa.float64(),
+    spark_types.StringType: lambda _: pa.utf8(),
+    spark_types.BinaryType: lambda _: pa.binary(),
+    spark_types.DateType: lambda _: pa.date32(),
+    spark_types.TimestampType: lambda _: pa.timestamp('us', "UTC"),
+    spark_types.TimestampNTZType: lambda _: pa.timestamp('us'),
+    spark_types.DecimalType: lambda t: pa.decimal128(t.precision, t.scale),
+
+    # Complex types with recursive conversion
+    spark_types.ArrayType: lambda t: pa.list_(spark_to_arrow_type(t.elementType)),
+    spark_types.MapType: lambda t: pa.map_(
+        spark_to_arrow_type(t.keyType),
+        spark_to_arrow_type(t.valueType),
+    ),
+    spark_types.StructType: lambda t: pa.struct([
+        pa.field(
+            field.name,
+            spark_to_arrow_type(field.dataType),
+            field.nullable,
+            metadata=field.metadata
+        )
+        for field in t.fields
+    ])
+}
+
 __all__ = [
     "ARROW_TYPE_TO_SPARK_TYPE",
     "spark", "spark_sql", "spark_types", "spark_functions",
@@ -32,24 +69,40 @@ __all__ = [
 
 # Monkey patch
 def toPolars(self: spark_sql.DataFrame):
-    from ..types import DataField
-
-    schema = DataField.from_spark_type(
-        name="root",
-        spark_type=self.schema,
-        nullable=False,
-        metadata=None
-    )
     arrow_table: pa.Table = self.toArrow()
-    polars_field: polars.Field = schema.to_polars_field()
-    polars_type: polars.Struct = polars_field.dtype
-    polars_schema = {
-        field.name: field.dtype
-        for field in polars_type.fields
-    }
-    return polars.from_arrow(arrow_table, schema=polars_schema)
+    return pl.from_arrow(arrow_table)
 
 setattr(spark_sql.DataFrame, "toPolars", toPolars)
+
+
+def safe_spark_dataframe(
+    obj: Any,
+    spark_session: spark_sql.SparkSession | None = None
+):
+    if isinstance(obj, spark_sql.DataFrame):
+        return obj
+
+    from ..types import DataField
+
+    spark_session = spark_session or spark_sql.SparkSession.getActiveSession()
+
+    if not spark_session:
+        raise RuntimeError(
+            f"Cannot build spark dataframe from {type(obj)} without active spark session, create one"
+        )
+
+    if not isinstance(obj, (pa.RecordBatch, pa.Table)):
+        obj = safe_arrow_tabular(obj)
+
+    if isinstance(obj, pa.RecordBatch):
+        obj = pa.Table.from_batches([obj])
+
+    schema = DataField.from_arrow_schema(obj.schema)
+    return spark_session._create_from_arrow_table(
+        obj,
+        schema=schema.to_spark_field().dataType,
+        timezone="UTC"
+    )
 
 
 def spark_to_arrow_type(spark_type: spark_types.DataType):
@@ -65,40 +118,8 @@ def spark_to_arrow_type(spark_type: spark_types.DataType):
         ImportError: If PySpark is not installed
         TypeError: If the Spark type cannot be converted to a PyArrow type
     """
-    # Type mapping from Spark to PyArrow for atomic types
-    type_mapping = {
-        spark_types.BooleanType: lambda _: pa.bool_(),
-        spark_types.ByteType: lambda _: pa.int8(),
-        spark_types.ShortType: lambda _: pa.int16(),
-        spark_types.IntegerType: lambda _: pa.int32(),
-        spark_types.LongType: lambda _: pa.int64(),
-        spark_types.FloatType: lambda _: pa.float32(),
-        spark_types.DoubleType: lambda _: pa.float64(),
-        spark_types.StringType: lambda _: pa.utf8(),
-        spark_types.BinaryType: lambda _: pa.binary(),
-        spark_types.DateType: lambda _: pa.date32(),
-        spark_types.TimestampType: lambda _: pa.timestamp('us'),
-        spark_types.DecimalType: lambda t: pa.decimal128(t.precision, t.scale),
-
-        # Complex types with recursive conversion
-        spark_types.ArrayType: lambda t: pa.list_(spark_to_arrow_type(t.elementType)),
-        spark_types.MapType: lambda t: pa.map_(
-            spark_to_arrow_type(t.keyType),
-            spark_to_arrow_type(t.valueType),
-        ),
-        spark_types.StructType: lambda t: pa.struct([
-            pa.field(
-                field.name,
-                spark_to_arrow_type(field.dataType),
-                field.nullable,
-                metadata=field.metadata
-            )
-            for field in t.fields
-        ])
-    }
-
     # Find the correct type converter using the type of spark_type
-    for spark_class, converter in type_mapping.items():
+    for spark_class, converter in SPARK_TO_ARROW_TYPE_MAP.items():
         if isinstance(spark_type, spark_class):
             return converter(spark_type)
 

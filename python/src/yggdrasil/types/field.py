@@ -16,7 +16,7 @@ from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arr
     get_child_array
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
-    spark_sql, spark_functions
+    spark_sql, spark_functions, safe_spark_dataframe
 
 __all__ = [
     "DataField",
@@ -280,6 +280,20 @@ class DataField:
             children=None,
             metadata=field.metadata,
         )
+
+    @classmethod
+    def from_arrow_schema(
+        cls,
+        schema: pa.Schema,
+    ) -> "DataField":
+        field = pa.field(
+            name="root",
+            type=pa.struct(list(schema)),
+            nullable=False,
+            metadata=schema.metadata
+        )
+
+        return cls.from_arrow_field(field)
 
     @classmethod
     def from_arrow_type(
@@ -564,8 +578,7 @@ class DataField:
         if not self.is_struct():
             raise TypeError(f"Cannot cast DataFrame to non-struct type {self}")
 
-        if not self.children:
-            return df
+        df = safe_spark_dataframe(df, spark_session=df.sparkSession)
 
         # Get original column names
         original_columns = df.columns

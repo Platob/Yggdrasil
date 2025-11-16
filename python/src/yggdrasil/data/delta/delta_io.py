@@ -3,7 +3,7 @@ from typing import Optional
 from ..data_io import DataIO, SaveMode
 from ..table_location import TableLocation
 from ...types import DataField
-from ...utils.spark_utils import spark_sql
+from ...utils.spark_utils import spark_sql, safe_spark_dataframe
 
 try:
     from delta.tables import DeltaTable
@@ -110,6 +110,7 @@ class DeltaIO(DataIO):
         self,
         df, *,
         location: TableLocation,
+        mode: str,
         match_keys: list[str] = None,
         zorder_cols: list[str] = None,
         create_catalog_if_missing: bool = False,
@@ -135,7 +136,8 @@ class DeltaIO(DataIO):
 
         spark = df.sparkSession
         schema = self.get_schema(location)
-        df = schema.cast_spark_dataframe(df)
+        df = schema.cast(df)
+        df = safe_spark_dataframe(df, spark_session=spark)
         full_name = location.delta_table_name()
 
         # --- Ensure catalog/schema exist (Unity Catalog) ---
@@ -172,7 +174,7 @@ class DeltaIO(DataIO):
             else:
                 # Table exists but no match key specified: append incoming rows.
                 # This cannot be idempotent; caller should provide match_keys for upserts.
-                df.write.format("delta").mode("append").saveAsTable(full_name)
+                df.write.format("delta").mode(mode).saveAsTable(full_name)
 
         # --- Optimize: Z-ORDER for faster lookups by composite key (Databricks) ---
         if optimize_after_merge and zorder_cols:

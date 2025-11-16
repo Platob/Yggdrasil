@@ -3,11 +3,10 @@ Abstract DataWriter class for writing data in different formats.
 """
 
 from abc import ABC, abstractmethod
-from enum import Enum
-from typing import Any, Optional
+from enum import StrEnum
+from typing import Optional
 
 from yggdrasil.data.table_location import TableLocation
-
 from ..types.field import DataField
 from ..utils.spark_utils import spark_sql
 
@@ -21,7 +20,7 @@ __all__ = [
     "DataIO"
 ]
 
-class SaveMode(Enum):
+class SaveMode(StrEnum):
     Overwrite = "overwrite"
     Append = "append"
 
