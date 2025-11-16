@@ -759,29 +759,22 @@ class DataField:
         df = safe_arrow_tabular(df)
 
         target_schema = self.to_arrow_schema()
-
+        target_fields: list[DataField] = self.children
         result_columns = {}
-        target_fields = target_schema.names
 
-        for field_name in target_fields:
-            target_field = target_schema.field(field_name)
-            target_type = target_field.type
-
-            if field_name in df.column_names:
-                # Column exists - cast it
-                source_column = df.column(field_name)
-
+        for target_field in target_fields:
+            if target_field.name in df.column_names:
                 # Use your existing cast_arrow_array method
-                casted_column = self.cast_arrow_array(
-                    source_column,
+                casted_column = target_field.cast_arrow_array(
+                    df.column(target_field.name),
                     safe=safe,
                     memory_pool=memory_pool
                 )
-                result_columns[field_name] = casted_column
+                result_columns[target_field.name] = casted_column
             else:
                 # Column missing - create null column of target type
-                result_columns[field_name] = pa.nulls(
-                    df.num_rows, type=target_type, memory_pool=memory_pool
+                result_columns[target_field.name] = pa.nulls(
+                    df.num_rows, type=target_field.arrow_type, memory_pool=memory_pool
                 )
 
         # Create new table with only target columns in target schema order
