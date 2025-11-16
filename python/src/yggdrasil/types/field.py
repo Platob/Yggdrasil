@@ -727,7 +727,7 @@ class DataField:
                         memory_pool=memory_pool,
                         use_polars=use_polars
                     )
-                    for idx, child in enumerate(self.children)
+                    for child in self.children
                 ],
                 memory_pool=memory_pool,
                 type=self.arrow_type

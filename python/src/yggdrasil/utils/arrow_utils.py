@@ -105,12 +105,13 @@ def get_child_array(
     default: pa.Scalar | None = None,
     memory_pool: pa.MemoryPool | None = None
 ) -> ArrowArrayLike:
-    assert pa.types.is_struct(field.type), f"Arrow field {field} is not struct"
-    arrow_type: pa.StructType = field.type
+    assert pa.types.is_struct(arr.type), f"Arrow array type {arr.type} is not struct"
+    arrow_type: pa.StructType = arr.type
 
     if not index or index < 0:
         index = index_of(
-            collection=arrow_type.names, value=field.name,
+            collection=arrow_type.names,
+            value=field.name,
             strict_names=strict_names,
             raise_error=False
         )
