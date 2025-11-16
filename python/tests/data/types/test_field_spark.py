@@ -16,6 +16,7 @@ If Java is not installed, the test will attempt to install it automatically.
 """
 
 import logging
+import sys
 import unittest
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -29,10 +30,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Import from field module
-from yggdrasil.utils.spark_utils import HAVE_SPARK, spark_sql, spark_types
+from yggdrasil.utils.spark_utils import spark_sql, spark_types
 from yggdrasil.types.field import DataField
 
-@pytest.mark.skipif(HAVE_SPARK, reason="No pyspark found")
+@pytest.mark.skipif(not "pyspark" in sys.modules, reason="No pyspark found")
 class TestDataFieldSpark(unittest.TestCase):
     """Tests for Spark integration with DataField."""
 
@@ -40,9 +41,6 @@ class TestDataFieldSpark(unittest.TestCase):
         """Set up a SparkSession for testing."""
         test_name = self.id().split('.')[-1]
         logger.info(f"Setting up test: {test_name}")
-
-        if not HAVE_SPARK:
-            self.skipTest("No pyspark found")
 
         try:
             logger.info("Creating SparkSession...")
@@ -66,9 +64,6 @@ class TestDataFieldSpark(unittest.TestCase):
 
     def tearDown(self):
         """Stop the SparkSession after testing."""
-        test_name = self.id().split('.')[-1]
-        if not HAVE_SPARK and hasattr(self, 'spark') and self.spark is not None:
-            self.spark.stop()
 
     def test_spark_basic_types(self):
         """Test converting basic Spark types to DataField and back."""

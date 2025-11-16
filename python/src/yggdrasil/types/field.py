@@ -5,23 +5,16 @@ This module provides a decorator for creating dataclasses with PyArrow schema in
 
 from __future__ import annotations
 
-import datetime as dt
-import decimal as dec
 from dataclasses import dataclass
 from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union
 
+import pandas
 import polars as pl
 import pyarrow as pa
 
-from ..utils.fake_module import make_fake_module
-
-try:
-    import pandas
-except ImportError:
-    pandas = make_fake_module(module_name="pandas")
-
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
-from ..utils.spark_utils import HAVE_SPARK, ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
+from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular
+from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, spark_sql, spark_functions
 
 __all__ = [
     "DataField",
@@ -29,21 +22,6 @@ __all__ = [
 ]
 
 T = TypeVar("T")
-
-# Type mapping from Python types to PyArrow types
-_PYTHON_TO_ARROW_TYPE_MAP = {
-    bool: pa.bool_(),
-    int: pa.int64(),
-    float: pa.float64(),
-    str: pa.utf8(),
-    bytes: pa.binary(),
-    memoryview: pa.binary(),
-    bytearray: pa.binary(),
-    dec.Decimal: pa.decimal128(38,18),
-    dt.datetime: pa.timestamp("us"),
-    dt.date: pa.date32(),
-}
-
 
 @dataclass(frozen=True)
 class DataField:
@@ -81,10 +59,16 @@ class DataField:
                 ]
             elif pa.types.is_map(self.arrow_type):
                 map_type: pa.MapType = self.arrow_type
-                children = [
-                    self.from_arrow_field(field=map_type.key_field),
-                    self.from_arrow_field(field=map_type.item_field)
-                ]
+                child = self.from_arrow_type(
+                    name="key_value",
+                    dtype=pa.struct([
+                        map_type.key_field,
+                        map_type.item_field
+                    ]),
+                    nullable=False
+                )
+
+                children = [child]
             else:
                 raise ValueError(
                     f"Cannot initialize nested arrow type {self.arrow_type} without children set"
@@ -206,66 +190,65 @@ class DataField:
                     metadata=metadata
                 )
 
-        arrow_type = None
+        arrow_type = PYTHON_TO_ARROW_TYPE_MAP.get(hint)
         children_fields = None
         metadata = safe_dict(
             metadata, default={},
             check_key=safe_str, check_value=safe_str
         )
-        # Check if it's a direct mapping from Python type to Arrow type
-        if hint in _PYTHON_TO_ARROW_TYPE_MAP:
-            arrow_type = _PYTHON_TO_ARROW_TYPE_MAP[hint]
-        elif isinstance(hint, pa.DataType):
-            # It's already a PyArrow type
-            arrow_type = hint
-        elif origin is list or hint is list:
-            # Handle list[T]
-            if args and len(args) > 0:
-                item_hint = args[0]
-                item_field = cls.from_py_hint(
-                    name="item",
-                    hint=item_hint,
-                    nullable=None,
-                    comment=None,
-                    metadata=None
-                )
 
+        if not arrow_type:
+            if isinstance(hint, pa.DataType):
+                # It's already a PyArrow type
+                arrow_type = hint
+            elif origin is list or hint is list:
+                # Handle list[T]
+                if args and len(args) > 0:
+                    item_hint = args[0]
+                    item_field = cls.from_py_hint(
+                        name="item",
+                        hint=item_hint,
+                        nullable=None,
+                        comment=None,
+                        metadata=None
+                    )
+
+                else:
+                    # Default to list of strings
+                    item_field = cls.from_arrow_type(name="item", dtype=pa.utf8(), nullable=True)
+
+                arrow_type = pa.list_(item_field.to_arrow_field())
+            elif origin is dict or hint is dict:
+                # Handle dict[K, V]
+                if args and len(args) == 2:
+                    key_type, value_type = args
+                    key_field = cls.from_py_hint(
+                        name="key",
+                        hint=key_type,
+                        nullable=False,
+                        comment=None,
+                        metadata=None
+                    )
+                    value_field = cls.from_py_hint(
+                        name="value",
+                        hint=value_type,
+                        nullable=None,
+                        comment=None,
+                        metadata=None
+                    )
+                else:
+                    key_field = cls.from_arrow_type(name="key", dtype=pa.utf8(), nullable=False)
+                    value_field = cls.from_arrow_type(name="value", dtype=pa.utf8(), nullable=True)
+
+                arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field())
             else:
-                # Default to list of strings
-                item_field = cls.from_arrow_type(name="item", dtype=pa.utf8(), nullable=True)
-
-            arrow_type = pa.list_(item_field.to_arrow_field())
-        elif origin is dict or hint is dict:
-            # Handle dict[K, V]
-            if args and len(args) == 2:
-                key_type, value_type = args
-                key_field = cls.from_py_hint(
-                    name="key",
-                    hint=key_type,
-                    nullable=False,
-                    comment=None,
-                    metadata=None
-                )
-                value_field = cls.from_py_hint(
-                    name="value",
-                    hint=value_type,
-                    nullable=None,
-                    comment=None,
-                    metadata=None
-                )
-            else:
-                key_field = cls.from_arrow_type(name="key", dtype=pa.utf8(), nullable=False)
-                value_field = cls.from_arrow_type(name="value", dtype=pa.utf8(), nullable=True)
-
-            arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field())
-        else:
-            type_hints = get_type_hints(hint, include_extras=True)
-            children_fields = [
-                cls.from_py_hint(name=child_name, hint=child_type)
-                for child_name, child_type in type_hints.items()
-                if not child_name.startswith("_")
-            ]
-            arrow_type = pa.struct([_.to_arrow_field() for _ in children_fields])
+                type_hints = get_type_hints(hint, include_extras=True)
+                children_fields = [
+                    cls.from_py_hint(name=child_name, hint=child_type)
+                    for child_name, child_type in type_hints.items()
+                    if not child_name.startswith("_")
+                ]
+                arrow_type = pa.struct([_.to_arrow_field() for _ in children_fields])
 
         if arrow_type is None:
             raise TypeError(f"Cannot create DataField from Python type hint {hint}")
@@ -294,8 +277,17 @@ class DataField:
         )
 
     @classmethod
-    def from_arrow_type(cls, name: str, dtype: pa.DataType, nullable: bool) -> "DataField":
-        field = pa.field(name=name, type=dtype, nullable=nullable)
+    def from_arrow_type(
+        cls,
+        name: str,
+        dtype: pa.DataType,
+        nullable: bool | None = None,
+        metadata: dict[str, str] | None = None
+    ) -> "DataField":
+        field = pa.field(
+            name=name, type=dtype, nullable=nullable,
+            metadata=safe_dict(metadata, default=None)
+        )
 
         return cls.from_arrow_field(field)
 
@@ -313,9 +305,6 @@ class DataField:
             ImportError: If PySpark is not installed
             TypeError: If the Spark type cannot be converted to a PyArrow type
         """
-        if not HAVE_SPARK:
-            raise ImportError("PySpark is required for from_spark_field. Install it with 'pip install pyspark'.")
-
         name = spark_field.name
         nullable = spark_field.nullable
         metadata = getattr(spark_field, "metadata", {})
@@ -347,9 +336,6 @@ class DataField:
             ImportError: If PySpark is not installed
             TypeError: If the Spark type cannot be converted to a PyArrow type
         """
-        if not HAVE_SPARK:
-            raise ImportError("PySpark is required for from_spark_field. Install it with 'pip install pyspark'.")
-
         field = spark_types.StructField(name=name, dataType=spark_type, nullable=nullable, metadata=metadata)
 
         return cls.from_spark_field(field)
@@ -382,8 +368,17 @@ class DataField:
     def is_nested(self):
         return pa.types.is_nested(self.arrow_type)
 
+    def is_list_like(self):
+        return self.is_list() or self.is_large_list() or self.is_fixed_list()
+
     def is_list(self):
-        return pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type)
+        return pa.types.is_list(self.arrow_type)
+
+    def is_large_list(self):
+        return pa.types.is_large_list(self.arrow_type)
+
+    def is_fixed_list(self):
+        return pa.types.is_fixed_size_list(self.arrow_type)
 
     def is_map(self):
         return pa.types.is_map(self.arrow_type)
@@ -414,9 +409,6 @@ class DataField:
             ImportError: If PySpark is not installed
             TypeError: If the arrow_type cannot be converted to a Spark type
         """
-        if not HAVE_SPARK:
-            raise ImportError("PySpark is required for to_spark_field. Install it with 'pip install pyspark'.")
-
         spark_type = ARROW_TYPE_TO_SPARK_TYPE.get(self.arrow_type)
         md = self.metadata.copy() or {}
 
@@ -443,15 +435,17 @@ class DataField:
                         _.to_spark_field()
                         for _ in self.children
                     ])
-                elif self.is_list():
+                elif self.is_list_like():
                     item_field: DataField = self.children[0]
                     item_spark = item_field.to_spark_field()
                     spark_type = spark_types.ArrayType(item_spark.dataType, containsNull=item_field.nullable)
                 elif self.is_map():
-                    key_field: DataField = self.children[0]
+                    key_value = self.children[0]
+
+                    key_field: DataField = key_value.children[0]
                     key_spark = key_field.to_spark_field()
 
-                    value_field: DataField = self.children[1]
+                    value_field: DataField = key_value.children[1]
                     value_spark = value_field.to_spark_field()
 
                     spark_type = spark_types.MapType(key_spark.dataType, value_spark.dataType, valueContainsNull=value_field.nullable)
@@ -502,9 +496,18 @@ class DataField:
                         for _ in self.children
                     ]
                 )
-            elif self.is_list():
+            elif self.is_list_like():
                 polars_type = pl.List(
                     inner=self.children[0].to_polars_field().dtype
+                )
+            elif self.is_map():
+                key_value = self.children[0]
+
+                polars_type = pl.List(
+                    inner=pl.Struct([
+                        key_value.children[0].to_polars_field(),
+                        key_value.children[1].to_polars_field()
+                    ])
                 )
 
         if not polars_type:
@@ -518,12 +521,6 @@ class DataField:
         column: spark_sql.Column,
     ) -> spark_sql.Column:
         """Cast a Spark Column from one DataField type to another."""
-        if not HAVE_SPARK:
-            raise ImportError(
-                "PySpark is required for cast_spark_column. "
-                "Install it with 'pip install pyspark'."
-            )
-
         # Target Spark field (what this DataField wants)
         target_field: spark_types.StructField = self.to_spark_field()
 
@@ -536,7 +533,11 @@ class DataField:
         # Keep the field name consistent with this DataField
         return casted.alias(self.name)
 
-    def cast_spark_dataframe(self, df: spark_sql.DataFrame) -> spark_sql.DataFrame:
+    def cast_spark_dataframe(
+        self,
+        df: spark_sql.DataFrame,
+        safe: bool | None = None
+    ) -> spark_sql.DataFrame:
         """Cast a Spark DataFrame to match this DataField's schema.
 
         This method handles field name matching (case-insensitive), type casting,
@@ -544,6 +545,7 @@ class DataField:
 
         Args:
             df: The source Spark DataFrame to cast
+            safe: Safe cast
 
         Returns:
             A new Spark DataFrame with columns cast to the appropriate types
@@ -552,9 +554,6 @@ class DataField:
             ImportError: If PySpark is not installed
             ValueError: If required fields are missing from the DataFrame
         """
-        if not HAVE_SPARK:
-            raise ImportError("PySpark is required for cast_spark_dataframe. Install it with 'pip install pyspark'.")
-
         if not self.is_struct():
             raise TypeError(f"Cannot cast DataFrame to non-struct type {self}")
 
@@ -667,22 +666,148 @@ class DataField:
         # build and return new dataframe; use select to preserve order
         return df.select(*exprs)
 
-    def cast_arrow(self, df):
-        pldf = pl.from_arrow(df)
+    def cast_arrow_array(
+        self,
+        arr: pa.Array | pa.ChunkedArray,
+        safe: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+        use_polars: bool | None = True
+    ):
+        if arr.type == self.arrow_type:
+            return arr
 
-        return self.cast_polars_dataframe(pldf).to_arrow()
+        if isinstance(arr, pa.ChunkedArray):
+            return pa.chunked_array(
+                arrays=[
+                    self.cast_arrow_array(arr=a, safe=safe, memory_pool=memory_pool)
+                    for a in arr.chunks
+                ]
+            )
 
-    def cast_pandas(self, df):
-        pldf = pl.from_pandas(df, include_index=bool(df.index.name))
+        source_field = self.from_arrow_type(
+            name="arr", dtype=arr.type, nullable=True
+        )
+        casted = None
 
-        return self.cast_polars_dataframe(pldf).to_pandas()
+        if self.is_list_like():
+            target_item_field = self.children[0]
 
-    def cast_dataframe(self, df):
+            if source_field.is_list_like():
+                source_list: pa.ListArray = arr
+
+                if self.is_list():
+                    casted = pa.ListArray.from_arrays(
+                        offsets=source_list.offsets,
+                        values=target_item_field.cast_arrow_array(arr),
+                        pool=memory_pool,
+                    )
+                elif self.is_large_list():
+                    casted = pa.LargeListArray.from_arrays(
+                        offsets=source_list.offsets,
+                        values=target_item_field.cast_arrow_array(arr),
+                        pool=memory_pool,
+                    )
+                elif self.is_fixed_list():
+                    casted = pa.FixedSizeListArray.from_arrays(
+                        values=target_item_field.cast_arrow_array(arr),
+                        list_size=self.arrow_type.list_size,
+                        pool=memory_pool,
+                    )
+        elif self.is_map():
+            key_value: DataField = self.children[0]
+
+            if source_field.is_list_like():
+                list_array: pa.ListArray = self.from_arrow_type(
+                    name="list", dtype=pa.list_(key_value.arrow_type), nullable=True
+                ).cast_arrow_array(arr, safe=safe, memory_pool=memory_pool)
+                key_values: pa.StructArray = list_array.values
+                key_values: list[pa.Array] = key_values.flatten(pool=memory_pool)
+                casted = pa.MapArray.from_arrays(
+                    offsets=list_array.offsets,
+                    keys=key_values[0],
+                    items=key_values[1],
+                    pool=memory_pool
+                )
+
+        if casted is None:
+            try:
+                casted = arr.cast(
+                    target_type=self.arrow_type,
+                    safe=safe,
+                    memory_pool=memory_pool
+                )
+            except pa.ArrowInvalid as e:
+                if not safe and use_polars:
+                    pltype = self.to_polars_field().dtype
+                    casted = pl.from_arrow(arr).cast(pltype, strict=safe or False)
+                    return casted.to_arrow()
+                raise e
+
+        return casted
+
+    def cast_arrow_tabular(
+        self,
+        df: ArrowTabular,
+        safe: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None
+    ) -> ArrowTabular:
+        """
+        Cast an Arrow Table or RecordBatch to match the target schema.
+        Handles missing columns by adding them as nulls and selects only target columns.
+        """
+        # Convert RecordBatch to Table for consistent handling
+        df = safe_arrow_tabular(df)
+
+        target_schema = self.to_arrow_schema()
+
+        result_columns = {}
+        target_fields = target_schema.names
+
+        for field_name in target_fields:
+            target_field = target_schema.field(field_name)
+            target_type = target_field.type
+
+            if field_name in df.column_names:
+                # Column exists - cast it
+                source_column = df.column(field_name)
+
+                # Use your existing cast_arrow_array method
+                casted_column = self.cast_arrow_array(
+                    source_column,
+                    safe=safe,
+                    memory_pool=memory_pool
+                )
+                result_columns[field_name] = casted_column
+            else:
+                # Column missing - create null column of target type
+                result_columns[field_name] = pa.nulls(
+                    df.num_rows, type=target_type, memory_pool=memory_pool
+                )
+
+        # Create new table with only target columns in target schema order
+        if isinstance(df, pa.Table):
+            return pa.Table.from_pydict(result_columns, schema=target_schema)
+        else:
+            return pa.RecordBatch.from_pydict(result_columns, schema=target_schema)
+
+    def cast_pandas_dataframe(
+        self,
+        df,
+        safe: bool | None = None,
+    ):
+        table = pa.Table.from_pandas(df, preserve_index=bool(df.index.name))
+        return self.cast_arrow_tabular(table, safe=safe).to_pandas()
+
+    def cast(
+        self,
+        df,
+        safe: bool | None = None,
+    ):
         if isinstance(df, (pa.RecordBatch, pa.Table)):
-            return self.cast_arrow(df)
+            return self.cast_arrow_tabular(df, safe=safe)
         elif isinstance(df, pandas.DataFrame):
-            return self.cast_pandas(df)
+            return self.cast_pandas_dataframe(df, safe=safe)
         elif isinstance(df, spark_sql.DataFrame):
-            return self.cast_spark_dataframe(df)
+            return self.cast_spark_dataframe(df, safe=safe)
 
         raise ValueError(f"Cannot cast {df} with {self}")

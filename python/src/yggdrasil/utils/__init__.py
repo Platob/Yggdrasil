@@ -1,18 +1,8 @@
-"""Utility modules for Yggdrasil."""
+from .fake_module import *
 
-# Import key utilities for easier access
-from yggdrasil.utils.java import (
-    is_java_installed,
-    get_java_home,
-    set_java_home,
-    install_java,
-    DEFAULT_JAVA_VERSION
-)
-
-__all__ = [
-    "is_java_installed",
-    "get_java_home",
-    "set_java_home",
-    "install_java",
-    "DEFAULT_JAVA_VERSION"
-]
+for mod_name in [
+    "pyspark.sql.types",
+    "pandas",
+    "polars"
+]:
+    make_fake_module(mod_name)

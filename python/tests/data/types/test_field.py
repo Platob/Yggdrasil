@@ -219,9 +219,10 @@ class TestDataField(unittest.TestCase):
         self.assertFalse(field.nullable)
         
         # Check the map's key and value types
-        self.assertEqual(len(field.children), 2)
-        key_field = field.children[0]
-        value_field = field.children[1]
+        self.assertEqual(len(field.children), 1)
+        key_value = field.children[0]
+        key_field = key_value.children[0]
+        value_field = key_value.children[1]
         
         self.assertEqual(key_field.name, "key")
         self.assertEqual(key_field.arrow_type, pa.utf8())
@@ -232,9 +233,10 @@ class TestDataField(unittest.TestCase):
         # Test Dict[int, str]
         field = DataField.from_py_hint(hint=Dict[int, str], name="int_str_dict")
         self.assertTrue(pa.types.is_map(field.arrow_type))
-        
-        key_field = field.children[0]
-        value_field = field.children[1]
+
+        key_value = field.children[0]
+        key_field = key_value.children[0]
+        value_field = key_value.children[1]
         
         self.assertEqual(key_field.arrow_type, pa.int64())
         self.assertEqual(value_field.arrow_type, pa.utf8())
@@ -242,9 +244,10 @@ class TestDataField(unittest.TestCase):
         # Test Dict without type parameters (defaults to str, str)
         field = DataField.from_py_hint(hint=dict, name="generic_dict")
         self.assertTrue(pa.types.is_map(field.arrow_type))
-        
-        key_field = field.children[0]
-        value_field = field.children[1]
+
+        key_value = field.children[0]
+        key_field = key_value.children[0]
+        value_field = key_value.children[1]
         
         self.assertEqual(key_field.arrow_type, pa.utf8())
         self.assertEqual(value_field.arrow_type, pa.utf8())
@@ -261,15 +264,17 @@ class TestDataField(unittest.TestCase):
         # Test nested dict: Dict[str, Dict[str, int]]
         field = DataField.from_py_hint(hint=Dict[str, Dict[str, int]], name="nested_dict")
         self.assertTrue(pa.types.is_map(field.arrow_type))
-        
-        key_field = field.children[0]
-        value_field = field.children[1]
+
+        key_value = field.children[0]
+        key_field = key_value.children[0]
+        value_field = key_value.children[1]
         
         self.assertEqual(key_field.arrow_type, pa.utf8())
         self.assertTrue(pa.types.is_map(value_field.arrow_type))
-        
-        inner_key_field = value_field.children[0]
-        inner_value_field = value_field.children[1]
+
+        key_value = value_field.children[0]
+        inner_key_field = key_value.children[0]
+        inner_value_field = key_value.children[1]
         
         self.assertEqual(inner_key_field.arrow_type, pa.utf8())
         self.assertEqual(inner_value_field.arrow_type, pa.int64())

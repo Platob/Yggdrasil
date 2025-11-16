@@ -1,43 +1,50 @@
 # fake_module.py
 import sys
+import logging
 from types import ModuleType
 from typing import Any
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-__all__ = [
-    "FakeModule",
-    "make_fake_module"
-]
+__all__ = ["make_fake_module"]
 
 
 class _FakeValue:
-    """
-    Chainable fake value:
-    - attribute access returns another _FakeValue (chainable)
-    - calling returns self (so you can do fake.foo().bar().baz)
-    - awaiting returns None (so await fake.foo works)
-    - iterating yields nothing
-    - bool(self) -> False, len(self) -> 0, int(self)->0, str(self)->'None'
-    - indexing returns another _FakeValue
-    - equality to None is True (so fake == None)
-    """
-    __slots__ = ("_name",)
+    __slots__ = ("_name", "_inner")  # _inner will store monkey-patched attributes
+
+    def __hash__(self):
+        return hash(self._name)
+
     def __init__(self, name: str | None = None):
-        self._name = name
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_inner", {})  # store any dynamically assigned attributes
 
     def __getattr__(self, item: str) -> "_FakeValue":
-        return _FakeValue(f"{self._name}.{item}" if self._name else item)
+        inner = object.__getattribute__(self, "_inner")
+        if item in inner:
+            return inner[item]  # return previously set monkey-patched value
+        name = object.__getattribute__(self, "_name")
+        logger.debug("Accessing attribute %s on fake value %s", item, name)
+        val = _FakeValue(f"{name}.{item}" if name else item)
+        inner[item] = val  # cache so repeated access returns the same
+        return val
 
-    def __call__(self, *args, **kwargs) -> "_FakeValue":
-        # return self so chained calls work; awaiting the returned object yields None
-        return self
+    def __setattr__(self, name: str, value):
+        # always store in _inner for monkey-patch support
+        inner = object.__getattribute__(self, "_inner")
+        inner[name] = value
+
+    def __call__(self, *args, **kwargs):
+        name = object.__getattribute__(self, "_name")
+        if not args and not kwargs:
+            return self
+        raise ImportError(f"Cannot call {name!r}, module not installed.")
 
     def __await__(self):
-        # make `await fake.x` or `await fake.x()` valid and produce None
         return None
 
     def __iter__(self):
-        # empty iterator
         yield None
 
     def __len__(self):
@@ -56,33 +63,17 @@ class _FakeValue:
         return "<FakeNone>"
 
     def __getitem__(self, key):
-        return _FakeValue(f"{self._name}[{key}]" if self._name else f"[{key}]")
+        inner = object.__getattribute__(self, "_inner")
+        name = object.__getattribute__(self, "_name")
+        if key in inner:
+            return inner[key]
+        val = _FakeValue(f"{name}[{key}]" if name else f"[{key}]")
+        inner[key] = val
+        return val
 
-    # make equality to None evaluate True so `if fake is None` won't pass, but `fake == None` will
     def __eq__(self, other: Any) -> bool:
         return other is None
 
-    # you can optionally expose a value() method to force explicit None
-    def value(self):
-        return None
-
-
-class _StrictNoneValue:
-    """Always returns None for attribute access, calling, awaiting, indexing, iter."""
-    def __getattr__(self, item):
-        return None
-    def __call__(self, *a, **k):
-        return None
-    def __await__(self):
-        return None
-    def __iter__(self):
-        return iter(())
-    def __getitem__(self, k):
-        return None
-    def __repr__(self):
-        return "None"
-    def __bool__(self):
-        return False
     def value(self):
         return None
 
@@ -90,17 +81,16 @@ class _StrictNoneValue:
 class FakeModule(ModuleType):
     """
     A module-like object:
-    - If strict True: every attribute returns None (strict mode).
-    - If strict False: attributes return a chainable _FakeValue (safer for call/await chains).
+    - If strict True: every attribute returns None (strict mode)
+    - If strict False: attributes return _FakeValue objects (callable/awaitable/chainable)
     """
     def __init__(self, name: str, strict: bool = False):
         super().__init__(name)
         self.__dict__["_fake_strict"] = bool(strict)
-        # expose a sentinel attr in case tests need it
         self.__dict__["__is_fake_module__"] = True
+        logger.info("Created fake module: %s, strict=%s", name, strict)
 
     def __getattr__(self, name: str):
-        # avoid recursion for our own fields
         if name in self.__dict__:
             return self.__dict__[name]
         if self.__dict__.get("_fake_strict", False):
@@ -108,22 +98,23 @@ class FakeModule(ModuleType):
         return _FakeValue(name)
 
     def __setattr__(self, name: str, value):
-        # allow setting real attrs on the fake module if desired
         super().__setattr__(name, value)
 
-    def __repr__(self):
-        return f"<FakeModule {self.__name__!r} strict={self.__dict__.get('_fake_strict', False)}>"
 
 def make_fake_module(module_name: str, strict: bool = False, inject: bool = True) -> ModuleType:
     """
-    Create a fake module object.
+    Create a fake module object if it does not exist.
 
     - module_name: name for the module (e.g. "heavy.thirdparty.client")
-    - strict: if True, every attribute access immediately returns None
-              if False, attributes return _FakeValue objects (callable/awaitable/chainable)
-    - inject: if True, the fake is inserted into sys.modules under module_name
+    - strict: if True, attributes return None
+    - inject: if True, insert into sys.modules
     """
+    if module_name in sys.modules:
+        logger.info("Module %s already exists, skipping fake creation", module_name)
+        return sys.modules[module_name]
+
     fake = FakeModule(module_name, strict=strict)
     if inject:
         sys.modules[module_name] = fake
+        logger.info("Injected fake module %s into sys.modules", module_name)
     return fake

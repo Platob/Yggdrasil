@@ -1,63 +1,28 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import polars
 import pyarrow as pa
 
-from .fake_module import make_fake_module
+import pyspark as spark
+import pyspark.sql as spark_sql
+import pyspark.sql.functions as spark_functions
+import pyspark.sql.types as spark_types
 
-if TYPE_CHECKING:
-    # These are only imported for type-checkers / IDEs.
-    import pyspark.sql as spark_sql
-    import pyspark.sql.types as spark_types
-
-# Conditionally import pyspark at runtime
-try:
-    import pyspark as spark
-    import pyspark.sql as spark_sql
-    import pyspark.sql.types as spark_types
-    import pyspark.sql.functions as spark_functions
-
-    HAVE_SPARK = True
-
-    # Re-export commonly used types at module level
-    StructType = spark_types.StructType
-    StructField = spark_types.StructField
-    ArrayType = spark_types.ArrayType
-    MapType = spark_types.MapType
-    ARROW_TYPE_TO_SPARK_TYPE = {
-        pa.utf8(): spark_types.StringType(),
-        pa.binary(): spark_types.BinaryType(),
-        pa.int8(): spark_types.ByteType(),
-        pa.int16(): spark_types.IntegerType(),
-        pa.int32(): spark_types.IntegerType(),
-        pa.int64(): spark_types.LongType(),
-        pa.float32(): spark_types.FloatType(),
-        pa.float64(): spark_types.DoubleType(),
-        pa.date32(): spark_types.DateType(),
-        pa.date64(): spark_types.TimestampType(),
-        pa.decimal128(38,18): spark_types.DecimalType(38,18),
-        pa.timestamp("ns"): spark_types.TimestampNTZType(),
-    }
-
-except ImportError:
-    spark = make_fake_module(module_name="spark")
-    spark_sql = make_fake_module(module_name="spark_sql")
-    spark_types = make_fake_module(module_name="spark_types")
-    spark_functions = make_fake_module(module_name="spark_functions")
-
-    HAVE_SPARK = False
-
-    # Keep names defined so annotations don’t explode
-    StructType = None
-    StructField = None
-    ArrayType = None
-    MapType = None
-    ARROW_TYPE_TO_SPARK_TYPE = {}
+ARROW_TYPE_TO_SPARK_TYPE = {
+    pa.bool_(): spark_types.BooleanType(),
+    pa.utf8(): spark_types.StringType(),
+    pa.binary(): spark_types.BinaryType(),
+    pa.int8(): spark_types.ByteType(),
+    pa.int16(): spark_types.IntegerType(),
+    pa.int32(): spark_types.IntegerType(),
+    pa.int64(): spark_types.LongType(),
+    pa.float32(): spark_types.FloatType(),
+    pa.float64(): spark_types.DoubleType(),
+    pa.date32(): spark_types.DateType(),
+    pa.date64(): spark_types.TimestampType(),
+}
 
 __all__ = [
-    "HAVE_SPARK",
     "ARROW_TYPE_TO_SPARK_TYPE",
     "spark", "spark_sql", "spark_types", "spark_functions",
     "spark_to_arrow_type",
@@ -100,9 +65,6 @@ def spark_to_arrow_type(spark_type: spark_types.DataType):
         ImportError: If PySpark is not installed
         TypeError: If the Spark type cannot be converted to a PyArrow type
     """
-    if not HAVE_SPARK:
-        raise ImportError("PySpark is required for _spark_to_arrow_type. Install it with 'pip install pyspark'.")
-
     # Type mapping from Spark to PyArrow for atomic types
     type_mapping = {
         spark_types.BooleanType: lambda _: pa.bool_(),
@@ -146,8 +108,8 @@ def spark_to_arrow_type(spark_type: spark_types.DataType):
 
 def cast_nested_spark_field(
     column: spark_sql.Column,
-    source_field: StructField,
-    target_field: StructField,
+    source_field: spark_types.StructField,
+    target_field: spark_types.StructField,
 ) -> spark_sql.Column:
     """
     Recursively cast a Spark column from source_field to target_field,
@@ -158,8 +120,8 @@ def cast_nested_spark_field(
     casted = None
 
     # === STRUCT ===
-    if isinstance(tgt_type, StructType):
-        if isinstance(src_type, StructType):
+    if isinstance(tgt_type, spark_types.StructType):
+        if isinstance(src_type, spark_types.StructType):
             src_fields_by_name = {f.name: f for f in src_type.fields}
             field_exprs = []
 
@@ -185,22 +147,22 @@ def cast_nested_spark_field(
             casted = spark_functions.struct(*field_exprs)
 
     # === ARRAY ===
-    elif isinstance(tgt_type, ArrayType):
-        if isinstance(src_type, ArrayType):
+    elif isinstance(tgt_type, spark_types.ArrayType):
+        if isinstance(src_type, spark_types.ArrayType):
             casted = column.cast(tgt_type)
 
     # === MAP ===
-    elif isinstance(tgt_type, MapType):
-        if isinstance(src_type, MapType):
+    elif isinstance(tgt_type, spark_types.MapType):
+        if isinstance(src_type, spark_types.MapType):
             src_key_type = src_type.keyType
             src_val_type = src_type.valueType
             tgt_key_type = tgt_type.keyType
             tgt_val_type = tgt_type.valueType
 
-            src_key_field = StructField("key", src_key_type, nullable=False, metadata={})
-            src_val_field = StructField("value", src_val_type, nullable=True, metadata={})
-            tgt_key_field = StructField("key", tgt_key_type, nullable=False, metadata={})
-            tgt_val_field = StructField("value", tgt_val_type, nullable=True, metadata={})
+            src_key_field = spark_types.StructField("key", src_key_type, nullable=False, metadata={})
+            src_val_field = spark_types.StructField("value", src_val_type, nullable=True, metadata={})
+            tgt_key_field = spark_types.StructField("key", tgt_key_type, nullable=False, metadata={})
+            tgt_val_field = spark_types.StructField("value", tgt_val_type, nullable=True, metadata={})
 
             casted = spark_functions.map_from_entries(
                 spark_functions.transform(
