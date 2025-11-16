@@ -609,7 +609,11 @@ class DataField:
         return df.select(*select_exprs)
 
     # --------------------------- Polars support ---------------------------
-    def cast_polars_column(self, series: "pl.Series") -> "pl.Series":
+    def cast_polars_column(
+        self,
+        series: "pl.Series",
+        safe: bool | None = None
+    ) -> "pl.Series":
         """Cast a Polars Series to match this DataField's Arrow type.
 
         This is a best-effort cast and will raise if Polars is not available.
@@ -617,14 +621,26 @@ class DataField:
         Polars dtypes where possible.
         """
         target_field = self.to_polars_field()
+
+        if series.dtype == target_field.dtype:
+            return series
+
         casted = None
 
         if casted is None:
-            casted = series.cast(target_field.dtype)
+            casted = series.cast(
+                target_field.dtype,
+                strict=safe or False,
+                wrap_numerical=safe or False
+            )
 
         return casted.alias(target_field.name)
 
-    def cast_polars_dataframe(self, df: "pl.DataFrame") -> "pl.DataFrame":
+    def cast_polars_dataframe(
+        self,
+        df: "pl.DataFrame",
+        safe: bool | None = None
+    ) -> "pl.DataFrame":
         """Cast a Polars DataFrame to match this DataField's schema (when this DataField is a struct).
 
         Behavior mirrors cast_spark_dataframe: case-insensitive field matching, required fields check,
@@ -656,7 +672,7 @@ class DataField:
         for field in self.children:
             if field.name in field_to_col_map:
                 src = field_to_col_map[field.name]
-                casted = field.cast_polars_column(df[src])
+                casted = field.cast_polars_column(df[src], safe=safe)
             else:
                 target_field = self.to_polars_field()
                 casted = pl.lit(None).cast(target_field.dtype).alias(field.name)
@@ -684,9 +700,7 @@ class DataField:
                 ]
             )
 
-        source_field = self.from_arrow_type(
-            name="arr", dtype=arr.type, nullable=True
-        )
+        source_field = self.from_arrow_type(name="arr", dtype=arr.type, nullable=True)
         casted = None
 
         if self.is_list_like():
@@ -717,10 +731,12 @@ class DataField:
             key_value: DataField = self.children[0]
 
             if source_field.is_list_like():
-                list_array: pa.ListArray = self.from_arrow_type(
-                    name="list", dtype=pa.list_(key_value.arrow_type), nullable=True
-                ).cast_arrow_array(arr, safe=safe, memory_pool=memory_pool)
-                key_values: pa.StructArray = list_array.values
+                list_array: pa.ListArray = arr
+                key_values: pa.StructArray = key_value.cast_arrow_array(
+                    list_array.values,
+                    safe=safe,
+                    memory_pool=memory_pool
+                )
                 key_values: list[pa.Array] = key_values.flatten(pool=memory_pool)
                 casted = pa.MapArray.from_arrays(
                     offsets=list_array.offsets,
@@ -737,10 +753,11 @@ class DataField:
                     memory_pool=memory_pool
                 )
             except pa.ArrowInvalid as e:
-                if not safe and use_polars:
-                    pltype = self.to_polars_field().dtype
-                    casted = pl.from_arrow(arr).cast(pltype, strict=safe or False)
-                    return casted.to_arrow()
+                if use_polars:
+                    return self.cast_polars_column(
+                        pl.from_arrow(arr),
+                        safe=safe
+                    ).to_arrow()
                 raise e
 
         return casted
@@ -798,6 +815,10 @@ class DataField:
     ):
         if isinstance(df, (pa.RecordBatch, pa.Table)):
             return self.cast_arrow_tabular(df, safe=safe)
+        elif isinstance(df, (pa.Array, pa.ChunkedArray)):
+            return self.cast_arrow_array(df, safe=safe)
+        elif isinstance(df, pl.DataFrame):
+            return self.cast_polars_dataframe(df, safe=safe)
         elif isinstance(df, pandas.DataFrame):
             return self.cast_pandas_dataframe(df, safe=safe)
         elif isinstance(df, spark_sql.DataFrame):
