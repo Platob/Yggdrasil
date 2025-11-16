@@ -5,9 +5,8 @@ Abstract DataWriter class for writing data in different formats.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Optional
 
-from yggdrasil.data.table_location import TableLocation
+from .table_location import TableLocation
 from ..types.field import DataField
 from ..utils.spark_utils import spark_sql
 
@@ -27,7 +26,7 @@ class SaveMode(StrEnum):
     Append = "append"
 
 
-@dataclass(frozen=True)
+@dataclass
 class DataTableIO(ABC):
     """
     Abstract base class for data writers.
@@ -38,17 +37,11 @@ class DataTableIO(ABC):
     location: TableLocation
     schema: DataField | None
 
-    def __post_init__(self):
-        setattr(self, "location", TableLocation.parse_any(self.location))
-
-        if self.schema:
-            setattr(self, "schema", DataField.parse_any(self.schema))
-
     @classmethod
-    def get_spark(cls):
+    def get_spark(cls, raise_error: bool = True):
         session = spark_sql.SparkSession.getActiveSession()
 
-        if not session:
+        if raise_error and not session:
             raise ValueError(f"No spark session available for {cls.__name__}")
 
         return session
@@ -65,3 +58,8 @@ class DataTableIO(ABC):
             DataField: The field representing the schema of the data.
         """
         pass
+
+
+@dataclass
+class DataTransform:
+    pass

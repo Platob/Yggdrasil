@@ -1,10 +1,9 @@
-from typing import Optional
+from dataclasses import dataclass
 
-from ..data_io import DataTableIO, SaveMode
+from ..data_io import DataTableIO
 from ..table_location import TableLocation
 from ...types import DataField
 from ...utils.py_utils import safe_dict, safe_str
-from ...utils.arrow_utils import safe_arrow_tabular
 from ...utils.spark_utils import spark_sql, safe_spark_dataframe
 
 try:
@@ -17,8 +16,20 @@ __all__ = [
     "DeltaTableIO"
 ]
 
-
+@dataclass
 class DeltaTableIO(DataTableIO):
+    spark: spark_sql.SparkSession | None
+
+    @classmethod
+    def parse_any(cls, path: str):
+        location = TableLocation.parse_any(path)
+
+        return DeltaTableIO(
+            location=location,
+            schema=None,
+            spark=cls.get_spark(raise_error=False)
+        )
+
     @classmethod
     def get_spark_delta_table(
         cls,
@@ -72,7 +83,7 @@ class DeltaTableIO(DataTableIO):
         if self.schema and not isinstance(df, spark_sql.DataFrame):
             df = self.schema.cast_arrow_tabular(df)
 
-        spark_session = self.get_spark()
+        spark_session = self.spark
         df = safe_spark_dataframe(df, spark_session=spark_session)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---

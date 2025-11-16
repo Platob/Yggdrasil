@@ -649,5 +649,18 @@ class TestDataField(unittest.TestCase):
         field_set = {field1, field2, field3, field4}
         self.assertEqual(len(field_set), 3)  # field1 and field2 are duplicates
 
+    def test_from_method(self):
+        """Test DataField.__hash__ method."""
+        @dataclass()
+        class Arg:
+            b: str
+
+        def apply(a: int | None, person: Arg) -> pa.Table:
+            return a
+
+        field = DataField.from_py_hint(apply)
+
+        self.assertTrue(field.is_struct())
+
 if __name__ == "__main__":
     unittest.main()

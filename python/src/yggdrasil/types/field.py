@@ -286,8 +286,23 @@ class DataField:
                     value_field = cls.from_arrow_type(name="value", dtype=pa.utf8(), nullable=True)
 
                 arrow_type = pa.map_(key_field.to_arrow_field(), value_field.to_arrow_field())
-            else:
-                type_hints = get_type_hints(hint, include_extras=True)
+            elif not isinstance(hint, type) and callable(hint):
+                anno = getattr(hint, "__annotations__", {})
+
+                if anno:
+                    children = [
+                        cls.from_py_hint(hint=child_hint, name=child_name)
+                        for child_name, child_hint in anno.items()
+                    ]
+                    arrow_type = pa.struct([
+                        _.to_arrow_field() for _ in children
+                    ])
+            if not arrow_type:
+                try:
+                    type_hints = get_type_hints(hint, include_extras=True)
+                except TypeError:
+                    type_hints = {}
+
                 children_fields = [
                     cls.from_py_hint(name=child_name, hint=child_type)
                     for child_name, child_type in type_hints.items()
@@ -857,8 +872,6 @@ class DataField:
         """
         # Convert RecordBatch to Table for consistent handling
         df = safe_arrow_tabular(df)
-
-        target_schema = self.to_arrow_schema()
         target_fields: list[DataField] = self.children
         result_columns = {}
 
@@ -877,6 +890,8 @@ class DataField:
                     df.num_rows, type=target_field.arrow_type, memory_pool=memory_pool
                 )
 
+        target_schema = self.to_arrow_schema()
+
         # Create new table with only target columns in target schema order
         if isinstance(df, pa.Table):
             return pa.Table.from_pydict(result_columns, schema=target_schema)
@@ -889,7 +904,7 @@ class DataField:
         safe: bool | None = None,
         strict_names: bool | None = None,
     ):
-        table = pa.Table.from_pandas(df, preserve_index=bool(df.index.name))
+        table = safe_arrow_tabular(df)
         return self.cast_arrow_tabular(table, safe=safe, strict_names=strict_names).to_pandas()
 
     def cast(
@@ -910,3 +925,8 @@ class DataField:
             return self.cast_spark_dataframe(df, safe=safe, strict_names=strict_names)
 
         raise ValueError(f"Cannot cast {df} with {self}")
+
+
+def holder_class_type_hint(cls, item):
+    cls.expected_type = item
+    return cls
