@@ -3,7 +3,7 @@ from typing import Optional
 from ..data_io import DataIO, SaveMode
 from ..table_location import TableLocation
 from ...types import DataField
-from ...utils.spark_utils import spark_sql, spark_functions
+from ...utils.spark_utils import spark_sql
 
 try:
     from delta.tables import DeltaTable
@@ -156,18 +156,14 @@ class DeltaIO(DataIO):
             # Build merge condition on the composite key
             cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in match_keys])
 
-            # Define update set: update all non-key cols
-            non_keys = [c for c in df.columns if c not in match_keys]
-            if not non_keys:
-                raise ValueError("No updatable columns besides match keys. Provide non-key columns.")
-            set_map = {c: spark_functions.col(f"s.`{c}`") for c in non_keys}
-
-            # Execute MERGE
-            (target.alias("t")
-             .merge(df.alias("s"), cond)
-             .whenMatchedUpdate(set=set_map)
-             .whenNotMatchedInsertAll()
-             .execute())
+            # Execute MERGE - delete matching records first, then insert new ones
+            (
+                target.alias("t")
+                .merge(df.alias("s"), cond)
+                .whenMatchedDelete()  # Remove existing records that match
+                .whenNotMatchedInsertAll()  # Insert all new records
+                .execute()
+            )
         else:
             # No match keys provided or target does not exist -> simple write/create behavior.
             if target is None:

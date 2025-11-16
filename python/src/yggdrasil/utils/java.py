@@ -4,17 +4,14 @@ This module provides utilities for installing and configuring Java, which is
 required for using Spark with Yggdrasil.
 """
 
+import logging
 import os
-import sys
-import subprocess
 import platform
+import subprocess
 import tempfile
-import shutil
 import urllib.request
 import zipfile
-import logging
-from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

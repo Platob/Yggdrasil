@@ -483,14 +483,18 @@ class DataField:
         if not polars_type:
             if self.is_timestamp():
                 polars_type = pl.Datetime(
-                    time_unit=self.arrow_type.unit, time_zone=self.arrow_type.tz
+                    time_unit=self.arrow_type.unit,
+                    time_zone=getattr(self.arrow_type, "tz")
                 )
             elif self.is_date():
                 polars_type = pl.Date()
             elif self.is_time():
                 polars_type = pl.Time()
             elif self.is_decimal():
-                polars_type = pl.Decimal(self.arrow_type.precision, self.arrow_type.scale)
+                polars_type = pl.Decimal(
+                    self.arrow_type.precision,
+                    self.arrow_type.scale
+                )
             elif self.is_struct():
                 polars_type = pl.Struct(
                     fields=[
@@ -499,7 +503,9 @@ class DataField:
                     ]
                 )
             elif self.is_list():
-                polars_type = pl.List(inner=self.children[0].to_polars_field().dtype)
+                polars_type = pl.List(
+                    inner=self.children[0].to_polars_field().dtype
+                )
 
         if not polars_type:
             raise ValueError(f"Cannot convert {self} to polars field")
