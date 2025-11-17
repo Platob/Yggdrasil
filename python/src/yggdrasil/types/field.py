@@ -12,7 +12,7 @@ import polars as pl
 import pyarrow as pa
 
 from ..libutils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular, ArrowArrayLike, \
-    get_child_array
+    get_child_array, refine_arrow_field
 from ..libutils.polars_utils import polars_to_arrow_type
 from ..libutils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..libutils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_type_to_arrow_type, \
@@ -37,15 +37,6 @@ class DataField:
     children: list[DataField] | None
 
     def __post_init__(self):
-        checked_metadata = safe_dict(
-            self.metadata, default={},
-            check_key=safe_str, check_value=safe_str
-        )
-        object.__setattr__(self, "metadata", checked_metadata)
-
-        checked_comment = safe_str(self.comment, default=None)
-        object.__setattr__(self, "comment", checked_comment)
-
         if pa.types.is_nested(self.arrow_type) and not self.children:
             if pa.types.is_struct(self.arrow_type):
                 children = [
@@ -84,52 +75,15 @@ class DataField:
             object.__setattr__(self, "children", children)
 
     def refine(self):
-        object.__setattr__(self, "comment", self.metadata.pop("comment", self.comment))
+        if self.metadata:
+            object.__setattr__(self, "comment", self.metadata.pop("comment", self.comment))
 
-        if pa.types.is_timestamp(self.arrow_type):
-            timeunit = self.metadata.pop("timeunit", self.arrow_type.unit)
-            timezone = self.metadata.pop("timezone", self.arrow_type.tz)
-
-            if self.arrow_type.unit != timeunit or self.arrow_type.tz != timezone:
-                arrow_type = pa.timestamp(unit=timeunit, tz=timezone)
-                object.__setattr__(self, "arrow_type", arrow_type)
-        elif pa.types.is_time(self.arrow_type):
-            timeunit = self.metadata.pop("timeunit", self.arrow_type.unit)
-
-            if timeunit != self.arrow_type.unit:
-                arrow_type = pa.time32(timeunit) if timeunit in ("s", "ms") else pa.time64(timeunit)
-                object.__setattr__(self, "arrow_type", arrow_type)
-        elif pa.types.is_decimal(self.arrow_type):
-            precision = int(self.metadata.pop("precision", self.arrow_type.precision))
-            scale = int(self.metadata.pop("scale", self.arrow_type.scale))
-
-            if self.arrow_type.precision != precision or self.arrow_type.scale != scale:
-                arrow_type = pa.decimal128(precision, scale) if precision <= 38 else pa.decimal256(precision, scale)
-                object.__setattr__(self, "arrow_type", arrow_type)
-        elif pa.types.is_map(self.arrow_type):
-            keys_sorted = safe_bool(
-                self.metadata.pop("keys_sorted", self.arrow_type.keys_sorted),
-                default=False
-            )
-
-            if self.arrow_type.keys_sorted != keys_sorted:
-                map_type: pa.MapType = self.arrow_type
-                arrow_type = pa.map_(
-                    map_type.key_field,
-                    map_type.item_field,
-                    keys_sorted=keys_sorted
-                )
-                object.__setattr__(self, "arrow_type", arrow_type)
-        elif pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type):
-            fixed_size = safe_int(
-                self.metadata.pop("fixed_size", -1),
-                default=-1
-            )
-
-            if fixed_size > 0:
-                list_type: pa.ListType = self.arrow_type
-                arrow_type = pa.list_(list_type.value_field, fixed_size)
-                object.__setattr__(self, "arrow_type", arrow_type)
+            field = refine_arrow_field(self.to_arrow_field())
+            object.__setattr__(self, "arrow_type", field.type)
+            object.__setattr__(self, "metadata", safe_dict(
+                field.metadata, default={},
+                check_key=safe_str, check_value=safe_str
+            ))
 
         if self.children:
             object.__setattr__(self, "children", [_.refine() for _ in self.children])

@@ -353,15 +353,11 @@ def parse_timestamp_metadata(metadata: dict) -> tuple[str, str | None]:
     # Check for string keys using get() to handle None gracefully
     tz_val = metadata.get('tz')
     if tz_val is not None:
-        if isinstance(tz_val, bytes):
-            tz_val = tz_val.decode('utf-8')
         timezone = safe_str(tz_val)
 
     # Check for bytes keys using get() (PyArrow stores metadata keys as bytes)
     tz_val = metadata.get(b'tz')
     if tz_val is not None:
-        if isinstance(tz_val, bytes):
-            tz_val = tz_val.decode('utf-8')
         timezone = safe_str(tz_val)
 
     # Empty string timezone should be treated as None

@@ -191,7 +191,7 @@ class TestDataField(unittest.TestCase):
         field = DataField.from_py_hint(
             hint=List[int], 
             name="fixed_size_list",
-            metadata={"fixed_size": "3"}
+            metadata={"size": "3"}
         )
         self.assertTrue(pa.types.is_fixed_size_list(field.arrow_type))
         self.assertEqual(field.arrow_type.list_size, 3)
@@ -256,7 +256,7 @@ class TestDataField(unittest.TestCase):
         field = DataField.from_py_hint(
             hint=Dict[str, int], 
             name="sorted_dict",
-            metadata={"keys_sorted": "true"}
+            metadata={"sorted": "true"}
         )
         self.assertTrue(pa.types.is_map(field.arrow_type))
         self.assertTrue(field.arrow_type.keys_sorted)

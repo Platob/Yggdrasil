@@ -409,222 +409,407 @@ class TestGetChildArray:
         assert result.type == pa.int64()
         assert result.null_count == 3
 
-
 class TestDumpArrowFieldMetadata:
-    """Test dump_arrow_field_metadata function."""
+    """Test the dump_arrow_field_metadata function with the new nested JSON structure."""
 
-    def test_basic_metadata_extraction(self):
+    def test_simple_field_metadata(self):
         """Test extracting metadata from a simple field."""
-        field = pa.field('test', pa.int32(), metadata={b'key1': b'value1', b'key2': b'value2'})
-        metadata = dump_arrow_field_metadata(field)
+        field = pa.field('test', pa.int32(), metadata={b'description': b'A test field'})
+        result = dump_arrow_field_metadata(field)
 
-        # Should include field metadata and type info
-        assert 'test' in metadata
-        assert metadata['test']['key1'] == 'value1'
-        assert metadata['test']['key2'] == 'value2'
-        assert metadata['test']['type'] == 'int32'
-        assert metadata['test']['base_type'] == 'int32'
-        assert metadata['test']['nullable'] == 'true'
+        assert 'test' in result
+        assert 'metadata' in result['test']
+        assert result['test']['metadata']['description'] == 'A test field'
+        assert 'type' in result['test']
+        assert result['test']['type'] == 'integer'
 
-    def test_exclude_keys(self):
-        """Test excluding specific keys from metadata."""
-        field = pa.field('test', pa.int32(), metadata={b'key1': b'value1', b'key2': b'value2'})
+    def test_nested_struct_recursive(self):
+        """Test extracting metadata from a struct field with nested fields recursively."""
+        # Create a nested struct type with metadata at multiple levels
+        address_fields = [
+            pa.field('street', pa.string(), metadata={b'description': b'Street name'}),
+            pa.field('city', pa.string(), metadata={b'description': b'City name'}),
+            pa.field('zip', pa.string(), metadata={b'description': b'ZIP code'})
+        ]
+        address_field = pa.field('address', pa.struct(address_fields),
+                                metadata={b'description': b'Address information'})
 
-        # Exclude 'key1' and 'type'
-        metadata = dump_arrow_field_metadata(field, exclude_keys=['key1', 'type'])
+        person_fields = [
+            pa.field('name', pa.string(), metadata={b'description': b'Person name'}),
+            pa.field('age', pa.int32(), metadata={b'description': b'Age in years'}),
+            address_field
+        ]
+        person_field = pa.field('person', pa.struct(person_fields),
+                               metadata={b'description': b'Person information'})
 
-        # key1 should be excluded, but key2 should remain
-        assert 'test' in metadata
-        assert 'key1' not in metadata['test']
-        assert metadata['test']['key2'] == 'value2'
-        assert 'type' not in metadata['test']
-        assert metadata['test']['base_type'] == 'int32'  # Not excluded
+        # Test with recursive=False (default)
+        non_recursive_result = dump_arrow_field_metadata(person_field)
+        assert 'person' in non_recursive_result
+        assert 'metadata' in non_recursive_result['person']
+        assert non_recursive_result['person']['metadata']['description'] == 'Person information'
+        assert 'children' not in non_recursive_result['person']
 
-    def test_recursive_with_exclude_keys(self):
-        """Test recursive metadata extraction with key exclusion."""
-        # Create a nested struct field with metadata
-        struct_field = pa.field(
-            'parent',
-            pa.struct([
-                pa.field('child1', pa.int32(), metadata={b'c1key1': b'c1val1', b'c1key2': b'c1val2'}),
-                pa.field('child2', pa.string(), metadata={b'c2key1': b'c2val1', b'c2key2': b'c2val2'})
-            ]),
-            metadata={b'pkey1': b'pval1', b'pkey2': b'pval2'}
-        )
+        # Test with recursive=True
+        recursive_result = dump_arrow_field_metadata(person_field, recursive=True)
+        assert 'person' in recursive_result
+        assert recursive_result['person']['metadata']['description'] == 'Person information'
 
-        # Exclude 'c1key1' and any 'type' keys
-        metadata = dump_arrow_field_metadata(struct_field, exclude_keys=['c1key1', 'type'])
+        # Check for children dictionary
+        assert 'children' in recursive_result['person']
 
-        # Check parent metadata
-        assert 'parent' in metadata
-        assert metadata['parent']['pkey1'] == 'pval1'
-        assert metadata['parent']['pkey2'] == 'pval2'
-        assert 'type' not in metadata['parent']
+        # Check first level of nesting
+        assert 'name' in recursive_result['person']['children']
+        assert recursive_result['person']['children']['name']['metadata']['description'] == 'Person name'
+        assert 'age' in recursive_result['person']['children']
+        assert recursive_result['person']['children']['age']['metadata']['description'] == 'Age in years'
+        assert 'address' in recursive_result['person']['children']
+        assert recursive_result['person']['children']['address']['metadata']['description'] == 'Address information'
 
-        # Check child1 metadata
-        assert 'parent.child1' in metadata
-        assert 'c1key1' not in metadata['parent.child1']
-        assert metadata['parent.child1']['c1key2'] == 'c1val2'
-        assert 'type' not in metadata['parent.child1']
+        # Check second level of nesting
+        assert 'children' in recursive_result['person']['children']['address']
+        assert 'street' in recursive_result['person']['children']['address']['children']
+        assert recursive_result['person']['children']['address']['children']['street']['metadata']['description'] == 'Street name'
+        assert 'city' in recursive_result['person']['children']['address']['children']
+        assert recursive_result['person']['children']['address']['children']['city']['metadata']['description'] == 'City name'
+        assert 'zip' in recursive_result['person']['children']['address']['children']
+        assert recursive_result['person']['children']['address']['children']['zip']['metadata']['description'] == 'ZIP code'
 
-        # Check child2 metadata
-        assert 'parent.child2' in metadata
-        assert metadata['parent.child2']['c2key1'] == 'c2val1'
-        assert metadata['parent.child2']['c2key2'] == 'c2val2'
-        assert 'type' not in metadata['parent.child2']
+    def test_list_field_recursive(self):
+        """Test extracting metadata from a list field recursively."""
+        # Create a list field with item metadata
+        item_field = pa.field('item', pa.string(), metadata={b'description': b'List item'})
+        list_type = pa.list_(item_field)
+        list_field = pa.field('items', list_type, metadata={b'description': b'List of items'})
 
-    def test_exclude_all_type_info(self):
-        """Test excluding all type-related keys."""
-        field = pa.field('test', pa.float64(), metadata={b'description': b'A test field'})
+        # Test with recursive=True
+        result = dump_arrow_field_metadata(list_field, recursive=True)
 
-        # Exclude all type-related keys
-        metadata = dump_arrow_field_metadata(field, exclude_keys=['type', 'base_type', 'nullable'])
+        assert 'items' in result
+        assert result['items']['metadata']['description'] == 'List of items'
+        assert 'items' in result['items']
+        assert 'metadata' in result['items']['items']
+        assert result['items']['items']['metadata']['description'] == 'List item'
 
-        # Should only have the description left
-        assert 'test' in metadata
-        assert metadata['test']['description'] == 'A test field'
-        assert 'type' not in metadata['test']
-        assert 'base_type' not in metadata['test']
-        assert 'nullable' not in metadata['test']
+    def test_map_field_recursive(self):
+        """Test extracting metadata from a map field recursively."""
+        # Create a map field with key and item metadata
+        key_field = pa.field('key', pa.string(), metadata={b'description': b'Map key'})
+        value_field = pa.field('value', pa.int32(), metadata={b'description': b'Map value'})
+        map_type = pa.map_(key_type=key_field.type, item_type=value_field.type)
+        # In PyArrow, map fields don't retain the metadata from key_field and value_field
+        # We need to recreate these in the map type
+        map_field = pa.field('mappings', map_type, metadata={b'description': b'Map of key-values'})
+
+        # Test with recursive=True
+        result = dump_arrow_field_metadata(map_field, recursive=True)
+
+        assert 'mappings' in result
+        assert result['mappings']['metadata']['description'] == 'Map of key-values'
+        assert 'keys' in result['mappings']
+        assert 'values' in result['mappings']
+
+    def test_nested_list_of_structs_recursive(self):
+        """Test extracting metadata from a list of structs field recursively."""
+        # Create a struct for the list items
+        struct_fields = [
+            pa.field('name', pa.string(), metadata={b'description': b'Item name'}),
+            pa.field('value', pa.float64(), metadata={b'description': b'Item value'})
+        ]
+        struct_type = pa.struct(struct_fields)
+        struct_field = pa.field('struct_item', struct_type, metadata={b'description': b'Struct item'})
+
+        # Create a list of structs
+        list_type = pa.list_(struct_field)
+        list_field = pa.field('items', list_type, metadata={b'description': b'List of structs'})
+
+        # Test with recursive=True
+        result = dump_arrow_field_metadata(list_field, recursive=True)
+
+        assert 'items' in result
+        assert result['items']['metadata']['description'] == 'List of structs'
+        assert 'items' in result['items']
+        assert result['items']['items']['metadata']['description'] == 'Struct item'
+        assert 'children' in result['items']['items']
+        assert 'name' in result['items']['items']['children']
+        assert result['items']['items']['children']['name']['metadata']['description'] == 'Item name'
+        assert 'value' in result['items']['items']['children']
+        assert result['items']['items']['children']['value']['metadata']['description'] == 'Item value'
+
+    def test_union_field_recursive(self):
+        """Test extracting metadata from a union field recursively."""
+        # Create fields for the union
+        str_field = pa.field('str_val', pa.string(), metadata={b'description': b'String value'})
+        int_field = pa.field('int_val', pa.int32(), metadata={b'description': b'Integer value'})
+
+        # Create a sparse union field
+        union_type = pa.sparse_union([str_field, int_field], type_codes=[0, 1])
+        union_field = pa.field('variant', union_type, metadata={b'description': b'Variant data'})
+
+        # Test with recursive=True
+        result = dump_arrow_field_metadata(union_field, recursive=True)
+
+        assert 'variant' in result
+        assert result['variant']['metadata']['description'] == 'Variant data'
+
+        # Check union variants
+        assert 'variants' in result['variant']
+        assert 'str_val' in result['variant']['variants']
+        assert result['variant']['variants']['str_val']['metadata']['description'] == 'String value'
+        assert 'int_val' in result['variant']['variants']
+        assert result['variant']['variants']['int_val']['metadata']['description'] == 'Integer value'
+
+    def test_type_specific_metadata(self):
+        """Test that type-specific metadata is correctly extracted."""
+        # Test decimal type
+        decimal_field = pa.field('amount', pa.decimal128(precision=10, scale=2))
+        result = dump_arrow_field_metadata(decimal_field)
+
+        assert 'amount' in result
+        assert 'type' in result['amount']
+        assert result['amount']['type'] == 'decimal'
+        # Type-specific attributes are top-level keys
+        assert result['amount']['precision'] == '10'
+        assert result['amount']['scale'] == '2'
+
+        # Test timestamp type
+        ts_field = pa.field('timestamp', pa.timestamp('ms', tz='UTC'))
+        result = dump_arrow_field_metadata(ts_field)
+
+        assert 'timestamp' in result
+        assert 'type' in result['timestamp']
+        assert result['timestamp']['type'] == 'timestamp'
+        # Type-specific attributes are top-level keys
+        assert result['timestamp']['timeunit'] == 'ms'
+        assert result['timestamp']['timezone'] == 'UTC'
 
 
 class TestRefineArrowField:
-    """Test refine_arrow_field function."""
+    """Test the refine_arrow_field function."""
 
-    def test_refine_metadata_only(self):
-        """Test refining field's metadata without changing type."""
-        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
+    def test_no_refinement_needed(self):
+        """Test that fields without relevant metadata are returned unchanged."""
+        # Field with no metadata
+        field = pa.field('test', pa.int32())
+        result = refine_arrow_field(field)
+        assert result.equals(field)
+        assert result.metadata is None
 
-        # Add a new key and update an existing one
-        refined = refine_arrow_field(
-            original,
-            metadata={'key1': 'new_value', 'key2': 'value2'}
-        )
+        # Field with unrelated metadata
+        field = pa.field('test', pa.int32(), metadata={b'description': b'A test field'})
+        result = refine_arrow_field(field)
+        assert result.equals(field)
+        assert result.metadata == {b'description': b'A test field'}
 
-        # Type should remain the same
-        assert refined.type == original.type
-        assert refined.type == pa.int32()
+    def test_decimal_refinement(self):
+        """Test refinement of float fields to decimal based on metadata."""
+        # Using data_type directive with precision and scale
+        field = pa.field('amount', pa.float64(), metadata={
+            b'data_type': b'decimal',
+            b'precision': b'10',
+            b'scale': b'2',
+            b'description': b'Transaction amount'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'amount'
+        assert pa.types.is_decimal(result.type)
+        assert result.type.precision == 10
+        assert result.type.scale == 2
+        assert result.metadata == {b'description': b'Transaction amount'}
 
-        # Name and nullable should be preserved
-        assert refined.name == 'test'
-        assert refined.nullable == original.nullable
+        # Using just precision and scale without data_type
+        field = pa.field('price', pa.float64(), metadata={
+            b'precision': b'8',
+            b'scale': b'4',
+            b'description': b'Item price'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'price'
+        assert pa.types.is_decimal(result.type)
+        assert result.type.precision == 8
+        assert result.type.scale == 4
+        assert result.metadata == {b'description': b'Item price'}
 
-        # Metadata should be updated
-        assert b'key1' in refined.metadata
-        assert b'key2' in refined.metadata
-        assert refined.metadata[b'key1'] == b'new_value'
-        assert refined.metadata[b'key2'] == b'value2'
+        # Invalid precision or scale should keep the original type
+        field = pa.field('invalid', pa.float64(), metadata={
+            b'precision': b'not_a_number',
+            b'scale': b'2',
+            b'description': b'Invalid precision'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'invalid'
+        assert pa.types.is_floating(result.type)  # Original type preserved
+        assert result.metadata == {
+            b'precision': b'not_a_number',
+            b'scale': b'2',
+            b'description': b'Invalid precision'
+        }
 
-    def test_refine_type_via_type_metadata(self):
-        """Test refining field's type via 'type' metadata."""
-        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
+    def test_date_refinement(self):
+        """Test refinement to date type based on metadata."""
+        field = pa.field('date_field', pa.string(), metadata={
+            b'data_type': b'date',
+            b'format': b'YYYY-MM-DD',
+            b'description': b'Date of transaction'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'date_field'
+        assert pa.types.is_date(result.type)
+        assert result.metadata == {b'format': b'YYYY-MM-DD', b'description': b'Date of transaction'}
 
-        # Add type metadata to change the type
-        refined = refine_arrow_field(
-            original,
-            metadata={'type': 'int64'}
-        )
+    def test_time_refinement(self):
+        """Test refinement to time type based on metadata."""
+        # Time32 with seconds unit
+        field = pa.field('time_s', pa.string(), metadata={
+            b'data_type': b'time',
+            b'unit': b's',
+            b'description': b'Time in seconds'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'time_s'
+        assert pa.types.is_time32(result.type)
+        assert result.type.unit == 's'
+        assert result.metadata == {b'description': b'Time in seconds'}
 
-        # Type should be updated based on the 'type' metadata
-        assert refined.type != original.type
-        assert refined.type == pa.int64()
+        # Time64 with microseconds unit
+        field = pa.field('time_us', pa.string(), metadata={
+            b'data_type': b'time',
+            b'unit': b'us',
+            b'description': b'Time with microseconds'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'time_us'
+        assert pa.types.is_time64(result.type)
+        assert result.type.unit == 'us'
+        assert result.metadata == {b'description': b'Time with microseconds'}
 
-        # Name and nullable should be preserved
-        assert refined.name == 'test'
-        assert refined.nullable == original.nullable
+        # Invalid unit should keep original type
+        field = pa.field('time_invalid', pa.string(), metadata={
+            b'data_type': b'time',
+            b'unit': b'invalid',
+            b'description': b'Invalid time unit'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'time_invalid'
+        assert pa.types.is_string(result.type)  # Original type preserved
+        # data_type is marked as used even with invalid unit
+        assert b'data_type' not in result.metadata
+        # but unit is preserved since it's invalid
+        assert b'unit' in result.metadata
+        assert result.metadata[b'unit'] == b'invalid'
+        # description is preserved
+        assert b'description' in result.metadata
+        assert result.metadata[b'description'] == b'Invalid time unit'
 
-        # Metadata should be updated
-        assert b'key1' in refined.metadata
-        assert b'type' in refined.metadata
+    def test_timestamp_refinement(self):
+        """Test refinement to timestamp type based on metadata."""
+        # Timestamp with unit only
+        field = pa.field('ts_ms', pa.int64(), metadata={
+            b'data_type': b'timestamp',
+            b'unit': b'ms',
+            b'description': b'Timestamp in milliseconds'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'ts_ms'
+        assert pa.types.is_timestamp(result.type)
+        assert result.type.unit == 'ms'
+        assert result.type.tz is None
+        assert result.metadata == {b'description': b'Timestamp in milliseconds'}
 
-    def test_refine_decimal_type_via_metadata(self):
-        """Test refining decimal type via precision/scale metadata."""
-        original = pa.field('price', pa.decimal128(10, 2))
+        # Timestamp with unit and timezone
+        field = pa.field('ts_utc', pa.int64(), metadata={
+            b'data_type': b'timestamp',
+            b'unit': b'us',
+            b'timezone': b'UTC',
+            b'description': b'Timestamp in UTC'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'ts_utc'
+        assert pa.types.is_timestamp(result.type)
+        assert result.type.unit == 'us'
+        assert result.type.tz == 'UTC'
+        assert result.metadata == {b'description': b'Timestamp in UTC'}
 
-        # Change precision and scale via metadata
-        refined = refine_arrow_field(
-            original,
-            metadata={'precision': '15', 'scale': '5'}
-        )
+        # Adding timezone to existing timestamp type
+        field = pa.field('ts_existing', pa.timestamp('ns'), metadata={
+            b'timezone': b'America/New_York',
+            b'description': b'Timestamp with timezone'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'ts_existing'
+        assert pa.types.is_timestamp(result.type)
+        assert result.type.unit == 'ns'  # Preserves original unit
+        assert result.type.tz == 'America/New_York'
+        assert result.metadata == {b'description': b'Timestamp with timezone'}
 
-        # Type should be updated with new precision and scale
-        assert refined.type.precision == 15
-        assert refined.type.scale == 5
-        assert pa.types.is_decimal(refined.type)
+    def test_duration_refinement(self):
+        """Test refinement to duration type based on metadata."""
+        field = pa.field('duration', pa.int64(), metadata={
+            b'data_type': b'duration',
+            b'unit': b'us',
+            b'description': b'Duration in microseconds'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'duration'
+        assert pa.types.is_duration(result.type)
+        assert result.type.unit == 'us'
+        assert result.metadata == {b'description': b'Duration in microseconds'}
 
-    def test_refine_time_type_via_metadata(self):
-        """Test refining time type via unit metadata."""
-        original = pa.field('time', pa.time32('s'))
+    def test_metadata_cleanup(self):
+        """Test that used metadata is properly cleaned up."""
+        # Metadata with multiple keys, some used for refinement
+        field = pa.field('mixed', pa.float64(), metadata={
+            b'data_type': b'decimal',
+            b'precision': b'12',
+            b'scale': b'3',
+            b'description': b'Mixed metadata',
+            b'source': b'external',
+            b'nullable': b'false'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'mixed'
+        assert pa.types.is_decimal(result.type)
+        assert result.type.precision == 12
+        assert result.type.scale == 3
+        # Check that used keys are removed
+        assert b'data_type' not in result.metadata
+        assert b'precision' not in result.metadata
+        assert b'scale' not in result.metadata
+        # Check that unused keys are preserved
+        assert result.metadata == {
+            b'description': b'Mixed metadata',
+            b'source': b'external',
+            b'nullable': b'false'
+        }
 
-        # Change time unit via metadata
-        refined = refine_arrow_field(
-            original,
-            metadata={'unit': 'ms'}
-        )
+    def test_all_metadata_used(self):
+        """Test case where all metadata is used for refinement."""
+        field = pa.field('all_used', pa.int64(), metadata={
+            b'data_type': b'timestamp',
+            b'unit': b'ms',
+            b'timezone': b'UTC'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'all_used'
+        assert pa.types.is_timestamp(result.type)
+        assert result.type.unit == 'ms'
+        assert result.type.tz == 'UTC'
+        # All metadata was used, so metadata should be None
+        assert result.metadata is None or len(result.metadata) == 0
 
-        # Type should be updated with new unit
-        assert refined.type.unit == 'ms'
-        assert pa.types.is_time32(refined.type)  # Still a time32 type
-
-        # Now change to a microsecond unit, which requires a time64 type
-        refined2 = refine_arrow_field(
-            original,
-            metadata={'unit': 'us'}
-        )
-
-        # Type should change from time32 to time64
-        assert refined2.type.unit == 'us'
-        assert pa.types.is_time64(refined2.type)  # Changed to time64
-
-    def test_refine_timestamp_type_via_metadata(self):
-        """Test refining timestamp type via unit and timezone metadata."""
-        original = pa.field('ts', pa.timestamp('ms'))
-
-        # Change timestamp unit via metadata
-        refined = refine_arrow_field(
-            original,
-            metadata={'unit': 'us'}
-        )
-
-        # Unit should be updated
-        assert refined.type.unit == 'us'
-        assert refined.type.tz is None  # Still no timezone
-
-        # Change both unit and timezone
-        refined2 = refine_arrow_field(
-            original,
-            metadata={'unit': 'ns', 'tz': 'UTC'}
-        )
-
-        # Both unit and timezone should be updated
-        assert refined2.type.unit == 'ns'
-        assert refined2.type.tz == 'UTC'
-
-    def test_with_none_values(self):
-        """Test refining with None values for metadata."""
-        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
-
-        # Passing None for metadata
-        refined = refine_arrow_field(original)
-
-        # Should essentially be a copy with the same properties
-        assert refined.type == original.type
-        assert refined.name == original.name
-        assert refined.nullable == original.nullable
-        assert refined.metadata == original.metadata
-
-    def test_with_invalid_type_metadata(self):
-        """Test handling of invalid type metadata."""
-        original = pa.field('test', pa.int32())
-
-        # Add invalid type metadata
-        refined = refine_arrow_field(
-            original,
-            metadata={'type': 'nonexistent_type'}
-        )
-
-        # Type should remain unchanged when type metadata is invalid
-        assert refined.type == original.type
+    def test_complex_refinement(self):
+        """Test handling of complex data type refinements."""
+        field = pa.field('complex', pa.string(), metadata={
+            b'data_type': b'decimal',  # Doesn't match original type well
+            b'precision': b'9',
+            b'scale': b'3',
+            b'description': b'Complex type conversion'
+        })
+        result = refine_arrow_field(field)
+        assert result.name == 'complex'
+        assert pa.types.is_decimal(result.type)
+        assert result.type.precision == 9
+        assert result.type.scale == 3
+        assert result.metadata == {b'description': b'Complex type conversion'}
 
 
 if __name__ == "__main__":

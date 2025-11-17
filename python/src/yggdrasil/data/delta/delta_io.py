@@ -103,14 +103,10 @@ class DeltaTableIO(DataTableIO):
         - CREATE TABLE IF NOT EXISTS (with schema from df).
         - Optionally OPTIMIZE ZORDER and VACUUM.
         """
-        if not self.schema:
-            try:
-                self.schema = self.load_schema(self.location)
-            except Exception:
-                pass
+        schema = self.load_schema(self.location)
 
-        if self.schema and not isinstance(df, spark_sql.DataFrame):
-            df = self.schema.cast_arrow_tabular(df)
+        if schema and not isinstance(df, spark_sql.DataFrame):
+            df = schema.cast_arrow_tabular(df)
 
         spark_session = self.spark
         df = safe_spark_dataframe(df, spark_session=spark_session)

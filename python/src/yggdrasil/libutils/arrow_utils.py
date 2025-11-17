@@ -8,10 +8,6 @@ from datetime import timezone
 from typing import Dict, List, Set, Tuple
 
 from .py_utils import (
-    parse_decimal_metadata,
-    parse_time_metadata,
-    parse_timestamp_metadata,
-    safe_dict,
     safe_str
 )
 
@@ -42,15 +38,8 @@ __all__ = [
     "array_length",
     "get_child_array",
     "refine_arrow_field",
-    "refine_decimal_type",
-    "refine_time_type",
-    "refine_timestamp_type",
-    "refine_nested_type",
     "dump_arrow_field_metadata",
-    "format_arrow_type",
     "get_base_type_name",
-    "parse_arrow_type",
-    "parse_arrow_field",
     "default_uuid",
     "uuid_to_bytes"
 ]
@@ -237,387 +226,164 @@ def array_nulls(
     return pa.repeat(default, size=size, memory_pool=memory_pool)
 
 
-def refine_arrow_field(field: pa.Field, metadata: dict = None) -> pa.Field:
+def refine_arrow_field(field: pa.Field) -> pa.Field:
     """
-    Refine an arrow field by checking its metadata and potentially updating its type.
-
-    This function examines the field's metadata (including any new metadata provided)
-    and refines the arrow type if relevant metadata is present. It handles:
-    - Decimal types: refines precision and scale based on metadata
-    - Time types: refines unit (s, ms, us, ns) based on metadata
-    - Timestamp types: refines unit and timezone based on metadata
-    - Type changes: converts between types if 'type' metadata is present
+    Apply type-specific refinements to an Arrow field based on its metadata.
+    Adjusts the arrow type according to field type and metadata values and removes used metadata.
 
     Args:
         field: The PyArrow field to refine
-        metadata: A dictionary of string key-value pairs to add as metadata
 
     Returns:
-        A new PyArrow field with updated metadata and potentially refined type
+        A new PyArrow field with refined type and cleaned metadata
 
-    Note:
-        This will merge any existing metadata with the provided metadata.
-        If there are conflicting keys, the new metadata values will override existing ones.
-        The field's type may be changed based on type-related metadata.
-
-    Examples:
-        >>> # Update only metadata
-        >>> field = pa.field('value', pa.int32())
-        >>> refined = refine_arrow_field(field, metadata={'description': 'An integer value'})
-        >>>
-        >>> # Update decimal precision/scale via metadata
-        >>> field = pa.field('value', pa.decimal128(10, 2))
-        >>> refined = refine_arrow_field(field, metadata={'precision': '15', 'scale': '5'})
-        >>> # refined.type will be pa.decimal128(15, 5)
-        >>>
-        >>> # Update timestamp unit and timezone via metadata
-        >>> field = pa.field('value', pa.timestamp('ms'))
-        >>> refined = refine_arrow_field(field, metadata={'unit': 'us', 'tz': 'UTC'})
-        >>> # refined.type will be pa.timestamp('us', tz='UTC')
+    Example:
+        >>> # A float field with metadata specifying precision and scale
+        >>> field = pa.field('amount', pa.float64(), metadata={
+        ...     b'precision': b'10',
+        ...     b'scale': b'2',
+        ...     b'description': b'Transaction amount'
+        ... })
+        >>> refined = refine_arrow_field(field)
+        >>> print(refined)
+        amount: decimal(10, 2) not null
+        >>> print(refined.metadata)
+        {b'description': b'Transaction amount'}
     """
-    # Convert metadata to a safe dict, ensuring all keys and values are properly handled
-    metadata = safe_dict(metadata, default={})
-
-    # Convert metadata values to bytes as required by PyArrow
-    metadata_bytes = {}
-    for k, v in metadata.items():
-        # Convert key to bytes if it's a string
-        key = k.encode('utf-8') if isinstance(k, str) else k
-        # Convert value to bytes if it's a string
-        value = v.encode('utf-8') if isinstance(v, str) else v
-        metadata_bytes[key] = value
-
-    # Get existing field metadata if any
-    existing_metadata = field.metadata or {}
-
-    # Merge with new metadata
-    updated_metadata = {**existing_metadata, **metadata_bytes}
-
-    # Extract combined metadata as a regular dict with string keys
-    # This makes it easier to work with the metadata for type refinement
-    decoded_metadata = {}
-    for k, v in updated_metadata.items():
-        key = safe_str(k)
-        value = safe_str(v)
-        if key:  # Ensure no empty keys
-            decoded_metadata[key] = value
-
-    # Create a base field with the updated metadata
-    refined_field = pa.field(
-        field.name,
-        field.type,
-        nullable=field.nullable,
-        metadata=updated_metadata
-    )
-
-    # Apply type-specific refinements based on metadata
+    # Start with original field attributes
     arrow_type = field.type
+    field_name = field.name
+    nullable = field.nullable
 
-    # Check if we should refine a decimal type
-    if pa.types.is_decimal(arrow_type):
-        return refine_decimal_type(refined_field, decoded_metadata)
+    # Use original metadata directly or empty dict if None
+    metadata = {} if field.metadata is None else field.metadata
+    metadata_str = {}
 
-    # Check if we should refine a time type
-    elif pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type):
-        return refine_time_type(refined_field, decoded_metadata)
+    # Convert metadata binary keys/values to strings for easier handling
+    for key, value in list(metadata.items()):
+        if isinstance(key, bytes):
+            key_str = safe_str(key)
+        else:
+            key_str = str(key)
 
-    # Check if we should refine a timestamp type
-    elif pa.types.is_timestamp(arrow_type):
-        return refine_timestamp_type(refined_field, decoded_metadata)
+        if isinstance(value, bytes):
+            value_str = safe_str(value)
+        else:
+            value_str = str(value)
 
-    # Check if we need to change the type entirely based on 'type' metadata
-    elif 'type' in decoded_metadata:
+        metadata_str[key_str] = value_str
+
+    # Decimal type conversion from data_type
+    if pa.types.is_decimal(arrow_type) and 'precision' in metadata_str and 'scale' in metadata_str:
         try:
-            # Try to parse a type string from metadata
-            type_str = decoded_metadata['type']
-            new_type = parse_arrow_type(type_str)
-
-            # Create a new field with the parsed type
-            return pa.field(
-                field.name,
-                new_type,
-                nullable=field.nullable,
-                metadata=updated_metadata
-            )
-        except ValueError:
-            # If parsing fails, just keep the current type
+            precision = int(metadata_str['precision'])
+            scale = int(metadata_str['scale'])
+            arrow_type = pa.decimal128(precision, scale)
+            # Pop used keys
+            metadata.pop(b'precision' if b'precision' in metadata else 'precision', None)
+            metadata.pop(b'scale' if b'scale' in metadata else 'scale', None)
+        except (ValueError, TypeError):
+            # If conversion fails, keep the original type
             pass
 
-    return refined_field
-
-
-def refine_decimal_type(field: pa.Field, metadata: dict) -> pa.Field:
-    """
-    Refine a decimal field using precision and scale from metadata.
-
-    Args:
-        field: The PyArrow field to refine (should contain a decimal type)
-        metadata: Dictionary containing 'precision' and 'scale' keys
-
-    Returns:
-        A new field with the decimal type refined according to metadata if different,
-        otherwise returns the field with its metadata updated
-
-    Note:
-        - If the input field's type is not a decimal type, only the metadata will be updated
-        - If metadata doesn't contain precision/scale info, default values will be used
-        - The metadata is added to the resulting field
-        - No new type will be created if precision and scale haven't changed
-    """
-    arrow_type = field.type
-
-    # If not a decimal type, just return the field as is with metadata
-    if not pa.types.is_decimal(arrow_type):
-        return field
-
-    # Parse precision and scale from metadata
-    precision, scale = parse_decimal_metadata(metadata)
-
-    # Get current precision and scale
-    current_precision = arrow_type.precision
-    current_scale = arrow_type.scale
-
-    # Check if precision or scale actually changed
-    if precision != current_precision or scale != current_scale:
-        # Only create a new type if precision or scale changed
-        new_decimal_type = pa.decimal128(precision, scale)
-
-        # Create a new field with the updated type and metadata
-        return pa.field(
-            field.name,
-            new_decimal_type,
-            nullable=field.nullable,
-            metadata=field.metadata
-        )
-
-    # If no change in precision/scale, just return the field as is
-    return field
-
-
-def refine_time_type(field: pa.Field, metadata: dict) -> pa.Field:
-    """
-    Refine a time field using unit from metadata.
-
-    Args:
-        field: The PyArrow field to refine (should contain a time type)
-        metadata: Dictionary containing 'unit' key
-
-    Returns:
-        A new field with the time type refined according to metadata if different,
-        otherwise returns the field with its metadata updated
-
-    Note:
-        - If the input field's type is not a time type, only the metadata will be updated
-        - If metadata doesn't contain unit info, default value will be used
-        - The metadata is added to the resulting field
-        - No new type will be created if the unit hasn't changed
-    """
-    arrow_type = field.type
-
-    # If not a time type, just return the field as is
-    if not (pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type)):
-        return field
-
-    # Parse unit from metadata
-    unit = parse_time_metadata(metadata)
-
-    # Get current unit
-    current_unit = arrow_type.unit
-
-    # Check if unit changed
-    if unit != current_unit:
-        # Determine the time type based on the unit
-        # time32 supports 's' and 'ms'
-        # time64 supports 'us' and 'ns'
+    # Handle time type
+    elif pa.types.is_time(arrow_type) and 'unit' in metadata_str:
+        unit = metadata_str['unit']
         if unit in ['s', 'ms']:
-            new_time_type = pa.time32(unit)
-        else:  # unit in ['us', 'ns']
-            new_time_type = pa.time64(unit)
+            arrow_type = pa.time32(unit)
+            metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
+        elif unit in ['us', 'ns']:
+            arrow_type = pa.time64(unit)
+            metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
 
-        # Create a new field with the updated type and metadata
-        return pa.field(
-            field.name,
-            new_time_type,
-            nullable=field.nullable,
-            metadata=field.metadata
-        )
+    # Handle timestamp type
+    elif pa.types.is_timestamp(arrow_type) and 'unit' in metadata_str:
+        unit = metadata_str['unit']
+        if unit in ['s', 'ms', 'us', 'ns']:
+            if 'timezone' in metadata_str:
+                timezone = metadata_str['timezone']
+                arrow_type = pa.timestamp(unit, tz=timezone)
+                metadata.pop(b'timezone' if b'timezone' in metadata else 'timezone', None)
+            else:
+                arrow_type = pa.timestamp(unit)
+            metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
 
-    # If no change in unit, just return the field as is
-    return field
+    # Handle duration type
+    elif pa.types.is_duration(arrow_type) and 'unit' in metadata_str:
+        unit = metadata_str['unit']
+        if unit in ['s', 'ms', 'us', 'ns']:
+            arrow_type = pa.duration(unit)
+            metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
 
+    # Process type refinements based on field type and metadata (not related to data_type)
+    elif (pa.types.is_floating(arrow_type) or pa.types.is_decimal(arrow_type)) and 'precision' in metadata_str and 'scale' in metadata_str:
+        try:
+            precision = int(metadata_str['precision'])
+            scale = int(metadata_str['scale'])
+            arrow_type = pa.decimal128(precision, scale)
+            # Pop used keys from metadata
+            metadata.pop(b'precision' if b'precision' in metadata else 'precision', None)
+            metadata.pop(b'scale' if b'scale' in metadata else 'scale', None)
+        except (ValueError, TypeError):
+            # If conversion fails, keep the original type
+            pass
 
-def refine_timestamp_type(field: pa.Field, metadata: dict) -> pa.Field:
-    """
-    Refine a timestamp field using unit and timezone from metadata.
+    # Handle integer with time units as timestamp/time/duration
+    elif pa.types.is_integer(arrow_type) and 'unit' in metadata_str:
+        unit = metadata_str['unit']
+        if unit in ['s', 'ms', 'us', 'ns']:
+            # Check for time-related type hints in other metadata
+            if 'timezone' in metadata_str:
+                # This is a timestamp with timezone
+                timezone = metadata_str['timezone']
+                arrow_type = pa.timestamp(unit, tz=timezone)
+                # Pop used keys
+                metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
+                metadata.pop(b'timezone' if b'timezone' in metadata else 'timezone', None)
+            else:
+                # This could be a timestamp, time, or duration
+                # Default to timestamp if no other indication
+                arrow_type = pa.timestamp(unit)
+                # Pop used key
+                metadata.pop(b'unit' if b'unit' in metadata else 'unit', None)
 
-    Args:
-        field: The PyArrow field to refine (should contain a timestamp type)
-        metadata: Dictionary containing 'unit' and optional 'tz' keys
+    # Handle timestamp timezone addition
+    elif pa.types.is_timestamp(arrow_type) and 'timezone' in metadata_str:
+        timezone = metadata_str['timezone']
+        arrow_type = pa.timestamp(arrow_type.unit, tz=timezone)
+        # Pop used key
+        metadata.pop(b'timezone' if b'timezone' in metadata else 'timezone', None)
 
-    Returns:
-        A new field with the timestamp type refined according to metadata if different,
-        otherwise returns the field with its metadata updated
+    # Handle string with date format as date type
+    elif pa.types.is_string(arrow_type) and 'format' in metadata_str:
+        format_str = metadata_str['format'].lower()
+        if any(date_hint in format_str for date_hint in ['date', 'yyyy', 'mm', 'dd']):
+            arrow_type = pa.date32()
+            # Pop used key
+            metadata.pop(b'format' if b'format' in metadata else 'format', None)
 
-    Note:
-        - If the input field's type is not a timestamp type, only the metadata will be updated
-        - If metadata doesn't contain unit info, default value will be used
-        - If metadata doesn't contain timezone info, no timezone is assumed (naive timestamp)
-        - The metadata is added to the resulting field
-        - No new type will be created if the unit and timezone haven't changed
-    """
-    arrow_type = field.type
-
-    # If not a timestamp type, just return the field as is
-    if not pa.types.is_timestamp(arrow_type):
-        return field
-
-    # Parse unit and timezone from metadata
-    unit, timezone = parse_timestamp_metadata(metadata)
-
-    # Get current unit and timezone
-    current_unit = arrow_type.unit
-    current_tz = arrow_type.tz
-
-    # Check if unit or timezone changed
-    if unit != current_unit or timezone != current_tz:
-        # Create a new timestamp type with the specified unit and timezone
-        new_timestamp_type = pa.timestamp(unit, tz=timezone)
-
-        # Create a new field with the updated type and metadata
-        return pa.field(
-            field.name,
-            new_timestamp_type,
-            nullable=field.nullable,
-            metadata=field.metadata
-        )
-
-    # If no change in unit or timezone, just return the field as is
-    return field
-
-
-def refine_nested_type(field: pa.Field, metadata: dict = None, field_metadata_map: dict = None) -> pa.Field:
-    """
-    Recursively refine a nested type (struct, list, map) and its children.
-
-    Args:
-        field: The PyArrow field to refine (may contain a nested type)
-        metadata: Dictionary containing metadata for the field itself
-        field_metadata_map: Dictionary mapping field paths to their metadata dictionaries.
-                           Keys are field paths in the format "field.subfield.subsubfield"
-
-    Returns:
-        A new field with all nested types refined according to metadata if any changes,
-        otherwise returns the field with its metadata updated
-
-    Note:
-        - Handles struct, list, fixed-size list, large list, and map types
-        - If a type is not nested, its metadata will still be updated
-        - field_metadata_map allows specifying metadata for nested fields
-        - Specific type refinements (decimal, time, timestamp) will be applied to respective types
-    """
-    arrow_type = field.type
-    field_path = field.name
-    field_metadata_map = field_metadata_map or {}
-    metadata = metadata or {}
-
-    # Apply basic metadata to the current field
-    refined_field = refine_arrow_field(field, metadata)
-
-    # Handle struct types (fields within a struct)
-    if pa.types.is_struct(arrow_type):
-        struct_fields = []
-
-        for child_field in arrow_type:
-            child_path = f"{field_path}.{child_field.name}"
-            child_metadata = field_metadata_map.get(child_path, {})
-
-            # Recursively refine the child field
-            refined_child = refine_nested_type(child_field, child_metadata, field_metadata_map)
-            struct_fields.append(refined_child)
-
-        # Create a new struct type with the refined fields
-        new_struct_type = pa.struct(struct_fields)
-
-        # Create a new field with the updated type and metadata
-        refined_field = pa.field(
-            field.name,
-            new_struct_type,
-            nullable=field.nullable,
-            metadata=refined_field.metadata
-        )
-
-    # Handle list-like types (regular list, large list, fixed-size list)
-    elif (pa.types.is_list(arrow_type) or
-          pa.types.is_large_list(arrow_type) or
-          pa.types.is_fixed_size_list(arrow_type)):
-
-        value_field = arrow_type.value_field
-        value_path = f"{field_path}.items"
-        value_metadata = field_metadata_map.get(value_path, {})
-
-        # Recursively refine the value field
-        refined_value = refine_nested_type(value_field, value_metadata, field_metadata_map)
-
-        # Create an appropriate list type based on the original type
-        if pa.types.is_fixed_size_list(arrow_type):
-            list_size = arrow_type.list_size
-            new_list_type = pa.list_(refined_value.type, list_size)
-        elif pa.types.is_large_list(arrow_type):
-            new_list_type = pa.large_list(refined_value)
-        else:
-            new_list_type = pa.list_(refined_value)
-
-        # Create a new field with the updated type and metadata
-        refined_field = pa.field(
-            field.name,
-            new_list_type,
-            nullable=field.nullable,
-            metadata=refined_field.metadata
-        )
-
-    # Handle map types
-    elif pa.types.is_map(arrow_type):
-        key_field = arrow_type.key_field
-        item_field = arrow_type.item_field
-
-        key_path = f"{field_path}.keys"
-        item_path = f"{field_path}.items"
-
-        key_metadata = field_metadata_map.get(key_path, {})
-        item_metadata = field_metadata_map.get(item_path, {})
-
-        # Recursively refine key and item fields
-        refined_key = refine_nested_type(key_field, key_metadata, field_metadata_map)
-        refined_item = refine_nested_type(item_field, item_metadata, field_metadata_map)
-
-        # Create a new map type with the refined key and item fields
-        new_map_type = pa.map_(refined_key, refined_item)
-
-        # Create a new field with the updated type and metadata
-        refined_field = pa.field(
-            field.name,
-            new_map_type,
-            nullable=field.nullable,
-            metadata=refined_field.metadata
-        )
-
-    return refined_field
+    # Create a new field with refined type and remaining metadata
+    return pa.field(field_name, arrow_type, nullable=nullable, metadata=metadata if metadata else None)
 
 
-def dump_arrow_field_metadata(field: pa.Field, recursive: bool = True, prefix: str = "", decode_values: bool = True, include_type: bool = True, exclude_keys: list = None) -> dict:
+def dump_arrow_field_metadata(
+    field: pa.Field,
+    recursive: bool = False,
+) -> dict:
     """
     Extract and format metadata from an Arrow field, optionally recursing through nested types.
+    Returns a nested JSON structure with standardized key groups:
+    - "type": Base type information (name, width, etc.)
+    - "metadata": Field metadata from the metadata dict
+    - "children": List of child fields (for nested types)
+    - Type-specific keys (like "precision", "scale", etc.)
 
     Args:
         field: The PyArrow field to extract metadata from
         recursive: Whether to recursively extract metadata from nested fields
-        prefix: String prefix to add to each field path (useful for nested calls)
-        decode_values: Whether to decode byte values to strings when possible
-        include_type: Whether to include the Arrow type information in the metadata
-        exclude_keys: Optional list of keys to exclude from the metadata
 
     Returns:
-        A dictionary mapping field paths to their metadata dictionaries
+        A nested dictionary representing the field hierarchy and metadata
 
     Example:
         >>> schema = pa.schema([
@@ -627,317 +393,143 @@ def dump_arrow_field_metadata(field: pa.Field, recursive: bool = True, prefix: s
         ...         pa.field('value', pa.decimal128(10, 2), metadata={b'precision': b'10', b'scale': b'2'})
         ...     ]), metadata={b'description': b'Additional details'})
         ... ])
-        >>> metadata = dump_arrow_field_metadata(schema.field('details'))
+        >>> metadata = dump_arrow_field_metadata(schema.field('details'), recursive=True)
         >>> print(metadata)
         {
-            'details': {'description': 'Additional details', 'type': 'struct<name: string, value: decimal(10,2)>'},
-            'details.name': {'description': 'Full name', 'type': 'string'},
-            'details.value': {'precision': '10', 'scale': '2', 'type': 'decimal(10,2)'}
-        }
-        >>> # Exclude 'type' key from metadata
-        >>> metadata = dump_arrow_field_metadata(schema.field('details'), exclude_keys=['type'])
-        >>> print(metadata)
-        {
-            'details': {'description': 'Additional details'},
-            'details.name': {'description': 'Full name'},
-            'details.value': {'precision': '10', 'scale': '2'}
+            "details": {
+                "type": {
+                    "name": "struct"
+                },
+                "metadata": {
+                    "description": "Additional details"
+                },
+                "children": {
+                    "name": {
+                        "type": {
+                            "name": "string",
+                            "encoding": "UTF8"
+                        },
+                        "metadata": {
+                            "description": "Full name"
+                        }
+                    },
+                    "value": {
+                        "type": {
+                            "name": "decimal128"
+                        },
+                        "metadata": {
+                            "precision": "10",
+                            "scale": "2"
+                        },
+                        "precision": "10",
+                        "scale": "2"
+                    }
+                }
+            }
         }
     """
+    def _create_field_data(field):
+        """Helper function to create field metadata structure."""
+        arrow_type = field.type
+        field_data = {}
+
+        # Add field metadata (convert from binary to string)
+        metadata_dict = {}
+        if field.metadata:
+            for key, value in field.metadata.items():
+                if isinstance(key, bytes):
+                    key = safe_str(key)
+                if isinstance(value, bytes):
+                    value = safe_str(value)
+                metadata_dict[key] = value
+
+        if metadata_dict:
+            field_data["metadata"] = metadata_dict
+
+        # Add type as a simple string
+        field_data["type"] = get_base_type_name(arrow_type)
+
+        # Add type-specific attributes at the top level
+        if (pa.types.is_integer(arrow_type) or pa.types.is_floating(arrow_type) or
+                pa.types.is_boolean(arrow_type)):
+            try:
+                field_data["bitwidth"] = safe_str(arrow_type.bit_width)
+                field_data["bytewidth"] = safe_str(arrow_type.byte_width)
+            except (AttributeError, ValueError):
+                pass
+
+        if pa.types.is_fixed_size_binary(arrow_type):
+            field_data["byte_width"] = safe_str(arrow_type.byte_width)
+
+        # Add type-specific information as top-level keys
+        if pa.types.is_decimal(arrow_type):
+            field_data["precision"] = safe_str(arrow_type.precision)
+            field_data["scale"] = safe_str(arrow_type.scale)
+        elif pa.types.is_date64(arrow_type):
+            field_data["timeunit"] = "ms"
+        elif pa.types.is_time(arrow_type):
+            field_data["timeunit"] = safe_str(arrow_type.unit)
+        elif pa.types.is_timestamp(arrow_type):
+            field_data["timeunit"] = safe_str(arrow_type.unit)
+            if arrow_type.tz:
+                field_data["timezone"] = safe_str(arrow_type.tz)
+        elif pa.types.is_string(arrow_type):
+            field_data["encoding"] = "UTF8"
+
+        return field_data
+
+    # Create the result dictionary and add this field
     result = {}
-    field_path = prefix + field.name if prefix else field.name
-    arrow_type = field.type
-    exclude_keys = exclude_keys or []
+    field_data = _create_field_data(field)
+    result[field.name] = field_data
 
-    # Initialize metadata dict for the current field
-    metadata_dict = {}
+    # Handle nested types recursively if requested
+    if recursive:
+        arrow_type = field.type
+        children = {}
 
-    # Extract existing metadata from the current field
-    if field.metadata:
-        # Convert metadata from bytes to strings if requested
-        if decode_values:
-            metadata_dict = {
-                k.decode('utf-8') if isinstance(k, bytes) else k:
-                v.decode('utf-8') if isinstance(v, bytes) else v
-                for k, v in field.metadata.items()
-                if (k.decode('utf-8') if isinstance(k, bytes) else k) not in exclude_keys
-            }
-        else:
-            metadata_dict = {
-                k: v for k, v in field.metadata.items()
-                if (k.decode('utf-8') if isinstance(k, bytes) else k) not in exclude_keys
-            }
+        if pa.types.is_struct(arrow_type):
+            for i in range(arrow_type.num_fields):
+                child_field = arrow_type.field(i)
+                # Recursively process this child's structure
+                nested = dump_arrow_field_metadata(child_field, recursive=True)
+                # Add to children dictionary
+                children[child_field.name] = nested[child_field.name]
 
-    # Add type information if requested and not excluded
-    if include_type:
-        # Add formatted type string to metadata if not excluded
-        if 'type' not in exclude_keys:
-            metadata_dict['type'] = format_arrow_type(arrow_type)
-        # Add base type name (without parameters) if not excluded
-        if 'base_type' not in exclude_keys:
-            metadata_dict['base_type'] = get_base_type_name(arrow_type)
-        # Add nullable information if not excluded
-        if 'nullable' not in exclude_keys:
-            metadata_dict['nullable'] = str(field.nullable).lower()
+            if children:
+                field_data["children"] = children
 
-    # Only add to result if there's metadata or type info
-    if metadata_dict:
-        result[field_path] = metadata_dict
+        elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
+            child_field = arrow_type.value_field
 
-    # If not recursive, just return the current field's metadata
-    if not recursive:
-        return result
+            # Recursively process item field
+            nested = dump_arrow_field_metadata(child_field, recursive=True)
+            field_data["items"] = nested[child_field.name]
 
-    # Handle struct types (fields within a struct)
-    if pa.types.is_struct(arrow_type):
-        for child_field in arrow_type:
-            child_path_prefix = field_path + "."
-            child_result = dump_arrow_field_metadata(
-                child_field, recursive=recursive,
-                prefix=child_path_prefix, decode_values=decode_values,
-                include_type=include_type, exclude_keys=exclude_keys
-            )
-            result.update(child_result)
+        elif pa.types.is_map(arrow_type):
+            key_field = arrow_type.key_field
+            item_field = arrow_type.item_field
 
-    # Handle list-like types
-    elif (pa.types.is_list(arrow_type) or
-          pa.types.is_large_list(arrow_type) or
-          pa.types.is_fixed_size_list(arrow_type)):
+            # Recursively process key and item fields
+            key_data = dump_arrow_field_metadata(key_field, recursive=True)
+            item_data = dump_arrow_field_metadata(item_field, recursive=True)
 
-        value_field = arrow_type.value_field
-        item_path_prefix = field_path + ".items."
+            field_data["keys"] = key_data[key_field.name]
+            field_data["values"] = item_data[item_field.name]
 
-        # Recursively extract metadata from the list item type
-        item_result = dump_arrow_field_metadata(
-            value_field, recursive=recursive,
-            prefix=field_path + ".items", decode_values=decode_values,
-            include_type=include_type, exclude_keys=exclude_keys
-        )
-        result.update(item_result)
+        elif pa.types.is_union(arrow_type):
+            variants = {}
+            for i in range(arrow_type.num_fields):
+                child_field = arrow_type.field(i)
 
-    # Handle map types
-    elif pa.types.is_map(arrow_type):
-        key_field = arrow_type.key_field
-        item_field = arrow_type.item_field
+                # Recursively process each variant field
+                nested = dump_arrow_field_metadata(child_field, recursive=True)
+                variants[child_field.name] = nested[child_field.name]
 
-        # Extract metadata from key and item types
-        key_result = dump_arrow_field_metadata(
-            key_field, recursive=recursive,
-            prefix=field_path + ".keys", decode_values=decode_values,
-            include_type=include_type, exclude_keys=exclude_keys
-        )
-        result.update(key_result)
-
-        item_result = dump_arrow_field_metadata(
-            item_field, recursive=recursive,
-            prefix=field_path + ".items", decode_values=decode_values,
-            include_type=include_type, exclude_keys=exclude_keys
-        )
-        result.update(item_result)
+            if variants:
+                field_data["variants"] = variants
 
     return result
-
-
-def parse_arrow_type(type_str: str) -> pa.DataType:
-    """
-    Parse a string representation of an Arrow type and create the actual Arrow type.
-
-    Args:
-        type_str: String representation of an Arrow type (e.g., 'decimal(10,2)', 'timestamp[ms,UTC]')
-
-    Returns:
-        A PyArrow DataType object
-
-    Raises:
-        ValueError: If the type string cannot be parsed
-
-    Examples:
-        >>> parse_arrow_type('int32')
-        DataType(int32)
-        >>> parse_arrow_type('decimal(10,2)')
-        DataType(decimal(10, 2))
-        >>> parse_arrow_type('timestamp[ms,UTC]')
-        DataType(timestamp[ms, tz=UTC])
-        >>> parse_arrow_type('list<string>')
-        DataType(list<item: string>)
-    """
-    # Strip any whitespace
-    type_str = type_str.strip()
-
-    # Handle basic types
-    if type_str == 'bool':
-        return pa.bool_()
-    elif type_str == 'int8':
-        return pa.int8()
-    elif type_str == 'int16':
-        return pa.int16()
-    elif type_str == 'int32':
-        return pa.int32()
-    elif type_str == 'int64':
-        return pa.int64()
-    elif type_str == 'uint8':
-        return pa.uint8()
-    elif type_str == 'uint16':
-        return pa.uint16()
-    elif type_str == 'uint32':
-        return pa.uint32()
-    elif type_str == 'uint64':
-        return pa.uint64()
-    elif type_str == 'float16':
-        return pa.float16()
-    elif type_str == 'float32':
-        return pa.float32()
-    elif type_str == 'float64':
-        return pa.float64()
-    elif type_str == 'string':
-        return pa.string()
-    elif type_str == 'binary':
-        return pa.binary()
-    elif type_str == 'large_string':
-        return pa.large_string()
-    elif type_str == 'large_binary':
-        return pa.large_binary()
-    elif type_str == 'null':
-        return pa.null()
-
-    # Handle decimal types: decimal(precision,scale)
-    if type_str.startswith('decimal('):
-        # Extract precision and scale from decimal(p,s)
-        params = type_str[len('decimal('):-1]  # Remove 'decimal(' prefix and ')' suffix
-        try:
-            precision, scale = map(int, params.split(','))
-            return pa.decimal128(precision, scale)
-        except ValueError:
-            raise ValueError(f"Invalid decimal parameters: {params}")
-
-    # Handle timestamp types: timestamp[unit] or timestamp[unit,tz]
-    if type_str.startswith('timestamp['):
-        # Extract unit and optional timezone
-        params = type_str[len('timestamp['):-1]  # Remove 'timestamp[' prefix and ']' suffix
-        parts = params.split(',')
-        unit = parts[0]
-        tz = parts[1] if len(parts) > 1 else None
-        return pa.timestamp(unit, tz=tz)
-
-    # Handle time types: time32[unit] or time64[unit]
-    if type_str.startswith('time32[') or type_str.startswith('time64['):
-        # Extract unit
-        unit = type_str[type_str.find('[')+1:type_str.find(']')]
-        if type_str.startswith('time32['):
-            return pa.time32(unit)
-        else:  # time64
-            return pa.time64(unit)
-
-    # Handle date types
-    if type_str == 'date32':
-        return pa.date32()
-    elif type_str == 'date64':
-        return pa.date64()
-
-    # Handle duration types: duration[unit]
-    if type_str.startswith('duration['):
-        unit = type_str[len('duration['):-1]
-        return pa.duration(unit)
-
-    # Handle list types: list<type>
-    if type_str.startswith('list<'):
-        # Extract inner type
-        inner_type_str = type_str[len('list<'):-1]
-        inner_type = parse_arrow_type(inner_type_str)
-        return pa.list_(inner_type)
-
-    # Handle large_list types: large_list<type>
-    if type_str.startswith('large_list<'):
-        # Extract inner type
-        inner_type_str = type_str[len('large_list<'):-1]
-        inner_type = parse_arrow_type(inner_type_str)
-        return pa.large_list(inner_type)
-
-    # Handle fixed size list types: fixed_size_list<type,size>
-    if type_str.startswith('fixed_size_list<'):
-        # Remove prefix and suffix
-        params = type_str[len('fixed_size_list<'):-1]
-        # Find the last comma (to handle nested types with commas)
-        last_comma = params.rfind(',')
-        if last_comma == -1:
-            raise ValueError(f"Invalid fixed_size_list format: {type_str}")
-
-        inner_type_str = params[:last_comma]
-        size_str = params[last_comma+1:]
-
-        try:
-            size = int(size_str)
-            inner_type = parse_arrow_type(inner_type_str)
-            return pa.list_(inner_type, size)
-        except ValueError:
-            raise ValueError(f"Invalid fixed_size_list parameters: {params}")
-
-    # Handle map types: map<key_type,item_type>
-    if type_str.startswith('map<'):
-        # Remove prefix and suffix
-        params = type_str[len('map<'):-1]
-        # Find the first comma (assuming key type doesn't have commas)
-        first_comma = params.find(',')
-        if first_comma == -1:
-            raise ValueError(f"Invalid map format: {type_str}")
-
-        key_type_str = params[:first_comma]
-        item_type_str = params[first_comma+1:]
-
-        key_type = parse_arrow_type(key_type_str)
-        item_type = parse_arrow_type(item_type_str)
-        return pa.map_(key_type, item_type)
-
-    # Handle struct types: struct<name1: type1, name2: type2, ...>
-    if type_str.startswith('struct<'):
-        fields_str = type_str[len('struct<'):-1]
-        if not fields_str:
-            return pa.struct([])
-
-        # This is a simplified parser that won't handle all edge cases
-        # For a complete parser, we'd need a more sophisticated approach
-        fields = []
-        field_parts = []
-
-        # Simple parser for struct fields that handles nesting
-        # This won't handle all edge cases, but works for common cases
-        depth = 0
-        current = ""
-        for char in fields_str:
-            if char == ',' and depth == 0:
-                field_parts.append(current.strip())
-                current = ""
-            else:
-                if char == '<':
-                    depth += 1
-                elif char == '>':
-                    depth -= 1
-                current += char
-
-        if current:
-            field_parts.append(current.strip())
-
-        # Parse each field
-        for part in field_parts:
-            if ':' not in part:
-                raise ValueError(f"Invalid struct field format: {part}")
-
-            name, type_def = part.split(':', 1)
-            name = name.strip()
-            type_def = type_def.strip()
-
-            # Check if field is nullable (ends with !)
-            nullable = True
-            if type_def.endswith('!'):
-                nullable = False
-                type_def = type_def[:-1]
-
-            field_type = parse_arrow_type(type_def)
-            fields.append(pa.field(name, field_type, nullable=nullable))
-
-        return pa.struct(fields)
-
-    # If all else fails
-    raise ValueError(f"Unsupported Arrow type format: {type_str}")
 
 
 def get_base_type_name(arrow_type: pa.DataType) -> str:
@@ -953,19 +545,8 @@ def get_base_type_name(arrow_type: pa.DataType) -> str:
     if pa.types.is_boolean(arrow_type):
         return 'bool'
     elif pa.types.is_integer(arrow_type):
-        if pa.types.is_int8(arrow_type): return 'int8'
-        elif pa.types.is_int16(arrow_type): return 'int16'
-        elif pa.types.is_int32(arrow_type): return 'int32'
-        elif pa.types.is_int64(arrow_type): return 'int64'
-        elif pa.types.is_uint8(arrow_type): return 'uint8'
-        elif pa.types.is_uint16(arrow_type): return 'uint16'
-        elif pa.types.is_uint32(arrow_type): return 'uint32'
-        elif pa.types.is_uint64(arrow_type): return 'uint64'
         return 'integer'
     elif pa.types.is_floating(arrow_type):
-        if pa.types.is_float16(arrow_type): return 'float16'
-        elif pa.types.is_float32(arrow_type): return 'float32'
-        elif pa.types.is_float64(arrow_type): return 'float64'
         return 'float'
     elif pa.types.is_decimal(arrow_type):
         return 'decimal'
@@ -974,11 +555,11 @@ def get_base_type_name(arrow_type: pa.DataType) -> str:
     elif pa.types.is_binary(arrow_type):
         return 'binary'
     elif pa.types.is_large_string(arrow_type):
-        return 'large_string'
+        return 'string'
     elif pa.types.is_large_binary(arrow_type):
-        return 'large_binary'
+        return 'binary'
     elif pa.types.is_fixed_size_binary(arrow_type):
-        return 'fixed_size_binary'
+        return 'binary'
     elif pa.types.is_timestamp(arrow_type):
         return 'timestamp'
     elif pa.types.is_date(arrow_type):
@@ -990,9 +571,9 @@ def get_base_type_name(arrow_type: pa.DataType) -> str:
     elif pa.types.is_list(arrow_type):
         return 'list'
     elif pa.types.is_large_list(arrow_type):
-        return 'large_list'
+        return 'list'
     elif pa.types.is_fixed_size_list(arrow_type):
-        return 'fixed_size_list'
+        return 'list'
     elif pa.types.is_map(arrow_type):
         return 'map'
     elif pa.types.is_struct(arrow_type):
@@ -1009,91 +590,6 @@ def get_base_type_name(arrow_type: pa.DataType) -> str:
         # Remove any parameters
         base_type = type_str.split('(')[0].split('[')[0].strip()
         return base_type
-
-
-def parse_arrow_field(field_metadata: dict) -> pa.Field:
-    """
-    Parse a field from its metadata representation (as returned by dump_arrow_field_metadata).
-
-    Args:
-        field_metadata: Dictionary containing field metadata including 'type' key
-
-    Returns:
-        A PyArrow Field object
-
-    Raises:
-        ValueError: If required metadata is missing or invalid
-
-    Examples:
-        >>> metadata = {'type': 'decimal(10,2)', 'nullable': 'true', 'description': 'Amount field'}
-        >>> field = parse_arrow_field(metadata)
-        >>> field
-        pyarrow.field('field_name', decimal(10, 2), nullable=True, metadata={b'description': b'Amount field'})
-    """
-    if 'type' not in field_metadata:
-        raise ValueError("Field metadata must include 'type' key")
-
-    # Parse the type
-    arrow_type = parse_arrow_type(field_metadata['type'])
-
-    # Get nullable status (default to True if not specified)
-    nullable_str = field_metadata.get('nullable', 'true').lower()
-    nullable = nullable_str not in ('false', 'f', '0', 'no')
-
-    # Extract name (default to 'field')
-    name = field_metadata.get('name', 'field')
-
-    # Create metadata dictionary excluding special keys
-    special_keys = {'type', 'base_type', 'nullable', 'name'}
-    metadata = {
-        k.encode('utf-8') if isinstance(k, str) else k:
-        v.encode('utf-8') if isinstance(v, str) else v
-        for k, v in field_metadata.items()
-        if k not in special_keys
-    }
-
-    # Create and return the field
-    return pa.field(name, arrow_type, nullable=nullable, metadata=metadata)
-
-
-def format_arrow_type(arrow_type: pa.DataType) -> str:
-    """
-    Format an Arrow data type as a readable string.
-
-    Args:
-        arrow_type: PyArrow data type to format
-
-    Returns:
-        A formatted string representation of the type
-    """
-    # Handle special cases for common types
-    if pa.types.is_decimal(arrow_type):
-        return f"decimal({arrow_type.precision},{arrow_type.scale})"
-    elif pa.types.is_timestamp(arrow_type):
-        tz_str = f",{arrow_type.tz}" if arrow_type.tz else ""
-        return f"timestamp[{arrow_type.unit}{tz_str}]"
-    elif pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type):
-        return f"time[{arrow_type.unit}]"
-    elif pa.types.is_list(arrow_type):
-        return f"list<{format_arrow_type(arrow_type.value_type)}>"
-    elif pa.types.is_large_list(arrow_type):
-        return f"large_list<{format_arrow_type(arrow_type.value_type)}>"
-    elif pa.types.is_fixed_size_list(arrow_type):
-        return f"fixed_size_list<{format_arrow_type(arrow_type.value_type)},{arrow_type.list_size}>"
-    elif pa.types.is_map(arrow_type):
-        key_type = format_arrow_type(arrow_type.key_type)
-        item_type = format_arrow_type(arrow_type.item_type)
-        return f"map<{key_type},{item_type}>"
-    elif pa.types.is_struct(arrow_type):
-        field_strs = []
-        for field in arrow_type:
-            field_type = format_arrow_type(field.type)
-            nullable_str = "" if field.nullable else "!"
-            field_strs.append(f"{field.name}: {field_type}{nullable_str}")
-        return f"struct<{', '.join(field_strs)}>"
-    else:
-        # For basic types, use the standard string representation
-        return str(arrow_type)
 
 
 def arrow_default_scalar(arrow_type: pa.DataType, nullable: bool) -> pa.Scalar:
@@ -1115,6 +611,10 @@ def arrow_default_scalar(arrow_type: pa.DataType, nullable: bool) -> pa.Scalar:
     if hasattr(pa.types, 'is_uuid') and pa.types.is_uuid(arrow_type):
         # Create a nil UUID (all zeros) and convert to bytes for PyArrow
         return pa.scalar(uuid_to_bytes(default_uuid()), arrow_type)
+
+    if pa.types.is_fixed_size_binary(arrow_type):
+        dft = b"0" * arrow_type.byte_width
+        return pa.scalar(dft, arrow_type)
 
     # handle list types recursively
     if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type) or pa.types.is_fixed_size_list(arrow_type):
