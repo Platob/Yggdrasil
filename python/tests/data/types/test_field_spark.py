@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Import from field module
-from yggdrasil.utils.spark_utils import spark_sql, spark_types
+from yggdrasil.libutils.spark_utils import spark_sql, spark_types
 from yggdrasil.types.field import DataField
 
 @pytest.mark.skipif(not "pyspark" in sys.modules, reason="No pyspark found")

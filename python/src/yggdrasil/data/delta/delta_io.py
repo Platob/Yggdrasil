@@ -4,8 +4,8 @@ from typing import Any
 from ..data_io import DataTableIO
 from ..table_location import TableLocation
 from ...types import DataField
-from ...utils.py_utils import safe_dict, safe_str
-from ...utils.spark_utils import spark_sql, safe_spark_dataframe
+from ...libutils.py_utils import safe_dict, safe_str
+from ...libutils.spark_utils import spark_sql, safe_spark_dataframe
 
 try:
     from delta.tables import DeltaTable

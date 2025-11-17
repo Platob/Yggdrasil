@@ -2,7 +2,7 @@ import json
 import pytest
 
 # Replace `safe_utils` with the actual module name if different
-from yggdrasil.utils.py_utils import (
+from yggdrasil.libutils.py_utils import (
     safe_str,
     safe_bytes,
     safe_bool,

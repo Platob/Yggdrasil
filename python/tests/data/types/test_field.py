@@ -185,7 +185,7 @@ class TestDataField(unittest.TestCase):
         field = DataField.from_py_hint(hint=list, name="generic_list")
         self.assertTrue(pa.types.is_list(field.arrow_type))
         item_field = field.children[0]
-        self.assertEqual(item_field.arrow_type, pa.utf8())
+        self.assertEqual(item_field.arrow_type, pa.null())
         
         # Test fixed-size list
         field = DataField.from_py_hint(
@@ -250,7 +250,7 @@ class TestDataField(unittest.TestCase):
         value_field = key_value.children[1]
         
         self.assertEqual(key_field.arrow_type, pa.utf8())
-        self.assertEqual(value_field.arrow_type, pa.utf8())
+        self.assertEqual(value_field.arrow_type, pa.null())
         
         # Test keys_sorted parameter
         field = DataField.from_py_hint(

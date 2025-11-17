@@ -11,13 +11,13 @@ from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union, It
 import polars as pl
 import pyarrow as pa
 
-from ..utils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular, ArrowArrayLike, \
+from ..libutils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_arrow_tabular, ArrowArrayLike, \
     get_child_array
-from ..utils.polars_utils import polars_to_arrow_type
-from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
-from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
+from ..libutils.polars_utils import polars_to_arrow_type
+from ..libutils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
+from ..libutils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
     spark_sql, spark_functions, safe_spark_dataframe
-from ..utils.pandas_utils import PandasDataFrame
+from ..libutils.pandas_utils import PandasDataFrame
 
 __all__ = [
     "DataField",

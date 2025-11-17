@@ -70,9 +70,6 @@ class FakeObject:
     def __eq__(self, other: Any) -> bool:
         return other is None
 
-    def value(self):
-        return None
-
 
 class FakeModule(ModuleType):
     """

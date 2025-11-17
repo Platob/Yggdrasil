@@ -208,7 +208,9 @@ def index_of(
         return collection.index(value)
     except ValueError:
         if strict_names:
-            raise ValueError(f"Cannot find '{value}' in {collection}")
+            if raise_error:
+                raise ValueError(f"Cannot find '{value}' in {collection}")
+            return -1
 
         idx = 0
 

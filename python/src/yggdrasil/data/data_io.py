@@ -8,7 +8,7 @@ from enum import StrEnum
 
 from .table_location import TableLocation
 from ..types.field import DataField
-from ..utils.spark_utils import spark_sql
+from ..libutils.spark_utils import spark_sql
 
 try:
     from delta.tables import DeltaTable
