@@ -1,8 +1,14 @@
+from .fake_module import make_fake_module
+
+for mod_name in [
+    "polars"
+]:
+    make_fake_module(mod_name)
+
 import polars as pl
 import pyarrow as pa
 
 __all__ = [
-    "POLARS_TO_ARROW_TYPE_MAP",
     "polars_to_arrow_type"
 ]
 

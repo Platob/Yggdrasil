@@ -1,11 +1,12 @@
-import functools
-import decimal as dec
 import datetime as dt
-import pyarrow as pa
-import polars as pl
-import pandas as pd
-import numpy as np
+import decimal as dec
+import functools
 
+import polars as pl
+import pyarrow as pa
+
+from .numpy_utils import numpy
+from .pandas_utils import PandasDataFrame, PandasSeries
 from .py_utils import index_of
 
 __all__ = [
@@ -45,10 +46,14 @@ ARROW_DEFAULT_SCALARS: dict[pa.DataType, pa.Scalar] = {
     pa.uint16(): pa.scalar(0, pa.uint16()),
     pa.uint32(): pa.scalar(0, pa.uint32()),
     pa.uint64(): pa.scalar(0, pa.uint64()),
-    pa.float16(): pa.scalar(np.float16(0), pa.float16()),
     pa.float32(): pa.scalar(0.0, pa.float32()),
     pa.float64(): pa.scalar(0.0, pa.float64()),
 }
+
+try:
+    ARROW_DEFAULT_SCALARS[pa.float16()] = pa.scalar(numpy.float16(0), pa.float16())
+except ImportError:
+    pass
 
 
 ArrowArrayLike = pa.Array | pa.ChunkedArray
@@ -60,9 +65,9 @@ def safe_arrow_tabular(obj) -> ArrowTabular:
         return obj
     if isinstance(obj, pl.DataFrame):
         return obj.to_arrow()
-    if isinstance(obj, pd.DataFrame):
+    if isinstance(obj, PandasDataFrame):
         return pa.table(obj)
-    if isinstance(obj, pd.Series):
+    if isinstance(obj, PandasSeries):
         return safe_arrow_tabular(obj.to_frame())
 
     raise TypeError(f"Cannot convert {type(obj)} to arrow Table or RecordBatch")

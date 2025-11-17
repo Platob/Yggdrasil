@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypeVar, Any, get_type_hints, get_origin, get_args, Union, Iterable
 
-import pandas
 import polars as pl
 import pyarrow as pa
 
@@ -18,6 +17,7 @@ from ..utils.polars_utils import polars_to_arrow_type
 from ..utils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
 from ..utils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
     spark_sql, spark_functions, safe_spark_dataframe
+from ..utils.pandas_utils import PandasDataFrame
 
 __all__ = [
     "DataField",
@@ -930,7 +930,7 @@ class DataField:
             return self.cast_arrow_array(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, pl.DataFrame):
             return self.cast_polars_dataframe(df, safe=safe, strict_names=strict_names)
-        elif isinstance(df, pandas.DataFrame):
+        elif isinstance(df, PandasDataFrame):
             return self.cast_pandas_dataframe(df, safe=safe, strict_names=strict_names)
         elif isinstance(df, spark_sql.DataFrame):
             return self.cast_spark_dataframe(df, safe=safe, strict_names=strict_names)
