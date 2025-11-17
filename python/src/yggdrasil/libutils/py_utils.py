@@ -22,7 +22,10 @@ __all__ = [
     "safe_dict",
     "safe_int",
     "merge_dicts",
-    "index_of"
+    "index_of",
+    "parse_decimal_metadata",
+    "parse_time_metadata",
+    "parse_timestamp_metadata"
 ]
 
 TRUE_STR_VALUES = {"True", "true", "1", "Yes", "yes"}
@@ -231,3 +234,138 @@ def is_py_scalar(obj: Any) -> bool:
         int, float, decimal.Decimal,
         dt.datetime, dt.date, dt.time, dt.timedelta, dt.timezone
     ))
+
+
+def parse_decimal_metadata(metadata: dict) -> tuple[int, int]:
+    """
+    Parse precision and scale for a decimal type from metadata.
+
+    Args:
+        metadata: Dictionary containing metadata with precision and scale information
+
+    Returns:
+        A tuple of (precision, scale) for decimal types
+
+    Notes:
+        - Looks for keys 'precision' and 'scale' in the metadata
+        - Both string and bytes keys are supported
+        - Default precision is 38 and scale is 18 if not found
+        - Values can be provided as strings or integers
+    """
+    precision = 38  # Default precision
+    scale = 18      # Default scale
+
+    # Check for string keys using get() to handle None gracefully
+    precision_val = metadata.get('precision')
+    if precision_val is not None:
+        precision = safe_int(precision_val, default=precision)
+
+    scale_val = metadata.get('scale')
+    if scale_val is not None:
+        scale = safe_int(scale_val, default=scale)
+
+    # Check for bytes keys using get() (PyArrow stores metadata keys as bytes)
+    precision_val = metadata.get(b'precision')
+    if precision_val is not None:
+        if isinstance(precision_val, bytes):
+            precision_val = precision_val.decode('utf-8')
+        precision = safe_int(precision_val, default=precision)
+
+    scale_val = metadata.get(b'scale')
+    if scale_val is not None:
+        if isinstance(scale_val, bytes):
+            scale_val = scale_val.decode('utf-8')
+        scale = safe_int(scale_val, default=scale)
+
+    # Ensure valid precision and scale
+    if precision <= 0:
+        precision = 38
+
+    if scale < 0 or scale > precision:
+        scale = min(18, precision)
+
+    return precision, scale
+
+
+def parse_time_metadata(metadata: dict) -> str:
+    """
+    Parse time resolution unit from metadata.
+
+    Args:
+        metadata: Dictionary containing metadata with time unit information
+
+    Returns:
+        Time unit string ('s', 'ms', 'us', or 'ns')
+
+    Notes:
+        - Looks for key 'unit' in the metadata
+        - Both string and bytes keys are supported
+        - Default unit is 'us' (microseconds) if not found
+        - Valid values are: 's', 'ms', 'us', 'ns'
+    """
+    default_unit = 'us'  # Default unit is microseconds
+    valid_units = ['s', 'ms', 'us', 'ns']
+
+    # Check for string keys using get() to handle None gracefully
+    unit_val = metadata.get('unit')
+    if unit_val is not None:
+        if isinstance(unit_val, bytes):
+            unit_val = unit_val.decode('utf-8')
+        if unit_val in valid_units:
+            return unit_val
+
+    # Check for bytes keys using get() (PyArrow stores metadata keys as bytes)
+    unit_val = metadata.get(b'unit')
+    if unit_val is not None:
+        if isinstance(unit_val, bytes):
+            unit_val = unit_val.decode('utf-8')
+        if unit_val in valid_units:
+            return unit_val
+
+    return default_unit
+
+
+def parse_timestamp_metadata(metadata: dict) -> tuple[str, str | None]:
+    """
+    Parse timestamp unit and timezone from metadata.
+
+    Args:
+        metadata: Dictionary containing metadata with timestamp information
+
+    Returns:
+        A tuple of (unit, timezone) where:
+        - unit is one of: 's', 'ms', 'us', 'ns'
+        - timezone is a valid timezone string or None
+
+    Notes:
+        - Looks for keys 'unit' and 'tz' in the metadata
+        - Both string and bytes keys are supported
+        - Default unit is 'us' (microseconds) if not found
+        - Default timezone is None (timezone-naive) if not found
+        - If timezone is specified but invalid, None will be returned for timezone
+    """
+    # First, get the time unit using the existing function
+    unit = parse_time_metadata(metadata)
+
+    # Now handle timezone
+    timezone = None
+
+    # Check for string keys using get() to handle None gracefully
+    tz_val = metadata.get('tz')
+    if tz_val is not None:
+        if isinstance(tz_val, bytes):
+            tz_val = tz_val.decode('utf-8')
+        timezone = safe_str(tz_val)
+
+    # Check for bytes keys using get() (PyArrow stores metadata keys as bytes)
+    tz_val = metadata.get(b'tz')
+    if tz_val is not None:
+        if isinstance(tz_val, bytes):
+            tz_val = tz_val.decode('utf-8')
+        timezone = safe_str(tz_val)
+
+    # Empty string timezone should be treated as None
+    if timezone == '':
+        timezone = None
+
+    return unit, timezone

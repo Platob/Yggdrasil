@@ -28,12 +28,45 @@ except ImportError:
 
 from yggdrasil.libutils.arrow_utils import (
     PYTHON_TO_ARROW_TYPE_MAP,
+    default_uuid,
+    uuid_to_bytes,
     safe_arrow_tabular,
     arrow_default_scalar,
     array_nulls,
     array_length,
     get_child_array,
+    dump_arrow_field_metadata,
 )
+
+
+def test_default_uuid():
+    """Test that default_uuid returns a nil UUID (all zeros)."""
+    import uuid
+
+    nil_uuid = default_uuid()
+    assert isinstance(nil_uuid, uuid.UUID)
+    assert str(nil_uuid) == '00000000-0000-0000-0000-000000000000'
+    assert int(nil_uuid) == 0
+
+
+def test_uuid_to_bytes():
+    """Test that uuid_to_bytes correctly converts a UUID to bytes."""
+    import uuid
+
+    # Test with nil UUID
+    nil_uuid = default_uuid()
+    bytes_val = uuid_to_bytes(nil_uuid)
+    assert isinstance(bytes_val, bytes)
+    assert len(bytes_val) == 16  # UUID is 16 bytes
+    assert bytes_val == b'\x00' * 16  # Nil UUID is all zeros
+
+    # Test with a random UUID
+    random_uuid = uuid.uuid4()
+    bytes_val = uuid_to_bytes(random_uuid)
+    assert isinstance(bytes_val, bytes)
+    assert len(bytes_val) == 16
+    # Verify roundtrip conversion
+    assert uuid.UUID(bytes=bytes_val) == random_uuid
 
 
 def test_python_to_arrow_type_map_mappings():
@@ -62,7 +95,7 @@ def test_python_to_arrow_type_map_mappings():
     assert PYTHON_TO_ARROW_TYPE_MAP[dt.timedelta] == pa.duration("us")
 
     # Check additional types
-    assert PYTHON_TO_ARROW_TYPE_MAP[uuid.UUID] == pa.string()
+    assert PYTHON_TO_ARROW_TYPE_MAP[uuid.UUID] == pa.uuid()
     assert PYTHON_TO_ARROW_TYPE_MAP[type(None)] == pa.null()
     assert PYTHON_TO_ARROW_TYPE_MAP[enum.Enum] == pa.string()
 
@@ -193,6 +226,27 @@ class TestArrowDefaultScalar:
         scalar = arrow_default_scalar(timestamp_us_ny, nullable=False)
         assert isinstance(scalar, pa.Scalar)
         assert scalar.type == timestamp_us_ny
+
+    def test_with_uuid_type(self):
+        """Test default value for UUID type."""
+        import uuid
+
+        # Test the UUID type gets the nil UUID (all zeros) as default
+        uuid_type = pa.uuid()
+        scalar = arrow_default_scalar(uuid_type, nullable=False)
+        assert isinstance(scalar, pa.Scalar)
+        assert scalar.type == uuid_type
+
+        # PyArrow might return bytes or UUID depending on version
+        # so we need to handle both cases
+        value = scalar.as_py()
+        if isinstance(value, bytes):
+            # Convert bytes to UUID if needed
+            value = uuid.UUID(bytes=value)
+
+        # Verify the UUID value is the nil UUID
+        assert value == default_uuid()
+        assert str(value) == '00000000-0000-0000-0000-000000000000'
 
     def test_with_time_types(self):
         """Test default values for time types."""
@@ -353,6 +407,84 @@ class TestGetChildArray:
 
         assert result.type == pa.int64()
         assert result.null_count == 3
+
+
+class TestDumpArrowFieldMetadata:
+    """Test dump_arrow_field_metadata function."""
+
+    def test_basic_metadata_extraction(self):
+        """Test extracting metadata from a simple field."""
+        field = pa.field('test', pa.int32(), metadata={b'key1': b'value1', b'key2': b'value2'})
+        metadata = dump_arrow_field_metadata(field)
+
+        # Should include field metadata and type info
+        assert 'test' in metadata
+        assert metadata['test']['key1'] == 'value1'
+        assert metadata['test']['key2'] == 'value2'
+        assert metadata['test']['type'] == 'int32'
+        assert metadata['test']['base_type'] == 'int32'
+        assert metadata['test']['nullable'] == 'true'
+
+    def test_exclude_keys(self):
+        """Test excluding specific keys from metadata."""
+        field = pa.field('test', pa.int32(), metadata={b'key1': b'value1', b'key2': b'value2'})
+
+        # Exclude 'key1' and 'type'
+        metadata = dump_arrow_field_metadata(field, exclude_keys=['key1', 'type'])
+
+        # key1 should be excluded, but key2 should remain
+        assert 'test' in metadata
+        assert 'key1' not in metadata['test']
+        assert metadata['test']['key2'] == 'value2'
+        assert 'type' not in metadata['test']
+        assert metadata['test']['base_type'] == 'int32'  # Not excluded
+
+    def test_recursive_with_exclude_keys(self):
+        """Test recursive metadata extraction with key exclusion."""
+        # Create a nested struct field with metadata
+        struct_field = pa.field(
+            'parent',
+            pa.struct([
+                pa.field('child1', pa.int32(), metadata={b'c1key1': b'c1val1', b'c1key2': b'c1val2'}),
+                pa.field('child2', pa.string(), metadata={b'c2key1': b'c2val1', b'c2key2': b'c2val2'})
+            ]),
+            metadata={b'pkey1': b'pval1', b'pkey2': b'pval2'}
+        )
+
+        # Exclude 'c1key1' and any 'type' keys
+        metadata = dump_arrow_field_metadata(struct_field, exclude_keys=['c1key1', 'type'])
+
+        # Check parent metadata
+        assert 'parent' in metadata
+        assert metadata['parent']['pkey1'] == 'pval1'
+        assert metadata['parent']['pkey2'] == 'pval2'
+        assert 'type' not in metadata['parent']
+
+        # Check child1 metadata
+        assert 'parent.child1' in metadata
+        assert 'c1key1' not in metadata['parent.child1']
+        assert metadata['parent.child1']['c1key2'] == 'c1val2'
+        assert 'type' not in metadata['parent.child1']
+
+        # Check child2 metadata
+        assert 'parent.child2' in metadata
+        assert metadata['parent.child2']['c2key1'] == 'c2val1'
+        assert metadata['parent.child2']['c2key2'] == 'c2val2'
+        assert 'type' not in metadata['parent.child2']
+
+    def test_exclude_all_type_info(self):
+        """Test excluding all type-related keys."""
+        field = pa.field('test', pa.float64(), metadata={b'description': b'A test field'})
+
+        # Exclude all type-related keys
+        metadata = dump_arrow_field_metadata(field, exclude_keys=['type', 'base_type', 'nullable'])
+
+        # Should only have the description left
+        assert 'test' in metadata
+        assert metadata['test']['description'] == 'A test field'
+        assert 'type' not in metadata['test']
+        assert 'base_type' not in metadata['test']
+        assert 'nullable' not in metadata['test']
 
 
 if __name__ == "__main__":

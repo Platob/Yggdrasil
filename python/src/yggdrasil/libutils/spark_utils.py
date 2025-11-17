@@ -43,15 +43,15 @@ SPARK_TO_ARROW_TYPE_MAP = {
     spark_types.DecimalType: lambda t: pa.decimal128(t.precision, t.scale),
 
     # Complex types with recursive conversion
-    spark_types.ArrayType: lambda t: pa.list_(spark_to_arrow_type(t.elementType)),
+    spark_types.ArrayType: lambda t: pa.list_(spark_type_to_arrow_type(t.elementType)),
     spark_types.MapType: lambda t: pa.map_(
-        spark_to_arrow_type(t.keyType),
-        spark_to_arrow_type(t.valueType),
+        spark_type_to_arrow_type(t.keyType),
+        spark_type_to_arrow_type(t.valueType),
     ),
     spark_types.StructType: lambda t: pa.struct([
         pa.field(
             field.name,
-            spark_to_arrow_type(field.dataType),
+            spark_type_to_arrow_type(field.dataType),
             field.nullable,
             metadata=field.metadata
         )
@@ -62,9 +62,10 @@ SPARK_TO_ARROW_TYPE_MAP = {
 __all__ = [
     "ARROW_TYPE_TO_SPARK_TYPE",
     "spark", "spark_sql", "spark_types", "spark_functions",
-    "spark_to_arrow_type",
+    "spark_type_to_arrow_type",
     "cast_nested_spark_field",
-    "safe_spark_dataframe"
+    "safe_spark_dataframe",
+    "spark_field_to_arrow_field"
 ]
 
 
@@ -106,7 +107,13 @@ def safe_spark_dataframe(
     )
 
 
-def spark_to_arrow_type(spark_type: spark_types.DataType):
+def spark_field_to_arrow_field(spark_field: spark_types.StructField):
+    arrow_type = spark_type_to_arrow_type(spark_field.dataType)
+
+    return pa.field(name=spark_field.name, type=arrow_type, nullable=spark_field.nullable, metadata=spark_field.metadata)
+
+
+def spark_type_to_arrow_type(spark_type: spark_types.DataType):
     """Convert a Spark type to a PyArrow type.
 
     Args:

@@ -15,8 +15,9 @@ from ..libutils.arrow_utils import PYTHON_TO_ARROW_TYPE_MAP, ArrowTabular, safe_
     get_child_array
 from ..libutils.polars_utils import polars_to_arrow_type
 from ..libutils.py_utils import Annotated, safe_dict, safe_str, merge_dicts, safe_bool, safe_int
-from ..libutils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_to_arrow_type, spark_types, \
-    spark_sql, spark_functions, safe_spark_dataframe
+from ..libutils.spark_utils import ARROW_TYPE_TO_SPARK_TYPE, cast_nested_spark_field, spark_type_to_arrow_type, \
+    spark_types, \
+    spark_sql, spark_functions, safe_spark_dataframe, spark_field_to_arrow_field
 from ..libutils.pandas_utils import PandasDataFrame
 
 __all__ = [
@@ -390,19 +391,7 @@ class DataField:
             ImportError: If PySpark is not installed
             TypeError: If the Spark type cannot be converted to a PyArrow type
         """
-        name = spark_field.name
-        nullable = spark_field.nullable
-        metadata = getattr(spark_field, "metadata", {})
-        arrow_type = spark_to_arrow_type(spark_field.dataType)
-
-        return cls(
-            name=name,
-            arrow_type=arrow_type,
-            nullable=nullable,
-            comment=None,
-            metadata=metadata,
-            children=None
-        ).refine()
+        return cls.from_arrow_field(spark_field_to_arrow_field(spark_field))
 
     @classmethod
     def from_spark_type(cls, name: str, spark_type: spark_types.DataType, nullable: bool, metadata: dict[str, str] = None) -> "DataField":

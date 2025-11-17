@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(not has_spark, reason="PySpark not installed")
 if has_spark:
     from yggdrasil.libutils.spark_utils import (
         ARROW_TYPE_TO_SPARK_TYPE,
-        spark_to_arrow_type,
+        spark_type_to_arrow_type,
         cast_nested_spark_field,
         safe_spark_dataframe
     )
@@ -104,31 +104,31 @@ class TestSparkToArrowType:
     def test_primitive_types(self):
         """Test conversion of primitive Spark types to Arrow types."""
         # Boolean type
-        assert spark_to_arrow_type(spark_types.BooleanType()) == pa.bool_()
+        assert spark_type_to_arrow_type(spark_types.BooleanType()) == pa.bool_()
 
         # Integer types
-        assert spark_to_arrow_type(spark_types.ByteType()) == pa.int8()
-        assert spark_to_arrow_type(spark_types.ShortType()) == pa.int16()
-        assert spark_to_arrow_type(spark_types.IntegerType()) == pa.int32()
-        assert spark_to_arrow_type(spark_types.LongType()) == pa.int64()
+        assert spark_type_to_arrow_type(spark_types.ByteType()) == pa.int8()
+        assert spark_type_to_arrow_type(spark_types.ShortType()) == pa.int16()
+        assert spark_type_to_arrow_type(spark_types.IntegerType()) == pa.int32()
+        assert spark_type_to_arrow_type(spark_types.LongType()) == pa.int64()
 
         # Float types
-        assert spark_to_arrow_type(spark_types.FloatType()) == pa.float32()
-        assert spark_to_arrow_type(spark_types.DoubleType()) == pa.float64()
+        assert spark_type_to_arrow_type(spark_types.FloatType()) == pa.float32()
+        assert spark_type_to_arrow_type(spark_types.DoubleType()) == pa.float64()
 
         # String and binary types
-        assert spark_to_arrow_type(spark_types.StringType()) == pa.utf8()
-        assert spark_to_arrow_type(spark_types.BinaryType()) == pa.binary()
+        assert spark_type_to_arrow_type(spark_types.StringType()) == pa.utf8()
+        assert spark_type_to_arrow_type(spark_types.BinaryType()) == pa.binary()
 
         # Date and timestamp types
-        assert spark_to_arrow_type(spark_types.DateType()) == pa.date32()
-        assert spark_to_arrow_type(spark_types.TimestampType()) == pa.timestamp('us', "UTC")
-        assert spark_to_arrow_type(spark_types.TimestampNTZType()) == pa.timestamp('us')
+        assert spark_type_to_arrow_type(spark_types.DateType()) == pa.date32()
+        assert spark_type_to_arrow_type(spark_types.TimestampType()) == pa.timestamp('us', "UTC")
+        assert spark_type_to_arrow_type(spark_types.TimestampNTZType()) == pa.timestamp('us')
 
     def test_decimal_type(self):
         """Test conversion of Spark decimal type to Arrow decimal type."""
         decimal_type = spark_types.DecimalType(10, 2)
-        arrow_type = spark_to_arrow_type(decimal_type)
+        arrow_type = spark_type_to_arrow_type(decimal_type)
         assert pa.types.is_decimal(arrow_type)
         assert arrow_type.precision == 10
         assert arrow_type.scale == 2
@@ -137,7 +137,7 @@ class TestSparkToArrowType:
         """Test conversion of Spark array type to Arrow list type."""
         # Array of integers
         array_type = spark_types.ArrayType(spark_types.IntegerType())
-        arrow_type = spark_to_arrow_type(array_type)
+        arrow_type = spark_type_to_arrow_type(array_type)
 
         assert pa.types.is_list(arrow_type)
         assert arrow_type.value_type == pa.int32()
@@ -146,7 +146,7 @@ class TestSparkToArrowType:
         nested_array_type = spark_types.ArrayType(
             spark_types.ArrayType(spark_types.StringType())
         )
-        arrow_nested_type = spark_to_arrow_type(nested_array_type)
+        arrow_nested_type = spark_type_to_arrow_type(nested_array_type)
 
         assert pa.types.is_list(arrow_nested_type)
         assert pa.types.is_list(arrow_nested_type.value_type)
@@ -159,7 +159,7 @@ class TestSparkToArrowType:
             spark_types.StringType(),
             spark_types.IntegerType()
         )
-        arrow_type = spark_to_arrow_type(map_type)
+        arrow_type = spark_type_to_arrow_type(map_type)
 
         assert pa.types.is_map(arrow_type)
         assert arrow_type.key_type == pa.utf8()
@@ -172,7 +172,7 @@ class TestSparkToArrowType:
             spark_types.StructField("name", spark_types.StringType(), True),
             spark_types.StructField("age", spark_types.IntegerType(), False)
         ])
-        arrow_type = spark_to_arrow_type(struct_type)
+        arrow_type = spark_type_to_arrow_type(struct_type)
 
         assert pa.types.is_struct(arrow_type)
         assert len(arrow_type) == 2
@@ -199,7 +199,7 @@ class TestSparkToArrowType:
             spark_types.StructField("address", address_struct, True)
         ])
 
-        arrow_type = spark_to_arrow_type(person_struct)
+        arrow_type = spark_type_to_arrow_type(person_struct)
 
         assert pa.types.is_struct(arrow_type)
         assert len(arrow_type) == 2
@@ -216,7 +216,7 @@ class TestSparkToArrowType:
             pass
 
         with pytest.raises(TypeError):
-            spark_to_arrow_type(UnsupportedType())
+            spark_type_to_arrow_type(UnsupportedType())
 
 
 @pytest.mark.skipif(not has_spark, reason="PySpark not installed")
