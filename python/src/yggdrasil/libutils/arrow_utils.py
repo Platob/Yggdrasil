@@ -10,7 +10,9 @@ from typing import Dict, List, Set, Tuple
 from .py_utils import (
     parse_decimal_metadata,
     parse_time_metadata,
-    parse_timestamp_metadata
+    parse_timestamp_metadata,
+    safe_dict,
+    safe_str
 )
 
 
@@ -235,24 +237,55 @@ def array_nulls(
     return pa.repeat(default, size=size, memory_pool=memory_pool)
 
 
-def refine_arrow_field(field: pa.Field, metadata: dict) -> pa.Field:
+def refine_arrow_field(field: pa.Field, metadata: dict = None) -> pa.Field:
     """
-    Refine an arrow field by adding or updating its metadata.
+    Refine an arrow field by checking its metadata and potentially updating its type.
+
+    This function examines the field's metadata (including any new metadata provided)
+    and refines the arrow type if relevant metadata is present. It handles:
+    - Decimal types: refines precision and scale based on metadata
+    - Time types: refines unit (s, ms, us, ns) based on metadata
+    - Timestamp types: refines unit and timezone based on metadata
+    - Type changes: converts between types if 'type' metadata is present
 
     Args:
         field: The PyArrow field to refine
         metadata: A dictionary of string key-value pairs to add as metadata
 
     Returns:
-        A new PyArrow field with the updated metadata
+        A new PyArrow field with updated metadata and potentially refined type
 
     Note:
         This will merge any existing metadata with the provided metadata.
         If there are conflicting keys, the new metadata values will override existing ones.
+        The field's type may be changed based on type-related metadata.
+
+    Examples:
+        >>> # Update only metadata
+        >>> field = pa.field('value', pa.int32())
+        >>> refined = refine_arrow_field(field, metadata={'description': 'An integer value'})
+        >>>
+        >>> # Update decimal precision/scale via metadata
+        >>> field = pa.field('value', pa.decimal128(10, 2))
+        >>> refined = refine_arrow_field(field, metadata={'precision': '15', 'scale': '5'})
+        >>> # refined.type will be pa.decimal128(15, 5)
+        >>>
+        >>> # Update timestamp unit and timezone via metadata
+        >>> field = pa.field('value', pa.timestamp('ms'))
+        >>> refined = refine_arrow_field(field, metadata={'unit': 'us', 'tz': 'UTC'})
+        >>> # refined.type will be pa.timestamp('us', tz='UTC')
     """
+    # Convert metadata to a safe dict, ensuring all keys and values are properly handled
+    metadata = safe_dict(metadata, default={})
+
     # Convert metadata values to bytes as required by PyArrow
-    metadata_bytes = {k: v.encode('utf-8') if isinstance(v, str) else v
-                      for k, v in metadata.items()}
+    metadata_bytes = {}
+    for k, v in metadata.items():
+        # Convert key to bytes if it's a string
+        key = k.encode('utf-8') if isinstance(k, str) else k
+        # Convert value to bytes if it's a string
+        value = v.encode('utf-8') if isinstance(v, str) else v
+        metadata_bytes[key] = value
 
     # Get existing field metadata if any
     existing_metadata = field.metadata or {}
@@ -260,13 +293,57 @@ def refine_arrow_field(field: pa.Field, metadata: dict) -> pa.Field:
     # Merge with new metadata
     updated_metadata = {**existing_metadata, **metadata_bytes}
 
-    # Create a new field with the updated metadata
-    return pa.field(
+    # Extract combined metadata as a regular dict with string keys
+    # This makes it easier to work with the metadata for type refinement
+    decoded_metadata = {}
+    for k, v in updated_metadata.items():
+        key = safe_str(k)
+        value = safe_str(v)
+        if key:  # Ensure no empty keys
+            decoded_metadata[key] = value
+
+    # Create a base field with the updated metadata
+    refined_field = pa.field(
         field.name,
         field.type,
         nullable=field.nullable,
         metadata=updated_metadata
     )
+
+    # Apply type-specific refinements based on metadata
+    arrow_type = field.type
+
+    # Check if we should refine a decimal type
+    if pa.types.is_decimal(arrow_type):
+        return refine_decimal_type(refined_field, decoded_metadata)
+
+    # Check if we should refine a time type
+    elif pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type):
+        return refine_time_type(refined_field, decoded_metadata)
+
+    # Check if we should refine a timestamp type
+    elif pa.types.is_timestamp(arrow_type):
+        return refine_timestamp_type(refined_field, decoded_metadata)
+
+    # Check if we need to change the type entirely based on 'type' metadata
+    elif 'type' in decoded_metadata:
+        try:
+            # Try to parse a type string from metadata
+            type_str = decoded_metadata['type']
+            new_type = parse_arrow_type(type_str)
+
+            # Create a new field with the parsed type
+            return pa.field(
+                field.name,
+                new_type,
+                nullable=field.nullable,
+                metadata=updated_metadata
+            )
+        except ValueError:
+            # If parsing fails, just keep the current type
+            pass
+
+    return refined_field
 
 
 def refine_decimal_type(field: pa.Field, metadata: dict) -> pa.Field:
@@ -289,9 +366,9 @@ def refine_decimal_type(field: pa.Field, metadata: dict) -> pa.Field:
     """
     arrow_type = field.type
 
-    # If not a decimal type, just add metadata to the field and return
+    # If not a decimal type, just return the field as is with metadata
     if not pa.types.is_decimal(arrow_type):
-        return refine_arrow_field(field, metadata)
+        return field
 
     # Parse precision and scale from metadata
     precision, scale = parse_decimal_metadata(metadata)
@@ -310,11 +387,11 @@ def refine_decimal_type(field: pa.Field, metadata: dict) -> pa.Field:
             field.name,
             new_decimal_type,
             nullable=field.nullable,
-            metadata=metadata
+            metadata=field.metadata
         )
 
-    # If no change in precision/scale, just add metadata to the field
-    return refine_arrow_field(field, metadata)
+    # If no change in precision/scale, just return the field as is
+    return field
 
 
 def refine_time_type(field: pa.Field, metadata: dict) -> pa.Field:
@@ -337,9 +414,9 @@ def refine_time_type(field: pa.Field, metadata: dict) -> pa.Field:
     """
     arrow_type = field.type
 
-    # If not a time type, just add metadata to the field and return
+    # If not a time type, just return the field as is
     if not (pa.types.is_time32(arrow_type) or pa.types.is_time64(arrow_type)):
-        return refine_arrow_field(field, metadata)
+        return field
 
     # Parse unit from metadata
     unit = parse_time_metadata(metadata)
@@ -362,11 +439,11 @@ def refine_time_type(field: pa.Field, metadata: dict) -> pa.Field:
             field.name,
             new_time_type,
             nullable=field.nullable,
-            metadata=metadata
+            metadata=field.metadata
         )
 
-    # If no change in unit, just add metadata to the field
-    return refine_arrow_field(field, metadata)
+    # If no change in unit, just return the field as is
+    return field
 
 
 def refine_timestamp_type(field: pa.Field, metadata: dict) -> pa.Field:
@@ -390,9 +467,9 @@ def refine_timestamp_type(field: pa.Field, metadata: dict) -> pa.Field:
     """
     arrow_type = field.type
 
-    # If not a timestamp type, just add metadata to the field and return
+    # If not a timestamp type, just return the field as is
     if not pa.types.is_timestamp(arrow_type):
-        return refine_arrow_field(field, metadata)
+        return field
 
     # Parse unit and timezone from metadata
     unit, timezone = parse_timestamp_metadata(metadata)
@@ -411,14 +488,14 @@ def refine_timestamp_type(field: pa.Field, metadata: dict) -> pa.Field:
             field.name,
             new_timestamp_type,
             nullable=field.nullable,
-            metadata=metadata
+            metadata=field.metadata
         )
 
-    # If no change in unit or timezone, just add metadata to the field
-    return refine_arrow_field(field, metadata)
+    # If no change in unit or timezone, just return the field as is
+    return field
 
 
-def refine_nested_type(field: pa.Field, metadata: dict, field_metadata_map: dict = None) -> pa.Field:
+def refine_nested_type(field: pa.Field, metadata: dict = None, field_metadata_map: dict = None) -> pa.Field:
     """
     Recursively refine a nested type (struct, list, map) and its children.
 
@@ -441,6 +518,7 @@ def refine_nested_type(field: pa.Field, metadata: dict, field_metadata_map: dict
     arrow_type = field.type
     field_path = field.name
     field_metadata_map = field_metadata_map or {}
+    metadata = metadata or {}
 
     # Apply basic metadata to the current field
     refined_field = refine_arrow_field(field, metadata)
@@ -522,14 +600,6 @@ def refine_nested_type(field: pa.Field, metadata: dict, field_metadata_map: dict
             nullable=field.nullable,
             metadata=refined_field.metadata
         )
-
-    # Apply specific type refinements if applicable
-    if pa.types.is_decimal(refined_field.type):
-        refined_field = refine_decimal_type(refined_field, metadata)
-    elif pa.types.is_time32(refined_field.type) or pa.types.is_time64(refined_field.type):
-        refined_field = refine_time_type(refined_field, metadata)
-    elif pa.types.is_timestamp(refined_field.type):
-        refined_field = refine_timestamp_type(refined_field, metadata)
 
     return refined_field
 

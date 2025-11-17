@@ -36,6 +36,7 @@ from yggdrasil.libutils.arrow_utils import (
     array_length,
     get_child_array,
     dump_arrow_field_metadata,
+    refine_arrow_field,
 )
 
 
@@ -485,6 +486,145 @@ class TestDumpArrowFieldMetadata:
         assert 'type' not in metadata['test']
         assert 'base_type' not in metadata['test']
         assert 'nullable' not in metadata['test']
+
+
+class TestRefineArrowField:
+    """Test refine_arrow_field function."""
+
+    def test_refine_metadata_only(self):
+        """Test refining field's metadata without changing type."""
+        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
+
+        # Add a new key and update an existing one
+        refined = refine_arrow_field(
+            original,
+            metadata={'key1': 'new_value', 'key2': 'value2'}
+        )
+
+        # Type should remain the same
+        assert refined.type == original.type
+        assert refined.type == pa.int32()
+
+        # Name and nullable should be preserved
+        assert refined.name == 'test'
+        assert refined.nullable == original.nullable
+
+        # Metadata should be updated
+        assert b'key1' in refined.metadata
+        assert b'key2' in refined.metadata
+        assert refined.metadata[b'key1'] == b'new_value'
+        assert refined.metadata[b'key2'] == b'value2'
+
+    def test_refine_type_via_type_metadata(self):
+        """Test refining field's type via 'type' metadata."""
+        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
+
+        # Add type metadata to change the type
+        refined = refine_arrow_field(
+            original,
+            metadata={'type': 'int64'}
+        )
+
+        # Type should be updated based on the 'type' metadata
+        assert refined.type != original.type
+        assert refined.type == pa.int64()
+
+        # Name and nullable should be preserved
+        assert refined.name == 'test'
+        assert refined.nullable == original.nullable
+
+        # Metadata should be updated
+        assert b'key1' in refined.metadata
+        assert b'type' in refined.metadata
+
+    def test_refine_decimal_type_via_metadata(self):
+        """Test refining decimal type via precision/scale metadata."""
+        original = pa.field('price', pa.decimal128(10, 2))
+
+        # Change precision and scale via metadata
+        refined = refine_arrow_field(
+            original,
+            metadata={'precision': '15', 'scale': '5'}
+        )
+
+        # Type should be updated with new precision and scale
+        assert refined.type.precision == 15
+        assert refined.type.scale == 5
+        assert pa.types.is_decimal(refined.type)
+
+    def test_refine_time_type_via_metadata(self):
+        """Test refining time type via unit metadata."""
+        original = pa.field('time', pa.time32('s'))
+
+        # Change time unit via metadata
+        refined = refine_arrow_field(
+            original,
+            metadata={'unit': 'ms'}
+        )
+
+        # Type should be updated with new unit
+        assert refined.type.unit == 'ms'
+        assert pa.types.is_time32(refined.type)  # Still a time32 type
+
+        # Now change to a microsecond unit, which requires a time64 type
+        refined2 = refine_arrow_field(
+            original,
+            metadata={'unit': 'us'}
+        )
+
+        # Type should change from time32 to time64
+        assert refined2.type.unit == 'us'
+        assert pa.types.is_time64(refined2.type)  # Changed to time64
+
+    def test_refine_timestamp_type_via_metadata(self):
+        """Test refining timestamp type via unit and timezone metadata."""
+        original = pa.field('ts', pa.timestamp('ms'))
+
+        # Change timestamp unit via metadata
+        refined = refine_arrow_field(
+            original,
+            metadata={'unit': 'us'}
+        )
+
+        # Unit should be updated
+        assert refined.type.unit == 'us'
+        assert refined.type.tz is None  # Still no timezone
+
+        # Change both unit and timezone
+        refined2 = refine_arrow_field(
+            original,
+            metadata={'unit': 'ns', 'tz': 'UTC'}
+        )
+
+        # Both unit and timezone should be updated
+        assert refined2.type.unit == 'ns'
+        assert refined2.type.tz == 'UTC'
+
+    def test_with_none_values(self):
+        """Test refining with None values for metadata."""
+        original = pa.field('test', pa.int32(), metadata={b'key1': b'value1'})
+
+        # Passing None for metadata
+        refined = refine_arrow_field(original)
+
+        # Should essentially be a copy with the same properties
+        assert refined.type == original.type
+        assert refined.name == original.name
+        assert refined.nullable == original.nullable
+        assert refined.metadata == original.metadata
+
+    def test_with_invalid_type_metadata(self):
+        """Test handling of invalid type metadata."""
+        original = pa.field('test', pa.int32())
+
+        # Add invalid type metadata
+        refined = refine_arrow_field(
+            original,
+            metadata={'type': 'nonexistent_type'}
+        )
+
+        # Type should remain unchanged when type metadata is invalid
+        assert refined.type == original.type
 
 
 if __name__ == "__main__":
