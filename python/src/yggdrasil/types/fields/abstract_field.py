@@ -88,20 +88,34 @@ class PythonField(AbstractField, ABC):
         name: str,
         hint: Union[type, Any],
         nullable: bool,
-        metadata: Optional[Dict[str, Any]]
+        metadata: Optional[Dict[str, Any]],
     ):
         self._name = name
         self._hint = hint
         self._nullable = nullable
         self._metadata = metadata
 
+    @staticmethod
+    def _encode_metadata_value(value: Any) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode()
+        if isinstance(value, bool):
+            return b"true" if value else b"false"
+        return str(value).encode()
+
     @classmethod
     def validate_type(cls, dtype: pa.DataType):
         return isinstance(dtype, pa.DataType)
 
+    @classmethod
+    def _parse(cls, dtype: Any):
+        raise NotImplementedError("Parsing is not supported for PythonField")
+
     @property
     def name(self) -> str:
-        return self.name
+        return self._name
 
     @property
     def type(self):
@@ -109,28 +123,50 @@ class PythonField(AbstractField, ABC):
 
     @property
     def nullable(self):
-        return self.nullable
+        return self._nullable
 
     @property
     def metadata(self) -> Optional[Dict[str, Any]]:
-        return self.metadata_str
+        return self._metadata
 
     @property
     def metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
-        return self.metadata
+        if not self._metadata:
+            return None
+        return {
+            k.encode() if isinstance(k, str) else str(k).encode(): self._encode_metadata_value(v)
+            for k, v in self._metadata.items()
+        }
 
     @property
     def metadata_str(self) -> Optional[Dict[str, str]]:
-        if not self.metadata:
+        if not self._metadata:
             return None
 
-        return {
-            k.encode(): v.encode()
-            for k, v in self.metadata.items()
-        }
+        def _to_str(value: Any) -> str:
+            if isinstance(value, bytes):
+                try:
+                    return value.decode()
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        return {str(k): _to_str(v) for k, v in self._metadata.items()}
 
     def to_python(self) -> "PythonField":
         return self
+
+    def to_arrow(self) -> "ArrowField":
+        raise NotImplementedError("Conversion to ArrowField is not available from PythonField")
+
+    def to_spark(self) -> "SparkField":
+        raise NotImplementedError("Conversion to SparkField is not available from PythonField")
+
+    def to_polars(self) -> "PolarsField":
+        raise NotImplementedError("Conversion to PolarsField is not available from PythonField")
+
+    def to_pandas(self) -> "PandasField":
+        raise NotImplementedError("Conversion to PandasField is not available from PythonField")
 
 
 class PandasField(AbstractField, ABC):
@@ -174,6 +210,22 @@ class PandasField(AbstractField, ABC):
     def to_pandas(self) -> "PandasField":
         return self
 
+    @classmethod
+    def _parse(cls, dtype: Any):
+        raise NotImplementedError("Parsing is not supported for PandasField")
+
+    def to_python(self) -> "PythonField":
+        raise NotImplementedError("Conversion to PythonField is not available from PandasField")
+
+    def to_arrow(self) -> "ArrowField":
+        raise NotImplementedError("Conversion to ArrowField is not available from PandasField")
+
+    def to_spark(self) -> "SparkField":
+        raise NotImplementedError("Conversion to SparkField is not available from PandasField")
+
+    def to_polars(self) -> "PolarsField":
+        raise NotImplementedError("Conversion to PolarsField is not available from PandasField")
+
 
 class PolarsField(AbstractField, ABC):
     def __init__(self, inner: "polars.Field", nullable: bool, metadata: Optional[Dict[str, Any]]):
@@ -214,6 +266,22 @@ class PolarsField(AbstractField, ABC):
 
     def to_polars(self) -> "PolarsField":
         return self
+
+    @classmethod
+    def _parse(cls, dtype: Any):
+        raise NotImplementedError("Parsing is not supported for PolarsField")
+
+    def to_python(self) -> "PythonField":
+        raise NotImplementedError("Conversion to PythonField is not available from PolarsField")
+
+    def to_arrow(self) -> "ArrowField":
+        raise NotImplementedError("Conversion to ArrowField is not available from PolarsField")
+
+    def to_spark(self) -> "SparkField":
+        raise NotImplementedError("Conversion to SparkField is not available from PolarsField")
+
+    def to_pandas(self) -> "PandasField":
+        raise NotImplementedError("Conversion to PandasField is not available from PolarsField")
 
     def cast_series(
         self,
@@ -271,13 +339,34 @@ class ArrowField(AbstractField, ABC):
         if not self.inner.metadata:
             return None
 
-        return {
-            k.encode(): v.encode()
-            for k, v in self.inner.metadata
-        }
+        def _decode(value: Any) -> str:
+            if isinstance(value, (bytes, bytearray)):
+                try:
+                    return value.decode()
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        return {_decode(k): _decode(v) for k, v in self.inner.metadata.items()}
 
     def to_arrow(self) -> "ArrowField":
         return self
+
+    @classmethod
+    def _parse(cls, dtype: Any):
+        raise NotImplementedError("Parsing is not supported for ArrowField")
+
+    def to_python(self) -> "PythonField":
+        raise NotImplementedError("Conversion to PythonField is not available from ArrowField")
+
+    def to_spark(self) -> "SparkField":
+        raise NotImplementedError("Conversion to SparkField is not available from ArrowField")
+
+    def to_polars(self) -> "PolarsField":
+        raise NotImplementedError("Conversion to PolarsField is not available from ArrowField")
+
+    def to_pandas(self) -> "PandasField":
+        raise NotImplementedError("Conversion to PandasField is not available from ArrowField")
 
     def cast_array(
         self,
@@ -328,8 +417,8 @@ class SparkField(AbstractField, ABC):
             return None
 
         return {
-            k.encode(): v.encode() if isinstance(v, str) else str(v).encode()
-            for k, v in self.inner.metadata
+            k.encode() if isinstance(k, str) else str(k).encode(): v.encode() if isinstance(v, str) else str(v).encode()
+            for k, v in self.inner.metadata.items()
         }
 
     @property
@@ -338,12 +427,28 @@ class SparkField(AbstractField, ABC):
             return None
 
         return {
-            k: v.encode() if isinstance(v, str) else str(v)
-            for k, v in self.inner.metadata
+            str(k): v if isinstance(v, str) else str(v)
+            for k, v in self.inner.metadata.items()
         }
 
     def to_spark(self) -> "SparkField":
         return self
+
+    @classmethod
+    def _parse(cls, dtype: Any):
+        raise NotImplementedError("Parsing is not supported for SparkField")
+
+    def to_python(self) -> "PythonField":
+        raise NotImplementedError("Conversion to PythonField is not available from SparkField")
+
+    def to_arrow(self) -> "ArrowField":
+        raise NotImplementedError("Conversion to ArrowField is not available from SparkField")
+
+    def to_polars(self) -> "PolarsField":
+        raise NotImplementedError("Conversion to PolarsField is not available from SparkField")
+
+    def to_pandas(self) -> "PandasField":
+        raise NotImplementedError("Conversion to PandasField is not available from SparkField")
 
     def cast_column(
         self,

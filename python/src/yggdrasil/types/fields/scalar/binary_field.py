@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from typing import Any, Dict, Optional
-
 import pyarrow as pa
 
 from ...libs import pandas, polars, pyspark
@@ -45,7 +43,7 @@ class BinaryField(AbstractScalarField):
         )
 
     def to_python(self) -> "PythonBinaryField":
-        return PythonBinaryField(self.name, bytes, self.nullable, self.metadata)
+        return PythonBinaryField(self.name, bytes, self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowBinaryField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

@@ -43,7 +43,7 @@ class StringField(AbstractScalarField):
         )
 
     def to_python(self) -> "PythonStringField":
-        return PythonStringField(self.name, str, self.nullable, self.metadata)
+        return PythonStringField(self.name, str, self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowStringField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

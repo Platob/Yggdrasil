@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from typing import Any, Dict, Optional
-
 import pyarrow as pa
 
 from ...libs import pandas, polars
@@ -24,7 +22,7 @@ class TimeField(AbstractScalarField):
         super().__init__(name, pa.time64(unit), "time", nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonTimeField":
-        return PythonTimeField(self.name, "time", self.nullable, self.metadata)
+        return PythonTimeField(self.name, "time", self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowTimeField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)
