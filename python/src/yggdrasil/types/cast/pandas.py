@@ -24,6 +24,7 @@ def cast_pandas_series(
     casted = cast_arrow_array(arrow_array, arrow_type, options)
 
     result = casted.to_pandas()
+    result.index = series.index
     result.name = series.name
     return result
 
@@ -31,13 +32,12 @@ def cast_pandas_series(
 @require_pandas
 def cast_pandas_dataframe(
     dataframe: "pandas.DataFrame",
-    arrow_schema: pa.Schema,
     options: Optional[ArrowCastOptions] = None,
 ) -> "pandas.DataFrame":
     """Cast a pandas DataFrame to a target Arrow schema using Arrow casting rules."""
 
     options = options or ArrowCastOptions()
     arrow_table = pa.Table.from_pandas(dataframe, preserve_index=False)
-    casted = cast_arrow_table(arrow_table, arrow_schema, options)
+    casted = cast_arrow_table(arrow_table, options)
 
     return casted.to_pandas()

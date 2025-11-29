@@ -51,7 +51,9 @@ def _strip_optional(hint):
 
         if _is_optional(base_hint):
             stripped_base = _strip_optional(base_hint)
-            return Annotated[stripped_base, *metadata]
+            # Using __class_getitem__ to rebuild the Annotated type avoids the
+            # unpacking syntax that is unsupported in older Python versions.
+            return Annotated.__class_getitem__((stripped_base, *metadata))
 
         return hint
 
@@ -77,7 +79,7 @@ def _struct_from_dataclass(hint) -> pa.StructType:
     fields = []
 
     for field in dataclasses.fields(hint):
-        if not field.init:
+        if not field.init or field.name.startswith("_"):
             continue
 
         fields.append(arrow_field_from_hint(field.type, name=field.name))

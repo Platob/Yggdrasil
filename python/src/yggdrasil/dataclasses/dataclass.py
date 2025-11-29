@@ -34,6 +34,13 @@ def dataclass(
     """
 
     def wrap(c):
+        def _init_public_fields(cls):
+            return [
+                field
+                for field in dataclasses.fields(cls)
+                if field.init and not field.name.startswith("_")
+            ]
+
         if not hasattr(c, "to_dict"):
             def to_dict(self) -> Mapping[str, Any]:
                 return dataclasses.asdict(self)
@@ -49,7 +56,7 @@ def dataclass(
 
                 from yggdrasil.types.cast import convert
 
-                fields = {field.name: field for field in dataclasses.fields(cls)}
+                fields = {field.name: field for field in _init_public_fields(cls)}
                 converted = {}
 
                 for name, value in values.items():
@@ -78,7 +85,7 @@ def dataclass(
             @classmethod
             def from_tuple(cls, values: Iterable[Any], *, safe: bool = True):
                 items = tuple(values)
-                fields = dataclasses.fields(cls)
+                fields = _init_public_fields(cls)
 
                 if len(items) != len(fields):
                     raise TypeError(
@@ -129,8 +136,8 @@ def dataclass(
                 mirroring the class constructor's positional ordering.
                 """
 
-                fields = dataclasses.fields(cls)
-                init_fields = [field.name for field in fields if field.init]
+                fields = _init_public_fields(cls)
+                init_fields = [field.name for field in fields]
 
                 if len(args) > len(init_fields):
                     raise TypeError(
