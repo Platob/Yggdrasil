@@ -1,4 +1,6 @@
+import dataclasses
 import datetime
+import enum
 
 import pytest
 
@@ -65,3 +67,52 @@ def test_collection_conversions():
     assert result == {"a": 1, "b": 2}
     nested = convert({"numbers": ["1", "2"]}, dict[str, list[int]])
     assert nested == {"numbers": [1, 2]}
+
+
+class Color(enum.Enum):
+    RED = 1
+    BLUE = 2
+
+
+def test_enum_conversions():
+    assert convert("RED", Color) is Color.RED
+    assert convert("blue", Color) is Color.BLUE
+    assert convert(1, Color) is Color.RED
+    assert convert("2", Color) is Color.BLUE
+
+    with pytest.raises(TypeError):
+        convert("green", Color)
+
+
+@dataclasses.dataclass
+class Widget:
+    name: str
+    color: Color
+    count: int = 1
+    tags: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class Container:
+    widget: Widget
+    enabled: bool
+
+
+def test_dataclass_conversion():
+    source = {
+        "widget": {"name": "example", "color": "blue", "tags": ["x", "y"]},
+        "enabled": "true",
+    }
+
+    result = convert(source, Container)
+
+    assert isinstance(result, Container)
+    assert result.widget == Widget(name="example", color=Color.BLUE, tags=["x", "y"])
+    assert result.widget.count == 1
+    assert result.enabled is True
+
+    nested_dataclass = Container(widget=Widget(name="direct", color=Color.RED), enabled=False)
+    assert convert(nested_dataclass, Container) is nested_dataclass
+
+    with pytest.raises(TypeError):
+        convert({}, Container)

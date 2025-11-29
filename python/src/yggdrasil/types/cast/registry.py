@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import dataclasses as _dataclasses
 import datetime as _datetime
+import enum
 import re
 import types
 from collections.abc import Iterable, Mapping
-from typing import Any, Callable, Dict, Tuple, Union, get_args, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Tuple,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+
+if TYPE_CHECKING:
+    from .arrow import ArrowCastOptions
 
 __all__ = ["register", "convert"]
 
 
-Converter = Callable[[Any, Any, Any], Any]
+Converter = Callable[[Any, "ArrowCastOptions | dict | None", Any], Any]
 
 
 _registry: Dict[Tuple[Any, Any], Converter] = {}
@@ -68,7 +83,13 @@ def _normalize_fractional_seconds(value: str) -> str:
     return value[:start] + normalized_fraction + value[end:]
 
 
-def convert(value: Any, target_hint: Any, *, cast_options: Any = None, default_value: Any = None) -> Any:
+def convert(
+    value: Any,
+    target_hint: Any,
+    *,
+    cast_options: "ArrowCastOptions | dict | None" = None,
+    default_value: Any = None,
+) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
 
     is_optional, inner_hint = _unwrap_optional(target_hint)
@@ -79,6 +100,69 @@ def convert(value: Any, target_hint: Any, *, cast_options: Any = None, default_v
 
     origin = get_origin(target) or target
     args = get_args(target)
+
+    if isinstance(target, type) and issubclass(target, enum.Enum):
+        if isinstance(value, target):
+            return value
+
+        if isinstance(value, str):
+            for member in target:
+                if member.name.lower() == value.lower():
+                    return member
+
+        try:
+            first_member = next(iter(target))
+        except StopIteration:
+            raise TypeError(f"Cannot convert to empty Enum {target.__name__}")
+
+        try:
+            converted_value = convert(
+                value,
+                type(first_member.value),
+                cast_options=cast_options,
+                default_value=default_value,
+            )
+        except Exception:
+            converted_value = value
+
+        for member in target:
+            if member.value == converted_value:
+                return member
+
+        raise TypeError(f"No matching Enum member for {value!r} in {target.__name__}")
+
+    if isinstance(target, type) and _dataclasses.is_dataclass(target):
+        if isinstance(value, target):
+            return value
+
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Cannot convert {type(value)} to dataclass {target.__name__}")
+
+        hints = get_type_hints(target)
+        kwargs = {}
+        for field in _dataclasses.fields(target):
+            if not field.init or field.name.startswith("_"):
+                continue
+
+            if field.name in value:
+                field_value = convert(
+                    value[field.name],
+                    hints.get(field.name, Any),
+                    cast_options=cast_options,
+                    default_value=default_value,
+                )
+            elif field.default is not _dataclasses.MISSING:
+                field_value = field.default
+            elif field.default_factory is not _dataclasses.MISSING:  # type: ignore[attr-defined]
+                field_value = field.default_factory()  # type: ignore[misc]
+            else:
+                raise TypeError(
+                    f"Missing required field {field.name!r} for dataclass {target.__name__}"
+                )
+
+            kwargs[field.name] = field_value
+
+        return target(**kwargs)
 
     if origin in {list, set}:
         if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):

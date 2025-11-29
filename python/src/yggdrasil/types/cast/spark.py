@@ -16,7 +16,6 @@ __all__ = ["cast_spark_dataframe"]
 @require_pyspark(active_session=True)
 def cast_spark_dataframe(
     dataframe: "pyspark.sql.DataFrame",
-    arrow_schema: pa.Schema,
     options: Optional[ArrowCastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """Cast a Spark DataFrame to the provided Arrow schema.
@@ -29,7 +28,7 @@ def cast_spark_dataframe(
 
     pandas_df = dataframe.toPandas()
     arrow_table = pa.Table.from_pandas(pandas_df, preserve_index=False)
-    casted = cast_arrow_table(arrow_table, arrow_schema, options)
+    casted = cast_arrow_table(arrow_table, options)
 
     spark_schema = pyspark.sql.types.StructType(
         [arrow_field_to_spark(field) for field in casted.schema]

@@ -72,7 +72,7 @@ def _default_for_dataclass(hint):
     kwargs = {}
 
     for field in dataclasses.fields(hint):
-        if not field.init:
+        if not field.init or field.name.startswith("_"):
             continue
 
         if field.default is not dataclasses.MISSING:
