@@ -19,9 +19,7 @@ dev = [
   "ruff",
   "mypy",
 
-  "polars",
   "databricks-connect==17",
-  "pandas",
 ]
 
 [tool.setuptools]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from abc import ABC
 from typing import Any, Dict, Optional
 
@@ -32,13 +33,19 @@ def _encode_metadata_value(value: Any) -> bytes:
         return value
     if isinstance(value, str):
         return value.encode()
-    return str(value).encode()
+    if isinstance(value, bool):
+        return b"true" if value else b"false"
+    return json.dumps(value).encode()
 
 
 def metadata_bytes(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[bytes, bytes]]:
     if not metadata:
         return None
-    return {k.encode() if isinstance(k, str) else bytes(k): _encode_metadata_value(v) for k, v in metadata.items()}
+    return {
+        k.encode() if isinstance(k, str) else bytes(k): _encode_metadata_value(v)
+        for k, v in metadata.items()
+        if k and v
+    }
 
 
 def metadata_str(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -52,7 +59,11 @@ def metadata_str(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]
                 return str(value)
         return str(value)
 
-    return {_to_str(k): _to_str(v) for k, v in metadata.items()}
+    return {
+        _to_str(k): _to_str(v)
+        for k, v in metadata.items()
+        if k and v
+    }
 
 
 class AbstractScalarField(AbstractField, ABC):
@@ -118,21 +129,6 @@ class AbstractScalarField(AbstractField, ABC):
     @property
     def metadata_str(self) -> Optional[Dict[str, str]]:
         return metadata_str(self._metadata)
-
-    def to_python(self) -> "PythonScalarField":
-        raise NotImplementedError
-
-    def to_arrow(self) -> "ArrowScalarField":
-        raise NotImplementedError
-
-    def to_spark(self) -> "SparkScalarField":
-        raise NotImplementedError
-
-    def to_polars(self) -> "PolarsScalarField":
-        raise NotImplementedError
-
-    def to_pandas(self) -> "PandasScalarField":
-        raise NotImplementedError
 
     @staticmethod
     def _from_arrow_components(
@@ -249,7 +245,9 @@ class AbstractScalarField(AbstractField, ABC):
         if isinstance(dtype, pyspark.sql.types.DateType):
             return DateField(field.name, nullable=field.nullable, metadata=field.metadata)
         if isinstance(dtype, pyspark.sql.types.TimestampType):
-            return TimestampField(field.name, nullable=field.nullable, metadata=field.metadata)
+            return TimestampField(
+                field.name, nullable=field.nullable, metadata=field.metadata
+            )
 
         raise TypeError(f"Unsupported Spark scalar type: {dtype!r}")
 

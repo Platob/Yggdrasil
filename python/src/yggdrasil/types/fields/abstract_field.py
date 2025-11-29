@@ -2,14 +2,11 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Union
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from ...libs import (
-    pandas,
     polars,
     pyspark,
-    require_pandas,
-    require_polars,
-    require_pyspark,
 )
 
 __all__ = [
@@ -32,11 +29,6 @@ class AbstractField(ABC):
     @classmethod
     @abstractmethod
     def _parse(cls, dtype: Any):
-        pass
-
-    @classmethod
-    @abstractmethod
-    def validate_type(cls, dtype: Any):
         pass
 
     @property
@@ -90,7 +82,7 @@ class AbstractField(ABC):
         ...
 
 
-class PythonField(ABC):
+class PythonField(AbstractField, ABC):
     def __init__(
         self,
         name: str,
@@ -98,138 +90,155 @@ class PythonField(ABC):
         nullable: bool,
         metadata: Optional[Dict[str, Any]]
     ):
-        self.name = name
-        self.hint = hint
-        self.nullable = nullable
-        self.metadata = metadata
+        self._name = name
+        self._hint = hint
+        self._nullable = nullable
+        self._metadata = metadata
 
     @classmethod
     def validate_type(cls, dtype: pa.DataType):
         return isinstance(dtype, pa.DataType)
 
     @property
-    def field_name(self) -> str:
+    def name(self) -> str:
         return self.name
 
     @property
-    def field_type(self):
-        return self.hint
+    def type(self):
+        return self._hint
 
     @property
-    def field_nullable(self):
+    def nullable(self):
         return self.nullable
 
     @property
-    def field_metadata(self) -> Optional[Dict[str, Any]]:
-        return self.field_metadata_str
+    def metadata(self) -> Optional[Dict[str, Any]]:
+        return self.metadata_str
 
     @property
-    def field_metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
+    def metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
         return self.metadata
 
     @property
-    def field_metadata_str(self) -> Optional[Dict[str, str]]:
+    def metadata_str(self) -> Optional[Dict[str, str]]:
         if not self.metadata:
             return None
 
         return {
             k.encode(): v.encode()
-            for k, v in self.metadata
+            for k, v in self.metadata.items()
         }
 
     def to_python(self) -> "PythonField":
         return self
 
 
-class PandasField(ABC):
-    @classmethod
-    @require_pandas
-    def validate_type(cls, dtype: Any):
-        return True
-
+class PandasField(AbstractField, ABC):
     def __init__(self, name: str, dtype: Any, nullable: bool, metadata: Optional[Dict[str, Any]]):
-        self.name = name
-        self.dtype = dtype
-        self.nullable = nullable
-        self.metadata = metadata
+        self._name = name
+        self._dtype = dtype
+        self._nullable = nullable
+        self._metadata = metadata
 
     @property
-    def field_name(self) -> str:
-        return self.name
+    def name(self) -> str:
+        return self._name
 
     @property
-    def field_type(self):
-        return self.dtype
+    def type(self):
+        return self._dtype
 
     @property
-    def field_nullable(self):
-        return self.nullable
+    def nullable(self):
+        return self._nullable
 
     @property
-    def field_metadata(self) -> Optional[Dict[str, Any]]:
-        return self.metadata
+    def metadata(self) -> Optional[Dict[str, Any]]:
+        return self._metadata
 
     @property
-    def field_metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
-        if not self.metadata:
+    def metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
+        if not self._metadata:
             return None
-        return {k.encode() if isinstance(k, str) else k: v.encode() if isinstance(v, str) else v for k, v in self.metadata.items()}
+        return {
+            k.encode() if isinstance(k, str) else k: v.encode() if isinstance(v, str) else v
+            for k, v in self._metadata.items()
+        }
 
     @property
-    def field_metadata_str(self) -> Optional[Dict[str, str]]:
-        if not self.metadata:
+    def metadata_str(self) -> Optional[Dict[str, str]]:
+        if not self._metadata:
             return None
-        return {str(k): str(v) for k, v in self.metadata.items()}
+        return {str(k): str(v) for k, v in self._metadata.items()}
 
     def to_pandas(self) -> "PandasField":
         return self
 
 
-class PolarsField(ABC):
-    @classmethod
-    @require_polars
-    def validate_type(cls, dtype: Any):
-        return True
-
-    def __init__(self, name: str, dtype: Any, nullable: bool, metadata: Optional[Dict[str, Any]]):
-        self.name = name
-        self.dtype = dtype
-        self.nullable = nullable
-        self.metadata = metadata
+class PolarsField(AbstractField, ABC):
+    def __init__(self, inner: "polars.Field", nullable: bool, metadata: Optional[Dict[str, Any]]):
+        self.inner = inner
+        self._nullable = nullable
+        self._metadata = metadata
 
     @property
-    def field_name(self) -> str:
-        return self.name
+    def name(self) -> str:
+        return self.inner.name
 
     @property
-    def field_type(self):
-        return self.dtype
+    def type(self) -> "polars.DataType":
+        return self.inner.dtype
 
     @property
-    def field_nullable(self):
-        return self.nullable
+    def nullable(self):
+        return self._nullable
 
     @property
-    def field_metadata(self) -> Optional[Dict[str, Any]]:
-        return self.metadata
+    def metadata(self) -> Optional[Dict[str, Any]]:
+        return self._metadata
 
     @property
-    def field_metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
-        if not self.metadata:
+    def metadata_bytes(self) -> Optional[Dict[bytes, bytes]]:
+        if not self._metadata:
             return None
-        return {k.encode() if isinstance(k, str) else k: v.encode() if isinstance(v, str) else v for k, v in self.metadata.items()}
+        return {
+            k.encode() if isinstance(k, str) else k: v.encode() if isinstance(v, str) else v
+            for k, v in self._metadata.items()
+        }
 
     @property
-    def field_metadata_str(self) -> Optional[Dict[str, str]]:
-        if not self.metadata:
+    def metadata_str(self) -> Optional[Dict[str, str]]:
+        if not self._metadata:
             return None
-        return {str(k): str(v) for k, v in self.metadata.items()}
+        return {str(k): str(v) for k, v in self._metadata.items()}
 
     def to_polars(self) -> "PolarsField":
         return self
 
+    def cast_series(
+        self,
+        data: "polars.Series",
+        safe: Optional[bool] = None,
+        add_missing_columns: Optional[bool] = None,
+        strict_match_names: Optional[bool] = None,
+        allow_add_columns: Optional[bool] = None,
+        *,
+        wrap_numerical: Optional[bool] = None
+    ):
+        safe = False if safe is None else safe
+        wrap_numerical = False if wrap_numerical is None else wrap_numerical
+        add_missing_columns = True if add_missing_columns is None else add_missing_columns
+        strict_match_names = False if strict_match_names is None else strict_match_names
+        allow_add_columns = False if allow_add_columns is None else allow_add_columns
 
-class ArrowField(ABC):
+        return data.cast(
+            dtype=self.type,
+            strict=safe,
+            wrap_numerical=wrap_numerical
+        )
+
+
+class ArrowField(AbstractField, ABC):
     @classmethod
     def validate_type(cls, dtype: pa.DataType):
         return isinstance(dtype, pa.DataType)
@@ -242,7 +251,7 @@ class ArrowField(ABC):
         return self.inner.name
 
     @property
-    def type(self):
+    def type(self) -> pa.DataType:
         return self.inner.type
 
     @property
@@ -270,13 +279,30 @@ class ArrowField(ABC):
     def to_arrow(self) -> "ArrowField":
         return self
 
+    def cast_array(
+        self,
+        data: Union[pa.ChunkedArray, pa.Array],
+        safe: Optional[bool] = None,
+        add_missing_columns: Optional[bool] = None,
+        strict_match_names: Optional[bool] = None,
+        allow_add_columns: Optional[bool] = None,
+        *,
+        memory_pool: Optional[pa.MemoryPool] = None
+    ):
+        safe = False if safe is None else safe
+        add_missing_columns = True if add_missing_columns is None else add_missing_columns
+        strict_match_names = False if strict_match_names is None else strict_match_names
+        allow_add_columns = False if allow_add_columns is None else allow_add_columns
 
-class SparkField(ABC):
-    @classmethod
-    @require_pyspark
-    def validate_type(cls, dtype: "pyspark.sql.types.DataType"):
-        return isinstance(dtype, pyspark.sql.types.DataType)
+        return pc.cast(
+            data,
+            target_type=self.type,
+            safe=safe,
+            memory_pool=memory_pool
+        )
 
+
+class SparkField(AbstractField, ABC):
     def __init__(self, inner: "pyspark.sql.types.StructField"):
         self.inner = inner
 
@@ -285,7 +311,7 @@ class SparkField(ABC):
         return self.inner.name
 
     @property
-    def type(self):
+    def type(self) -> "pyspark.sql.types.DataType":
         return self.inner.dataType
 
     @property
@@ -318,3 +344,18 @@ class SparkField(ABC):
 
     def to_spark(self) -> "SparkField":
         return self
+
+    def cast_column(
+        self,
+        data: "pyspark.sql.Column",
+        safe: Optional[bool] = None,
+        add_missing_columns: Optional[bool] = None,
+        strict_match_names: Optional[bool] = None,
+        allow_add_columns: Optional[bool] = None,
+    ):
+        safe = False if safe is None else safe
+        add_missing_columns = True if add_missing_columns is None else add_missing_columns
+        strict_match_names = False if strict_match_names is None else strict_match_names
+        allow_add_columns = False if allow_add_columns is None else allow_add_columns
+
+        return data.cast(dataType=self.type)
