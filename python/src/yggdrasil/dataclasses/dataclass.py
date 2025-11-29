@@ -42,9 +42,29 @@ def dataclass(
 
         if not hasattr(c, "from_dict"):
             @classmethod
-            def from_dict(cls, values: Mapping[str, Any]):
+            def from_dict(cls, values: Mapping[str, Any], *, safe: bool = True):
                 defaults = cls.default_instance()
-                return dataclasses.replace(defaults, **values)
+                if not safe:
+                    return dataclasses.replace(defaults, **values)
+
+                from yggdrasil.types.cast import convert
+
+                fields = {field.name: field for field in dataclasses.fields(cls)}
+                converted = {}
+
+                for name, value in values.items():
+                    if name not in fields:
+                        raise TypeError(f"{name!r} is an invalid field for {cls.__name__}")
+
+                    field = fields[name]
+                    default_value = getattr(defaults, name, None)
+                    converted[name] = convert(
+                        value,
+                        field.type,
+                        default_value=default_value,
+                    )
+
+                return dataclasses.replace(defaults, **converted)
 
             c.from_dict = from_dict
 
@@ -56,7 +76,7 @@ def dataclass(
 
         if not hasattr(c, "from_tuple"):
             @classmethod
-            def from_tuple(cls, values: Iterable[Any]):
+            def from_tuple(cls, values: Iterable[Any], *, safe: bool = True):
                 items = tuple(values)
                 fields = dataclasses.fields(cls)
 
@@ -65,7 +85,23 @@ def dataclass(
                         f"Expected {len(fields)} values but received {len(items)}"
                     )
 
-                kwargs = {field.name: value for field, value in zip(fields, items)}
+                if not safe:
+                    kwargs = {field.name: value for field, value in zip(fields, items)}
+                    return cls(**kwargs)
+
+                from yggdrasil.types.cast import convert
+
+                defaults = cls.default_instance()
+                kwargs = {}
+
+                for field, value in zip(fields, items):
+                    default_value = getattr(defaults, field.name, None)
+                    kwargs[field.name] = convert(
+                        value,
+                        field.type,
+                        default_value=default_value,
+                    )
+
                 return cls(**kwargs)
 
             c.from_tuple = from_tuple
@@ -112,6 +148,15 @@ def dataclass(
 
             c.copy = copy
 
+        if not hasattr(c, "arrow_field"):
+            @classmethod
+            def arrow_field(cls, name: str | None = None):
+                from yggdrasil.types import arrow_field_from_hint
+
+                return arrow_field_from_hint(cls, name=name)
+
+            c.arrow_field = arrow_field
+
         base = _builtin_dataclass(
             c,
             init=init,
@@ -123,7 +168,6 @@ def dataclass(
             match_args=match_args,
             kw_only=kw_only,
             slots=slots,
-            weakref_slot=weakref_slot
         )
 
         return base

@@ -76,11 +76,11 @@ def _infer_package_name(
 
     raise ModuleInstallError(
         "Cannot infer which package to install from ImportError; "
-        "provide `package=` to @require_modules."
+        "provide `package=` to @check_modules."
     )
 
 
-def require_modules(
+def check_modules(
     *module_names: str,
     package: Optional[str] = None,
     auto_install: bool = True,
@@ -104,25 +104,34 @@ def require_modules(
 
     Examples
     --------
-    @require_modules("polars")
+    @check_modules("polars")
     def fn():
         import polars as pl
         ...
 
-    @require_modules("pyspark.sql", package="pyspark")
+    @check_modules("pyspark.sql", package="pyspark")
     def fn():
         from pyspark.sql import SparkSession
         ...
 
-    @require_modules(package="polars")
+    @check_modules(package="polars")
     def fn():
         import polars as pl
         ...
 
-    @require_modules()  # allowed; only reacts if ImportError happens
+    @check_modules()  # allowed; only reacts if ImportError happens
     def fn():
         ...
     """
+
+    # Support bare decorator use: @check_modules
+    if module_names and callable(module_names[0]) and len(module_names) == 1:
+        func = module_names[0]
+        return check_modules(
+            package=package,
+            auto_install=auto_install,
+            retries=retries,
+        )(func)
 
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
@@ -149,5 +158,5 @@ def require_modules(
 __all__ = [
     "ModuleInstallError",
     "install_package",
-    "require_modules",
+    "check_modules",
 ]
