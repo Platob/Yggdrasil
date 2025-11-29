@@ -4,7 +4,7 @@ import decimal
 import types
 import uuid
 from collections.abc import Mapping, MutableMapping, MutableSequence, MutableSet
-from typing import Any, Tuple, Union, get_args, get_origin
+from typing import Annotated, Any, Tuple, Union, get_args, get_origin
 
 import pyarrow as pa
 
@@ -34,6 +34,9 @@ _SPECIAL_ARROW_TYPES = {
 def _is_optional(hint) -> bool:
     origin = get_origin(hint)
 
+    if origin is Annotated:
+        return _is_optional(get_args(hint)[0])
+
     if origin in (Union, types.UnionType):
         return _NONE_TYPE in get_args(hint)
 
@@ -41,6 +44,17 @@ def _is_optional(hint) -> bool:
 
 
 def _strip_optional(hint):
+    origin = get_origin(hint)
+
+    if origin is Annotated:
+        base_hint, *metadata = get_args(hint)
+
+        if _is_optional(base_hint):
+            stripped_base = _strip_optional(base_hint)
+            return Annotated[stripped_base, *metadata]
+
+        return hint
+
     if not _is_optional(hint):
         return hint
 
@@ -71,13 +85,90 @@ def _struct_from_dataclass(hint) -> pa.StructType:
     return pa.struct(fields)
 
 
-def _struct_from_tuple(args) -> pa.StructType:
+def _struct_from_tuple(args, names: list[str] | None = None) -> pa.StructType:
+    if names is not None and len(names) != len(args):
+        raise TypeError("Tuple metadata names length must match tuple elements")
+
     return pa.struct(
-        [arrow_field_from_hint(arg, name=f"_{idx}") for idx, arg in enumerate(args, start=1)]
+        [
+            arrow_field_from_hint(arg, name=names[idx] if names else f"_{idx + 1}")
+            for idx, arg in enumerate(args)
+        ]
     )
 
 
+def _arrow_type_from_metadata(base_hint, metadata):
+    merged_metadata: dict[str, Any] = {}
+
+    for item in metadata:
+        if isinstance(item, pa.DataType):
+            return item
+
+        if isinstance(item, Mapping):
+            merged_metadata.update(item)
+        elif (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], str)
+        ):
+            merged_metadata[item[0]] = item[1]
+
+    if merged_metadata:
+        explicit_type = merged_metadata.get("arrow_type")
+
+        if isinstance(explicit_type, pa.DataType):
+            return explicit_type
+
+        if get_origin(base_hint) in (tuple, Tuple):
+            names = merged_metadata.get("names")
+
+            if names is not None:
+                return _struct_from_tuple(get_args(base_hint), list(names))
+
+        if base_hint is decimal.Decimal:
+            precision = merged_metadata.get("precision")
+
+            if precision is not None:
+                scale = merged_metadata.get("scale", 0)
+                bit_width = merged_metadata.get("bit_width", 128)
+
+                if bit_width > 128:
+                    return pa.decimal256(precision, scale)
+
+                return pa.decimal128(precision, scale)
+
+        if base_hint is datetime.datetime:
+            unit = merged_metadata.get("unit", "us")
+            tz = merged_metadata.get("tz", "UTC")
+
+            return pa.timestamp(unit, tz=tz)
+
+        if base_hint is datetime.time:
+            unit = merged_metadata.get("unit", "us")
+
+            return pa.time64(unit)
+
+        if base_hint is datetime.timedelta:
+            unit = merged_metadata.get("unit", "us")
+
+            return pa.duration(unit)
+
+        if base_hint is bytes and "length" in merged_metadata:
+            return pa.binary(merged_metadata["length"])
+
+    return None
+
+
 def _arrow_type_from_hint(hint):
+    if get_origin(hint) is Annotated:
+        base_hint, *metadata = get_args(hint)
+        metadata_type = _arrow_type_from_metadata(base_hint, metadata)
+
+        if metadata_type:
+            return metadata_type
+
+        return _arrow_type_from_hint(base_hint)
+
     if hint in _PRIMITIVE_ARROW_TYPES:
         return _PRIMITIVE_ARROW_TYPES[hint]
 

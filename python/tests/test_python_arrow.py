@@ -1,6 +1,9 @@
+import datetime
+import decimal
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Annotated, Optional, Tuple
 
+import pytest
 import pyarrow as pa
 
 from yggdrasil.types import arrow_field_from_hint
@@ -59,3 +62,65 @@ def test_tuple_fields_are_indexed():
         ]
     )
     assert field.nullable is False
+
+
+def test_annotated_tuple_metadata_names():
+    field = arrow_field_from_hint(
+        Annotated[
+            Tuple[int, Annotated[str, {"arrow_type": pa.large_string()}]],
+            {"names": ["age", "comment"]},
+        ]
+    )
+
+    assert field.type == pa.struct(
+        [
+            pa.field("age", pa.int64(), nullable=False),
+            pa.field("comment", pa.large_string(), nullable=False),
+        ]
+    )
+    assert field.nullable is False
+
+
+def test_annotated_tuple_metadata_name_mismatch():
+    with pytest.raises(TypeError):
+        arrow_field_from_hint(Annotated[Tuple[int, str], {"names": ["only_one"]}])
+
+
+def test_annotated_decimal_metadata():
+    field = arrow_field_from_hint(
+        Annotated[decimal.Decimal, {"precision": 10, "scale": 2}]
+    )
+
+    assert field.type == pa.decimal128(10, 2)
+    assert field.nullable is False
+
+
+def test_annotated_metadata_key_value_tuple():
+    field = arrow_field_from_hint(
+        Annotated[str, ("arrow_type", pa.large_string()), ("comment", "ignored")]
+    )
+
+    assert field.type == pa.large_string()
+    assert field.nullable is False
+
+
+def test_annotated_timestamp_metadata():
+    field = arrow_field_from_hint(
+        Annotated[
+            datetime.datetime,
+            {
+                "unit": "ns",
+                "tz": "America/New_York",
+            },
+        ]
+    )
+
+    assert field.type == pa.timestamp("ns", tz="America/New_York")
+    assert field.nullable is False
+
+
+def test_optional_annotated_nullable():
+    field = arrow_field_from_hint(Annotated[Optional[int], {"arrow_type": pa.int32()}])
+
+    assert field.type == pa.int32()
+    assert field.nullable is True

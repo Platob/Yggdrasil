@@ -1,5 +1,7 @@
-from yggdrasil.dataclasses import dataclass
 import dataclasses as py_dataclasses
+import pyarrow as pa
+
+from yggdrasil.dataclasses import dataclass
 
 
 @dataclass
@@ -23,6 +25,20 @@ def test_to_and_from_dict():
     assert defaulted == Person("Carl", 0, "buddy")
 
 
+def test_from_dict_safe_casting():
+    recreated = Person.from_dict({"name": "Bob", "age": "25"})
+
+    assert recreated == Person("Bob", 25)
+
+    empty_age = Person.from_dict({"name": "Dana", "age": ""})
+
+    assert empty_age == Person("Dana", 0, "buddy")
+
+    unsafe = Person.from_dict({"name": "Eve", "age": "28"}, safe=False)
+
+    assert unsafe.age == "28"
+
+
 def test_to_and_from_tuple():
     person = Person("Charlie", 40, nickname="chuck")
 
@@ -31,6 +47,16 @@ def test_to_and_from_tuple():
     recreated = Person.from_tuple(["Dana", 35, "dee"])
 
     assert recreated == Person("Dana", 35, "dee")
+
+
+def test_from_tuple_safe_casting():
+    recreated = Person.from_tuple(["Fay", "41", "friend"])
+
+    assert recreated == Person("Fay", 41, "friend")
+
+    unsafe = Person.from_tuple(["Gil", "42", "g"], safe=False)
+
+    assert unsafe.age == "42"
 
 
 def test_from_tuple_length_mismatch():
@@ -75,6 +101,40 @@ def test_default_instance_standard_dataclass():
     instance = WithDefaults.default_instance()
 
     assert instance == WithDefaults("", 2)
+
+
+def test_arrow_field_method():
+    field = Person.arrow_field()
+
+    assert field.name == "Person"
+    assert field.type == pa.struct(
+        [
+            pa.field("name", pa.string(), nullable=False),
+            pa.field("age", pa.int64(), nullable=False),
+            pa.field("nickname", pa.string(), nullable=False),
+        ]
+    )
+    assert field.nullable is False
+
+
+def test_arrow_field_name_override_and_standard_patch():
+    field = Person.arrow_field(name="person_record")
+
+    assert field.name == "person_record"
+
+    @py_dataclasses.dataclass
+    class Point:
+        x: int
+        y: int
+
+    point_field = Point.arrow_field()
+
+    assert point_field.type == pa.struct(
+        [
+            pa.field("x", pa.int64(), nullable=False),
+            pa.field("y", pa.int64(), nullable=False),
+        ]
+    )
 
 
 def test_copy():
