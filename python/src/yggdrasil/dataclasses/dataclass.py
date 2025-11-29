@@ -1,8 +1,11 @@
 import dataclasses
+from typing import Any, Iterable, Mapping, Tuple
 
 __all__ = [
     "dataclass"
 ]
+
+_builtin_dataclass = dataclasses.dataclass
 
 
 def dataclass(
@@ -31,7 +34,85 @@ def dataclass(
     """
 
     def wrap(c):
-        base = dataclasses.dataclass(
+        if not hasattr(c, "to_dict"):
+            def to_dict(self) -> Mapping[str, Any]:
+                return dataclasses.asdict(self)
+
+            c.to_dict = to_dict
+
+        if not hasattr(c, "from_dict"):
+            @classmethod
+            def from_dict(cls, values: Mapping[str, Any]):
+                defaults = cls.default_instance()
+                return dataclasses.replace(defaults, **values)
+
+            c.from_dict = from_dict
+
+        if not hasattr(c, "to_tuple"):
+            def to_tuple(self) -> Tuple[Any, ...]:
+                return dataclasses.astuple(self)
+
+            c.to_tuple = to_tuple
+
+        if not hasattr(c, "from_tuple"):
+            @classmethod
+            def from_tuple(cls, values: Iterable[Any]):
+                items = tuple(values)
+                fields = dataclasses.fields(cls)
+
+                if len(items) != len(fields):
+                    raise TypeError(
+                        f"Expected {len(fields)} values but received {len(items)}"
+                    )
+
+                kwargs = {field.name: value for field, value in zip(fields, items)}
+                return cls(**kwargs)
+
+            c.from_tuple = from_tuple
+
+        if not hasattr(c, "default_instance"):
+            @classmethod
+            def default_instance(cls):
+                from yggdrasil.types import default_from_hint
+
+                if not hasattr(cls, "__default_instance__"):
+                    cls.__default_instance__ = default_from_hint(cls)
+
+                return dataclasses.replace(cls.__default_instance__)
+
+            c.default_instance = default_instance
+
+        if not hasattr(c, "copy"):
+            @classmethod
+            def copy(cls, *args, **kwargs):
+                """Return a new instance using defaults merged with overrides.
+
+                Positional arguments override fields in definition order, while
+                keyword arguments override matching field names. Both sets of
+                overrides are applied on top of the cached default instance,
+                mirroring the class constructor's positional ordering.
+                """
+
+                fields = dataclasses.fields(cls)
+                init_fields = [field.name for field in fields if field.init]
+
+                if len(args) > len(init_fields):
+                    raise TypeError(
+                        f"Expected at most {len(init_fields)} positional arguments, "
+                        f"got {len(args)}"
+                    )
+
+                positional_overrides = {
+                    name: value for name, value in zip(init_fields, args)
+                }
+
+                overrides = {**positional_overrides, **kwargs}
+
+                return dataclasses.replace(cls.default_instance(), **overrides)
+
+            c.copy = copy
+
+        base = _builtin_dataclass(
             c,
             init=init,
             repr=repr,
@@ -54,3 +135,6 @@ def dataclass(
 
     # We're called as @dataclass without parens.
     return wrap(cls)
+
+
+dataclasses.dataclass = dataclass
