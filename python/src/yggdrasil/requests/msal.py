@@ -1,0 +1,184 @@
+# auth_session.py
+import os
+import time
+from typing import Optional, Mapping
+
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from dataclasses import dataclass
+
+from .session import YGGSession
+
+try:
+    import msal
+
+    ConfidentialClientApplication = msal.ConfidentialClientApplication
+except ImportError:
+    msal = None
+    ConfidentialClientApplication = None
+
+
+__all__ = [
+    "MSALSession",
+    "MSALAuth"
+]
+
+
+@dataclass
+class MSALAuth:
+    tenant_id: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    authority: Optional[str] = None
+    scopes: list[str] | None = None
+
+    _auth_app: ConfidentialClientApplication | None = None
+    _expires_at: float | None = None
+    _access_token: Optional[str] = None
+
+    def __setitem__(self, key, value):
+        self.__setattr__(key, value)
+
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    def __post_init__(self):
+        self.tenant_id = self.tenant_id or os.environ.get("AZURE_TENANT_ID")
+        self.client_id = self.client_id or os.environ.get("AZURE_CLIENT_ID")
+        self.client_secret = self.client_secret or os.environ.get("AZURE_CLIENT_SECRET")
+
+        self.authority = self.authority or os.environ.get("AZURE_AUTHORITY")
+        if not self.authority:
+            self.authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+
+        self.scopes = self.scopes or os.environ.get("AZURE_SCOPES")
+        if self.scopes:
+            if isinstance(self.scopes, str):
+                self.scopes = self.scopes.split(",")
+
+        self._validate_config()
+
+    def _validate_config(self):
+        """Validate that all required configuration is present."""
+        missing = []
+
+        if not self.client_id:
+            missing.append("azure_client_id (AZURE_CLIENT_ID)")
+        if not self.client_secret:
+            missing.append("azure_client_secret (AZURE_CLIENT_SECRET)")
+        if not self.tenant_id:
+            missing.append("azure_client_secret (AZURE_TENANT_ID)")
+        if not self.scopes:
+            missing.append("scopes (AZURE_SCOPES)")
+
+        if missing:
+            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
+
+    @classmethod
+    def find_in_env(
+        cls,
+        env: Mapping = None,
+        prefix: Optional[str] = None
+    ) -> "MSALAuth":
+        if not env:
+            env = os.environ
+        prefix = prefix or "AZURE_"
+
+        if all([
+            prefix + k in env.keys()
+            for k in (
+                "client_id", "client_secret", "tenant_id", "scopes"
+            )
+        ]):
+            return MSALAuth()
+        return None
+
+    def export_to(self, to: dict = os.environ):
+        for key, value in (
+            ("AZURE_CLIENT_ID", self.client_id),
+            ("AZURE_CLIENT_SECRET", self.client_secret),
+            ("AZURE_AUTHORITY", self.authority),
+            ("AZURE_SCOPES", ",".join(self.scopes)),
+        ):
+            if value:
+                to[key] = value
+
+    @property
+    def auth_app(self) -> ConfidentialClientApplication:
+        if not self._auth_app:
+            self._auth_app = ConfidentialClientApplication(
+                client_id=self.client_id,
+                client_credential=self.client_secret,
+                authority=self.authority,
+
+            )
+        return self._auth_app
+
+    @property
+    def expires_in(self) -> float:
+        return time.time() - self.expires_at
+
+    @property
+    def expires_at(self) -> float:
+        self.refresh()
+
+        return self._expires_at
+
+    @property
+    def expired(self) -> bool:
+        return not self._expires_at or time.time() >= self._expires_at
+
+    def refresh(self, force: bool | None = None):
+        if self.expired or force:
+            app = self.auth_app
+            result = app.acquire_token_for_client(scopes=self.scopes)
+            current_time = time.time()
+
+            self._access_token = result.get("access_token")
+
+            if not self._access_token:
+                raise RuntimeError(f"Failed to acquire token: {result.get('error_description') or result}")
+
+            # msal returns expires_in in seconds
+            self._expires_at = current_time + int(result.get("expires_in", 3600))
+
+        return self
+
+    @property
+    def access_token(self) -> str:
+        """Return access token."""
+        self.refresh()
+        return self._access_token
+
+    @property
+    def authorization(self) -> str:
+        """Return authorization token."""
+        return f"Bearer {self.access_token}"
+
+    def requests_session(self, **kwargs):
+        return MSALSession(
+            msal_auth=self,
+            **kwargs
+        )
+
+
+class MSALSession(YGGSession):
+    msal_auth: MSALAuth | None = None
+
+    def __init__(
+        self,
+        msal_auth: Optional[MSALAuth] = None,
+        *args,
+        **kwargs: dict
+    ):
+        super().__init__(*args, **kwargs)
+        self.msal_auth = msal_auth
+
+
+    def prepare_request(self, request):
+        # called before sending; ensure header exists
+        if self.msal_auth is not None:
+            request.headers["Authorization"] = request.headers.get("Authorization", self.msal_auth.authorization)
+
+        return super().prepare_request(request)
