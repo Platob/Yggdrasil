@@ -29,7 +29,7 @@ class DateField(AbstractScalarField):
         super().__init__(name, pa.date32(), "date", nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonDateField":
-        return PythonDateField(self.name, "date", self.nullable, self.metadata)
+        return PythonDateField(self.name, "date", self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowDateField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

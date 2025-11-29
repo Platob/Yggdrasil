@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from typing import Any, Dict, Optional
-
 import pyarrow as pa
 
 from ...libs import pandas, polars, pyspark
@@ -66,7 +64,7 @@ class FloatingField(AbstractScalarField):
         super().__init__(name, self._ARROW_BY_SIZE[bytesize], float, nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonFloatingField":
-        return PythonFloatingField(self.name, float, self.nullable, self.metadata)
+        return PythonFloatingField(self.name, float, self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowFloatingField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

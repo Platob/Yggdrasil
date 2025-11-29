@@ -1,10 +1,3 @@
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-sys.path.insert(0, str(SRC_ROOT))
-
 import pyarrow as pa
 import pytest
 
@@ -26,10 +19,10 @@ def test_string_field_conversions(large):
     field = StringField("text", large=large, nullable=False, metadata={"k": "v"})
 
     python_field = field.to_python()
-    assert python_field.field_name == "text"
-    assert python_field.field_type is str
-    assert python_field.field_nullable is False
-    assert python_field.field_metadata == {"k": "v"}
+    assert python_field.name == "text"
+    assert python_field.type is str
+    assert python_field.nullable is False
+    assert python_field.metadata == {"k": "v"}
 
     arrow_field = field.to_arrow()
     expected_dtype = pa.large_string() if large else pa.string()
@@ -38,16 +31,16 @@ def test_string_field_conversions(large):
     assert arrow_field.metadata_bytes == {b"k": b"v"}
 
     polars_field = field.to_polars()
-    assert polars_field.field_name == "text"
-    assert polars_field.field_type == polars.Utf8
-    assert polars_field.field_nullable is False
-    assert polars_field.field_metadata == {"k": "v"}
+    assert polars_field.name == "text"
+    assert polars_field.type == polars.Utf8
+    assert polars_field.nullable is False
+    assert polars_field.metadata == {"k": "v"}
 
     pandas_field = field.to_pandas()
-    assert pandas_field.field_name == "text"
-    assert isinstance(pandas_field.field_type, pandas.StringDtype)
-    assert pandas_field.field_nullable is False
-    assert pandas_field.field_metadata == {"k": "v"}
+    assert pandas_field.name == "text"
+    assert isinstance(pandas_field.type, pandas.StringDtype)
+    assert pandas_field.nullable is False
+    assert pandas_field.metadata == {"k": "v"}
 
 
 @requires_polars_and_pandas
@@ -65,10 +58,10 @@ def test_integer_field_mappings(bytesize, arrow_type, polars_type, pandas_dtype)
     assert arrow_field.metadata_bytes == {b"signed": b"True"}
 
     polars_field = field.to_polars()
-    assert polars_field.field_type == polars_type
+    assert polars_field.type == polars_type
 
     pandas_field = field.to_pandas()
-    assert isinstance(pandas_field.field_type, type(pandas_dtype))
+    assert isinstance(pandas_field.type, type(pandas_dtype))
 
     if pyspark is not None:
         spark_field = field.to_spark()

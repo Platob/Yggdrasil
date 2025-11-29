@@ -39,7 +39,7 @@ class TimestampField(AbstractScalarField):
         super().__init__(name, pa.timestamp(unit, tz=tz), "datetime", nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonTimestampField":
-        return PythonTimestampField(self.name, "datetime", self.nullable, self.metadata)
+        return PythonTimestampField(self.name, "datetime", self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowTimestampField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

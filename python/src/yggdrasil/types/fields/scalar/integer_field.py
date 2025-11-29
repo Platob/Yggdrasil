@@ -68,7 +68,7 @@ class IntegerField(AbstractScalarField):
         super().__init__(name, self._ARROW_BY_SIZE[bytesize], int, nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonIntegerField":
-        return PythonIntegerField(self.name, int, self.nullable, self.metadata)
+        return PythonIntegerField(self.name, int, self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowIntegerField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)

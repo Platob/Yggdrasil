@@ -39,7 +39,7 @@ class DecimalField(AbstractScalarField):
         super().__init__(name, pa.decimal128(precision, scale), float, nullable=nullable, metadata=metadata)
 
     def to_python(self) -> "PythonDecimalField":
-        return PythonDecimalField(self.name, float, self.nullable, self.metadata)
+        return PythonDecimalField(self.name, float, self.nullable, self._metadata)
 
     def to_arrow(self) -> "ArrowDecimalField":
         field = pa.field(self.name, self.type, nullable=self.nullable, metadata=self.metadata_bytes)
