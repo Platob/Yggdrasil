@@ -1,10 +1,16 @@
 import functools
+import pyarrow as pa
 
 try:
     import polars  # type: ignore
     polars = polars
+
+    ARROW_TO_POLARS = {
+        pa.bool_(): polars.Boolean()
+    }
 except ImportError:
     polars = None
+    ARROW_TO_POLARS = {}
 
 
 def require_polars(_func=None):
@@ -43,4 +49,14 @@ def require_polars(_func=None):
 __all__ = [
     "polars",
     "require_polars",
+    "arrow_type_to_polars"
 ]
+
+
+def arrow_type_to_polars(arrow_type: pa.DataType) -> "polars.DataType":
+    existing = ARROW_TO_POLARS.get(arrow_type)
+
+    if existing is not None:
+        return existing
+
+    raise ValueError()

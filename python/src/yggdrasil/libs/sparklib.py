@@ -1,14 +1,29 @@
 import functools
 
+import pyarrow as pa
+
 try:
     import pyspark  # type: ignore
     from pyspark.sql import SparkSession
+    import pyspark.sql.types as T
 
     pyspark = pyspark
     SparkSession = SparkSession
+
+    ARROW_TO_SPARK = {
+        pa.bool_(): T.BooleanType(),
+        pa.string(): T.StringType()
+    }
 except ImportError:
     pyspark = None
     SparkSession = None
+
+    ARROW_TO_SPARK = {}
+
+SPARK_TO_ARROW = {
+    v: k
+    for k, v in ARROW_TO_SPARK.items()
+}
 
 
 def require_pyspark(_func=None, *, active_session: bool = False):
@@ -61,5 +76,57 @@ def require_pyspark(_func=None, *, active_session: bool = False):
 __all__ = [
     "pyspark",
     "require_pyspark",
-    "SparkSession"
+    "SparkSession",
+    "arrow_type_to_spark",
+    "spark_type_to_arrow",
+    "arrow_field_to_spark",
+    "spark_field_to_arrow"
 ]
+
+
+@require_pyspark
+def arrow_type_to_spark(arrow_type: pa.DataType) -> "pyspark.sql.types.DataType":
+    existing = ARROW_TO_SPARK.get(arrow_type)
+
+    if existing is not None:
+        return existing
+
+    raise ValueError()
+
+
+def spark_type_to_arrow(spark_type: "pyspark.sql.types.DataType") -> pa.DataType:
+    existing = SPARK_TO_ARROW.get(spark_type)
+
+    if existing is not None:
+        return existing
+
+    raise ValueError()
+
+
+def arrow_field_to_spark(arrow_field: pa.Field) -> "pyspark.sql.types.StructField":
+    spark_type = arrow_type_to_spark(arrow_field.type)
+
+    return pyspark.sql.types.StructField(
+        arrow_field.name,
+        spark_type,
+        arrow_field.nullable,
+        metadata={
+            k.decode(): v.decode()
+            for k, v in arrow_field.metadata.items()
+        } if arrow_field.metadata else {}
+    )
+
+
+def spark_field_to_arrow(spark_field: "pyspark.sql.types.StructField") -> pa.Field:
+    arrow_type = spark_type_to_arrow(spark_field.dataType)
+
+    return pa.field(
+        spark_field.name,
+        arrow_type,
+        spark_field.nullable,
+        metadata={
+            k.encode(): v.encode() if isinstance(v, str) else str(v).encode()
+            for k, v in spark_field.metadata.items()
+            if k and v
+        } if spark_field.metadata else {}
+    )
