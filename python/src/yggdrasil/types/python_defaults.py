@@ -68,6 +68,71 @@ def _default_for_tuple_args(args):
     return tuple(default_from_hint(arg) for arg in args)
 
 
+_ARROW_NOT_HANDLED = object()
+
+
+def _default_from_arrow_hint(hint):
+    try:
+        import pyarrow as pa
+    except ModuleNotFoundError:
+        return _ARROW_NOT_HANDLED
+
+    def _arrow_default_value(dtype: "pa.DataType"):
+        if pa.types.is_struct(dtype):
+            return {
+                field.name: (
+                    _arrow_default_value(field.type) if not field.nullable else None
+                )
+                for field in dtype
+            }
+
+        if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+            return []
+
+        if pa.types.is_map(dtype):
+            return {}
+
+        if pa.types.is_integer(dtype) or pa.types.is_unsigned_integer(dtype):
+            return 0
+
+        if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
+            return decimal.Decimal(0) if pa.types.is_decimal(dtype) else 0.0
+
+        if pa.types.is_boolean(dtype):
+            return False
+
+        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+            return ""
+
+        if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
+            return b""
+
+        if pa.types.is_fixed_size_binary(dtype):
+            return b"\x00" * dtype.byte_width
+
+        if (
+            pa.types.is_timestamp(dtype)
+            or pa.types.is_time(dtype)
+            or pa.types.is_duration(dtype)
+            or pa.types.is_interval(dtype)
+        ):
+            return 0
+
+        return None
+
+    def _arrow_default_scalar(dtype: "pa.DataType"):
+        value = _arrow_default_value(dtype)
+        return pa.scalar(value, type=dtype)
+
+    if isinstance(hint, pa.Field):
+        return pa.scalar(None, type=hint.type) if hint.nullable else _arrow_default_scalar(hint.type)
+
+    if isinstance(hint, pa.DataType):
+        return _arrow_default_scalar(hint)
+
+    return _ARROW_NOT_HANDLED
+
+
 def _default_for_dataclass(hint):
     kwargs = {}
 
@@ -96,6 +161,10 @@ def default_from_hint(hint: Any):
 
     if hint in _SPECIAL_DEFAULTS:
         return _SPECIAL_DEFAULTS[hint]()
+
+    arrow_default = _default_from_arrow_hint(hint)
+    if arrow_default is not _ARROW_NOT_HANDLED:
+        return arrow_default
 
     origin = get_origin(hint)
 

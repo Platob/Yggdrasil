@@ -419,6 +419,54 @@ def test_convert_table_to_record_batch_reader_and_back_via_convert():
     assert table_back.column("a").to_pylist() == [10, 20, 30]
 
 
+def test_convert_respects_arrow_target_hint():
+    arr = pa.array([1, 2, 3], type=pa.int32())
+
+    converted = convert(arr, pa.float64())
+
+    assert isinstance(converted, pa.Array)
+    assert converted.type == pa.float64()
+
+
+def test_convert_propagates_arrow_source_and_target_hints():
+    arr = pa.array([1, 2, 3], type=pa.int32())
+    target_hint = pa.field("a", pa.int64(), nullable=False)
+    source_hint = pa.field("b", pa.int32(), nullable=True)
+
+    received: dict[str, object] = {}
+
+    # Temporarily replace the array->array converter to observe the options.
+    from yggdrasil.types.cast import registry
+
+    original_converter = registry._registry[(pa.Array, pa.Array)]
+
+    def _spy(value, cast_options):  # type: ignore[override]
+        received["cast_options"] = cast_options
+        return value
+
+    registry._registry[(pa.Array, pa.Array)] = _spy
+
+    try:
+        result = convert(
+            arr,
+            target_hint,
+            options=ArrowCastOptions(source_hint=source_hint),
+            default_value=0,
+        )
+    finally:
+        registry._registry[(pa.Array, pa.Array)] = original_converter
+
+    assert isinstance(result, pa.Array)
+
+    opts = received["cast_options"]
+    assert isinstance(opts, ArrowCastOptions)
+    assert opts.target_field.type == pa.int64()
+    assert opts.target_hint is target_hint
+    assert opts.source_field.type == pa.int32()
+    assert opts.source_hint is source_hint
+    assert opts.default_value == 0
+
+
 def test_convert_record_batch_to_record_batch_reader_and_back_via_convert():
     batch = pa.record_batch({"a": [5, 6, 7]})
 

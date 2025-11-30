@@ -112,7 +112,6 @@ def require_polars(_func=None):
 def arrow_type_to_polars_type(
     arrow_type: pa.DataType,
     options: Optional[dict] = None,
-    default_value: Any = None,
 ) -> Any:
     """
     Convert a pyarrow.DataType to a Polars dtype.
@@ -216,7 +215,6 @@ def arrow_type_to_polars_type(
 def arrow_field_to_polars_field(
     field: pa.Field,
     options: Optional[dict] = None,
-    default_value: Any = None,
 ) -> Any:
     """
     Convert a pyarrow.Field to a Polars field representation.
@@ -257,7 +255,6 @@ def _polars_base_type(pl_dtype: Any) -> Any:
 def polars_type_to_arrow_type(
     pl_type: Any,
     options: Optional[dict] = None,
-    default_value: Any = None,
 ) -> pa.DataType:
     """
     Convert a Polars dtype (class or instance) to a pyarrow.DataType.
@@ -331,7 +328,6 @@ def polars_type_to_arrow_type(
 def polars_field_to_arrow_field(
     field: Any,
     options: Optional[dict] = None,
-    default_value: Any = None,
 ) -> pa.Field:
     """
     Convert a Polars field to a pyarrow.Field.

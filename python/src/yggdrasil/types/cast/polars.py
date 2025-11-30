@@ -34,7 +34,6 @@ __all__ = [
 def cast_polars_series(
     series: "polars.Series",
     options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "polars.Series":
     """
     Cast a Polars Series to a target Arrow type using Polars casting rules.
@@ -47,6 +46,7 @@ def cast_polars_series(
       when nullable=False (using default_arrow_python_value).
     """
     options = ArrowCastOptions.check_arg(options)
+    default_value = options.default_value
     target_field = options.target_field
 
     if target_field is None:
@@ -66,7 +66,7 @@ def cast_polars_series(
     nullable = target_field.nullable
 
     # Convert Arrow dtype -> Polars dtype
-    polars_dtype = arrow_type_to_polars_type(target_dtype, options, default_value)
+    polars_dtype = arrow_type_to_polars_type(target_dtype, options)
 
     # strict=True => fail on lossy casts
     casted = series.cast(polars_dtype, strict=options.safe)
@@ -86,7 +86,6 @@ def cast_polars_series(
 def cast_polars_dataframe(
     dataframe: "polars.DataFrame",
     options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "polars.DataFrame":
     """
     Cast a Polars DataFrame to a target Arrow schema using Arrow casting rules.
@@ -97,6 +96,7 @@ def cast_polars_dataframe(
     - allow_add_columns to keep or drop extra source columns
     """
     options = ArrowCastOptions.check_arg(options)
+    default_value = options.default_value
     arrow_schema = options.target_schema
 
     if arrow_schema is None:
@@ -145,7 +145,7 @@ def cast_polars_dataframe(
 
         # override target_field for this column
         col_options = replace(options, target_field=field)
-        casted = cast_polars_series(series, col_options, default_value)
+        casted = cast_polars_series(series, col_options)
         columns.append(casted.alias(field.name))
 
     # Start with only the casted schema columns
@@ -170,7 +170,6 @@ def cast_polars_dataframe(
 def polars_series_to_arrow_array(
     series: "polars.Series",
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> pa.Array:
     """
     Convert a Polars Series to a pyarrow.Array.
@@ -182,7 +181,7 @@ def polars_series_to_arrow_array(
     opts = ArrowCastOptions.check_arg(cast_options)
 
     if opts.target_field is not None:
-        series = cast_polars_series(series, opts, default_value)
+        series = cast_polars_series(series, opts)
 
     arr = series.to_arrow()
     if isinstance(arr, pa.ChunkedArray):
@@ -194,7 +193,6 @@ def polars_series_to_arrow_array(
 def polars_dataframe_to_arrow_table(
     dataframe: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> pa.Table:
     """
     Convert a Polars DataFrame to a pyarrow.Table.
@@ -206,7 +204,7 @@ def polars_dataframe_to_arrow_table(
     opts = ArrowCastOptions.check_arg(cast_options)
 
     if opts.target_schema is not None:
-        dataframe = cast_polars_dataframe(dataframe, opts, default_value)
+        dataframe = cast_polars_dataframe(dataframe, opts)
 
     return dataframe.to_arrow()
 
@@ -215,7 +213,6 @@ def polars_dataframe_to_arrow_table(
 def arrow_array_to_polars_series(
     arr: pa.Array,
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "polars.Series":
     """
     Convert a pyarrow.Array (or ChunkedArray) to a Polars Series.
@@ -229,7 +226,7 @@ def arrow_array_to_polars_series(
     opts = ArrowCastOptions.check_arg(cast_options)
 
     if opts.target_field is not None:
-        arr = cast_arrow_array(arr, opts, default_value=default_value)
+        arr = cast_arrow_array(arr, opts)
 
     series = polars.from_arrow(arr)
     assert isinstance(series, polars.Series)
@@ -240,7 +237,6 @@ def arrow_array_to_polars_series(
 def arrow_table_to_polars_dataframe(
     table: pa.Table,
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "polars.DataFrame":
     """
     Convert a pyarrow.Table to a Polars DataFrame.
@@ -251,7 +247,7 @@ def arrow_table_to_polars_dataframe(
     opts = ArrowCastOptions.check_arg(cast_options)
 
     if opts.target_schema is not None:
-        table = cast_arrow_table(table, opts, default_value=default_value)
+        table = cast_arrow_table(table, opts)
 
     df = polars.from_arrow(table)
     assert isinstance(df, polars.DataFrame)
@@ -266,7 +262,6 @@ def arrow_table_to_polars_dataframe(
 def polars_dataframe_to_record_batch_reader(
     dataframe: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> pa.RecordBatchReader:
     """
     Convert a Polars DataFrame to a pyarrow.RecordBatchReader.
@@ -274,7 +269,7 @@ def polars_dataframe_to_record_batch_reader(
     - If cast_options.target_schema is set, we apply `cast_polars_dataframe`
       first, then convert to Arrow and wrap as a RecordBatchReader.
     """
-    table = polars_dataframe_to_arrow_table(dataframe, cast_options, default_value)
+    table = polars_dataframe_to_arrow_table(dataframe, cast_options)
     batches = table.to_batches()
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
@@ -283,7 +278,6 @@ def polars_dataframe_to_record_batch_reader(
 def record_batch_reader_to_polars_dataframe(
     reader: pa.RecordBatchReader,
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "polars.DataFrame":
     """
     Convert a pyarrow.RecordBatchReader to a Polars DataFrame.
@@ -294,7 +288,7 @@ def record_batch_reader_to_polars_dataframe(
     opts = ArrowCastOptions.check_arg(cast_options)
 
     if opts.target_schema is not None:
-        reader = cast_arrow_record_batch_reader(reader, opts, default_value=default_value)
+        reader = cast_arrow_record_batch_reader(reader, opts)
 
     batches = list(reader)
     if not batches:
@@ -303,7 +297,7 @@ def record_batch_reader_to_polars_dataframe(
         return polars.from_arrow(empty_table)
 
     table = pa.Table.from_batches(batches)
-    return arrow_table_to_polars_dataframe(table, None, default_value)
+    return arrow_table_to_polars_dataframe(table, None)
 
 
 # ---------------------------------------------------------------------------

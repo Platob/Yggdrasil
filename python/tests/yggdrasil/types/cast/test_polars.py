@@ -330,7 +330,7 @@ def test_convert_arrow_record_batch_reader_to_polars_with_cast():
     )
     opts = ArrowCastOptions(target_field=target_schema, strict_match_names=False)
 
-    df = convert(rbr, polars.DataFrame, cast_options=opts)
+    df = convert(rbr, polars.DataFrame, options=opts)
 
     assert df.columns == ["a"]
     # null should be filled with 0 by Arrow-side cast before Polars conversion

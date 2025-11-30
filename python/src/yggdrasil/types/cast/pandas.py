@@ -1,5 +1,7 @@
 from typing import Optional, Any
 
+from typing import Any, Optional
+
 import pyarrow as pa
 
 from ...libs.pandaslib import pandas, require_pandas
@@ -15,7 +17,6 @@ __all__ = [
 def cast_pandas_series(
     series: "pandas.Series",
     options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "pandas.Series":
     """
     Cast a pandas Series to a target Arrow type using Arrow casting rules.
@@ -45,7 +46,6 @@ def cast_pandas_series(
 def cast_pandas_dataframe(
     dataframe: "pandas.DataFrame",
     options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "pandas.DataFrame":
     """
     Cast a pandas DataFrame to a target Arrow schema using Arrow casting rules.

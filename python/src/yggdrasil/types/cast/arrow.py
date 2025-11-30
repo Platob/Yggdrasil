@@ -54,11 +54,17 @@ class ArrowCastOptions:
     allow_add_columns: bool = False
     rename: bool = True
     memory_pool: Optional[pa.MemoryPool] = None
+    default_value: object = None
+    source_hint: object = None
+    target_hint: object = None
     source_field: Optional[pa.Field] = None
     target_field: Optional[pa.Field] = None
 
     @classmethod
-    def check_arg(cls, arg: Optional[Union["ArrowCastOptions", dict, pa.DataType, pa.Field, pa.Schema]]) -> "ArrowCastOptions":
+    def check_arg(
+        cls,
+        arg: Optional[Union["ArrowCastOptions", dict, pa.DataType, pa.Field, pa.Schema, object]],
+    ) -> "ArrowCastOptions":
         """
         Normalize an argument into an ArrowCastOptions instance.
 
@@ -77,6 +83,9 @@ class ArrowCastOptions:
 
         if isinstance(arg, (pa.DataType, pa.Field, pa.Schema)):
             return replace(DEFAULT_CAST_OPTIONS, target_field=arg)
+
+        if arg is not None:
+            return replace(DEFAULT_CAST_OPTIONS, target_hint=arg)
 
         return DEFAULT_CAST_OPTIONS
 
@@ -152,6 +161,12 @@ class ArrowCastOptions:
                     metadata=None,
                 )
 
+        if self.target_hint is None and self.target_field is not None:
+            self.target_hint = self.target_field
+
+        if self.source_hint is None and self.source_field is not None:
+            self.source_hint = self.source_field
+
 
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()
 
@@ -159,7 +174,6 @@ DEFAULT_CAST_OPTIONS = ArrowCastOptions()
 def cast_arrow_array(
     data: Union[pa.ChunkedArray, pa.Array],
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> Union[pa.ChunkedArray, pa.Array]:
     """
     Cast an Arrow array or chunked array to the type described in options.target_field.
@@ -173,6 +187,7 @@ def cast_arrow_array(
     Nullability is enforced using `default_arrow_python_value` for non-nullable targets.
     """
     options = ArrowCastOptions.check_arg(options)
+    default_value = options.default_value
 
     source_field = options.source_field
     target_field = options.target_field
@@ -433,8 +448,11 @@ def cast_arrow_array(
             return pa.chunked_array(filled_chunks, type=arr.type)
 
         if arr.null_count:
-            default_value = default_arrow_python_value(dtype)
-            default_arr = pa.array([default_value] * len(arr), type=dtype)
+            fill_value = default_value
+            if fill_value is None:
+                fill_value = default_arrow_python_value(dtype)
+
+            default_arr = pa.array([fill_value] * len(arr), type=dtype)
             return pc.if_else(pc.is_null(arr), default_arr, arr)
 
         return arr
@@ -503,7 +521,6 @@ def cast_arrow_array(
 def cast_arrow_table(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.Table:
     """
     Cast a pyarrow.Table to `options.target_schema`.
@@ -573,7 +590,6 @@ def cast_arrow_table(
 def cast_arrow_batch(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.RecordBatch:
     """
     Cast a pyarrow.RecordBatch to `options.target_schema`.
@@ -639,7 +655,6 @@ def cast_arrow_batch(
 def cast_arrow_record_batch_reader(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.RecordBatchReader:
     """
     Wrap a RecordBatchReader and lazily cast each batch to `options.target_schema`.
@@ -744,7 +759,6 @@ def default_arrow_python_value(dtype: pa.DataType):
 def table_to_record_batch(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
-    default_value=None,
 ) -> pa.RecordBatch:
     """
     Cast a Table using `cast_arrow_table` and return a single RecordBatch.
@@ -780,7 +794,6 @@ def table_to_record_batch(
 def record_batch_to_table(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.Table:
     """
     Cast a RecordBatch using `cast_arrow_batch` and wrap as a single-batch Table.
@@ -792,7 +805,6 @@ def record_batch_to_table(
 def table_to_record_batch_reader(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.RecordBatchReader:
     """
     Cast a Table and expose it as a RecordBatchReader.
@@ -807,7 +819,6 @@ def table_to_record_batch_reader(
 def record_batch_reader_to_table(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None
 ) -> pa.Table:
     """
     Cast each batch in a RecordBatchReader and collect into a Table.
@@ -819,7 +830,6 @@ def record_batch_reader_to_table(
 def record_batch_to_record_batch_reader(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
-    default_value = None,
 ) -> pa.RecordBatchReader:
     """
     Cast a RecordBatch and wrap it into a single-batch RecordBatchReader.
@@ -831,7 +841,6 @@ def record_batch_to_record_batch_reader(
 def record_batch_reader_to_record_batch(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
-    default_value=None,
 ) -> pa.RecordBatch:
     """
     Cast a RecordBatchReader, collect to a Table, then to a single RecordBatch.

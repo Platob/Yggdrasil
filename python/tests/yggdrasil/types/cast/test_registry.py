@@ -5,6 +5,7 @@ import enum
 import pytest
 
 from yggdrasil.types.cast import convert, register_converter
+from yggdrasil.types.cast.arrow import ArrowCastOptions
 
 
 def test_builtin_converters():
@@ -47,13 +48,30 @@ def test_builtin_converters():
 
 def test_custom_registration():
     @register_converter(int, str)
-    def _int_to_str(value, cast_options, default_value):
+    def _int_to_str(value, cast_options):
         return f"val={value}"
 
     assert convert(3, str) == "val=3"
 
     with pytest.raises(TypeError):
         convert(1.2, str)
+
+
+def test_convert_passes_source_hint():
+    class Source:
+        pass
+
+    received: dict[str, object] = {}
+
+    @register_converter(Source, str)
+    def _source_to_str(value, cast_options):
+        received["hint"] = getattr(cast_options, "source_hint", None)
+        return "hinted" if received["hint"] else "no-hint"
+
+    result = convert(Source(), str, options=ArrowCastOptions(source_hint="original-type"))
+
+    assert result == "hinted"
+    assert received["hint"] == "original-type"
 
 
 def test_collection_conversions():
@@ -116,3 +134,26 @@ def test_dataclass_conversion():
 
     with pytest.raises(TypeError):
         convert({}, Container)
+
+
+@dataclasses.dataclass
+class SimpleConfig:
+    number: int
+    label: str | None = None
+
+
+@dataclasses.dataclass
+class ConfigWrapper:
+    config: SimpleConfig
+    active: bool = False
+
+
+def test_create_dataclass_from_dict_defaults():
+    basic_result = convert({"number": "7"}, SimpleConfig)
+    assert basic_result == SimpleConfig(number=7, label=None)
+
+    wrapped_result = convert({}, ConfigWrapper)
+    assert wrapped_result == ConfigWrapper(config=SimpleConfig(number=0, label=None), active=False)
+
+    nested_override = convert({"config": {"number": "3", "label": "x"}}, ConfigWrapper)
+    assert nested_override == ConfigWrapper(config=SimpleConfig(number=3, label="x"), active=False)

@@ -20,7 +20,6 @@ __all__ = [
 def cast_spark_dataframe(
     dataframe: "pyspark.sql.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
-    default_value: Any = None,
 ) -> "pyspark.sql.DataFrame":
     """
     Cast a Spark DataFrame using Arrow *types* but without collecting to Arrow.
@@ -39,6 +38,7 @@ def cast_spark_dataframe(
     from pyspark.sql import functions as F
 
     opts = ArrowCastOptions.check_arg(cast_options)
+    default_value = opts.default_value
     target_schema = opts.target_schema
 
     # No target -> nothing to do
@@ -116,7 +116,6 @@ def cast_spark_dataframe(
 def cast_spark_column(
     column: "pyspark.sql.Column",
     cast_options: Any = None,
-    default_value: Any = None,
 ) -> "pyspark.sql.Column":
     """
     Cast a single Spark Column using an Arrow target *type*.
