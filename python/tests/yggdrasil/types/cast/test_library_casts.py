@@ -56,7 +56,7 @@ def test_cast_polars_dataframe_with_missing_column(sample_arrow_schema):
     polars = pytest.importorskip("polars")
 
     dataframe = polars.DataFrame({"A": ["10", "20"]})
-    options = ArrowCastOptions(target_schema=sample_arrow_schema)
+    options = ArrowCastOptions(target_field=sample_arrow_schema)
 
     result = cast_polars_dataframe(dataframe, options)
     table = result.to_arrow()
@@ -74,7 +74,7 @@ def test_cast_polars_dataframe_uses_target_schema_option(sample_arrow_schema):
     polars = pytest.importorskip("polars")
 
     dataframe = polars.DataFrame({"a": ["1", "2"]})
-    options = ArrowCastOptions(target_schema=sample_arrow_schema)
+    options = ArrowCastOptions(target_field=sample_arrow_schema)
 
     result = cast_polars_dataframe(dataframe, options)
     table = result.to_arrow()
@@ -96,7 +96,7 @@ def test_cast_polars_dataframe_avoids_arrow_roundtrip(monkeypatch, sample_arrow_
 
     dataframe = polars.DataFrame({"a": [1]})
     result = cast_polars_dataframe(
-        dataframe, ArrowCastOptions(target_schema=sample_arrow_schema)
+        dataframe, ArrowCastOptions(target_field=sample_arrow_schema)
     )
 
     assert result.schema == polars.Schema([("a", polars.Int64), ("b", polars.Utf8)])
@@ -116,7 +116,7 @@ def test_cast_pandas_dataframe_to_schema(sample_arrow_schema):
     pandas = pytest.importorskip("pandas", reason="pandas is optional")
 
     dataframe = pandas.DataFrame({"a": ["1", "2"], "B": ["x", "y"]})
-    options = ArrowCastOptions(target_schema=sample_arrow_schema)
+    options = ArrowCastOptions(target_field=sample_arrow_schema)
 
     result = cast_pandas_dataframe(dataframe, options)
     casted_table = pa.Table.from_pandas(result, schema=sample_arrow_schema, preserve_index=False)
@@ -130,7 +130,7 @@ def test_cast_pandas_dataframe_uses_target_schema_option(sample_arrow_schema):
     pandas = pytest.importorskip("pandas", reason="pandas is optional")
 
     dataframe = pandas.DataFrame({"a": ["1", "2"]})
-    options = ArrowCastOptions(target_schema=sample_arrow_schema)
+    options = ArrowCastOptions(target_field=sample_arrow_schema)
 
     result = cast_pandas_dataframe(dataframe, options)
     casted_table = pa.Table.from_pandas(result, schema=sample_arrow_schema, preserve_index=False)
@@ -183,7 +183,7 @@ def test_cast_polars_dataframe_struct_field():
         ]
     )
 
-    result = cast_polars_dataframe(dataframe, ArrowCastOptions(target_schema=schema))
+    result = cast_polars_dataframe(dataframe, ArrowCastOptions(target_field=schema))
 
     assert result.schema == polars.Schema([("payload", polars.Struct({"x": polars.Int64, "y": polars.Utf8}))])
     assert result.select(polars.col("payload").struct.field("x")).to_series().to_list() == [1, 0]

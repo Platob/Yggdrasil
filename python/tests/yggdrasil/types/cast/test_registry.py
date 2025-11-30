@@ -4,7 +4,7 @@ import enum
 
 import pytest
 
-from yggdrasil.types.cast import convert, register
+from yggdrasil.types.cast import convert, register_converter
 
 
 def test_builtin_converters():
@@ -46,7 +46,7 @@ def test_builtin_converters():
 
 
 def test_custom_registration():
-    @register(int, str)
+    @register_converter(int, str)
     def _int_to_str(value, cast_options, default_value):
         return f"val={value}"
 

@@ -15,13 +15,14 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints,
+    get_type_hints, Optional,
 )
+
 
 if TYPE_CHECKING:
     from .arrow import ArrowCastOptions
 
-__all__ = ["register", "convert"]
+__all__ = ["register_converter", "convert"]
 
 
 Converter = Callable[[Any, "ArrowCastOptions | dict | None", Any], Any]
@@ -30,7 +31,7 @@ Converter = Callable[[Any, "ArrowCastOptions | dict | None", Any], Any]
 _registry: Dict[Tuple[Any, Any], Converter] = {}
 
 
-def register(from_hint: Any, to_hint: Any) -> Callable[[Converter], Converter]:
+def register_converter(from_hint: Any, to_hint: Any) -> Callable[[Converter], Converter]:
     """Register a converter from ``from_hint`` to ``to_hint``.
 
     The decorated callable receives ``(value, cast_options, default_value)`` and
@@ -87,10 +88,11 @@ def convert(
     value: Any,
     target_hint: Any,
     *,
-    cast_options: "ArrowCastOptions | dict | None" = None,
+    cast_options: Optional[Union[ArrowCastOptions, dict]] = None,
     default_value: Any = None,
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
+    from yggdrasil.types import default_from_hint
 
     is_optional, inner_hint = _unwrap_optional(target_hint)
     if is_optional and (value is None or value == ""):
@@ -156,9 +158,7 @@ def convert(
             elif field.default_factory is not _dataclasses.MISSING:  # type: ignore[attr-defined]
                 field_value = field.default_factory()  # type: ignore[misc]
             else:
-                raise TypeError(
-                    f"Missing required field {field.name!r} for dataclass {target.__name__}"
-                )
+                field_value = default_from_hint(field.type)
 
             kwargs[field.name] = field_value
 
@@ -219,21 +219,21 @@ def convert(
     return converter(value, cast_options, default_value)
 
 
-@register(str, int)
+@register_converter(str, int)
 def _str_to_int(value: str, cast_options: Any, default_value: Any) -> int:
     if value == "" and default_value is not None:
         return default_value
     return int(value)
 
 
-@register(str, float)
+@register_converter(str, float)
 def _str_to_float(value: str, cast_options: Any, default_value: Any) -> float:
     if value == "" and default_value is not None:
         return default_value
     return float(value)
 
 
-@register(str, bool)
+@register_converter(str, bool)
 def _str_to_bool(value: str, cast_options: Any, default_value: Any) -> bool:
     if value == "" and default_value is not None:
         return default_value
@@ -247,14 +247,14 @@ def _str_to_bool(value: str, cast_options: Any, default_value: Any) -> bool:
     raise ValueError(f"Cannot parse boolean from {value!r}")
 
 
-@register(str, _datetime.date)
+@register_converter(str, _datetime.date)
 def _str_to_date(value: str, cast_options: Any, default_value: Any) -> _datetime.date:
     if value == "" and default_value is not None:
         return default_value
     return _datetime.date.fromisoformat(value)
 
 
-@register(str, _datetime.datetime)
+@register_converter(str, _datetime.datetime)
 def _str_to_datetime(value: str, cast_options: Any, default_value: Any) -> _datetime.datetime:
     if value == "" and default_value is not None:
         return default_value
@@ -295,18 +295,19 @@ def _str_to_datetime(value: str, cast_options: Any, default_value: Any) -> _date
     return parsed
 
 
-@register(str, _datetime.time)
+@register_converter(str, _datetime.time)
 def _str_to_time(value: str, cast_options: Any, default_value: Any) -> _datetime.time:
     if value == "" and default_value is not None:
         return default_value
     return _datetime.time.fromisoformat(value)
 
 
-@register(_datetime.datetime, _datetime.date)
+@register_converter(_datetime.datetime, _datetime.date)
 def _datetime_to_date(value: _datetime.datetime, cast_options: Any, default_value: Any) -> _datetime.date:
     return value.date()
 
 
-@register(int, str)
+@register_converter(int, str)
 def _int_to_str(value: int, cast_options: Any, default_value: Any) -> str:
     return str(value)
+

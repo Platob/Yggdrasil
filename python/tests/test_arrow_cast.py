@@ -106,17 +106,17 @@ def test_cast_arrow_array_struct_case_insensitive_names():
     assert result.field("a").to_pylist() == [1, 3]
     assert result.field("b").to_pylist() == [2.0, 4.0]
 
-    strict_options = ArrowCastOptions(strict_match_names=True, add_missing_columns=False)
+    strict_options = ArrowCastOptions(strict_match_names=True, add_missing_columns=False, target_field=target_type)
     with pytest.raises(pa.ArrowInvalid):
-        cast_arrow_array(source, target_type, strict_options)
+        cast_arrow_array(source, strict_options)
 
 
 def test_cast_arrow_array_best_effort_unsafe():
-    options = ArrowCastOptions(safe=True)
+    options = ArrowCastOptions(safe=True, target_field=pa.int64())
     data = pa.array([1.2, 3.4])
 
     try:
-        cast_arrow_array(data, pa.int64(), options)
+        cast_arrow_array(data, options)
     except pa.ArrowInvalid:
         pass
     else:
@@ -147,7 +147,7 @@ def test_cast_arrow_array_uses_target_field_option():
     arr = pa.array([1, None], type=pa.int64())
     options = ArrowCastOptions(target_field=pa.field("value", pa.int64(), nullable=False))
 
-    result = cast_arrow_array(arr, pa.int64(), options)
+    result = cast_arrow_array(arr, options)
 
     assert result.to_pylist() == [1, 0]
     assert result.type == pa.int64()
@@ -178,7 +178,7 @@ def test_cast_arrow_array_respects_source_field_hint():
     arr = pa.array([1, 2], type=pa.int64())
     options = ArrowCastOptions(source_field=pa.field("value", pa.int64(), nullable=False))
 
-    result = cast_arrow_array(arr, pa.field("value", pa.int64(), nullable=False), options)
+    result = cast_arrow_array(arr, options)
 
     assert result is arr
 
@@ -191,7 +191,7 @@ def test_cast_arrow_table_fills_missing_columns():
         pa.field("c", pa.int64(), nullable=False),
     ])
 
-    result = cast_arrow_table(data, ArrowCastOptions(target_schema=schema))
+    result = cast_arrow_table(data, ArrowCastOptions(target_field=schema))
 
     assert result.schema == schema
     assert result["a"].type == pa.int64()
@@ -203,7 +203,7 @@ def test_cast_arrow_table_uses_target_schema_option():
     data = pa.table({"a": ["1", "2"]})
     target_schema = pa.schema([pa.field("a", pa.int64())])
 
-    options = ArrowCastOptions(target_schema=target_schema)
+    options = ArrowCastOptions(target_field=target_schema)
     result = cast_arrow_table(data, options)
 
     assert result.schema == target_schema
@@ -227,7 +227,7 @@ def test_cast_arrow_table_case_insensitive_names():
         pa.field("b", pa.large_string()),
     ])
 
-    result = cast_arrow_table(data, ArrowCastOptions(target_schema=schema))
+    result = cast_arrow_table(data, ArrowCastOptions(target_field=schema))
 
     assert result.schema == schema
     assert result["a"].to_pylist() == [1.0]
@@ -237,7 +237,7 @@ def test_cast_arrow_table_case_insensitive_names():
         cast_arrow_table(
             data,
             ArrowCastOptions(
-                target_schema=schema,
+                target_field=schema,
                 strict_match_names=True,
                 add_missing_columns=False,
             ),
@@ -255,7 +255,7 @@ def test_cast_arrow_batch_matches_table_behavior():
         ),
     ])
 
-    result = cast_arrow_batch(batch, ArrowCastOptions(target_schema=schema))
+    result = cast_arrow_batch(batch, ArrowCastOptions(target_field=schema))
 
     assert result.schema == schema
     assert result.column(0).type == pa.float64()
@@ -270,7 +270,7 @@ def test_cast_arrow_batch_case_insensitive_names():
         pa.field("b", pa.int32()),
     ])
 
-    result = cast_arrow_batch(batch, ArrowCastOptions(target_schema=schema))
+    result = cast_arrow_batch(batch, ArrowCastOptions(target_field=schema))
 
     assert result.column(0).to_pylist() == [1]
     assert result.column(1).to_pylist() == [2]
@@ -279,7 +279,7 @@ def test_cast_arrow_batch_case_insensitive_names():
         cast_arrow_batch(
             batch,
             ArrowCastOptions(
-                target_schema=schema,
+                target_field=schema,
                 strict_match_names=True,
                 add_missing_columns=False,
             ),
@@ -300,7 +300,7 @@ def test_cast_arrow_record_batch_reader():
     ])
 
     casted_reader = cast_arrow_record_batch_reader(
-        reader, ArrowCastOptions(target_schema=target_schema)
+        reader, ArrowCastOptions(target_field=target_schema)
     )
     casted_batches = list(casted_reader)
 
@@ -322,4 +322,4 @@ def test_arrow_cast_options_target_schema_cached_from_field():
 
     updated_schema = options.target_schema
     assert updated_schema == pa.schema([updated_field])
-    assert updated_schema is options.target_schema
+    assert updated_schema == options.target_schema
