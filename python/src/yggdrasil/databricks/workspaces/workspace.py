@@ -1,7 +1,6 @@
 import dataclasses
-import hashlib
-import json
 import os
+import platform
 from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
@@ -83,6 +82,15 @@ class DBXWorkspace:
             auth_type = self.auth_type
             if isinstance(auth_type, DBXAuthType):
                 auth_type = auth_type.value
+            elif self.token is None and auth_type is None:
+                if platform.system() == "Windows":
+                    # default to external browser on Windows
+                    auth_type = DBXAuthType.external_browser.value
+
+            if not self.host:
+                self.host = os.getenv("DATABRICKS_HOST")
+                if not self.host:
+                    raise ValueError(f"DATABRICKS_HOST not found in current environment")
 
             self._sdk = databricks_sdk.WorkspaceClient(
                 host=self.host,
