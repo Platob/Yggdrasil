@@ -394,6 +394,63 @@ def _str_to_datetime(value: str, cast_options: Any) -> _datetime.datetime:
     return parsed
 
 
+@register_converter(str, _datetime.timedelta)
+def _str_to_timedelta(value: str, cast_options: Any) -> _datetime.timedelta:
+    default_value = getattr(cast_options, "default_value", None)
+    stripped = value.strip()
+
+    if stripped == "" and default_value is not None:
+        return default_value
+
+    # 1) Match "Dd HH:MM:SS[.ffffff]" or "HH:MM:SS[.ffffff]"
+    m = re.fullmatch(
+        r"(?:(\d+)d\s+)?"
+        r"(\d{1,2}):(\d{1,2})"
+        r"(?::(\d{1,2})(?:\.(\d{1,6}))?)?",
+        stripped,
+    )
+    if m:
+        days = int(m.group(1)) if m.group(1) else 0
+        hours = int(m.group(2))
+        minutes = int(m.group(3))
+        seconds = int(m.group(4)) if m.group(4) else 0
+        frac = m.group(5) or "0"
+        microseconds = int(frac.ljust(6, "0"))
+        return _datetime.timedelta(
+            days=days,
+            hours=hours,
+            minutes=minutes,
+            seconds=seconds,
+            microseconds=microseconds,
+        )
+
+    # 2) Match "<number><unit>" where unit in {s, m, h, d}
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)([smhd])", stripped)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        if unit == "s":
+            seconds = val
+        elif unit == "m":
+            seconds = val * 60
+        elif unit == "h":
+            seconds = val * 3600
+        elif unit == "d":
+            seconds = val * 86400
+        else:  # shouldn't happen
+            raise ValueError(f"Unknown timedelta unit {unit!r}")
+        return _datetime.timedelta(seconds=seconds)
+
+    # 3) Fallback: bare number = seconds
+    try:
+        seconds = float(stripped)
+        return _datetime.timedelta(seconds=seconds)
+    except ValueError:
+        pass
+
+    raise ValueError(f"Cannot parse timedelta from {value!r}")
+
+
 @register_converter(str, _datetime.time)
 def _str_to_time(value: str, cast_options: Any) -> _datetime.time:
     default_value = getattr(cast_options, "default_value", None)
