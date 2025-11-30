@@ -155,6 +155,46 @@ def dataclass(
 
             c.copy = copy
 
+        if not hasattr(c, "safe_init"):
+            @classmethod
+            def safe_init(cls, *args, **kwargs):
+                """Safely initialize a dataclass using type conversion and defaults."""
+
+                fields = _init_public_fields(cls)
+                field_names = [field.name for field in fields]
+
+                if len(args) > len(field_names):
+                    raise TypeError(
+                        f"Expected at most {len(field_names)} positional arguments, got {len(args)}"
+                    )
+
+                provided = {name: value for name, value in zip(field_names, args)}
+
+                for key, value in kwargs.items():
+                    if key in provided:
+                        raise TypeError(f"Got multiple values for argument '{key}'")
+                    if key not in field_names:
+                        raise TypeError(
+                            f"{key!r} is an invalid field for {cls.__name__}"
+                        )
+
+                    provided[key] = value
+
+                from yggdrasil.types.cast import convert
+
+                defaults = cls.default_instance()
+                init_kwargs = {}
+
+                for field in fields:
+                    if field.name in provided:
+                        init_kwargs[field.name] = convert(provided[field.name], field.type)
+                    else:
+                        init_kwargs[field.name] = getattr(defaults, field.name, None)
+
+                return cls(**init_kwargs)
+
+            c.safe_init = safe_init
+
         if not hasattr(c, "arrow_field"):
             @classmethod
             def arrow_field(cls, name: str | None = None):

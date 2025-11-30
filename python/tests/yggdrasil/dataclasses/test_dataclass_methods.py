@@ -156,3 +156,22 @@ def test_copy():
         pass
     else:
         raise AssertionError("Expected TypeError on too many positional args")
+
+
+def test_safe_init_casts_and_defaults():
+    person = Person.safe_init("Hank", "34")
+
+    assert person == Person("Hank", 34, "buddy")
+
+    with_defaults = Person.safe_init("Ivy")
+
+    assert with_defaults == Person("Ivy", 0, "buddy")
+
+
+def test_safe_init_rejects_invalid_fields():
+    try:
+        Person.safe_init("Jake", unknown=1)
+    except TypeError as exc:
+        assert "invalid field" in str(exc)
+    else:
+        raise AssertionError("Expected TypeError for invalid field overrides")
