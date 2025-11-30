@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import dataclass, replace
-from typing import Union, Optional
+from typing import Optional, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -14,9 +14,13 @@ __all__ = [
     "cast_arrow_batch",
     "cast_arrow_record_batch_reader",
     "default_arrow_array",
-    "ALLOWED_CAST_OPTIONS_ARG"
+    "ALLOWED_CAST_OPTIONS_ARG",
+    "pylist_to_arrow_table",
+    "pylist_to_record_batch",
+    "pylist_to_record_batch_reader",
 ]
 
+from ..python_arrow import arrow_field_from_hint
 from ..python_defaults import default_from_arrow_hint
 
 ALLOWED_CAST_OPTIONS_ARG = Union[
@@ -426,10 +430,6 @@ def cast_arrow_array(
         if nullable:
             return arr
 
-        if source_field is not None and source_field.nullable is False:
-            # Source already guaranteed non-nullable.
-            return arr
-
         if isinstance(arr, pa.ChunkedArray):
             if arr.null_count == 0:
                 return arr
@@ -444,6 +444,10 @@ def cast_arrow_array(
                 for chunk in arr.chunks
             ]
             return pa.chunked_array(filled_chunks, type=arr.type)
+
+        if source_field is not None and source_field.nullable is False and arr.null_count == 0:
+            # Source already guaranteed non-nullable and contains no nulls.
+            return arr
 
         if arr.null_count:
             fill_value = default_from_arrow_hint(dtype)
@@ -688,6 +692,96 @@ def default_arrow_array(
     return pa.array([value] * length, type=value.type)
 
 
+def _normalize_pylist_value(value):
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+
+    return value
+
+
+def _schema_from_dataclass_instance(instance) -> pa.Schema:
+    fields = []
+
+    for field in dataclasses.fields(type(instance)):
+        if not field.init or field.name.startswith("_"):
+            continue
+
+        fields.append(arrow_field_from_hint(field.type, name=field.name))
+
+    return pa.schema(fields)
+
+
+def _table_from_pylist(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Table:
+    options = ArrowCastOptions.check_arg(options)
+    target_schema = options.target_schema
+    schema = target_schema
+
+    if schema is None and data:
+        for item in data:
+            if dataclasses.is_dataclass(item):
+                schema = _schema_from_dataclass_instance(item)
+                break
+
+    requires_row_mapping = schema is not None or any(
+        item is not None
+        and (dataclasses.is_dataclass(item) or isinstance(item, dict))
+        for item in data
+    )
+
+    normalized = []
+    for item in data:
+        if item is None and requires_row_mapping:
+            normalized.append({})
+            continue
+
+        normalized.append(_normalize_pylist_value(item))
+
+    if not normalized:
+        if schema is None:
+            raise pa.ArrowInvalid(
+                "Cannot build Arrow table from empty list without target_field"
+            )
+
+        arrays = [pa.array([], type=field.type) for field in schema]
+        return pa.Table.from_arrays(arrays, schema=schema)
+
+    if schema is None:
+        has_keys = any(isinstance(item, dict) and item for item in normalized)
+        if not has_keys:
+            raise pa.ArrowInvalid(
+                "Cannot build Arrow table from list of None/empty rows without target_field"
+            )
+
+    return pa.Table.from_pylist(normalized, schema=schema)
+
+
+def pylist_to_arrow_table(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Table:
+    table = _table_from_pylist(data, options)
+    return cast_arrow_table(table, options)
+
+
+def pylist_to_record_batch(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.RecordBatch:
+    table = _table_from_pylist(data, options)
+    return table_to_record_batch(table, options)
+
+
+def pylist_to_record_batch_reader(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.RecordBatchReader:
+    table = _table_from_pylist(data, options)
+    return table_to_record_batch_reader(table, options)
+
+
 # ---------------------------------------------------------------------------
 # Cross-container casting helpers
 # ---------------------------------------------------------------------------
@@ -863,3 +957,6 @@ register_converter(pa.RecordBatch, pa.RecordBatchReader)(
 register_converter(pa.RecordBatchReader, pa.RecordBatch)(
     record_batch_reader_to_record_batch
 )
+register_converter(list, pa.Table)(pylist_to_arrow_table)
+register_converter(list, pa.RecordBatch)(pylist_to_record_batch)
+register_converter(list, pa.RecordBatchReader)(pylist_to_record_batch_reader)
