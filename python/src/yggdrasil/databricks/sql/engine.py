@@ -1,6 +1,7 @@
 import base64
 import dataclasses
 import io
+import itertools
 import json
 import os
 import random
@@ -101,9 +102,9 @@ STRING_TYPE_MAP = {
 }
 
 _decimal_re = re.compile(r"^DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$", re.IGNORECASE)
-_array_re   = re.compile(r"^ARRAY\s*<\s*(.+)\s*>$", re.IGNORECASE)
-_map_re     = re.compile(r"^MAP\s*<\s*(.+?)\s*,\s*(.+)\s*>$", re.IGNORECASE)
-_struct_re  = re.compile(r"^STRUCT\s*<\s*(.+)\s*>$", re.IGNORECASE)
+_array_re = re.compile(r"^ARRAY\s*<\s*(.+)\s*>$", re.IGNORECASE)
+_map_re = re.compile(r"^MAP\s*<\s*(.+?)\s*,\s*(.+)\s*>$", re.IGNORECASE)
+_struct_re = re.compile(r"^STRUCT\s*<\s*(.+)\s*>$", re.IGNORECASE)
 
 def _split_top_level_commas(s: str):
     parts, cur, depth = [], [], 0
@@ -313,6 +314,12 @@ class DBXSQL(DBXWorkspaceObject):
     ):
         pass
 
+    @staticmethod
+    def _random_suffix(prefix: str = "") -> str:
+        unique = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        timestamp = int(time.time() * 1000)
+        return f"{prefix}{timestamp}_{unique}"
+
     def execute(
         self,
         statement: str,
@@ -327,6 +334,62 @@ class DBXSQL(DBXWorkspaceObject):
         )
 
         return execution
+
+    def read_arrow_batches(
+        self,
+        statement: str,
+        *,
+        batch_size: int | None = None,
+    ) -> pa.RecordBatchReader:
+        """Stream query results from a temporary workspace export as Arrow batches."""
+        query = statement.strip().rstrip(";")
+        if not query:
+            raise ValueError("Statement must not be empty")
+
+        temp_folder = self.temp_volume_folder(suffix=self._random_suffix("read_"))
+        fs = self.fs()
+
+        try:
+            fs.rm(temp_folder, recurse=True)
+        except Exception:
+            pass
+
+        copy_sql = f"""
+        COPY INTO '{temp_folder}'
+        FROM ({query})
+        FILEFORMAT PARQUET
+        """
+
+        self.execute(copy_sql)
+
+        file_infos = [
+            info
+            for info in fs.ls(temp_folder)
+            if not str(getattr(info, "path", "")).endswith("/")
+        ]
+
+        def batch_iterator():
+            try:
+                for info in file_infos:
+                    with fs.open(info.path, "rb") as handle:
+                        parquet_file = pq.ParquetFile(handle)
+                        yield from parquet_file.iter_batches(batch_size=batch_size)
+            finally:
+                try:
+                    fs.rm(temp_folder, recurse=True)
+                except Exception:
+                    pass
+
+        iterator = batch_iterator()
+        first_batch = next(iterator, None)
+
+        if first_batch is None:
+            return pa.RecordBatchReader.from_batches(pa.schema([]), [])
+
+        return pa.RecordBatchReader.from_batches(
+            first_batch.schema,
+            itertools.chain([first_batch], iterator)
+        )
 
     def spark_table(
         self,
@@ -386,7 +449,7 @@ class DBXSQL(DBXWorkspaceObject):
                 spark_options=spark_options
             )
 
-        transaction_id = str(int(time.time() * 1000)) + "_" + ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+        transaction_id = self._random_suffix()
 
         try:
             schema = self.get_table_schema(
