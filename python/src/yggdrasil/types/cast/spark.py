@@ -2,18 +2,29 @@ from typing import Any, Optional, Tuple, List
 
 import pyarrow as pa
 
-from .arrow import ArrowCastOptions
+from .arrow import (
+    ArrowCastOptions,
+    cast_arrow_table,
+    record_batch_reader_to_table,
+    record_batch_to_table,
+)
 from ..cast.registry import register_converter
 from ..python_defaults import default_from_arrow_hint
 from ...libs.sparklib import (
     pyspark,
     require_pyspark,
     arrow_field_to_spark_field,
+    spark_field_to_arrow_field,
 )
 
 __all__ = [
     "cast_spark_dataframe",
     "cast_spark_column",
+    "spark_dataframe_to_arrow_table",
+    "spark_dataframe_to_record_batch_reader",
+    "arrow_table_to_spark_dataframe",
+    "arrow_record_batch_to_spark_dataframe",
+    "arrow_record_batch_reader_to_spark_dataframe",
 ]
 
 
@@ -162,6 +173,99 @@ def cast_spark_column(
     return col
 
 
+@require_pyspark(active_session=True)
+def spark_dataframe_to_arrow_table(
+    dataframe: "pyspark.sql.DataFrame",
+    cast_options: Optional[ArrowCastOptions] = None,
+) -> pa.Table:
+    """Convert a Spark DataFrame to a pyarrow.Table.
+
+    If ``cast_options.target_schema`` is provided, the DataFrame is first cast
+    using :func:`cast_spark_dataframe` before conversion. The resulting Arrow
+    schema is derived from the cast target schema when available; otherwise it
+    is inferred from the Spark schema via :func:`spark_field_to_arrow_field`.
+    """
+
+    opts = ArrowCastOptions.check_arg(cast_options)
+
+    if opts.target_schema is not None:
+        dataframe = cast_spark_dataframe(dataframe, opts)
+        arrow_schema = opts.target_schema
+    else:
+        arrow_schema = pa.schema(
+            [spark_field_to_arrow_field(f, cast_options) for f in dataframe.schema]
+        )
+
+    pandas_df = dataframe.toPandas()
+    return pa.Table.from_pandas(pandas_df, schema=arrow_schema, preserve_index=False)
+
+
+@require_pyspark(active_session=True)
+def spark_dataframe_to_record_batch_reader(
+    dataframe: "pyspark.sql.DataFrame",
+    cast_options: Optional[ArrowCastOptions] = None,
+) -> pa.RecordBatchReader:
+    """Convert a Spark DataFrame to a pyarrow.RecordBatchReader."""
+
+    table = spark_dataframe_to_arrow_table(dataframe, cast_options)
+    batches = table.to_batches()
+    return pa.RecordBatchReader.from_batches(table.schema, batches)
+
+
+@require_pyspark(active_session=True)
+def arrow_table_to_spark_dataframe(
+    table: pa.Table,
+    cast_options: Optional[ArrowCastOptions] = None,
+) -> "pyspark.sql.DataFrame":
+    """Convert a pyarrow.Table to a Spark DataFrame.
+
+    If a target schema is supplied, :func:`cast_arrow_table` is applied before
+    creating the Spark DataFrame. Column types are derived from the Arrow
+    schema using :func:`arrow_field_to_spark_field` to preserve nullability and
+    metadata-driven mappings.
+    """
+
+    opts = ArrowCastOptions.check_arg(cast_options)
+
+    if opts.target_schema is not None:
+        table = cast_arrow_table(table, opts)
+
+    spark_schema = pyspark.sql.types.StructType(
+        [arrow_field_to_spark_field(f, cast_options) for f in table.schema]
+    )
+
+    spark = pyspark.sql.SparkSession.getActiveSession()
+    if spark is None:
+        raise RuntimeError(
+            "An active SparkSession is required to convert Arrow data to Spark"
+        )
+
+    pandas_df = table.to_pandas()
+    return spark.createDataFrame(pandas_df, schema=spark_schema)
+
+
+@require_pyspark(active_session=True)
+def arrow_record_batch_to_spark_dataframe(
+    batch: pa.RecordBatch,
+    cast_options: Optional[ArrowCastOptions] = None,
+) -> "pyspark.sql.DataFrame":
+    """Convert a pyarrow.RecordBatch to a Spark DataFrame."""
+
+    table = record_batch_to_table(batch, cast_options)
+    return arrow_table_to_spark_dataframe(table, cast_options)
+
+
+@require_pyspark(active_session=True)
+def arrow_record_batch_reader_to_spark_dataframe(
+    reader: pa.RecordBatchReader,
+    cast_options: Optional[ArrowCastOptions] = None,
+) -> "pyspark.sql.DataFrame":
+    """Convert a pyarrow.RecordBatchReader to a Spark DataFrame."""
+
+    table = record_batch_reader_to_table(reader, cast_options)
+    return arrow_table_to_spark_dataframe(table, cast_options)
+
+
 # ---------------------------------------------------------------------------
 # Converter registrations
 # ---------------------------------------------------------------------------
@@ -172,3 +276,16 @@ if pyspark is not None:
 
     # Spark Column -> Spark Column (Arrow-type-driven cast, pure Spark)
     register_converter(pyspark.sql.Column, pyspark.sql.Column)(cast_spark_column)
+
+    # Spark <-> Arrow holders
+    register_converter(pyspark.sql.DataFrame, pa.Table)(spark_dataframe_to_arrow_table)
+    register_converter(pyspark.sql.DataFrame, pa.RecordBatchReader)(
+        spark_dataframe_to_record_batch_reader
+    )
+    register_converter(pa.Table, pyspark.sql.DataFrame)(arrow_table_to_spark_dataframe)
+    register_converter(pa.RecordBatch, pyspark.sql.DataFrame)(
+        arrow_record_batch_to_spark_dataframe
+    )
+    register_converter(pa.RecordBatchReader, pyspark.sql.DataFrame)(
+        arrow_record_batch_reader_to_spark_dataframe
+    )
