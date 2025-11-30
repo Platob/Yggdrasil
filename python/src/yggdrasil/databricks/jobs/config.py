@@ -7,14 +7,13 @@ from enum import Enum
 from inspect import isclass
 from typing import Any, Dict, List, get_type_hints, Optional, get_origin
 
+from ...libs.sparklib import SparkSession
 from ...types.cast.registry import convert
 
 __all__ = [
     "WidgetType",
     "NotebookConfig"
 ]
-
-from yggdrasil.types.constants import SparkSession
 
 
 def type_is_iterable(tpe: type, origin=None):
