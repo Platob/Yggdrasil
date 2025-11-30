@@ -112,7 +112,6 @@ def require_pyspark(_func=None, *, active_session: bool = False):
 def arrow_type_to_spark_type(
     arrow_type: pa.DataType,
     cast_options: Any = None,
-    default_value: Any = None,
 ) -> "T.DataType":
     """
     Convert a pyarrow.DataType to a pyspark.sql.types.DataType.
@@ -137,29 +136,26 @@ def arrow_type_to_spark_type(
     # List / LargeList
     if pat.is_list(arrow_type) or pat.is_large_list(arrow_type):
         element_arrow = arrow_type.value_type
-        element_spark = arrow_type_to_spark_type(element_arrow, cast_options, default_value)
+        element_spark = arrow_type_to_spark_type(element_arrow, cast_options)
         return T.ArrayType(elementType=element_spark, containsNull=True)
 
     # Fixed-size list -> treat as an array in Spark
     if pat.is_fixed_size_list(arrow_type):
         element_arrow = arrow_type.value_type
-        element_spark = arrow_type_to_spark_type(element_arrow, cast_options, default_value)
+        element_spark = arrow_type_to_spark_type(element_arrow, cast_options)
         return T.ArrayType(elementType=element_spark, containsNull=True)
 
     # Struct
     if pat.is_struct(arrow_type):
-        fields = [
-            arrow_field_to_spark_field(f, cast_options, default_value)
-            for f in arrow_type
-        ]
+        fields = [arrow_field_to_spark_field(f, cast_options) for f in arrow_type]
         return T.StructType(fields)
 
     # Map -> MapType(keyType, valueType)
     if pat.is_map(arrow_type):
         key_arrow = arrow_type.key_type
         item_arrow = arrow_type.item_type
-        key_spark = arrow_type_to_spark_type(key_arrow, cast_options, default_value)
-        value_spark = arrow_type_to_spark_type(item_arrow, cast_options, default_value)
+        key_spark = arrow_type_to_spark_type(key_arrow, cast_options)
+        value_spark = arrow_type_to_spark_type(item_arrow, cast_options)
         return T.MapType(
             keyType=key_spark,
             valueType=value_spark,
@@ -189,12 +185,11 @@ def arrow_type_to_spark_type(
 def arrow_field_to_spark_field(
     field: pa.Field,
     cast_options: Any = None,
-    default_value: Any = None,
 ) -> "T.StructField":
     """
     Convert a pyarrow.Field to a pyspark StructField.
     """
-    spark_type = arrow_type_to_spark_type(field.type, cast_options, default_value)
+    spark_type = arrow_type_to_spark_type(field.type, cast_options)
     return T.StructField(
         name=field.name,
         dataType=spark_type,
@@ -207,7 +202,6 @@ def arrow_field_to_spark_field(
 def spark_type_to_arrow_type(
     spark_type: "T.DataType",
     cast_options: Any = None,
-    default_value: Any = None,
 ) -> pa.DataType:
     """
     Convert a pyspark.sql.types.DataType to a pyarrow.DataType.
@@ -260,21 +254,18 @@ def spark_type_to_arrow_type(
 
     # ArrayType
     if isinstance(spark_type, ArrayType):
-        element_arrow = spark_type_to_arrow_type(spark_type.elementType, cast_options, default_value)
+        element_arrow = spark_type_to_arrow_type(spark_type.elementType, cast_options)
         return pa.list_(element_arrow)
 
     # MapType
     if isinstance(spark_type, MapType):
-        key_arrow = spark_type_to_arrow_type(spark_type.keyType, cast_options, default_value)
-        value_arrow = spark_type_to_arrow_type(spark_type.valueType, cast_options, default_value)
+        key_arrow = spark_type_to_arrow_type(spark_type.keyType, cast_options)
+        value_arrow = spark_type_to_arrow_type(spark_type.valueType, cast_options)
         return pa.map_(key_arrow, value_arrow)
 
     # StructType
     if isinstance(spark_type, StructType):
-        arrow_fields = [
-            spark_field_to_arrow_field(f, cast_options, default_value)
-            for f in spark_type.fields
-        ]
+        arrow_fields = [spark_field_to_arrow_field(f, cast_options) for f in spark_type.fields]
         return pa.struct(arrow_fields)
 
     raise TypeError(f"Unsupported or unknown Spark type for Arrow conversion: {spark_type!r}")
@@ -284,12 +275,11 @@ def spark_type_to_arrow_type(
 def spark_field_to_arrow_field(
     field: "T.StructField",
     cast_options: Any = None,
-    default_value: Any = None,
 ) -> pa.Field:
     """
     Convert a pyspark StructField to a pyarrow.Field.
     """
-    arrow_type = spark_type_to_arrow_type(field.dataType, cast_options, default_value)
+    arrow_type = spark_type_to_arrow_type(field.dataType, cast_options)
     return pa.field(
         name=field.name,
         type=arrow_type,

@@ -236,7 +236,7 @@ def test_convert_dataframe_to_dataframe_uses_cast_spark_dataframe(spark):
     )
 
     # `convert(df, DataFrame)` should hit the registered converter:
-    casted = convert(df, pyspark.sql.DataFrame, cast_options=ArrowCastOptions(target_field=target_schema))
+    casted = convert(df, pyspark.sql.DataFrame, options=ArrowCastOptions(target_field=target_schema))
 
     assert casted.schema["a"].dataType == T.LongType()
     assert casted.schema["a"].nullable is False
@@ -247,7 +247,7 @@ def test_convert_column_to_column_uses_cast_spark_column(spark):
     df = spark.createDataFrame([(1,), (2,)], ["a"])
 
     target_type = pa.float64()
-    casted_col = convert(F.col("a"), pyspark.sql.Column, cast_options=target_type)
+    casted_col = convert(F.col("a"), pyspark.sql.Column, options=target_type)
 
     result = df.select(casted_col.alias("a"))
     assert result.schema["a"].dataType == T.DoubleType()

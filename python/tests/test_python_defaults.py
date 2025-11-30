@@ -57,6 +57,19 @@ def test_default_for_dataclass():
     assert value == Example(title="", tags=[], info=Inner(name=""))
 
 
+def test_default_for_arrow_types():
+    pa = pytest.importorskip("pyarrow")
+
+    assert default_from_hint(pa.int32()).equals(pa.scalar(0, type=pa.int32()))
+
+    nullable_field = pa.field("name", pa.string(), nullable=True)
+    assert default_from_hint(nullable_field).equals(pa.scalar(None, type=pa.string()))
+
+    non_nullable_field = pa.field("amount", pa.decimal128(10, 2), nullable=False)
+    expected = pa.scalar(decimal.Decimal(0), type=pa.decimal128(10, 2))
+    assert default_from_hint(non_nullable_field).equals(expected)
+
+
 def test_unsupported_type_raises_type_error():
     class NeedsArgs:
         def __init__(self, value):
