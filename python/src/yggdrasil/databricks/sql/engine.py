@@ -638,6 +638,10 @@ class DBXSQL(DBXWorkspaceObject):
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
         spark_options: Optional[Dict[str, Any]] = None,
     ):
+        if location:
+            c, s, t = self.catalog_schema_table_names(location)
+            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
+
         location = location or self.table_full_name(
             catalog_name=catalog_name, schema_name=schema_name,
             table_name=table_name

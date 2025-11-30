@@ -1,140 +1,161 @@
-import pyarrow as pa
+# tests/types/test_pandas_cast.py
+import math
+
 import pytest
 
+pa = pytest.importorskip("pyarrow")
 pandas = pytest.importorskip("pandas")
 
-from yggdrasil.types.cast.arrow import ArrowCastOptions
+from yggdrasil.types.cast.registry import convert
 from yggdrasil.types.cast.pandas import (
     cast_pandas_series,
     cast_pandas_dataframe,
+    arrow_array_to_pandas_series,
+    arrow_table_to_pandas_dataframe,
+    record_batch_reader_to_pandas_dataframe,
+    pandas_series_to_arrow_array,
+    pandas_dataframe_to_arrow_table,
+    pandas_dataframe_to_record_batch_reader,
 )
 
 
-def make_options(**overrides):
-    """
-    Helper to construct ArrowCastOptions with defaults, then override attributes.
-    Assumes ArrowCastOptions.__safe_init__() is default-constructible and its fields are mutable.
-    """
-    opts = ArrowCastOptions.__safe_init__()
-    for k, v in overrides.items():
-        setattr(opts, k, v)
-    return opts
+def test_cast_pandas_series_via_function_identity_int():
+    s = pandas.Series([1, 2, 3], name="col")
+    out = cast_pandas_series(s, options=None)
+
+    assert isinstance(out, pandas.Series)
+    assert out.name == s.name
+    assert out.index.equals(s.index)
+    assert out.tolist() == [1, 2, 3]
 
 
-# ---------------- cast_pandas_series ----------------
+def test_cast_pandas_dataframe_via_function_identity_basic():
+    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+    out = cast_pandas_dataframe(df, options=None)
+
+    assert isinstance(out, pandas.DataFrame)
+    # same columns and values, index preserved
+    pandas.testing.assert_frame_equal(out, df)
 
 
-def test_cast_pandas_series_roundtrip_without_target_schema():
-    s = pandas.Series([1, 2, 3], name="a")
-    opts = make_options()  # no target schema/field → should be effectively identity
+def test_convert_pandas_series_to_pandas_series_registered():
+    s = pandas.Series([10, 20, 30], name="n")
 
-    result = cast_pandas_series(s, opts)
+    out = convert(s, pandas.Series)
 
-    # index + name preserved, values unchanged
-    assert list(result.index) == list(s.index)
-    assert result.name == "a"
-    assert result.tolist() == [1, 2, 3]
-
-
-def test_cast_pandas_series_respects_index_and_name_after_cast():
-    idx = [10, 20, 30]
-    s = pandas.Series([1.1, 2.2, 3.3], name="col", index=idx)
-
-    # Even if ArrowCastOptions causes some casting internally, we only care
-    # here that index and name survive the roundtrip.
-    opts = make_options()
-    result = cast_pandas_series(s, opts)
-
-    assert list(result.index) == idx
-    assert result.name == "col"
-    assert result.tolist() == s.tolist()
+    assert isinstance(out, pandas.Series)
+    assert out.tolist() == [10, 20, 30]
+    assert out.name == s.name
+    assert out.index.equals(s.index)
 
 
-# ---------------- cast_pandas_dataframe ----------------
+def test_convert_pandas_series_to_arrow_array_registered():
+    s = pandas.Series([1, 2, None], name="n")
+
+    arr = convert(s, pa.Array)
+
+    assert isinstance(arr, pa.Array)
+    assert arr.to_pylist() == [1, 2, None]
 
 
-def test_cast_pandas_dataframe_roundtrip_with_schema_and_preserve_index():
-    df = pandas.DataFrame(
-        {
-            "a": [1, 2, 3],
-            "b": [0.1, 0.2, 0.3],
-        },
-        index=[10, 11, 12],
+def test_convert_arrow_array_to_pandas_series_registered():
+    arr = pa.array([1, 2, 3])
+
+    s = convert(arr, pandas.Series)
+
+    assert isinstance(s, pandas.Series)
+    assert s.tolist() == [1, 2, 3]
+
+
+def test_convert_pandas_dataframe_to_arrow_table_registered():
+    df = pandas.DataFrame({"a": [1, 2], "b": ["u", "v"]})
+
+    table = convert(df, pa.Table)
+
+    assert isinstance(table, pa.Table)
+    assert table.column("a").to_pylist() == [1, 2]
+    assert table.column("b").to_pylist() == ["u", "v"]
+
+
+def test_convert_arrow_table_to_pandas_dataframe_registered():
+    df = pandas.DataFrame({"a": [1, 2], "b": ["u", "v"]})
+    table = pa.Table.from_pandas(df, preserve_index=False)
+
+    out = convert(table, pandas.DataFrame)
+
+    assert isinstance(out, pandas.DataFrame)
+    # Arrow may tweak dtypes but values/columns should match
+    pandas.testing.assert_frame_equal(out.reset_index(drop=True),
+                                      df.reset_index(drop=True))
+
+
+def test_convert_pandas_dataframe_to_record_batch_reader_registered():
+    df = pandas.DataFrame({"x": [1, 2, 3]})
+
+    reader = convert(df, pa.RecordBatchReader)
+
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    # Re-materialize and compare roundtrip
+    batches = list(reader)
+    table = pa.Table.from_batches(batches)
+    df_roundtrip = table.to_pandas()
+
+    pandas.testing.assert_frame_equal(
+        df_roundtrip.reset_index(drop=True),
+        df.reset_index(drop=True),
     )
 
-    schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("b", pa.float64()),
-        ]
+
+def test_convert_record_batch_reader_to_pandas_dataframe_registered():
+    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+
+    out = convert(reader, pandas.DataFrame)
+
+    assert isinstance(out, pandas.DataFrame)
+    pandas.testing.assert_frame_equal(
+        out.reset_index(drop=True),
+        df.reset_index(drop=True),
     )
 
-    opts = make_options(target_schema=schema)
-
-    result = cast_pandas_dataframe(df, opts)
-
-    # Same index back after Arrow roundtrip
-    assert list(result.index) == [10, 11, 12]
-
-    # Columns present and in same order as schema
-    assert list(result.columns) == ["a", "b"]
-
-    # Values preserved (cast_arrow_table is responsible for actual type casting)
-    assert result["a"].tolist() == [1, 2, 3]
-    assert result["b"].tolist() == [0.1, 0.2, 0.3]
 
 
-def test_cast_pandas_dataframe_disallow_extra_columns_drops_them():
-    df = pandas.DataFrame(
-        {
-            "a": [1, 2],
-            "b": [0.1, 0.2],
-            "extra": ["x", "y"],
-        }
+def test_arrow_array_to_pandas_series_direct_helper():
+    arr = pa.array([1.5, 2.5, None])
+
+    s = arrow_array_to_pandas_series(arr, cast_options=None)
+
+    assert isinstance(s, pandas.Series)
+    assert len(s) == 3
+    assert s.iloc[0] == 1.5
+    assert s.iloc[1] == 2.5
+    assert math.isnan(s.iloc[2])
+
+
+def test_arrow_table_to_pandas_dataframe_direct_helper():
+    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+    table = pa.Table.from_pandas(df, preserve_index=False)
+
+    out = arrow_table_to_pandas_dataframe(table, cast_options=None)
+
+    assert isinstance(out, pandas.DataFrame)
+    pandas.testing.assert_frame_equal(
+        out.reset_index(drop=True),
+        df.reset_index(drop=True),
     )
 
-    schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("b", pa.float64()),
-        ]
+
+def test_record_batch_reader_to_pandas_dataframe_direct_helper():
+    df = pandas.DataFrame({"a": [1, 2, 3]})
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+
+    out = record_batch_reader_to_pandas_dataframe(reader, cast_options=None)
+
+    assert isinstance(out, pandas.DataFrame)
+    pandas.testing.assert_frame_equal(
+        out.reset_index(drop=True),
+        df.reset_index(drop=True),
     )
-
-    # We assume cast_arrow_table respects target_schema and drops "extra".
-    opts = make_options(target_schema=schema, allow_add_columns=False)
-
-    result = cast_pandas_dataframe(df, opts)
-
-    assert list(result.columns) == ["a", "b"]
-    assert "extra" not in result.columns
-
-
-def test_cast_pandas_dataframe_allow_extra_columns_kept_and_appended():
-    df = pandas.DataFrame(
-        {
-            "a": [1, 2],
-            "b": [0.1, 0.2],
-            "extra": ["x", "y"],
-        }
-    )
-
-    schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("b", pa.float64()),
-        ]
-    )
-
-    # cast_arrow_table should produce only schema columns;
-    # wrapper then adds "extra" back when allow_add_columns=True.
-    opts = make_options(target_schema=schema, allow_add_columns=True)
-
-    result = cast_pandas_dataframe(df, opts)
-
-    # Schema columns present
-    assert "a" in result.columns
-    assert "b" in result.columns
-    # Extra column preserved by wrapper
-    assert "extra" in result.columns
-    assert result["extra"].tolist() == ["x", "y"]
-    assert result.shape[0] == 2

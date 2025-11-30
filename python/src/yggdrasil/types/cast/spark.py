@@ -16,6 +16,7 @@ from ...libs.sparklib import (
     arrow_field_to_spark_field,
     spark_field_to_arrow_field,
 )
+from ...libs.polarslib import polars
 
 __all__ = [
     "cast_spark_dataframe",
