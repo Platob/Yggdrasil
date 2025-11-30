@@ -1,7 +1,7 @@
 # auth_session.py
 import os
 import time
-from typing import Optional, Mapping
+from typing import Any, Mapping, Optional
 
 import urllib3
 
@@ -16,7 +16,7 @@ try:
     ConfidentialClientApplication = msal.ConfidentialClientApplication
 except ImportError:
     msal = None
-    ConfidentialClientApplication = None
+    ConfidentialClientApplication = Any
 
 
 __all__ = [
@@ -85,13 +85,23 @@ class MSALAuth:
             env = os.environ
         prefix = prefix or "AZURE_"
 
-        if all([
-            prefix + k in env.keys()
-            for k in (
+        required = {
+            key: env.get(prefix + key.upper())
+            for key in (
                 "client_id", "client_secret", "tenant_id", "scopes"
             )
-        ]):
-            return MSALAuth()
+        }
+
+        if all(required.values()):
+            scopes = required["scopes"].split(",") if required["scopes"] else None
+            return MSALAuth(
+                tenant_id=required["tenant_id"],
+                client_id=required["client_id"],
+                client_secret=required["client_secret"],
+                scopes=scopes,
+                authority=env.get(prefix + "AUTHORITY"),
+            )
+
         return None
 
     def export_to(self, to: dict = os.environ):
