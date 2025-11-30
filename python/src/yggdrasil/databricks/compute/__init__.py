@@ -1,5 +1,5 @@
 __all__ = [
-    "remote_pyeval",
+    "databricks_remote_compute",
 ]
 
-from .pyeval import remote_pyeval
+from .remote import databricks_remote_compute

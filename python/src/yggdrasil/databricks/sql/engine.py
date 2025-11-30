@@ -13,12 +13,14 @@ from typing import Optional, Union, Generator, Any, Dict, Mapping
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .exception import DBXTableNotFound
 from ..workspaces import DBXWorkspaceObject, DBXWorkspace
+from ... import convert, ArrowCastOptions
 from ...libs import SparkSession, SparkDataFrame, pyspark, require_pyspark
 
 try:
-    from delta.tables import DeltaTable as SparkDeltaTable
+    from delta.tables import DeltaTable
+
+    SparkDeltaTable = DeltaTable
 except ImportError:
     SparkDeltaTable = None
 
@@ -28,6 +30,11 @@ try:
 except ImportError:
     pass
 
+
+try:
+    import pyspark.sql.functions as F
+except ImportError:
+    pass
 
 __all__ = [
     "DBXSQL",
@@ -400,7 +407,9 @@ class DBXSQL(DBXWorkspaceObject):
     ):
         if not full_name:
             full_name = self.table_full_name(
-                catalog_name=catalog_name, schema_name=schema_name, table_name=table_name
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name
             )
 
         return SparkDeltaTable.forName(
@@ -410,14 +419,16 @@ class DBXSQL(DBXWorkspaceObject):
 
     def insert_into(
         self,
-        data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader, str],
+        data: Union[
+            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
+            SparkDataFrame
+        ],
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         mode: str = "auto",
-        safe: Optional[bool] = None,
-        fill_columns: Optional[bool] = None,
+        cast_options: Optional[ArrowCastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: list[str] = None,
         zorder_by: list[str] = None,
@@ -438,8 +449,7 @@ class DBXSQL(DBXWorkspaceObject):
                 schema_name=schema_name,
                 table_name=table_name,
                 mode=mode,
-                safe=safe,
-                fill_columns=fill_columns,
+                cast_options=cast_options,
                 overwrite_schema=overwrite_schema,
                 match_by=match_by,
                 zorder_by=zorder_by,
@@ -449,19 +459,55 @@ class DBXSQL(DBXWorkspaceObject):
                 spark_options=spark_options
             )
 
+        return self.arrow_insert_into(
+            data=data,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            mode=mode,
+            cast_options=cast_options,
+            overwrite_schema=overwrite_schema,
+            match_by=match_by,
+            zorder_by=zorder_by,
+            optimize_after_merge=optimize_after_merge,
+            vacuum_hours=vacuum_hours,
+        )
+
+    def arrow_insert_into(
+        self,
+        data: Union[
+            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
+        ],
+        location: Optional[str] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+        mode: str = "auto",
+        cast_options: Optional[ArrowCastOptions] = None,
+        overwrite_schema: bool | None = None,
+        match_by: list[str] = None,
+        zorder_by: list[str] = None,
+        optimize_after_merge: bool = False,
+        vacuum_hours: int | None = None,  # e.g., 168 for 7 days
+    ):
+        if location:
+            c, s, t = self.catalog_schema_table_names(location)
+            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
+
         transaction_id = self._random_suffix()
 
         try:
-            schema = self.get_table_schema(
-                catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
-                spark_session=spark_session,
-                to_arrow=False
+            existing_schema = self.get_table_schema(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
             )
-        except DBXTableNotFound:
-            data = safe_arrow_tabular(data)
-            schema = PyField.from_any(data)
+        except ValueError:
+            data = convert(data, pa.Table)
+            existing_schema = data.schema
             statement = self.create_table_ddl(
-                schema=schema,
+                schema=existing_schema,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name,
@@ -471,31 +517,16 @@ class DBXSQL(DBXWorkspaceObject):
             mode = "overwrite"
 
         # normalize arrow tabular input
-        data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader] = schema.cast_arrow_tabular(
-            data,
-            safe=safe,
-            fill_columns=fill_columns,
-        )
+        data = convert(convert(data, pa.Table), existing_schema, options=cast_options)
 
         # Write in temp volume
         databricks_tmp_folder = self.temp_volume_folder(suffix=transaction_id)
         databricks_tmp_path = databricks_tmp_folder + "/data.parquet"
 
-        # Use pyarrow to write parquet to local tmp path (robust across pyarrow versions)
-        # If `data` is a RecordBatchReader, convert to table
-        if isinstance(data, pa.RecordBatchReader):
-            table: pa.Table = pa.Table.from_batches(list(data))
-        elif isinstance(data, pa.RecordBatch):
-            table: pa.Table = pa.Table.from_batches([data])
-        elif isinstance(data, pa.Table):
-            table: pa.Table = data
-        else:
-            raise TypeError("Unsupported data type for parquet write")
-
         buffer = io.BytesIO()
 
         # remove pandas index if present in the schema helper
-        pq.write_table(table, buffer, compression="snappy")
+        pq.write_table(data, buffer, compression="snappy")
 
         buffer = base64.b64encode(buffer.getvalue()).decode("utf8")
 
@@ -513,7 +544,7 @@ class DBXSQL(DBXWorkspaceObject):
         )
 
         # get column list from arrow schema
-        columns = [c for c in table.schema.names]
+        columns = [c for c in existing_schema.names]
         cols_quoted = ", ".join([f"`{c}`" for c in columns])
 
         statements = []
@@ -599,48 +630,34 @@ class DBXSQL(DBXWorkspaceObject):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         mode: str = "auto",
-        safe: Optional[bool] = None,
-        fill_columns: Optional[bool] = None,
+        cast_options: Optional[ArrowCastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: list[str] = None,
         zorder_by: list[str] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
-        spark_session: Optional[SparkSession] = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        existing_schema: Optional[pa.Schema] = None
     ):
-        location = location or self.table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name)
+        location = location or self.table_full_name(
+            catalog_name=catalog_name, schema_name=schema_name,
+            table_name=table_name
+        )
         spark_options = spark_options if spark_options else {}
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"
 
         try:
-            existing_schema = existing_schema or self.get_table_schema(
-                catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
-                spark_session=spark_session,
-                to_arrow=False
+            existing_schema = self.get_table_schema(
+                catalog_name=catalog_name, schema_name=schema_name,
+                table_name=table_name,
             )
-            data = safe_spark_dataframe(data, field=existing_schema)
-        except:
-            data = safe_spark_dataframe(data)
+            data = convert(data, target_hint=existing_schema)
+        except ValueError:
+            data = convert(data, pyspark.sql.DataFrame)
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
-        if not isinstance(data, SparkDataFrame):
-            data = existing_schema.cast_arrow_tabular(
-                data,
-                safe=safe,
-                fill_columns=fill_columns
-            )
-            spark_session = spark_session or SparkSession.getActiveSession()
-            if not spark_session:
-                raise ValueError("Need initialized spark session")
-            data = spark_session.createDataFrame(data)
-        else:
-            data = existing_schema.cast_spark_dataframe(
-                data, safe=safe, fill_columns=fill_columns
-            )
+        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
@@ -664,7 +681,7 @@ class DBXSQL(DBXWorkspaceObject):
             if mode.casefold() == "auto":
                 update_cols = [c for c in data.columns if c not in match_by]
                 set_expr = {
-                    c: pyspark.sql.functions.expr(f"s.`{c}`") for c in update_cols
+                    c: F.expr(f"s.`{c}`") for c in update_cols
                 }
 
                 # Execute MERGE - update matching records first, then insert new ones
@@ -710,45 +727,32 @@ class DBXSQL(DBXWorkspaceObject):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        spark_session: Optional[SparkSession] = None,
-        to_arrow: bool = False
-    ):
+    ) -> pa.Schema:
         full_name = self.table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
-            safe_chars=False)
-
-        if SparkDeltaTable is not None:
-            spark_session = spark_session or SparkSession.getActiveSession()
-
-            if spark_session:
-                schema = PyField.from_spark(SparkDeltaTable.forName(
-                    sparkSession=SparkSession.getActiveSession(),
-                    tableOrViewName=full_name
-                ).toDF())
-
-                return schema
+            safe_chars=False
+        )
 
         wk = self.workspace.sdk()
 
         try:
-            columns =  wk.tables.get(full_name).columns
+            table = wk.tables.get(full_name)
         except Exception as e:
-            raise DBXTableNotFound(f"Table %s not found, {type(e)} {e}" % full_name)
+            raise ValueError(f"Table %s not found, {type(e)} {e}" % full_name)
 
         fields = [
             self._column_info_to_arrow_field(_)
-            for _ in columns
+            for _ in table.columns
         ]
 
-        arrow_field = pa.field(
-            name=full_name,
-            type=pa.struct(fields),
-            nullable=False
+        return pa.schema(
+            fields,
+            metadata={
+                b"name": table.name.encode(),
+            }
         )
-
-        return arrow_field if to_arrow else PyStructField.from_arrow_field(arrow_field)
 
     @staticmethod
     def _column_info_to_arrow_field(col):
@@ -851,7 +855,8 @@ class DBXSQL(DBXWorkspaceObject):
 
     @classmethod
     def create_table_ddl(
-        cls, schema: PyField,
+        cls,
+        schema: pa.Schema,
         table_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
@@ -886,7 +891,7 @@ class DBXSQL(DBXWorkspaceObject):
 
         # Generate column definitions
         column_defs = []
-        children = schema.children if isinstance(schema, PyStructField) else [schema]
+        children = list(schema)
 
         for child in children:
             column_def = cls._field_to_ddl(child)
@@ -928,7 +933,7 @@ class DBXSQL(DBXWorkspaceObject):
 
     @staticmethod
     def _field_to_ddl(
-        field: PyField,
+        field: pa.Field,
         put_name: bool = True,
         put_not_null: bool = True,
         put_comment: bool = True
@@ -953,25 +958,27 @@ class DBXSQL(DBXWorkspaceObject):
             comment_str = f" COMMENT '{comment}'"
 
         # Handle primitive types
-        if not pa.types.is_nested(field.arrow_type):
-            sql_type = DBXSQL._arrow_to_sql_type(field.arrow_type)
+        if not pa.types.is_nested(field.type):
+            sql_type = DBXSQL._arrow_to_sql_type(field.type)
             return f"{name_str}{sql_type}{nullable_str}{comment_str}"
 
         # Handle struct type
-        if isinstance(field, PyStructField):
-            child_defs = [DBXSQL._field_to_ddl(child) for child in field.children]
+        if pa.types.is_struct(field.type):
+            child_defs = [DBXSQL._field_to_ddl(child) for child in field.type]
             struct_body = ", ".join(child_defs)
             return f"{name_str}STRUCT<{struct_body}>{nullable_str}{comment_str}"
 
         # Handle map type
-        if isinstance(field, PyMapField):
-            key_type = DBXSQL._field_to_ddl(field.key_field, put_name=False, put_comment=False, put_not_null=False)
-            val_type = DBXSQL._field_to_ddl(field.value_field, put_name=False, put_comment=False, put_not_null=False)
+        if pa.types.is_map(field.type):
+            map_type: pa.MapType = field.type
+            key_type = DBXSQL._field_to_ddl(map_type.key_field, put_name=False, put_comment=False, put_not_null=False)
+            val_type = DBXSQL._field_to_ddl(map_type.item_field, put_name=False, put_comment=False, put_not_null=False)
             return f"{name_str}MAP<{key_type}, {val_type}>{nullable_str}{comment_str}"
 
         # Handle list type after map
-        if isinstance(field, PyListField):
-            elem_type = DBXSQL._field_to_ddl(field.value_field, put_name=False, put_comment=False, put_not_null=False)
+        if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
+            list_type: pa.ListType = field.type
+            elem_type = DBXSQL._field_to_ddl(list_type.value_field, put_name=False, put_comment=False, put_not_null=False)
             return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
 
         # Default fallback to string for unknown types
@@ -1002,9 +1009,9 @@ class DBXSQL(DBXWorkspaceObject):
             return "FLOAT"
         elif pa.types.is_float64(arrow_type):
             return "DOUBLE"
-        elif PyField.is_arrow_string_like(arrow_type):
+        elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type) or pa.types.is_string_view(arrow_type):
             return "STRING"
-        elif PyField.is_arrow_binary_like(arrow_type):
+        elif pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type) or pa.types.is_binary_view(arrow_type) or pa.types.is_fixed_size_binary(arrow_type):
             return "BINARY"
         elif pa.types.is_timestamp(arrow_type):
             tz = getattr(arrow_type, "tz", None)

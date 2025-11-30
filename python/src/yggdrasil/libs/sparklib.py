@@ -52,6 +52,7 @@ except ImportError:
 
     ARROW_TO_SPARK = {}
 
+
 # Primitive Spark -> Arrow mapping (only for the types in ARROW_TO_SPARK)
 SPARK_TO_ARROW = {
     v: k
@@ -216,6 +217,7 @@ def spark_type_to_arrow_type(
         BinaryType,
         DateType,
         TimestampType,
+        TimestampNTZType,
         DecimalType,
         ArrayType,
         MapType,
@@ -245,6 +247,8 @@ def spark_type_to_arrow_type(
         return pa.date32()
     if isinstance(spark_type, TimestampType):
         return pa.timestamp("us", "UTC")
+    elif isinstance(spark_type, TimestampNTZType):
+        return pa.timestamp("us")
 
     # DecimalType
     if isinstance(spark_type, DecimalType):
