@@ -234,7 +234,7 @@ class DBXSQL(DBXWorkspaceObject):
 
 
     @staticmethod
-    def table_full_name(
+    def _table_full_name(
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
@@ -249,7 +249,7 @@ class DBXSQL(DBXWorkspaceObject):
         return f"{catalog_name}.{schema_name}.{table_name}"
 
     @staticmethod
-    def catalog_schema_table_names(
+    def _catalog_schema_table_names(
         full_name: str,
     ):
         parts = [
@@ -267,7 +267,7 @@ class DBXSQL(DBXWorkspaceObject):
 
 
     @staticmethod
-    def volume_full_path(
+    def _volume_full_path(
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         volume_name: Optional[str] = None,
@@ -280,7 +280,7 @@ class DBXSQL(DBXWorkspaceObject):
 
         return f"/{prefix}/{catalog_name}/{schema_name}/{volume_name}"
 
-    def default_warehouse(
+    def _default_warehouse(
         self,
         find_alive: bool = True
     ):
@@ -303,17 +303,17 @@ class DBXSQL(DBXWorkspaceObject):
 
         raise ValueError(f"No default warehouse found in {wk.config.host}")
 
-    def get_or_default_warehouse_id(
+    def _get_or_default_warehouse_id(
         self,
         find_alive: bool = True
     ):
         if not self.warehouse_id:
-            dft = self.default_warehouse(find_alive=find_alive)
+            dft = self._default_warehouse(find_alive=find_alive)
 
             self.warehouse_id = dft.id
         return self.warehouse_id
 
-    def get_temp_volume(
+    def _get_temp_volume(
         self,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
@@ -336,7 +336,7 @@ class DBXSQL(DBXWorkspaceObject):
 
         execution = wk.statement_execution.execute_statement(
             statement=statement,
-            warehouse_id=self.get_or_default_warehouse_id(),
+            warehouse_id=self._get_or_default_warehouse_id(),
             **kwargs
         )
 
@@ -406,7 +406,7 @@ class DBXSQL(DBXWorkspaceObject):
         table_name: Optional[str] = None,
     ):
         if not full_name:
-            full_name = self.table_full_name(
+            full_name = self._table_full_name(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name
@@ -492,7 +492,7 @@ class DBXSQL(DBXWorkspaceObject):
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
     ):
         if location:
-            c, s, t = self.catalog_schema_table_names(location)
+            c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
 
         transaction_id = self._random_suffix()
@@ -537,7 +537,7 @@ class DBXSQL(DBXWorkspaceObject):
         )
 
         # build fully-qualified table name
-        full_table = self.table_full_name(
+        full_table = self._table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name
@@ -639,10 +639,10 @@ class DBXSQL(DBXWorkspaceObject):
         spark_options: Optional[Dict[str, Any]] = None,
     ):
         if location:
-            c, s, t = self.catalog_schema_table_names(location)
+            c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
 
-        location = location or self.table_full_name(
+        location = location or self._table_full_name(
             catalog_name=catalog_name, schema_name=schema_name,
             table_name=table_name
         )
@@ -732,7 +732,7 @@ class DBXSQL(DBXWorkspaceObject):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ) -> pa.Schema:
-        full_name = self.table_full_name(
+        full_name = self._table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,

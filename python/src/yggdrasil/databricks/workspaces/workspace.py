@@ -87,11 +87,6 @@ class DBXWorkspace:
                     # default to external browser on Windows
                     auth_type = DBXAuthType.external_browser.value
 
-            if not self.host:
-                self.host = os.getenv("DATABRICKS_HOST")
-                if not self.host:
-                    raise ValueError(f"DATABRICKS_HOST not found in current environment")
-
             self._sdk = databricks_sdk.WorkspaceClient(
                 host=self.host,
                 token=self.token,
@@ -99,6 +94,13 @@ class DBXWorkspace:
                 product=self.product,
                 product_version=self.product_version or "0.0.0"
             )
+
+            if not self.host:
+                self.host = self._sdk.config.host
+
+            if not self.auth_type:
+                self.auth_type = self._sdk.config.auth_type
+                
         return self._sdk
 
     def close(self):

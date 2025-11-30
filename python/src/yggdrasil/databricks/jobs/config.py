@@ -34,6 +34,7 @@ def type_is_iterable(tpe: type, origin=None):
 
 ALL_VALUES_TAG = "**all**"
 
+
 class WidgetType(Enum):
     """Enum defining supported widget types in Databricks"""
     TEXT = "text"
