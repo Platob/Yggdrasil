@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import dataclasses as _dataclasses
 import datetime as _datetime
 import enum
@@ -161,7 +162,6 @@ def convert(
         type,
         pa.Field, pa.DataType, pa.Schema,
     ],
-    *,
     options: Optional[ArrowCastOptions] = None,
     **kwargs,
 ) -> Any:
@@ -169,8 +169,17 @@ def convert(
     from yggdrasil.types import default_from_hint
     from yggdrasil.types.cast.arrow import ArrowCastOptions
 
-    options = ArrowCastOptions.check_arg(arg=options,kwargs=kwargs)
+    if options is None and not kwargs:
+        if value is None:
+            return default_from_hint(target_hint)
 
+        try:
+            if isinstance(value, target_hint):
+                return value
+        except:
+            pass
+
+    options = ArrowCastOptions.check_arg(arg=options, kwargs=kwargs)
     is_optional, target_hint = _unwrap_optional(target_hint)
     if is_optional and (value is None or value == ""):
         return None
@@ -399,3 +408,10 @@ def _datetime_to_date(value: _datetime.datetime, cast_options: Any) -> _datetime
 def _int_to_str(value: int, cast_options: Any) -> str:
     return str(value)
 
+
+if not getattr(builtins, "register_converter", None):
+    setattr(builtins, "register_converter", register_converter)
+
+
+if not getattr(builtins, "convert", None):
+    setattr(builtins, "convert", convert)

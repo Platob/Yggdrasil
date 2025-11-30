@@ -5,7 +5,7 @@ from typing import Optional, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .registry import register_converter
+from .registry import register_converter, convert
 
 __all__ = [
     "ArrowCastOptions",
@@ -85,13 +85,8 @@ class ArrowCastOptions:
         """
         if isinstance(arg, ArrowCastOptions):
             result = arg
-        elif isinstance(arg, dict):
-            # Assuming ArrowCastOptions.from_dict(...) exists in your codebase.
-            result = cls.from_dict(arg)
-        elif isinstance(arg, (pa.DataType, pa.Field, pa.Schema)):
-            result = replace(DEFAULT_CAST_OPTIONS, target_field=arg)
         else:
-            result = DEFAULT_CAST_OPTIONS
+            result = replace(DEFAULT_CAST_OPTIONS, target_field=arg)
 
         if kwargs:
             result = dataclasses.replace(result, **kwargs)
@@ -137,38 +132,12 @@ class ArrowCastOptions:
         - pa.Field     -> used as-is
         """
         # Normalize source_field
-        if self.source_field is not None:
-            if isinstance(self.source_field, pa.Schema):
-                self.source_field = pa.field(
-                    "root",
-                    pa.struct(list(self.source_field)),
-                    nullable=False,
-                    metadata=self.source_field.metadata,
-                )
-            elif isinstance(self.source_field, pa.DataType):
-                self.source_field = pa.field(
-                    "root",
-                    self.source_field,
-                    nullable=True,
-                    metadata=None,
-                )
+        if self.source_field is not None and not isinstance(self.source_field, pa.Field):
+            self.source_field = convert(self.source_field, pa.Field)
 
         # Normalize target_field
-        if self.target_field is not None:
-            if isinstance(self.target_field, pa.Schema):
-                self.target_field = pa.field(
-                    "root",
-                    pa.struct(list(self.target_field)),
-                    nullable=False,
-                    metadata=self.target_field.metadata,
-                )
-            elif isinstance(self.target_field, pa.DataType):
-                self.target_field = pa.field(
-                    "root",
-                    self.target_field,
-                    nullable=True,
-                    metadata=None,
-                )
+        if self.target_field is not None and not isinstance(self.target_field, pa.Field):
+            self.target_field = convert(self.target_field, pa.Field)
 
 
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()

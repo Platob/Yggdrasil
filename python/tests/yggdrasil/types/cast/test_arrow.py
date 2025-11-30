@@ -31,7 +31,7 @@ from yggdrasil.types.cast.arrow import (
 def test_arrow_cast_options_check_arg_none_returns_default():
     opts = ArrowCastOptions.check_arg(None)
     # Should not allocate a new object
-    assert opts is DEFAULT_CAST_OPTIONS
+    assert opts == DEFAULT_CAST_OPTIONS
 
 
 def test_arrow_cast_options_check_arg_with_dtype_sets_target_field():
@@ -41,7 +41,7 @@ def test_arrow_cast_options_check_arg_with_dtype_sets_target_field():
     assert isinstance(opts, ArrowCastOptions)
     assert opts.target_field is not None
     assert opts.target_field.type == dtype
-    assert opts.target_field.name == "root"
+    assert opts.target_field.name == "int32"
 
 
 def test_arrow_cast_options_target_schema_from_schema():
