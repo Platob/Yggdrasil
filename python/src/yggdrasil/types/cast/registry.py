@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import builtins
 import dataclasses as _dataclasses
 import datetime as _datetime
 import enum
@@ -346,10 +345,7 @@ def _str_to_bool(value: str, cast_options: Any) -> bool:
 
 @register_converter(str, _datetime.date)
 def _str_to_date(value: str, cast_options: Any) -> _datetime.date:
-    default_value = getattr(cast_options, "default_value", None)
-    if value == "" and default_value is not None:
-        return default_value
-    return _datetime.date.fromisoformat(value)
+    return _str_to_datetime(value, cast_options).date()
 
 
 @register_converter(str, _datetime.datetime)
@@ -467,11 +463,3 @@ def _datetime_to_date(value: _datetime.datetime, cast_options: Any) -> _datetime
 @register_converter(int, str)
 def _int_to_str(value: int, cast_options: Any) -> str:
     return str(value)
-
-
-if not getattr(builtins, "register_converter", None):
-    setattr(builtins, "register_converter", register_converter)
-
-
-if not getattr(builtins, "convert", None):
-    setattr(builtins, "convert", convert)

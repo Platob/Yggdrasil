@@ -26,7 +26,7 @@ _RESULT_END = "<<<REMOTE_PYEVAL_RESULT_END>>>"
 
 @require_databricks_sdk
 def databricks_remote_compute(
-    cluster_id: str,
+    cluster_id: Optional[str] = None,
     workspace: Optional[Union[DBXWorkspace, str]] = None,
     timeout: Optional[dt.timedelta] = None,
     debug: bool = False,

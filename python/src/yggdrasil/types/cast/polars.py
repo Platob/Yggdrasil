@@ -81,7 +81,7 @@ def cast_polars_series(
 
 @require_polars
 def cast_polars_dataframe(
-    dataframe: "polars.DataFrame",
+    data: "polars.DataFrame",
     options: Optional[ArrowCastOptions] = None,
 ) -> "polars.DataFrame":
     """
@@ -96,14 +96,11 @@ def cast_polars_dataframe(
     arrow_schema = options.target_schema
 
     if arrow_schema is None:
-        raise pa.ArrowInvalid("Target schema is required for casting Polars DataFrame")
+        return data
 
-    if isinstance(arrow_schema, pa.Field):
-        arrow_schema = pa.schema([arrow_schema])
-
-    exact_name_to_index = {name: idx for idx, name in enumerate(dataframe.columns)}
+    exact_name_to_index = {name: idx for idx, name in enumerate(data.columns)}
     folded_name_to_index = {
-        str(name).casefold(): idx for idx, name in enumerate(dataframe.columns)
+        str(name).casefold(): idx for idx, name in enumerate(data.columns)
     }
 
     columns: list["polars.Series"] = []
@@ -112,20 +109,20 @@ def cast_polars_dataframe(
         # 1. Exact name match
         if field.name in exact_name_to_index:
             idx = exact_name_to_index[field.name]
-            series = dataframe[:, idx]
+            series = data[:, idx]
 
         # 2. Case-insensitive name match
         elif not options.strict_match_names and field.name.casefold() in folded_name_to_index:
             idx = folded_name_to_index[field.name.casefold()]
-            series = dataframe[:, idx]
+            series = data[:, idx]
 
         # 3. Positional fallback: reuse next column if allowed
-        elif not options.strict_match_names and dataframe.width > len(columns):
-            series = dataframe[:, len(columns)]
+        elif not options.strict_match_names and data.width > len(columns):
+            series = data[:, len(columns)]
 
         # 4. Add missing columns if configured
         elif options.add_missing_columns:
-            default_arr = default_arrow_array(field, len(dataframe))
+            default_arr = default_arrow_array(field, len(data))
             series = (
                 polars.from_arrow(
                     pa.Table.from_arrays([default_arr], names=[field.name])
@@ -150,9 +147,9 @@ def cast_polars_dataframe(
     # If we allow extra columns, horizontally concat them back
     if options.allow_add_columns:
         schema_names = {field.name for field in arrow_schema}
-        extra_cols = [name for name in dataframe.columns if name not in schema_names]
+        extra_cols = [name for name in data.columns if name not in schema_names]
         if extra_cols:
-            extra_df = dataframe.select(extra_cols)
+            extra_df = data.select(extra_cols)
             result = polars.concat([result, extra_df], how="horizontal")
 
     return result
@@ -187,7 +184,7 @@ def polars_series_to_arrow_array(
 
 @require_polars
 def polars_dataframe_to_arrow_table(
-    dataframe: "polars.DataFrame",
+    data: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
 ) -> pa.Table:
     """
@@ -199,10 +196,13 @@ def polars_dataframe_to_arrow_table(
     """
     opts = ArrowCastOptions.check_arg(cast_options)
 
-    if opts.target_schema is not None:
-        dataframe = cast_polars_dataframe(dataframe, opts)
+    if opts.target_field is not None:
+        data = cast_polars_dataframe(data, opts).to_arrow()
+        data = cast_arrow_table(data, opts)
+    else:
+        data = data.to_arrow()
 
-    return dataframe.to_arrow()
+    return data
 
 
 @require_polars

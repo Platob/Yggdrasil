@@ -5,12 +5,14 @@ import pyarrow as pa
 
 try:
     import pyspark  # type: ignore
-    from pyspark.sql import SparkSession, DataFrame
+    from pyspark.sql import SparkSession, DataFrame, Column
     import pyspark.sql.types as T
 
     pyspark = pyspark
     SparkSession = SparkSession
     SparkDataFrame = DataFrame
+    SparkColumn = Column
+    SparkDataType = T.DataType
 
     # Primitive Arrow -> Spark mappings
     ARROW_TO_SPARK = {
@@ -49,6 +51,8 @@ except ImportError:
     pyspark = None
     SparkSession = None
     SparkDataFrame = None
+    SparkColumn = None
+    SparkDataType = None
 
     ARROW_TO_SPARK = {}
 
@@ -294,6 +298,8 @@ __all__ = [
     "require_pyspark",
     "SparkSession",
     "SparkDataFrame",
+    "SparkColumn",
+    "SparkDataType",
     "ARROW_TO_SPARK",
     "SPARK_TO_ARROW",
     "arrow_type_to_spark_type",

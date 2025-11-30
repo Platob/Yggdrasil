@@ -9,6 +9,7 @@ import pyarrow.compute as pc
 from .registry import register_converter, convert
 
 __all__ = [
+    "DataFormat",
     "ArrowCastOptions",
     "cast_arrow_array",
     "cast_arrow_table",
@@ -24,11 +25,11 @@ from ..python_arrow import arrow_field_from_hint
 from ..python_defaults import default_from_arrow_hint
 
 
-class PackageCompat(Enum):
-    arrow = "arrow"
-    spark = "spark"
-    polars = "polars"
-    pandas = "pandas"
+class DataFormat(Enum):
+    ARROW = "arrow"
+    SPARK = "spark"
+    POLARS = "polars"
+    PANDAS = "pandas"
 
 
 @dataclass
@@ -69,7 +70,6 @@ class ArrowCastOptions:
     memory_pool: Optional[pa.MemoryPool] = None
     source_field: Optional[pa.Field] = None
     target_field: Optional[pa.Field] = None
-    target_package: Optional[PackageCompat] = None
 
     @classmethod
     def check_arg(
@@ -77,7 +77,7 @@ class ArrowCastOptions:
         arg: Union[
             "ArrowCastOptions", dict,
             pa.DataType, pa.Field, pa.Schema,
-            object
+            DataFormat,
         ],
         kwargs: Optional[dict] = None,
     ) -> "ArrowCastOptions":
@@ -92,8 +92,6 @@ class ArrowCastOptions:
         """
         if isinstance(arg, ArrowCastOptions):
             result = arg
-        elif isinstance(arg, PackageCompat):
-            result = replace(DEFAULT_CAST_OPTIONS, target_package=arg)
         else:
             result = replace(
                 DEFAULT_CAST_OPTIONS,
@@ -161,8 +159,8 @@ def cast_arrow_array(
     target_nullable = target_field.nullable
 
     def _cast_single(
-        arr: pa.Array,
-        target: pa.DataType,
+        arr: Union[pa.Array, pa.ListType, pa.MapArray, pa.StructArray],
+        target: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
         *,
         nullable: bool,
         source_field: Optional[pa.Field],
@@ -715,6 +713,131 @@ def _table_from_pylist(
             )
 
     return pa.Table.from_pylist(normalized, schema=schema)
+
+
+def _spark_compatible_type(
+    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]
+) -> pa.DataType:
+    """
+    Normalize an Arrow DataType to something Spark can handle:
+
+    - large_string  -> string
+    - large_binary  -> binary
+    - large_list<T> -> list<T>
+    - dictionary    -> value type
+    - extension     -> storage type
+    - recurse through struct/map/list fields
+    """
+    # Large scalar types
+    if pa.types.is_large_string(dtype):
+        return pa.string()
+    if pa.types.is_large_binary(dtype):
+        return pa.binary()
+
+    # Large list -> normal list with normalized value type
+    if pa.types.is_large_list(dtype):
+        return pa.list_(_spark_compatible_type(dtype.value_type))
+
+    # Normal list: still normalize value type
+    if pa.types.is_list(dtype):
+        return pa.list_(_spark_compatible_type(dtype.value_type))
+
+    # Dictionary-encoded types: Spark wants the value type, not the indices
+    if pa.types.is_dictionary(dtype):
+        return _spark_compatible_type(dtype.value_type)
+
+    # Extension types: unwrap to storage type
+    if isinstance(dtype, pa.ExtensionType):
+        return _spark_compatible_type(dtype.storage_type)
+
+    # Struct: normalize each child field
+    if pa.types.is_struct(dtype):
+        new_fields = [
+            pa.field(
+                f.name,
+                _spark_compatible_type(f.type),
+                nullable=f.nullable,
+                metadata=f.metadata,
+            )
+            for f in dtype
+        ]
+        return pa.struct(new_fields)
+
+    # Map: normalize key/value types
+    if pa.types.is_map(dtype):
+        key_field = dtype.key_field
+        item_field = dtype.item_field
+
+        new_key = pa.field(
+            key_field.name,
+            _spark_compatible_type(key_field.type),
+            nullable=key_field.nullable,
+            metadata=key_field.metadata,
+        )
+        new_item = pa.field(
+            item_field.name,
+            _spark_compatible_type(item_field.type),
+            nullable=item_field.nullable,
+            metadata=item_field.metadata,
+        )
+        return pa.map_(new_key, new_item)
+
+    # Everything else: leave as-is
+    return dtype
+
+
+def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
+    """
+    Normalize an Arrow DataType to something Polars can handle nicely.
+
+    Special rule:
+    - map<k,v> -> list<struct<key: K, value: V>>
+
+    Also:
+    - unwrap dictionary/extension/large_* similarly to Spark logic so we don't
+      leak weird "view" types into Polars.
+    """
+    # First normalize "views" / large types using the Spark helper
+    # (dictionary, extension, large_string/binary/list, nested recursion, etc.)
+    dtype = _spark_compatible_type(dtype)
+
+    # Map -> list<struct<key, value>>
+    if pa.types.is_map(dtype):
+        key_field = dtype.key_field
+        item_field = dtype.item_field
+
+        key_type = _polars_compatible_type(key_field.type)
+        value_type = _polars_compatible_type(item_field.type)
+
+        struct_type = pa.field(
+            "entries",
+            pa.struct([
+                pa.field(key_field.name, key_type, nullable=key_field.nullable, metadata=key_field.metadata),
+                pa.field(item_field.name, value_type, nullable=item_field.nullable, metadata=item_field.metadata),
+            ]),
+            nullable=True
+        )
+        return pa.list_(struct_type)
+
+    # Struct: recurse into children (after _spark_compatible_type it should already be struct)
+    if pa.types.is_struct(dtype):
+        new_fields = [
+            pa.field(
+                f.name,
+                _polars_compatible_type(f.type),
+                nullable=f.nullable,
+                metadata=f.metadata,
+            )
+            for f in dtype
+        ]
+        return pa.struct(new_fields)
+
+    # List: recurse into element type
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+        return pa.list_(_polars_compatible_type(dtype.value_type))
+
+    # Map already handled, other types are fine as returned by _spark_compatible_type
+    return dtype
 
 
 def pylist_to_arrow_table(
