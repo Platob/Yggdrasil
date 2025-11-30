@@ -169,27 +169,26 @@ def convert(
     from yggdrasil.types import default_from_hint
     from yggdrasil.types.cast.arrow import ArrowCastOptions
 
-    if options is None and not kwargs:
-        if value is None:
-            return default_from_hint(target_hint)
+    is_optional, target_hint = _unwrap_optional(target_hint)
 
+    if options is None and not kwargs:
         try:
             if isinstance(value, target_hint):
                 return value
         except:
             pass
 
+        if value is None:
+            return None if is_optional else default_from_hint(target_hint)
+
     options = ArrowCastOptions.check_arg(arg=options, kwargs=kwargs)
-    is_optional, target_hint = _unwrap_optional(target_hint)
-    if is_optional and (value is None or value == ""):
-        return None
     origin = get_origin(target_hint) or target_hint
     args = get_args(target_hint)
     source_hint = type(value)
 
     if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
-        options: ArrowCastOptions = options.copy()
         options.target_field = convert(target_hint, pa.Field)
+
         converter = _find_converter(source_hint, source_hint)
     else:
         converter = _find_converter(source_hint, target_hint)

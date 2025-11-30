@@ -13,9 +13,9 @@ from yggdrasil.types.cast.pandas import (
 def make_options(**overrides):
     """
     Helper to construct ArrowCastOptions with defaults, then override attributes.
-    Assumes ArrowCastOptions() is default-constructible and its fields are mutable.
+    Assumes ArrowCastOptions.safe_init() is default-constructible and its fields are mutable.
     """
-    opts = ArrowCastOptions()
+    opts = ArrowCastOptions.safe_init()
     for k, v in overrides.items():
         setattr(opts, k, v)
     return opts

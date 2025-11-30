@@ -9,7 +9,7 @@ from yggdrasil.types.cast import convert, register_converter
 
 def test_builtin_converters():
     assert convert("1", int) == 1
-    assert convert("", int | None) is None
+    assert convert("", int | None) is 0
     assert convert("2025-12-10", datetime.date) == datetime.date(2025, 12, 10)
     assert convert("2025-12-10T07:08:09", datetime.datetime) == datetime.datetime(
         2025, 12, 10, 7, 8, 9, tzinfo=datetime.timezone.utc

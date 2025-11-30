@@ -1,5 +1,6 @@
 import dataclasses
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Optional, Union
 
 import pyarrow as pa
@@ -14,7 +15,6 @@ __all__ = [
     "cast_arrow_batch",
     "cast_arrow_record_batch_reader",
     "default_arrow_array",
-    "ALLOWED_CAST_OPTIONS_ARG",
     "pylist_to_arrow_table",
     "pylist_to_record_batch",
     "pylist_to_record_batch_reader",
@@ -23,11 +23,13 @@ __all__ = [
 from ..python_arrow import arrow_field_from_hint
 from ..python_defaults import default_from_arrow_hint
 
-ALLOWED_CAST_OPTIONS_ARG = Union[
-    "ArrowCastOptions", dict,
-    pa.DataType, pa.Field, pa.Schema,
-    object
-]
+
+class PackageCompat(Enum):
+    arrow = "arrow"
+    spark = "spark"
+    polars = "polars"
+    pandas = "pandas"
+
 
 @dataclass
 class ArrowCastOptions:
@@ -67,11 +69,16 @@ class ArrowCastOptions:
     memory_pool: Optional[pa.MemoryPool] = None
     source_field: Optional[pa.Field] = None
     target_field: Optional[pa.Field] = None
+    target_package: Optional[PackageCompat] = None
 
     @classmethod
     def check_arg(
         cls,
-        arg: ALLOWED_CAST_OPTIONS_ARG,
+        arg: Union[
+            "ArrowCastOptions", dict,
+            pa.DataType, pa.Field, pa.Schema,
+            object
+        ],
         kwargs: Optional[dict] = None,
     ) -> "ArrowCastOptions":
         """
@@ -85,8 +92,13 @@ class ArrowCastOptions:
         """
         if isinstance(arg, ArrowCastOptions):
             result = arg
+        elif isinstance(arg, PackageCompat):
+            result = replace(DEFAULT_CAST_OPTIONS, target_package=arg)
         else:
-            result = replace(DEFAULT_CAST_OPTIONS, target_field=arg)
+            result = replace(
+                DEFAULT_CAST_OPTIONS,
+                target_field=convert(arg, Optional[pa.Field])
+            )
 
         if kwargs:
             result = dataclasses.replace(result, **kwargs)
@@ -102,12 +114,7 @@ class ArrowCastOptions:
         - Otherwise treat target_field as a single-field schema.
         """
         if self.target_field is not None:
-            if pa.types.is_struct(self.target_field.type):
-                return pa.schema(
-                    list(self.target_field.type),
-                    metadata=self.target_field.metadata,
-                )
-            return pa.schema([self.target_field], metadata=self.target_field.metadata)
+            return arrow_field_to_schema(self.target_field, None)
         return None
 
     @target_schema.setter
@@ -121,23 +128,6 @@ class ArrowCastOptions:
             nullable=False,
             metadata=value.metadata,
         )
-
-    def __post_init__(self) -> None:
-        """
-        Normalize `source_field` and `target_field` to pa.Field instances.
-
-        Supported input types:
-        - pa.Schema  -> wrapped as struct("root", struct(schema_fields))
-        - pa.DataType -> wrapped as field("root", dtype)
-        - pa.Field     -> used as-is
-        """
-        # Normalize source_field
-        if self.source_field is not None and not isinstance(self.source_field, pa.Field):
-            self.source_field = convert(self.source_field, pa.Field)
-
-        # Normalize target_field
-        if self.target_field is not None and not isinstance(self.target_field, pa.Field):
-            self.target_field = convert(self.target_field, pa.Field)
 
 
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()

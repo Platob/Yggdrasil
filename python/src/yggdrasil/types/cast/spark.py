@@ -50,7 +50,6 @@ def cast_spark_dataframe(
     from pyspark.sql import functions as F
 
     opts = ArrowCastOptions.check_arg(cast_options)
-    default_value = opts.default_value
     target_schema = opts.target_schema
 
     # No target -> nothing to do
@@ -91,15 +90,13 @@ def cast_spark_dataframe(
             raise TypeError(f"Missing column {field.name} while casting Spark DataFrame")
 
         # ----- get target Spark type from Arrow field -----
-        spark_struct_field = arrow_field_to_spark_field(field, cast_options, default_value)
+        spark_struct_field = arrow_field_to_spark_field(field, cast_options)
         spark_type = spark_struct_field.dataType
 
         # ----- build column expression -----
         if source_name is None:
             # construct default column
-            dv = default_value
-            if dv is None:
-                dv = default_from_arrow_hint(field)
+            dv = default_from_arrow_hint(field).as_py()
             col = F.lit(dv).cast(spark_type)
         else:
             col = F.col(source_name).cast(spark_type)
@@ -107,9 +104,7 @@ def cast_spark_dataframe(
             # If target field is non-nullable but Spark side might have nulls,
             # fill them with defaults
             if not field.nullable and (source_nullable is None or source_nullable):
-                dv = default_value
-                if dv is None:
-                    dv = default_from_arrow_hint(field)
+                dv = default_from_arrow_hint(field).as_py()
                 col = F.when(col.isNull(), F.lit(dv)).otherwise(col)
 
         # Final alias to target name
