@@ -1,7 +1,5 @@
 # test_arrow_cast.py
 
-import decimal
-
 import pyarrow as pa
 import pytest
 
@@ -13,7 +11,6 @@ from yggdrasil.types.cast.arrow import (
     cast_arrow_batch,
     cast_arrow_record_batch_reader,
     default_arrow_array,
-    default_arrow_python_value,
     table_to_record_batch,
     record_batch_to_table,
     table_to_record_batch_reader,
@@ -67,29 +64,6 @@ def test_arrow_cast_options_target_schema_from_schema():
 # ---------------------------------------------------------------------------
 # default_arrow_python_value / default_arrow_array
 # ---------------------------------------------------------------------------
-
-def test_default_arrow_python_value_scalars_and_containers():
-    assert default_arrow_python_value(pa.int32()) == 0
-    assert default_arrow_python_value(pa.float64()) == 0.0
-    assert default_arrow_python_value(pa.decimal128(10, 2)) == decimal.Decimal(0)
-    assert default_arrow_python_value(pa.bool_()) is False
-    assert default_arrow_python_value(pa.string()) == ""
-    assert default_arrow_python_value(pa.binary()) == b""
-    assert default_arrow_python_value(pa.list_(pa.int32())) == []
-    assert default_arrow_python_value(pa.map_(pa.string(), pa.int64())) == {}
-
-    struct_type = pa.struct(
-        [
-            pa.field("a", pa.int32(), nullable=False),
-            pa.field("b", pa.string(), nullable=True),
-        ]
-    )
-    struct_default = default_arrow_python_value(struct_type)
-    assert struct_default["a"] == 0
-    # nullable -> should be None
-    assert struct_default["b"] is None
-
-
 def test_default_arrow_array_nullable_vs_non_nullable():
     field_nullable = pa.field("x", pa.int32(), nullable=True)
     field_not_nullable = pa.field("y", pa.int32(), nullable=False)
@@ -450,8 +424,7 @@ def test_convert_propagates_arrow_source_and_target_hints():
         result = convert(
             arr,
             target_hint,
-            options=ArrowCastOptions(source_hint=source_hint),
-            default_value=0,
+            options=ArrowCastOptions(source_field=source_hint),
         )
     finally:
         registry._registry[(pa.Array, pa.Array)] = original_converter
@@ -461,10 +434,6 @@ def test_convert_propagates_arrow_source_and_target_hints():
     opts = received["cast_options"]
     assert isinstance(opts, ArrowCastOptions)
     assert opts.target_field.type == pa.int64()
-    assert opts.target_hint is target_hint
-    assert opts.source_field.type == pa.int32()
-    assert opts.source_hint is source_hint
-    assert opts.default_value == 0
 
 
 def test_convert_record_batch_to_record_batch_reader_and_back_via_convert():

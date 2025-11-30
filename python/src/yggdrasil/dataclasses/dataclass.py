@@ -68,7 +68,6 @@ def dataclass(
                     converted[name] = convert(
                         value,
                         field.type,
-                        default_value=default_value,
                     )
 
                 return dataclasses.replace(defaults, **converted)
@@ -102,12 +101,13 @@ def dataclass(
                 kwargs = {}
 
                 for field, value in zip(fields, items):
-                    default_value = getattr(defaults, field.name, None)
-                    kwargs[field.name] = convert(
-                        value,
-                        field.type,
-                        default_value=default_value,
-                    )
+                    if value is None:
+                        kwargs[field.name] = getattr(defaults, field.name, None)
+                    else:
+                        kwargs[field.name] = convert(
+                            value,
+                            field.type,
+                        )
 
                 return cls(**kwargs)
 

@@ -5,7 +5,6 @@ import enum
 import pytest
 
 from yggdrasil.types.cast import convert, register_converter
-from yggdrasil.types.cast.arrow import ArrowCastOptions
 
 
 def test_builtin_converters():
@@ -55,23 +54,6 @@ def test_custom_registration():
 
     with pytest.raises(TypeError):
         convert(1.2, str)
-
-
-def test_convert_passes_source_hint():
-    class Source:
-        pass
-
-    received: dict[str, object] = {}
-
-    @register_converter(Source, str)
-    def _source_to_str(value, cast_options):
-        received["hint"] = getattr(cast_options, "source_hint", None)
-        return "hinted" if received["hint"] else "no-hint"
-
-    result = convert(Source(), str, options=ArrowCastOptions(source_hint="original-type"))
-
-    assert result == "hinted"
-    assert received["hint"] == "original-type"
 
 
 def test_collection_conversions():

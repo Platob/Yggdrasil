@@ -6,8 +6,11 @@ import uuid
 from collections.abc import Collection, Mapping, MutableMapping, MutableSequence, MutableSet
 from typing import Any, Tuple, Union, get_args, get_origin
 
+import pyarrow as pa
+
 __all__ = [
     "default_from_hint",
+    "default_from_arrow_hint"
 ]
 
 
@@ -68,15 +71,7 @@ def _default_for_tuple_args(args):
     return tuple(default_from_hint(arg) for arg in args)
 
 
-_ARROW_NOT_HANDLED = object()
-
-
-def _default_from_arrow_hint(hint):
-    try:
-        import pyarrow as pa
-    except ModuleNotFoundError:
-        return _ARROW_NOT_HANDLED
-
+def default_from_arrow_hint(hint):
     def _arrow_default_value(dtype: "pa.DataType"):
         if pa.types.is_struct(dtype):
             return {
@@ -101,10 +96,10 @@ def _default_from_arrow_hint(hint):
         if pa.types.is_boolean(dtype):
             return False
 
-        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype) or pa.types.is_string_view(dtype):
             return ""
 
-        if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
+        if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype) or pa.types.is_binary_view(dtype):
             return b""
 
         if pa.types.is_fixed_size_binary(dtype):
@@ -130,7 +125,7 @@ def _default_from_arrow_hint(hint):
     if isinstance(hint, pa.DataType):
         return _arrow_default_scalar(hint)
 
-    return _ARROW_NOT_HANDLED
+    return dataclasses.MISSING
 
 
 def _default_for_dataclass(hint):
@@ -162,8 +157,8 @@ def default_from_hint(hint: Any):
     if hint in _SPECIAL_DEFAULTS:
         return _SPECIAL_DEFAULTS[hint]()
 
-    arrow_default = _default_from_arrow_hint(hint)
-    if arrow_default is not _ARROW_NOT_HANDLED:
+    arrow_default = default_from_arrow_hint(hint)
+    if arrow_default is not dataclasses.MISSING:
         return arrow_default
 
     origin = get_origin(hint)

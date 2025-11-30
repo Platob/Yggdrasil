@@ -16,11 +16,10 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints, Optional,
+    get_type_hints, Optional, List,
 )
 
 import pyarrow as pa
-
 
 if TYPE_CHECKING:
     from .arrow import ArrowCastOptions
@@ -34,7 +33,10 @@ Converter = Callable[[Any, "ArrowCastOptions | dict | None"], Any]
 _registry: Dict[Tuple[Any, Any], Converter] = {}
 
 
-def register_converter(from_hint: Any, to_hint: Any) -> Callable[[Callable[..., Any]], Converter]:
+def register_converter(
+    from_hint: Union[Any, List[Any]],
+    to_hint: Any
+) -> Callable[[Callable[..., Any]], Converter]:
     """Register a converter from ``from_hint`` to ``to_hint``.
 
     The decorated callable receives ``(value, options)`` and should return the
@@ -57,11 +59,12 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[Callable[..., 
                 "Converters must accept exactly two positional arguments: (value, options)"
             )
 
-        def wrapped(value: Any, options: "ArrowCastOptions | dict | None") -> Any:
-            return func(value, options)
-
-        _registry[(from_hint, to_hint)] = wrapped
-        return wrapped
+        if isinstance(from_hint, list):
+            for h in from_hint:
+                _registry[(h, to_hint)] = func
+        else:
+            _registry[(from_hint, to_hint)] = func
+        return func
 
     return decorator
 
@@ -77,18 +80,65 @@ def _unwrap_optional(hint: Any) -> Tuple[bool, Any]:
     return False, hint
 
 
-def _find_converter(from_value: Any, to_hint: Any) -> Converter | None:
-    from_type = type(from_value)
+def _iter_mro(tp: Any) -> Iterable[Any]:
+    """Return (tp, …) including its MRO if it's a class-like object."""
+    try:
+        mro = getattr(tp, "__mro__", None)
+    except TypeError:
+        mro = None
 
-    if (from_type, to_hint) in _registry:
-        return _registry[(from_type, to_hint)]
+    if mro is None:
+        # Not a normal class, just treat as single value
+        return (tp,)
+    return mro  # includes tp itself as mro[0]
 
-    for (registered_from, registered_to), converter in _registry.items():
+
+def _find_converter(from_type: Any, to_hint: Any) -> "Converter | None":
+    # Fast path: exact match
+    conv = _registry.get((from_type, to_hint))
+    if conv is not None:
+        return conv
+
+    # Build from_mro and to_mro
+    from_mro = _iter_mro(from_type)
+    to_mro = _iter_mro(to_hint)
+
+    # 1) Try direct dict lookup on all (from_mro × to_mro) combinations.
+    #    This is O(len(MRO)^2) but much cheaper than scanning the whole registry.
+    for f in from_mro:
+        for t in to_mro:
+            conv = _registry.get((f, t))
+            if conv is not None:
+                return conv
+
+    # 2) Fallback: scan registry with issubclass for more exotic keys
+    #    (e.g. using typing hints, Protocols, etc.)
+    for (registered_from, registered_to), conv in _registry.items():
         try:
-            if isinstance(from_value, registered_from) and to_hint == registered_to:
-                return converter
+            # registered_from may be a base of from_type
+            from_ok = (
+                from_type is registered_from
+                or (
+                    isinstance(registered_from, type)
+                    and isinstance(from_type, type)
+                    and issubclass(from_type, registered_from)
+                )
+            )
+
+            # registered_to may be a base of to_hint
+            to_ok = (
+                to_hint is registered_to
+                or (
+                    isinstance(registered_to, type)
+                    and isinstance(to_hint, type)
+                    and issubclass(to_hint, registered_to)
+                )
+            )
+
+            if from_ok and to_ok:
+                return conv
         except TypeError:
-            # ``registered_from`` might not be usable with ``isinstance`` (e.g. typing hints)
+            # Some registered types (e.g. typing constructs) may explode in issubclass
             continue
 
     return None
@@ -107,127 +157,76 @@ def _normalize_fractional_seconds(value: str) -> str:
 
 def convert(
     value: Any,
-    target_hint: Any,
+    target_hint: Union[
+        type,
+        pa.Field, pa.DataType, pa.Schema,
+    ],
     *,
-    options: Optional[Union[ArrowCastOptions, dict]] = None,
-    default_value: Any = None,
+    options: Optional[ArrowCastOptions] = None,
+    **kwargs,
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
     from yggdrasil.types import default_from_hint
+    from yggdrasil.types.cast.arrow import ArrowCastOptions
 
-    arrow_hint_types = (pa.DataType, pa.Field, pa.Schema)
+    options = ArrowCastOptions.check_arg(arg=options,kwargs=kwargs)
 
-    try:
-        from yggdrasil.types.cast.arrow import ArrowCastOptions
-    except Exception:
-        ArrowCastOptions = None  # type: ignore[assignment]
-
-    is_optional, inner_hint = _unwrap_optional(target_hint)
+    is_optional, target_hint = _unwrap_optional(target_hint)
     if is_optional and (value is None or value == ""):
         return None
+    origin = get_origin(target_hint) or target_hint
+    args = get_args(target_hint)
+    source_hint = type(value)
 
-    target_hint_value = inner_hint if is_optional else target_hint
-    target_arrow_hint = (
-        target_hint_value if isinstance(target_hint_value, arrow_hint_types) else None
-    )
-    source_hint: Any | None = None
+    if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
+        options: ArrowCastOptions = options.copy()
+        options.target_field = convert(target_hint, pa.Field)
+        converter = _find_converter(source_hint, source_hint)
+    else:
+        converter = _find_converter(source_hint, target_hint)
 
-    options_arg = options
-    if ArrowCastOptions is not None:
-        options = ArrowCastOptions.check_arg(options_arg)
+    if converter is not None:
+        return converter(value, options)
 
-        if options.target_hint is not None and not isinstance(options_arg, ArrowCastOptions):
-            target_hint_value = options.target_hint
-            target_arrow_hint = (
-                target_hint_value
-                if isinstance(target_hint_value, arrow_hint_types)
-                else None
-            )
-
-        source_hint = options.source_hint
-
-        replacements: dict[str, object] = {}
-
-        if target_arrow_hint is not None and options.target_field is None:
-            replacements["target_field"] = target_arrow_hint
-
-        if (
-            source_hint is not None
-            and options.source_field is None
-            and isinstance(source_hint, arrow_hint_types)
-        ):
-            replacements["source_field"] = source_hint
-
-        if options.target_hint is None or options.target_hint != target_hint_value:
-            replacements["target_hint"] = target_hint_value
-
-        if options.source_hint is None and source_hint is not None:
-            replacements["source_hint"] = source_hint
-
-        if default_value is not None and options.default_value is None:
-            replacements["default_value"] = default_value
-
-        if replacements:
-            options = _dataclasses.replace(options, **replacements)
-
-    target = target_hint_value
-    if target_arrow_hint is not None:
-        if isinstance(value, pa.ChunkedArray):
-            target = pa.ChunkedArray
-        elif isinstance(value, pa.Table):
-            target = pa.Table
-        elif isinstance(value, pa.RecordBatch):
-            target = pa.RecordBatch
-        elif isinstance(value, pa.RecordBatchReader):
-            target = pa.RecordBatchReader
-        elif isinstance(value, pa.Array):
-            target = pa.Array
-        else:
-            target = pa.Array
-
-    origin = get_origin(target) or target
-    args = get_args(target)
-
-    if isinstance(target, type) and issubclass(target, enum.Enum):
-        if isinstance(value, target):
+    if isinstance(target_hint, type) and issubclass(target_hint, enum.Enum):
+        if isinstance(value, target_hint):
             return value
 
         if isinstance(value, str):
-            for member in target:
+            for member in target_hint:
                 if member.name.lower() == value.lower():
                     return member
 
         try:
-            first_member = next(iter(target))
+            first_member = next(iter(target_hint))
         except StopIteration:
-            raise TypeError(f"Cannot convert to empty Enum {target.__name__}")
+            raise TypeError(f"Cannot convert to empty Enum {target_hint.__name__}")
 
         try:
             converted_value = convert(
                 value,
                 type(first_member.value),
                 options=options,
-                default_value=default_value,
             )
         except Exception:
             converted_value = value
 
-        for member in target:
+        for member in target_hint:
             if member.value == converted_value:
                 return member
 
-        raise TypeError(f"No matching Enum member for {value!r} in {target.__name__}")
+        raise TypeError(f"No matching Enum member for {value!r} in {target_hint.__name__}")
 
-    if isinstance(target, type) and _dataclasses.is_dataclass(target):
-        if isinstance(value, target):
+    if isinstance(target_hint, type) and _dataclasses.is_dataclass(target_hint):
+        if isinstance(value, target_hint):
             return value
 
         if not isinstance(value, Mapping):
-            raise TypeError(f"Cannot convert {type(value)} to dataclass {target.__name__}")
+            raise TypeError(f"Cannot convert {type(value)} to dataclass {target_hint.__name__}")
 
-        hints = get_type_hints(target)
+        hints = get_type_hints(target_hint)
         kwargs = {}
-        for field in _dataclasses.fields(target):
+        for field in _dataclasses.fields(target_hint):
             if not field.init or field.name.startswith("_"):
                 continue
 
@@ -236,7 +235,6 @@ def convert(
                     value[field.name],
                     hints.get(field.name, Any),
                     options=options,
-                    default_value=default_value,
                 )
             elif field.default is not _dataclasses.MISSING:
                 field_value = field.default
@@ -247,7 +245,7 @@ def convert(
 
             kwargs[field.name] = field_value
 
-        return target(**kwargs)
+        return target_hint(**kwargs)
 
     if origin in {list, set}:
         if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
@@ -255,7 +253,7 @@ def convert(
 
         element_hint = args[0] if args else Any
         converted = [
-            convert(item, element_hint, options=options, default_value=default_value)
+            convert(item, element_hint, options=options)
             for item in value
         ]
         return origin(converted)
@@ -268,7 +266,7 @@ def convert(
         if len(args) == 2 and args[1] is Ellipsis:
             element_hint = args[0]
             return tuple(
-                convert(item, element_hint, options=options, default_value=default_value)
+                convert(item, element_hint, options=options)
                 for item in values
             )
 
@@ -276,7 +274,11 @@ def convert(
             raise TypeError("Tuple length does not match target annotation")
 
         return tuple(
-            convert(item, args[idx] if args else Any, options=options, default_value=default_value)
+            convert(
+                item,
+                target_hint=args[idx] if args else Any,
+                options=options,
+            )
             for idx, item in enumerate(values)
         )
 
@@ -288,27 +290,22 @@ def convert(
         mapping_ctor = dict if origin is Mapping else origin
         return mapping_ctor(
             (
-                convert(key, key_hint, options=options, default_value=default_value),
-                convert(val, value_hint, options=options, default_value=default_value),
+                convert(key, key_hint, options=options),
+                convert(val, value_hint, options=options),
             )
             for key, val in value.items()
         )
 
-    if target is Any or (isinstance(value, target) and target_arrow_hint is None):
+    if target_hint is Any or isinstance(value, target_hint):
         return value
 
-    converter = _find_converter(value, target)
-    if converter is None:
-        raise TypeError(f"No converter registered for {type(value)} -> {target}")
-
-    return converter(value, options)
+    raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
 
 
 @register_converter(str, int)
 def _str_to_int(value: str, cast_options: Any) -> int:
-    default_value = getattr(cast_options, "default_value", None)
-    if value == "" and default_value is not None:
-        return default_value
+    if value == "":
+        return 0
     return int(value)
 
 

@@ -1,17 +1,17 @@
 from dataclasses import replace
-from typing import Optional, Any
+from typing import Optional
 
 import pyarrow as pa
 
-from .registry import register_converter
 from .arrow import (
     ArrowCastOptions,
-    default_arrow_python_value,
     default_arrow_array,
     cast_arrow_array,
     cast_arrow_table,
     cast_arrow_record_batch_reader,
 )
+from .registry import register_converter
+from ..python_defaults import default_from_arrow_hint
 from ...libs.polarslib import polars, require_polars, arrow_type_to_polars_type
 
 __all__ = [
@@ -46,7 +46,6 @@ def cast_polars_series(
       when nullable=False (using default_arrow_python_value).
     """
     options = ArrowCastOptions.check_arg(options)
-    default_value = options.default_value
     target_field = options.target_field
 
     if target_field is None:
@@ -73,9 +72,7 @@ def cast_polars_series(
 
     # If Arrow says "non-nullable", fill nulls with a default value
     if not nullable:
-        dv = default_value
-        if dv is None:
-            dv = default_arrow_python_value(target_dtype)
+        dv = default_from_arrow_hint(target_dtype).as_py()
         casted = casted.fill_null(dv)
 
     # Preserve original series name
@@ -96,7 +93,6 @@ def cast_polars_dataframe(
     - allow_add_columns to keep or drop extra source columns
     """
     options = ArrowCastOptions.check_arg(options)
-    default_value = options.default_value
     arrow_schema = options.target_schema
 
     if arrow_schema is None:

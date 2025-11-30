@@ -3,8 +3,6 @@ from typing import Any
 
 import pyarrow as pa
 
-from ..types.cast.registry import register_converter
-
 try:
     import pyspark  # type: ignore
     from pyspark.sql import SparkSession, DataFrame
@@ -287,13 +285,6 @@ def spark_field_to_arrow_field(
     )
 
 
-if pyspark is not None:
-    register_converter(pa.DataType, T.DataType)(arrow_type_to_spark_type)
-    register_converter(pa.Field, T.StructField)(arrow_field_to_spark_field)
-    register_converter(T.DataType, pa.DataType)(spark_type_to_arrow_type)
-    register_converter(T.StructField, pa.Field)(spark_field_to_arrow_field)
-
-
 __all__ = [
     "pyspark",
     "require_pyspark",
@@ -306,3 +297,11 @@ __all__ = [
     "spark_type_to_arrow_type",
     "spark_field_to_arrow_field",
 ]
+
+from ..types.cast.registry import register_converter
+
+if pyspark is not None:
+    register_converter(pa.DataType, T.DataType)(arrow_type_to_spark_type)
+    register_converter(pa.Field, T.StructField)(arrow_field_to_spark_field)
+    register_converter(T.DataType, pa.DataType)(spark_type_to_arrow_type)
+    register_converter(T.StructField, pa.Field)(spark_field_to_arrow_field)

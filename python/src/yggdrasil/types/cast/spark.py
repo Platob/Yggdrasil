@@ -1,9 +1,10 @@
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, List
 
 import pyarrow as pa
 
-from .arrow import ArrowCastOptions, default_arrow_python_value
+from .arrow import ArrowCastOptions
 from ..cast.registry import register_converter
+from ..python_defaults import default_from_arrow_hint
 from ...libs.sparklib import (
     pyspark,
     require_pyspark,
@@ -46,14 +47,15 @@ def cast_spark_dataframe(
         return dataframe
 
     src_schema = dataframe.schema
-    src_names = [f.name for f in src_schema]
+    src_names = [f.name for f in src_schema.fields]
 
     exact_name_to_index = {name: idx for idx, name in enumerate(src_names)}
     folded_name_to_index = {name.casefold(): idx for idx, name in enumerate(src_names)}
 
     new_cols = []
+    f: List[Tuple[int, pa.Field]] = enumerate(target_schema)
 
-    for i, field in enumerate(target_schema):
+    for i, field in f:
         # ----- resolve source column name -----
         source_name: Optional[str] = None
         source_nullable: Optional[bool] = None
@@ -86,7 +88,7 @@ def cast_spark_dataframe(
             # construct default column
             dv = default_value
             if dv is None:
-                dv = default_arrow_python_value(field.type)
+                dv = default_from_arrow_hint(field)
             col = F.lit(dv).cast(spark_type)
         else:
             col = F.col(source_name).cast(spark_type)
@@ -96,7 +98,7 @@ def cast_spark_dataframe(
             if not field.nullable and (source_nullable is None or source_nullable):
                 dv = default_value
                 if dv is None:
-                    dv = default_arrow_python_value(field.type)
+                    dv = default_from_arrow_hint(field)
                 col = F.when(col.isNull(), F.lit(dv)).otherwise(col)
 
         # Final alias to target name
@@ -148,15 +150,13 @@ def cast_spark_column(
         # treat DataType as a single anonymous field
         target_field = pa.field("value", target_field, nullable=True)
 
-    spark_struct_field = arrow_field_to_spark_field(target_field, cast_options, default_value)
+    spark_struct_field = arrow_field_to_spark_field(target_field, cast_options)
     spark_type = spark_struct_field.dataType
 
     col = column.cast(spark_type)
 
     if not target_field.nullable:
-        dv = default_value
-        if dv is None:
-            dv = default_arrow_python_value(target_field.type)
+        dv = default_from_arrow_hint(target_field)
         col = F.when(col.isNull(), F.lit(dv)).otherwise(col)
 
     return col

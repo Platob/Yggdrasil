@@ -1,4 +1,4 @@
-import decimal
+import dataclasses
 from dataclasses import dataclass, replace
 from typing import Union, Optional
 
@@ -14,9 +14,16 @@ __all__ = [
     "cast_arrow_batch",
     "cast_arrow_record_batch_reader",
     "default_arrow_array",
-    "default_arrow_python_value",
+    "ALLOWED_CAST_OPTIONS_ARG"
 ]
 
+from ..python_defaults import default_from_arrow_hint
+
+ALLOWED_CAST_OPTIONS_ARG = Union[
+    "ArrowCastOptions", dict,
+    pa.DataType, pa.Field, pa.Schema,
+    object
+]
 
 @dataclass
 class ArrowCastOptions:
@@ -54,16 +61,14 @@ class ArrowCastOptions:
     allow_add_columns: bool = False
     rename: bool = True
     memory_pool: Optional[pa.MemoryPool] = None
-    default_value: object = None
-    source_hint: object = None
-    target_hint: object = None
     source_field: Optional[pa.Field] = None
     target_field: Optional[pa.Field] = None
 
     @classmethod
     def check_arg(
         cls,
-        arg: Optional[Union["ArrowCastOptions", dict, pa.DataType, pa.Field, pa.Schema, object]],
+        arg: ALLOWED_CAST_OPTIONS_ARG,
+        kwargs: Optional[dict] = None,
     ) -> "ArrowCastOptions":
         """
         Normalize an argument into an ArrowCastOptions instance.
@@ -75,19 +80,19 @@ class ArrowCastOptions:
         - If None or anything else, return DEFAULT_CAST_OPTIONS.
         """
         if isinstance(arg, ArrowCastOptions):
-            return arg
-
-        if isinstance(arg, dict):
+            result = arg
+        elif isinstance(arg, dict):
             # Assuming ArrowCastOptions.from_dict(...) exists in your codebase.
-            return cls.from_dict(arg)
+            result = cls.from_dict(arg)
+        elif isinstance(arg, (pa.DataType, pa.Field, pa.Schema)):
+            result = replace(DEFAULT_CAST_OPTIONS, target_field=arg)
+        else:
+            result = DEFAULT_CAST_OPTIONS
 
-        if isinstance(arg, (pa.DataType, pa.Field, pa.Schema)):
-            return replace(DEFAULT_CAST_OPTIONS, target_field=arg)
+        if kwargs:
+            result = dataclasses.replace(result, **kwargs)
 
-        if arg is not None:
-            return replace(DEFAULT_CAST_OPTIONS, target_hint=arg)
-
-        return DEFAULT_CAST_OPTIONS
+        return result
 
     @property
     def target_schema(self) -> Optional[pa.Schema]:
@@ -161,12 +166,6 @@ class ArrowCastOptions:
                     metadata=None,
                 )
 
-        if self.target_hint is None and self.target_field is not None:
-            self.target_hint = self.target_field
-
-        if self.source_hint is None and self.source_field is not None:
-            self.source_hint = self.source_field
-
 
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()
 
@@ -187,7 +186,6 @@ def cast_arrow_array(
     Nullability is enforced using `default_arrow_python_value` for non-nullable targets.
     """
     options = ArrowCastOptions.check_arg(options)
-    default_value = options.default_value
 
     source_field = options.source_field
     target_field = options.target_field
@@ -448,9 +446,7 @@ def cast_arrow_array(
             return pa.chunked_array(filled_chunks, type=arr.type)
 
         if arr.null_count:
-            fill_value = default_value
-            if fill_value is None:
-                fill_value = default_arrow_python_value(dtype)
+            fill_value = default_from_arrow_hint(dtype)
 
             default_arr = pa.array([fill_value] * len(arr), type=dtype)
             return pc.if_else(pc.is_null(arr), default_arr, arr)
@@ -684,72 +680,12 @@ def default_arrow_array(
     - If field is nullable -> returns a null array of the given type.
     - Otherwise -> returns an array filled with `default_arrow_python_value(dtype)`.
     """
-    if isinstance(field, pa.Field):
-        nullable = field.nullable
-        dtype = field.type
-    else:
-        nullable = True
-        dtype = field
+    value = default_from_arrow_hint(field)
 
-    if nullable:
-        return pa.nulls(length, type=dtype)
+    if value.as_py() is None:
+        return pa.nulls(length, type=value.type)
 
-    value = default_arrow_python_value(dtype)
-    return pa.array([value] * length, type=dtype)
-
-
-def default_arrow_python_value(dtype: pa.DataType):
-    """
-    Return a Python default value for a given Arrow dtype.
-
-    Used when we need to fill non-nullable fields that contain nulls.
-    """
-    if pa.types.is_struct(dtype):
-        # For non-nullable struct fields, recurse on nested types.
-        return {
-            field.name: (
-                default_arrow_python_value(field.type)
-                if not field.nullable
-                else None
-            )
-            for field in dtype
-        }
-
-    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
-        return []
-
-    if pa.types.is_map(dtype):
-        return {}
-
-    if pa.types.is_integer(dtype) or pa.types.is_unsigned_integer(dtype):
-        return 0
-
-    if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
-        return decimal.Decimal(0) if pa.types.is_decimal(dtype) else 0.0
-
-    if pa.types.is_boolean(dtype):
-        return False
-
-    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-        return ""
-
-    if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
-        return b""
-
-    if pa.types.is_fixed_size_binary(dtype):
-        return b"\x00" * dtype.byte_width
-
-    if (
-        pa.types.is_timestamp(dtype)
-        or pa.types.is_time(dtype)
-        or pa.types.is_duration(dtype)
-        or pa.types.is_interval(dtype)
-    ):
-        # Represent temporal zero as 0 (epoch, zero duration, etc.)
-        return 0
-
-    # Fallback: nothing better to do
-    return None
+    return pa.array([value] * length, type=value.type)
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +785,54 @@ def record_batch_reader_to_record_batch(
     """
     table = record_batch_reader_to_table(data, options)
     return table_to_record_batch(table, options)
+
+@register_converter(pa.DataType, pa.Field)
+def arrow_type_to_field(
+    data: pa.DataType,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Field:
+    return pa.field(str(data), data, True, None)
+
+
+@register_converter([pa.Array, pa.ChunkedArray], pa.Field)
+def arrow_array_to_field(
+    data: Union[pa.Array, pa.ChunkedArray],
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Field:
+    return pa.field(str(data.type), data.type, data.null_count > 0, None)
+
+
+@register_converter(pa.Schema, pa.Field)
+def arrow_schema_to_field(
+    data: pa.Schema,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Field:
+    dtype = pa.struct(list(data))
+    md = data.metadata or {}
+    name = md[b"name"] = md.get(b"name", b"root")
+
+    return pa.field(name.decode(), dtype, False, md)
+
+
+@register_converter(pa.Field, pa.Schema)
+def arrow_field_to_schema(
+    data: pa.Field,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Schema:
+    md = data.metadata or {}
+    md[b"name"] = md.get(b"name", data.name.encode())
+
+    if pa.types.is_struct(data.type):
+        return pa.schema(list(data.type), metadata=md)
+    return pa.schema([data], metadata=md)
+
+
+@register_converter([pa.Table, pa.RecordBatch, pa.RecordBatchReader], pa.Field)
+def arrow_tabular_to_field(
+    data: Union[pa.Table, pa.RecordBatch],
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Field:
+    return arrow_schema_to_field(data.schema, options)
 
 
 # Inner / column-level
