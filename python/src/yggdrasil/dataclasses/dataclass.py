@@ -155,9 +155,9 @@ def dataclass(
 
             c.copy = copy
 
-        if not hasattr(c, "safe_init"):
+        if not hasattr(c, "__safe_init__"):
             @classmethod
-            def safe_init(cls, *args, **kwargs):
+            def __safe_init__(cls, *args, **kwargs):
                 """Safely initialize a dataclass using type conversion and defaults."""
 
                 fields = _init_public_fields(cls)
@@ -193,7 +193,7 @@ def dataclass(
 
                 return cls(**init_kwargs)
 
-            c.safe_init = safe_init
+            c.__safe_init__ = __safe_init__
 
         if not hasattr(c, "arrow_field"):
             @classmethod

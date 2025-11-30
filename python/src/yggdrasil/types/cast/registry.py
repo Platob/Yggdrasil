@@ -201,8 +201,12 @@ def convert(
             return value
 
         if isinstance(value, str):
+            vcsfld = value.casefold()
+
             for member in target_hint:
-                if member.name.lower() == value.lower():
+                if member.name.casefold() == vcsfld:
+                    return member
+                if str(member.value).casefold() == vcsfld:
                     return member
 
         try:

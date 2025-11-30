@@ -159,18 +159,18 @@ def test_copy():
 
 
 def test_safe_init_casts_and_defaults():
-    person = Person.safe_init("Hank", "34")
+    person = Person.__safe_init__("Hank", "34")
 
     assert person == Person("Hank", 34, "buddy")
 
-    with_defaults = Person.safe_init("Ivy")
+    with_defaults = Person.__safe_init__("Ivy")
 
     assert with_defaults == Person("Ivy", 0, "buddy")
 
 
 def test_safe_init_rejects_invalid_fields():
     try:
-        Person.safe_init("Jake", unknown=1)
+        Person.__safe_init__("Jake", unknown=1)
     except TypeError as exc:
         assert "invalid field" in str(exc)
     else:

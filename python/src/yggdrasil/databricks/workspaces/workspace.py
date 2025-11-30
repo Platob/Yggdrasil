@@ -4,10 +4,11 @@ import json
 import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from enum import Enum
+from typing import Mapping, Optional, Union
 
 from ...libs import require_pyspark
-from ...libs.databricks import require_databricks_sdk, databricks_sdk, databricks
+from ...libs.databrickslib import require_databricks_sdk, databricks_sdk, databricks
 from ...requests import MSALAuth
 
 try:
@@ -21,13 +22,16 @@ except ImportError:
     DeltaTable = None
 
 
+class DBXAuthType(Enum):
+    external_browser = "external-browser"
+
 
 @dataclass
 class DBXWorkspace:
     host: str = None
     token: str = None
     msal_auth: Optional[MSALAuth] = None
-    auth_type: Optional[str] = None
+    auth_type: Optional[Union[str, DBXAuthType]] = None
     product: Optional[str] = None
     product_version: Optional[str] = None
 
@@ -77,10 +81,9 @@ class DBXWorkspace:
     ):
         if reset or self._sdk is None:
             auth_type = self.auth_type
-            if auth_type == "u2m-oauth":
-                auth_type = "external-browser"
-            if auth_type == "external-browser":
-                self._configure_external_browser_cache()
+            if isinstance(auth_type, DBXAuthType):
+                auth_type = auth_type.value
+
             self._sdk = databricks_sdk.WorkspaceClient(
                 host=self.host,
                 token=self.token,
@@ -94,78 +97,6 @@ class DBXWorkspace:
         if self._sdk:
             self._sdk = None
             self._was_connected = False
-
-    def _configure_external_browser_cache(self):
-        oauth = getattr(databricks_sdk, "oauth", None)
-        if oauth is None:
-            return
-
-        token_cache_cls = getattr(oauth, "TokenCache", None)
-        if token_cache_cls is None:
-            session_credentials_cls = getattr(oauth, "SessionCredentials", None)
-            token_cls = getattr(oauth, "Token", None)
-            if not session_credentials_cls or not token_cls:
-                return
-
-            class TokenCache:
-                BASE_PATH = "~/.ygg/databricks/auth/cache/external-browser"
-
-                def __init__(
-                    self,
-                    host: str,
-                    oidc_endpoints,
-                    client_id: str,
-                    redirect_url: Optional[str] = None,
-                    client_secret: Optional[str] = None,
-                    scopes: Optional[list[str]] = None,
-                ) -> None:
-                    self._host = host
-                    self._client_id = client_id
-                    self._oidc_endpoints = oidc_endpoints
-                    self._redirect_url = redirect_url
-                    self._client_secret = client_secret
-                    self._scopes = scopes or []
-
-                @property
-                def filename(self) -> str:
-                    hash_value = hashlib.sha256()
-                    for chunk in [self._host, self._client_id, ",".join(self._scopes)]:
-                        hash_value.update(chunk.encode("utf-8"))
-                    return os.path.expanduser(
-                        os.path.join(
-                            self.__class__.BASE_PATH,
-                            hash_value.hexdigest() + ".json",
-                        )
-                    )
-
-                def load(self):
-                    if not os.path.exists(self.filename):
-                        return None
-                    try:
-                        with open(self.filename, "r") as f:
-                            raw = json.load(f)
-                            return session_credentials_cls.from_dict(
-                                raw,
-                                token_endpoint=self._oidc_endpoints.token_endpoint,
-                                client_id=self._client_id,
-                                client_secret=self._client_secret,
-                                redirect_url=self._redirect_url,
-                            )
-                    except Exception:
-                        return None
-
-                def save(self, credentials):
-                    os.makedirs(os.path.dirname(self.filename), exist_ok=True)
-                    with open(self.filename, "w") as f:
-                        json.dump(credentials.as_dict(), f)
-                    os.chmod(self.filename, 0o600)
-
-            oauth.TokenCache = TokenCache
-            token_cache_cls = TokenCache
-
-        token_cache_cls.BASE_PATH = os.path.expanduser(
-            "~/.ygg/databricks/auth/cache/external-browser"
-        )
 
     @require_pyspark(active_session=True)
     def spark_session(self):

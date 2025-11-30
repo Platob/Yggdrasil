@@ -28,7 +28,7 @@ def test_cast_polars_series_simple_numeric_cast():
     s = polars.Series("a", [1, 2, 3])
 
     target_field = pa.field("a", pa.float64(), nullable=True)
-    opts = ArrowCastOptions.safe_init(target_field=target_field)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
 
     casted = cast_polars_series(s, opts)
 
@@ -43,7 +43,7 @@ def test_cast_polars_series_fill_non_nullable_defaults():
     s = polars.Series("a", [1, None, 3])
 
     target_field = pa.field("a", pa.int64(), nullable=False)
-    opts = ArrowCastOptions.safe_init(target_field=target_field)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
 
     casted = cast_polars_series(s, opts)
 
@@ -59,7 +59,7 @@ def test_cast_polars_series_schema_target_uses_first_field():
     schema = pa.schema(
         [pa.field("a", pa.string(), nullable=True)]
     )
-    opts = ArrowCastOptions.safe_init(target_field=schema)
+    opts = ArrowCastOptions.__safe_init__(target_field=schema)
 
     casted = cast_polars_series(s, opts)
 
@@ -90,7 +90,7 @@ def test_cast_polars_dataframe_basic_schema_cast():
             pa.field("b", pa.string(), nullable=True),
         ]
     )
-    opts = ArrowCastOptions.safe_init(
+    opts = ArrowCastOptions.__safe_init__(
         target_field=target_schema,
         strict_match_names=False,  # allow case-insensitive matching
     )
@@ -113,7 +113,7 @@ def test_cast_polars_dataframe_missing_column_add_missing_false_raises():
         ]
     )
 
-    opts = ArrowCastOptions.safe_init(
+    opts = ArrowCastOptions.__safe_init__(
         target_field=target_schema,
         add_missing_columns=False,
         strict_match_names=True,
@@ -133,7 +133,7 @@ def test_cast_polars_dataframe_add_missing_column_with_defaults():
         ]
     )
 
-    opts = ArrowCastOptions.safe_init(
+    opts = ArrowCastOptions.__safe_init__(
         target_field=target_schema,
         add_missing_columns=True,
         strict_match_names=True,
@@ -154,7 +154,7 @@ def test_cast_polars_dataframe_allow_add_columns_true_keeps_extras():
         [pa.field("a", pa.int32(), nullable=True)],
     )
 
-    opts = ArrowCastOptions.safe_init(
+    opts = ArrowCastOptions.__safe_init__(
         target_field=target_schema,
         allow_add_columns=True,
         strict_match_names=True,
@@ -174,7 +174,7 @@ def test_cast_polars_dataframe_allow_add_columns_false_drops_extras():
         [pa.field("a", pa.int32(), nullable=True)],
     )
 
-    opts = ArrowCastOptions.safe_init(
+    opts = ArrowCastOptions.__safe_init__(
         target_field=target_schema,
         allow_add_columns=False,
         strict_match_names=True,
@@ -220,7 +220,7 @@ def test_polars_dataframe_to_arrow_table_with_cast_options():
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.safe_init(target_field=target_schema)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
 
     table = polars_dataframe_to_arrow_table(df, opts)
     assert table.schema.field("a").type == pa.int64()
@@ -256,7 +256,7 @@ def test_record_batch_reader_to_polars_dataframe_with_arrow_cast():
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.safe_init(target_field=target_schema, strict_match_names=False)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
 
     df = record_batch_reader_to_polars_dataframe(rbr, opts)
 
@@ -314,7 +314,7 @@ def test_cast_polars_dataframe_with_arrow_schema_cast_direct():
         [pa.field("a", pa.int64(), nullable=False)],
     )
 
-    opts = ArrowCastOptions.safe_init(target_field=target_schema, strict_match_names=False)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
     df_cast = cast_polars_dataframe(df, opts)
 
     assert df_cast.columns == ["a"]
@@ -328,7 +328,7 @@ def test_convert_arrow_record_batch_reader_to_polars_with_cast():
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.safe_init(target_field=target_schema, strict_match_names=False)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
 
     df = convert(rbr, polars.DataFrame, options=opts)
 
