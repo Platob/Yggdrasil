@@ -97,6 +97,7 @@ def databricks_remote_compute(
     persist_context: bool = False,
     context_key: Optional[str] = None,
     remote_target: Optional[str] = None,
+    force_local: Optional[bool] = None
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     """
     Decorator that executes the wrapped function on a Databricks cluster.
@@ -134,6 +135,7 @@ def databricks_remote_compute(
         remote_target: Optional "pkg.mod:func" string. If provided, the remote
             side will import and call that symbol by name instead of unpickling
             the function object from the client.
+        force_local: Optional bool to bypass remote compute
 
     Returns:
         A decorator that wraps the target function so calls are executed remotely.
@@ -142,6 +144,9 @@ def databricks_remote_compute(
     def decorator(func: Callable[..., ReturnType]) -> Callable[..., ReturnType]:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> ReturnType:
+            if force_local:
+                return func(*args, **kwargs)
+
             return remote_invoke(
                 cluster_id=cluster_id,
                 func=func,
@@ -612,7 +617,7 @@ def _build_remote_command(
     for path in resolved_paths_abs:
         base_candidates.append(path if os.path.isdir(path) else os.path.dirname(path))
 
-    base_dir = os.path.commonpath(base_candidates)
+    base_dir = os.path.dirname(os.path.commonpath(base_candidates))
     modules_zip_b64 = _build_modules_zip(resolved_paths_abs, base_dir)
 
     debug_snippet = ""
@@ -705,7 +710,7 @@ def _build_remote_command(
                 "traceback": traceback.format_exc(),
             }}
 
-        _resp_bytes = dill.dumps(_resp_inner, recurse=True)
+        _resp_bytes = dill.dumps(_resp_inner)
         _resp_env_b64 = _remote_encode_envelope(_resp_bytes)
 
         print("{_RESULT_BEGIN}")
