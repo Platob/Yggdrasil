@@ -16,7 +16,6 @@ from ...libs.sparklib import (
     arrow_field_to_spark_field,
     spark_field_to_arrow_field,
 )
-from ...libs.polarslib import polars
 
 __all__ = [
     "cast_spark_dataframe",
@@ -29,7 +28,6 @@ __all__ = [
 ]
 
 
-@require_pyspark(active_session=True)
 def cast_spark_dataframe(
     dataframe: "pyspark.sql.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -121,7 +119,6 @@ def cast_spark_dataframe(
     return dataframe.select(*new_cols, *extra_cols)
 
 
-@require_pyspark(active_session=True)
 def cast_spark_column(
     column: "pyspark.sql.Column",
     cast_options: Any = None,
@@ -169,7 +166,6 @@ def cast_spark_column(
     return col
 
 
-@require_pyspark(active_session=True)
 def spark_dataframe_to_arrow_table(
     dataframe: "pyspark.sql.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -196,7 +192,6 @@ def spark_dataframe_to_arrow_table(
     return pa.Table.from_pandas(pandas_df, schema=arrow_schema, preserve_index=False)
 
 
-@require_pyspark(active_session=True)
 def spark_dataframe_to_record_batch_reader(
     dataframe: "pyspark.sql.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -208,7 +203,6 @@ def spark_dataframe_to_record_batch_reader(
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
 
-@require_pyspark(active_session=True)
 def arrow_table_to_spark_dataframe(
     table: pa.Table,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -240,7 +234,6 @@ def arrow_table_to_spark_dataframe(
     return spark.createDataFrame(pandas_df, schema=spark_schema)
 
 
-@require_pyspark(active_session=True)
 def arrow_record_batch_to_spark_dataframe(
     batch: pa.RecordBatch,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -251,7 +244,6 @@ def arrow_record_batch_to_spark_dataframe(
     return arrow_table_to_spark_dataframe(table, cast_options)
 
 
-@require_pyspark(active_session=True)
 def arrow_record_batch_reader_to_spark_dataframe(
     reader: pa.RecordBatchReader,
     cast_options: Optional[ArrowCastOptions] = None,

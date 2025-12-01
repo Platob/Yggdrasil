@@ -10,7 +10,7 @@ dependencies = [
   "requests",
   "polars",
   "pyarrow>=13",
-  "dill",
+  "dill"
 ]
 
 [project.optional-dependencies]
@@ -21,7 +21,6 @@ dev = [
   "mypy",
 
   "databricks-sdk",
-  "databricks-connect==17",
 ]
 
 [tool.setuptools]

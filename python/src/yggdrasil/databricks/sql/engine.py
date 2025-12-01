@@ -14,8 +14,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..workspaces import DBXWorkspaceObject, DBXWorkspace
-from ... import convert, ArrowCastOptions
-from ...libs import SparkSession, SparkDataFrame, pyspark, require_pyspark
+from ...types.cast import convert, ArrowCastOptions
+from ...libs import SparkSession, SparkDataFrame, pyspark
 
 try:
     from delta.tables import DeltaTable
@@ -620,7 +620,6 @@ class DBXSQL(DBXWorkspaceObject):
 
         return None
 
-    @require_pyspark
     def spark_insert_into(
         self,
         data: SparkDataFrame,
@@ -661,7 +660,7 @@ class DBXSQL(DBXWorkspaceObject):
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
-        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame)
+        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame, cast_options)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:

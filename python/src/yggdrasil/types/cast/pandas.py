@@ -23,7 +23,6 @@ __all__ = [
 # ---------- pandas <-> Arrow via ArrowCastOptions ----------
 
 
-@require_pandas
 def cast_pandas_series(
     series: "pandas.Series",
     options: Optional[ArrowCastOptions] = None,
@@ -51,7 +50,6 @@ def cast_pandas_series(
     return result
 
 
-@require_pandas
 def cast_pandas_dataframe(
     dataframe: "pandas.DataFrame",
     options: Optional[ArrowCastOptions] = None,
@@ -93,7 +91,6 @@ def cast_pandas_dataframe(
 # ---------- Arrow -> pandas ----------
 
 
-@require_pandas
 def arrow_array_to_pandas_series(
     array: pa.Array,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -107,7 +104,6 @@ def arrow_array_to_pandas_series(
     return casted.to_pandas()
 
 
-@require_pandas
 def arrow_table_to_pandas_dataframe(
     table: pa.Table,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -124,7 +120,6 @@ def arrow_table_to_pandas_dataframe(
     return table.to_pandas()
 
 
-@require_pandas
 def record_batch_reader_to_pandas_dataframe(
     reader: pa.RecordBatchReader,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -152,7 +147,6 @@ def record_batch_reader_to_pandas_dataframe(
 # ---------- pandas -> Arrow ----------
 
 
-@require_pandas
 def pandas_series_to_arrow_array(
     series: "pandas.Series",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -167,7 +161,6 @@ def pandas_series_to_arrow_array(
     return cast_arrow_array(array, opts)
 
 
-@require_pandas
 def pandas_dataframe_to_arrow_table(
     dataframe: "pandas.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -182,7 +175,6 @@ def pandas_dataframe_to_arrow_table(
     return cast_arrow_table(table, opts)
 
 
-@require_pandas
 def pandas_dataframe_to_record_batch_reader(
     dataframe: "pandas.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,

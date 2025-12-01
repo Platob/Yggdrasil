@@ -1,4 +1,3 @@
-import functools
 from typing import Any
 
 import pyarrow as pa
@@ -64,7 +63,7 @@ SPARK_TO_ARROW = {
 }
 
 
-def require_pyspark(_func=None, *, active_session: bool = False):
+def require_pyspark(active_session: bool = False):
     """
     Can be used as:
 
@@ -76,42 +75,25 @@ def require_pyspark(_func=None, *, active_session: bool = False):
     @require_pyspark(active_session=True)
     def f(...): ...
     """
+    if pyspark is None:
+        raise ImportError(
+            "pyspark is required to use this function. "
+            "Install it or run inside a Spark/Databricks environment."
+        )
 
-    def decorator_require_pyspark(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # 1) pyspark must be importable
-            if pyspark is None:
-                raise ImportError(
-                    "pyspark is required to use this function. "
-                    "Install it or run inside a Spark/Databricks environment."
-                )
-
-            # 2) Optionally require an active SparkSession
-            if active_session:
-                if SparkSession is None:
-                    raise ImportError(
-                        "pyspark.sql.SparkSession is required to check for an active session."
-                    )
-                if SparkSession.getActiveSession() is None:
-                    raise RuntimeError(
-                        "An active SparkSession is required to use this function. "
-                        "Create one with SparkSession.builder.getOrCreate()."
-                    )
-
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    # Used as @require_pyspark(active_session=True)
-    if _func is None:
-        return decorator_require_pyspark
-
-    # Used as @require_pyspark
-    return decorator_require_pyspark(_func)
+    # 2) Optionally require an active SparkSession
+    if active_session:
+        if SparkSession is None:
+            raise ImportError(
+                "pyspark.sql.SparkSession is required to check for an active session."
+            )
+        if SparkSession.getActiveSession() is None:
+            raise RuntimeError(
+                "An active SparkSession is required to use this function. "
+                "Create one with SparkSession.builder.getOrCreate()."
+            )
 
 
-@require_pyspark
 def arrow_type_to_spark_type(
     arrow_type: pa.DataType,
     cast_options: Any = None,
@@ -119,6 +101,8 @@ def arrow_type_to_spark_type(
     """
     Convert a pyarrow.DataType to a pyspark.sql.types.DataType.
     """
+    require_pyspark()
+
     import pyarrow.types as pat
 
     # Fast path: exact mapping hit
@@ -184,7 +168,6 @@ def arrow_type_to_spark_type(
     raise TypeError(f"Unsupported or unknown Arrow type for Spark conversion: {arrow_type!r}")
 
 
-@require_pyspark
 def arrow_field_to_spark_field(
     field: pa.Field,
     cast_options: Any = None,
@@ -201,7 +184,6 @@ def arrow_field_to_spark_field(
     )
 
 
-@require_pyspark
 def spark_type_to_arrow_type(
     spark_type: "T.DataType",
     cast_options: Any = None,
@@ -209,6 +191,7 @@ def spark_type_to_arrow_type(
     """
     Convert a pyspark.sql.types.DataType to a pyarrow.DataType.
     """
+    require_pyspark()
     from pyspark.sql.types import (
         BooleanType,
         ByteType,
@@ -277,7 +260,6 @@ def spark_type_to_arrow_type(
     raise TypeError(f"Unsupported or unknown Spark type for Arrow conversion: {spark_type!r}")
 
 
-@require_pyspark
 def spark_field_to_arrow_field(
     field: "T.StructField",
     cast_options: Any = None,

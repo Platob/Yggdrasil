@@ -77,7 +77,6 @@ def getAlias(
     return result
 
 
-@require_pyspark
 def safe_spark_column(obj: Union[str, SparkColumn], holder: SparkDataFrame) -> SparkColumn:
     """Convert string or Spark Column into a Spark Column safely."""
     if isinstance(obj, SparkColumn):
@@ -124,7 +123,6 @@ def truncate(
         raise ValueError(f"Cannot truncate {dataType} with {type(value)}")
 
 
-@require_pyspark
 def latest(
     df: SparkDataFrame,
     partitionBy: List[Union[str, SparkColumn]],
@@ -155,7 +153,6 @@ def latest(
     )
 
 
-@require_pyspark
 def withNextValue(df: SparkDataFrame, orderBy: Union[str, SparkColumn], name: str,
                   partitionBy: List[Union[str, SparkColumn]] = None) -> SparkDataFrame:
     """
@@ -175,7 +172,6 @@ def withNextValue(df: SparkDataFrame, orderBy: Union[str, SparkColumn], name: st
     return df.withColumn(name, F.lead(order_col_names[0]).over(window_spec))
 
 
-@require_pyspark
 def upsample(
     df: SparkDataFrame,
     time: Union[str, SparkColumn],

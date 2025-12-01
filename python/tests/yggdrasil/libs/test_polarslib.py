@@ -14,14 +14,6 @@ from yggdrasil.libs.polarslib import (
 )
 
 
-def test_require_polars_decorator_runs_when_polars_installed():
-    @require_polars
-    def add(a, b):
-        return a + b
-
-    assert add(1, 2) == 3
-
-
 def test_arrow_to_polars_primitive_bool_int_string():
     assert arrow_type_to_polars_type(pa.bool_()) is polars.Boolean
 

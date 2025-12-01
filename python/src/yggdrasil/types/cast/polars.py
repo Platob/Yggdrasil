@@ -30,7 +30,6 @@ __all__ = [
 # Core casting: Polars <-> Arrow types (no registration yet)
 # ---------------------------------------------------------------------------
 
-@require_polars
 def cast_polars_series(
     series: "polars.Series",
     options: Optional[ArrowCastOptions] = None,
@@ -79,7 +78,6 @@ def cast_polars_series(
     return casted.alias(series.name)
 
 
-@require_polars
 def cast_polars_dataframe(
     data: "polars.DataFrame",
     options: Optional[ArrowCastOptions] = None,
@@ -159,7 +157,6 @@ def cast_polars_dataframe(
 # Polars <-> Arrow conversion helpers
 # ---------------------------------------------------------------------------
 
-@require_polars
 def polars_series_to_arrow_array(
     series: "polars.Series",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -182,7 +179,6 @@ def polars_series_to_arrow_array(
     return arr
 
 
-@require_polars
 def polars_dataframe_to_arrow_table(
     data: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -205,7 +201,6 @@ def polars_dataframe_to_arrow_table(
     return data
 
 
-@require_polars
 def arrow_array_to_polars_series(
     arr: pa.Array,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -229,7 +224,6 @@ def arrow_array_to_polars_series(
     return series
 
 
-@require_polars
 def arrow_table_to_polars_dataframe(
     table: pa.Table,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -254,7 +248,6 @@ def arrow_table_to_polars_dataframe(
 # RecordBatchReader <-> Polars DataFrame
 # ---------------------------------------------------------------------------
 
-@require_polars
 def polars_dataframe_to_record_batch_reader(
     dataframe: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -270,7 +263,6 @@ def polars_dataframe_to_record_batch_reader(
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
 
-@require_polars
 def record_batch_reader_to_polars_dataframe(
     reader: pa.RecordBatchReader,
     cast_options: Optional[ArrowCastOptions] = None,
