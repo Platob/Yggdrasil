@@ -600,7 +600,20 @@ def _build_remote_command(
 
     module_dir = _get_module_dir_for_func(func)
     resolved_paths = _resolve_upload_paths(func, upload_paths)
-    modules_zip_b64 = _build_modules_zip(resolved_paths, module_dir)
+
+    resolved_paths_abs: List[str] = []
+    for path in resolved_paths:
+        if os.path.isabs(path):
+            resolved_paths_abs.append(path)
+        else:
+            resolved_paths_abs.append(os.path.abspath(os.path.join(module_dir, path)))
+
+    base_candidates: List[str] = [module_dir]
+    for path in resolved_paths_abs:
+        base_candidates.append(path if os.path.isdir(path) else os.path.dirname(path))
+
+    base_dir = os.path.commonpath(base_candidates)
+    modules_zip_b64 = _build_modules_zip(resolved_paths_abs, base_dir)
 
     debug_snippet = ""
     if debug:
