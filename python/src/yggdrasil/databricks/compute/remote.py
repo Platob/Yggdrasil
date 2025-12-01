@@ -123,7 +123,8 @@ def databricks_remote_compute(
         debug_port: Debug server port.
         debug_suspend: Whether the debugger should suspend on attach.
         upload_paths: Optional list of folders/files/globs whose `.py` files
-            will be shipped to the cluster.
+            will be shipped to the cluster. If not provided, the package
+            containing the decorated function is uploaded automatically.
         persist_context: If True, reuse a long-lived command context instead of
             creating/destroying one per call.
         context_key: Logical key to distinguish multiple persistent contexts on
@@ -152,6 +153,7 @@ def databricks_remote_compute(
                 debug_host=debug_host,
                 debug_port=debug_port,
                 debug_suspend=debug_suspend,
+                upload_paths=upload_paths,
                 persist_context=persist_context,
                 context_key=context_key,
                 remote_target=remote_target,
@@ -173,6 +175,7 @@ def remote_invoke(
     debug_host: Optional[str] = None,
     debug_port: int = 5678,
     debug_suspend: bool = True,
+    upload_paths: Optional[List[str]] = None,
     persist_context: bool = False,
     context_key: Optional[str] = None,
     remote_target: Optional[str] = None,
@@ -191,6 +194,8 @@ def remote_invoke(
         debug_host: Debug server host.
         debug_port: Debug server port.
         debug_suspend: Whether the debugger should suspend on attach.
+        upload_paths: Optional explicit paths/globs of modules to ship.
+            If not provided, the package containing ``func`` is uploaded.
         persist_context: Reuse command context across calls.
         context_key: Optional logical name to distinguish multiple contexts.
             If None and persist_context=True, the current process ID
@@ -255,6 +260,7 @@ def remote_invoke(
         debug_host=debug_host,
         debug_port=debug_port,
         debug_suspend=debug_suspend,
+        upload_paths=upload_paths,
         remote_target=remote_target,
     )
 
@@ -426,9 +432,68 @@ def find_package_root(path: str) -> str:
     return last_pkg_dir or (os.path.dirname(path) if os.path.isfile(path) else path)
 
 
+def _resolve_upload_paths(
+    func: Callable[..., Any], upload_paths: Optional[List[str]]
+) -> List[str]:
+    """Return the set of paths that should be shipped to the remote cluster."""
+
+    # Explicit paths/globs provided by the caller take precedence.
+    if upload_paths:
+        return upload_paths
+
+    # Otherwise, ship the package that defines ``func``.
+    module_dir = _get_module_dir_for_func(func)
+    pkg_root = find_package_root(module_dir)
+    return [pkg_root]
+
+
+def _normalize_upload_paths(
+    upload_paths: List[str], module_dir: str
+) -> List[str]:
+    """Normalize upload paths to absolute paths relative to module_dir."""
+
+    normalized: list[str] = []
+    module_dir_abs = os.path.abspath(module_dir)
+
+    for path in upload_paths:
+        if not path:
+            continue
+        if os.path.isabs(path):
+            normalized.append(path)
+        else:
+            normalized.append(os.path.abspath(os.path.join(module_dir_abs, path)))
+
+    return normalized
+
+
+def _compute_zip_base_dir(upload_paths: Optional[List[str]], module_dir: str) -> str:
+    """Return a stable base directory for packaging uploaded modules.
+
+    We prefer the common path of all upload paths (normalized to directories) to
+    avoid writing entries with ``..`` segments into the zip archive. If the
+    common path cannot be determined (e.g., empty list or different drives), we
+    fall back to the module directory.
+    """
+
+    if not upload_paths:
+        return os.path.abspath(module_dir)
+
+    dirs: list[str] = []
+    for path in upload_paths:
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        dirs.append(os.path.dirname(abs_path) if os.path.isfile(abs_path) else abs_path)
+
+    try:
+        return os.path.commonpath(dirs)
+    except ValueError:
+        return os.path.abspath(module_dir)
+
+
 def _build_modules_zip(
     upload_paths: Optional[List[str]],
-    module_dir: str,
+    base_dir: str,
 ) -> str:
     """Create a zip containing code under the given paths.
 
@@ -436,16 +501,15 @@ def _build_modules_zip(
         * folders
         * single files
         * glob patterns (e.g. "src/**/*.py")
-    - Relative paths are resolved against this module's directory.
+    - Relative paths are resolved against the computed base directory.
     - Only `.py` files are shipped.
-    - Paths inside the zip are relative to this module's directory, so that
-      adding the extracted temp dir to sys.path behaves like having this
-      directory on sys.path.
+    - Paths inside the zip are relative to the base directory, so adding the
+      extracted temp dir to sys.path behaves like having that base on sys.path.
     """
     if not upload_paths:
         return ""
 
-    module_dir = os.path.abspath(module_dir)
+    base_dir = os.path.abspath(base_dir)
 
     ignore_dirs = {
         "__pycache__",
@@ -467,7 +531,9 @@ def _build_modules_zip(
         if not full_path.endswith(".py"):
             return
         full_path_abs = os.path.abspath(full_path)
-        rel_path = os.path.relpath(full_path_abs, module_dir)
+        rel_path = os.path.relpath(full_path_abs, base_dir)
+        if rel_path.startswith(".."):
+            return
         if rel_path in written:
             return
         written.add(rel_path)
@@ -490,11 +556,11 @@ def _build_modules_zip(
             if not spec:
                 continue
 
-            # Resolve relative to module_dir
+            # Resolve relative to the base_dir
             if os.path.isabs(spec):
                 pattern = spec
             else:
-                pattern = os.path.abspath(spec)
+                pattern = os.path.abspath(os.path.join(base_dir, spec))
 
             # If it looks like a glob, expand it
             if any(ch in pattern for ch in "*?[]"):
@@ -554,6 +620,7 @@ def _build_remote_command(
     debug_host: Optional[str],
     debug_port: int,
     debug_suspend: bool,
+    upload_paths: Optional[List[str]],
     remote_target: Optional[str] = None,
 ) -> str:
     # Inner payload: func + args/kwargs (or target + args/kwargs)
@@ -574,6 +641,12 @@ def _build_remote_command(
 
     inner_bytes = dill.dumps(call_spec, recurse=True)
     encoded_input = _encode_envelope(inner_bytes)
+
+    module_dir = _get_module_dir_for_func(func)
+    resolved_paths = _resolve_upload_paths(func, upload_paths)
+    normalized_paths = _normalize_upload_paths(resolved_paths, module_dir)
+    base_dir = _compute_zip_base_dir(normalized_paths, module_dir)
+    modules_zip_b64 = _build_modules_zip(normalized_paths, base_dir)
 
     debug_snippet = ""
     if debug:
@@ -606,6 +679,14 @@ def _build_remote_command(
         import tempfile
 
         {debug_snippet}
+
+        _modules_zip = "{modules_zip_b64}"
+        if _modules_zip:
+            _mod_buf = io.BytesIO(base64.b64decode(_modules_zip))
+            _tmp_mod_dir = tempfile.mkdtemp(prefix="remote_modules_")
+            with zipfile.ZipFile(_mod_buf) as _zf:
+                _zf.extractall(_tmp_mod_dir)
+            sys.path.insert(0, _tmp_mod_dir)
 
         def _remote_decode_envelope(b64: str) -> bytes:
             raw = base64.b64decode(b64)
