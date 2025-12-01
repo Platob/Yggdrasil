@@ -1,13 +1,25 @@
 import base64
 import datetime as dt
 import functools
+import glob
+import inspect
 import io
 import os
 import sys
 import textwrap
 import zipfile
 import zlib
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, List, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import dill
 
@@ -23,6 +35,54 @@ _MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024  # 4 MiB
 _RESULT_BEGIN = "<<<REMOTE_PYEVAL_RESULT_BEGIN>>>"
 _RESULT_END = "<<<REMOTE_PYEVAL_RESULT_END>>>"
 
+# key: (host, cluster_id, context_key)
+_PERSISTED_CONTEXTS: Dict[Tuple[Optional[str], str, Optional[str]], str] = {}
+
+
+def _make_context_key(
+    client: Any,
+    cluster_id: str,
+    context_key: Optional[str],
+) -> Tuple[Optional[str], str, Optional[str]]:
+    host = getattr(getattr(client, "config", None), "host", None)
+    return (host, cluster_id, context_key)
+
+
+def clear_persisted_context(
+    workspace: Optional[Union[DBXWorkspace, str]],
+    cluster_id: str,
+    context_key: Optional[str] = None,
+) -> None:
+    """
+    Drop a cached context_id mapping for a given (host, cluster_id, context_key).
+
+    If context_key is None, the current process ID (os.getpid()) is used as the
+    default, mirroring remote_invoke/databricks_remote_compute behavior.
+
+    Note: this does NOT call destroy() on the remote context; it only clears the
+    local cache. If you want to destroy the remote context, do so via the SDK.
+    """
+    if workspace is None:
+        ws = DBXWorkspace()
+    elif isinstance(workspace, DBXWorkspace):
+        ws = workspace
+    else:
+        ws = DBXWorkspace(host=str(workspace))
+
+    client = ws.sdk()
+
+    # default to PID-based context key if not explicitly given
+    if context_key is None:
+        context_key = str(os.getpid())
+
+    key = _make_context_key(client, cluster_id, context_key)
+    _PERSISTED_CONTEXTS.pop(key, None)
+
+
+def clear_all_persisted_contexts() -> None:
+    """Drop all cached context IDs (local process only)."""
+    _PERSISTED_CONTEXTS.clear()
+
 
 @require_databricks_sdk
 def databricks_remote_compute(
@@ -33,16 +93,20 @@ def databricks_remote_compute(
     debug_host: Optional[str] = None,
     debug_port: int = 5678,
     debug_suspend: bool = True,
-    upload_folders: Optional[List[str]] = None,
+    upload_paths: Optional[List[str]] = None,
+    persist_context: bool = False,
+    context_key: Optional[str] = None,
+    remote_target: Optional[str] = None,
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     """
     Decorator that executes the wrapped function on a Databricks cluster.
 
     Usage:
-        @remote_pyeval(
+        @databricks_remote_compute(
             cluster_id="...",
             workspace="https://<workspace-url>",
-            upload_folders=[".."],
+            upload_paths=[".."],
+            persist_context=True,
         )
         def my_func(x, y):
             return x + y
@@ -58,9 +122,17 @@ def databricks_remote_compute(
         debug_host: Debug server host.
         debug_port: Debug server port.
         debug_suspend: Whether the debugger should suspend on attach.
-        upload_folders: Optional list of folders (relative to this file's
-            directory or absolute) whose `.py` files will be shipped to the
-            cluster.
+        upload_paths: Optional list of folders/files/globs whose `.py` files
+            will be shipped to the cluster.
+        persist_context: If True, reuse a long-lived command context instead of
+            creating/destroying one per call.
+        context_key: Logical key to distinguish multiple persistent contexts on
+            the same cluster (e.g. "feature_eng", "etl").
+            If None and persist_context=True, the current process ID
+            (str(os.getpid())) is used.
+        remote_target: Optional "pkg.mod:func" string. If provided, the remote
+            side will import and call that symbol by name instead of unpickling
+            the function object from the client.
 
     Returns:
         A decorator that wraps the target function so calls are executed remotely.
@@ -80,7 +152,9 @@ def databricks_remote_compute(
                 debug_host=debug_host,
                 debug_port=debug_port,
                 debug_suspend=debug_suspend,
-                upload_folders=upload_folders,
+                persist_context=persist_context,
+                context_key=context_key,
+                remote_target=remote_target,
             )
 
         return wrapper
@@ -99,12 +173,34 @@ def remote_invoke(
     debug_host: Optional[str] = None,
     debug_port: int = 5678,
     debug_suspend: bool = True,
-    upload_folders: Optional[List[str]] = None,
+    persist_context: bool = False,
+    context_key: Optional[str] = None,
+    remote_target: Optional[str] = None,
 ) -> ReturnType:
     """
     Internal helper that actually performs the remote execution.
+
+    Args:
+        func: Local callable whose calls we want to execute remotely.
+        args: Positional arguments for the call.
+        kwargs: Keyword arguments for the call.
+        cluster_id: Target cluster ID (required).
+        workspace: Optional DBXWorkspace or host string.
+        timeout: Optional timeout for remote execution.
+        debug: Remote debugger toggle (PyCharm).
+        debug_host: Debug server host.
+        debug_port: Debug server port.
+        debug_suspend: Whether the debugger should suspend on attach.
+        persist_context: Reuse command context across calls.
+        context_key: Optional logical name to distinguish multiple contexts.
+            If None and persist_context=True, the current process ID
+            (str(os.getpid())) is used.
+        remote_target: If provided, remote code will import and call this
+            "pkg.mod:func" on the cluster instead of using the pickled func.
+
+    Returns:
+        Deserialized return value from the remote function.
     """
-    # Import here so @require_databricks_sdk can do its thing first
     from databricks.sdk.service.compute import CommandStatus, Language, ResultType
 
     if workspace is None:
@@ -112,15 +208,44 @@ def remote_invoke(
     elif isinstance(workspace, DBXWorkspace):
         ws = workspace
     else:
-        # treat as host string
         ws = DBXWorkspace(host=str(workspace))
 
     client = ws.sdk()
 
-    context = client.command_execution.create_and_wait(
-        cluster_id=cluster_id,
-        language=Language.PYTHON,
-    )
+    if not cluster_id:
+        raise ValueError("cluster_id is required for remote_invoke")
+
+    timeout = timeout or dt.timedelta(minutes=20)
+
+    # default context key based on current process id when using persistence
+    if persist_context and context_key is None:
+        context_key = str(os.getpid())
+
+    # --- context acquisition with optional persistence ---
+    context_id: Optional[str] = None
+    created_here = False
+    ctx_key_tuple: Optional[Tuple[Optional[str], str, Optional[str]]] = None
+
+    if persist_context:
+        ctx_key_tuple = _make_context_key(client, cluster_id, context_key)
+        context_id = _PERSISTED_CONTEXTS.get(ctx_key_tuple)
+
+    def _create_context() -> str:
+        nonlocal created_here
+        ctx = client.command_execution.create_and_wait(
+            cluster_id=cluster_id,
+            language=Language.PYTHON,
+        )
+        cid = getattr(ctx, "id", None)
+        if not cid:
+            raise RuntimeError("Failed to acquire remote command context")
+        created_here = True
+        if ctx_key_tuple is not None:
+            _PERSISTED_CONTEXTS[ctx_key_tuple] = cid
+        return cid
+
+    if not context_id:
+        context_id = _create_context()
 
     command = _build_remote_command(
         func=func,
@@ -130,51 +255,76 @@ def remote_invoke(
         debug_host=debug_host,
         debug_port=debug_port,
         debug_suspend=debug_suspend,
-        upload_folders=upload_folders,
+        remote_target=remote_target,
     )
-    timeout = timeout or dt.timedelta(minutes=20)
-    context_id = getattr(context, "id", None)
 
-    try:
-        result = client.command_execution.execute_and_wait(
+    def _execute_once(cid: str) -> Any:
+        return client.command_execution.execute_and_wait(
             cluster_id=cluster_id,
-            context_id=context_id,
+            context_id=cid,
             language=Language.PYTHON,
             command=command,
             timeout=timeout,
         )
 
-        if not result.results:
-            raise RuntimeError("Remote execution returned no results")
+    tried_recreate = False
 
-        if result.results.result_type == ResultType.ERROR:
-            raise RuntimeError(result.results.cause or "Remote execution failed")
+    while True:
+        try:
+            result = _execute_once(context_id)
+            break
+        except Exception as exc:
+            msg = str(exc)
+            if (
+                persist_context
+                and not tried_recreate
+                and (
+                    "ContextNotFound" in msg
+                    or "does not exist" in msg
+                    or "INVALID_STATE" in msg
+                )
+            ):
+                # Drop cached, recreate once, then retry
+                if ctx_key_tuple is not None:
+                    _PERSISTED_CONTEXTS.pop(ctx_key_tuple, None)
+                context_id = _create_context()
+                tried_recreate = True
+                continue
+            raise
 
-        if result.results.result_type != ResultType.TEXT:
-            raise RuntimeError(
-                "Unexpected remote result type: "
-                f"{result.results.result_type}. Expected text."
-            )
+    # --- result handling ---
+    if not result.results:
+        raise RuntimeError("Remote execution returned no results")
 
-        if result.status != CommandStatus.FINISHED:
-            raise RuntimeError(
-                f"Remote execution did not finish successfully (status={result.status})"
-            )
+    if result.results.result_type == ResultType.ERROR:
+        raise RuntimeError(result.results.cause or "Remote execution failed")
 
-        if result.results.data is None:
-            raise RuntimeError("Remote execution returned empty data")
+    if result.results.result_type != ResultType.TEXT:
+        raise RuntimeError(
+            "Unexpected remote result type: "
+            f"{result.results.result_type}. Expected text."
+        )
 
+    if result.status != CommandStatus.FINISHED:
+        raise RuntimeError(
+            f"Remote execution did not finish successfully (status={result.status})"
+        )
+
+    if result.results.data is None:
+        raise RuntimeError("Remote execution returned empty data")
+
+    try:
         return _decode_remote_result(result.results.data)
-
     finally:
-        if context_id:
+        # Only tear down context if not persistent
+        if context_id and not persist_context:
             try:
                 client.command_execution.destroy(
                     cluster_id=cluster_id,
                     context_id=context_id,
                 )
             except Exception:
-                # Best-effort cleanup; avoid masking the original error
+                # best-effort cleanup; avoid masking the original error
                 pass
 
 
@@ -235,20 +385,67 @@ def _decode_envelope(encoded: str) -> bytes:
     raise RuntimeError(f"Unknown envelope compression flag: {flag}")
 
 
-def _build_modules_zip(upload_folders: Optional[List[str]]) -> str:
-    """Create a zip containing code under the given folders.
+def find_package_root(path: str) -> str:
+    """
+    Return the 'package root' directory for a given file or directory.
 
-    - `upload_folders` entries may be relative or absolute paths.
+    - If `path` is a file, we start from its containing directory.
+    - We walk upwards as long as there is an `__init__.py` in the directory.
+    - If one or more package dirs are found, we return the *top-most* such dir.
+    - If no `__init__.py` is found anywhere, we return the starting directory.
+    """
+    path = os.path.abspath(path)
+
+    # Normalize to directory
+    if os.path.isfile(path):
+        current_dir = os.path.dirname(path)
+    else:
+        current_dir = path
+
+    last_pkg_dir: Optional[str] = None
+
+    # If current_dir itself is a package, mark it
+    if os.path.isfile(os.path.join(current_dir, "__init__.py")):
+        last_pkg_dir = current_dir
+
+    # Walk upwards while parent also looks like a package
+    while True:
+        parent = os.path.dirname(current_dir)
+        if parent == current_dir:  # reached filesystem root
+            break
+
+        init_path = os.path.join(parent, "__init__.py")
+        if os.path.isfile(init_path):
+            last_pkg_dir = parent
+            current_dir = parent
+        else:
+            break
+
+    # If we found any package dir, return the top-most one,
+    # otherwise just return the original directory.
+    return last_pkg_dir or (os.path.dirname(path) if os.path.isfile(path) else path)
+
+
+def _build_modules_zip(
+    upload_paths: Optional[List[str]],
+    module_dir: str,
+) -> str:
+    """Create a zip containing code under the given paths.
+
+    - `upload_paths` entries may be:
+        * folders
+        * single files
+        * glob patterns (e.g. "src/**/*.py")
     - Relative paths are resolved against this module's directory.
     - Only `.py` files are shipped.
     - Paths inside the zip are relative to this module's directory, so that
       adding the extracted temp dir to sys.path behaves like having this
       directory on sys.path.
     """
-    if not upload_folders:
+    if not upload_paths:
         return ""
 
-    module_dir = os.path.abspath(os.path.dirname(__file__))
+    module_dir = os.path.abspath(module_dir)
 
     ignore_dirs = {
         "__pycache__",
@@ -264,34 +461,89 @@ def _build_modules_zip(upload_folders: Optional[List[str]]) -> str:
     }
 
     buf = io.BytesIO()
+    written: set[str] = set()
+
+    def _add_file(full_path: str, zf: zipfile.ZipFile) -> None:
+        if not full_path.endswith(".py"):
+            return
+        full_path_abs = os.path.abspath(full_path)
+        rel_path = os.path.relpath(full_path_abs, module_dir)
+        if rel_path in written:
+            return
+        written.add(rel_path)
+        zf.write(full_path_abs, rel_path)
+
+    def _walk_dir(base: str, zf: zipfile.ZipFile) -> None:
+        base = os.path.abspath(base)
+        if not os.path.isdir(base):
+            return
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [
+                d for d in dirs
+                if d not in ignore_dirs and not d.startswith(".")
+            ]
+            for filename in files:
+                _add_file(os.path.join(root, filename), zf)
+
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for folder in upload_folders:
-            if not folder:
+        for spec in upload_paths:
+            if not spec:
                 continue
 
-            if os.path.isabs(folder):
-                base = os.path.abspath(folder)
+            # Resolve relative to module_dir
+            if os.path.isabs(spec):
+                pattern = spec
             else:
-                base = os.path.abspath(os.path.join(module_dir, folder))
+                pattern = os.path.abspath(spec)
 
-            if not os.path.isdir(base):
-                # Silently skip invalid entries
+            # If it looks like a glob, expand it
+            if any(ch in pattern for ch in "*?[]"):
+                matches = glob.glob(pattern, recursive=True)
+                for m in matches:
+                    if os.path.isdir(m):
+                        _walk_dir(m, zf)
+                    elif os.path.isfile(m):
+                        _add_file(m, zf)
                 continue
 
-            for root, dirs, files in os.walk(base):
-                dirs[:] = [
-                    d for d in dirs
-                    if d not in ignore_dirs and not d.startswith(".")
-                ]
-
-                for filename in files:
-                    if not filename.endswith(".py"):
-                        continue
-                    full_path = os.path.join(root, filename)
-                    rel_path = os.path.relpath(full_path, module_dir)
-                    zf.write(full_path, rel_path)
+            # Not a glob: treat as concrete path
+            path = os.path.abspath(pattern)
+            if os.path.isdir(path):
+                _walk_dir(path, zf)
+            elif os.path.isfile(path):
+                _add_file(path, zf)
+            else:
+                # silently ignore nonexistent path specs
+                continue
 
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _get_module_dir_for_func(func: Callable[..., Any]) -> str:
+    """
+    Best-effort resolution of the directory containing the file that defines `func`.
+
+    Falls back to CWD if it can't find a real file (e.g. builtins, REPL, etc.).
+    """
+    # Try via inspect first (handles functions defined in regular .py files)
+    try:
+        module_file = inspect.getsourcefile(func) or inspect.getfile(func)
+    except (TypeError, OSError):
+        module_file = None
+
+    if not module_file:
+        # Fallback: go via the module object
+        module_name = getattr(func, "__module__", None)
+        if module_name is not None:
+            mod = sys.modules.get(module_name)
+            if mod is not None:
+                module_file = getattr(mod, "__file__", None)
+
+    if module_file:
+        return os.path.dirname(os.path.abspath(module_file))
+
+    # Absolute last resort: current working directory
+    return os.path.abspath(os.getcwd())
 
 
 def _build_remote_command(
@@ -302,15 +554,26 @@ def _build_remote_command(
     debug_host: Optional[str],
     debug_port: int,
     debug_suspend: bool,
-    upload_folders: Optional[List[str]] = None,
+    remote_target: Optional[str] = None,
 ) -> str:
-    # Inner payload: func + args/kwargs
-    call_spec = {"func": func, "args": args, "kwargs": kwargs}
+    # Inner payload: func + args/kwargs (or target + args/kwargs)
+    if remote_target:
+        call_spec = {
+            "mode": "by_name",
+            "target": remote_target,
+            "args": args,
+            "kwargs": kwargs,
+        }
+    else:
+        call_spec = {
+            "mode": "by_object",
+            "func": func,
+            "args": args,
+            "kwargs": kwargs,
+        }
+
     inner_bytes = dill.dumps(call_spec, recurse=True)
     encoded_input = _encode_envelope(inner_bytes)
-
-    # Zip up the requested folders
-    modules_zip_b64 = _build_modules_zip(upload_folders)
 
     debug_snippet = ""
     if debug:
@@ -344,8 +607,6 @@ def _build_remote_command(
 
         {debug_snippet}
 
-        _MODULES_ZIP_B64 = {modules_zip_b64!r}
-
         def _remote_decode_envelope(b64: str) -> bytes:
             raw = base64.b64decode(b64)
             if not raw:
@@ -355,7 +616,7 @@ def _build_remote_command(
                 return body
             if flag == 1:
                 return zlib.decompress(body)
-            raise RuntimeError(f"Unknown envelope compression flag: {{flag}}")
+            raise RuntimeError("Unknown envelope compression flag: {{flag}}".format(flag=flag))
 
         def _remote_encode_envelope(data: bytes) -> str:
             if len(data) > {_MAX_UNCOMPRESSED_BYTES}:
@@ -367,25 +628,22 @@ def _build_remote_command(
             env = flag + body
             return base64.b64encode(env).decode("utf-8")
 
-        def _remote_setup_modules():
-            if not _MODULES_ZIP_B64:
-                return
-            try:
-                zip_bytes = base64.b64decode(_MODULES_ZIP_B64)
-                tmp_dir = tempfile.mkdtemp(prefix="remote_pyeval_mods_")
-                with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-                    zf.extractall(tmp_dir)
-                if tmp_dir not in sys.path:
-                    sys.path.insert(0, tmp_dir)
-            except Exception as _mod_exc:  # noqa: BLE001
-                # best-effort; don't crash the whole command
-                print("Remote module setup failed:", _mod_exc, file=sys.stderr)
-
-        _remote_setup_modules()
-
         _inner_bytes = _remote_decode_envelope("{encoded_input}")
         _payload = dill.loads(_inner_bytes)
-        _func = _payload["func"]
+        _mode = _payload.get("mode", "by_object")
+
+        if _mode == "by_object":
+            _func = _payload["func"]
+        elif _mode == "by_name":
+            _target = _payload["target"]
+            _mod_name, _sep, _attr = _target.partition(":")
+            if not _sep:
+                raise RuntimeError("Invalid remote_target: %r" % (_target,))
+            _mod = __import__(_mod_name, fromlist=[_attr])
+            _func = getattr(_mod, _attr)
+        else:
+            raise RuntimeError("Unknown call mode: %r" % (_mode,))
+
         _args = _payload["args"]
         _kwargs = _payload["kwargs"]
 
@@ -444,5 +702,8 @@ def _decode_remote_result(raw_data: str) -> ReturnType:
 
 
 __all__ = [
-    "databricks_remote_compute"
+    "databricks_remote_compute",
+    "remote_invoke",
+    "clear_persisted_context",
+    "clear_all_persisted_contexts",
 ]

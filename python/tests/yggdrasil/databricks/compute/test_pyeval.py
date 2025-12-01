@@ -1,20 +1,23 @@
-import pytest
+from mongoengine import DynamicDocument, connect
 
-from yggdrasil.databricks.compute.pyeval import remote_pyeval
-from yggdrasil.databricks.workspaces import DBXWorkspace
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
+
+def dump_os(*args, **kwargs):
+    class Cities(DynamicDocument):
+        meta = {'collection': 'cities'}
+
+    # Connect to local MongoDB (standalone mode)
+    connect(db="xxx",alias="default",host=prod)
+
+    # Test the function
+    docs = list(Cities.objects.limit(10))
+    return [doc.to_mongo().to_dict() for doc in docs]
 
 def test_remote_pyeval_executes_function_and_returns_value():
-    workspace = DBXWorkspace(
-        host=""
-    )
+    result = databricks_remote_compute(
+        "xxx",
+        workspace="xxx.cloud.databricks.com",
+    )(dump_os)
 
-    result = remote_pyeval(
-        "",
-        lambda a, b: a + b,
-        2,
-        3,
-        workspace=workspace,
-    )
-
-    assert result == 5
+    assert result() == 5
