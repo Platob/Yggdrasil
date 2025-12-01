@@ -449,7 +449,7 @@ def _resolve_upload_paths(
 
 def _build_modules_zip(
     upload_paths: Optional[List[str]],
-    module_dir: str,
+    base_dir: str,
 ) -> str:
     """Create a zip containing code under the given paths.
 
@@ -457,16 +457,15 @@ def _build_modules_zip(
         * folders
         * single files
         * glob patterns (e.g. "src/**/*.py")
-    - Relative paths are resolved against this module's directory.
+    - Relative paths are resolved against the computed base directory.
     - Only `.py` files are shipped.
-    - Paths inside the zip are relative to this module's directory, so that
-      adding the extracted temp dir to sys.path behaves like having this
-      directory on sys.path.
+    - Paths inside the zip are relative to the base directory, so adding the
+      extracted temp dir to sys.path behaves like having that base on sys.path.
     """
     if not upload_paths:
         return ""
 
-    module_dir = os.path.abspath(module_dir)
+    base_dir = os.path.abspath(base_dir)
 
     ignore_dirs = {
         "__pycache__",
@@ -488,7 +487,9 @@ def _build_modules_zip(
         if not full_path.endswith(".py"):
             return
         full_path_abs = os.path.abspath(full_path)
-        rel_path = os.path.relpath(full_path_abs, module_dir)
+        rel_path = os.path.relpath(full_path_abs, base_dir)
+        if rel_path.startswith(".."):
+            return
         if rel_path in written:
             return
         written.add(rel_path)
@@ -511,11 +512,11 @@ def _build_modules_zip(
             if not spec:
                 continue
 
-            # Resolve relative to module_dir
+            # Resolve relative to the base_dir
             if os.path.isabs(spec):
                 pattern = spec
             else:
-                pattern = os.path.abspath(spec)
+                pattern = os.path.abspath(os.path.join(base_dir, spec))
 
             # If it looks like a glob, expand it
             if any(ch in pattern for ch in "*?[]"):
