@@ -12,24 +12,26 @@ from yggdrasil.databricks.compute.remote import (
 )
 
 
-def dump_os(*args, **kwargs):
-    class Cities(DynamicDocument):
-        meta = {'collection': 'cities'}
+class Cities(DynamicDocument):
+    meta = {'collection': 'cities'}
 
+
+@databricks_remote_compute(
+    cluster_id="xxx",
+    workspace="xxx.cloud.databricks.com",
+    force_local=False
+)
+def dump_os(*args, **kwargs):
     # Connect to local MongoDB (standalone mode)
-    connect(db="xxx",alias="default",host=prod)
+    connect(db="xxx",alias="default",host="xxx")
 
     # Test the function
-    docs = list(Cities.objects.limit(10))
-    return [doc.to_mongo().to_dict() for doc in docs]
+    return list(Cities.objects.limit(10))
 
 def test_remote_pyeval_executes_function_and_returns_value():
-    result = databricks_remote_compute(
-        "xxx",
-        workspace="xxx.cloud.databricks.com",
-    )(dump_os)
-
-    assert result() == 5
+    r = dump_os()
+    print(r)
+    assert r == 5
 
 
 def test_package_root_uploaded_for_remote_dill_imports():
@@ -54,6 +56,7 @@ def test_package_root_uploaded_for_remote_dill_imports():
     modules_zip = base64.b64decode(match.group(1))
     with zipfile.ZipFile(io.BytesIO(modules_zip)) as zf:
         names = set(zf.namelist())
+        zf.extractall(r"C:\Users\NFILLO\Downloads")
 
     tests_root = Path(__file__).resolve().parents[3]
     expected_rel = Path(__file__).resolve().relative_to(tests_root)
