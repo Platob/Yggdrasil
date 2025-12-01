@@ -123,7 +123,8 @@ def databricks_remote_compute(
         debug_port: Debug server port.
         debug_suspend: Whether the debugger should suspend on attach.
         upload_paths: Optional list of folders/files/globs whose `.py` files
-            will be shipped to the cluster.
+            will be shipped to the cluster. If not provided, the package
+            containing the decorated function is uploaded automatically.
         persist_context: If True, reuse a long-lived command context instead of
             creating/destroying one per call.
         context_key: Logical key to distinguish multiple persistent contexts on
@@ -152,6 +153,7 @@ def databricks_remote_compute(
                 debug_host=debug_host,
                 debug_port=debug_port,
                 debug_suspend=debug_suspend,
+                upload_paths=upload_paths,
                 persist_context=persist_context,
                 context_key=context_key,
                 remote_target=remote_target,
@@ -173,6 +175,7 @@ def remote_invoke(
     debug_host: Optional[str] = None,
     debug_port: int = 5678,
     debug_suspend: bool = True,
+    upload_paths: Optional[List[str]] = None,
     persist_context: bool = False,
     context_key: Optional[str] = None,
     remote_target: Optional[str] = None,
@@ -191,6 +194,8 @@ def remote_invoke(
         debug_host: Debug server host.
         debug_port: Debug server port.
         debug_suspend: Whether the debugger should suspend on attach.
+        upload_paths: Optional explicit paths/globs of modules to ship.
+            If not provided, the package containing ``func`` is uploaded.
         persist_context: Reuse command context across calls.
         context_key: Optional logical name to distinguish multiple contexts.
             If None and persist_context=True, the current process ID
@@ -255,6 +260,7 @@ def remote_invoke(
         debug_host=debug_host,
         debug_port=debug_port,
         debug_suspend=debug_suspend,
+        upload_paths=upload_paths,
         remote_target=remote_target,
     )
 
@@ -426,6 +432,21 @@ def find_package_root(path: str) -> str:
     return last_pkg_dir or (os.path.dirname(path) if os.path.isfile(path) else path)
 
 
+def _resolve_upload_paths(
+    func: Callable[..., Any], upload_paths: Optional[List[str]]
+) -> List[str]:
+    """Return the set of paths that should be shipped to the remote cluster."""
+
+    # Explicit paths/globs provided by the caller take precedence.
+    if upload_paths:
+        return upload_paths
+
+    # Otherwise, ship the package that defines ``func``.
+    module_dir = _get_module_dir_for_func(func)
+    pkg_root = find_package_root(module_dir)
+    return [pkg_root]
+
+
 def _build_modules_zip(
     upload_paths: Optional[List[str]],
     module_dir: str,
@@ -554,6 +575,7 @@ def _build_remote_command(
     debug_host: Optional[str],
     debug_port: int,
     debug_suspend: bool,
+    upload_paths: Optional[List[str]],
     remote_target: Optional[str] = None,
 ) -> str:
     # Inner payload: func + args/kwargs (or target + args/kwargs)
@@ -574,6 +596,10 @@ def _build_remote_command(
 
     inner_bytes = dill.dumps(call_spec, recurse=True)
     encoded_input = _encode_envelope(inner_bytes)
+
+    module_dir = _get_module_dir_for_func(func)
+    resolved_paths = _resolve_upload_paths(func, upload_paths)
+    modules_zip_b64 = _build_modules_zip(resolved_paths, module_dir)
 
     debug_snippet = ""
     if debug:
@@ -606,6 +632,14 @@ def _build_remote_command(
         import tempfile
 
         {debug_snippet}
+
+        _modules_zip = "{modules_zip_b64}"
+        if _modules_zip:
+            _mod_buf = io.BytesIO(base64.b64decode(_modules_zip))
+            _tmp_mod_dir = tempfile.mkdtemp(prefix="remote_modules_")
+            with zipfile.ZipFile(_mod_buf) as _zf:
+                _zf.extractall(_tmp_mod_dir)
+            sys.path.insert(0, _tmp_mod_dir)
 
         def _remote_decode_envelope(b64: str) -> bytes:
             raw = base64.b64decode(b64)
