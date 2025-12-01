@@ -447,50 +447,6 @@ def _resolve_upload_paths(
     return [pkg_root]
 
 
-def _normalize_upload_paths(
-    upload_paths: List[str], module_dir: str
-) -> List[str]:
-    """Normalize upload paths to absolute paths relative to module_dir."""
-
-    normalized: list[str] = []
-    module_dir_abs = os.path.abspath(module_dir)
-
-    for path in upload_paths:
-        if not path:
-            continue
-        if os.path.isabs(path):
-            normalized.append(path)
-        else:
-            normalized.append(os.path.abspath(os.path.join(module_dir_abs, path)))
-
-    return normalized
-
-
-def _compute_zip_base_dir(upload_paths: Optional[List[str]], module_dir: str) -> str:
-    """Return a stable base directory for packaging uploaded modules.
-
-    We prefer the common path of all upload paths (normalized to directories) to
-    avoid writing entries with ``..`` segments into the zip archive. If the
-    common path cannot be determined (e.g., empty list or different drives), we
-    fall back to the module directory.
-    """
-
-    if not upload_paths:
-        return os.path.abspath(module_dir)
-
-    dirs: list[str] = []
-    for path in upload_paths:
-        if not path:
-            continue
-        abs_path = os.path.abspath(path)
-        dirs.append(os.path.dirname(abs_path) if os.path.isfile(abs_path) else abs_path)
-
-    try:
-        return os.path.commonpath(dirs)
-    except ValueError:
-        return os.path.abspath(module_dir)
-
-
 def _build_modules_zip(
     upload_paths: Optional[List[str]],
     base_dir: str,
@@ -644,9 +600,7 @@ def _build_remote_command(
 
     module_dir = _get_module_dir_for_func(func)
     resolved_paths = _resolve_upload_paths(func, upload_paths)
-    normalized_paths = _normalize_upload_paths(resolved_paths, module_dir)
-    base_dir = _compute_zip_base_dir(normalized_paths, module_dir)
-    modules_zip_b64 = _build_modules_zip(normalized_paths, base_dir)
+    modules_zip_b64 = _build_modules_zip(resolved_paths, module_dir)
 
     debug_snippet = ""
     if debug:
