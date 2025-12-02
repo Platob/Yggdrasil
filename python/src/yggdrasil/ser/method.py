@@ -567,7 +567,7 @@ class EmbeddedFunction:
             "import base64",
             "import importlib",
             "import dill",
-            # if you really need this and it's installed on the cluster, uncomment:
+            "import pandas",
         ]
 
         # --- sys.path bootstrapping on remote ---
@@ -614,16 +614,11 @@ class EmbeddedFunction:
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
             f"_embedded_kwargs = dill.loads(base64.b64decode({kwargs_ser!r}.encode('utf-8')))",
             "",
-            "# Normalize to expected shapes; be strict for kwargs.",
-            "if not isinstance(_embedded_args, (tuple, list)):",
-            "    _embedded_args = (_embedded_args,)",
-            "if not isinstance(_embedded_kwargs, dict):",
-            "    raise TypeError(f'Expected kwargs dict, got {type(_embedded_kwargs)!r}')",
-            "if not callable(_embedded_func):",
-            "    raise TypeError(f'Expected func be callable, got {type(_embedded_func)!r}')",
-            "",
-            "_embedded_result = _embedded_func()",
-            "_ser_result = base64.b64encode(dill.dumps(_embedded_result)).decode('utf-8')",
+            "_embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
+            "try:",
+            "    _ser_result = base64.b64encode(dill.dumps(_embedded_result)).decode('utf-8')",
+            "except:",
+            "    _ser_result = base64.b64encode(dill.dumps(pandas.DataFrame(_embedded_result))).decode('utf-8')",
             "print(_ser_result)",
         ])
 
