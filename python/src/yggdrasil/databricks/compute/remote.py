@@ -184,6 +184,9 @@ def remote_invoke(
     Returns:
         Deserialized return value from the remote function.
     """
+    if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+        return func(*args, **kwargs)
+
     from databricks.sdk.service.compute import CommandStatus, Language, ResultType
 
     if workspace is None:
