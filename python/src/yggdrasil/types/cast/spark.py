@@ -12,10 +12,14 @@ from ..cast.registry import register_converter
 from ..python_defaults import default_from_arrow_hint
 from ...libs.sparklib import (
     pyspark,
-    require_pyspark,
     arrow_field_to_spark_field,
     spark_field_to_arrow_field,
 )
+
+try:
+    import pyspark.sql.types as T
+except ImportError:
+    pass
 
 __all__ = [
     "cast_spark_dataframe",
