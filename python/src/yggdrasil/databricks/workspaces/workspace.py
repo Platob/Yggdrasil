@@ -1,5 +1,4 @@
 import dataclasses
-import io
 import os
 import platform
 import posixpath
@@ -7,7 +6,7 @@ from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping, Optional, Union, List, BinaryIO
+from typing import Mapping, Optional, Union, List, BinaryIO, Dict
 
 from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk, databricks
@@ -288,27 +287,36 @@ class DBXWorkspace:
         local_dir: str,
         target_dir: str,
         makedirs: bool = True,
-        ignore_hidden: bool = True,
-        only_if_size_diff: bool = False,
-        exclude_dirs: Optional[List[str]] = None,
+        only_if_size_diff: bool = True,
+        exclude_dir_names: Optional[List[str]] = None,
+        exclude_hidden: bool = True,
         parallel_pool: Optional[Union[ThreadPoolExecutor, int]] = None,
     ):
         """
         Recursively upload a local folder into Databricks Workspace Files.
 
         - Traverses subdirectories recursively.
-        - For each remote directory, can call workspace.list() once (when only_if_size_diff=True)
-          to build {filename -> size} and skip unchanged files.
+        - For each remote directory, can call workspace.list() once (when only_if_size_diff=True
+          or exclude_present=True) to build {filename -> size} and skip unchanged/present files.
         - Can upload files in parallel using a ThreadPoolExecutor.
 
-        parallel_pool:
-          - None: run uploads synchronously
-          - ThreadPoolExecutor: reuse caller's pool
-          - int: create a new ThreadPoolExecutor(max_workers=<value>)
+        Args:
+            local_dir: Local directory to upload from.
+            target_dir: Workspace path to upload into.
+            makedirs: Create remote directories as needed.
+            only_if_size_diff: Skip upload if remote file exists with same size.
+            exclude_dir_names: Directory names to skip entirely.
+            exclude_hidden: Skip dot-prefixed files/directories.
+            parallel_pool: None | ThreadPoolExecutor | int (max_workers).
         """
         sdk = self.sdk()
         local_dir = os.path.abspath(local_dir)
-        exclude_dirs_set = set(exclude_dirs or [])
+        exclude_dirs_set = set(exclude_dir_names or [])
+        try:
+            existing_objs = list(sdk.workspace.list(target_dir))
+        except ResourceDoesNotExist:
+            # Directory doesn't exist -> treat as empty, continue
+            existing_objs = []
 
         # --- setup pool semantics ---
         created_pool: Optional[ThreadPoolExecutor] = None
@@ -326,72 +334,62 @@ class DBXWorkspace:
 
         def _upload_dir(local_root: str, remote_root: str, ensure_dir: bool):
             # Ensure remote directory exists if requested
-            if ensure_dir:
+            if ensure_dir and not existing_objs:
                 sdk.workspace.mkdirs(remote_root)
 
             # List local entries
             try:
-                entries = list(os.scandir(local_root))
+                local_entries = list(os.scandir(local_root))
             except FileNotFoundError:
                 return
 
-            files = []
-            dirs = []
+            local_files = []
+            local_dirs = []
 
-            for entry in entries:
-                name = entry.name
-
+            for local_entry in local_entries:
                 # Skip hidden if requested
-                if ignore_hidden and name.startswith("."):
+                if exclude_hidden and local_entry.name.startswith("."):
                     continue
 
-                if entry.is_dir():
-                    if name in exclude_dirs_set:
+                if local_entry.is_dir():
+                    if local_entry.name in exclude_dirs_set:
                         continue
-                    dirs.append(entry)
+                    local_dirs.append(local_entry)
+                elif existing_objs:
+                    found_same_remote = None
+                    for exiting_obj in existing_objs:
+                        existing_obj_name = os.path.basename(exiting_obj.path)
+
+                        if existing_obj_name == local_entry.name:
+                            found_same_remote = exiting_obj
+                            break
+
+                    if found_same_remote:
+                        found_same_remote_epoch = found_same_remote.modified_at / 1000
+                        local_stats = local_entry.stat()
+
+                        if only_if_size_diff and found_same_remote.size and found_same_remote.size != local_stats.st_size:
+                            pass
+                        elif local_stats.st_mtime < found_same_remote_epoch:
+                            pass
+                        else:
+                            local_files.append(local_entry)
+                    else:
+                        local_files.append(local_entry)
                 else:
-                    files.append(entry)
-
-            # ---- bulk fetch remote file info for this directory ----
-            remote_sizes = {}
-            if only_if_size_diff:
-                try:
-                    for obj in sdk.workspace.list(remote_root):
-                        # we only care about files, not directories
-                        if getattr(obj, "object_type", None) == ObjectType.DIRECTORY:
-                            continue
-
-                        name = posixpath.basename(obj.path)
-                        size = getattr(obj, "size", None)
-                        if size is not None:
-                            remote_sizes[name] = size
-                except ResourceDoesNotExist:
-                    remote_sizes = {}
+                    local_files.append(local_entry)
 
             # ---- upload files in this directory ----
-            for entry in files:
-                local_path = entry.path
-                remote_path = posixpath.join(remote_root, entry.name)
-                remote_size = None
-
-                if only_if_size_diff:
-                    local_size = os.path.getsize(local_path)
-                    remote_size = remote_sizes.get(entry.name)
-
-                    if remote_size is not None and remote_size == local_size:
-                        # same size remotely -> skip
-                        continue
-
-                # If we don't know remote_size at dir-level, let upload_local_file
-                # optionally do its own get_status() for big files
-                file_only_if_size_diff = only_if_size_diff and (remote_size is None)
+            for local_entry in local_files:
+                local_path = local_entry.path
+                remote_path = posixpath.join(remote_root, local_entry.name)
 
                 fut = self.upload_local_file(
                     local_path=local_path,
                     target_path=remote_path,
                     makedirs=False,
                     overwrite=True,
-                    only_if_size_diff=file_only_if_size_diff,
+                    only_if_size_diff=False,
                     parallel_pool=pool,
                 )
 
@@ -399,10 +397,8 @@ class DBXWorkspace:
                     futures.append(fut)
 
             # ---- recurse into subdirectories ----
-            for entry in dirs:
-                child_local = entry.path
-                child_remote = posixpath.join(remote_root, entry.name)
-                _upload_dir(child_local, child_remote, ensure_dir=makedirs)
+            for local_entry in local_dirs:
+                _upload_dir(local_entry.path, posixpath.join(remote_root, local_entry.name), ensure_dir=makedirs)
 
         try:
             # start recursion at root

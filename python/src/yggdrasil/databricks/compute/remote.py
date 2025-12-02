@@ -210,6 +210,11 @@ def remote_invoke(
 
         new_deps = []
         for dep in method.dependencies_map:
+            if dep.root_module in {
+                "pandas", "pyspark", "yggdrasil", "mongoengine"
+            }:
+                continue
+
             # If we have a local root_path, copy it to a user-scoped DBFS cache
             if dep.root_path:
                 # Use the last path component as package name fallback
@@ -222,7 +227,11 @@ def remote_invoke(
                         local_dir=dep.root_path,
                         target_dir=dbfs_root,
                         only_if_size_diff=True,
-                        parallel_pool=4
+                        parallel_pool=4,
+                        exclude_dir_names=[
+                            "__pycache__",
+                        ],
+                        exclude_hidden=True
                     )
 
                 # Point the dependency at the DBFS-backed local path so build() can

@@ -239,6 +239,7 @@ class EmbeddedFunction:
 
     name: str
     source: str
+    source_file_content: Optional[str]
 
     # List of DependencyInfo entries
     dependencies_map: List[DependencyInfo] = field(default_factory=list)
@@ -255,6 +256,70 @@ class EmbeddedFunction:
     )
 
     # ---------- constructors ----------
+    @classmethod
+    def _infer_imported_modules_from_file(
+        cls,
+        module_file: str,
+        src: Optional[str] = None,
+        package_root: Optional[str] = None,
+    ) -> List[DependencyInfo]:
+        """
+        Given a Python source file, parse its imports and return DependencyInfo
+        objects for modules that look relevant.
+
+        Returns:
+            List[DependencyInfo]
+        """
+        if not src:
+            with open(module_file, "r", encoding="utf-8") as f:
+                src = f.read()
+
+        tree = ast.parse(src, filename=module_file)
+
+        imported_module_names: set[str] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                # import x, import x.y.z
+                for alias in node.names:
+                    imported_module_names.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                # from x import y; from x.y import z; from .x import y
+                if node.module is None:
+                    # "from . import foo" -> skip unless you want to get fancy
+                    continue
+                full = ("." * node.level + node.module) if node.level else node.module
+                imported_module_names.add(full)
+
+        # Resolve names → real modules, filter by package_root if given
+        resolved_names: set[str] = set()
+
+        for name in imported_module_names:
+            try:
+                # Handle relative names relative to this module's package
+                if name.startswith("."):
+                    if not package_root:
+                        continue
+                    rel_path = os.path.relpath(module_file, package_root)
+                    # e.g. my_pkg/mod.py -> my_pkg.mod
+                    pkg = os.path.splitext(rel_path)[0].replace(os.path.sep, ".")
+                    pkg = pkg.rsplit(".", 1)[0]  # strip final segment
+                    full_name = pkg + name  # let importlib normalize it
+                    spec = importlib.util.find_spec(full_name)
+                else:
+                    spec = importlib.util.find_spec(name)
+
+                if spec is None or spec.origin is None:
+                    continue
+
+                resolved_names.add(spec.name)
+            except Exception:
+                # noisy/edge imports shouldn't break everything
+                continue
+
+        # Now build DependencyInfo list reusing your existing helper
+        raw_deps = {full_name: None for full_name in resolved_names}
+        return _build_dependency_infos(raw_deps)
 
     @classmethod
     def from_callable(cls, func: Callable[..., Any]) -> "EmbeddedFunction":
@@ -269,14 +334,16 @@ class EmbeddedFunction:
           - bound methods (inspect.ismethod)
           - functions that capture nonlocal variables in their closure
         """
+        # 1) Reject bound methods
         if inspect.ismethod(func):
             raise ValueError("EmbeddedFunction does not support bound methods")
 
+        # 2) Qualname is how we identify nested/local defs
         qualname = getattr(func, "__qualname__", None)
         if not qualname:
             raise ValueError(f"Cannot derive qualname for {func!r}")
 
-        # Check closure for nonlocals; we don't support capturing outer locals
+        # 3) Reject functions that close over nonlocal variables
         closure = inspect.getclosurevars(func)
         if closure.nonlocals:
             raise ValueError(
@@ -284,39 +351,69 @@ class EmbeddedFunction:
                 "nonlocal variables in their closure"
             )
 
+        # 4) Extract raw source for the function
         try:
             raw_src = inspect.getsource(func)
         except OSError as exc:
             raise ValueError(f"Cannot extract source for {func!r}: {exc}") from exc
 
-        # Extract the specific def block (handles nested funcs)
+        # 5) Trim down to just the def block for this specific function
         src = _extract_function_source(raw_src, qualname, func.__name__)
 
-        # Raw dependencies + alias mapping from closure
+        # 6) Infer raw deps (module_name -> file_or_None) + aliases
         raw_deps, aliases = _infer_raw_dependencies_and_aliases(func)
 
-        # Also add the defining module itself to raw deps + package root
+        # 7) Add the defining module; track package_root
         module_name = getattr(func, "__module__", None)
-        package_root = None
+        package_root: Optional[str] = None
+        module_file: Optional[str] = None
+        source_file_content: Optional[str] = None
 
         if module_name:
             mod = sys.modules.get(module_name)
             if mod is not None:
                 module_file = getattr(mod, "__file__", None)
                 if module_file:
+                    module_file = os.path.abspath(module_file)
                     package_root = _find_package_root_from_file(module_file)
+                    # Always include the defining module itself
                     raw_deps.setdefault(module_name, module_file)
 
-        dep_infos = _build_dependency_infos(raw_deps)
+        # 8) Convert closure/module deps -> DependencyInfo list
+        base_dep_infos: List[DependencyInfo] = _build_dependency_infos(raw_deps)
 
+        # 9) Add imported modules from the defining file (also DependencyInfo)
+        imported_dep_infos: List[DependencyInfo] = []
+        if module_file:
+            with open(module_file, "r", encoding="utf-8") as f:
+                source_file_content = f.read()
+            imported_dep_infos = cls._infer_imported_modules_from_file(
+                module_file=module_file,
+                src=source_file_content,
+                package_root=package_root,
+            )
+
+        # 10) Merge and dedupe DependencyInfo entries
+        merged: dict[tuple[str, str], DependencyInfo] = {}
+
+        for info in base_dep_infos + imported_dep_infos:
+            key = (info.root_module, info.submodule)
+            # last-one-wins; they're usually identical anyway
+            merged[key] = info
+
+        dep_infos = list(merged.values())
+
+        # 11) Build the EmbeddedFunction dataclass
         built = cls(
             name=func.__name__,
             source=src,
+            source_file_content=source_file_content,
             dependencies_map=dep_infos,
             aliases=aliases,
             package_root=package_root,
         )
 
+        # Cache the original callable for local use
         built._compiled = func
 
         return built
@@ -502,13 +599,18 @@ class EmbeddedFunction:
         #   - the actual function object (self.func)
         #   - args as a tuple
         #   - kwargs as a dict
-        func_ser = _b64_dumps(self.func)
         args_ser = _b64_dumps(tuple(args))
         kwargs_ser = _b64_dumps(dict(kwargs))
 
+        lines.extend([
+            "",
+            self.source_file_content,
+            ""
+        ])
+
         # --- remote-side deserialization + shape checks ---
         lines.extend([
-            f"_embedded_func = dill.loads(base64.b64decode({func_ser!r}.encode('utf-8')))",
+            f"_embedded_func = {self.name}",
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
             f"_embedded_kwargs = dill.loads(base64.b64decode({kwargs_ser!r}.encode('utf-8')))",
             "",
