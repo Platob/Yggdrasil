@@ -144,16 +144,16 @@ def databricks_remote_compute(
         def wrapper(*args: Any, **kwargs: Any) -> ReturnType:
             if force_local:
                 return func(*args, **kwargs)
-
-            return remote_invoke(
-                cluster_id=cluster_id,
-                func=func,
-                args=args,
-                kwargs=kwargs,
-                workspace=workspace,
-                timeout=timeout,
-                env_keys=env_keys
-            )
+            else:
+                return remote_invoke(
+                    cluster_id=cluster_id,
+                    func=func,
+                    args=args,
+                    kwargs=kwargs,
+                    workspace=workspace,
+                    timeout=timeout,
+                    env_keys=env_keys
+                )
 
         return wrapper
 
