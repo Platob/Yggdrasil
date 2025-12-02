@@ -217,7 +217,7 @@ def remote_invoke(
         new_deps = []
         for dep in method.dependencies_map:
             if dep.root_module in {
-                "os", "shutil", "path", "sys", "json",
+                "os", "shutil", "path", "sys", "json", "logging",
                 "pandas", "pyspark",
                 "yggdrasil",
                 "mongoengine"
