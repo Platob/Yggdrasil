@@ -3,6 +3,7 @@ import concurrent
 import concurrent.futures
 import datetime as dt
 import functools
+import json
 import os
 import time
 from typing import (
@@ -107,7 +108,8 @@ def databricks_remote_compute(
     cluster_id: Optional[str] = None,
     workspace: Optional[Union[DBXWorkspace, str]] = None,
     timeout: Optional[dt.timedelta] = None,
-    force_local: Optional[bool] = None
+    force_local: Optional[bool] = None,
+    env_keys: Optional[List[str]] = None
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     """
     Decorator that executes the wrapped function on a Databricks cluster.
@@ -211,7 +213,10 @@ def remote_invoke(
         new_deps = []
         for dep in method.dependencies_map:
             if dep.root_module in {
-                "pandas", "pyspark", "yggdrasil", "mongoengine"
+                "os", "shutil", "path", "sys", "json",
+                "pandas", "pyspark",
+                "yggdrasil",
+                "mongoengine"
             }:
                 continue
 
@@ -302,9 +307,43 @@ def remote_invoke(
             raise RuntimeError("Remote execution returned empty data")
 
         try:
-            # Parse JSON payload produced by to_command()
-            content = base64.b64decode(result.results.data.encode("utf-8"))
-            return dill.loads(content)
+            import json
+            import base64
+            import dill
+            import sys as _sys
+
+            text = result.results.data  # full stdout from remote command (string)
+
+            start_tag = "<<<EMBEDDED_RESULT_START>>>"
+            end_tag = "<<<EMBEDDED_RESULT_END>>>"
+
+            start_idx = text.find(start_tag)
+            end_idx = text.find(end_tag, start_idx + len(start_tag)) if start_idx != -1 else -1
+
+            # --- print everything before the balise, line by line ---
+            if start_idx == -1:
+                # No marker at all -> just dump the whole thing as logs and bail/handle fallback
+                prefix = text
+            else:
+                prefix = text[:start_idx]
+
+            prefix = prefix or ""
+            if prefix.strip():
+                for line in prefix.splitlines():
+                    print(line.rstrip())
+
+            if start_idx == -1 or end_idx == -1:
+                raise ValueError("Cannot find result content")
+
+            start_idx += len(start_tag)
+            payload_json = text[start_idx:end_idx].strip()
+
+            payload = json.loads(payload_json)
+
+            result_b64 = payload["result_b64"]
+            result_bytes = base64.b64decode(result_b64.encode("utf-8"))
+            return dill.loads(result_bytes)
+
         finally:
             if context_id:
                 try:

@@ -545,17 +545,23 @@ class EmbeddedFunction:
         The generated code will:
           - best-effort add dependency root paths to sys.path
           - restore module aliases used by the function
-          - reconstruct the function via dill (sent from driver)
           - reconstruct args/kwargs via dill (sent from driver)
           - call the function with *args / **kwargs
-          - print a base64-encoded dill-serialized result
+          - capture stdout/stderr produced during the call
+          - print a base64-encoded dill-serialized dict:
+                {
+                  "result_b64": <base64 of dill(result or DataFrame(result))>,
+                  "stdout": "<captured stdout>",
+                  "stderr": "<captured stderr>",
+                }
         """
         import dill  # driver-side
         import base64 as _b64
+        import os as _os
 
         # Collect unique, non-empty dependency root paths
         roots = sorted({
-            os.path.dirname(d.root_path) for d in self.dependencies_map if d.root_path
+            _os.path.dirname(d.root_path) for d in self.dependencies_map if d.root_path
         })
         imports = set(
             d.submodule for d in self.dependencies_map
@@ -566,8 +572,11 @@ class EmbeddedFunction:
             "import os",
             "import base64",
             "import importlib",
+            "import json",
             "import dill",
             "import pandas",
+            "import io",
+            "import contextlib",
         ]
 
         # --- sys.path bootstrapping on remote ---
@@ -576,10 +585,11 @@ class EmbeddedFunction:
             lines.extend([
                 "    if __p and __p not in sys.path:",
                 "        if not os.path.isdir(__p):",
-                "            raise ValueError(f'Cannot find lib path {{__p}}')",
+                "            raise ValueError(f'Cannot find lib path {__p}')",
                 "        sys.path.insert(0, __p)",
             ])
 
+        # --- best-effort import of dependencies on remote ---
         if imports:
             lines.extend([
                 "try:\n    import %s\nexcept:\n    pass" % _ for _ in imports
@@ -595,20 +605,20 @@ class EmbeddedFunction:
         def _b64_dumps(obj: Any) -> str:
             return _b64.b64encode(dill.dumps(obj)).decode("utf-8")
 
-        # Always serialize:
-        #   - the actual function object (self.func)
-        #   - args as a tuple
-        #   - kwargs as a dict
+        # Serialize args/kwargs as plain data
         args_ser = _b64_dumps(tuple(args))
         kwargs_ser = _b64_dumps(dict(kwargs))
 
+        # Prefer full file content if we have it, otherwise just the function source
+        source_block = self.source_file_content or self.source
+
         lines.extend([
             "",
-            self.source_file_content,
-            ""
+            source_block,
+            "",
         ])
 
-        # --- remote-side deserialization + shape checks ---
+        # --- remote-side deserialization + log capture ---
         lines.extend([
             f"_embedded_func = {self.name}",
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
@@ -616,10 +626,14 @@ class EmbeddedFunction:
             "",
             "_embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
             "try:",
-            "    _ser_result = base64.b64encode(dill.dumps(_embedded_result)).decode('utf-8')",
-            "except:",
-            "    _ser_result = base64.b64encode(dill.dumps(pandas.DataFrame(_embedded_result))).decode('utf-8')",
-            "print(_ser_result)",
+            "    _ser_result = dill.dumps(_embedded_result)",
+            "except Exception:",
+            "    _ser_result = dill.dumps(pandas.DataFrame(_embedded_result))",
+            "",
+            "payload = {",
+            "    'result_b64': base64.b64encode(_ser_result).decode('utf-8'),",
+            "}",
+            "print('<<<EMBEDDED_RESULT_START>>>' + json.dumps(payload) + '<<<EMBEDDED_RESULT_END>>>')",
         ])
 
         return "\n".join(lines)
