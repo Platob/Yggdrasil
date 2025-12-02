@@ -12,7 +12,7 @@ from typing import (
     Callable,
     Optional,
     TypeVar,
-    Union,
+    Union, List,
 )
 
 import dill
@@ -131,12 +131,13 @@ def databricks_remote_compute(
             DBXWorkspace is created.
         timeout: Optional timeout for remote execution (default 20 minutes).
         force_local: Optional bool to bypass remote compute
+        env_keys: Environment keys
 
     Returns:
         A decorator that wraps the target function so calls are executed remotely.
     """
-    if force_local is None:
-        force_local = os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
+    if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+        force_local = True
 
     def decorator(func: Callable[..., ReturnType]) -> Callable[..., ReturnType]:
         @functools.wraps(func)
@@ -151,6 +152,7 @@ def databricks_remote_compute(
                 kwargs=kwargs,
                 workspace=workspace,
                 timeout=timeout,
+                env_keys=env_keys
             )
 
         return wrapper
@@ -165,6 +167,7 @@ def remote_invoke(
     cluster_id: Optional[str] = None,
     workspace: Optional[Union[DBXWorkspace, str]] = None,
     timeout: Optional[dt.timedelta] = None,
+    env_keys: Optional[List[str]] = None
 ) -> ReturnType:
     """
     Internal helper that actually performs the remote execution.
@@ -176,6 +179,7 @@ def remote_invoke(
         cluster_id: Target cluster ID (required).
         workspace: Optional DBXWorkspace or host string.
         timeout: Optional timeout for remote execution.
+        env_keys: Environment keys
 
     Returns:
         Deserialized return value from the remote function.
@@ -255,7 +259,10 @@ def remote_invoke(
         # Swap in the updated dependency map so to_command/build() use DBFS paths
         method.dependencies_map = new_deps
 
-        command = method.to_command(args=args, kwargs=kwargs)
+        command = method.to_command(
+            args=args, kwargs=kwargs,
+            env_keys=env_keys
+        )
 
         result = client.command_execution.execute_and_wait(
             cluster_id=cluster_id,

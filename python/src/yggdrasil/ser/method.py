@@ -538,6 +538,7 @@ class EmbeddedFunction:
         self,
         args: list,
         kwargs: dict,
+        env_keys: Optional[List[str]] = None
     ) -> str:
         """
         Build a Python command string suitable for Databricks `command_execution`.
@@ -578,6 +579,23 @@ class EmbeddedFunction:
             "import io",
             "import contextlib",
         ]
+
+        # --- embed env vars into remote process ---
+        if env_keys:
+            env_vars = {
+                k: os.getenv(k)
+                for k in env_keys
+                if os.getenv(k) is not None
+            }
+
+            if env_vars:
+                # env_vars is a plain dict on the driver; we stringify it into code
+                lines.append(f"__embedded_env = {env_vars!r}")
+                lines.extend([
+                    "for __k, __v in __embedded_env.items():",
+                    "    if __v is not None:",
+                    "        os.environ[__k] = __v",
+                ])
 
         # --- sys.path bootstrapping on remote ---
         if roots:
