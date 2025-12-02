@@ -8,7 +8,7 @@ from yggdrasil.databricks.workspaces import DBXWorkspace
 
 
 def test_insert():
-    sql = DBXSQL(workspace=DBXWorkspace(host="dbc-e646c5f9-8a44.cloud.databricks.com"))
+    sql = DBXSQL(workspace=DBXWorkspace(host="xxx.cloud.databricks.com"))
 
     data = pandas.DataFrame([
         {"test": 1, "b": datetime.datetime.now()}
@@ -24,7 +24,7 @@ def test_insert():
     assert written.equals(data)
 
 def test_read():
-    sql = DBXSQL(workspace=DBXWorkspace(host="dbc-e646c5f9-8a44.cloud.databricks.com"))
+    sql = DBXSQL(workspace=DBXWorkspace(host="xxx.cloud.databricks.com"))
 
     data = sql.execute(
         catalog_name="trading", schema_name="ba_3mv_polaris__p__volcano_ref_input", table_name="test",
