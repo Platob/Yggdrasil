@@ -10,6 +10,7 @@ dependencies = [
   "requests",
   "polars",
   "pandas>=2",
+  "numpy>=1.26,<2.0",
   "pyarrow>=16",
   "dill"
 ]
