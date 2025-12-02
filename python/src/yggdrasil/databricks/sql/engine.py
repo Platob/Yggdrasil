@@ -1,20 +1,23 @@
-import base64
 import dataclasses
 import io
-import itertools
-import json
-import os
 import random
-import re
 import string
 import time
-from typing import Optional, Union, Generator, Any, Dict, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cached_property
+from typing import Optional, Union, Generator, Any, Dict, List
 
 import pyarrow as pa
+import pyarrow.ipc as pipc
 import pyarrow.parquet as pq
 
-from ..workspaces import DBXWorkspaceObject, DBXWorkspace
-from ...libs import SparkSession, SparkDataFrame, pyspark
+from .types import column_info_to_arrow_field
+from ..workspaces import DBXWorkspaceObject
+from ...libs.databrickslib import databricks_sdk
+from ...libs.pandaslib import pandas
+from ...libs.polarslib import polars
+from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
+from ...requests.session import YGGSession
 from ...types.cast import convert, ArrowCastOptions
 
 try:
@@ -25,10 +28,13 @@ except ImportError:
     SparkDeltaTable = None
 
 
-try:
-    from databricks.sdk.service.sql import State
-except ImportError:
-    pass
+if databricks_sdk is not None:
+    from databricks.sdk.service.sql import StatementState, StatementResponse, Disposition, Format, \
+    ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
+
+    StatementResponse = StatementResponse
+else:
+    StatementResponse = None
 
 
 try:
@@ -41,169 +47,173 @@ __all__ = [
 ]
 
 
-STRING_TYPE_MAP = {
-    # boolean
-    "BOOL": pa.bool_(),
-    "BOOLEAN": pa.bool_(),
-
-    # string / text
-    "CHAR": pa.string(),
-    "NCHAR": pa.string(),
-    "VARCHAR": pa.string(),
-    "NVARCHAR": pa.string(),
-    "STRING": pa.string(),
-    "TEXT": pa.large_string(),
-    "LONGTEXT": pa.large_string(),
-
-    # integers
-    "TINYINT": pa.int8(),
-    "SMALLINT": pa.int16(),
-    "INT2": pa.int16(),
-
-    "INT": pa.int32(),
-    "INTEGER": pa.int32(),
-    "INT4": pa.int32(),
-
-    "BIGINT": pa.int64(),
-    "INT8": pa.int64(),
-
-    # unsigned → widen (Arrow has no unsigned for many)
-    "UNSIGNED TINYINT": pa.int16(),
-    "UNSIGNED SMALLINT": pa.int32(),
-    "UNSIGNED INT": pa.int64(),
-    "UNSIGNED BIGINT": pa.uint64() if hasattr(pa, "uint64") else pa.int64(),
-
-    # floats
-    "FLOAT": pa.float32(),
-    "REAL": pa.float32(),
-    "DOUBLE": pa.float64(),
-    "DOUBLE PRECISION": pa.float64(),
-
-    # numeric/decimal — regex later for DECIMAL(p,s)
-    "NUMERIC": pa.decimal128(38, 18),
-    "DECIMAL": pa.decimal128(38, 18),
-
-    # date/time/timestamp
-    "DATE": pa.date32(),
-    "TIME": pa.time64("ns"),
-    "TIMESTAMP": pa.timestamp("us", "UTC"),
-    "TIMESTAMP_NTZ": pa.timestamp("us"),
-    "DATETIME": pa.timestamp("us", "UTC"),
-
-    # binary
-    "BINARY": pa.binary(),
-    "VARBINARY": pa.binary(),
-    "BLOB": pa.binary(),
-
-    # json-like
-    "JSON": pa.string(),
-    "JSONB": pa.string(),
-
-    # other structured text
-    "UUID": pa.string(),
-    "XML": pa.string(),
-
-    # explicit arrow large types
-    "LARGE_STRING": pa.large_string(),
-    "LARGE_BINARY": pa.large_binary(),
-}
-
-_decimal_re = re.compile(r"^DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$", re.IGNORECASE)
-_array_re = re.compile(r"^ARRAY\s*<\s*(.+)\s*>$", re.IGNORECASE)
-_map_re = re.compile(r"^MAP\s*<\s*(.+?)\s*,\s*(.+)\s*>$", re.IGNORECASE)
-_struct_re = re.compile(r"^STRUCT\s*<\s*(.+)\s*>$", re.IGNORECASE)
-
-def _split_top_level_commas(s: str):
-    parts, cur, depth = [], [], 0
-    for ch in s:
-        if ch == '<':
-            depth += 1
-        elif ch == '>':
-            depth -= 1
-        if ch == ',' and depth == 0:
-            parts.append(''.join(cur).strip())
-            cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        parts.append(''.join(cur).strip())
-    return parts
-
-def parse_sql_type_to_pa(type_str: str) -> pa.DataType:
-    """
-    Adapted parser that:
-      - looks up base types in STRING_TYPE_MAP (expects uppercase keys)
-      - supports DECIMAL(p,s), ARRAY<...>, MAP<k,v>, STRUCT<...> recursively
-      - raises ValueError if it cannot map the provided type string
-    """
-    if not type_str:
-        raise ValueError("Empty type string")
-
-    raw = str(type_str).strip()
-
-    # DECIMAL(p,s)
-    m = _decimal_re.match(raw)
-    if m:
-        precision = int(m.group(1)); scale = int(m.group(2))
-        return pa.decimal128(precision, scale)
-
-    # ARRAY<...>
-    m = _array_re.match(raw)
-    if m:
-        inner = m.group(1).strip()
-        return pa.list_(parse_sql_type_to_pa(inner))
-
-    # MAP<k,v>
-    m = _map_re.match(raw)
-    if m:
-        key_raw = m.group(1).strip()
-        val_raw = m.group(2).strip()
-        key_type = parse_sql_type_to_pa(key_raw)
-        val_type = parse_sql_type_to_pa(val_raw)
-        return pa.map_(key_type, val_type)
-
-    # STRUCT<...>
-    m = _struct_re.match(raw)
-    if m:
-        inner = m.group(1).strip()
-        parts = _split_top_level_commas(inner)
-        fields = []
-        for p in parts:
-            if ':' not in p:
-                # defensive fallback
-                fname = p
-                ftype = pa.string()
-            else:
-                fname, ftype_raw = p.split(':', 1)
-                fname = fname.strip()
-                ftype = parse_sql_type_to_pa(ftype_raw.strip())
-            fields.append(pa.field(fname, ftype, nullable=True))
-        return pa.struct(fields)
-
-    # normalize and strip size/precision suffixes: e.g. VARCHAR(255) -> VARCHAR
-    base = re.sub(r"\(.*\)\s*$", "", raw).strip().upper()
-
-    # direct lookup in provided map
-    if base in STRING_TYPE_MAP:
-        return STRING_TYPE_MAP[base]
-
-    # nothing matched — raise so caller knows it's unknown
-    raise ValueError(f"Cannot convert string data type '{type_str}' to arrow")
-
-
-# create a safe local staging area for ingestion ops
-try:
-    DEFAULT_STAGING_ALLOWED_LOCAL_PATH = os.path.join(
-        os.path.expanduser("~"),
-        ".ygg", "databricks", "sql", "staging"
-    )
-except OSError:
-    DEFAULT_STAGING_ALLOWED_LOCAL_PATH = None
-
-
-
 class SqlExecutionError(RuntimeError):
     pass
+
+
+@dataclasses.dataclass
+class DBXStatementResult:
+    base: StatementResponse
+
+    @property
+    def status(self):
+        return self.base.status
+
+    @property
+    def state(self):
+        return self.status.state
+
+    @property
+    def statement_id(self):
+        return self.base.statement_id
+
+    @property
+    def manifest(self):
+        return self.base.manifest
+
+    @property
+    def result(self):
+        return self.base.result
+
+    @property
+    def external_links(self):
+        return self.base.result.external_links
+
+    @property
+    def done(self):
+        return self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
+
+    @property
+    def failed(self):
+        return self.state in [StatementState.CANCELED, StatementState.FAILED]
+
+    def raise_for_status(self):
+        if self.failed:
+            # grab error info if present
+            err = self.status.error
+            message = err.message or "Unknown SQL error"
+            error_code = err.error_code
+            sql_state = getattr(err, "sql_state", None)
+
+            parts = [message]
+            if error_code:
+                parts.append(f"error_code={error_code}")
+            if sql_state:
+                parts.append(f"sql_state={sql_state}")
+
+            raise SqlExecutionError(
+                f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
+            )
+
+    def wait(
+        self,
+        engine: "DBXSQL",
+        timeout: Optional[int] = None,
+        poll_interval: Optional[float] = None
+    ):
+        start = time.time()
+        poll_interval = poll_interval or 1
+        current = self
+
+        while True:
+            current = engine.get_statement(current.statement_id)
+            current.raise_for_status()
+
+            if current.done:
+                break
+
+            # still running / queued / pending
+            if timeout is not None and (time.time() - start) > timeout:
+                raise TimeoutError(
+                    f"Statement {current.statement_id} did not finish within {timeout} seconds "
+                    f"(last state={current})"
+                )
+
+            poll_interval = max(10, poll_interval * 1.2)
+            time.sleep(poll_interval)
+
+        return current
+
+    @cached_property
+    def arrow_schema(self):
+        fields = [
+            column_info_to_arrow_field(_) for _ in self.manifest.schema.columns
+        ]
+        return pa.schema(fields)
+
+    def arrow_table(self, max_workers: int | None = None) -> pa.Table:
+        batches = list(self.arrow_batches(max_workers=max_workers))
+
+        if not batches:
+            # empty table with no columns
+            return pa.table({}, self.arrow_schema)
+
+        return pa.Table.from_batches(batches)
+
+    def arrow_batches(self, max_workers: int | None = None):
+        if self.external_links:
+            session = YGGSession()
+            # if you really need to skip TLS verification, do it on the session
+            session.verify = False  # ideally don't do this in prod...
+
+            for link in self.external_links:
+                resp = session.get(link.external_link, verify=False, timeout=10)
+                resp.raise_for_status()
+
+                buf = pa.BufferReader(resp.content)
+
+                # If it's an IPC *stream*:
+                reader = pipc.open_stream(buf)
+
+                # If it’s an IPC *file*, use:
+                # reader = pipc.open_file(buf)
+
+                # reader yields RecordBatch objects
+                for batch in reader:
+                    yield batch
+        else:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+    def arrow_messages(self, max_workers: int | None = None):
+        if self.external_links:
+            links = list(self.external_links)
+
+            if max_workers is None:
+                # tune this to your workloads; 16–32 is usually fine for I/O
+                max_workers = min(32, len(links))
+
+            session = YGGSession()
+            # if you really need to skip TLS verification, do it on the session
+            session.verify = False  # ideally don't do this in prod...
+
+            read_message = pipc.read_message
+
+            def fetch_and_decode(link):
+                url = link.external_link
+                resp = session.get(url, timeout=10)
+                resp.raise_for_status()
+                return read_message(resp.content)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(fetch_and_decode, link): link for link in links}
+                for fut in as_completed(futures):
+                    # if you want to surface which link failed, you can catch here
+                    batch = fut.result()  # will raise if that request failed
+                    yield batch
+        else:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+    def to_pandas(
+        self,
+        max_workers: int | None = None
+    ) -> "pandas.DataFrame":
+        return self.arrow_table(max_workers=max_workers).to_pandas()
+
+    def to_polars(
+        self,
+        max_workers: int | None = None
+    ) -> "polars.DataFrame":
+        return polars.DataFrame(self.arrow_table(max_workers=max_workers))
 
 
 @dataclasses.dataclass
@@ -212,31 +222,6 @@ class DBXSQL(DBXWorkspaceObject):
 
     _http_path: str = dataclasses.field(init=False, default=None)
     _was_connected: bool = dataclasses.field(init=False, default=False)
-
-    @classmethod
-    def find_in_env(
-        cls,
-        env: Mapping = None,
-        prefix: Optional[str] = None,
-        workspace: Optional[DBXWorkspace] = None
-    ):
-        env = env or os.environ
-        prefix = prefix or "DATABRICKS_SQL_"
-        workspace = workspace or DBXWorkspace.find_in_env(env=env)
-
-        options = {
-            k: env.get(prefix + k.upper())
-            for k in (
-                "warehouse_id"
-            )
-            if env.get(prefix + k.upper())
-        }
-
-        return cls(
-            workspace=workspace,
-            **options
-        )
-
 
     @staticmethod
     def _table_full_name(
@@ -319,8 +304,18 @@ class DBXSQL(DBXWorkspaceObject):
 
     def execute(
         self,
-        statement: str,
+        statement: Optional[str] = None,
         *,
+        byte_limit: Optional[int] = None,
+        disposition: Optional[Disposition] = None,
+        format: Optional[Format] = None,
+        on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
+        parameters: Optional[List[StatementParameterListItem]] = None,
+        row_limit: Optional[int] = None,
+        wait_timeout: Optional[str] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
         wait: bool = True,
         timeout: Optional[float] = 600.0,
         poll_interval: float = 1.0,
@@ -334,121 +329,40 @@ class DBXSQL(DBXWorkspaceObject):
             - On FAILED / CANCELED: raise SqlExecutionError
         - If wait=False: return initial execution handle without polling.
         """
-        wk = self.workspace.sdk()
+        if (disposition is None or disposition == Disposition.INLINE) and format in [Format.CSV, Format.ARROW_STREAM]:
+            disposition = Disposition.EXTERNAL_LINKS
 
-        execution = wk.statement_execution.execute_statement(
-            statement=statement,
-            warehouse_id=self._get_or_default_warehouse_id(),
-            **kwargs,
-        )
-
-        if not wait:
-            # Caller handles polling / status themselves
-            return execution
-
-        statement_id = execution.statement_id
-        start = time.time()
-
-        while True:
-            current = wk.statement_execution.get_statement(statement_id)
-            status = getattr(current, "status", None)
-            state = getattr(status, "state", None)
-
-            # handle enum vs string
-            state_str = getattr(state, "value", state)
-            state_str = str(state_str) if state_str is not None else "UNKNOWN"
-
-            if state_str in ("SUCCEEDED", "FAILED", "CANCELED"):
-                # terminal
-                if state_str == "SUCCEEDED":
-                    return current
-
-                # grab error info if present
-                err = getattr(status, "error", None)
-                message = getattr(err, "message", None) or "Unknown SQL error"
-                error_code = getattr(err, "error_code", None)
-                sql_state = getattr(err, "sql_state", None)
-
-                parts = [message]
-                if error_code:
-                    parts.append(f"error_code={error_code}")
-                if sql_state:
-                    parts.append(f"sql_state={sql_state}")
-
-                raise SqlExecutionError(
-                    f"Statement {statement_id} {state_str}: " + " | ".join(parts)
-                )
-
-            # still running / queued / pending
-            if timeout is not None and (time.time() - start) > timeout:
-                raise TimeoutError(
-                    f"Statement {statement_id} did not finish within {timeout} seconds "
-                    f"(last state={state_str})"
-                )
-
-            time.sleep(poll_interval)
-
-    def read_arrow_batches(
-        self,
-        statement: Optional[str] = None,
-        *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        batch_size: int | None = None,
-    ) -> pa.RecordBatchReader:
-        """Stream query results from a temporary workspace export as Arrow batches."""
         if not statement:
-            if catalog_name and schema_name and table_name:
-                full_name = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name, safe_chars=True)
-                statement = f"SELECT * FROM {full_name}"
-            else:
-                raise ValueError("Missing SQL statement")
+            full_name = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name)
+            statement = f"SELECT * FROM {full_name}"
 
-        query = statement.strip().rstrip(";")
-        if not query:
-            raise ValueError("Statement must not be empty")
+        with self as connected:
+            wk = connected.workspace.sdk()
 
-        with self.workspace.connect() as connected:
-            temp_folder = self.workspace.temp_volume_folder(suffix=self._random_suffix("read_"))
-            connected.delete_path(temp_folder, recursive=True)
-
-            copy_sql = f"""COPY INTO '{temp_folder}'
-FROM (
-    {query}
-)
-FILEFORMAT = PARQUET"""
-
-            self.execute(copy_sql)
-
-            file_infos = [
-                info
-                for info in connected.sdk().workspace.list(temp_folder)
-                if not str(getattr(info, "path", "")).endswith("/")
-            ]
-
-            def batch_iterator():
-                try:
-                    for info in file_infos:
-                        with connected.open_path(info.path) as handle:
-                            parquet_file = pq.ParquetFile(handle)
-                            yield from parquet_file.iter_batches(batch_size=batch_size)
-                finally:
-                    try:
-                        connected.delete_path(temp_folder, recursive=True)
-                    except Exception:
-                        pass
-
-            iterator = batch_iterator()
-            first_batch = next(iterator, None)
-
-            if first_batch is None:
-                return pa.RecordBatchReader.from_batches(pa.schema([]), [])
-
-            return pa.RecordBatchReader.from_batches(
-                first_batch.schema,
-                itertools.chain([first_batch], iterator)
+            execution = DBXStatementResult(
+                base=wk.statement_execution.execute_statement(
+                    statement=statement,
+                    warehouse_id=self._get_or_default_warehouse_id(),
+                    byte_limit=byte_limit,
+                    disposition=disposition,
+                    format=format,
+                    on_wait_timeout=on_wait_timeout,
+                    parameters=parameters,
+                    row_limit=row_limit,
+                    wait_timeout=wait_timeout,
+                    catalog=catalog_name,
+                    schema=schema_name,
+                    **kwargs,
+                )
             )
+
+            if not wait:
+                # Caller handles polling / status themselves
+                return execution
+            return execution.wait(engine=connected, timeout=timeout, poll_interval=poll_interval)
+
+    def get_statement(self, statement_id: str):
+        return DBXStatementResult(self.sdk().statement_execution.get_statement(statement_id))
 
     def spark_table(
         self,
@@ -624,33 +538,26 @@ FILEFORMAT = PARQUET"""
                 # build INSERT clause
                 insert_clause = f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
 
-                merge_sql = f"""
-                MERGE INTO {full_table} AS T
-                USING (
-                  SELECT {cols_quoted}
-                  FROM parquet.`{databricks_tmp_folder}`
-                ) AS S
-                ON {on_condition}
-                {update_clause}
-                {insert_clause}
-                """
+                merge_sql = f"""MERGE INTO {full_table} AS T
+USING (
+  SELECT {cols_quoted} FROM parquet.`{databricks_tmp_folder}`
+) AS S
+ON {on_condition}
+{update_clause}
+{insert_clause}"""
                 statements.append(merge_sql)
 
             else:
                 # No match_by -> plain insert
                 if mode.lower() in ("overwrite",):
-                    insert_sql = f"""
-                    INSERT OVERWRITE {full_table}
-                    SELECT {cols_quoted}
-                    FROM parquet.`{databricks_tmp_folder}`
-                    """
+                    insert_sql = f"""INSERT OVERWRITE {full_table}
+SELECT {cols_quoted}
+FROM parquet.`{databricks_tmp_folder}`"""
                 else:
                     # default: append
-                    insert_sql = f"""
-                    INSERT INTO {full_table} ({cols_quoted})
-                    SELECT {cols_quoted}
-                    FROM parquet.`{databricks_tmp_folder}`
-                    """
+                    insert_sql = f"""INSERT INTO {full_table} ({cols_quoted})
+SELECT {cols_quoted}
+FROM parquet.`{databricks_tmp_folder}`"""
                 statements.append(insert_sql)
 
             # Execute statements (use your existing execute helper)
@@ -801,7 +708,7 @@ FILEFORMAT = PARQUET"""
             raise ValueError(f"Table %s not found, {type(e)} {e}" % full_name)
 
         fields = [
-            self._column_info_to_arrow_field(_)
+            column_info_to_arrow_field(_)
             for _ in table.columns
         ]
 
@@ -810,21 +717,6 @@ FILEFORMAT = PARQUET"""
             metadata={
                 b"name": table.name.encode(),
             }
-        )
-
-    @staticmethod
-    def _column_info_to_arrow_field(col):
-        from databricks.sdk.service.catalog import ColumnInfo
-        col: ColumnInfo = col
-
-        parsed = json.loads(col.type_json)
-        arrow_type = parse_sql_type_to_pa(col.type_text)
-
-        return pa.field(
-            col.name,
-            arrow_type,
-            nullable=col.nullable,
-            metadata=parsed.get("metadata", {}) or {}
         )
 
     @staticmethod

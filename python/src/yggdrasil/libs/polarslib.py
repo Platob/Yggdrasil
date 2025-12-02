@@ -8,6 +8,7 @@ from ..types.cast.registry import register_converter
 try:
     import polars  # type: ignore
 
+    polars = polars
     # Primitive Arrow -> Polars dtype mapping (base, non-nested types).
     # These are Polars *dtype classes* (not instances), so they can be used
     # directly in schemas (e.g. pl.Struct({"a": pl.Int64})).

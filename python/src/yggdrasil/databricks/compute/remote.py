@@ -239,7 +239,6 @@ def remote_invoke(
                         local_dir=dep.root_path,
                         target_dir=dbfs_root,
                         only_if_size_diff=True,
-                        parallel_pool=4,
                         exclude_dir_names=[
                             "__pycache__",
                         ],

@@ -1,4 +1,6 @@
+import base64
 import dataclasses
+import io
 import os
 import platform
 import posixpath
@@ -6,15 +8,19 @@ from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping, Optional, Union, List, BinaryIO, Dict
+from typing import Mapping, Optional, Union, List, BinaryIO, Iterator
+
+from databricks.sdk.dbutils import FileInfo
+from databricks.sdk.service.files import DirectoryEntry
 
 from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk, databricks
 from ...requests import MSALAuth
 
 if databricks_sdk is not None:
-    from databricks.sdk.errors import ResourceDoesNotExist
-    from databricks.sdk.service.workspace import ImportFormat, ObjectType, ExportFormat
+    from databricks.sdk.errors import ResourceDoesNotExist, NotFound
+    from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
+    from databricks.sdk.service import catalog as catalog_svc
 
 try:
     from pyspark.sql import SparkSession
@@ -25,6 +31,35 @@ try:
     from delta.tables import DeltaTable
 except ImportError:
     DeltaTable = None
+
+
+__all__ = [
+    "DBXAuthType",
+    "DBXWorkspace",
+    "DBXWorkspaceObject"
+]
+
+
+def _get_remote_size(sdk, target_path: str) -> Optional[int]:
+    """
+    Best-effort fetch remote file size for target_path across
+    dbfs, Volumes, and Workspace. Returns None if not found.
+    """
+    try:
+        if target_path.startswith("dbfs:/"):
+            st = sdk.dbfs.get_status(target_path)
+            return getattr(st, "file_size", None)
+
+        if target_path.startswith("/Volumes"):
+            st = sdk.files.get_status(file_path=target_path)
+            return getattr(st, "file_size", None)
+
+        # Workspace path
+        st = sdk.workspace.get_status(target_path)
+        return getattr(st, "size", None)
+
+    except ResourceDoesNotExist:
+        return None
 
 
 class DBXAuthType(Enum):
@@ -100,7 +135,7 @@ class DBXWorkspace:
         if catalog_name and schema_name and volume_name:
             base = f"/Volumes/{catalog_name}/{schema_name}/{volume_name}"
         else:
-            base = f"/Workspace/Shared/.ygg/tmp/{self.current_user.user_name}"
+            base = f"dbfs:/FileStore/.ygg/tmp/{self.current_user.user_name}"
 
         if not suffix:
             return base
@@ -155,6 +190,57 @@ class DBXWorkspace:
         require_pyspark(active_session=True)
         return SparkSession.getActiveSession()
 
+    def ensure_uc_volume_and_dir(
+        self,
+        target_path: str,
+    ) -> None:
+        """
+        Ensure catalog, schema, volume exist for a UC volume path
+        like /Volumes/<catalog>/<schema>/<volume>/...,
+        then create the directory.
+        """
+        sdk = self.sdk()
+        parts = target_path.split("/")
+
+        # basic sanity check
+        if len(parts) < 5 or parts[1] != "Volumes":
+            raise ValueError(
+                f"Unexpected UC volume path: {target_path!r}. "
+                "Expected /Volumes/<catalog>/<schema>/<volume>/..."
+            )
+
+        # /Volumes/<catalog>/<schema>/<volume>/...
+        _, _, catalog_name, schema_name, volume_name, *subpath = parts
+
+        # 1) ensure catalog
+        try:
+            sdk.catalogs.get(name=catalog_name)
+        except NotFound:
+            sdk.catalogs.create(name=catalog_name)
+
+        # 2) ensure schema
+        schema_full_name = f"{catalog_name}.{schema_name}"
+        try:
+            sdk.schemas.get(full_name=schema_full_name)
+        except NotFound:
+            sdk.schemas.create(name=schema_name, catalog_name=catalog_name)
+
+        # 3) ensure volume (managed volume is simplest)
+        volume_full_name = f"{catalog_name}.{schema_name}.{volume_name}"
+        try:
+            sdk.volumes.read(name=volume_full_name)
+        except NotFound:
+            sdk.volumes.create(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                name=volume_name,
+                volume_type=catalog_svc.VolumeType.MANAGED,
+                # for EXTERNAL you'd also pass storage_location=...
+            )
+
+        # 4) finally create the directory path itself
+        sdk.files.create_directory(target_path)
+
     def upload_content_file(
         self,
         content: Union[bytes, BinaryIO],
@@ -165,21 +251,35 @@ class DBXWorkspace:
         parallel_pool: Optional[ThreadPoolExecutor] = None,
     ):
         """
-        Upload a single local file into Databricks Workspace Files.
+        Upload a single content blob into Databricks (Workspace / Volumes / DBFS).
+
+        content:
+            bytes or a binary file-like object.
+
+        target_path:
+            - "dbfs:/..." → DBFS via dbfs.put
+            - "/Volumes/..." → Unity Catalog Volumes via files.upload
+            - anything else → Workspace via workspace.upload
 
         If parallel_pool is provided, this schedules the upload on the pool
-        and returns a Future. The actual worker call runs synchronously
-        (parallel_pool=None inside the job) to avoid infinite resubmission.
+        and returns a Future. The underlying call is non-parallel (no nested pool).
 
         If only_if_size_diff=True, it will:
-        - For large files (>4 MiB), check remote file status
-        - Skip upload if remote size == local size
+          - compute local content size (len(bytes))
+          - fetch remote size (best-effort)
+          - skip upload if sizes match.
         """
+        # If we're doing this in a pool, normalize content to bytes *before*
+        # submitting so we don't share a live file handle across threads.
         if parallel_pool is not None:
-            # Submit a *non-parallel* variant into the pool
+            if hasattr(content, "read"):
+                data = content.read()
+            else:
+                data = content
+
             return parallel_pool.submit(
                 self.upload_content_file,
-                content=content,
+                content=data,
                 target_path=target_path,
                 makedirs=makedirs,
                 overwrite=overwrite,
@@ -187,41 +287,75 @@ class DBXWorkspace:
                 parallel_pool=None,
             )
 
-        sdk = self.sdk()
 
-        try:
-            if target_path.startswith("/Volumes"):
-                # Ensure parent directory exists in the volume
-                parent_dir = os.path.dirname(target_path)
-                if parent_dir and parent_dir != "/":
-                    sdk.files.create_directory(parent_dir)
+        with self.connect() as connected:
+            sdk = connected.sdk()
+
+            # Normalize content to bytes once
+            if hasattr(content, "read"):  # BinaryIO
+                data = content.read()
+            else:
+                data = content
+
+            if not isinstance(data, (bytes, bytearray)):
+                raise TypeError(
+                    f"content must be bytes or BinaryIO, got {type(content)!r}"
+                )
+
+            data_bytes = bytes(data)
+            local_size = len(data_bytes)
+
+            # Only-if-size-diff: check remote size and bail early if equal
+            if only_if_size_diff:
+                remote_size = _get_remote_size(sdk, target_path)
+                if remote_size is not None and remote_size == local_size:
+                    # Same size remotely -> skip upload
+                    return None
+
+            # Ensure parent directory if requested
+            parent = os.path.dirname(target_path)
+
+            if target_path.startswith("dbfs:/"):
+                # --- DBFS path ---
+                if makedirs and parent and parent != "dbfs:/":
+                    sdk.dbfs.mkdirs(parent)
+
+                if isinstance(data_bytes, bytes):
+                    data_str = base64.b64encode(data_bytes).decode("utf-8")
+                else:
+                    data_str = data_bytes
+
+                sdk.dbfs.put(
+                    path=target_path,
+                    contents=data_str,
+                    overwrite=overwrite,
+                )
+
+            elif target_path.startswith("/Volumes"):
+                # --- Unity Catalog Volumes path ---
+                if makedirs and parent and parent != "/":
+                    try:
+                        sdk.files.create_directory(parent)
+                    except NotFound:
+                        connected.ensure_uc_volume_and_dir(parent)
 
                 sdk.files.upload(
                     file_path=target_path,
-                    contents=content,
+                    contents=io.BytesIO(data_bytes),
                     overwrite=overwrite,
                 )
+
             else:
+                # --- Workspace Files / Notebooks ---
+                if makedirs and parent:
+                    sdk.workspace.mkdirs(parent)
+
                 sdk.workspace.upload(
                     path=target_path,
                     format=ImportFormat.AUTO,
-                    content=content,
+                    content=data_bytes,
                     overwrite=overwrite,
                 )
-        except ResourceDoesNotExist:
-            if not makedirs:
-                raise
-
-            parent = os.path.dirname(target_path)
-            if parent:
-                sdk.workspace.mkdirs(parent)
-
-            sdk.workspace.upload(
-                path=target_path,
-                format=ImportFormat.AUTO,
-                content=content,
-                overwrite=overwrite,
-            )
 
     def upload_local_file(
         self,
@@ -412,6 +546,66 @@ class DBXWorkspace:
             if created_pool is not None:
                 created_pool.shutdown(wait=True)
 
+    def list_path(
+        self,
+        path: str,
+        recursive: bool = False,
+    ) -> Iterator[Union[FileInfo, ObjectInfo, DirectoryEntry]]:
+        """
+        List contents of a path across Databricks namespaces:
+
+          - 'dbfs:/...'      -> DBFS (sdk.dbfs.list)
+          - '/Volumes/...'   -> Unity Catalog Volumes (sdk.files.list_directory_contents)
+          - other paths      -> Workspace paths (sdk.workspace.list)
+
+        If recursive=True, yield all nested files/directories.
+        """
+
+        sdk = self.sdk()
+
+        # ---------------------------
+        # DBFS RECURSIVE WALK
+        # ---------------------------
+        if path.startswith("dbfs:/"):
+            try:
+                entries = list(sdk.dbfs.list(path, recursive=recursive))
+            except ResourceDoesNotExist:
+                return
+
+            for info in entries:
+                yield info
+
+            return
+
+        # ---------------------------
+        # UNITY CATALOG VOLUMES
+        # ---------------------------
+        if path.startswith("/Volumes"):
+            try:
+                entries = list(sdk.files.list_directory_contents(path))
+            except ResourceDoesNotExist:
+                return
+
+            for entry in entries:
+                yield entry
+
+                if recursive and entry.is_directory:
+                    child_path = posixpath.join(path, entry.path)
+                    yield from self.list_path(child_path, recursive=True)
+
+            return
+
+        # ---------------------------
+        # WORKSPACE FILES / NOTEBOOKS
+        # ---------------------------
+        try:
+            entries = list(sdk.workspace.list(path, recursive=recursive))
+        except ResourceDoesNotExist:
+            return
+
+        for obj in entries:
+            yield obj
+
     def open_path(
         self,
         path: str,
@@ -486,6 +680,13 @@ class DBXWorkspaceObject(ABC):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.workspace.__exit__(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
+
+    def connect(self):
+        self.workspace.connect()
+        return self
+
+    def sdk(self):
+        return self.workspace.sdk()
 
     @property
     def current_user(self):
