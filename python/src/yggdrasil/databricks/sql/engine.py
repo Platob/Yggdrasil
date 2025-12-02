@@ -14,8 +14,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..workspaces import DBXWorkspaceObject, DBXWorkspace
-from ...types.cast import convert, ArrowCastOptions
 from ...libs import SparkSession, SparkDataFrame, pyspark
+from ...types.cast import convert, ArrowCastOptions
 
 try:
     from delta.tables import DeltaTable
@@ -201,6 +201,11 @@ except OSError:
     DEFAULT_STAGING_ALLOWED_LOCAL_PATH = None
 
 
+
+class SqlExecutionError(RuntimeError):
+    pass
+
+
 @dataclasses.dataclass
 class DBXSQL(DBXWorkspaceObject):
     warehouse_id: Optional[str] = None
@@ -265,35 +270,20 @@ class DBXSQL(DBXWorkspaceObject):
 
         return parts[-3], parts[-2], parts[-1]
 
-
-    @staticmethod
-    def _volume_full_path(
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
-        shared: bool = False
-    ):
-        assert catalog_name, "No catalog name give"
-        assert schema_name, "No schema name give"
-        assert volume_name, "No table name give"
-        prefix = "Shared" if shared else "Volumes"
-
-        return f"/{prefix}/{catalog_name}/{schema_name}/{volume_name}"
-
     def _default_warehouse(
         self,
-        find_alive: bool = True
+        cluster_size: str = "Small"
     ):
         wk = self.workspace.sdk()
-        existing = wk.warehouses.list(page_size=5)
+        existing = list(wk.warehouses.list(page_size=5))
         first = None
 
         for warehouse in existing:
             if first is None:
                 first = warehouse
 
-            if find_alive:
-                if warehouse.state == State.RUNNING:
+            if cluster_size:
+                if warehouse.cluster_size == cluster_size:
                     return warehouse
             else:
                 return warehouse
@@ -305,10 +295,10 @@ class DBXSQL(DBXWorkspaceObject):
 
     def _get_or_default_warehouse_id(
         self,
-        find_alive: bool = True
+        cluster_size = "Small"
     ):
         if not self.warehouse_id:
-            dft = self._default_warehouse(find_alive=find_alive)
+            dft = self._default_warehouse(cluster_size=cluster_size)
 
             self.warehouse_id = dft.id
         return self.warehouse_id
@@ -330,73 +320,135 @@ class DBXSQL(DBXWorkspaceObject):
     def execute(
         self,
         statement: str,
-        **kwargs
+        *,
+        wait: bool = True,
+        timeout: Optional[float] = 600.0,
+        poll_interval: float = 1.0,
+        **kwargs,
     ):
+        """
+        Execute a SQL statement on a SQL warehouse.
+
+        - If wait=True (default): poll until terminal state.
+            - On SUCCEEDED: return final statement object
+            - On FAILED / CANCELED: raise SqlExecutionError
+        - If wait=False: return initial execution handle without polling.
+        """
         wk = self.workspace.sdk()
 
         execution = wk.statement_execution.execute_statement(
             statement=statement,
             warehouse_id=self._get_or_default_warehouse_id(),
-            **kwargs
+            **kwargs,
         )
 
-        return execution
+        if not wait:
+            # Caller handles polling / status themselves
+            return execution
+
+        statement_id = execution.statement_id
+        start = time.time()
+
+        while True:
+            current = wk.statement_execution.get_statement(statement_id)
+            status = getattr(current, "status", None)
+            state = getattr(status, "state", None)
+
+            # handle enum vs string
+            state_str = getattr(state, "value", state)
+            state_str = str(state_str) if state_str is not None else "UNKNOWN"
+
+            if state_str in ("SUCCEEDED", "FAILED", "CANCELED"):
+                # terminal
+                if state_str == "SUCCEEDED":
+                    return current
+
+                # grab error info if present
+                err = getattr(status, "error", None)
+                message = getattr(err, "message", None) or "Unknown SQL error"
+                error_code = getattr(err, "error_code", None)
+                sql_state = getattr(err, "sql_state", None)
+
+                parts = [message]
+                if error_code:
+                    parts.append(f"error_code={error_code}")
+                if sql_state:
+                    parts.append(f"sql_state={sql_state}")
+
+                raise SqlExecutionError(
+                    f"Statement {statement_id} {state_str}: " + " | ".join(parts)
+                )
+
+            # still running / queued / pending
+            if timeout is not None and (time.time() - start) > timeout:
+                raise TimeoutError(
+                    f"Statement {statement_id} did not finish within {timeout} seconds "
+                    f"(last state={state_str})"
+                )
+
+            time.sleep(poll_interval)
 
     def read_arrow_batches(
         self,
-        statement: str,
+        statement: Optional[str] = None,
         *,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
         batch_size: int | None = None,
     ) -> pa.RecordBatchReader:
         """Stream query results from a temporary workspace export as Arrow batches."""
+        if not statement:
+            if catalog_name and schema_name and table_name:
+                full_name = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name, safe_chars=True)
+                statement = f"SELECT * FROM {full_name}"
+            else:
+                raise ValueError("Missing SQL statement")
+
         query = statement.strip().rstrip(";")
         if not query:
             raise ValueError("Statement must not be empty")
 
-        temp_folder = self.temp_volume_folder(suffix=self._random_suffix("read_"))
-        fs = self.fs()
+        with self.workspace.connect() as connected:
+            temp_folder = self.workspace.temp_volume_folder(suffix=self._random_suffix("read_"))
+            connected.delete_path(temp_folder, recursive=True)
 
-        try:
-            fs.rm(temp_folder, recurse=True)
-        except Exception:
-            pass
+            copy_sql = f"""COPY INTO '{temp_folder}'
+FROM (
+    {query}
+)
+FILEFORMAT = PARQUET"""
 
-        copy_sql = f"""
-        COPY INTO '{temp_folder}'
-        FROM ({query})
-        FILEFORMAT PARQUET
-        """
+            self.execute(copy_sql)
 
-        self.execute(copy_sql)
+            file_infos = [
+                info
+                for info in connected.sdk().workspace.list(temp_folder)
+                if not str(getattr(info, "path", "")).endswith("/")
+            ]
 
-        file_infos = [
-            info
-            for info in fs.ls(temp_folder)
-            if not str(getattr(info, "path", "")).endswith("/")
-        ]
-
-        def batch_iterator():
-            try:
-                for info in file_infos:
-                    with fs.open(info.path, "rb") as handle:
-                        parquet_file = pq.ParquetFile(handle)
-                        yield from parquet_file.iter_batches(batch_size=batch_size)
-            finally:
+            def batch_iterator():
                 try:
-                    fs.rm(temp_folder, recurse=True)
-                except Exception:
-                    pass
+                    for info in file_infos:
+                        with connected.open_path(info.path) as handle:
+                            parquet_file = pq.ParquetFile(handle)
+                            yield from parquet_file.iter_batches(batch_size=batch_size)
+                finally:
+                    try:
+                        connected.delete_path(temp_folder, recursive=True)
+                    except Exception:
+                        pass
 
-        iterator = batch_iterator()
-        first_batch = next(iterator, None)
+            iterator = batch_iterator()
+            first_batch = next(iterator, None)
 
-        if first_batch is None:
-            return pa.RecordBatchReader.from_batches(pa.schema([]), [])
+            if first_batch is None:
+                return pa.RecordBatchReader.from_batches(pa.schema([]), [])
 
-        return pa.RecordBatchReader.from_batches(
-            first_batch.schema,
-            itertools.chain([first_batch], iterator)
-        )
+            return pa.RecordBatchReader.from_batches(
+                first_batch.schema,
+                itertools.chain([first_batch], iterator)
+            )
 
     def spark_table(
         self,
@@ -455,7 +507,6 @@ class DBXSQL(DBXWorkspaceObject):
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                spark_session=spark_session,
                 spark_options=spark_options
             )
 
@@ -497,126 +548,130 @@ class DBXSQL(DBXWorkspaceObject):
 
         transaction_id = self._random_suffix()
 
-        try:
-            existing_schema = self.get_table_schema(
+        with self.workspace.connect() as connected:
+            try:
+                existing_schema = self.get_table_schema(
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                )
+            except ValueError:
+                data = convert(data, pa.Table)
+                existing_schema = data.schema
+                statement = self.create_table_ddl(
+                    schema=existing_schema,
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    if_not_exists=False
+                )
+                self.execute(statement)
+                mode = "overwrite"
+
+            # normalize arrow tabular input
+            data = convert(convert(data, pa.Table), existing_schema, options=cast_options)
+
+            # Write in temp volume
+            databricks_tmp_folder = connected.temp_volume_folder(
+                suffix=transaction_id,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
-                table_name=table_name,
+                volume_name="tmp"
             )
-        except ValueError:
-            data = convert(data, pa.Table)
-            existing_schema = data.schema
-            statement = self.create_table_ddl(
-                schema=existing_schema,
+            databricks_tmp_path = databricks_tmp_folder + "/data.parquet"
+
+            buffer = io.BytesIO()
+
+            # remove pandas index if present in the schema helper
+            pq.write_table(data, buffer, compression="snappy")
+            buffer.seek(0)
+
+            connected.upload_content_file(
+                target_path=databricks_tmp_path,
+                content=buffer,
+            )
+
+            # build fully-qualified table name
+            full_table = self._table_full_name(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
-                table_name=table_name,
-                if_not_exists=False
+                table_name=table_name
             )
-            self.execute(statement)
-            mode = "overwrite"
 
-        # normalize arrow tabular input
-        data = convert(convert(data, pa.Table), existing_schema, options=cast_options)
+            # get column list from arrow schema
+            columns = [c for c in existing_schema.names]
+            cols_quoted = ", ".join([f"`{c}`" for c in columns])
 
-        # Write in temp volume
-        databricks_tmp_folder = self.temp_volume_folder(suffix=transaction_id)
-        databricks_tmp_path = databricks_tmp_folder + "/data.parquet"
+            statements = []
 
-        buffer = io.BytesIO()
+            # Decide how to ingest
+            # If merge keys provided -> use MERGE
+            if match_by:
+                # build ON condition using match_by
+                on_clauses = []
+                for k in match_by:
+                    on_clauses.append(f"T.`{k}` = S.`{k}`")
+                on_condition = " AND ".join(on_clauses)
 
-        # remove pandas index if present in the schema helper
-        pq.write_table(data, buffer, compression="snappy")
+                # build UPDATE set (all columns except match_by)
+                update_cols = [c for c in columns if c not in match_by]
+                if update_cols:
+                    update_set = ", ".join([f"T.`{c}` = S.`{c}`" for c in update_cols])
+                    update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
+                else:
+                    update_clause = ""  # nothing to update
 
-        buffer = base64.b64encode(buffer.getvalue()).decode("utf8")
+                # build INSERT clause
+                insert_clause = f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
 
-        self.fs().put(
-            file=databricks_tmp_path,
-            contents=buffer,
-            overwrite=True
-        )
-
-        # build fully-qualified table name
-        full_table = self._table_full_name(
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name
-        )
-
-        # get column list from arrow schema
-        columns = [c for c in existing_schema.names]
-        cols_quoted = ", ".join([f"`{c}`" for c in columns])
-
-        statements = []
-
-        # Decide how to ingest
-        # If merge keys provided -> use MERGE
-        if match_by:
-            # build ON condition using match_by
-            on_clauses = []
-            for k in match_by:
-                on_clauses.append(f"T.`{k}` = S.`{k}`")
-            on_condition = " AND ".join(on_clauses)
-
-            # build UPDATE set (all columns except match_by)
-            update_cols = [c for c in columns if c not in match_by]
-            if update_cols:
-                update_set = ", ".join([f"T.`{c}` = S.`{c}`" for c in update_cols])
-                update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
-            else:
-                update_clause = ""  # nothing to update
-
-            # build INSERT clause
-            insert_clause = f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
-
-            merge_sql = f"""
-            MERGE INTO {full_table} AS T
-            USING (
-              SELECT {cols_quoted}
-              FROM parquet.`{databricks_tmp_folder}`
-            ) AS S
-            ON {on_condition}
-            {update_clause}
-            {insert_clause}
-            """
-            statements.append(merge_sql)
-
-        else:
-            # No match_by -> plain insert
-            if mode.lower() in ("overwrite",):
-                insert_sql = f"""
-                INSERT OVERWRITE {full_table}
-                SELECT {cols_quoted}
-                FROM parquet.`{databricks_tmp_folder}`
+                merge_sql = f"""
+                MERGE INTO {full_table} AS T
+                USING (
+                  SELECT {cols_quoted}
+                  FROM parquet.`{databricks_tmp_folder}`
+                ) AS S
+                ON {on_condition}
+                {update_clause}
+                {insert_clause}
                 """
+                statements.append(merge_sql)
+
             else:
-                # default: append
-                insert_sql = f"""
-                INSERT INTO {full_table} ({cols_quoted})
-                SELECT {cols_quoted}
-                FROM parquet.`{databricks_tmp_folder}`
-                """
-            statements.append(insert_sql)
+                # No match_by -> plain insert
+                if mode.lower() in ("overwrite",):
+                    insert_sql = f"""
+                    INSERT OVERWRITE {full_table}
+                    SELECT {cols_quoted}
+                    FROM parquet.`{databricks_tmp_folder}`
+                    """
+                else:
+                    # default: append
+                    insert_sql = f"""
+                    INSERT INTO {full_table} ({cols_quoted})
+                    SELECT {cols_quoted}
+                    FROM parquet.`{databricks_tmp_folder}`
+                    """
+                statements.append(insert_sql)
 
-        # Execute statements (use your existing execute helper)
-        try:
-            for stmt in statements:
-                # trim and run
-                self.execute(stmt.strip())
-        finally:
-            self.fs().rm(databricks_tmp_folder, recurse=True)
+            # Execute statements (use your existing execute helper)
+            try:
+                for stmt in statements:
+                    # trim and run
+                    self.execute(stmt.strip())
+            finally:
+                connected.delete_path(databricks_tmp_folder, recursive=True)
 
-        # Optionally run OPTIMIZE / ZORDER / VACUUM if requested (Databricks SQL)
-        if zorder_by:
-            zcols = ", ".join([f"`{c}`" for c in zorder_by])
-            optimize_sql = f"OPTIMIZE {full_table} ZORDER BY ({zcols})"
-            self.execute(optimize_sql)
+            # Optionally run OPTIMIZE / ZORDER / VACUUM if requested (Databricks SQL)
+            if zorder_by:
+                zcols = ", ".join([f"`{c}`" for c in zorder_by])
+                optimize_sql = f"OPTIMIZE {full_table} ZORDER BY ({zcols})"
+                self.execute(optimize_sql)
 
-        if optimize_after_merge and match_by:
-            self.execute(f"OPTIMIZE {full_table}")
+            if optimize_after_merge and match_by:
+                self.execute(f"OPTIMIZE {full_table}")
 
-        if vacuum_hours is not None:
-            self.execute(f"VACUUM {full_table} RETAIN {vacuum_hours} HOURS")
+            if vacuum_hours is not None:
+                self.execute(f"VACUUM {full_table} RETAIN {vacuum_hours} HOURS")
 
         return None
 
@@ -910,7 +965,12 @@ class DBXSQL(DBXWorkspaceObject):
             sql.append(f"\nCLUSTER BY AUTO")
 
         # Add comment if provided
-        comment = comment or schema.metadata_str.get("comment")
+        if not comment and schema.metadata:
+            comment = schema.metadata.get(b"comment")
+
+        if isinstance(comment, bytes):
+            comment = comment.decode("utf-8")
+
         if comment:
             sql.append(f"\nCOMMENT '{comment}'")
 

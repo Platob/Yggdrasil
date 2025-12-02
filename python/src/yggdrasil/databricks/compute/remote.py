@@ -221,7 +221,8 @@ def remote_invoke(
                     connected.upload_local_folder(
                         local_dir=dep.root_path,
                         target_dir=dbfs_root,
-                        only_if_size_diff=True
+                        only_if_size_diff=True,
+                        parallel_pool=4
                     )
 
                 # Point the dependency at the DBFS-backed local path so build() can
