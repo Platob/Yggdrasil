@@ -18,6 +18,7 @@ from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...requests.session import YGGSession
+from ...types import cast_spark_dataframe, arrow_table_to_spark_dataframe
 from ...types.cast import convert, ArrowCastOptions
 
 try:
@@ -667,7 +668,11 @@ FROM parquet.`{databricks_tmp_folder}`"""
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
-        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame, existing_schema)
+        if not isinstance(data, pyspark.sql.DataFrame):
+            data = convert(data, pa.Table, existing_schema)
+            data = arrow_table_to_spark_dataframe(data, existing_schema)
+
+        data = cast_spark_dataframe(data, existing_schema)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
