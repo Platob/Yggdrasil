@@ -104,6 +104,7 @@ class DBXWorkspace:
     account_id: Optional[str] = None
     token: Optional[str] = None
     client_id: Optional[str] = None
+    client_secret: Optional[str] = None
     token_audience: Optional[str] = None
 
     # Azure
@@ -157,6 +158,7 @@ class DBXWorkspace:
             account_id=self.account_id,
             token=self.token,
             client_id=self.client_id,
+            client_secret=self.client_secret,
             token_audience=self.token_audience,
             azure_workspace_resource_id=self.azure_workspace_resource_id,
             azure_use_msi=self.azure_use_msi,
@@ -319,6 +321,7 @@ class DBXWorkspace:
                 "account_id": self.account_id,
                 "token": self.token,
                 "client_id": self.client_id,
+                "client_secret": self.client_secret,
                 "token_audience": self.token_audience,
                 "azure_workspace_resource_id": self.azure_workspace_resource_id,
                 "azure_use_msi": self.azure_use_msi,
