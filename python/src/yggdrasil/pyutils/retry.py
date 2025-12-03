@@ -7,6 +7,7 @@ Features:
 - Configurable max attempts
 - Fixed or exponential backoff
 - Optional jitter
+- Optional total timeout
 - Works for both sync and async functions
 - Optional logging hook
 """
@@ -20,9 +21,7 @@ import random
 import time
 from typing import (
     Any,
-    Awaitable,
     Callable,
-    Iterable,
     Optional,
     Type,
     TypeVar,
@@ -52,6 +51,7 @@ def retry(
     jitter: Optional[Callable[[float], float]] = None,
     logger: Optional[logging.Logger] = None,
     reraise: bool = True,
+    timeout: Optional[float] = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """
     Retry decorator that works for both sync and async functions.
@@ -74,8 +74,12 @@ def retry(
     logger:
         Optional logger for debug/info messages.
     reraise:
-        If True, re-raise the last exception after exhausting retries.
-        If False, returns None after all retries fail.
+        If True, re-raise the last exception after exhausting retries or timeout.
+        If False, returns None after all retries fail or timeout is hit.
+    timeout:
+        Optional max total time in seconds across all attempts. The timeout is
+        checked after each failed attempt. In-flight attempts are not forcibly
+        cancelled; we just stop scheduling new retries when the timeout is hit.
 
     Usage
     -----
@@ -83,7 +87,7 @@ def retry(
     def flaky():
         ...
 
-    @retry(tries=5)
+    @retry(tries=5, timeout=2.0)
     async def async_flaky():
         ...
     """
@@ -94,6 +98,8 @@ def retry(
         raise ValueError("delay must be >= 0")
     if backoff < 1:
         raise ValueError("backoff must be >= 1")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("timeout must be > 0 when provided")
 
     exc_types = _ensure_exception_tuple(exceptions)
 
@@ -103,10 +109,29 @@ def retry(
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
                 _delay = delay
                 attempt = 1
+                start_time = time.monotonic() if timeout is not None else None
+
                 while True:
                     try:
                         return await func(*args, **kwargs)
                     except exc_types as e:  # type: ignore[misc]
+                        # Check timeout after a failed attempt
+                        if start_time is not None:
+                            elapsed = time.monotonic() - start_time
+                            if elapsed >= timeout:  # type: ignore[operator]
+                                if logger:
+                                    logger.error(
+                                        "Retry timeout (%.3fs) reached on async %s "
+                                        "after %s attempts: %r",
+                                        elapsed,
+                                        func.__name__,
+                                        attempt,
+                                        e,
+                                    )
+                                if reraise:
+                                    raise
+                                return None  # type: ignore[return-value]
+
                         if attempt >= tries:
                             if logger:
                                 logger.error(
@@ -147,10 +172,29 @@ def retry(
             def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
                 _delay = delay
                 attempt = 1
+                start_time = time.monotonic() if timeout is not None else None
+
                 while True:
                     try:
                         return func(*args, **kwargs)
                     except exc_types as e:  # type: ignore[misc]
+                        # Check timeout after a failed attempt
+                        if start_time is not None:
+                            elapsed = time.monotonic() - start_time
+                            if elapsed >= timeout:  # type: ignore[operator]
+                                if logger:
+                                    logger.error(
+                                        "Retry timeout (%.3fs) reached on %s "
+                                        "after %s attempts: %r",
+                                        elapsed,
+                                        func.__name__,
+                                        attempt,
+                                        e,
+                                    )
+                                if reraise:
+                                    raise
+                                return None  # type: ignore[return-value]
+
                         if attempt >= tries:
                             if logger:
                                 logger.error(
@@ -231,3 +275,34 @@ def random_jitter(scale: float = 0.1) -> Callable[[float], float]:
         return d + random.uniform(-delta, delta)
 
     return _jitter
+
+
+# Example usage / quick smoke test
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger("retry-demo")
+
+    counter = {"n": 0}
+
+    @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
+    def flaky_function() -> str:
+        counter["n"] += 1
+        if counter["n"] < 3:
+            raise ValueError("boom")
+        return "ok"
+
+    print("Result:", flaky_function())
+
+    async def main():
+        async_counter = {"n": 0}
+
+        @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
+        async def async_flaky() -> str:
+            async_counter["n"] += 1
+            if async_counter["n"] < 3:
+                raise RuntimeError("async boom")
+            return "async ok"
+
+        print("Async result:", await async_flaky())
+
+    asyncio.run(main())

@@ -313,17 +313,86 @@ def remote_invoke(
                 for line in prefix.splitlines():
                     print(line.rstrip())
 
-            if start_idx == -1 or end_idx == -1:
-                raise ValueError("Cannot find result content")
+            # --- validate markers with explicit errors ---
+            if start_idx == -1 and end_idx == -1:
+                snippet = text[-1000:] if len(text) > 1000 else text
+                raise ValueError(
+                    "Cannot find embedded result markers in remote stdout. "
+                    f"Expected '{start_tag}' and '{end_tag}' but neither was found. "
+                    "Last part of stdout:\n"
+                    f"{snippet}"
+                )
 
+            if start_idx == -1:
+                snippet = text[-1000:] if len(text) > 1000 else text
+                raise ValueError(
+                    f"Missing start marker '{start_tag}' in remote stdout. "
+                    "Cannot locate embedded result payload. "
+                    "Last part of stdout:\n"
+                    f"{snippet}"
+                )
+
+            if end_idx == -1:
+                snippet = text[start_idx:start_idx + 1000]
+                raise ValueError(
+                    f"Found start marker '{start_tag}' at index {start_idx} "
+                    f"but missing end marker '{end_tag}'. "
+                    "Partial content after start marker:\n"
+                    f"{snippet}"
+                )
+
+            # --- extract JSON payload ---
             start_idx += len(start_tag)
             payload_json = text[start_idx:end_idx].strip()
 
-            payload = json.loads(payload_json)
+            if not payload_json:
+                raise ValueError(
+                    "Embedded result payload between markers is empty. "
+                    f"Markers used: '{start_tag}' ... '{end_tag}'."
+                )
+
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError as e:
+                snippet = payload_json[:1000]
+                raise ValueError(
+                    "Failed to parse embedded result JSON between markers. "
+                    f"JSON error: {e}. "
+                    "First 1000 characters of raw payload:\n"
+                    f"{snippet}"
+                ) from e
+
+            if "result_b64" not in payload:
+                raise KeyError(
+                    "Embedded result JSON does not contain required key 'result_b64'. "
+                    f"Available keys: {list(payload.keys())}"
+                )
 
             result_b64 = payload["result_b64"]
-            result_bytes = base64.b64decode(result_b64.encode("utf-8"))
-            return dill.loads(result_bytes)
+
+            if not isinstance(result_b64, str) or not result_b64.strip():
+                raise ValueError(
+                    "Field 'result_b64' in embedded result JSON is missing or empty."
+                )
+
+            # --- decode base64 + dill with explicit errors ---
+            try:
+                result_bytes = base64.b64decode(result_b64.encode("utf-8"))
+            except Exception as e:
+                snippet = result_b64[:200]
+                raise ValueError(
+                    "Failed to base64-decode 'result_b64' from embedded result JSON. "
+                    f"Error: {e}. First 200 characters of base64 string:\n{snippet}"
+                ) from e
+
+            try:
+                return dill.loads(result_bytes)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to unpickle embedded result via dill.loads(). "
+                    "The remote side may have returned an incompatible or corrupted payload. "
+                    f"Underlying error: {e}"
+                ) from e
 
         finally:
             if context_id:
@@ -333,6 +402,7 @@ def remote_invoke(
                         context_id=context_id,
                     )
                 except Exception:
+                    # Best-effort cleanup; don't mask original error
                     pass
 
 
