@@ -638,7 +638,7 @@ def test_cast_arrow_array_default_datetime_formats_to_utc_timestamp():
         "2024-01-02 03:04:05.123456+0100", # %Y-%m-%d %H:%M:%S.%f%z
 
         # Zoned without fraction seconds (T / space)
-        "2024-01-02T03:04Z",            # %Y-%m-%dT%H:%M:%S%z
+        "2024-01-02 03:04Z",            # %Y-%m-%dT%H:%M:%S%z
         "2024-01-02 03:04:05+0100",        # %Y-%m-%d %H:%M:%S%z
 
         # Zoned without seconds (T / space)

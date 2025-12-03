@@ -147,26 +147,6 @@ class ArrowCastOptions:
 
 
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()
-DEFAULT_ZONED_DATETIME_FORMATS = [
-    "%Y-%m-%dT%H:%M:%S.%f%z",       # 2024-01-02T03:04:05.123456Z
-    "%Y-%m-%d %H:%M:%S.%f%z",       # 2024-01-02T03:04:05.123456Z
-    "%Y-%m-%dT%H:%M:%S%z",          # 2024-01-02T03:04:05Z / +0100
-    "%Y-%m-%d %H:%M:%S%z",          # 2024-01-02 03:04:05Z / +0100
-    "%Y-%m-%dT%H:%M%z",
-    "%Y-%m-%d %H:%M%z"
-]
-DEFAULT_NAIVE_DATETIME_FORMATS = [
-    "%Y-%m-%dT%H:%M:%S.%f",       # 2024-01-02 03:04:05.123456Z
-    "%Y-%m-%d %H:%M:%S.%f",       # 2024-01-02 03:04:05.123456Z
-    "%Y-%m-%dT%H:%M:%S",          # 2024-01-02 03:04:05Z / +0100
-    "%Y-%m-%d %H:%M:%S",          # 2024-01-02 03:04:05Z / +0100
-    "%Y-%m-%d %H:%M",          # 2024-01-02 03:04:05Z / +0100
-]
-DEFAULT_DATE_FORMATS = [
-    "%Y-%m-%d",                     # 2024-01-02
-]
-DEFAULT_DATETIME_FORMATS = DEFAULT_ZONED_DATETIME_FORMATS + DEFAULT_NAIVE_DATETIME_FORMATS + DEFAULT_DATE_FORMATS
-
 
 # ---------------------------------------------------------------------------
 # Core array casting
@@ -273,31 +253,56 @@ def cast_to_struct_array(
 
 def cast_to_list_array(
     arr: Union[pa.Array, pa.ListArray, pa.LargeListArray],
-    target: pa.DataType,
+    target: Union[pa.ListType, pa.LargeListType, pa.FixedSizeListType],
     *,
     nullable: bool,
     source_field: Optional[pa.Field],
     _cast_array_fn,
 ) -> Union[pa.ListArray, pa.LargeListArray]:
     """Cast arrays to a list or large list Arrow array."""
-    if pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type):
+    if pa.types.is_large_list(target):
+        constructor = pa.LargeListArray
+    elif pa.types.is_fixed_size_list(target):
+        constructor = pa.FixedSizeListArray
+    elif pa.types.is_list_view(target):
+        constructor = pa.FixedSizeListArray
+    else:
+        constructor = pa.ListArray
+
+    mask = arr.is_null() if arr.null_count else None
+
+    if (
+        pa.types.is_list(arr.type)
+        or pa.types.is_large_list(arr.type)
+        or pa.types.is_fixed_size_list(arr.type)
+        or pa.types.is_list_view(arr.type)
+    ):
         list_source_field = arr.type.value_field
 
+        offsets = arr.offsets
         values = _cast_array_fn(
             arr.values,
             target.value_type,
             nullable=True,
             source_field=list_source_field,
         )
-        mask = arr.is_null() if arr.null_count else None
-        return type(arr).from_arrays(
-            arr.offsets,
+    else:
+        raise pa.ArrowInvalid(f"Unsupported list casting for type {arr.type}")
+
+    if constructor == pa.FixedSizeListArray:
+        return constructor.from_arrays(
             values,
-            mask=mask,
-            type=target,
+            target.list_size,
+            target,
+            mask
         )
 
-    raise pa.ArrowInvalid(f"Unsupported list casting for type {arr.type}")
+    return constructor.from_arrays(
+        offsets,
+        values,
+        mask,
+        target,
+    )
 
 
 def cast_to_map_array(
@@ -443,150 +448,20 @@ def cast_arrow_array_strptime(
       ... optionally with .fraction (1–9 digits)
       ... optionally with timezone: Z, +HHMM, +HH:MM, -HHMM, -HH:MM
     """
-    fmt_list = getattr(options, "datetime_formats", None)
-    if not fmt_list:
-        fmt_list = DEFAULT_DATETIME_FORMATS  # semantic flag only
+    from .polars_cast import arrow_type_to_polars_type, cast_polars_series_strptime
 
-    unit = target.unit  # "s", "ms", "us", "ns"
+    if options.target_field is None:
+        return arr
 
-    s = polars.from_arrow(arr).alias("value")
-    df = s.to_frame()
-
-    # ✅ compact pattern: no VERBOSE-style whitespace/comments
-    pattern = (
-        r"^"
-        r"(\d{4})-(\d{2})-(\d{2})"
-        r"(?:[ T]"
-        r"(\d{2}):(\d{2})"
-        r"(?::(\d{2}))?"
-        r"(?:\.(\d+))?"
-        r")?"
-        r"(Z|[+-]\d{2}:?\d{2})?"
-        r"$"
+    ticks_series = cast_polars_series_strptime(
+        polars.from_arrow(arr),
+        options=options,
+        target=arrow_type_to_polars_type(options.target_field.type, options)
     )
 
-    df = df.with_columns([
-        polars.col("value").str.extract(pattern, group_index=1).alias("year"),
-        polars.col("value").str.extract(pattern, group_index=2).alias("month"),
-        polars.col("value").str.extract(pattern, group_index=3).alias("day"),
-        polars.col("value").str.extract(pattern, group_index=4).alias("hour"),
-        polars.col("value").str.extract(pattern, group_index=5).alias("minute"),
-        polars.col("value").str.extract(pattern, group_index=6).alias("second"),
-        polars.col("value").str.extract(pattern, group_index=7).alias("fraction"),
-        polars.col("value").str.extract(pattern, group_index=8).alias("tz"),
-    ])
-
-    # Cast components, default missing time parts to 0
-    df = df.with_columns([
-        polars.col("year").cast(polars.Int64),
-        polars.col("month").cast(polars.Int64),
-        polars.col("day").cast(polars.Int64),
-        polars.col("hour").cast(polars.Int64).fill_null(0),
-        polars.col("minute").cast(polars.Int64).fill_null(0),
-        polars.col("second").cast(polars.Int64).fill_null(0),
-    ])
-
-    # fraction -> nanoseconds (pad right to 9 digits)
-    df = df.with_columns(
-        polars.when(polars.col("fraction").is_null())
-        .then(0)
-        .otherwise(
-            (polars.col("fraction") + polars.lit("000000000"))
-            .str.slice(0, 9)
-            .cast(polars.Int64)
-        )
-        .alias("frac_ns")
-    )
-
-    # tz_clean: normalize +HH:MM/+HHMM, -HH:MM/-HHMM, ignore Z / null
-    df = df.with_columns(
-        polars.when(polars.col("tz").is_null() | (polars.col("tz") == "Z"))
-        .then(None)
-        .otherwise(polars.col("tz").str.replace(":", ""))
-        .alias("tz_clean")
-    )
-
-    df = df.with_columns([
-        polars.when(polars.col("tz_clean").is_null())
-        .then(0)
-        .otherwise(
-            polars.when(polars.col("tz_clean").str.starts_with("-")).then(-1).otherwise(1)
-        )
-        .alias("tz_sign"),
-        polars.when(polars.col("tz_clean").is_null())
-        .then(0)
-        .otherwise(polars.col("tz_clean").str.slice(1, 2).cast(polars.Int64))
-        .alias("tz_h"),
-        polars.when(polars.col("tz_clean").is_null())
-        .then(0)
-        .otherwise(polars.col("tz_clean").str.slice(3, 2).cast(polars.Int64))
-        .alias("tz_m"),
-    ])
-
-    df = df.with_columns(
-        polars.when(polars.col("tz").is_null() | (polars.col("tz") == "Z"))
-        .then(0)
-        .otherwise(
-            polars.col("tz_sign") * (polars.col("tz_h") * 3600 + polars.col("tz_m") * 60)
-        )
-        .alias("offset_seconds")
-    )
-
-    # local naive datetime(ns)
-    df = df.with_columns(
-        polars.datetime(
-            polars.col("year"),
-            polars.col("month"),
-            polars.col("day"),
-            polars.col("hour"),
-            polars.col("minute"),
-            polars.col("second"),
-            time_unit="ns",
-        ).alias("local_dt")
-    ).with_columns(
-        polars.col("local_dt").cast(polars.Int64).alias("local_ns")
-    )
-
-    # apply fraction + offset to get utc_ns
-    df = df.with_columns(
-        (
-            polars.col("local_ns")
-            + polars.col("frac_ns")
-            - polars.col("offset_seconds") * 1_000_000_000
-        ).alias("utc_ns")
-    )
-
-    # ns → target unit
-    if unit == "s":
-        ticks_expr = (polars.col("utc_ns") // 1_000_000_000).alias("ticks")
-    elif unit == "ms":
-        ticks_expr = (polars.col("utc_ns") // 1_000_000).alias("ticks")
-    elif unit == "us":
-        ticks_expr = (polars.col("utc_ns") // 1_000).alias("ticks")
-    elif unit == "ns":
-        ticks_expr = polars.col("utc_ns").alias("ticks")
-    else:
-        raise pa.ArrowInvalid(f"Unsupported timestamp unit: {unit!r}")
-
-    df = df.with_columns(ticks_expr)
-
-    # safe mode: only allow null ticks for "" / None
-    if options.safe:
-        failed = df.filter(
-            polars.col("value").is_not_null()
-            & (polars.col("value") != "")
-            & polars.col("ticks").is_null()
-        )
-        if failed.height > 0:
-            bad_vals = failed["value"].to_list()
-            raise pa.ArrowInvalid(
-                f"Could not parse datetime values: {bad_vals[:5]}..."
-            )
-
-    ticks_series = df["ticks"]
     out_arr = pa.array(
         ticks_series.to_arrow(),
-        type=pa.timestamp(unit, tz=target.tz),
+        type=pa.timestamp(target.unit, tz=target.tz),
     )
 
     if out_arr.type != target:
@@ -667,7 +542,12 @@ def _cast_single(
         )
 
     # ---------- List / LargeList casting ----------
-    if pa.types.is_list(target) or pa.types.is_large_list(target):
+    if (
+        pa.types.is_list(target)
+        or pa.types.is_large_list(target)
+        or pa.types.is_fixed_size_list(target)
+        or pa.types.is_list_view(target)
+    ):
         return cast_to_list_array(
             arr,
             target,

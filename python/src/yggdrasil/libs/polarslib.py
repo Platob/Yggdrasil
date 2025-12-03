@@ -58,7 +58,7 @@ def require_polars():
 def arrow_type_to_polars_type(
     arrow_type: pa.DataType,
     options: Optional[dict] = None,
-) -> Any:
+) -> "polars.DataType":
     """
     Convert a pyarrow.DataType to a Polars dtype.
 
