@@ -1,12 +1,13 @@
-import dataclasses
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace as dc_replace, fields as dc_fields, is_dataclass, asdict
 from enum import Enum
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 from .registry import register_converter, convert
+from ..python_arrow import arrow_field_from_hint
+from ..python_defaults import default_from_arrow_hint
 
 __all__ = [
     "DataFormat",
@@ -21,8 +22,10 @@ __all__ = [
     "pylist_to_record_batch_reader",
 ]
 
-from ..python_arrow import arrow_field_from_hint
-from ..python_defaults import default_from_arrow_hint
+
+# ---------------------------------------------------------------------------
+# DataFormat enum
+# ---------------------------------------------------------------------------
 
 
 class DataFormat(Enum):
@@ -30,6 +33,11 @@ class DataFormat(Enum):
     SPARK = "spark"
     POLARS = "polars"
     PANDAS = "pandas"
+
+
+# ---------------------------------------------------------------------------
+# ArrowCastOptions
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -56,10 +64,10 @@ class ArrowCastOptions:
         Optional Arrow memory pool passed down to compute kernels.
     source_field:
         Description of the source field/schema. Used to infer nullability behavior.
-        Can be a pa.Field, pa.Schema, or pa.DataType (normalized in __post_init__).
+        Can be a pa.Field, pa.Schema, or pa.DataType (normalized elsewhere).
     target_field:
         Description of the target field/schema. Can be pa.Field, pa.Schema,
-        or pa.DataType (normalized in __post_init__).
+        or pa.DataType (normalized elsewhere).
     """
 
     safe: bool = False
@@ -75,31 +83,35 @@ class ArrowCastOptions:
     def check_arg(
         cls,
         arg: Union[
-            "ArrowCastOptions", dict,
-            pa.DataType, pa.Field, pa.Schema,
+            "ArrowCastOptions",
+            dict,
+            pa.DataType,
+            pa.Field,
+            pa.Schema,
             DataFormat,
-        ],
+            None,
+        ] = None,
         kwargs: Optional[dict] = None,
     ) -> "ArrowCastOptions":
         """
         Normalize an argument into an ArrowCastOptions instance.
 
         - If `arg` is already ArrowCastOptions, return it.
-        - If `arg` is a dict, delegate to `ArrowCastOptions.from_dict(arg)`.
-          (Assumed to be implemented elsewhere.)
-        - If `arg` is a DataType/Field/Schema, treat it as the target.
-        - If None or anything else, return DEFAULT_CAST_OPTIONS.
+        - Otherwise, treat `arg` as something convertible to pa.Field via
+          the registry (`convert(arg, Optional[pa.Field])`) and apply it
+          as `target_field` on top of DEFAULT_CAST_OPTIONS.
+        - If arg is None, just use DEFAULT_CAST_OPTIONS.
         """
         if isinstance(arg, ArrowCastOptions):
             result = arg
         else:
-            result = replace(
+            result = dc_replace(
                 DEFAULT_CAST_OPTIONS,
-                target_field=convert(arg, Optional[pa.Field])
+                target_field=convert(arg, Optional[pa.Field]),
             )
 
         if kwargs:
-            result = dataclasses.replace(result, **kwargs)
+            result = dc_replace(result, **kwargs)
 
         return result
 
@@ -131,6 +143,13 @@ class ArrowCastOptions:
 DEFAULT_CAST_OPTIONS = ArrowCastOptions()
 
 
+# ---------------------------------------------------------------------------
+# Core array casting
+# ---------------------------------------------------------------------------
+
+
+@register_converter(pa.Array, pa.Array)
+@register_converter(pa.ChunkedArray, pa.ChunkedArray)
 def cast_arrow_array(
     data: Union[pa.ChunkedArray, pa.Array],
     options: Optional[ArrowCastOptions] = None,
@@ -144,7 +163,7 @@ def cast_arrow_array(
     - Lists and large lists (recursive value casting)
     - Maps (map-to-map and struct-to-map conversions)
 
-    Nullability is enforced using `default_arrow_python_value` for non-nullable targets.
+    Nullability is enforced using `default_from_arrow_hint` for non-nullable targets.
     """
     options = ArrowCastOptions.check_arg(options)
 
@@ -159,8 +178,8 @@ def cast_arrow_array(
     target_nullable = target_field.nullable
 
     def _cast_single(
-        arr: Union[pa.Array, pa.ListType, pa.MapArray, pa.StructArray],
-        target: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
+        arr: Union[pa.Array, pa.StructArray, pa.ListArray, pa.MapArray],
+        target: pa.DataType,
         *,
         nullable: bool,
         source_field: Optional[pa.Field],
@@ -176,7 +195,7 @@ def cast_arrow_array(
                     f"Cannot cast non-struct array to struct type {target}"
                 )
 
-            children = []
+            children: List[pa.Array] = []
 
             # Case 1: struct -> struct
             if pa.types.is_struct(arr.type):
@@ -330,8 +349,8 @@ def cast_arrow_array(
 
             num_rows = len(arr)
             offsets = [0]
-            keys = []
-            items = []
+            keys: List[str] = []
+            items: List[object] = []
             mask = arr.is_null() if arr.null_count else None
 
             # Pre-cast all children values
@@ -407,9 +426,8 @@ def cast_arrow_array(
             return arr
 
         if arr.null_count:
-            fill_value = default_from_arrow_hint(dtype)
-
-            default_arr = pa.array([fill_value] * len(arr), type=dtype)
+            fill_scalar = default_from_arrow_hint(dtype)
+            default_arr = pa.array([fill_scalar] * len(arr), type=dtype)
             return pc.if_else(pc.is_null(arr), default_arr, arr)
 
         return arr
@@ -475,6 +493,12 @@ def cast_arrow_array(
     )
 
 
+# ---------------------------------------------------------------------------
+# Table / RecordBatch casting
+# ---------------------------------------------------------------------------
+
+
+@register_converter(pa.Table, pa.Table)
 def cast_arrow_table(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
@@ -499,7 +523,7 @@ def cast_arrow_table(
         name.casefold(): idx for idx, name in enumerate(data.column_names)
     }
 
-    columns = []
+    columns: List[Union[pa.Array, pa.ChunkedArray]] = []
 
     for field in arrow_schema:
         # Exact match
@@ -532,7 +556,7 @@ def cast_arrow_table(
 
         casted_col = cast_arrow_array(
             column,
-            replace(
+            dc_replace(
                 options,
                 source_field=source_field,
                 target_field=field,
@@ -544,6 +568,7 @@ def cast_arrow_table(
     return pa.Table.from_arrays(columns, schema=arrow_schema)
 
 
+@register_converter(pa.RecordBatch, pa.RecordBatch)
 def cast_arrow_batch(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
@@ -564,7 +589,7 @@ def cast_arrow_batch(
         name.casefold(): idx for idx, name in enumerate(data.schema.names)
     }
 
-    columns = []
+    columns: List[Union[pa.Array, pa.ChunkedArray]] = []
 
     for field in arrow_schema:
         # Exact match
@@ -597,7 +622,7 @@ def cast_arrow_batch(
 
         casted_col = cast_arrow_array(
             column,
-            replace(
+            dc_replace(
                 options,
                 source_field=source_field,
                 target_field=field,
@@ -609,6 +634,7 @@ def cast_arrow_batch(
     return pa.RecordBatch.from_arrays(columns, schema=arrow_schema)
 
 
+@register_converter(pa.RecordBatchReader, pa.RecordBatchReader)
 def cast_arrow_record_batch_reader(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
@@ -630,6 +656,11 @@ def cast_arrow_record_batch_reader(
     return pa.RecordBatchReader.from_batches(arrow_schema, casted_batches())
 
 
+# ---------------------------------------------------------------------------
+# Default-valued arrays
+# ---------------------------------------------------------------------------
+
+
 def default_arrow_array(
     field: Union[pa.Field, pa.DataType],
     length: int,
@@ -639,7 +670,7 @@ def default_arrow_array(
     for the given field / dtype.
 
     - If field is nullable -> returns a null array of the given type.
-    - Otherwise -> returns an array filled with `default_arrow_python_value(dtype)`.
+    - Otherwise -> returns an array filled with default_from_arrow_hint(dtype).
     """
     value = default_from_arrow_hint(field)
 
@@ -649,20 +680,23 @@ def default_arrow_array(
     return pa.array([value] * length, type=value.type)
 
 
-def _normalize_pylist_value(value):
-    if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
+# ---------------------------------------------------------------------------
+# Pylist -> Arrow
+# ---------------------------------------------------------------------------
 
+
+def _normalize_pylist_value(value):
+    if is_dataclass(value):
+        return asdict(value)
     return value
 
 
 def _schema_from_dataclass_instance(instance) -> pa.Schema:
     fields = []
 
-    for field in dataclasses.fields(type(instance)):
+    for field in dc_fields(type(instance)):
         if not field.init or field.name.startswith("_"):
             continue
-
         fields.append(arrow_field_from_hint(field.type, name=field.name))
 
     return pa.schema(fields)
@@ -678,13 +712,13 @@ def _table_from_pylist(
 
     if schema is None and data:
         for item in data:
-            if dataclasses.is_dataclass(item):
+            if is_dataclass(item):
                 schema = _schema_from_dataclass_instance(item)
                 break
 
     requires_row_mapping = schema is not None or any(
         item is not None
-        and (dataclasses.is_dataclass(item) or isinstance(item, dict))
+        and (is_dataclass(item) or isinstance(item, dict))
         for item in data
     )
 
@@ -693,7 +727,6 @@ def _table_from_pylist(
         if item is None and requires_row_mapping:
             normalized.append({})
             continue
-
         normalized.append(_normalize_pylist_value(item))
 
     if not normalized:
@@ -701,7 +734,6 @@ def _table_from_pylist(
             raise pa.ArrowInvalid(
                 "Cannot build Arrow table from empty list without target_field"
             )
-
         arrays = [pa.array([], type=field.type) for field in schema]
         return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -713,6 +745,38 @@ def _table_from_pylist(
             )
 
     return pa.Table.from_pylist(normalized, schema=schema)
+
+
+@register_converter(list, pa.Table)
+def pylist_to_arrow_table(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Table:
+    table = _table_from_pylist(data, options)
+    return cast_arrow_table(table, options)
+
+
+@register_converter(list, pa.RecordBatch)
+def pylist_to_record_batch(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.RecordBatch:
+    table = _table_from_pylist(data, options)
+    return table_to_record_batch(table, options)
+
+
+@register_converter(list, pa.RecordBatchReader)
+def pylist_to_record_batch_reader(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.RecordBatchReader:
+    table = _table_from_pylist(data, options)
+    return table_to_record_batch_reader(table, options)
+
+
+# ---------------------------------------------------------------------------
+# Type normalization helpers
+# ---------------------------------------------------------------------------
 
 
 def _spark_compatible_type(
@@ -798,7 +862,6 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
       leak weird "view" types into Polars.
     """
     # First normalize "views" / large types using the Spark helper
-    # (dictionary, extension, large_string/binary/list, nested recursion, etc.)
     dtype = _spark_compatible_type(dtype)
 
     # Map -> list<struct<key, value>>
@@ -811,15 +874,27 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
 
         struct_type = pa.field(
             "entries",
-            pa.struct([
-                pa.field(key_field.name, key_type, nullable=key_field.nullable, metadata=key_field.metadata),
-                pa.field(item_field.name, value_type, nullable=item_field.nullable, metadata=item_field.metadata),
-            ]),
-            nullable=True
+            pa.struct(
+                [
+                    pa.field(
+                        key_field.name,
+                        key_type,
+                        nullable=key_field.nullable,
+                        metadata=key_field.metadata,
+                    ),
+                    pa.field(
+                        item_field.name,
+                        value_type,
+                        nullable=item_field.nullable,
+                        metadata=item_field.metadata,
+                    ),
+                ]
+            ),
+            nullable=True,
         )
         return pa.list_(struct_type)
 
-    # Struct: recurse into children (after _spark_compatible_type it should already be struct)
+    # Struct: recurse into children
     if pa.types.is_struct(dtype):
         new_fields = [
             pa.field(
@@ -836,38 +911,15 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
         return pa.list_(_polars_compatible_type(dtype.value_type))
 
-    # Map already handled, other types are fine as returned by _spark_compatible_type
     return dtype
-
-
-def pylist_to_arrow_table(
-    data: list,
-    options: Optional[ArrowCastOptions] = None,
-) -> pa.Table:
-    table = _table_from_pylist(data, options)
-    return cast_arrow_table(table, options)
-
-
-def pylist_to_record_batch(
-    data: list,
-    options: Optional[ArrowCastOptions] = None,
-) -> pa.RecordBatch:
-    table = _table_from_pylist(data, options)
-    return table_to_record_batch(table, options)
-
-
-def pylist_to_record_batch_reader(
-    data: list,
-    options: Optional[ArrowCastOptions] = None,
-) -> pa.RecordBatchReader:
-    table = _table_from_pylist(data, options)
-    return table_to_record_batch_reader(table, options)
 
 
 # ---------------------------------------------------------------------------
 # Cross-container casting helpers
 # ---------------------------------------------------------------------------
 
+
+@register_converter(pa.Table, pa.RecordBatch)
 def table_to_record_batch(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
@@ -895,7 +947,6 @@ def table_to_record_batch(
     # Merge multiple batches into one RecordBatch
     merged_arrays = []
     for col_idx, field in enumerate(casted.schema):
-        # Column per batch -> list[Array]
         col_chunks = [b.column(col_idx) for b in batches]
         chunked = pa.chunked_array(col_chunks, type=field.type)
         merged_arrays.append(chunked.combine_chunks())
@@ -903,6 +954,7 @@ def table_to_record_batch(
     return pa.RecordBatch.from_arrays(merged_arrays, schema=casted.schema)
 
 
+@register_converter(pa.RecordBatch, pa.Table)
 def record_batch_to_table(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
@@ -914,6 +966,7 @@ def record_batch_to_table(
     return pa.Table.from_batches([casted])
 
 
+@register_converter(pa.Table, pa.RecordBatchReader)
 def table_to_record_batch_reader(
     data: pa.Table,
     options: Optional[ArrowCastOptions] = None,
@@ -928,6 +981,7 @@ def table_to_record_batch_reader(
     )
 
 
+@register_converter(pa.RecordBatchReader, pa.Table)
 def record_batch_reader_to_table(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
@@ -939,6 +993,7 @@ def record_batch_reader_to_table(
     return pa.Table.from_batches(list(casted_reader))
 
 
+@register_converter(pa.RecordBatch, pa.RecordBatchReader)
 def record_batch_to_record_batch_reader(
     data: pa.RecordBatch,
     options: Optional[ArrowCastOptions] = None,
@@ -950,6 +1005,7 @@ def record_batch_to_record_batch_reader(
     return pa.RecordBatchReader.from_batches(casted.schema, [casted])
 
 
+@register_converter(pa.RecordBatchReader, pa.RecordBatch)
 def record_batch_reader_to_record_batch(
     data: pa.RecordBatchReader,
     options: Optional[ArrowCastOptions] = None,
@@ -961,6 +1017,12 @@ def record_batch_reader_to_record_batch(
     """
     table = record_batch_reader_to_table(data, options)
     return table_to_record_batch(table, options)
+
+
+# ---------------------------------------------------------------------------
+# Field / Schema converters
+# ---------------------------------------------------------------------------
+
 
 @register_converter(pa.DataType, pa.Field)
 def arrow_type_to_field(
@@ -984,9 +1046,8 @@ def arrow_schema_to_field(
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.Field:
     dtype = pa.struct(list(data))
-    md = data.metadata or {}
-    name = md[b"name"] = md.get(b"name", b"root")
-
+    md = dict(data.metadata or {})
+    name = md.setdefault(b"name", b"root")
     return pa.field(name.decode(), dtype, False, md)
 
 
@@ -995,9 +1056,8 @@ def arrow_field_to_schema(
     data: pa.Field,
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.Schema:
-    md = data.metadata or {}
-    md[b"name"] = md.get(b"name", data.name.encode())
-
+    md = dict(data.metadata or {})
+    md.setdefault(b"name", data.name.encode())
     if pa.types.is_struct(data.type):
         return pa.schema(list(data.type), metadata=md)
     return pa.schema([data], metadata=md)
@@ -1005,40 +1065,11 @@ def arrow_field_to_schema(
 
 @register_converter([pa.Table, pa.RecordBatch, pa.RecordBatchReader], pa.Field)
 def arrow_tabular_to_field(
-    data: Union[pa.Table, pa.RecordBatch],
+    data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader],
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.Field:
-    return arrow_schema_to_field(data.schema, options)
-
-
-# Inner / column-level
-register_converter(pa.Array, pa.Array)(cast_arrow_array)
-register_converter(pa.ChunkedArray, pa.ChunkedArray)(cast_arrow_array)
-
-# Same-type tabular / batch
-register_converter(pa.Table, pa.Table)(cast_arrow_table)
-register_converter(pa.RecordBatch, pa.RecordBatch)(cast_arrow_batch)
-register_converter(pa.RecordBatchReader, pa.RecordBatchReader)(
-    cast_arrow_record_batch_reader
-)
-
-# Table <-> RecordBatch
-register_converter(pa.Table, pa.RecordBatch)(table_to_record_batch)
-register_converter(pa.RecordBatch, pa.Table)(record_batch_to_table)
-
-# Table <-> RecordBatchReader
-register_converter(pa.Table, pa.RecordBatchReader)(table_to_record_batch_reader)
-register_converter(pa.RecordBatchReader, pa.Table)(
-    record_batch_reader_to_table
-)
-
-# RecordBatch <-> RecordBatchReader
-register_converter(pa.RecordBatch, pa.RecordBatchReader)(
-    record_batch_to_record_batch_reader
-)
-register_converter(pa.RecordBatchReader, pa.RecordBatch)(
-    record_batch_reader_to_record_batch
-)
-register_converter(list, pa.Table)(pylist_to_arrow_table)
-register_converter(list, pa.RecordBatch)(pylist_to_record_batch)
-register_converter(list, pa.RecordBatchReader)(pylist_to_record_batch_reader)
+    if isinstance(data, pa.RecordBatchReader):
+        schema = data.schema
+    else:
+        schema = data.schema
+    return arrow_schema_to_field(schema, options)

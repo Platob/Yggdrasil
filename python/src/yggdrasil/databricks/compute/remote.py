@@ -1,9 +1,7 @@
-import base64
 import concurrent
 import concurrent.futures
 import datetime as dt
 import functools
-import json
 import os
 import time
 from typing import (
@@ -15,8 +13,6 @@ from typing import (
     Union, List,
 )
 
-import dill
-
 from ...libs.databrickslib import databricks_sdk
 
 if databricks_sdk is not None:
@@ -24,7 +20,7 @@ if databricks_sdk is not None:
     from databricks.sdk.service.compute import State, Language
 
 from ..workspaces.workspace import DBXWorkspace
-from ...ser import EmbeddedFunction, DependencyInfo
+from ...ser import EmbeddedFunction
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
     pass
@@ -217,49 +213,25 @@ def remote_invoke(
 
         method = EmbeddedFunction.from_callable(func)
 
-        new_deps = []
-        for dep in method.dependencies_map:
-            if dep.root_module in {
-                "os", "shutil", "path", "sys", "json", "logging",
-                "pandas", "pyspark",
-                "yggdrasil",
-                "mongoengine"
-            }:
-                continue
+        if method.package_root:
+            # Use the last path component as package name fallback
+            package_name = os.path.basename(method.package_root.rstrip(os.sep)) or method.package_root
+            # DBFS path for the package contents
+            dbfs_root = f"/Workspace/Shared/.ygg/cache/{current_user.user_name}/pypkg/{package_name}"
 
-            # If we have a local root_path, copy it to a user-scoped DBFS cache
-            if dep.root_path:
-                # Use the last path component as package name fallback
-                package_name = os.path.basename(dep.root_path.rstrip(os.sep)) or dep.root_module
-                # DBFS path for the package contents
-                dbfs_root = f"/Workspace/Shared/.ygg/cache/{current_user.user_name}/pypkg/{package_name}"
-
-                if os.path.isdir(dep.root_path):
-                    connected.upload_local_folder(
-                        local_dir=dep.root_path,
-                        target_dir=dbfs_root,
-                        only_if_size_diff=True,
-                        exclude_dir_names=[
-                            "__pycache__",
-                        ],
-                        exclude_hidden=True
-                    )
-
-                # Point the dependency at the DBFS-backed local path so build() can
-                # add it to sys.path on the cluster
-                new_dep = DependencyInfo(
-                    root_module=dep.root_module,
-                    submodule=dep.submodule,
-                    root_path=dbfs_root,
+            if os.path.isdir(method.package_root):
+                connected.upload_local_folder(
+                    local_dir=method.package_root,
+                    target_dir=dbfs_root,
+                    only_if_size_diff=True,
+                    parallel_pool=4,
+                    exclude_dir_names=[
+                        "__pycache__",
+                    ],
+                    exclude_hidden=True
                 )
-            else:
-                # Nothing to copy, just keep as-is
-                new_dep = dep
 
-            new_deps.append(new_dep)
-
-        # Swap in the updated dependency map so to_command/build() use DBFS paths
-        method.dependencies_map = new_deps
+            method.package_root = dbfs_root
 
         command = method.to_command(
             args=args, kwargs=kwargs,

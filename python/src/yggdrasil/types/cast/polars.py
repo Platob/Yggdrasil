@@ -25,11 +25,39 @@ __all__ = [
     "record_batch_reader_to_polars_dataframe",
 ]
 
+# ---------------------------------------------------------------------------
+# Polars type aliases + decorator wrapper (safe when Polars is missing)
+# ---------------------------------------------------------------------------
+
+if polars is not None:
+    require_polars()
+
+    PolarsSeries = polars.Series
+    PolarsDataFrame = polars.DataFrame
+
+    def polars_converter(*args, **kwargs):
+        return register_converter(*args, **kwargs)
+else:
+    # Dummy types so annotations/decorators don't explode without Polars
+    class _PolarsDummy:  # pragma: no cover - only used when Polars not installed
+        pass
+
+    PolarsSeries = _PolarsDummy
+    PolarsDataFrame = _PolarsDummy
+
+    def polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        def _decorator(func):
+            return func
+
+        return _decorator
+
 
 # ---------------------------------------------------------------------------
-# Core casting: Polars <-> Arrow types (no registration yet)
+# Core casting: Polars <-> Arrow types
 # ---------------------------------------------------------------------------
 
+
+@polars_converter(PolarsSeries, PolarsSeries)
 def cast_polars_series(
     series: "polars.Series",
     options: Optional[ArrowCastOptions] = None,
@@ -42,7 +70,7 @@ def cast_polars_series(
 
     - target_field can be a pa.DataType, pa.Field, or pa.Schema (schema → first field).
     - If a Field is provided, we also respect its nullability by filling nulls
-      when nullable=False (using default_arrow_python_value).
+      when nullable=False (using default_from_arrow_hint).
     """
     options = ArrowCastOptions.check_arg(options)
     target_field = options.target_field
@@ -78,6 +106,7 @@ def cast_polars_series(
     return casted.alias(series.name)
 
 
+@polars_converter(PolarsDataFrame, PolarsDataFrame)
 def cast_polars_dataframe(
     data: "polars.DataFrame",
     options: Optional[ArrowCastOptions] = None,
@@ -134,7 +163,7 @@ def cast_polars_dataframe(
                 f"Missing column {field.name} while casting Polars DataFrame"
             )
 
-        # override target_field for this column
+        # Override target_field for this column
         col_options = replace(options, target_field=field)
         casted = cast_polars_series(series, col_options)
         columns.append(casted.alias(field.name))
@@ -157,6 +186,8 @@ def cast_polars_dataframe(
 # Polars <-> Arrow conversion helpers
 # ---------------------------------------------------------------------------
 
+
+@polars_converter(PolarsSeries, pa.Array)
 def polars_series_to_arrow_array(
     series: "polars.Series",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -179,6 +210,7 @@ def polars_series_to_arrow_array(
     return arr
 
 
+@polars_converter(PolarsDataFrame, pa.Table)
 def polars_dataframe_to_arrow_table(
     data: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -187,20 +219,25 @@ def polars_dataframe_to_arrow_table(
     Convert a Polars DataFrame to a pyarrow.Table.
 
     - If cast_options.target_schema is set, we apply `cast_polars_dataframe`
-      first and then call `.to_arrow()`.
-    - Otherwise, we directly call `dataframe.to_arrow()`.
+      first, then call `.to_arrow()`.
+    - Otherwise, we directly call `data.to_arrow()`.
     """
     opts = ArrowCastOptions.check_arg(cast_options)
 
-    if opts.target_field is not None:
-        data = cast_polars_dataframe(data, opts).to_arrow()
-        data = cast_arrow_table(data, opts)
-    else:
-        data = data.to_arrow()
+    if opts.target_schema is not None:
+        data = cast_polars_dataframe(data, opts)
 
-    return data
+    table = data.to_arrow()
+
+    # If you want Arrow-side casting too, keep this; otherwise it’s redundant.
+    if opts.target_schema is not None:
+        table = cast_arrow_table(table, opts)
+
+    return table
 
 
+@polars_converter(pa.Array, PolarsSeries)
+@polars_converter(pa.ChunkedArray, PolarsSeries)
 def arrow_array_to_polars_series(
     arr: pa.Array,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -224,6 +261,7 @@ def arrow_array_to_polars_series(
     return series
 
 
+@polars_converter(pa.Table, PolarsDataFrame)
 def arrow_table_to_polars_dataframe(
     table: pa.Table,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -248,6 +286,8 @@ def arrow_table_to_polars_dataframe(
 # RecordBatchReader <-> Polars DataFrame
 # ---------------------------------------------------------------------------
 
+
+@polars_converter(PolarsDataFrame, pa.RecordBatchReader)
 def polars_dataframe_to_record_batch_reader(
     dataframe: "polars.DataFrame",
     cast_options: Optional[ArrowCastOptions] = None,
@@ -263,6 +303,7 @@ def polars_dataframe_to_record_batch_reader(
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
 
+@polars_converter(pa.RecordBatchReader, PolarsDataFrame)
 def record_batch_reader_to_polars_dataframe(
     reader: pa.RecordBatchReader,
     cast_options: Optional[ArrowCastOptions] = None,
@@ -285,25 +326,5 @@ def record_batch_reader_to_polars_dataframe(
         return polars.from_arrow(empty_table)
 
     table = pa.Table.from_batches(batches)
+    # opts already applied above if needed; no need to double-cast
     return arrow_table_to_polars_dataframe(table, None)
-
-
-# ---------------------------------------------------------------------------
-# Converter registrations (Polars <-> Arrow + same-type casts)
-# ---------------------------------------------------------------------------
-
-if polars is not None:
-    # Same-type Polars casts using Arrow types
-    register_converter(polars.Series, polars.Series)(cast_polars_series)
-    register_converter(polars.DataFrame, polars.DataFrame)(cast_polars_dataframe)
-
-    # Polars -> Arrow
-    register_converter(polars.Series, pa.Array)(polars_series_to_arrow_array)
-    register_converter(polars.DataFrame, pa.Table)(polars_dataframe_to_arrow_table)
-    register_converter(polars.DataFrame, pa.RecordBatchReader)(polars_dataframe_to_record_batch_reader)
-
-    # Arrow -> Polars
-    register_converter(pa.Array, polars.Series)(arrow_array_to_polars_series)
-    register_converter(pa.ChunkedArray, polars.Series)(arrow_array_to_polars_series)
-    register_converter(pa.Table, polars.DataFrame)(arrow_table_to_polars_dataframe)
-    register_converter(pa.RecordBatchReader, polars.DataFrame)(record_batch_reader_to_polars_dataframe)

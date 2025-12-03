@@ -564,9 +564,11 @@ class EmbeddedFunction:
         roots = sorted({
             _os.path.dirname(d.root_path) for d in self.dependencies_map if d.root_path
         })
-        imports = set(
-            d.submodule for d in self.dependencies_map
-        )
+
+        if self.package_root:
+            roots += _os.path.dirname(self.package_root)
+
+        imports = set(d.submodule for d in self.dependencies_map)
 
         lines: list[str] = [
             "import sys",
@@ -602,9 +604,8 @@ class EmbeddedFunction:
             lines.append(f"for __p in {roots!r}:")
             lines.extend([
                 "    if __p and __p not in sys.path:",
-                "        if not os.path.isdir(__p):",
-                "            raise ValueError(f'Cannot find lib path {__p}')",
-                "        sys.path.insert(0, __p)",
+                "        if os.path.isdir(__p):",
+                "            sys.path.insert(0, __p)",
             ])
 
         # --- best-effort import of dependencies on remote ---

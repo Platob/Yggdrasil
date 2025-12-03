@@ -33,6 +33,9 @@ Converter = Callable[[Any, "ArrowCastOptions | dict | None"], Any]
 _registry: Dict[Tuple[Any, Any], Converter] = {}
 
 
+def identity(x, opt):
+    return x
+
 def register_converter(
     from_hint: Union[Any, List[Any]],
     to_hint: Any
@@ -93,11 +96,26 @@ def _iter_mro(tp: Any) -> Iterable[Any]:
     return mro  # includes tp itself as mro[0]
 
 
-def _find_converter(from_type: Any, to_hint: Any) -> "Converter | None":
-    # Fast path: exact match
+def _type_matches(actual: Any, registered: Any) -> bool:
+    """Return True if `actual` can use a converter registered for `registered`."""
+    if actual is registered:
+        return True
+    if isinstance(registered, type) and isinstance(actual, type):
+        try:
+            return issubclass(actual, registered)
+        except TypeError:
+            return False
+    return False
+
+
+def _find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
+    # 0) Fast path: exact key
     conv = _registry.get((from_type, to_hint))
     if conv is not None:
         return conv
+
+    if from_type == to_hint:
+        return identity
 
     # Build from_mro and to_mro
     from_mro = _iter_mro(from_type)
@@ -115,31 +133,48 @@ def _find_converter(from_type: Any, to_hint: Any) -> "Converter | None":
     #    (e.g. using typing hints, Protocols, etc.)
     for (registered_from, registered_to), conv in _registry.items():
         try:
-            # registered_from may be a base of from_type
-            from_ok = (
-                from_type is registered_from
-                or (
-                    isinstance(registered_from, type)
-                    and isinstance(from_type, type)
-                    and issubclass(from_type, registered_from)
-                )
-            )
-
-            # registered_to may be a base of to_hint
-            to_ok = (
-                to_hint is registered_to
-                or (
-                    isinstance(registered_to, type)
-                    and isinstance(to_hint, type)
-                    and issubclass(to_hint, registered_to)
-                )
-            )
-
+            from_ok = _type_matches(from_type, registered_from)
+            to_ok = _type_matches(to_hint, registered_to)
             if from_ok and to_ok:
                 return conv
         except TypeError:
             # Some registered types (e.g. typing constructs) may explode in issubclass
             continue
+
+    # 3) One-level composition: from_type -> mid_type -> to_hint
+    #
+    # If we can find converters:
+    #   conv1: from_type -> mid
+    #   conv2: mid      -> to_hint
+    # we build a composite converter that calls conv2(conv1(x)).
+    #
+    # To keep things predictable, we:
+    #   - Only use registered keys (no recursive _find_converter calls here).
+    #   - Respect the same _type_matches logic for from/mid/to.
+    for (from1, mid_type), conv1 in _registry.items():
+        try:
+            if not _type_matches(from_type, from1):
+                continue
+        except TypeError:
+            continue
+
+        for (from2, to2), conv2 in _registry.items():
+            try:
+                # mid_type must be compatible with from2
+                if not _type_matches(mid_type, from2):
+                    continue
+                # requested to_hint must be compatible with to2
+                if not _type_matches(to_hint, to2):
+                    continue
+            except TypeError:
+                continue
+
+            # Build composite converter once we find the first viable chain.
+            def composed(value, options=None, _c1=conv1, _c2=conv2):
+                intermediate = _c1(value, options)
+                return _c2(intermediate, options)
+
+            return composed  # type: ignore[return-value]
 
     return None
 
@@ -165,7 +200,7 @@ def convert(
     **kwargs,
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
-    from yggdrasil.types import default_from_hint
+    from yggdrasil.types.python_defaults import default_from_hint
     from yggdrasil.types.cast.arrow import ArrowCastOptions
 
     is_optional, target_hint = _unwrap_optional(target_hint)
@@ -188,7 +223,12 @@ def convert(
     if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
         options.target_field = convert(target_hint, pa.Field)
 
-        converter = _find_converter(source_hint, source_hint)
+        if isinstance(value, pa.Array):
+            target_hint = pa.Array
+        else:
+            target_hint = source_hint
+
+        converter = _find_converter(source_hint, target_hint)
     else:
         converter = _find_converter(source_hint, target_hint)
 

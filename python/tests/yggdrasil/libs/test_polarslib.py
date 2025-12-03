@@ -1,16 +1,13 @@
-import pytest
 import pyarrow as pa
+import pytest
 
 polars = pytest.importorskip("polars")
 
 from yggdrasil.libs.polarslib import (
-    ARROW_TO_POLARS,
-    POLARS_BASE_TO_ARROW,
     arrow_type_to_polars_type,
     arrow_field_to_polars_field,
     polars_type_to_arrow_type,
     polars_field_to_arrow_field,
-    require_polars,
 )
 
 

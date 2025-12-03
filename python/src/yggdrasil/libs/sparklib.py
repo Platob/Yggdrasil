@@ -46,34 +46,22 @@ try:
         # Timestamp with any unit → TimestampType (Spark is microsecond-resolution)
         pa.timestamp("us", "UTC"): T.TimestampType(),
     }
-except ImportError:
+except ImportError:  # pragma: no cover - Spark not available
     pyspark = None
     SparkSession = None
     SparkDataFrame = None
     SparkColumn = None
     SparkDataType = None
-
     ARROW_TO_SPARK = {}
 
 
 # Primitive Spark -> Arrow mapping (only for the types in ARROW_TO_SPARK)
-SPARK_TO_ARROW = {
-    v: k
-    for k, v in ARROW_TO_SPARK.items()
-}
+SPARK_TO_ARROW = {v: k for k, v in ARROW_TO_SPARK.items()}
 
 
 def require_pyspark(active_session: bool = False):
     """
-    Can be used as:
-
-    @require_pyspark
-    def f(...): ...
-
-    or
-
-    @require_pyspark(active_session=True)
-    def f(...): ...
+    Optionally enforce that pyspark (and an active SparkSession) exists.
     """
     if pyspark is None:
         raise ImportError(
@@ -81,7 +69,6 @@ def require_pyspark(active_session: bool = False):
             "Install it or run inside a Spark/Databricks environment."
         )
 
-    # 2) Optionally require an active SparkSession
     if active_session:
         if SparkSession is None:
             raise ImportError(
@@ -114,6 +101,7 @@ def arrow_type_to_spark_type(
     if pat.is_decimal(arrow_type):
         return T.DecimalType(precision=arrow_type.precision, scale=arrow_type.scale)
 
+    # Timestamp
     if pat.is_timestamp(arrow_type):
         tz = getattr(arrow_type, "tz", None)
         if tz:
@@ -153,15 +141,15 @@ def arrow_type_to_spark_type(
     if pat.is_duration(arrow_type):
         return T.LongType()
 
+    # Fallback numeric: widen to Long/Double
     if pat.is_integer(arrow_type):
         return T.LongType()
-
     if pat.is_floating(arrow_type):
         return T.DoubleType()
 
+    # Binary / String families
     if pat.is_binary(arrow_type) or pat.is_large_binary(arrow_type):
         return T.BinaryType()
-
     if pat.is_string(arrow_type) or pat.is_large_string(arrow_type):
         return T.StringType()
 
@@ -234,7 +222,7 @@ def spark_type_to_arrow_type(
         return pa.date32()
     if isinstance(spark_type, TimestampType):
         return pa.timestamp("us", "UTC")
-    elif isinstance(spark_type, TimestampNTZType):
+    if isinstance(spark_type, TimestampNTZType):
         return pa.timestamp("us")
 
     # DecimalType
@@ -254,7 +242,10 @@ def spark_type_to_arrow_type(
 
     # StructType
     if isinstance(spark_type, StructType):
-        arrow_fields = [spark_field_to_arrow_field(f, cast_options) for f in spark_type.fields]
+        arrow_fields = [
+            spark_field_to_arrow_field(f, cast_options)
+            for f in spark_type.fields
+        ]
         return pa.struct(arrow_fields)
 
     raise TypeError(f"Unsupported or unknown Spark type for Arrow conversion: {spark_type!r}")
@@ -289,11 +280,3 @@ __all__ = [
     "spark_type_to_arrow_type",
     "spark_field_to_arrow_field",
 ]
-
-from ..types.cast.registry import register_converter
-
-if pyspark is not None:
-    register_converter(pa.DataType, T.DataType)(arrow_type_to_spark_type)
-    register_converter(pa.Field, T.StructField)(arrow_field_to_spark_field)
-    register_converter(T.DataType, pa.DataType)(spark_type_to_arrow_type)
-    register_converter(T.StructField, pa.Field)(spark_field_to_arrow_field)
