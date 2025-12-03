@@ -15,6 +15,7 @@ try:
 
     # Primitive Arrow -> Spark mappings
     ARROW_TO_SPARK = {
+        pa.null(): T.NullType(),
         pa.bool_(): T.BooleanType(),
 
         pa.int8(): T.ByteType(),

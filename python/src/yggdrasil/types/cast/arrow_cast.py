@@ -21,7 +21,11 @@ __all__ = [
     "pylist_to_arrow_table",
     "pylist_to_record_batch",
     "pylist_to_record_batch_reader",
+    "to_spark_arrow_type",
+    "to_polars_arrow_type"
 ]
+
+from ...libs import polars
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +260,6 @@ def cast_to_list_array(
     _cast_array_fn,
 ) -> Union[pa.ListArray, pa.LargeListArray]:
     """Cast arrays to a list or large list Arrow array."""
-
-    if not pa.types.is_list(arr.type) and not pa.types.is_large_list(arr.type):
-        raise pa.ArrowInvalid(f"Cannot cast non-list array to list type {target}")
-
     if pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type):
         list_source_field = arr.type.value_field
 
@@ -368,13 +368,26 @@ def cast_primitive_array(
 ) -> pa.Array:
     """Cast simple scalar arrays via pyarrow.compute.cast."""
 
-    return pc.cast(
-        arr,
-        target_type=target,
-        safe=options.safe,
-        memory_pool=options.memory_pool,
-    )
+    try:
+        return pc.cast(
+            arr,
+            target_type=target,
+            safe=options.safe,
+            memory_pool=options.memory_pool,
+        )
+    except:
+        if polars is not None:
+            from .polars_cast import arrow_type_to_polars_type
+            pl_type = arrow_type_to_polars_type(target)
+            pl_casted = polars.from_arrow(arr).cast(pl_type).to_arrow(polars.CompatLevel.newest())
 
+            return pc.cast(
+                pl_casted,
+                target_type=target,
+                safe=options.safe,
+                memory_pool=options.memory_pool,
+            )
+        raise
 
 def _fill_non_nullable_defaults(
     arr: Union[pa.Array, pa.ChunkedArray],
@@ -848,7 +861,7 @@ def pylist_to_record_batch_reader(
 # ---------------------------------------------------------------------------
 
 
-def _spark_compatible_type(
+def to_spark_arrow_type(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]
 ) -> pa.DataType:
     """
@@ -862,33 +875,33 @@ def _spark_compatible_type(
     - recurse through struct/map/list fields
     """
     # Large scalar types
-    if pa.types.is_large_string(dtype):
+    if pa.types.is_large_string(dtype) or pa.types.is_string_view(dtype):
         return pa.string()
-    if pa.types.is_large_binary(dtype):
+    if pa.types.is_large_binary(dtype) or pa.types.is_binary_view(dtype):
         return pa.binary()
 
     # Large list -> normal list with normalized value type
-    if pa.types.is_large_list(dtype):
-        return pa.list_(_spark_compatible_type(dtype.value_type))
+    if pa.types.is_large_list(dtype) or pa.types.is_list_view(dtype):
+        return pa.list_(to_spark_arrow_type(dtype.value_type))
 
     # Normal list: still normalize value type
     if pa.types.is_list(dtype):
-        return pa.list_(_spark_compatible_type(dtype.value_type))
+        return pa.list_(to_spark_arrow_type(dtype.value_type))
 
     # Dictionary-encoded types: Spark wants the value type, not the indices
     if pa.types.is_dictionary(dtype):
-        return _spark_compatible_type(dtype.value_type)
+        return to_spark_arrow_type(dtype.value_type)
 
     # Extension types: unwrap to storage type
     if isinstance(dtype, pa.ExtensionType):
-        return _spark_compatible_type(dtype.storage_type)
+        return to_spark_arrow_type(dtype.storage_type)
 
     # Struct: normalize each child field
     if pa.types.is_struct(dtype):
         new_fields = [
             pa.field(
                 f.name,
-                _spark_compatible_type(f.type),
+                to_spark_arrow_type(f.type),
                 nullable=f.nullable,
                 metadata=f.metadata,
             )
@@ -903,13 +916,13 @@ def _spark_compatible_type(
 
         new_key = pa.field(
             key_field.name,
-            _spark_compatible_type(key_field.type),
+            to_spark_arrow_type(key_field.type),
             nullable=key_field.nullable,
             metadata=key_field.metadata,
         )
         new_item = pa.field(
             item_field.name,
-            _spark_compatible_type(item_field.type),
+            to_spark_arrow_type(item_field.type),
             nullable=item_field.nullable,
             metadata=item_field.metadata,
         )
@@ -919,7 +932,7 @@ def _spark_compatible_type(
     return dtype
 
 
-def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
+def to_polars_arrow_type(dtype: pa.DataType) -> pa.DataType:
     """
     Normalize an Arrow DataType to something Polars can handle nicely.
 
@@ -931,15 +944,15 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
       leak weird "view" types into Polars.
     """
     # First normalize "views" / large types using the Spark helper
-    dtype = _spark_compatible_type(dtype)
+    dtype = to_spark_arrow_type(dtype)
 
     # Map -> list<struct<key, value>>
     if pa.types.is_map(dtype):
         key_field = dtype.key_field
         item_field = dtype.item_field
 
-        key_type = _polars_compatible_type(key_field.type)
-        value_type = _polars_compatible_type(item_field.type)
+        key_type = to_polars_arrow_type(key_field.type)
+        value_type = to_polars_arrow_type(item_field.type)
 
         struct_type = pa.field(
             "entries",
@@ -968,7 +981,7 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
         new_fields = [
             pa.field(
                 f.name,
-                _polars_compatible_type(f.type),
+                to_polars_arrow_type(f.type),
                 nullable=f.nullable,
                 metadata=f.metadata,
             )
@@ -978,7 +991,7 @@ def _polars_compatible_type(dtype: pa.DataType) -> pa.DataType:
 
     # List: recurse into element type
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
-        return pa.list_(_polars_compatible_type(dtype.value_type))
+        return pa.list_(to_polars_arrow_type(dtype.value_type))
 
     return dtype
 

@@ -12,11 +12,19 @@ from .arrow_cast import (
 )
 from .registry import register_converter
 from ..python_defaults import default_from_arrow_hint
-from ...libs.polarslib import polars, require_polars, arrow_type_to_polars_type
+from ...libs.polarslib import (
+    polars, require_polars,
+    arrow_type_to_polars_type, polars_type_to_arrow_type,
+    arrow_field_to_polars_field, polars_field_to_arrow_field
+)
 
 __all__ = [
     "cast_polars_series",
     "cast_polars_dataframe",
+    "arrow_type_to_polars_type",
+    "polars_type_to_arrow_type",
+    "arrow_field_to_polars_field",
+    "polars_field_to_arrow_field",
     "polars_series_to_arrow_array",
     "polars_dataframe_to_arrow_table",
     "arrow_array_to_polars_series",

@@ -1000,5 +1000,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             precision = arrow_type.precision
             scale = arrow_type.scale
             return f"DECIMAL({precision}, {scale})"
+        elif pa.types.is_null(arrow_type):
+            return "STRING"
         else:
             raise ValueError(f"Cannot make ddl type for {arrow_type}")

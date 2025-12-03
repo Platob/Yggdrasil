@@ -1,4 +1,3 @@
-import functools
 from typing import Any, Dict, Optional
 
 import pyarrow as pa
@@ -13,67 +12,39 @@ try:
     # These are Polars *dtype classes* (not instances), so they can be used
     # directly in schemas (e.g. pl.Struct({"a": pl.Int64})).
     ARROW_TO_POLARS: Dict[pa.DataType, Any] = {
-        pa.bool_(): polars.Boolean,
+        pa.null(): polars.Null(),
+        pa.bool_(): polars.Boolean(),
 
-        pa.int8(): polars.Int8,
-        pa.int16(): polars.Int16,
-        pa.int32(): polars.Int32,
-        pa.int64(): polars.Int64,
+        pa.int8(): polars.Int8(),
+        pa.int16(): polars.Int16(),
+        pa.int32(): polars.Int32(),
+        pa.int64(): polars.Int64(),
 
-        pa.uint8(): polars.UInt8,
-        pa.uint16(): polars.UInt16,
-        pa.uint32(): polars.UInt32,
-        pa.uint64(): polars.UInt64,
+        pa.uint8(): polars.UInt8(),
+        pa.uint16(): polars.UInt16(),
+        pa.uint32(): polars.UInt32(),
+        pa.uint64(): polars.UInt64(),
 
-        pa.float16(): polars.Float32,  # best-effort
-        pa.float32(): polars.Float32,
-        pa.float64(): polars.Float64,
+        pa.float16(): polars.Float32(),  # best-effort
+        pa.float32(): polars.Float32(),
+        pa.float64(): polars.Float64(),
 
-        pa.string(): polars.Utf8,
-        pa.string_view(): polars.Utf8,
-        pa.large_string(): polars.Utf8,
+        pa.string(): polars.Utf8(),
+        pa.string_view(): polars.Utf8(),
+        pa.large_string(): polars.Utf8(),
 
-        pa.binary(): polars.Binary,
-        pa.binary_view(): polars.Binary,
-        pa.large_binary(): polars.Binary,
+        pa.binary(): polars.Binary(),
+        pa.binary_view(): polars.Binary(),
+        pa.large_binary(): polars.Binary(),
 
-        pa.date32(): polars.Date,
-        # Arrow date64 is ms since epoch; Polars Date is “days”,
-        # so use Datetime to avoid silent semantic mismatch.
-        pa.date64(): polars.Datetime,
+        pa.date32(): polars.Date(),
     }
-
-    # Primitive Polars -> Arrow mapping keyed by *base* dtype class.
-    # We normalize any Polars dtype via .base_type() first.
-    POLARS_BASE_TO_ARROW: Dict[Any, pa.DataType] = {
-        polars.Boolean: pa.bool_(),
-
-        polars.Int8: pa.int8(),
-        polars.Int16: pa.int16(),
-        polars.Int32: pa.int32(),
-        polars.Int64: pa.int64(),
-
-        polars.UInt8: pa.uint8(),
-        polars.UInt16: pa.uint16(),
-        polars.UInt32: pa.uint32(),
-        polars.UInt64: pa.uint64(),
-
-        polars.Float32: pa.float32(),
-        polars.Float64: pa.float64(),
-
-        polars.Utf8: pa.large_string(),  # Polars string is 64-bit; map to large_string
-        polars.String: pa.large_string(),
-
-        polars.Binary: pa.large_binary(),
-
-        polars.Date: pa.date32(),
-        polars.Time: pa.time64("ns"),
-    }
-
 except ImportError:
     polars = None
     ARROW_TO_POLARS = {}
-    POLARS_BASE_TO_ARROW = {}
+
+
+POLARS_BASE_TO_ARROW = {v: k for k, v in ARROW_TO_POLARS.items()}
 
 
 def require_polars():
@@ -202,7 +173,7 @@ def arrow_field_to_polars_field(
     if callable(field_cls):
         return field_cls(field.name, pl_dtype)
 
-    return (field.name, pl_dtype)
+    return field.name, pl_dtype
 
 
 def _polars_base_type(pl_dtype: Any) -> Any:
@@ -237,7 +208,7 @@ def polars_type_to_arrow_type(
     base = _polars_base_type(pl_type)
 
     # Primitive base mapping
-    primitive = POLARS_BASE_TO_ARROW.get(base)
+    primitive = POLARS_BASE_TO_ARROW.get(base) or POLARS_BASE_TO_ARROW.get(type(pl_type))
     if primitive is not None:
         return primitive
 
