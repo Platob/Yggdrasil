@@ -4,7 +4,7 @@ from typing import List, Union, Optional, Iterable, Callable
 
 import pyarrow as pa
 
-from .. import pandas
+from ..pandaslib import pandas
 from ..sparklib import (
     pyspark,
     SparkDataFrame,

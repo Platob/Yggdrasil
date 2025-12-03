@@ -44,6 +44,7 @@ except ImportError:
 
 __all__ = [
     "DBXSQL",
+    "DBXStatementResult"
 ]
 
 
@@ -666,7 +667,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
-        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame, cast_options)
+        data = convert(convert(data, existing_schema), pyspark.sql.DataFrame, existing_schema)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
