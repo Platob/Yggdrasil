@@ -88,6 +88,16 @@ def test_cast_arrow_array_fill_non_nullable_defaults():
     assert casted.to_pylist() == [1, 0, 3]
 
 
+def test_cast_arrow_array_safe_primitive_cast_enforced():
+    arr = pa.array([128], type=pa.int32())
+    target_field = pa.field("x", pa.int8(), nullable=True)
+
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field, safe=True)
+
+    with pytest.raises(pa.ArrowInvalid):
+        cast_arrow_array(arr, opts)
+
+
 def test_cast_arrow_array_chunked_array_roundtrip():
     arr1 = pa.array([1, 2], type=pa.int32())
     arr2 = pa.array([3, 4], type=pa.int32())
@@ -134,6 +144,100 @@ def test_cast_arrow_array_struct_add_missing_field_defaults():
     assert result == [
         {"a": 1, "b": 0},
         {"a": None, "b": 0},
+    ]
+
+
+def test_cast_arrow_array_map_to_struct_case_insensitive_and_defaults():
+    map_type = pa.map_(pa.string(), pa.int32())
+    arr = pa.array([
+        {"A": 1},
+        {"a": None},
+    ], type=map_type)
+
+    struct_type_target = pa.struct(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("b", pa.int32(), nullable=False),
+        ]
+    )
+    target_field = pa.field("root", struct_type_target, nullable=False)
+
+    opts = ArrowCastOptions.__safe_init__(
+        target_field=target_field,
+        strict_match_names=False,
+    )
+
+    casted = cast_arrow_array(arr, opts)
+
+    assert casted.type == struct_type_target
+    assert casted.to_pylist() == [
+        {"a": 1, "b": 0},
+        {"a": None, "b": 0},
+    ]
+
+
+def test_cast_arrow_array_struct_to_map_preserves_values_and_nulls():
+    struct_type = pa.struct(
+        [
+            pa.field("x", pa.int32(), nullable=True),
+            pa.field("y", pa.int32(), nullable=True),
+        ]
+    )
+    arr = pa.array(
+        [
+            {"x": 1, "y": 2},
+            None,
+        ],
+        type=struct_type,
+    )
+
+    target_field = pa.field("root", pa.map_(pa.string(), pa.int32()), nullable=True)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+
+    casted = cast_arrow_array(arr, opts)
+
+    assert pa.types.is_map(casted.type)
+    assert casted.to_pylist() == [
+        [("x", 1), ("y", 2)],
+        None,
+    ]
+
+
+def test_cast_arrow_array_list_of_struct_add_missing_field_defaults():
+    struct_type_source = pa.struct(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+        ]
+    )
+    struct_type_target = pa.struct(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("b", pa.int32(), nullable=False),
+        ]
+    )
+
+    list_source = pa.list_(struct_type_source)
+    list_target = pa.list_(struct_type_target)
+
+    arr = pa.array(
+        [
+            [{"a": 1}],
+            None,
+            [{"a": None}],
+        ],
+        type=list_source,
+    )
+
+    target_field = pa.field("root", list_target, nullable=True)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+
+    casted = cast_arrow_array(arr, opts)
+
+    assert casted.type == list_target
+    assert casted.to_pylist() == [
+        [{"a": 1, "b": 0}],
+        None,
+        [{"a": None, "b": 0}],
     ]
 
 
