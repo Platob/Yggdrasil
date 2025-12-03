@@ -203,6 +203,44 @@ def test_cast_arrow_array_struct_to_map_preserves_values_and_nulls():
     ]
 
 
+def test_cast_arrow_array_list_of_struct_add_missing_field_defaults():
+    struct_type_source = pa.struct(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+        ]
+    )
+    struct_type_target = pa.struct(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("b", pa.int32(), nullable=False),
+        ]
+    )
+
+    list_source = pa.list_(struct_type_source)
+    list_target = pa.list_(struct_type_target)
+
+    arr = pa.array(
+        [
+            [{"a": 1}],
+            None,
+            [{"a": None}],
+        ],
+        type=list_source,
+    )
+
+    target_field = pa.field("root", list_target, nullable=True)
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+
+    casted = cast_arrow_array(arr, opts)
+
+    assert casted.type == list_target
+    assert casted.to_pylist() == [
+        [{"a": 1, "b": 0}],
+        None,
+        [{"a": None, "b": 0}],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # cast_arrow_table tests
 # ---------------------------------------------------------------------------
