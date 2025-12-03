@@ -173,6 +173,22 @@ def test_cast_spark_dataframe_allow_add_columns_true_keeps_extras(spark):
     assert [tuple(r) for r in result.collect()] == [(1, "x")]
 
 
+def test_cast_spark_dataframe_dictionary_targets_fall_back_to_mapinarrow(spark):
+    df = spark.createDataFrame([(1,), (2,)], ["a"])
+
+    target_schema = pa.schema(
+        [pa.field("a", pa.dictionary(pa.int32(), pa.string()), nullable=False)],
+    )
+
+    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
+
+    result = cast_spark_dataframe(df, opts)
+
+    assert result.schema["a"].dataType == T.StringType()
+    assert result.schema["a"].nullable is False
+    assert [r.a for r in result.collect()] == ["1", "2"]
+
+
 # ---------------------------------------------------------------------------
 # Column casting tests (pure Spark, Arrow-driven types)
 # ---------------------------------------------------------------------------
@@ -222,6 +238,26 @@ def test_cast_spark_column_schema_target_uses_first_field(spark):
 
     assert result.schema["a"].dataType == T.StringType()
     assert [r.a for r in result.collect()] == ["1"]
+
+
+def test_cast_spark_column_normalizes_nested_types(spark):
+    df = spark.createDataFrame([({"a": 1},)], schema="s struct<a:int>")
+
+    target_field = pa.field(
+        "s",
+        pa.struct(
+            [pa.field("a", pa.dictionary(pa.int32(), pa.large_string()), nullable=False)]
+        ),
+        nullable=True,
+    )
+
+    casted_col = cast_spark_column(F.col("s"), target_field)
+    result = df.select(casted_col.alias("s"))
+
+    struct_type = result.schema["s"].dataType
+    assert isinstance(struct_type, T.StructType)
+    assert struct_type["a"].dataType == T.StringType()
+    assert [r.s.a for r in result.collect()] == ["1"]
 
 
 # ---------------------------------------------------------------------------
