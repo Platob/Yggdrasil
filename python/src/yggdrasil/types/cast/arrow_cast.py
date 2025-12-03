@@ -260,15 +260,6 @@ def cast_to_list_array(
     _cast_array_fn,
 ) -> Union[pa.ListArray, pa.LargeListArray]:
     """Cast arrays to a list or large list Arrow array."""
-    if pa.types.is_large_list(target):
-        constructor = pa.LargeListArray
-    elif pa.types.is_fixed_size_list(target):
-        constructor = pa.FixedSizeListArray
-    elif pa.types.is_list_view(target):
-        constructor = pa.FixedSizeListArray
-    else:
-        constructor = pa.ListArray
-
     mask = arr.is_null() if arr.null_count else None
 
     if (
@@ -289,20 +280,29 @@ def cast_to_list_array(
     else:
         raise pa.ArrowInvalid(f"Unsupported list casting for type {arr.type}")
 
-    if constructor == pa.FixedSizeListArray:
-        return constructor.from_arrays(
+    if pa.types.is_list(target):
+        return pa.ListArray.from_arrays(
+            offsets,
             values,
-            target.list_size,
-            target,
-            mask
+            type=target,
+            mask=mask
         )
-
-    return constructor.from_arrays(
-        offsets,
-        values,
-        mask,
-        target,
-    )
+    if pa.types.is_large_list(target):
+        return pa.LargeListArray.from_arrays(
+            offsets,
+            values,
+            type=target,
+            mask=mask
+        )
+    elif pa.types.is_fixed_size_list(target):
+        return pa.FixedSizeListArray.from_arrays(
+            values,
+            list_size=target.list_size,
+            type=target,
+            mask=mask
+        )
+    else:
+        raise ValueError(f"Cannot build arrow array {target}")
 
 
 def cast_to_map_array(
