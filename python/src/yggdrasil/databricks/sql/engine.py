@@ -12,7 +12,7 @@ import pyarrow.ipc as pipc
 import pyarrow.parquet as pq
 
 from .types import column_info_to_arrow_field
-from ..workspaces import DBXWorkspaceObject
+from ..workspaces import DBXWorkspace, DBXWorkspaceObject
 from ...libs.databrickslib import databricks_sdk
 from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
@@ -54,6 +54,7 @@ class SqlExecutionError(RuntimeError):
 @dataclasses.dataclass
 class DBXStatementResult:
     base: StatementResponse
+    workspace: DBXWorkspace | None = None
 
     @property
     def status(self):
@@ -78,6 +79,29 @@ class DBXStatementResult:
     @property
     def external_links(self):
         return self.base.result.external_links
+
+    def _fetch_chunk(self, chunk_index: int):
+        if not self.workspace:
+            raise ValueError("Workspace is required to fetch additional result chunks")
+
+        sdk = self.workspace.sdk()
+        return sdk.statement_execution.get_statement_result_chunk_n(
+            statement_id=self.statement_id,
+            chunk_index=chunk_index,
+        )
+
+    def result_chunks(self):
+        result = self.result
+
+        while result is not None:
+            yield result
+
+            next_chunk_index = result.next_chunk_index
+
+            if next_chunk_index is None:
+                break
+
+            result = self._fetch_chunk(next_chunk_index)
 
     @property
     def done(self):
@@ -151,57 +175,73 @@ class DBXStatementResult:
         return pa.Table.from_batches(batches)
 
     def arrow_batches(self, max_workers: int | None = None):
-        if self.external_links:
-            session = YGGSession()
-            # if you really need to skip TLS verification, do it on the session
-            session.verify = False  # ideally don't do this in prod...
-
-            for link in self.external_links:
-                resp = session.get(link.external_link, verify=False, timeout=10)
-                resp.raise_for_status()
-
-                buf = pa.BufferReader(resp.content)
-
-                # If it's an IPC *stream*:
-                reader = pipc.open_stream(buf)
-
-                # If it’s an IPC *file*, use:
-                # reader = pipc.open_file(buf)
-
-                # reader yields RecordBatch objects
-                for batch in reader:
-                    yield batch
-        else:
+        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
             raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+        links: list = []
+
+        for result_chunk in self.result_chunks():
+            if result_chunk.external_links:
+                links.extend(result_chunk.external_links)
+
+        if not links:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+        session = YGGSession()
+        # if you really need to skip TLS verification, do it on the session
+        session.verify = False  # ideally don't do this in prod...
+
+        for link in links:
+            resp = session.get(link.external_link, verify=False, timeout=10)
+            resp.raise_for_status()
+
+            buf = pa.BufferReader(resp.content)
+
+            # If it's an IPC *stream*:
+            reader = pipc.open_stream(buf)
+
+            # If it’s an IPC *file*, use:
+            # reader = pipc.open_file(buf)
+
+            # reader yields RecordBatch objects
+            for batch in reader:
+                yield batch
 
     def arrow_messages(self, max_workers: int | None = None):
-        if self.external_links:
-            links = list(self.external_links)
-
-            if max_workers is None:
-                # tune this to your workloads; 16–32 is usually fine for I/O
-                max_workers = min(32, len(links))
-
-            session = YGGSession()
-            # if you really need to skip TLS verification, do it on the session
-            session.verify = False  # ideally don't do this in prod...
-
-            read_message = pipc.read_message
-
-            def fetch_and_decode(link):
-                url = link.external_link
-                resp = session.get(url, timeout=10)
-                resp.raise_for_status()
-                return read_message(resp.content)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(fetch_and_decode, link): link for link in links}
-                for fut in as_completed(futures):
-                    # if you want to surface which link failed, you can catch here
-                    batch = fut.result()  # will raise if that request failed
-                    yield batch
-        else:
+        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
             raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+        links: list = []
+
+        for result_chunk in self.result_chunks():
+            if result_chunk.external_links:
+                links.extend(result_chunk.external_links)
+
+        if not links:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+        if max_workers is None:
+            # tune this to your workloads; 16–32 is usually fine for I/O
+            max_workers = min(32, len(links))
+
+        session = YGGSession()
+        # if you really need to skip TLS verification, do it on the session
+        session.verify = False  # ideally don't do this in prod...
+
+        read_message = pipc.read_message
+
+        def fetch_and_decode(link):
+            url = link.external_link
+            resp = session.get(url, timeout=10)
+            resp.raise_for_status()
+            return read_message(resp.content)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fetch_and_decode, link): link for link in links}
+            for fut in as_completed(futures):
+                # if you want to surface which link failed, you can catch here
+                batch = fut.result()  # will raise if that request failed
+                yield batch
 
     def to_pandas(
         self,
@@ -353,7 +393,8 @@ class DBXSQL(DBXWorkspaceObject):
                     catalog=catalog_name,
                     schema=schema_name,
                     **kwargs,
-                )
+                ),
+                workspace=self.workspace,
             )
 
             if not wait:
@@ -362,7 +403,10 @@ class DBXSQL(DBXWorkspaceObject):
             return execution.wait(engine=connected, timeout=timeout, poll_interval=poll_interval)
 
     def get_statement(self, statement_id: str):
-        return DBXStatementResult(self.sdk().statement_execution.get_statement(statement_id))
+        return DBXStatementResult(
+            base=self.sdk().statement_execution.get_statement(statement_id),
+            workspace=self.workspace,
+        )
 
     def spark_table(
         self,
