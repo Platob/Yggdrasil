@@ -339,20 +339,25 @@ class DBXWorkspace:
                 "debug_truncate_bytes": self.debug_truncate_bytes,
                 "debug_headers": self.debug_headers,
                 "rate_limit": self.rate_limit,
-                "product": self.product,
-                "product_version": self.product_version or "0.0.0",
+                "product": self.product or os.getenv("DATABRICKS_PROJECT") or "unknown",
+                "product_version": self.product_version or os.getenv("DATABRICKS_PROJECT_VERSION") or "0.0.0",
             }
 
-            kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-            self._sdk = databricks_sdk.WorkspaceClient(**kwargs)
+            self._sdk = databricks_sdk.WorkspaceClient(**{
+                k: v
+                for k, v in kwargs.items()
+                if v is not None
+            })
 
             # Fill in host/auth_type from resolved config if we didn't set them
-            if not self.host:
-                self.host = self._sdk.config.host
+            for key in kwargs.keys():
+                self_value = getattr(self, key, None)
 
-            if not self.auth_type:
-                self.auth_type = self._sdk.config.auth_type
+                if self_value is None:
+                    config_value = getattr(self._sdk.config, key, None)
+
+                    if config_value is not None:
+                        setattr(self, key, config_value)
 
         return self
 

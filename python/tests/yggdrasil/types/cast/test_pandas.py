@@ -159,3 +159,11 @@ def test_record_batch_reader_to_pandas_dataframe_direct_helper():
         out.reset_index(drop=True),
         df.reset_index(drop=True),
     )
+
+
+def test_implicit_casts():
+    df = pandas.DataFrame({"a": [1, 2, 3]})
+
+    field = convert(df, pa.Field)
+
+    assert field
