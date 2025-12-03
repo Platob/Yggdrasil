@@ -174,7 +174,7 @@ def _find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
                 intermediate = _c1(value, options)
                 return _c2(intermediate, options)
 
-            return composed  # type: ignore[return-value]
+            return composed
 
     return None
 

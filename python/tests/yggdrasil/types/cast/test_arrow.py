@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import datetime as dt
 
 # test_arrow_cast.py
 import pyarrow as pa
@@ -628,3 +629,90 @@ def test_pylist_to_record_batch_and_reader_via_convert():
     table = pa.Table.from_batches(list(reader))
     assert table.schema.field("value").type == pa.int64()
     assert table.column("value").to_pylist() == [3, 4]
+
+
+def test_cast_arrow_array_default_datetime_formats_to_utc_timestamp():
+    values = [
+        # Zoned with fraction seconds (T / space)
+        "2024-01-02T03:04:05.123456Z",     # %Y-%m-%dT%H:%M:%S.%f%z
+        "2024-01-02 03:04:05.123456+0100", # %Y-%m-%d %H:%M:%S.%f%z
+
+        # Zoned without fraction seconds (T / space)
+        "2024-01-02T03:04Z",            # %Y-%m-%dT%H:%M:%S%z
+        "2024-01-02 03:04:05+0100",        # %Y-%m-%d %H:%M:%S%z
+
+        # Zoned without seconds (T / space)
+        "2024-01-02T03:04+0100",           # %Y-%m-%dT%H:%M%z
+        "2024-01-02 03:04+0100",           # %Y-%m-%d %H:%M%z
+
+        # Naive with fraction seconds (T / space)
+        "2024-01-02T03:04:05.123456",      # %Y-%m-%dT%H:%M:%S.%f
+        "2024-01-02 03:04:05.123456",      # %Y-%m-%d %H:%M:%S.%f
+
+        # Naive without fraction seconds (T / space)
+        "2024-01-02T03:04:05",             # %Y-%m-%dT%H:%M:%S
+        "2024-01-02 03:04:05",             # %Y-%m-%d %H:%M:%S
+
+        # Naive without seconds
+        "2024-01-02 03:04",                # %Y-%m-%d %H:%M
+
+        # Date only
+        "2024-01-02",                      # %Y-%m-%d
+
+        # Null-ish
+        "",                                # empty -> null
+        None,                              # explicit null
+    ]
+
+    arr = pa.array(values, type=pa.string())
+
+    target_field = pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=True)
+
+    # No explicit datetime_formats: should fall back to DEFAULT_DATETIME_FORMATS
+    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+
+    casted = cast_arrow_array(arr, opts)
+
+    assert casted.type == pa.timestamp("us", tz="UTC")
+
+    result = casted.to_pylist()
+
+    # IMPORTANT: Polars interprets %f as fractional seconds at nanosecond
+    # precision, then we downcast to microseconds. So ".123456" becomes
+    # 123456 ns -> 123 µs -> ".000123".
+    expected = [
+        # Zoned + fraction
+        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
+        # 03:04:05.123456+0100 -> 02:04:05.123456Z -> 123 ns -> 123 µs
+        dt.datetime(2024, 1, 2, 2, 4, 5, 123456, tzinfo=dt.timezone.utc),
+
+        # Zoned no fraction
+        dt.datetime(2024, 1, 2, 3, 4, 0, tzinfo=dt.timezone.utc),
+        dt.datetime(2024, 1, 2, 2, 4, 5, tzinfo=dt.timezone.utc),
+
+        # Zoned no seconds
+        dt.datetime(2024, 1, 2, 2, 4, 0, tzinfo=dt.timezone.utc),
+        dt.datetime(2024, 1, 2, 2, 4, 0, tzinfo=dt.timezone.utc),
+
+        # Naive with fraction (treated as UTC, same ns→µs behavior)
+        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
+        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
+
+        # Naive no fraction
+        dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc),
+        dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc),
+
+        # Naive no seconds
+        dt.datetime(2024, 1, 2, 3, 4, 0, tzinfo=dt.timezone.utc),
+
+        # Date only -> midnight UTC
+        dt.datetime(2024, 1, 2, 0, 0, 0, tzinfo=dt.timezone.utc),
+
+        None,
+        None,
+    ]
+
+    result_iso = [r.isoformat() if r is not None else None for r in result]
+    expected_iso = [e.isoformat() if e is not None else None for e in expected]
+
+    assert result_iso == expected_iso
