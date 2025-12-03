@@ -92,19 +92,6 @@ class DBXStatementResult:
             chunk_index=chunk_index,
         )
 
-    def result_chunks(self):
-        result = self.result
-
-        while result is not None:
-            yield result
-
-            next_chunk_index = result.next_chunk_index
-
-            if next_chunk_index is None:
-                break
-
-            result = self._fetch_chunk(next_chunk_index)
-
     @property
     def done(self):
         return self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
@@ -180,70 +167,46 @@ class DBXStatementResult:
         if self.manifest and self.manifest.format != Format.ARROW_STREAM:
             raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
 
-        links: list = []
+        result_data = self.result
 
-        for result_chunk in self.result_chunks():
-            if result_chunk.external_links:
-                links.extend(result_chunk.external_links)
+        if result_data.external_links is not None:
+            session = YGGSession()
+            link = None
 
-        if not links:
+            while True:
+                for link in result_data.external_links:
+                    resp = session.get(link.external_link, verify=False, timeout=10)
+                    resp.raise_for_status()
+
+                    buf = pa.BufferReader(resp.content)
+
+                    # If it's an IPC *stream*:
+                    reader = pipc.open_stream(buf)
+
+                    # If it’s an IPC *file*, use:
+                    # reader = pipc.open_file(buf)
+
+                    # reader yields RecordBatch objects
+                    for batch in reader:
+                        yield batch
+
+                    if not link.next_chunk_internal_link:
+                        break
+
+                    # /api/2.0/sql/statements/01f0d056-0596-194e-b011-aef9049504bf/result/chunks/1
+                    try:
+                        chunk_index = int(link.next_chunk_internal_link.split("/")[-1])
+                        result_data = self.workspace.sdk().statement_execution.get_statement_result_chunk_n(
+                            statement_id=self.statement_id,
+                            chunk_index=chunk_index
+                        )
+                    except Exception as e:
+                        raise SqlExecutionError(
+                            f"Cannot retrieve data batch from {link.next_chunk_internal_link!r}: {e}")
+
+                break
+        else:
             raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-        session = YGGSession()
-        # if you really need to skip TLS verification, do it on the session
-        session.verify = False  # ideally don't do this in prod...
-
-        for link in links:
-            resp = session.get(link.external_link, verify=False, timeout=10)
-            resp.raise_for_status()
-
-            buf = pa.BufferReader(resp.content)
-
-            # If it's an IPC *stream*:
-            reader = pipc.open_stream(buf)
-
-            # If it’s an IPC *file*, use:
-            # reader = pipc.open_file(buf)
-
-            # reader yields RecordBatch objects
-            for batch in reader:
-                yield batch
-
-    def arrow_messages(self, max_workers: int | None = None):
-        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-        links: list = []
-
-        for result_chunk in self.result_chunks():
-            if result_chunk.external_links:
-                links.extend(result_chunk.external_links)
-
-        if not links:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-        if max_workers is None:
-            # tune this to your workloads; 16–32 is usually fine for I/O
-            max_workers = min(32, len(links))
-
-        session = YGGSession()
-        # if you really need to skip TLS verification, do it on the session
-        session.verify = False  # ideally don't do this in prod...
-
-        read_message = pipc.read_message
-
-        def fetch_and_decode(link):
-            url = link.external_link
-            resp = session.get(url, timeout=10)
-            resp.raise_for_status()
-            return read_message(resp.content)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(fetch_and_decode, link): link for link in links}
-            for fut in as_completed(futures):
-                # if you want to surface which link failed, you can catch here
-                batch = fut.result()  # will raise if that request failed
-                yield batch
 
     def to_pandas(
         self,
@@ -519,7 +482,7 @@ class DBXSQL(DBXWorkspaceObject):
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
                 statement = self.create_table_ddl(
-                    schema=existing_schema,
+                    field=existing_schema,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     table_name=table_name,
@@ -856,7 +819,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
     @classmethod
     def create_table_ddl(
         cls,
-        schema: pa.Schema,
+        field: pa.Field,
         table_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
@@ -869,7 +832,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
         Generate DDL (Data Definition Language) SQL for creating a table from a PyField schema.
 
         Args:
-            schema: PyField schema that defines the table structure
+            field: PyField schema that defines the table structure
             table_name: Name of the table to create (defaults to schema.name)
             catalog_name: Optional catalog name (defaults to "hive_metastore")
             schema_name: Optional schema name (defaults to "default")
@@ -881,7 +844,10 @@ FROM parquet.`{databricks_tmp_folder}`"""
         Returns:
             A SQL string for creating the table
         """
-        table_name = table_name or schema.name
+        if not isinstance(field, pa.Field):
+            field = convert(field, pa.Field)
+
+        table_name = table_name or field.name
         catalog_name = catalog_name or "hive_metastore"
         schema_name = schema_name or "default"
         full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
@@ -891,7 +857,11 @@ FROM parquet.`{databricks_tmp_folder}`"""
 
         # Generate column definitions
         column_defs = []
-        children = list(schema)
+
+        if pa.types.is_struct(field.type):
+            children = list(field.type)
+        else:
+            children = [field]
 
         for child in children:
             column_def = cls._field_to_ddl(child)
@@ -907,8 +877,8 @@ FROM parquet.`{databricks_tmp_folder}`"""
             sql.append(f"\nCLUSTER BY AUTO")
 
         # Add comment if provided
-        if not comment and schema.metadata:
-            comment = schema.metadata.get(b"comment")
+        if not comment and field.metadata:
+            comment = field.metadata.get(b"comment")
 
         if isinstance(comment, bytes):
             comment = comment.decode("utf-8")

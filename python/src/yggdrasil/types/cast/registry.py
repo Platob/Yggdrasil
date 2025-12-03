@@ -196,7 +196,7 @@ def convert(
         type,
         pa.Field, pa.DataType, pa.Schema,
     ],
-    options: Optional[ArrowCastOptions] = None,
+    options: Optional[Union[ArrowCastOptions, pa.Field, pa.DataType, pa.Schema]] = None,
     **kwargs,
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
