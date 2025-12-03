@@ -379,7 +379,13 @@ def cast_primitive_array(
         if polars is not None:
             from .polars_cast import arrow_type_to_polars_type
             pl_type = arrow_type_to_polars_type(target)
-            pl_casted = polars.from_arrow(arr).cast(pl_type).to_arrow(polars.CompatLevel.newest())
+            try:
+                pl_casted = (
+                    polars.from_arrow(arr).cast(pl_type)
+                    .to_arrow(polars.CompatLevel.newest())
+                )
+            except Exception as e:
+                raise pa.ArrowInvalid(str(e))
 
             return pc.cast(
                 pl_casted,

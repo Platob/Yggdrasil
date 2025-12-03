@@ -12,14 +12,14 @@ from yggdrasil.libs.polarslib import (
 
 
 def test_arrow_to_polars_primitive_bool_int_string():
-    assert arrow_type_to_polars_type(pa.bool_()) is polars.Boolean
+    assert arrow_type_to_polars_type(pa.bool_()) is polars.Boolean()
 
-    assert arrow_type_to_polars_type(pa.int64()) is polars.Int64
-    assert arrow_type_to_polars_type(pa.uint32()) is polars.UInt32
+    assert arrow_type_to_polars_type(pa.int64()) is polars.Int64()
+    assert arrow_type_to_polars_type(pa.uint32()) is polars.UInt32()
 
     # Arrow string/large_string -> Polars Utf8
-    assert arrow_type_to_polars_type(pa.string()) is polars.Utf8
-    assert arrow_type_to_polars_type(pa.large_string()) is polars.Utf8
+    assert arrow_type_to_polars_type(pa.string()) is polars.Utf8()
+    assert arrow_type_to_polars_type(pa.large_string()) is polars.Utf8()
 
 
 def test_arrow_to_polars_list_and_struct():

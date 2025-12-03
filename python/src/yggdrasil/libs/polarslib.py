@@ -74,7 +74,7 @@ def arrow_type_to_polars_type(
 
     # Dictionary -> Categorical (no categories info at dtype level)
     if pat.is_dictionary(arrow_type):
-        return polars.Categorical
+        return polars.Categorical()
 
     # Map -> represented as List(Struct({"key": ..., "value": ...}))
     if pat.is_map(arrow_type):
@@ -138,21 +138,11 @@ def arrow_type_to_polars_type(
             unit = "ms"
         return polars.Duration(time_unit=unit)
 
-    # Fallback for numeric/string-ish if they weren't in the dict for some reason
-    if pat.is_integer(arrow_type):
-        if pat.is_signed_integer(arrow_type):
-            return polars.Int64
-        else:
-            return polars.UInt64
+    if pat.is_binary(arrow_type) or pat.is_large_binary(arrow_type) or pat.is_binary_view():
+        return polars.Binary()
 
-    if pat.is_floating(arrow_type):
-        return polars.Float64
-
-    if pat.is_binary(arrow_type) or pat.is_large_binary(arrow_type):
-        return polars.Binary
-
-    if pat.is_string(arrow_type) or pat.is_large_string(arrow_type):
-        return polars.Utf8
+    if pat.is_string(arrow_type) or pat.is_large_string(arrow_type) or pat.is_string_view():
+        return polars.Utf8()
 
     raise TypeError(f"Unsupported or unknown Arrow type for Polars conversion: {arrow_type!r}")
 
