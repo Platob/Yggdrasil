@@ -7,7 +7,7 @@ pa = pytest.importorskip("pyarrow")
 pandas = pytest.importorskip("pandas")
 
 from yggdrasil.types.cast.registry import convert
-from yggdrasil.types.cast.pandas import (
+from yggdrasil.types.cast.pandas_cast import (
     cast_pandas_series,
     cast_pandas_dataframe,
     arrow_array_to_pandas_series,

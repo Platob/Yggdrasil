@@ -2,17 +2,17 @@ from typing import Optional
 
 import pyarrow as pa
 
-from .arrow import ArrowCastOptions
+from .arrow_cast import ArrowCastOptions
 from .registry import register_converter
 
 # Spark <-> Arrow helpers
-from .spark import (
+from .spark_cast import (
     spark_dataframe_to_arrow_table,
     arrow_table_to_spark_dataframe,
 )
 
 # Polars <-> Arrow helpers
-from .polars import (
+from .polars_cast import (
     polars_dataframe_to_arrow_table,
     arrow_table_to_polars_dataframe,
 )

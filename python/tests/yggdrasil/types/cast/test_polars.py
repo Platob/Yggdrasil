@@ -6,7 +6,7 @@ import pytest
 polars = pytest.importorskip("polars")
 import polars as pl  # noqa: F401
 
-from yggdrasil.types.cast.polars import (
+from yggdrasil.types.cast.polars_cast import (
     cast_polars_series,
     cast_polars_dataframe,
     polars_series_to_arrow_array,
@@ -16,7 +16,7 @@ from yggdrasil.types.cast.polars import (
     polars_dataframe_to_record_batch_reader,
     record_batch_reader_to_polars_dataframe,
 )
-from yggdrasil.types.cast.arrow import ArrowCastOptions
+from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
 from yggdrasil.types import convert
 
 

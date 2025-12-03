@@ -1,16 +1,16 @@
 from typing import Optional
 
-from .arrow import ArrowCastOptions
+from .arrow_cast import ArrowCastOptions
 from .registry import register_converter
 
 # Reuse existing Spark <-> Arrow helpers
-from .spark import (
+from .spark_cast import (
     spark_dataframe_to_arrow_table,
     arrow_table_to_spark_dataframe,
 )
 
 # Reuse existing pandas <-> Arrow helpers
-from .pandas import (
+from .pandas_cast import (
     pandas_dataframe_to_arrow_table,
     arrow_table_to_pandas_dataframe,
 )

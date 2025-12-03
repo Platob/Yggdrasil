@@ -3,7 +3,7 @@ from typing import Optional
 
 import pyarrow as pa
 
-from .arrow import (
+from .arrow_cast import (
     ArrowCastOptions,
     default_arrow_array,
     cast_arrow_array,

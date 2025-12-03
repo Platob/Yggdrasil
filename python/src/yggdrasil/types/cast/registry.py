@@ -22,7 +22,7 @@ from typing import (
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    from .arrow import ArrowCastOptions
+    from .arrow_cast import ArrowCastOptions
 
 __all__ = ["register_converter", "convert"]
 
@@ -201,7 +201,7 @@ def convert(
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
     from yggdrasil.types.python_defaults import default_from_hint
-    from yggdrasil.types.cast.arrow import ArrowCastOptions
+    from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
 
     is_optional, target_hint = _unwrap_optional(target_hint)
 

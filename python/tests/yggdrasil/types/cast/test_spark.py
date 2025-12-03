@@ -6,11 +6,11 @@ import pytest
 pyspark = pytest.importorskip("pyspark")
 from pyspark.sql import SparkSession, functions as F, types as T
 
-from yggdrasil.types.cast.spark import (
+from yggdrasil.types.cast.spark_cast import (
     cast_spark_dataframe,
     cast_spark_column,
 )
-from yggdrasil.types.cast.arrow import ArrowCastOptions
+from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
 from yggdrasil.types import convert
 
 

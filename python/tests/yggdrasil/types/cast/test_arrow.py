@@ -5,7 +5,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.types import convert
-from yggdrasil.types.cast.arrow import (
+from yggdrasil.types.cast.arrow_cast import (
     ArrowCastOptions,
     cast_arrow_array,
     cast_arrow_table,

@@ -2,7 +2,7 @@ from typing import Any, Optional, Tuple, List
 
 import pyarrow as pa
 
-from .arrow import (
+from .arrow_cast import (
     ArrowCastOptions,
     cast_arrow_table,
     record_batch_reader_to_table,
