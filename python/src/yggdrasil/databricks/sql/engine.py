@@ -260,7 +260,7 @@ class DBXSQL(DBXWorkspaceObject):
         cluster_size: str = "Small"
     ):
         wk = self.workspace.sdk()
-        existing = list(wk.warehouses.list(page_size=5))
+        existing = list(wk.warehouses.list())
         first = None
 
         for warehouse in existing:
