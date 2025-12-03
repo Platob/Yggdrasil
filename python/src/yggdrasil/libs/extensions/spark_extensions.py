@@ -1,6 +1,6 @@
 import datetime
 import re
-from typing import List, Union, Optional, Iterable, Callable
+from typing import List, Union, Optional, Iterable, Callable, TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -13,8 +13,10 @@ from ..sparklib import (
     spark_type_to_arrow_type,
     arrow_field_to_spark_field,
 )
-from ...types.cast.arrow_cast import ArrowCastOptions
 from ...types.cast.registry import convert
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ...types.cast.arrow_cast import ArrowCastOptions
 
 # Try to import pyspark.sql stuff if pyspark is actually there
 try:
@@ -217,6 +219,7 @@ def upsample(
         arrow_table_to_polars_dataframe,
         polars_dataframe_to_arrow_table,
     )
+    from ...types.cast.arrow_cast import ArrowCastOptions
 
     df: pyspark.sql.DataFrame = df
 
