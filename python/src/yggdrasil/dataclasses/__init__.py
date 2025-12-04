@@ -1,3 +1,3 @@
-from .dataclass import dataclass
+from .dataclass import yggdataclass
 
-__all__ = ["dataclass"]
+__all__ = ["yggdataclass"]

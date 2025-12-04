@@ -43,14 +43,16 @@ Here is a minimal example that uses the enhanced dataclass decorator together
 with the conversion helpers:
 
 ```python
-from yggdrasil.dataclasses import dataclass
+from yggdrasil.dataclasses import yggdataclass
 from yggdrasil.types import arrow_field_from_hint
 import pyarrow as pa
 
-@dataclass
+
+@yggdataclass
 class Example:
     id: int
     name: str
+
 
 example = Example.default_instance()
 print(example.to_dict())

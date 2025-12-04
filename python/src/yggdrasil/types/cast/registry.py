@@ -215,7 +215,7 @@ def convert(
         if value is None:
             return None if is_optional else default_from_hint(target_hint)
 
-    options = ArrowCastOptions.check_arg(arg=options, kwargs=kwargs)
+    options = ArrowCastOptions.check_arg(target_field=options, kwargs=kwargs)
     origin = get_origin(target_hint) or target_hint
     args = get_args(target_hint)
     source_hint = type(value)

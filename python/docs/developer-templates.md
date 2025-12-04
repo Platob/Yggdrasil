@@ -9,13 +9,15 @@ Use the custom `@dataclass` decorator to add serialization helpers, safe
 initialization, and Arrow-aware schemas to your models.
 
 ```python
-from yggdrasil.dataclasses import dataclass
+from yggdrasil.dataclasses import yggdataclass
 
-@dataclass
+
+@yggdataclass
 class Customer:
     id: int
     name: str
     active: bool = True
+
 
 # Construct objects with type-safe coercion
 payload = {"id": "101", "name": "Ada"}

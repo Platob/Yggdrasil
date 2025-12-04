@@ -17,13 +17,16 @@ familiar semantics.
   `pyarrow.Field` objects directly from dataclass definitions.
 
 ## Quick start
-```python
-from yggdrasil.dataclasses import dataclass
 
-@dataclass
+```python
+from yggdrasil.dataclasses import yggdataclass
+
+
+@yggdataclass
 class Event:
     id: int
     payload: dict[str, str] | None = None
+
 
 record = Event.from_dict({"id": "42", "payload": {"k": "v"}})
 assert record.to_tuple() == (42, {"k": "v"})

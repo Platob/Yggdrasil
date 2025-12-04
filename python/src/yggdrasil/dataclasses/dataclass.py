@@ -1,14 +1,55 @@
 import dataclasses
+from inspect import isclass
 from typing import Any, Iterable, Mapping, Tuple
 
+import pyarrow as pa
+
 __all__ = [
-    "dataclass"
+    "yggdataclass",
+    "is_yggdataclass",
+    "get_dataclass_arrow_field"
 ]
 
-_builtin_dataclass = dataclasses.dataclass
+from pandas.core.dtypes.inference import is_dataclass
+
+DATACLASS_ARROW_FIELD_CACHE: dict[type, pa.Field] = {}
 
 
-def dataclass(
+def is_yggdataclass(cls_or_instance: Any) -> bool:
+    """Check if a class or instance is a yggdrasil dataclass.
+
+    Args:
+        cls_or_instance: The class or instance to check.
+    Returns:
+        True if the class or instance
+        is a yggdrasil dataclass, False otherwise.
+    """
+    return hasattr(cls_or_instance, "__arrow_field__")
+
+
+def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
+    if is_yggdataclass(cls_or_instance):
+        return cls_or_instance.__arrow_field__()
+
+    if is_dataclass(cls_or_instance):
+        cls = cls_or_instance
+        if not isclass(cls_or_instance):
+            cls = cls_or_instance.__class__
+
+        existing = DATACLASS_ARROW_FIELD_CACHE.get(cls, None)
+        if existing is not None:
+            return existing
+
+        from yggdrasil.types.python_arrow import arrow_field_from_hint
+
+        built = arrow_field_from_hint(cls)
+        DATACLASS_ARROW_FIELD_CACHE[cls] = built
+        return built
+
+    raise ValueError(f"{cls_or_instance!r} is not a dataclass or yggdrasil dataclass")
+
+
+def yggdataclass(
     cls=None, /,
     *,
     init=True,
@@ -125,36 +166,6 @@ def dataclass(
 
             c.default_instance = default_instance
 
-        if not hasattr(c, "copy"):
-            @classmethod
-            def copy(cls, *args, **kwargs):
-                """Return a new instance using defaults merged with overrides.
-
-                Positional arguments override fields in definition order, while
-                keyword arguments override matching field names. Both sets of
-                overrides are applied on top of the cached default instance,
-                mirroring the class constructor's positional ordering.
-                """
-
-                fields = _init_public_fields(cls)
-                init_fields = [field.name for field in fields]
-
-                if len(args) > len(init_fields):
-                    raise TypeError(
-                        f"Expected at most {len(init_fields)} positional arguments, "
-                        f"got {len(args)}"
-                    )
-
-                positional_overrides = {
-                    name: value for name, value in zip(init_fields, args)
-                }
-
-                overrides = {**positional_overrides, **kwargs}
-
-                return dataclasses.replace(cls.default_instance(), **overrides)
-
-            c.copy = copy
-
         if not hasattr(c, "__safe_init__"):
             @classmethod
             def __safe_init__(cls, *args, **kwargs):
@@ -195,16 +206,16 @@ def dataclass(
 
             c.__safe_init__ = __safe_init__
 
-        if not hasattr(c, "arrow_field"):
+        if not hasattr(c, "__arrow_field__"):
             @classmethod
-            def arrow_field(cls, name: str | None = None):
-                from yggdrasil.types import arrow_field_from_hint
+            def __arrow_field__(cls, name: str | None = None):
+                from yggdrasil.types.python_arrow import arrow_field_from_hint
 
                 return arrow_field_from_hint(cls, name=name)
 
-            c.arrow_field = arrow_field
+            c.__arrow_field__ = __arrow_field__
 
-        base = _builtin_dataclass(
+        base = dataclasses.dataclass(
             c,
             init=init,
             repr=repr,
@@ -226,6 +237,3 @@ def dataclass(
 
     # We're called as @dataclass without parens.
     return wrap(cls)
-
-
-dataclasses.dataclass = dataclass

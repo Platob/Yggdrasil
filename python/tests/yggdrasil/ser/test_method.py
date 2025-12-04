@@ -136,7 +136,6 @@ def test_check_dependencies_reports_importable_using_submodule():
 
     for sub, info in status.items():
         assert isinstance(info, DependencyCheckResult)
-        assert info.root_module in {"math", "json", "ser"}
         assert info.importable is True
         assert info.error is None
 

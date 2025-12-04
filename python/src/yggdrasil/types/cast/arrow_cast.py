@@ -1,18 +1,18 @@
-from dataclasses import dataclass, replace as dc_replace, fields as dc_fields, is_dataclass, asdict
-from functools import partial
-from enum import Enum
+import dataclasses
+import enum
+from dataclasses import is_dataclass
 from typing import Optional, Union, List
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .registry import register_converter, convert
-from ..python_arrow import arrow_field_from_hint
+from .cast_options import ArrowCastOptions
+from .registry import register_converter
 from ..python_defaults import default_from_arrow_hint
+from ...dataclasses.dataclass import get_dataclass_arrow_field
+from ...libs.polarslib import polars
 
 __all__ = [
-    "DataFormat",
-    "ArrowCastOptions",
     "cast_arrow_array",
     "cast_arrow_table",
     "cast_arrow_batch",
@@ -22,168 +22,44 @@ __all__ = [
     "pylist_to_record_batch",
     "pylist_to_record_batch_reader",
     "to_spark_arrow_type",
-    "to_polars_arrow_type"
+    "to_polars_arrow_type",
+    "arrow_field_to_schema"
 ]
-
-from ...libs import polars
-
-
-# ---------------------------------------------------------------------------
-# DataFormat enum
-# ---------------------------------------------------------------------------
-
-
-class DataFormat(Enum):
-    ARROW = "arrow"
-    SPARK = "spark"
-    POLARS = "polars"
-    PANDAS = "pandas"
-
-
-# ---------------------------------------------------------------------------
-# ArrowCastOptions
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ArrowCastOptions:
-    """
-    Options controlling Arrow casting behavior.
-
-    Attributes
-    ----------
-    safe:
-        If True, only allow "safe" casts (delegated to pyarrow.compute.cast).
-    add_missing_columns:
-        If True, create default-valued columns/fields when target schema has
-        fields that are missing in the source.
-    strict_match_names:
-        If True, only match fields/columns by exact name (case-sensitive).
-        If False, allows case-insensitive and positional matching.
-    allow_add_columns:
-        If True, allow additional columns beyond the target schema to remain.
-        If False, extra columns are effectively ignored.
-    rename:
-        Reserved / placeholder for rename behavior (currently unused).
-    memory_pool:
-        Optional Arrow memory pool passed down to compute kernels.
-    source_field:
-        Description of the source field/schema. Used to infer nullability behavior.
-        Can be a pa.Field, pa.Schema, or pa.DataType (normalized elsewhere).
-    target_field:
-        Description of the target field/schema. Can be pa.Field, pa.Schema,
-        or pa.DataType (normalized elsewhere).
-    """
-
-    safe: bool = False
-    add_missing_columns: bool = True
-    strict_match_names: bool = False
-    allow_add_columns: bool = False
-    rename: bool = True
-    memory_pool: Optional[pa.MemoryPool] = None
-    source_field: Optional[pa.Field] = None
-    target_field: Optional[pa.Field] = None
-    datetime_formats: Optional[List[str]] = None
-
-    @classmethod
-    def check_arg(
-        cls,
-        arg: Union[
-            "ArrowCastOptions",
-            dict,
-            pa.DataType,
-            pa.Field,
-            pa.Schema,
-            DataFormat,
-            None,
-        ] = None,
-        kwargs: Optional[dict] = None,
-    ) -> "ArrowCastOptions":
-        """
-        Normalize an argument into an ArrowCastOptions instance.
-
-        - If `arg` is already ArrowCastOptions, return it.
-        - Otherwise, treat `arg` as something convertible to pa.Field via
-          the registry (`convert(arg, Optional[pa.Field])`) and apply it
-          as `target_field` on top of DEFAULT_CAST_OPTIONS.
-        - If arg is None, just use DEFAULT_CAST_OPTIONS.
-        """
-        if isinstance(arg, ArrowCastOptions):
-            result = arg
-        else:
-            result = dc_replace(
-                DEFAULT_CAST_OPTIONS,
-                target_field=convert(arg, Optional[pa.Field]),
-            )
-
-        if kwargs:
-            result = dc_replace(result, **kwargs)
-
-        return result
-
-    @property
-    def target_schema(self) -> Optional[pa.Schema]:
-        """
-        Schema view of `target_field`.
-
-        - If target_field is a struct, unwrap its children as schema fields.
-        - Otherwise treat target_field as a single-field schema.
-        """
-        if self.target_field is not None:
-            return arrow_field_to_schema(self.target_field, None)
-        return None
-
-    @target_schema.setter
-    def target_schema(self, value: pa.Schema) -> None:
-        """
-        Set `target_field` from a `pa.Schema`, wrapping it as a root struct field.
-        """
-        self.target_field = pa.field(
-            "root",
-            pa.struct(list(value)),
-            nullable=False,
-            metadata=value.metadata,
-        )
-
-
-DEFAULT_CAST_OPTIONS = ArrowCastOptions()
-
-# ---------------------------------------------------------------------------
-# Core array casting
-# ---------------------------------------------------------------------------
 
 
 def cast_to_struct_array(
     arr: Union[pa.Array, pa.StructArray, pa.MapArray],
-    target: pa.DataType,
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
     options: ArrowCastOptions,
-    _cast_array_fn,
 ) -> pa.StructArray:
     """Cast arrays to a struct Arrow array."""
+    if not options.target_field:
+        return arr
 
-    if not pa.types.is_struct(arr.type) and not pa.types.is_map(arr.type):
-        raise pa.ArrowInvalid(f"Cannot cast non-struct array to struct type {target}")
-
+    source_field = options.source_field or array_to_field(arr, options)
+    target_field = options.target_field
+    target_type: pa.StructType = target_field.type
+    mask = arr.is_null() if source_field.nullable and target_field.nullable else None
     children: List[pa.Array] = []
 
     # Case 1: struct -> struct
     if pa.types.is_struct(arr.type):
-        name_to_index = {field.name: idx for idx, field in enumerate(arr.type)}
-        folded_to_index = {field.name.casefold(): idx for idx, field in enumerate(arr.type)}
+        name_to_index = {
+            field.name: idx for idx, field in enumerate(arr.type)
+        }
+        folded_to_index = {
+            field.name.casefold(): idx for idx, field in enumerate(arr.type)
+        }
 
-        for i, field in enumerate(target):
-            if field.name in name_to_index:
-                child_idx = name_to_index[field.name]
+        for i, target_field in enumerate(target_type):
+            if target_field.name in name_to_index:
+                child_idx = name_to_index[target_field.name]
                 child_arr = arr.field(child_idx)
                 child_source_field = arr.type[child_idx]
             elif (
                 not options.strict_match_names
-                and field.name.casefold() in folded_to_index
+                and target_field.name.casefold() in folded_to_index
             ):
-                child_idx = folded_to_index[field.name.casefold()]
+                child_idx = folded_to_index[target_field.name.casefold()]
                 child_arr = arr.field(child_idx)
                 child_source_field = arr.type[child_idx]
             elif not options.strict_match_names and i < arr.type.num_fields:
@@ -193,155 +69,139 @@ def cast_to_struct_array(
                 child_source_field = arr.type[child_idx]
             elif options.add_missing_columns:
                 # Field missing -> create default-valued array
-                child_arr = default_arrow_array(field, len(arr))
-                child_source_field = None
+                child_arr = default_arrow_array(target_field, len(arr))
+                child_source_field = array_to_field(child_arr, options)
             else:
                 raise pa.ArrowInvalid(
-                    f"Missing field {field.name} while casting struct"
+                    f"Missing field {target_field.name} while casting struct"
                 )
 
             children.append(
-                _cast_array_fn(
+                cast_arrow_array(
                     child_arr,
-                    field.type,
-                    nullable=field.nullable,
-                    source_field=child_source_field,
+                    options.copy(
+                        source_field=child_source_field,
+                        target_field=target_field
+                    )
                 )
             )
 
     # Case 2: map -> struct (e.g. map<string, value> with key-based lookup)
     else:
         map_arr = arr
+        map_type: pa.MapType = arr.type
 
-        # Optional case-insensitive map keys
-        if not options.strict_match_names and pa.types.is_string(arr.type.key_type):
-            lowered_keys = pc.utf8_lower(arr.keys)
-            map_arr = pa.MapArray.from_arrays(
-                arr.offsets,
-                lowered_keys,
-                arr.items,
-                mask=arr.is_null() if arr.null_count else None,
-                type=pa.map_(lowered_keys.type, arr.type.item_type),
-            )
+        for target_field in target_type:
+            values = pc.map_lookup(map_arr, target_field.name, "first")
 
-        for field in target:
-            lookup_key = field.name if options.strict_match_names else field.name.casefold()
-
-            values = pc.map_lookup(map_arr, lookup_key, "first")
-
-            casted = _cast_array_fn(
+            casted = cast_arrow_array(
                 values,
-                field.type,
-                nullable=field.nullable,
-                source_field=None,
+                options.copy(
+                    source_field=map_type.item_field,
+                    target_field=target_field
+                )
             )
-
-            # Enforce non-nullability with defaults if needed
-            if not field.nullable:
-                default_arr = default_arrow_array(field, len(arr))
-                casted = pc.if_else(pc.is_null(casted), default_arr, casted)
 
             children.append(casted)
 
-    mask = arr.is_null() if arr.null_count else None
     return pa.StructArray.from_arrays(
         children,
-        fields=list(target),
+        fields=list(target_type),
         mask=mask,
+        memory_pool=options.memory_pool
     )
 
 
 def cast_to_list_array(
     arr: Union[pa.Array, pa.ListArray, pa.LargeListArray],
-    target: Union[pa.ListType, pa.LargeListType, pa.FixedSizeListType],
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
-    _cast_array_fn,
+    options: ArrowCastOptions,
 ) -> Union[pa.ListArray, pa.LargeListArray]:
     """Cast arrays to a list or large list Arrow array."""
-    mask = arr.is_null() if arr.null_count else None
+    target_field = options.target_field
+    target_type: Union[pa.ListType, pa.FixedSizeListType] = target_field.type
+    source_field = options.source_field or array_to_field(arr, options)
+    mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
-    if (
-        pa.types.is_list(arr.type)
-        or pa.types.is_large_list(arr.type)
-        or pa.types.is_fixed_size_list(arr.type)
-        or pa.types.is_list_view(arr.type)
-    ):
+    if is_type_list_like(source_field.type):
         list_source_field = arr.type.value_field
 
         offsets = arr.offsets
-        values = _cast_array_fn(
+        values = cast_arrow_array(
             arr.values,
-            target.value_type,
-            nullable=True,
-            source_field=list_source_field,
+            options.copy(
+                source_field=list_source_field,
+                target_field=target_type.value_field,
+            )
         )
     else:
         raise pa.ArrowInvalid(f"Unsupported list casting for type {arr.type}")
 
-    if pa.types.is_list(target):
+    if pa.types.is_list(target_type):
         return pa.ListArray.from_arrays(
             offsets,
             values,
-            type=target,
+            type=target_type,
             mask=mask
         )
-    if pa.types.is_large_list(target):
+    if pa.types.is_large_list(target_type):
         return pa.LargeListArray.from_arrays(
             offsets,
             values,
-            type=target,
+            type=target_type,
             mask=mask
         )
-    elif pa.types.is_fixed_size_list(target):
+    elif pa.types.is_fixed_size_list(target_type):
         return pa.FixedSizeListArray.from_arrays(
             values,
-            list_size=target.list_size,
-            type=target,
+            list_size=target_type.list_size,
+            type=target_type,
             mask=mask
         )
     else:
-        raise ValueError(f"Cannot build arrow array {target}")
+        raise ValueError(f"Cannot build arrow array {target_type}")
 
 
 def cast_to_map_array(
     arr: Union[pa.Array, pa.MapArray, pa.StructArray],
-    target: pa.DataType,
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
     options: ArrowCastOptions,
-    _cast_array_fn,
 ) -> pa.MapArray:
     """Cast arrays to a map Arrow array."""
+    if not options.target_field:
+        return arr
+
+    source_field = options.source_field or array_to_field(arr, options)
+    target_field = options.target_field
+    target_type: pa.MapType = options.target_field.type
+    mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
     # Case 1: map -> map
     if pa.types.is_map(arr.type):
-        keys = _cast_array_fn(
+        keys = cast_arrow_array(
             arr.keys,
-            target.key_type,
-            nullable=True,
-            source_field=arr.type.key_field,
+            options.copy(
+                source_field=arr.type.key_field,
+                target_field=target_type.key_field,
+            )
         )
-        items = _cast_array_fn(
+        items = cast_arrow_array(
             arr.items,
-            target.item_type,
-            nullable=True,
-            source_field=arr.type.item_field,
+            options.copy(
+                source_field=arr.type.item_field,
+                target_field=target_type.item_field,
+            )
         )
-        mask = arr.is_null() if arr.null_count else None
         return pa.MapArray.from_arrays(
             arr.offsets,
             keys,
             items,
             mask=mask,
-            type=target,
+            type=target_type,
+            pool=options.memory_pool
         )
 
     # Case 2: struct -> map (field.name => value)
     if not pa.types.is_struct(arr.type):
-        raise pa.ArrowInvalid(f"Cannot cast non-map array to map type {target}")
+        raise pa.ArrowInvalid(f"Cannot cast non-map array to map type {target_type}")
 
     num_rows = len(arr)
     offsets = [0]
@@ -351,11 +211,12 @@ def cast_to_map_array(
 
     # Pre-cast all children values
     casted_children = [
-        _cast_array_fn(
+        cast_arrow_array(
             arr.field(i),
-            target.item_type,
-            nullable=True,
-            source_field=arr.type[i],
+            options.copy(
+                source_field=arr.type[i],
+                target_field=target_type.item_field,
+            )
         )
         for i in range(arr.type.num_fields)
     ]
@@ -375,44 +236,52 @@ def cast_to_map_array(
 
         offsets.append(len(keys))
 
-    map_type = pa.map_(pa.string(), target.item_type, keys_sorted=False)
+    map_type = pa.map_(pa.string(), target_type.item_type, keys_sorted=False)
+
     return pa.MapArray.from_arrays(
         offsets,
         pa.array(keys, type=pa.string()),
-        pa.array(items, type=target.item_type),
+        pa.array(items, type=target_type.item_type),
         mask=mask,
         type=map_type,
+        pool=options.memory_pool
     )
 
 
 def cast_primitive_array(
     arr: pa.Array,
-    target: pa.DataType,
-    *,
-    options: ArrowCastOptions,
+    options: ArrowCastOptions | None = None,
 ) -> pa.Array:
     """Cast simple scalar arrays via pyarrow.compute.cast."""
     # Special handling: string -> timestamp with multi-format parsing via Polars
+    if not options:
+        return arr
 
-    if (
-        pa.types.is_string(arr.type)
-        or pa.types.is_large_string(arr.type)
-        or pa.types.is_string_view(arr.type)
-    ):
-        if pa.types.is_timestamp(target):
-            return cast_arrow_array_strptime(arr, target, options=options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    target_type = target_field.type
+
+    if is_string_like(target_type):
+        if pa.types.is_timestamp(target_type):
+            return cast_arrow_array_strptime(
+                arr,
+                options
+            )
 
     try:
-        return pc.cast(
+        casted = pc.cast(
             arr,
-            target_type=target,
+            target_type=target_type,
             safe=options.safe,
             memory_pool=options.memory_pool,
         )
     except:
         if not options.safe and polars is not None:
             from .polars_cast import arrow_type_to_polars_type
-            pl_type = arrow_type_to_polars_type(target)
+            pl_type = arrow_type_to_polars_type(target_type)
             try:
                 pl_casted = (
                     polars.from_arrow(arr)
@@ -422,19 +291,29 @@ def cast_primitive_array(
             except Exception as e:
                 raise pa.ArrowInvalid(str(e))
 
-            return pc.cast(
+            casted = pc.cast(
                 pl_casted,
-                target_type=target,
+                target_type=target_type,
                 safe=options.safe,
                 memory_pool=options.memory_pool,
             )
-        raise
+        else:
+            raise
 
+    source_field = options.source_field or array_to_field(arr, options)
+
+    if source_field.nullable and not target_field.nullable:
+        casted = _fill_non_nullable_defaults(
+            casted,
+            target_type,
+            nullable=target_field.nullable,
+            source_field=source_field,
+        )
+
+    return casted
 
 def cast_arrow_array_strptime(
     arr: pa.Array,
-    target: pa.TimestampType,
-    *,
     options: "ArrowCastOptions",
 ) -> pa.Array:
     """
@@ -448,6 +327,13 @@ def cast_arrow_array_strptime(
       ... optionally with .fraction (1–9 digits)
       ... optionally with timezone: Z, +HHMM, +HH:MM, -HHMM, -HH:MM
     """
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    target_type: pa.TimestampType = target_field.type
+
     from .polars_cast import arrow_type_to_polars_type, cast_polars_series_strptime
 
     if options.target_field is None:
@@ -461,13 +347,13 @@ def cast_arrow_array_strptime(
 
     out_arr = pa.array(
         ticks_series.to_arrow(),
-        type=pa.timestamp(target.unit, tz=target.tz),
+        type=pa.timestamp(target_type.unit, tz=target_type.tz),
     )
 
-    if out_arr.type != target:
+    if out_arr.type != target_type:
         out_arr = pc.cast(
             out_arr,
-            target_type=target,
+            target_type=target_type,
             safe=options.safe,
             memory_pool=options.memory_pool,
         )
@@ -487,7 +373,9 @@ def _fill_non_nullable_defaults(
 
     If the *source* is already non-nullable and has no nulls, we leave it alone.
     """
-    if nullable:
+    source_nullable = True if source_field is None else source_field.nullable
+
+    if not source_nullable or nullable:
         return arr
 
     if isinstance(arr, pa.ChunkedArray):
@@ -505,7 +393,7 @@ def _fill_non_nullable_defaults(
         ]
         return pa.chunked_array(filled_chunks, type=arr.type)
 
-    if source_field is not None and source_field.nullable is False and arr.null_count == 0:
+    if arr.null_count == 0:
         # Source already guaranteed non-nullable and contains no nulls.
         return arr
 
@@ -517,122 +405,86 @@ def _fill_non_nullable_defaults(
     return arr
 
 
-def _cast_single(
-    arr: pa.Array,
-    target: pa.DataType,
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
-    options: ArrowCastOptions,
-    _cast_array_fn,
-) -> pa.Array:
-    """
-    Cast a single (non-chunked) array to the target type.
-    """
-
-    # ---------- Struct casting ----------
-    if pa.types.is_struct(target):
-        return cast_to_struct_array(
-            arr,
-            target,
-            nullable=nullable,
-            source_field=source_field,
-            options=options,
-            _cast_array_fn=_cast_array_fn,
-        )
-
-    # ---------- List / LargeList casting ----------
-    if (
-        pa.types.is_list(target)
-        or pa.types.is_large_list(target)
-        or pa.types.is_fixed_size_list(target)
-        or pa.types.is_list_view(target)
-    ):
-        return cast_to_list_array(
-            arr,
-            target,
-            nullable=nullable,
-            source_field=source_field,
-            _cast_array_fn=_cast_array_fn,
-        )
-
-    # ---------- Map casting ----------
-    if pa.types.is_map(target):
-        return cast_to_map_array(
-            arr,
-            target,
-            nullable=nullable,
-            source_field=source_field,
-            options=options,
-            _cast_array_fn=_cast_array_fn,
-        )
-
-    # ---------- Scalar / simple type casting ----------
-    return cast_primitive_array(arr, target, options=options)
-
-
-def _cast_array(
-    arr: Union[pa.Array, pa.ChunkedArray],
-    target: pa.DataType,
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
-    options: ArrowCastOptions,
-) -> Union[pa.Array, pa.ChunkedArray]:
-    """
-    Recursive array casting with chunked-array support and default filling.
-    """
-    # Fast path: same type, only need to enforce nullability defaults
-    if arr.type.equals(target):
-        return _fill_non_nullable_defaults(
-            arr,
-            target,
-            nullable=nullable,
-            source_field=source_field,
-        )
-
-    # ChunkedArray: cast each chunk and then reassemble
-    if isinstance(arr, pa.ChunkedArray):
-        chunks = [
-            _cast_array(
-                chunk,
-                target,
-                nullable=nullable,
-                source_field=source_field,
-                options=options,
-            )
-            for chunk in arr.chunks
-        ]
-        casted = pa.chunked_array(chunks, type=target)
-        return _fill_non_nullable_defaults(
-            casted,
-            target,
-            nullable=nullable,
-            source_field=source_field,
-        )
-
-    # Single array case
-    casted = _cast_single(
-        arr,
-        target,
-        nullable=nullable,
-        source_field=source_field,
-        options=options,
-        _cast_array_fn=partial(_cast_array, options=options),
-    )
-    return _fill_non_nullable_defaults(
-        casted,
-        target,
-        nullable=nullable,
-        source_field=source_field,
+def is_type_list_like(arrow_type: pa.DataType) -> bool:
+    """Check if an Arrow type is list-like."""
+    return (
+        pa.types.is_list(arrow_type)
+        or pa.types.is_large_list(arrow_type)
+        or pa.types.is_fixed_size_list(arrow_type)
+        or pa.types.is_list_view(arrow_type)
     )
 
+
+def is_string_like(arrow_type: pa.DataType) -> bool:
+    """Check if an Arrow type is string-like."""
+    return (
+        pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or pa.types.is_string_view(arrow_type)
+    )
+
+
+@register_converter(object, pa.Scalar)
+def any_to_arrow_scalar(
+    scalar: object,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Scalar:
+    if isinstance(scalar, pa.Scalar):
+        return cast_arrow_scalar(scalar, options)
+
+    options = ArrowCastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if isinstance(scalar, enum.Enum):
+        scalar = scalar.value
+
+    if is_dataclass(scalar):
+        if not target_field:
+            target_field = get_dataclass_arrow_field(scalar)
+            options = options.copy(target_field=target_field)
+
+        scalar = dataclasses.asdict(scalar)
+
+    if target_field is None:
+        if is_dataclass(scalar):
+            scalar = pa.scalar(dataclasses.asdict(scalar), type=get_dataclass_arrow_field(scalar).type)
+        else:
+            scalar = pa.scalar(scalar)
+
+        return scalar
+
+    if scalar is None and not target_field.nullable:
+        return default_from_arrow_hint(target_field)
+
+    try:
+        scalar = pa.scalar(scalar, type=target_field.type)
+    except:
+        scalar = pa.scalar(scalar)
+
+    return cast_arrow_scalar(scalar, options)
+
+
+@register_converter(pa.Scalar, pa.Scalar)
+def cast_arrow_scalar(
+    scalar: pa.Scalar,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Scalar:
+    options = ArrowCastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return scalar
+
+    arr = pa.array([scalar])
+    casted = cast_arrow_array(arr, options)
+
+    return casted[0]
 
 
 @register_converter(pa.Array, pa.Array)
 @register_converter(pa.ChunkedArray, pa.ChunkedArray)
 def cast_arrow_array(
-    data: Union[pa.ChunkedArray, pa.Array],
+    array: Union[pa.ChunkedArray, pa.Array],
     options: Optional[ArrowCastOptions] = None,
 ) -> Union[pa.ChunkedArray, pa.Array]:
     """
@@ -647,24 +499,24 @@ def cast_arrow_array(
     Nullability is enforced using `default_from_arrow_hint` for non-nullable targets.
     """
     options = ArrowCastOptions.check_arg(options)
-
-    source_field = options.source_field
     target_field = options.target_field
 
     # No target -> nothing to do
     if target_field is None:
-        return data
+        return array
 
     target_type = target_field.type
-    target_nullable = target_field.nullable
 
-    return _cast_array(
-        data,
-        target_type,
-        nullable=target_nullable,
-        source_field=source_field,
-        options=options,
-    )
+    if pa.types.is_nested(target_type):
+        if pa.types.is_struct(target_type):
+            return cast_to_struct_array(array, options)
+        elif is_type_list_like(target_type):
+            return cast_to_list_array(array, options)
+        elif pa.types.is_map(target_type):
+            return cast_to_map_array(array, options)
+        raise ValueError(f"Unsupported nested target type {target_type}")
+    else:
+        return cast_primitive_array(array, options)
 
 # ---------------------------------------------------------------------------
 # Table / RecordBatch casting
@@ -698,16 +550,16 @@ def cast_arrow_table(
 
     columns: List[Union[pa.Array, pa.ChunkedArray]] = []
 
-    for field in arrow_schema:
+    for target_field in arrow_schema:
         # Exact match
-        if field.name in exact_name_to_index:
-            col_idx = exact_name_to_index[field.name]
+        if target_field.name in exact_name_to_index:
+            col_idx = exact_name_to_index[target_field.name]
             column = data.column(col_idx)
             source_field = data.schema.field(col_idx)
 
         # Case-insensitive match
-        elif not options.strict_match_names and field.name.casefold() in folded_name_to_index:
-            col_idx = folded_name_to_index[field.name.casefold()]
+        elif not options.strict_match_names and target_field.name.casefold() in folded_name_to_index:
+            col_idx = folded_name_to_index[target_field.name.casefold()]
             column = data.column(col_idx)
             source_field = data.schema.field(col_idx)
 
@@ -719,21 +571,20 @@ def cast_arrow_table(
 
         # Missing -> default column
         elif options.add_missing_columns:
-            column = default_arrow_array(field, data.num_rows)
+            column = default_arrow_array(target_field, data.num_rows)
             source_field = None
 
         else:
             raise pa.ArrowInvalid(
-                f"Missing column {field.name} while casting table"
+                f"Missing column {target_field.name} while casting table"
             )
 
         casted_col = cast_arrow_array(
             column,
-            dc_replace(
-                options,
+            options.copy(
                 source_field=source_field,
-                target_field=field,
-            ),
+                target_field=target_field,
+            )
         )
         columns.append(casted_col)
 
@@ -751,29 +602,35 @@ def cast_arrow_batch(
 
     Same semantics as `cast_arrow_table`, but for a single RecordBatch.
     """
+    if options is None:
+        return data
+
     options = ArrowCastOptions.check_arg(options)
     arrow_schema = options.target_schema
 
     if arrow_schema is None:
         return data
 
-    exact_name_to_index = {name: idx for idx, name in enumerate(data.schema.names)}
+    exact_name_to_index = {
+        name: idx for idx, name in enumerate(data.schema.names)
+    }
+
     folded_name_to_index = {
         name.casefold(): idx for idx, name in enumerate(data.schema.names)
     }
 
     columns: List[Union[pa.Array, pa.ChunkedArray]] = []
 
-    for field in arrow_schema:
+    for target_field in arrow_schema:
         # Exact match
-        if field.name in exact_name_to_index:
-            col_idx = exact_name_to_index[field.name]
+        if target_field.name in exact_name_to_index:
+            col_idx = exact_name_to_index[target_field.name]
             column = data.column(col_idx)
             source_field = data.schema.field(col_idx)
 
         # Case-insensitive match
-        elif not options.strict_match_names and field.name.casefold() in folded_name_to_index:
-            col_idx = folded_name_to_index[field.name.casefold()]
+        elif not options.strict_match_names and target_field.name.casefold() in folded_name_to_index:
+            col_idx = folded_name_to_index[target_field.name.casefold()]
             column = data.column(col_idx)
             source_field = data.schema.field(col_idx)
 
@@ -785,20 +642,19 @@ def cast_arrow_batch(
 
         # Missing -> default column
         elif options.add_missing_columns:
-            column = default_arrow_array(field, data.num_rows)
+            column = default_arrow_array(target_field, data.num_rows)
             source_field = None
 
         else:
             raise pa.ArrowInvalid(
-                f"Missing column {field.name} while casting record batch"
+                f"Missing column {target_field.name} while casting record batch"
             )
 
         casted_col = cast_arrow_array(
             column,
-            dc_replace(
-                options,
+            options.copy(
                 source_field=source_field,
-                target_field=field,
+                target_field=target_field,
             ),
         )
         columns.append(casted_col)
@@ -856,77 +712,45 @@ def default_arrow_array(
 # ---------------------------------------------------------------------------
 # Pylist -> Arrow
 # ---------------------------------------------------------------------------
-
-
-def _normalize_pylist_value(value):
-    if is_dataclass(value):
-        return asdict(value)
-    return value
-
-
-def _schema_from_dataclass_instance(instance) -> pa.Schema:
-    fields = []
-
-    for field in dc_fields(type(instance)):
-        if not field.init or field.name.startswith("_"):
-            continue
-        fields.append(arrow_field_from_hint(field.type, name=field.name))
-
-    return pa.schema(fields)
-
-
-def _table_from_pylist(
-    data: list,
+@register_converter(list, pa.Array)
+def pylist_to_arrow_array(
+    pylist: list,
     options: Optional[ArrowCastOptions] = None,
-) -> pa.Table:
+) -> pa.Array:
     options = ArrowCastOptions.check_arg(options)
-    target_schema = options.target_schema
-    schema = target_schema
+    target_field = options.target_field
 
-    if schema is None and data:
-        for item in data:
-            if is_dataclass(item):
-                schema = _schema_from_dataclass_instance(item)
-                break
+    if not pylist:
+        return pa.array([], type=target_field.type if target_field else pa.null())
 
-    requires_row_mapping = schema is not None or any(
-        item is not None
-        and (is_dataclass(item) or isinstance(item, dict))
-        for item in data
-    )
+    found_scalar = None
+    null_count = 0
 
-    normalized = []
-    for item in data:
-        if item is None and requires_row_mapping:
-            normalized.append({})
-            continue
-        normalized.append(_normalize_pylist_value(item))
+    for item in pylist:
+        if item is not None:
+            found_scalar = any_to_arrow_scalar(item, None)
 
-    if not normalized:
-        if schema is None:
-            raise pa.ArrowInvalid(
-                "Cannot build Arrow table from empty list without target_field"
-            )
-        arrays = [pa.array([], type=field.type) for field in schema]
-        return pa.Table.from_arrays(arrays, schema=schema)
+            if target_field is None:
+                target_field = arrow_type_to_field(found_scalar.type, None)
+                options = options.copy(target_field=target_field)
+            break
+        else:
+            null_count += 1
 
-    if schema is None:
-        has_keys = any(isinstance(item, dict) and item for item in normalized)
-        if not has_keys:
-            raise pa.ArrowInvalid(
-                "Cannot build Arrow table from list of None/empty rows without target_field"
-            )
+    if null_count == len(pylist):
+        return default_arrow_array(field=target_field if target_field else pa.null(), length=len(pylist))
 
-    return pa.Table.from_pylist(normalized, schema=schema)
+    if found_scalar:
+        scalars = [
+            any_to_arrow_scalar(item, options)
+            for item in pylist
+        ]
+    else:
+        return default_arrow_array(field=target_field if target_field else pa.null(), length=len(pylist))
 
+    arr = pa.array(scalars, type=target_field.type if target_field else None)
 
-@register_converter(list, pa.Table)
-def pylist_to_arrow_table(
-    data: list,
-    options: Optional[ArrowCastOptions] = None,
-) -> pa.Table:
-    table = _table_from_pylist(data, options)
-    return cast_arrow_table(table, options)
+    return cast_arrow_array(arr, options)
 
 
 @register_converter(list, pa.RecordBatch)
@@ -934,8 +758,35 @@ def pylist_to_record_batch(
     data: list,
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.RecordBatch:
-    table = _table_from_pylist(data, options)
-    return table_to_record_batch(table, options)
+    options = ArrowCastOptions.check_arg(options)
+
+    array: Union[pa.Array, pa.StructArray] = pylist_to_arrow_array(data, options)
+
+    target_field = options.target_field or arrow_array_to_field(array, None)
+    target_type: Union[pa.DataType, pa.StructType] = target_field.type
+
+    schema = arrow_field_to_schema(target_field, None)
+
+    if isinstance(array, pa.StructArray):
+        arrays = [
+            array.field(i) for i in range(target_type.num_fields)
+        ]
+    else:
+        arrays = [array]
+
+    return pa.record_batch(
+        arrays,
+        schema=schema,
+    )
+
+
+@register_converter(list, pa.Table)
+def pylist_to_arrow_table(
+    data: list,
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Table:
+    batch = pylist_to_record_batch(data, options)
+    return record_batch_to_table(batch, None)
 
 
 @register_converter(list, pa.RecordBatchReader)
@@ -943,8 +794,8 @@ def pylist_to_record_batch_reader(
     data: list,
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.RecordBatchReader:
-    table = _table_from_pylist(data, options)
-    return table_to_record_batch_reader(table, options)
+    batch = pylist_to_record_batch(data, options)
+    return record_batch_to_record_batch_reader(batch, None)
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +805,7 @@ def pylist_to_record_batch_reader(
 
 def to_spark_arrow_type(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]
-) -> pa.DataType:
+) -> Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]:
     """
     Normalize an Arrow DataType to something Spark can handle:
 
@@ -1090,6 +941,21 @@ def to_polars_arrow_type(dtype: pa.DataType) -> pa.DataType:
 # ---------------------------------------------------------------------------
 # Cross-container casting helpers
 # ---------------------------------------------------------------------------
+@register_converter(pa.Array, pa.Field)
+@register_converter(pa.ChunkedArray, pa.Field)
+def array_to_field(
+    array: Union[pa.Array, pa.ChunkedArray],
+    options: Optional[ArrowCastOptions] = None,
+) -> pa.Field:
+    """
+    Convert an Arrow array or chunked array to a Field describing its type.
+    """
+    return pa.field(
+        str(array.type),
+        array.type,
+        nullable=array.null_count > 0,
+        metadata=None,
+    )
 
 
 @register_converter(pa.Table, pa.RecordBatch)
@@ -1230,9 +1096,11 @@ def arrow_field_to_schema(
     options: Optional[ArrowCastOptions] = None,
 ) -> pa.Schema:
     md = dict(data.metadata or {})
-    md.setdefault(b"name", data.name.encode())
+    md[b"name"] = data.name.encode()
+
     if pa.types.is_struct(data.type):
         return pa.schema(list(data.type), metadata=md)
+
     return pa.schema([data], metadata=md)
 
 

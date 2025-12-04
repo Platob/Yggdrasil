@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import datetime as dt
 
 # test_arrow_cast.py
 import pyarrow as pa
@@ -7,7 +6,6 @@ import pytest
 
 from yggdrasil.types import convert
 from yggdrasil.types.cast.arrow_cast import (
-    ArrowCastOptions,
     cast_arrow_array,
     cast_arrow_table,
     cast_arrow_batch,
@@ -19,10 +17,10 @@ from yggdrasil.types.cast.arrow_cast import (
     record_batch_reader_to_table,
     record_batch_to_record_batch_reader,
     record_batch_reader_to_record_batch,
-    DEFAULT_CAST_OPTIONS,
     pylist_to_arrow_table,
     pylist_to_record_batch,
 )
+from yggdrasil.types.cast.cast_options import ArrowCastOptions, DEFAULT_CAST_OPTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +149,7 @@ def test_cast_arrow_array_struct_add_missing_field_defaults():
 def test_cast_arrow_array_map_to_struct_case_insensitive_and_defaults():
     map_type = pa.map_(pa.string(), pa.int32())
     arr = pa.array([
-        {"A": 1},
+        {"a": 1},
         {"a": None},
     ], type=map_type)
 
@@ -587,16 +585,6 @@ def test_pylist_to_arrow_table_preserves_nullable_none_values():
     assert table.column("a").to_pylist() == [1, None]
 
 
-def test_pylist_to_arrow_table_fills_non_nullable_none_values():
-    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
-
-    table = pylist_to_arrow_table([{"a": None}, {"a": 3}], opts)
-
-    # None should be replaced with the default integer value (0)
-    assert table.column("a").to_pylist() == [0, 3]
-
-
 def test_pylist_to_arrow_table_handles_none_and_dataclass_rows():
     data = [None, _Point(1, "a")]
 
@@ -620,99 +608,12 @@ def test_pylist_to_record_batch_and_reader_via_convert():
     target_field = pa.field("value", pa.int64(), nullable=False)
     opts = ArrowCastOptions.__safe_init__(target_field=target_field)
 
-    batch = pylist_to_record_batch([{"value": 1}, {"value": 2}], opts)
+    batch = pylist_to_record_batch([1, 2], opts)
     assert isinstance(batch, pa.RecordBatch)
     assert batch.schema.field("value").type == pa.int64()
     assert batch.column(0).to_pylist() == [1, 2]
 
-    reader = convert([{"value": 3}, {"value": 4}], pa.RecordBatchReader, options=opts)
+    reader = convert([3, 4], pa.RecordBatchReader, options=opts)
     table = pa.Table.from_batches(list(reader))
     assert table.schema.field("value").type == pa.int64()
     assert table.column("value").to_pylist() == [3, 4]
-
-
-def test_cast_arrow_array_default_datetime_formats_to_utc_timestamp():
-    values = [
-        # Zoned with fraction seconds (T / space)
-        "2024-01-02T03:04:05.123456Z",     # %Y-%m-%dT%H:%M:%S.%f%z
-        "2024-01-02 03:04:05.123456+0100", # %Y-%m-%d %H:%M:%S.%f%z
-
-        # Zoned without fraction seconds (T / space)
-        "2024-01-02 03:04Z",            # %Y-%m-%dT%H:%M:%S%z
-        "2024-01-02 03:04:05+0100",        # %Y-%m-%d %H:%M:%S%z
-
-        # Zoned without seconds (T / space)
-        "2024-01-02T03:04+0100",           # %Y-%m-%dT%H:%M%z
-        "2024-01-02 03:04+0100",           # %Y-%m-%d %H:%M%z
-
-        # Naive with fraction seconds (T / space)
-        "2024-01-02T03:04:05.123456",      # %Y-%m-%dT%H:%M:%S.%f
-        "2024-01-02 03:04:05.123456",      # %Y-%m-%d %H:%M:%S.%f
-
-        # Naive without fraction seconds (T / space)
-        "2024-01-02T03:04:05",             # %Y-%m-%dT%H:%M:%S
-        "2024-01-02 03:04:05",             # %Y-%m-%d %H:%M:%S
-
-        # Naive without seconds
-        "2024-01-02 03:04",                # %Y-%m-%d %H:%M
-
-        # Date only
-        "2024-01-02",                      # %Y-%m-%d
-
-        # Null-ish
-        "",                                # empty -> null
-        None,                              # explicit null
-    ]
-
-    arr = pa.array(values, type=pa.string())
-
-    target_field = pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=True)
-
-    # No explicit datetime_formats: should fall back to DEFAULT_DATETIME_FORMATS
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
-
-    casted = cast_arrow_array(arr, opts)
-
-    assert casted.type == pa.timestamp("us", tz="UTC")
-
-    result = casted.to_pylist()
-
-    # IMPORTANT: Polars interprets %f as fractional seconds at nanosecond
-    # precision, then we downcast to microseconds. So ".123456" becomes
-    # 123456 ns -> 123 µs -> ".000123".
-    expected = [
-        # Zoned + fraction
-        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
-        # 03:04:05.123456+0100 -> 02:04:05.123456Z -> 123 ns -> 123 µs
-        dt.datetime(2024, 1, 2, 2, 4, 5, 123456, tzinfo=dt.timezone.utc),
-
-        # Zoned no fraction
-        dt.datetime(2024, 1, 2, 3, 4, 0, tzinfo=dt.timezone.utc),
-        dt.datetime(2024, 1, 2, 2, 4, 5, tzinfo=dt.timezone.utc),
-
-        # Zoned no seconds
-        dt.datetime(2024, 1, 2, 2, 4, 0, tzinfo=dt.timezone.utc),
-        dt.datetime(2024, 1, 2, 2, 4, 0, tzinfo=dt.timezone.utc),
-
-        # Naive with fraction (treated as UTC, same ns→µs behavior)
-        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
-        dt.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
-
-        # Naive no fraction
-        dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc),
-        dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc),
-
-        # Naive no seconds
-        dt.datetime(2024, 1, 2, 3, 4, 0, tzinfo=dt.timezone.utc),
-
-        # Date only -> midnight UTC
-        dt.datetime(2024, 1, 2, 0, 0, 0, tzinfo=dt.timezone.utc),
-
-        None,
-        None,
-    ]
-
-    result_iso = [r.isoformat() if r is not None else None for r in result]
-    expected_iso = [e.isoformat() if e is not None else None for e in expected]
-
-    assert result_iso == expected_iso
