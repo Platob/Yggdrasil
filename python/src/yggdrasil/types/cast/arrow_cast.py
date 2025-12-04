@@ -29,14 +29,23 @@ __all__ = [
 
 def cast_to_struct_array(
     arr: Union[pa.Array, pa.StructArray, pa.MapArray],
-    options: ArrowCastOptions,
+    options: Optional[ArrowCastOptions] = None,
 ) -> pa.StructArray:
     """Cast arrays to a struct Arrow array."""
-    if not options.target_field:
+    options = ArrowCastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
         return arr
 
+    if isinstance(arr, pa.ChunkedArray):
+        casted_chunks = [
+            cast_to_struct_array(chunk, options)
+            for chunk in arr.chunks
+        ]
+        return pa.chunked_array(casted_chunks, type=arr.type)
+
     source_field = options.source_field or array_to_field(arr, options)
-    target_field = options.target_field
     target_type: pa.StructType = target_field.type
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
     children: List[pa.Array] = []
@@ -114,10 +123,22 @@ def cast_to_struct_array(
 
 def cast_to_list_array(
     arr: Union[pa.Array, pa.ListArray, pa.LargeListArray],
-    options: ArrowCastOptions,
+    options: Optional[ArrowCastOptions] = None,
 ) -> Union[pa.ListArray, pa.LargeListArray]:
     """Cast arrays to a list or large list Arrow array."""
+    options = ArrowCastOptions.check_arg(options)
     target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    if isinstance(arr, pa.ChunkedArray):
+        casted_chunks = [
+            cast_to_list_array(chunk, options)
+            for chunk in arr.chunks
+        ]
+        return pa.chunked_array(casted_chunks, type=arr.type)
+
     target_type: Union[pa.ListType, pa.FixedSizeListType] = target_field.type
     source_field = options.source_field or array_to_field(arr, options)
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
@@ -163,14 +184,23 @@ def cast_to_list_array(
 
 def cast_to_map_array(
     arr: Union[pa.Array, pa.MapArray, pa.StructArray],
-    options: ArrowCastOptions,
+    options: Optional[ArrowCastOptions] = None,
 ) -> pa.MapArray:
     """Cast arrays to a map Arrow array."""
-    if not options.target_field:
+    options = ArrowCastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
         return arr
 
+    if isinstance(arr, pa.ChunkedArray):
+        casted_chunks = [
+            cast_to_map_array(chunk, options)
+            for chunk in arr.chunks
+        ]
+        return pa.chunked_array(casted_chunks, type=arr.type)
+
     source_field = options.source_field or array_to_field(arr, options)
-    target_field = options.target_field
     target_type: pa.MapType = options.target_field.type
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
