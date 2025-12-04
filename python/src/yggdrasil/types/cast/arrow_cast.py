@@ -10,7 +10,6 @@ from .cast_options import ArrowCastOptions
 from .registry import register_converter
 from ..python_defaults import default_from_arrow_hint
 from ...dataclasses.dataclass import get_dataclass_arrow_field
-from ...libs.polarslib import polars
 
 __all__ = [
     "cast_arrow_array",
@@ -43,7 +42,7 @@ def cast_to_struct_array(
             cast_to_struct_array(chunk, options)
             for chunk in arr.chunks
         ]
-        return pa.chunked_array(casted_chunks, type=arr.type)
+        return pa.chunked_array(casted_chunks, type=target_field.type)
 
     source_field = options.source_field or array_to_field(arr, options)
     target_type: pa.StructType = target_field.type
@@ -137,7 +136,7 @@ def cast_to_list_array(
             cast_to_list_array(chunk, options)
             for chunk in arr.chunks
         ]
-        return pa.chunked_array(casted_chunks, type=arr.type)
+        return pa.chunked_array(casted_chunks, type=target_field.type)
 
     target_type: Union[pa.ListType, pa.FixedSizeListType] = target_field.type
     source_field = options.source_field or array_to_field(arr, options)
@@ -198,7 +197,7 @@ def cast_to_map_array(
             cast_to_map_array(chunk, options)
             for chunk in arr.chunks
         ]
-        return pa.chunked_array(casted_chunks, type=arr.type)
+        return pa.chunked_array(casted_chunks, type=target_field.type)
 
     source_field = options.source_field or array_to_field(arr, options)
     target_type: pa.MapType = options.target_field.type
