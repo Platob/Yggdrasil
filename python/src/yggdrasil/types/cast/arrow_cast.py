@@ -283,7 +283,6 @@ def cast_primitive_array(
     options: ArrowCastOptions | None = None,
 ) -> pa.Array:
     """Cast simple scalar arrays via pyarrow.compute.cast."""
-    # Special handling: string -> timestamp with multi-format parsing via Polars
     if not options:
         return arr
 
@@ -292,133 +291,47 @@ def cast_primitive_array(
     if target_field is None:
         return arr
 
-    target_type = target_field.type
-
-    if is_string_like(target_type):
-        if pa.types.is_timestamp(target_type):
-            return cast_arrow_array_strptime(
-                arr,
-                options
-            )
-
-    try:
-        casted = pc.cast(
-            arr,
-            target_type=target_type,
-            safe=options.safe,
-            memory_pool=options.memory_pool,
-        )
-    except:
-        if not options.safe and polars is not None:
-            from .polars_cast import arrow_type_to_polars_type
-            pl_type = arrow_type_to_polars_type(target_type)
-            try:
-                pl_casted = (
-                    polars.from_arrow(arr)
-                    .cast(pl_type, strict=False)
-                    .to_arrow()
-                )
-            except Exception as e:
-                raise pa.ArrowInvalid(str(e))
-
-            casted = pc.cast(
-                pl_casted,
-                target_type=target_type,
-                safe=options.safe,
-                memory_pool=options.memory_pool,
-            )
-        else:
-            raise
-
-    source_field = options.source_field or array_to_field(arr, options)
-
-    if source_field.nullable and not target_field.nullable:
-        casted = _fill_non_nullable_defaults(
-            casted,
-            target_type,
-            nullable=target_field.nullable,
-            source_field=source_field,
-        )
-
-    return casted
-
-def cast_arrow_array_strptime(
-    arr: pa.Array,
-    options: "ArrowCastOptions",
-) -> pa.Array:
-    """
-    Cast a string array to a timestamp array using Polars + regex parsing.
-
-    Supported patterns:
-
-      YYYY-MM-DD
-      YYYY-MM-DD[ T]HH:MM
-      YYYY-MM-DD[ T]HH:MM:SS
-      ... optionally with .fraction (1–9 digits)
-      ... optionally with timezone: Z, +HHMM, +HH:MM, -HHMM, -HH:MM
-    """
-    target_field = options.target_field
-
-    if target_field is None:
-        return arr
-
-    target_type: pa.TimestampType = target_field.type
-
-    from .polars_cast import arrow_type_to_polars_type, cast_polars_series_strptime
-
-    if options.target_field is None:
-        return arr
-
-    ticks_series = cast_polars_series_strptime(
-        polars.from_arrow(arr),
-        options=options,
-        target=arrow_type_to_polars_type(options.target_field.type, options)
+    casted = pc.cast(
+        arr,
+        target_type=target_field.type,
+        safe=options.safe,
+        memory_pool=options.memory_pool,
     )
 
-    out_arr = pa.array(
-        ticks_series.to_arrow(),
-        type=pa.timestamp(target_type.unit, tz=target_type.tz),
-    )
-
-    if out_arr.type != target_type:
-        out_arr = pc.cast(
-            out_arr,
-            target_type=target_type,
-            safe=options.safe,
-            memory_pool=options.memory_pool,
-        )
-
-    return out_arr
+    return check_array_nullability(casted, options)
 
 
-def _fill_non_nullable_defaults(
+def check_array_nullability(
     arr: Union[pa.Array, pa.ChunkedArray],
-    dtype: pa.DataType,
-    *,
-    nullable: bool,
-    source_field: Optional[pa.Field],
+    options: Optional[ArrowCastOptions] = None,
 ) -> Union[pa.Array, pa.ChunkedArray]:
     """
     For non-nullable targets, replace nulls with default Python values.
 
     If the *source* is already non-nullable and has no nulls, we leave it alone.
     """
-    source_nullable = True if source_field is None else source_field.nullable
+    options = ArrowCastOptions.check_arg(options)
+    target_field = options.target_field
 
-    if not source_nullable or nullable:
+    if target_field is None:
+        return arr
+
+    source_field = options.source_field or array_to_field(arr, options)
+
+    if not source_field.nullable or target_field.nullable:
         return arr
 
     if isinstance(arr, pa.ChunkedArray):
         if arr.null_count == 0:
             return arr
 
+        options = options.copy(
+            source_field=source_field,
+            target_field=target_field,
+        )
+
         filled_chunks = [
-            _fill_non_nullable_defaults(
-                chunk,
-                dtype,
-                nullable=nullable,
-                source_field=source_field,
-            )
+            check_array_nullability(chunk, options)
             for chunk in arr.chunks
         ]
         return pa.chunked_array(filled_chunks, type=arr.type)
@@ -428,8 +341,8 @@ def _fill_non_nullable_defaults(
         return arr
 
     if arr.null_count:
-        fill_scalar = default_from_arrow_hint(dtype)
-        default_arr = pa.array([fill_scalar] * len(arr), type=dtype)
+        fill_scalar = default_from_arrow_hint(target_field.type)
+        default_arr = pa.array([fill_scalar] * len(arr), type=target_field.type)
         return pc.if_else(pc.is_null(arr), default_arr, arr)
 
     return arr
