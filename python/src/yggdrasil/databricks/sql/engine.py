@@ -17,8 +17,9 @@ from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...requests.session import YGGSession
-from ...types import cast_spark_dataframe, arrow_table_to_spark_dataframe
-from ...types.cast import convert, ArrowCastOptions
+from ...types.cast.cast_options import ArrowCastOptions
+from ...types.cast.registry import convert
+from ...types.cast.spark_cast import cast_spark_dataframe, arrow_table_to_spark_dataframe
 
 try:
     from delta.tables import DeltaTable

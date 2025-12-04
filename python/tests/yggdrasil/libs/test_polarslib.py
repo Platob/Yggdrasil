@@ -12,14 +12,14 @@ from yggdrasil.libs.polarslib import (
 
 
 def test_arrow_to_polars_primitive_bool_int_string():
-    assert arrow_type_to_polars_type(pa.bool_()) is polars.Boolean()
+    assert arrow_type_to_polars_type(pa.bool_()) == polars.Boolean()
 
-    assert arrow_type_to_polars_type(pa.int64()) is polars.Int64()
-    assert arrow_type_to_polars_type(pa.uint32()) is polars.UInt32()
+    assert arrow_type_to_polars_type(pa.int64()) == polars.Int64()
+    assert arrow_type_to_polars_type(pa.uint32()) == polars.UInt32()
 
     # Arrow string/large_string -> Polars Utf8
-    assert arrow_type_to_polars_type(pa.string()) is polars.Utf8()
-    assert arrow_type_to_polars_type(pa.large_string()) is polars.Utf8()
+    assert arrow_type_to_polars_type(pa.string()) == polars.Utf8()
+    assert arrow_type_to_polars_type(pa.large_string()) == polars.Utf8()
 
 
 def test_arrow_to_polars_list_and_struct():
@@ -72,8 +72,8 @@ def test_arrow_to_polars_map_type_is_list_of_struct():
     field_names = [f.name for f in inner.fields]
     assert field_names == ["key", "value"]
     key_field, value_field = inner.fields
-    assert key_field.dtype is polars.Utf8
-    assert value_field.dtype is polars.Int64
+    assert key_field.dtype == polars.Utf8()
+    assert value_field.dtype == polars.Int64()
 
 
 def test_arrow_field_to_polars_field_and_back_roundtrip():
@@ -83,12 +83,12 @@ def test_arrow_field_to_polars_field_and_back_roundtrip():
     # Depending on Polars version, this is either pl.Field or (name, dtype)
     if hasattr(polars, "Field") and isinstance(pl_field, polars.Field):
         assert pl_field.name == "x"
-        assert pl_field.dtype is polars.Int64
+        assert pl_field.dtype == polars.Int64()
         pl_repr = pl_field
     else:
         name, dtype = pl_field
         assert name == "x"
-        assert dtype is polars.Int64
+        assert dtype == polars.Int64()
         pl_repr = (name, dtype)
 
     arrow_field2 = polars_field_to_arrow_field(pl_repr)
