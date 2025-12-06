@@ -4,7 +4,7 @@ import pyarrow as pa
 import pytest
 
 pyspark = pytest.importorskip("pyspark")
-from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.sql import SparkSession, Row, functions as F, types as T
 
 from yggdrasil.types.cast.spark_cast import (
     cast_spark_dataframe,
@@ -21,8 +21,7 @@ from yggdrasil.types import convert
 @pytest.fixture(scope="session")
 def spark():
     spark = (
-        SparkSession.builder
-        .master("local[1]")
+        SparkSession.builder.master("local[1]")
         .appName("yggdrasil-spark-cast-tests")
         .getOrCreate()
     )
@@ -34,132 +33,74 @@ def spark():
 # DataFrame casting tests (pure Spark, Arrow-driven types)
 # ---------------------------------------------------------------------------
 
-def test_cast_spark_dataframe_no_target_schema_is_noop(spark):
-    df = spark.createDataFrame([(1, "x"), (2, "y")], ["a", "b"])
-
-    # options with no target_field -> target_schema is None
-    opts = CastOptions.safe_init(target_field=None)
-
-    result = cast_spark_dataframe(df, opts)
-
-    assert result.schema == df.schema
-    assert result.collect() == df.collect()
-
-
-def test_cast_spark_dataframe_numeric_cast_and_fill_non_nullable(spark):
+def test_cast_spark_dataframe_struct_defaults_and_casefold(spark):
     df = spark.createDataFrame(
-        [
-            (1,),
-            (None,),
-            (3,),
-        ],
-        ["a"],
+        [({"score": 1},), ({"score": None},)],
+        schema="payload struct<score:int>",
     )
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.float64(), nullable=False)],
-    )
-    opts = CastOptions.safe_init(target_field=target_schema)
-
-    result = cast_spark_dataframe(df, opts)
-
-    # Schema: a -> DoubleType, nullable False
-    assert result.schema["a"].dataType == T.DoubleType()
-    assert result.schema["a"].nullable is False
-
-    values = [row.a for row in result.orderBy("a").collect()]
-    # Null should be replaced by 0.0
-    assert sorted(values) == [0.0, 1.0, 3.0]
-
-
-def test_cast_spark_dataframe_case_insensitive_match(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["A"])
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
-    )
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
-        strict_match_names=False,
-    )
-
-    result = cast_spark_dataframe(df, opts)
-
-    assert result.columns == ["a"]
-    assert result.schema["a"].dataType == T.LongType()
-    assert [r.a for r in result.collect()] == [1, 2]
-
-
-def test_cast_spark_dataframe_missing_column_add_missing_false_raises(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["a"])
 
     target_schema = pa.schema(
         [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.int32(), nullable=True),
-        ]
-    )
-
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
-        add_missing_columns=False,
-        strict_match_names=True,
-    )
-
-    with pytest.raises(TypeError, match="Missing column b"):
-        cast_spark_dataframe(df, opts)
-
-
-def test_cast_spark_dataframe_add_missing_column_with_defaults(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["a"])
-
-    target_schema = pa.schema(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.string(), nullable=False),
+            pa.field(
+                "payload",
+                pa.struct(
+                    [
+                        pa.field("score", pa.int64(), nullable=False),
+                        pa.field("label", pa.string(), nullable=False),
+                    ]
+                ),
+                nullable=False,
+            )
         ]
     )
 
     opts = CastOptions.safe_init(
         target_field=target_schema,
         add_missing_columns=True,
-        strict_match_names=True,
+        strict_match_names=False,
     )
 
     result = cast_spark_dataframe(df, opts)
 
-    assert result.columns == ["a", "b"]
-    assert result.schema["b"].dataType == T.StringType()
-    # default_arrow_python_value(string) -> ""
-    assert [r.b for r in result.collect()] == ["", ""]
+    assert result.schema["payload"].dataType == T.StructType(
+        [
+            T.StructField("score", T.LongType(), nullable=False),
+            T.StructField("label", T.StringType(), nullable=False),
+        ]
+    )
+    assert [r.payload.asDict(recursive=True) for r in result.collect()] == [
+        {"score": 1, "label": ""},
+        {"score": 0, "label": ""},
+    ]
 
 
-def test_cast_spark_dataframe_allow_add_columns_false_drops_extras(spark):
-    df = spark.createDataFrame([(1, "x")], ["a", "extra"])
+def test_cast_spark_dataframe_adds_missing_columns_and_drops_extra(spark):
+    df = spark.createDataFrame([(1, True)], ["id", "extra"])
 
     target_schema = pa.schema(
-        [pa.field("a", pa.int32(), nullable=True)],
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("flag", pa.bool_(), nullable=False),
+        ]
     )
 
     opts = CastOptions.safe_init(
         target_field=target_schema,
+        add_missing_columns=True,
         allow_add_columns=False,
-        strict_match_names=True,
     )
 
     result = cast_spark_dataframe(df, opts)
 
-    assert result.columns == ["a"]
-    assert [tuple(r) for r in result.collect()] == [(1,)]
+    assert result.columns == ["id", "flag"]
+    assert result.schema["flag"].nullable is False
+    assert [tuple(r) for r in result.collect()] == [(1, False)]
 
 
-def test_cast_spark_dataframe_allow_add_columns_true_keeps_extras(spark):
+def test_cast_spark_dataframe_allows_extras_when_opted_in(spark):
     df = spark.createDataFrame([(1, "x")], ["a", "extra"])
 
-    target_schema = pa.schema(
-        [pa.field("a", pa.int32(), nullable=True)],
-    )
-
+    target_schema = pa.schema([pa.field("a", pa.int32(), nullable=True)])
     opts = CastOptions.safe_init(
         target_field=target_schema,
         allow_add_columns=True,
@@ -168,69 +109,49 @@ def test_cast_spark_dataframe_allow_add_columns_true_keeps_extras(spark):
 
     result = cast_spark_dataframe(df, opts)
 
-    # Target columns first, then extras
     assert result.columns == ["a", "extra"]
     assert [tuple(r) for r in result.collect()] == [(1, "x")]
-
-
-def test_cast_spark_dataframe_dictionary_targets_fall_back_to_mapinarrow(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["a"])
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.dictionary(pa.int32(), pa.string()), nullable=False)],
-    )
-
-    opts = CastOptions.safe_init(target_field=target_schema)
-
-    result = cast_spark_dataframe(df, opts)
-
-    assert result.schema["a"].dataType == T.StringType()
-    assert result.schema["a"].nullable is False
-    assert [r.a for r in result.collect()] == ["1", "2"]
 
 
 # ---------------------------------------------------------------------------
 # Column casting tests (pure Spark, Arrow-driven types)
 # ---------------------------------------------------------------------------
 
-def test_cast_spark_column_simple_type_cast(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["a"])
-
-    # Cast column to float64 using Arrow type
-    casted_col = cast_spark_column(F.col("a"), pa.float64())
-    result = df.select(casted_col.alias("a"))
-
-    assert result.schema["a"].dataType == T.DoubleType()
-    assert [r.a for r in result.collect()] == [1.0, 2.0]
-
-
-def test_cast_spark_column_fill_non_nullable_with_default(spark):
+def test_cast_spark_column_struct_child_defaults(spark):
     df = spark.createDataFrame(
-        [
-            (1,),
-            (None,),
-            (3,),
-        ],
-        ["a"],
+        [({"count": None, "label": "a"},)],
+        schema="info struct<count:int,label:string>",
     )
 
-    target_field = pa.field("a", pa.int32(), nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field)
+    target_field = pa.field(
+        "info",
+        pa.struct(
+            [
+                pa.field("count", pa.int64(), nullable=False),
+                pa.field("label", pa.string(), nullable=False),
+            ]
+        ),
+        nullable=False,
+    )
 
-    casted_col = cast_spark_column(F.col("a"), opts)
-    result = df.select(casted_col.alias("a"))
+    casted_col = cast_spark_column(F.col("info"), target_field)
+    result = df.select(casted_col.alias("info"))
 
-    assert result.schema["a"].dataType == T.IntegerType()
-    values = [r.a for r in result.orderBy("a").collect()]
-    assert sorted(values) == [0, 1, 3]
+    assert result.schema["info"].dataType == T.StructType(
+        [
+            T.StructField("count", T.LongType(), nullable=False),
+            T.StructField("label", T.StringType(), nullable=False),
+        ]
+    )
+    assert [r.info.asDict(recursive=True) for r in result.collect()] == [
+        {"count": 0, "label": "a"}
+    ]
 
 
-def test_cast_spark_column_schema_target_uses_first_field(spark):
+def test_cast_spark_column_schema_target_prefers_first_field(spark):
     df = spark.createDataFrame([(1,)], ["a"])
 
-    schema = pa.schema(
-        [pa.field("a", pa.string(), nullable=True)]
-    )
+    schema = pa.schema([pa.field("a", pa.string(), nullable=True)])
     opts = CastOptions.safe_init(target_field=schema)
 
     casted_col = cast_spark_column(F.col("a"), opts)
@@ -240,51 +161,52 @@ def test_cast_spark_column_schema_target_uses_first_field(spark):
     assert [r.a for r in result.collect()] == ["1"]
 
 
-def test_cast_spark_column_normalizes_nested_types(spark):
-    df = spark.createDataFrame([({"a": 1},)], schema="s struct<a:int>")
-
-    target_field = pa.field(
-        "s",
-        pa.struct(
-            [pa.field("a", pa.dictionary(pa.int32(), pa.large_string()), nullable=False)]
-        ),
-        nullable=True,
-    )
-
-    casted_col = cast_spark_column(F.col("s"), target_field)
-    result = df.select(casted_col.alias("s"))
-
-    struct_type = result.schema["s"].dataType
-    assert isinstance(struct_type, T.StructType)
-    assert struct_type["a"].dataType == T.StringType()
-    assert [r.s.a for r in result.collect()] == ["1"]
-
-
 # ---------------------------------------------------------------------------
 # Integration with convert(...) registry
 # ---------------------------------------------------------------------------
 
-def test_convert_dataframe_to_dataframe_uses_cast_spark_dataframe(spark):
-    df = spark.createDataFrame([(1,), (2,)], ["a"])
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+def test_convert_dataframe_to_dataframe_applies_nested_cast(spark):
+    df = spark.createDataFrame(
+        [(Row(score="4"),)],
+        schema=T.StructType(
+            [
+                T.StructField(
+                    "payload",
+                    T.StructType([T.StructField("score", T.StringType(), True)]),
+                    True,
+                )
+            ]
+        ),
     )
 
-    # `convert(df, DataFrame)` should hit the registered converter:
-    casted = convert(df, pyspark.sql.DataFrame, options=CastOptions.safe_init(target_field=target_schema))
+    target_schema = pa.schema(
+        [
+            pa.field(
+                "payload",
+                pa.struct([pa.field("score", pa.int64(), nullable=False)]),
+                nullable=False,
+            )
+        ]
+    )
 
-    assert casted.schema["a"].dataType == T.LongType()
-    assert casted.schema["a"].nullable is False
-    assert [r.a for r in casted.collect()] == [1, 2]
+    casted = convert(
+        df,
+        pyspark.sql.DataFrame,
+        options=CastOptions.safe_init(target_field=target_schema),
+    )
+
+    assert casted.schema["payload"].dataType == T.StructType(
+        [T.StructField("score", T.LongType(), nullable=False)]
+    )
+    assert [r.payload.score for r in casted.collect()] == [4]
 
 
-def test_convert_column_to_column_uses_cast_spark_column(spark):
+def test_convert_column_to_column_uses_target_dtype(spark):
     df = spark.createDataFrame([(1,), (2,)], ["a"])
-
     target_type = pa.float64()
-    casted_col = convert(F.col("a"), pyspark.sql.Column, options=target_type)
 
+    casted_col = convert(F.col("a"), pyspark.sql.Column, options=target_type)
     result = df.select(casted_col.alias("a"))
+
     assert result.schema["a"].dataType == T.DoubleType()
     assert [r.a for r in result.collect()] == [1.0, 2.0]

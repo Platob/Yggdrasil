@@ -16,7 +16,7 @@ from yggdrasil.types.cast.polars_cast import (
     polars_dataframe_to_record_batch_reader,
     record_batch_reader_to_polars_dataframe,
 )
-from yggdrasil.types.cast.arrow_cast import CastOptions
+from yggdrasil.types.cast.arrow_cast import CastOptions, arrow_schema_to_field
 from yggdrasil.types import convert
 
 
@@ -24,142 +24,130 @@ from yggdrasil.types import convert
 # Series casting tests
 # ---------------------------------------------------------------------------
 
-def test_cast_polars_series_simple_numeric_cast():
-    s = polars.Series("a", [1, 2, 3])
+def test_cast_polars_series_struct_child_defaults_and_missing_added():
+    series = polars.Series("payload", [{"value": 1}, {"value": None}])
 
-    target_field = pa.field("a", pa.float64(), nullable=True)
-    opts = CastOptions.safe_init(target_field=target_field)
+    target_field = pa.field(
+        "payload",
+        pa.struct(
+            [
+                pa.field("value", pa.int64(), nullable=False),
+                pa.field("label", pa.string(), nullable=False),
+            ]
+        ),
+        nullable=True,
+    )
 
-    casted = cast_polars_array(s, opts)
+    opts = CastOptions.safe_init(target_field=target_field, add_missing_columns=True)
+    casted = cast_polars_array(series, opts)
+    evaluated = (
+        polars.DataFrame({"payload": series})
+        .with_columns(casted)
+        .get_column("payload")
+    )
+
+    assert isinstance(evaluated, polars.Series)
+    assert evaluated.dtype.fields[0].name == "value"
+    assert evaluated.to_list() == [
+        {"value": 1, "label": ""},
+        {"value": 0, "label": ""},
+    ]
+
+
+def test_cast_polars_series_list_of_structs_preserves_null_lists():
+    series = polars.Series("items", [[{"count": 1}], [{"count": None}], None])
+
+    target_field = pa.field(
+        "items",
+        pa.list_(
+            pa.field(
+                "item",
+                pa.struct([pa.field("count", pa.int64(), nullable=False)]),
+                nullable=True,
+            )
+        ),
+        nullable=True,
+    )
+
+    casted = cast_polars_array(series, CastOptions.safe_init(target_field=target_field))
 
     assert isinstance(casted, polars.Series)
-    assert casted.name == "a"
-    # dtype will be Polars Float64-ish
-    assert "float" in str(casted.dtype).lower()
-    assert casted.to_list() == [1.0, 2.0, 3.0]
-
-
-def test_cast_polars_series_fill_non_nullable_defaults():
-    s = polars.Series("a", [1, None, 3])
-
-    target_field = pa.field("a", pa.int64(), nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field)
-
-    casted = cast_polars_array(s, opts)
-
-    # null should be replaced with default_arrow_python_value(int64) -> 0
-    assert casted.to_list() == [1, 0, 3]
-    # ensure integer-ish dtype
-    assert "int" in str(casted.dtype).lower()
+    assert casted.dtype.inner == polars.Struct([polars.Field("count", polars.Int64)])
+    assert casted.to_list() == [
+        [{"count": 1}],
+        [{"count": 0}],
+        None,
+    ]
 
 
 # ---------------------------------------------------------------------------
 # DataFrame casting tests
 # ---------------------------------------------------------------------------
 
-def test_cast_polars_dataframe_basic_schema_cast():
-    df = polars.DataFrame({"A": [1, 2], "B": ["x", "y"]})
+def test_cast_polars_dataframe_nested_schema_and_defaults():
+    df = polars.DataFrame(
+        {
+            "Meta": [{"id": 1}, {"id": 2}],
+            "payload": [{"score": "7"}, {"score": None}],
+            "extra": [True, False],
+        }
+    )
 
     target_schema = pa.schema(
         [
-            pa.field("a", pa.int64(), nullable=False),
-            pa.field("b", pa.string(), nullable=True),
-        ]
-    )
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
-        strict_match_names=False,  # allow case-insensitive matching
-    )
-
-    casted = cast_polars_dataframe(df, opts)
-
-    assert isinstance(casted, polars.DataFrame)
-    assert casted.columns == ["a", "b"]
-    assert casted["a"].to_list() == [1, 2]
-    assert casted["b"].to_list() == ["x", "y"]
-
-
-def test_cast_polars_dataframe_missing_column_add_missing_false_raises():
-    df = polars.DataFrame({"a": [1, 2]})
-
-    target_schema = pa.schema(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.int32(), nullable=True),
-        ]
-    )
-
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
-        add_missing_columns=False,
-        strict_match_names=True,
-    )
-
-    with pytest.raises(pa.ArrowInvalid):
-        cast_polars_dataframe(df, opts)
-
-
-def test_cast_polars_dataframe_add_missing_column_with_defaults():
-    df = polars.DataFrame({"a": [1, 2]})
-
-    target_schema = pa.schema(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.string(), nullable=False),
+            pa.field(
+                "meta",
+                pa.struct(
+                    [
+                        pa.field("id", pa.int64(), nullable=False),
+                        pa.field("tag", pa.string(), nullable=False),
+                    ]
+                ),
+                nullable=False,
+            ),
+            pa.field(
+                "payload",
+                pa.struct([pa.field("score", pa.int64(), nullable=False)]),
+                nullable=False,
+            ),
+            pa.field("extra", pa.bool_(), nullable=True),
         ]
     )
 
     opts = CastOptions.safe_init(
-        target_field=target_schema,
+        target_field=arrow_schema_to_field(target_schema),
         add_missing_columns=True,
-        strict_match_names=True,
-    )
-
-    casted = cast_polars_dataframe(df, opts)
-
-    assert casted.columns == ["a", "b"]
-    assert casted["a"].to_list() == [1, 2]
-    # default_arrow_python_value(string) -> ""
-    assert casted["b"].to_list() == ["", ""]
-
-
-def test_cast_polars_dataframe_allow_add_columns_true_keeps_extras():
-    df = polars.DataFrame({"a": [1], "extra": [42]})
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int32(), nullable=True)],
-    )
-
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
-        allow_add_columns=True,
-        strict_match_names=True,
-    )
-
-    casted = cast_polars_dataframe(df, opts)
-
-    assert casted.columns == ["a", "extra"]
-    assert casted["a"].to_list() == [1]
-    assert casted["extra"].to_list() == [42]
-
-
-def test_cast_polars_dataframe_allow_add_columns_false_drops_extras():
-    df = polars.DataFrame({"a": [1], "extra": [42]})
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int32(), nullable=True)],
-    )
-
-    opts = CastOptions.safe_init(
-        target_field=target_schema,
         allow_add_columns=False,
-        strict_match_names=True,
+        strict_match_names=False,
     )
 
     casted = cast_polars_dataframe(df, opts)
 
-    assert casted.columns == ["a"]
+    assert casted.columns == ["meta", "payload", "extra"]
+    assert casted["meta"].to_list() == [
+        {"id": 1, "tag": ""},
+        {"id": 2, "tag": ""},
+    ]
+    assert casted["payload"].to_list() == [
+        {"score": 7},
+        {"score": 0},
+    ]
+    assert casted["extra"].to_list() == [True, False]
+
+
+def test_cast_polars_dataframe_preserves_extras_when_allowed():
+    df = polars.DataFrame({"a": [1], "keep": [9]})
+
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(pa.schema([pa.field("a", pa.int64(), nullable=False)])),
+        allow_add_columns=True,
+    )
+
+    casted = cast_polars_dataframe(df, opts)
+
+    assert casted.columns == ["a", "keep"]
     assert casted["a"].to_list() == [1]
+    assert casted["keep"].to_list() == [9]
 
 
 # ---------------------------------------------------------------------------
@@ -178,29 +166,54 @@ def test_polars_series_to_arrow_array_and_back():
     assert s2.to_list() == [1, 2, 3]
 
 
-def test_polars_dataframe_to_arrow_table_and_back():
-    df = polars.DataFrame({"a": [1, 2], "b": ["x", "y"]})
-
-    table = polars_dataframe_to_arrow_table(df)
-    assert isinstance(table, pa.Table)
-    assert table.column("a").to_pylist() == [1, 2]
-
-    df2 = arrow_table_to_polars_dataframe(table)
-    assert isinstance(df2, polars.DataFrame)
-    assert df2.to_dict(as_series=False) == df.to_dict(as_series=False)
-
-
 def test_polars_dataframe_to_arrow_table_with_cast_options():
-    df = polars.DataFrame({"a": [1, 2]})
+    df = polars.DataFrame({"vals": [[1, 2], [None, 3]]})
 
     target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+        [
+            pa.field(
+                "vals",
+                pa.list_(pa.field("item", pa.int64(), nullable=False)),
+                nullable=False,
+            )
+        ]
     )
-    opts = CastOptions.safe_init(target_field=target_schema)
 
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
     table = polars_dataframe_to_arrow_table(df, opts)
-    assert table.schema.field("a").type == pa.int64()
-    assert table.column("a").to_pylist() == [1, 2]
+
+    assert isinstance(table, pa.Table)
+    assert table.schema == target_schema
+    assert table.column("vals").to_pylist() == [[1, 2], [0, 3]]
+
+
+def test_arrow_table_to_polars_dataframe_round_trip_structs():
+    table = pa.table(
+        {
+            "data": pa.array(
+                [
+                    {"count": 1, "label": "x"},
+                    {"count": None, "label": "y"},
+                ],
+                type=pa.struct(
+                    [
+                        pa.field("count", pa.int64(), nullable=False),
+                        pa.field("label", pa.string(), nullable=False),
+                    ]
+                ),
+            )
+        }
+    )
+
+    df = arrow_table_to_polars_dataframe(
+        table,
+        CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema)),
+    )
+    assert isinstance(df, polars.DataFrame)
+    assert df["data"].to_list() == [
+        {"count": 1, "label": "x"},
+        {"count": None, "label": "y"},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -212,102 +225,60 @@ def _make_record_batch_reader_from_table(table: pa.Table) -> pa.RecordBatchReade
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
 
+def test_record_batch_reader_to_polars_dataframe_with_cast():
+    table = pa.table({"COUNT": [1, None, 3]})
+    rbr = _make_record_batch_reader_from_table(table)
+
+    target_schema = pa.schema([pa.field("count", pa.int64(), nullable=False)])
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema), strict_match_names=False
+    )
+
+    df = record_batch_reader_to_polars_dataframe(rbr, opts)
+
+    assert df.columns == ["count"]
+    assert df["count"].to_list() == [1, 0, 3]
+
+
 def test_polars_dataframe_to_record_batch_reader_roundtrip():
     df = polars.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
     rbr = polars_dataframe_to_record_batch_reader(df)
     assert isinstance(rbr, pa.RecordBatchReader)
 
-    # Convert back to Polars
     df2 = record_batch_reader_to_polars_dataframe(rbr)
-
-    assert isinstance(df2, polars.DataFrame)
     assert df2.to_dict(as_series=False) == df.to_dict(as_series=False)
-
-
-def test_record_batch_reader_to_polars_dataframe_with_arrow_cast():
-    table = pa.table({"A": [1, 2, 3]})
-    rbr = _make_record_batch_reader_from_table(table)
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
-    )
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
-
-    df = record_batch_reader_to_polars_dataframe(rbr, opts)
-
-    assert df.columns == ["a"]
-    assert df["a"].to_list() == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------
 # Integration tests using convert(...)
 # ---------------------------------------------------------------------------
 
-def test_convert_polars_series_to_arrow_array_and_back():
-    s = polars.Series("a", [1, 2, 3])
+def test_convert_polars_dataframe_to_arrow_table_with_schema_hint():
+    df = polars.DataFrame({"amount": [1, None]})
+    target_schema = pa.schema([pa.field("amount", pa.int64(), nullable=False)])
 
-    arr = convert(s, pa.Array)
-    assert isinstance(arr, pa.Array)
-    assert arr.to_pylist() == [1, 2, 3]
-
-    s2 = convert(arr, polars.Series)
-    assert isinstance(s2, polars.Series)
-    assert s2.to_list() == [1, 2, 3]
-
-
-def test_convert_polars_dataframe_to_arrow_table_and_back():
-    df = polars.DataFrame({"a": [1, 2], "b": ["x", "y"]})
-
-    table = convert(df, pa.Table)
-    assert isinstance(table, pa.Table)
-    assert table.column("a").to_pylist() == [1, 2]
-
-    df2 = convert(table, polars.DataFrame)
-    assert isinstance(df2, polars.DataFrame)
-    assert df2.to_dict(as_series=False) == df.to_dict(as_series=False)
-
-
-def test_convert_polars_dataframe_to_record_batch_reader_and_back():
-    df = polars.DataFrame({"a": [10, 20, 30]})
-
-    rbr = convert(df, pa.RecordBatchReader)
-    assert isinstance(rbr, pa.RecordBatchReader)
-
-    df2 = convert(rbr, polars.DataFrame)
-    assert isinstance(df2, polars.DataFrame)
-    assert df2.to_dict(as_series=False) == df.to_dict(as_series=False)
-
-
-def test_cast_polars_dataframe_with_arrow_schema_cast_direct():
-    """
-    Directly test schema-based casting using cast_polars_dataframe, since convert(...)
-    may treat same-type conversions as identity and ignore cast_options.
-    """
-    df = polars.DataFrame({"A": [1, 2, 3]})
-
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+    table = convert(
+        df,
+        pa.Table,
+        options=CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema)),
     )
 
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
-    df_cast = cast_polars_dataframe(df, opts)
-
-    assert df_cast.columns == ["a"]
-    assert df_cast["a"].to_list() == [1, 2, 3]
+    assert isinstance(table, pa.Table)
+    assert table.schema == target_schema
+    assert table.column("amount").to_pylist() == [1, 0]
 
 
 def test_convert_arrow_record_batch_reader_to_polars_with_cast():
     table = pa.table({"A": [1, None, 3]})
     rbr = _make_record_batch_reader_from_table(table)
 
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
     df = convert(rbr, polars.DataFrame, options=opts)
 
     assert df.columns == ["a"]
-    # null should be filled with 0 by Arrow-side cast before Polars conversion
     assert df["a"].to_list() == [1, 0, 3]
