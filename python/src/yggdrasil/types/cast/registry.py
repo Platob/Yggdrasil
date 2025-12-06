@@ -201,7 +201,7 @@ def convert(
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
     from yggdrasil.types.python_defaults import default_scalar
-    from yggdrasil.types.cast.arrow_cast import CastOptions
+    from yggdrasil.types.cast.cast_options import CastOptions
 
     is_optional, target_hint = _unwrap_optional(target_hint)
 

@@ -149,7 +149,7 @@ def cast_to_list_array(
     source_field = options.source_field or array_to_field(arr, options)
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
-    if is_type_list_like(source_field.type):
+    if is_list_like(source_field.type):
         list_source_field = arr.type.value_field
 
         offsets = arr.offsets
@@ -355,7 +355,7 @@ def check_array_nullability(
     return arr
 
 
-def is_type_list_like(arrow_type: pa.DataType) -> bool:
+def is_list_like(arrow_type: pa.DataType) -> bool:
     """Check if an Arrow type is list-like."""
     return (
         pa.types.is_list(arrow_type)
@@ -371,6 +371,16 @@ def is_string_like(arrow_type: pa.DataType) -> bool:
         pa.types.is_string(arrow_type)
         or pa.types.is_large_string(arrow_type)
         or pa.types.is_string_view(arrow_type)
+    )
+
+
+def is_binary_like(arrow_type: pa.DataType) -> bool:
+    """Check if an Arrow type is string-like."""
+    return (
+        pa.types.is_binary(arrow_type)
+        or pa.types.is_large_binary(arrow_type)
+        or pa.types.is_fixed_size_binary(arrow_type)
+        or pa.types.is_binary_view(arrow_type)
     )
 
 
@@ -460,7 +470,7 @@ def cast_arrow_array(
     if pa.types.is_nested(target_type):
         if pa.types.is_struct(target_type):
             return cast_to_struct_array(array, options)
-        elif is_type_list_like(target_type):
+        elif is_list_like(target_type):
             return cast_to_list_array(array, options)
         elif pa.types.is_map(target_type):
             return cast_to_map_array(array, options)
@@ -766,17 +776,13 @@ def to_spark_arrow_type(
     - recurse through struct/map/list fields
     """
     # Large scalar types
-    if pa.types.is_large_string(dtype) or pa.types.is_string_view(dtype):
+    if is_string_like(dtype):
         return pa.string()
-    if pa.types.is_large_binary(dtype) or pa.types.is_binary_view(dtype):
+    if is_binary_like(dtype):
         return pa.binary()
 
     # Large list -> normal list with normalized value type
-    if pa.types.is_large_list(dtype) or pa.types.is_list_view(dtype):
-        return pa.list_(to_spark_arrow_type(dtype.value_type))
-
-    # Normal list: still normalize value type
-    if pa.types.is_list(dtype):
+    if is_list_like(dtype):
         return pa.list_(to_spark_arrow_type(dtype.value_type))
 
     # Dictionary-encoded types: Spark wants the value type, not the indices

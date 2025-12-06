@@ -185,30 +185,40 @@ def cast_spark_column(
     This is a pure Spark cast: no collection or Arrow arrays involved.
     """
     options = CastOptions.check_arg(options)
-    target_field = options.get_target_spark_field()
+    target_spark_field = options.get_target_spark_field()
 
-    if target_field is None:
+    if target_spark_field is None:
         # Nothing to cast to, return the column as-is
         return column
 
-    target_spark_type = target_field.dataType
-    source_field = options.get_source_spark_field() or T.StructField(
-        name=column.getAlias() or "col", dataType=column.dtype, nullable=True
-    )
+    target_spark_type = target_spark_field.dataType
+    source_field = options.get_source_spark_field()
 
     if isinstance(target_spark_type, T.StructType):
-        return cast_spark_column_to_struct(column, options=options)
+        casted = cast_spark_column_to_struct(column, options=options)
+    elif isinstance(target_spark_type, T.ArrayType):
+        casted = cast_spark_column_to_list(column, options=options)
+    elif isinstance(target_spark_type, T.MapType):
+        casted = cast_spark_column_to_map(column, options=options)
     else:
-        return (
-            check_column_nullability(column, source_field=source_field, target_field=target_field)
-            .alias(target_field.name)
+        casted = column.cast(target_spark_type)
+
+    return (
+        check_column_nullability(
+            casted,
+            source_field=source_field,
+            target_field=target_spark_field,
+            mask=column.isNull()
         )
+        .alias(target_spark_field.name)
+    )
 
 
 def check_column_nullability(
     column: "pyspark.sql.Column",
     source_field: Optional["T.StructField"] = None,
     target_field: Optional["T.StructField"] = None,
+    mask: Optional["pyspark.sql.Column"] = None
 ) -> "pyspark.sql.Column":
     source_nullable = True if source_field is None else source_field.nullable
     target_nullable = True if target_field is None else target_field.nullable
@@ -218,9 +228,83 @@ def check_column_nullability(
             dtype=to_spark_arrow_type(column.dtype),
             nullable=False
         ).as_py()
-        column = F.when(column.isNull(), F.lit(dv)).otherwise(column)
+        mask = mask or column.isNull()
+
+        column = F.when(mask, F.lit(dv)).otherwise(column)
 
     return column
+
+
+def cast_spark_column_to_list(
+    column: "pyspark.sql.Column",
+    options: Optional[CastOptions] = None,
+) -> "pyspark.sql.Column":
+    """
+    Cast a Spark Column to an ArrayType using Arrow field type info.
+
+    This is a pure Spark cast: no collection or Arrow arrays involved.
+    """
+    options = CastOptions.check_arg(options)
+
+    target_arrow_field = options.target_field
+    target_spark_field = options.get_target_spark_field()
+
+    if target_arrow_field is None:
+        # No target type info, just pass through
+        return column
+
+    target_spark_type: T.ArrayType = target_spark_field.dataType
+
+    source_spark_field = options.get_source_spark_field() or T.StructField(
+        name=column.getAlias() or "col",
+        dataType=column.dtype,
+        nullable=True,
+    )
+    source_spark_type = source_spark_field.dataType
+
+    if not isinstance(source_spark_type, T.ArrayType):
+        raise ValueError(f"Cannot cast {source_spark_field} to {target_spark_field}")
+
+    # ---- Arrow element fields ----
+    target_list_type = target_arrow_field.type
+
+    # Handle list / large_list / fixed_size_list
+    if pa.types.is_list(target_list_type) or pa.types.is_large_list(target_list_type):
+        target_element_arrow_field: pa.Field = target_list_type.value_field
+    elif pa.types.is_fixed_size_list(target_list_type):
+        target_element_arrow_field: pa.Field = target_list_type.value_field
+    else:
+        raise ValueError(
+            f"Expected list-like Arrow type for {target_arrow_field}, "
+            f"got {target_list_type}"
+        )
+
+    # Build a synthetic "element field" for the source array
+    source_element_spark_field = T.StructField(
+        name=source_spark_field.name,
+        dataType=source_spark_type.elementType,
+        nullable=source_spark_type.containsNull,
+    )
+    source_element_arrow_field = spark_field_to_arrow_field(
+        source_element_spark_field
+    )
+
+    # Options for casting individual elements
+    element_cast_options = options.copy(
+        source_field=source_element_arrow_field,
+        target_field=target_element_arrow_field,
+    )
+
+    # Cast each element using the same Arrow-aware machinery
+    casted = F.transform(
+        column,
+        lambda x: cast_spark_column(x, options=element_cast_options),
+    )
+
+    # Final cast to enforce the exact Spark ArrayType (element type + containsNull)
+    casted = casted.cast(target_spark_type)
+
+    return casted
 
 
 def cast_spark_column_to_struct(
@@ -294,6 +378,89 @@ def cast_spark_column_to_struct(
         children.append(casted_column.alias(child_target_spark_field.name))
 
     return F.struct(*children)
+
+
+def cast_spark_column_to_map(
+    column: "pyspark.sql.Column",
+    options: Optional[CastOptions] = None,
+) -> "pyspark.sql.Column":
+    """
+    Cast a Spark Column to a MapType using Arrow field type info.
+
+    This is a pure Spark cast: no collection or Arrow arrays involved.
+    """
+    options = CastOptions.check_arg(options)
+
+    target_arrow_field = options.target_field
+    target_spark_field = options.get_target_spark_field()
+
+    if target_arrow_field is None:
+        return column
+
+    target_spark_type: T.MapType = target_spark_field.dataType
+
+    source_spark_field = options.get_source_spark_field() or T.StructField(
+        name=column.getAlias() or "col",
+        dataType=column.dtype,
+        nullable=True,
+    )
+    source_spark_type = source_spark_field.dataType
+
+    if not isinstance(source_spark_type, T.MapType):
+        raise ValueError(f"Cannot cast {source_spark_field} to {target_spark_field}")
+
+    # ---------- Arrow key/value fields ----------
+    target_map_type = target_arrow_field.type
+    if not pa.types.is_map(target_map_type):
+        raise ValueError(
+            f"Expected Arrow map type for {target_arrow_field}, got {target_map_type}"
+        )
+
+    target_key_arrow_field: pa.Field = target_map_type.key_field
+    target_value_arrow_field: pa.Field = target_map_type.item_field
+
+    # ---------- Spark key/value fields ----------
+    source_key_spark_field = T.StructField(
+        name=f"{source_spark_field.name}_key",
+        dataType=source_spark_type.keyType,
+        nullable=False,  # Spark map keys are non-null
+    )
+    source_value_spark_field = T.StructField(
+        name=f"{source_spark_field.name}_value",
+        dataType=source_spark_type.valueType,
+        nullable=source_spark_type.valueContainsNull,
+    )
+
+    source_key_arrow_field = spark_field_to_arrow_field(source_key_spark_field)
+    source_value_arrow_field = spark_field_to_arrow_field(source_value_spark_field)
+
+    # ---------- Cast options for key/value ----------
+    key_cast_options = options.copy(
+        source_field=source_key_arrow_field,
+        target_field=target_key_arrow_field,
+    )
+    value_cast_options = options.copy(
+        source_field=source_value_arrow_field,
+        target_field=target_value_arrow_field,
+    )
+
+    # ---------- Transform entries ----------
+    entries = F.map_entries(column)  # array<struct<key, value>>
+
+    casted_entries = F.transform(
+        entries,
+        lambda entry: F.struct(
+            cast_spark_column(entry["key"], options=key_cast_options).alias("key"),
+            cast_spark_column(entry["value"], options=value_cast_options).alias("value"),
+        ),
+    )
+
+    casted_map = F.map_from_entries(casted_entries)
+
+    # Enforce exact target MapType (keyType, valueType, valueContainsNull)
+    casted_map = casted_map.cast(target_spark_type)
+
+    return casted_map
 
 
 # ---------------------------------------------------------------------------

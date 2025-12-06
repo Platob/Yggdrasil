@@ -21,13 +21,15 @@ from yggdrasil.types import convert
 @pytest.fixture(scope="session")
 def spark():
     spark = (
-        SparkSession.builder.master("local[1]")
+        SparkSession.builder
+        .master("local[*]")
         .appName("yggdrasil-spark-cast-tests")
+        .config("spark.ui.enabled", "false")
+        .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
     yield spark
-    spark.stop()
-
+    # Do NOT call spark.stop() here – let the process exit kill the JVM.
 
 # ---------------------------------------------------------------------------
 # DataFrame casting tests (pure Spark, Arrow-driven types)

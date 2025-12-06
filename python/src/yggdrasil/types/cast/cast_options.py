@@ -139,6 +139,8 @@ class CastOptions:
         """
         if isinstance(target_field, CastOptions):
             result = target_field
+        elif target_field is None:
+            result = CastOptions()
         else:
             if target_field is None:
                 result = CastOptions()
@@ -212,7 +214,7 @@ class CastOptions:
         object.__setattr__(self, "_polars_target_field", value)
 
     def get_source_spark_field(self):
-        if self.target_field is not None and self._spark_source_field is None:
+        if self.source_field is not None and self._spark_source_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
             setattr(self, "_spark_source_field", arrow_field_to_spark_field(self.source_field))
