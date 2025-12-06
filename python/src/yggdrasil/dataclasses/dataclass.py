@@ -157,10 +157,10 @@ def yggdataclass(
         if not hasattr(c, "default_instance"):
             @classmethod
             def default_instance(cls):
-                from yggdrasil.types import default_from_hint
+                from yggdrasil.types import default_scalar
 
                 if not hasattr(cls, "__default_instance__"):
-                    cls.__default_instance__ = default_from_hint(cls)
+                    cls.__default_instance__ = default_scalar(cls)
 
                 return dataclasses.replace(cls.__default_instance__)
 

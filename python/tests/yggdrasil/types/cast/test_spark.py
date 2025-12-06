@@ -10,7 +10,7 @@ from yggdrasil.types.cast.spark_cast import (
     cast_spark_dataframe,
     cast_spark_column,
 )
-from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
+from yggdrasil.types.cast.cast_options import CastOptions
 from yggdrasil.types import convert
 
 
@@ -38,7 +38,7 @@ def test_cast_spark_dataframe_no_target_schema_is_noop(spark):
     df = spark.createDataFrame([(1, "x"), (2, "y")], ["a", "b"])
 
     # options with no target_field -> target_schema is None
-    opts = ArrowCastOptions.__safe_init__(target_field=None)
+    opts = CastOptions.safe_init(target_field=None)
 
     result = cast_spark_dataframe(df, opts)
 
@@ -59,7 +59,7 @@ def test_cast_spark_dataframe_numeric_cast_and_fill_non_nullable(spark):
     target_schema = pa.schema(
         [pa.field("a", pa.float64(), nullable=False)],
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=target_schema)
 
     result = cast_spark_dataframe(df, opts)
 
@@ -78,7 +78,7 @@ def test_cast_spark_dataframe_case_insensitive_match(spark):
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         strict_match_names=False,
     )
@@ -100,7 +100,7 @@ def test_cast_spark_dataframe_missing_column_add_missing_false_raises(spark):
         ]
     )
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         add_missing_columns=False,
         strict_match_names=True,
@@ -120,7 +120,7 @@ def test_cast_spark_dataframe_add_missing_column_with_defaults(spark):
         ]
     )
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         add_missing_columns=True,
         strict_match_names=True,
@@ -141,7 +141,7 @@ def test_cast_spark_dataframe_allow_add_columns_false_drops_extras(spark):
         [pa.field("a", pa.int32(), nullable=True)],
     )
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         allow_add_columns=False,
         strict_match_names=True,
@@ -160,7 +160,7 @@ def test_cast_spark_dataframe_allow_add_columns_true_keeps_extras(spark):
         [pa.field("a", pa.int32(), nullable=True)],
     )
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         allow_add_columns=True,
         strict_match_names=True,
@@ -180,7 +180,7 @@ def test_cast_spark_dataframe_dictionary_targets_fall_back_to_mapinarrow(spark):
         [pa.field("a", pa.dictionary(pa.int32(), pa.string()), nullable=False)],
     )
 
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=target_schema)
 
     result = cast_spark_dataframe(df, opts)
 
@@ -215,7 +215,7 @@ def test_cast_spark_column_fill_non_nullable_with_default(spark):
     )
 
     target_field = pa.field("a", pa.int32(), nullable=False)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
 
     casted_col = cast_spark_column(F.col("a"), opts)
     result = df.select(casted_col.alias("a"))
@@ -231,7 +231,7 @@ def test_cast_spark_column_schema_target_uses_first_field(spark):
     schema = pa.schema(
         [pa.field("a", pa.string(), nullable=True)]
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=schema)
+    opts = CastOptions.safe_init(target_field=schema)
 
     casted_col = cast_spark_column(F.col("a"), opts)
     result = df.select(casted_col.alias("a"))
@@ -272,7 +272,7 @@ def test_convert_dataframe_to_dataframe_uses_cast_spark_dataframe(spark):
     )
 
     # `convert(df, DataFrame)` should hit the registered converter:
-    casted = convert(df, pyspark.sql.DataFrame, options=ArrowCastOptions.__safe_init__(target_field=target_schema))
+    casted = convert(df, pyspark.sql.DataFrame, options=CastOptions.safe_init(target_field=target_schema))
 
     assert casted.schema["a"].dataType == T.LongType()
     assert casted.schema["a"].nullable is False

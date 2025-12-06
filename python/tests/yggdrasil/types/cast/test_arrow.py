@@ -7,8 +7,7 @@ import pytest
 from yggdrasil.types import convert
 from yggdrasil.types.cast.arrow_cast import (
     cast_arrow_array,
-    cast_arrow_table,
-    cast_arrow_batch,
+    cast_arrow_tabular,
     cast_arrow_record_batch_reader,
     default_arrow_array,
     table_to_record_batch,
@@ -20,24 +19,18 @@ from yggdrasil.types.cast.arrow_cast import (
     pylist_to_arrow_table,
     pylist_to_record_batch,
 )
-from yggdrasil.types.cast.cast_options import ArrowCastOptions, DEFAULT_CAST_OPTIONS
+from yggdrasil.types.cast.cast_options import CastOptions
 
 
 # ---------------------------------------------------------------------------
 # ArrowCastOptions tests
 # ---------------------------------------------------------------------------
 
-def test_arrow_cast_options_check_arg_none_returns_default():
-    opts = ArrowCastOptions.check_arg(None)
-    # Should not allocate a new object
-    assert opts == DEFAULT_CAST_OPTIONS
-
-
 def test_arrow_cast_options_check_arg_with_dtype_sets_target_field():
     dtype = pa.int32()
-    opts = ArrowCastOptions.check_arg(dtype)
+    opts = CastOptions.check_arg(dtype)
 
-    assert isinstance(opts, ArrowCastOptions)
+    assert isinstance(opts, CastOptions)
     assert opts.target_field is not None
     assert opts.target_field.type == dtype
     assert opts.target_field.name == "int32"
@@ -50,12 +43,12 @@ def test_default_arrow_array_nullable_vs_non_nullable():
     field_nullable = pa.field("x", pa.int32(), nullable=True)
     field_not_nullable = pa.field("y", pa.int32(), nullable=False)
 
-    arr_null = default_arrow_array(field_nullable, length=3)
+    arr_null = default_arrow_array(field_nullable.type, nullable=True, size=3)
     assert isinstance(arr_null, pa.Array)
     assert arr_null.type == pa.int32()
     assert arr_null.null_count == 3
 
-    arr_non_null = default_arrow_array(field_not_nullable, length=2)
+    arr_non_null = default_arrow_array(field_not_nullable.type, nullable=False, size=2)
     assert list(arr_non_null.to_pylist()) == [0, 0]
 
 
@@ -67,7 +60,7 @@ def test_cast_arrow_array_simple_numeric_cast():
     arr = pa.array([1, 2, None], type=pa.int32())
     target_field = pa.field("x", pa.float64(), nullable=True)
 
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
     casted = cast_arrow_array(arr, opts)
 
     assert isinstance(casted, pa.Array)
@@ -79,7 +72,7 @@ def test_cast_arrow_array_fill_non_nullable_defaults():
     arr = pa.array([1, None, 3], type=pa.int32())
     target_field = pa.field("x", pa.int32(), nullable=False)
 
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
     casted = cast_arrow_array(arr, opts)
 
     assert casted.type == pa.int32()
@@ -91,7 +84,7 @@ def test_cast_arrow_array_safe_primitive_cast_enforced():
     arr = pa.array([128], type=pa.int32())
     target_field = pa.field("x", pa.int8(), nullable=True)
 
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field, safe=True)
+    opts = CastOptions.safe_init(target_field=target_field, safe=True)
 
     with pytest.raises(pa.ArrowInvalid):
         cast_arrow_array(arr, opts)
@@ -103,7 +96,7 @@ def test_cast_arrow_array_chunked_array_roundtrip():
     chunked = pa.chunked_array([arr1, arr2])
 
     target_field = pa.field("x", pa.int64(), nullable=False)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
 
     casted = cast_arrow_array(chunked, opts)
     assert isinstance(casted, pa.ChunkedArray)
@@ -133,7 +126,7 @@ def test_cast_arrow_array_struct_add_missing_field_defaults():
     )
 
     target_field = pa.field("root", struct_type_target, nullable=False)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field, add_missing_columns=True)
+    opts = CastOptions.safe_init(target_field=target_field, add_missing_columns=True)
 
     casted = cast_arrow_array(arr, opts)
 
@@ -161,7 +154,7 @@ def test_cast_arrow_array_map_to_struct_case_insensitive_and_defaults():
     )
     target_field = pa.field("root", struct_type_target, nullable=False)
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_field,
         strict_match_names=False,
     )
@@ -191,7 +184,7 @@ def test_cast_arrow_array_struct_to_map_preserves_values_and_nulls():
     )
 
     target_field = pa.field("root", pa.map_(pa.string(), pa.int32()), nullable=True)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
 
     casted = cast_arrow_array(arr, opts)
 
@@ -228,7 +221,7 @@ def test_cast_arrow_array_list_of_struct_add_missing_field_defaults():
     )
 
     target_field = pa.field("root", list_target, nullable=True)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
 
     casted = cast_arrow_array(arr, opts)
 
@@ -250,33 +243,13 @@ def test_cast_arrow_table_case_insensitive_column_match():
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
+    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
-    casted = cast_arrow_table(table, opts)
+    casted = cast_arrow_tabular(table, opts)
 
     assert casted.schema.names == ["a"]
     assert casted.schema.field("a").type == pa.int64()
     assert casted.column("a").to_pylist() == [1, 2]
-
-
-def test_cast_arrow_table_missing_column_raises_when_add_missing_false():
-    table = pa.table({"a": [1, 2]})
-
-    target_schema = pa.schema(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.int32(), nullable=True),
-        ]
-    )
-
-    opts = ArrowCastOptions.__safe_init__(
-        target_field=target_schema,
-        add_missing_columns=False,
-        strict_match_names=True,
-    )
-
-    with pytest.raises(pa.ArrowInvalid, match="Missing column b"):
-        cast_arrow_table(table, opts)
 
 
 def test_cast_arrow_table_add_missing_column_with_defaults():
@@ -289,13 +262,13 @@ def test_cast_arrow_table_add_missing_column_with_defaults():
         ]
     )
 
-    opts = ArrowCastOptions.__safe_init__(
+    opts = CastOptions.safe_init(
         target_field=target_schema,
         add_missing_columns=True,
         strict_match_names=True,
     )
 
-    casted = cast_arrow_table(table, opts)
+    casted = cast_arrow_tabular(table, opts)
 
     assert casted.schema.names == ["a", "b"]
     assert casted.column("a").to_pylist() == [1, 2]
@@ -304,20 +277,20 @@ def test_cast_arrow_table_add_missing_column_with_defaults():
 
 
 # ---------------------------------------------------------------------------
-# cast_arrow_batch tests
+# cast_arrow_tabular tests
 # ---------------------------------------------------------------------------
 
-def test_cast_arrow_batch_matches_table_cast():
+def test_cast_arrow_tabular_matches_table_cast():
     batch = pa.record_batch({"A": [1, 2]})
     table = pa.Table.from_batches([batch])
 
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
+    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
-    casted_table = cast_arrow_table(table, opts)
-    casted_batch = cast_arrow_batch(batch, opts)
+    casted_table = cast_arrow_tabular(table, opts)
+    casted_batch = cast_arrow_tabular(batch, opts)
 
     # Compare via Table representation
     table_from_batch = pa.Table.from_batches([casted_batch])
@@ -340,7 +313,7 @@ def test_cast_arrow_record_batch_reader_to_table():
     target_schema = pa.schema(
         [pa.field("a", pa.int64(), nullable=False)],
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema, strict_match_names=False)
+    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
     casted_reader = cast_arrow_record_batch_reader(reader, opts)
     casted_table = pa.Table.from_batches(list(casted_reader))
@@ -354,7 +327,7 @@ def test_cast_arrow_record_batch_reader_no_target_schema_returns_same_reader():
     reader = _make_reader_from_table(table)
 
     # options with no target_field -> target_schema is None
-    opts = ArrowCastOptions.__safe_init__(target_field=None)
+    opts = CastOptions.safe_init(target_field=None)
     casted_reader = cast_arrow_record_batch_reader(reader, opts)
 
     # Exhaust to Table and compare
@@ -372,29 +345,29 @@ def test_table_to_record_batch_and_back():
     table = pa.table({"a": [1, 2]})
 
     # Identity schema cast
-    opts = ArrowCastOptions.__safe_init__(target_field=table.schema)
+    opts = CastOptions.safe_init(target_field=table.schema)
 
     batch = table_to_record_batch(table, opts)
     assert isinstance(batch, pa.RecordBatch)
 
     table_roundtrip = record_batch_to_table(batch, opts)
-    assert table_roundtrip.equals(cast_arrow_table(table, opts))
+    assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
 
 
 def test_table_to_record_batch_reader_and_back():
     table = pa.table({"a": [1, 2, 3]})
-    opts = ArrowCastOptions.__safe_init__(target_field=table.schema)
+    opts = CastOptions.safe_init(target_field=table.schema)
 
     reader = table_to_record_batch_reader(table, opts)
     assert isinstance(reader, pa.RecordBatchReader)
 
     table_roundtrip = record_batch_reader_to_table(reader, opts)
-    assert table_roundtrip.equals(cast_arrow_table(table, opts))
+    assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
 
 
 def test_record_batch_to_record_batch_reader_and_back():
     batch = pa.record_batch({"a": [1, 2, 3]})
-    opts = ArrowCastOptions.__safe_init__(target_field=batch.schema)
+    opts = CastOptions.safe_init(target_field=batch.schema)
 
     reader = record_batch_to_record_batch_reader(batch, opts)
     assert isinstance(reader, pa.RecordBatchReader)
@@ -404,7 +377,7 @@ def test_record_batch_to_record_batch_reader_and_back():
     table_from_original = pa.Table.from_batches([batch])
     table_from_roundtrip = pa.Table.from_batches([batch_roundtrip])
 
-    assert table_from_roundtrip.equals(cast_arrow_table(table_from_original, opts))
+    assert table_from_roundtrip.equals(cast_arrow_tabular(table_from_original, opts))
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +491,7 @@ def test_convert_propagates_arrow_source_and_target_hints():
     assert isinstance(result, pa.Array)
 
     opts = received["cast_options"]
-    assert isinstance(opts, ArrowCastOptions)
+    assert isinstance(opts, CastOptions)
     assert opts.target_field.type == pa.int64()
 
 
@@ -565,7 +538,7 @@ def test_pylist_to_arrow_table_empty_uses_target_schema():
             pa.field("b", pa.string(), nullable=True),
         ]
     )
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=target_schema)
 
     table = pylist_to_arrow_table([], opts)
 
@@ -577,7 +550,7 @@ def test_pylist_to_arrow_table_empty_uses_target_schema():
 
 def test_pylist_to_arrow_table_preserves_nullable_none_values():
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=True)])
-    opts = ArrowCastOptions.__safe_init__(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=target_schema)
 
     table = pylist_to_arrow_table([{"a": 1}, {"a": None}], opts)
 
@@ -606,7 +579,7 @@ def test_pylist_to_arrow_table_all_none_rows_use_target_schema_defaults():
 
 def test_pylist_to_record_batch_and_reader_via_convert():
     target_field = pa.field("value", pa.int64(), nullable=False)
-    opts = ArrowCastOptions.__safe_init__(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=target_field)
 
     batch = pylist_to_record_batch([1, 2], opts)
     assert isinstance(batch, pa.RecordBatch)

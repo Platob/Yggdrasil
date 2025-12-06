@@ -1,6 +1,6 @@
 from typing import Optional
 
-from .arrow_cast import ArrowCastOptions
+from .arrow_cast import CastOptions
 from .registry import register_converter
 
 # Reuse existing Polars <-> Arrow helpers
@@ -60,7 +60,7 @@ else:
 @polars_pandas_converter(PolarsDataFrame, PandasDataFrame)
 def polars_dataframe_to_pandas_dataframe(
     dataframe: "polars.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pandas.DataFrame":
     """
     Convert a Polars DataFrame to a pandas DataFrame using Arrow as the bridge.
@@ -79,7 +79,7 @@ def polars_dataframe_to_pandas_dataframe(
     if polars is None or pandas is None:
         raise RuntimeError("Both polars and pandas are required for this conversion")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     # Polars -> Arrow (includes Arrow-side casting if target_schema is set)
     table = polars_dataframe_to_arrow_table(dataframe, opts)
@@ -91,7 +91,7 @@ def polars_dataframe_to_pandas_dataframe(
 @polars_pandas_converter(PandasDataFrame, PolarsDataFrame)
 def pandas_dataframe_to_polars_dataframe(
     dataframe: "pandas.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "polars.DataFrame":
     """
     Convert a pandas DataFrame to a Polars DataFrame using Arrow as the bridge.
@@ -110,7 +110,7 @@ def pandas_dataframe_to_polars_dataframe(
     if polars is None or pandas is None:
         raise RuntimeError("Both polars and pandas are required for this conversion")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     # pandas -> Arrow (includes Arrow-side casting if target_schema is set)
     table = pandas_dataframe_to_arrow_table(dataframe, opts)

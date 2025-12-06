@@ -17,7 +17,7 @@ from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...requests.session import YGGSession
-from ...types.cast.cast_options import ArrowCastOptions
+from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
 from ...types.cast.spark_cast import cast_spark_dataframe, arrow_table_to_spark_dataframe
 
@@ -403,7 +403,7 @@ class DBXSQL(DBXWorkspaceObject):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         mode: str = "auto",
-        cast_options: Optional[ArrowCastOptions] = None,
+        cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: list[str] = None,
         zorder_by: list[str] = None,
@@ -458,7 +458,7 @@ class DBXSQL(DBXWorkspaceObject):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         mode: str = "auto",
-        cast_options: Optional[ArrowCastOptions] = None,
+        cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: list[str] = None,
         zorder_by: list[str] = None,
@@ -600,7 +600,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         mode: str = "auto",
-        cast_options: Optional[ArrowCastOptions] = None,
+        cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: list[str] = None,
         zorder_by: list[str] = None,

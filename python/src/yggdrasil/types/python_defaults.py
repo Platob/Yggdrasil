@@ -4,13 +4,15 @@ import decimal
 import types
 import uuid
 from collections.abc import Collection, Mapping, MutableMapping, MutableSequence, MutableSet
-from typing import Any, Tuple, Union, get_args, get_origin
+from typing import Any, Tuple, Union, get_args, get_origin, Optional, List
 
 import pyarrow as pa
 
 __all__ = [
-    "default_from_hint",
-    "default_from_arrow_hint"
+    "default_scalar",
+    "default_python_scalar",
+    "default_arrow_scalar",
+    "default_arrow_array"
 ]
 
 
@@ -32,6 +34,65 @@ _SPECIAL_DEFAULTS = {
     decimal.Decimal: lambda: decimal.Decimal(0),
 }
 
+_ARROW_DEFAULTS = {
+    pa.null(): pa.scalar(None, type=pa.null()),
+
+    pa.bool_(): pa.scalar(False, type=pa.bool_()),
+
+    pa.int8(): pa.scalar(0, type=pa.int8()),
+    pa.int16(): pa.scalar(0, type=pa.int16()),
+    pa.int32(): pa.scalar(0, type=pa.int32()),
+    pa.int64(): pa.scalar(0, type=pa.int64()),
+
+    pa.uint8(): pa.scalar(0, type=pa.uint8()),
+    pa.uint16(): pa.scalar(0, type=pa.uint16()),
+    pa.uint32(): pa.scalar(0, type=pa.uint32()),
+    pa.uint64(): pa.scalar(0, type=pa.uint64()),
+
+    pa.float16(): pa.scalar(0.0, type=pa.float16()),
+    pa.float32(): pa.scalar(0.0, type=pa.float32()),
+    pa.float64(): pa.scalar(0.0, type=pa.float64()),
+
+    pa.string(): pa.scalar("", type=pa.string()),
+    pa.large_string(): pa.scalar("", type=pa.large_string()),
+    pa.string_view(): pa.scalar("", type=pa.string_view()),
+
+    pa.binary(): pa.scalar(b"", type=pa.binary()),
+    pa.large_binary(): pa.scalar(b"", type=pa.large_binary()),
+    pa.binary_view(): pa.scalar(b"", type=pa.binary_view()),
+}
+
+
+try:
+    import polars
+
+    polars = polars
+
+    _POLARS_DEFAULTS = {
+        polars.Null(): None,
+        polars.Boolean(): False,
+
+        polars.Binary(): b"",
+
+        polars.Utf8(): "",
+
+        polars.Int8(): 0,
+        polars.Int16(): 0,
+        polars.Int32(): 0,
+        polars.Int64(): 0,
+
+        polars.UInt8(): 0,
+        polars.UInt16(): 0,
+        polars.UInt32(): 0,
+        polars.UInt64(): 0,
+
+        polars.Float32(): 0.0,
+        polars.Float64(): 0.0,
+    }
+except ImportError:
+    polars = None
+
+    _POLARS_DEFAULTS = {}
 
 def _is_optional(hint) -> bool:
     origin = get_origin(hint)
@@ -68,64 +129,7 @@ def _default_for_tuple_args(args):
     if len(args) == 2 and args[1] is Ellipsis:
         return tuple()
 
-    return tuple(default_from_hint(arg) for arg in args)
-
-
-def default_from_arrow_hint(hint):
-    def _arrow_default_value(dtype: "pa.DataType"):
-        if pa.types.is_struct(dtype):
-            return {
-                field.name: (
-                    _arrow_default_value(field.type) if not field.nullable else None
-                )
-                for field in dtype
-            }
-
-        if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
-            return []
-
-        if pa.types.is_map(dtype):
-            return {}
-
-        if pa.types.is_integer(dtype) or pa.types.is_unsigned_integer(dtype):
-            return 0
-
-        if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
-            return decimal.Decimal(0) if pa.types.is_decimal(dtype) else 0.0
-
-        if pa.types.is_boolean(dtype):
-            return False
-
-        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype) or pa.types.is_string_view(dtype):
-            return ""
-
-        if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype) or pa.types.is_binary_view(dtype):
-            return b""
-
-        if pa.types.is_fixed_size_binary(dtype):
-            return b"\x00" * dtype.byte_width
-
-        if (
-            pa.types.is_timestamp(dtype)
-            or pa.types.is_time(dtype)
-            or pa.types.is_duration(dtype)
-            or pa.types.is_interval(dtype)
-        ):
-            return 0
-
-        return None
-
-    def _arrow_default_scalar(dtype: "pa.DataType"):
-        value = _arrow_default_value(dtype)
-        return pa.scalar(value, type=dtype)
-
-    if isinstance(hint, pa.Field):
-        return pa.scalar(None, type=hint.type) if hint.nullable else _arrow_default_scalar(hint.type)
-
-    if isinstance(hint, pa.DataType):
-        return _arrow_default_scalar(hint)
-
-    return dataclasses.MISSING
+    return tuple(default_scalar(arg) for arg in args)
 
 
 def _default_for_dataclass(hint):
@@ -140,14 +144,91 @@ def _default_for_dataclass(hint):
         elif field.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
             value = field.default_factory()  # type: ignore[misc]
         else:
-            value = default_from_hint(field.type)
+            value = default_scalar(field.type)
 
         kwargs[field.name] = value
 
     return hint(**kwargs)
 
 
-def default_from_hint(hint: Any):
+def default_arrow_scalar(
+    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
+    nullable: bool
+):
+    if nullable:
+        return pa.scalar(None, type=dtype)
+
+    existing = _ARROW_DEFAULTS.get(dtype)
+
+    if existing is not None:
+        return existing
+
+    if (
+        pa.types.is_timestamp(dtype)
+        or pa.types.is_time(dtype)
+        or pa.types.is_duration(dtype)
+        or pa.types.is_date(dtype)
+    ):
+        return pa.scalar(0, type=dtype)
+    elif pa.types.is_decimal(dtype):
+        return pa.scalar(decimal.Decimal(0), type=dtype)
+    elif pa.types.is_fixed_size_binary(dtype):
+        return pa.scalar(b"\x00" * dtype.byte_width, type=dtype)
+    elif pa.types.is_struct(dtype):
+        fields = [
+            (field.name, default_arrow_scalar(dtype=field.type, nullable=field.nullable))
+            for field in dtype
+        ]
+        return pa.scalar(fields, type=dtype)
+    elif (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_list_view(dtype)
+    ):
+        return pa.scalar([], type=dtype)
+    elif pa.types.is_fixed_size_list(dtype):
+        value_field: pa.Field = dtype.value_field
+
+        return pa.scalar(
+            [default_arrow_scalar(value_field.type, value_field.nullable)] * dtype.list_size,
+            type=dtype
+        )
+    elif pa.types.is_map(dtype):
+        return pa.scalar({}, type=dtype)
+    else:
+        raise TypeError(f"Cannot determine default value for Arrow type {dtype!r}")
+
+
+def default_arrow_array(
+    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
+    nullable: bool,
+    size: int = 0,
+    memory_pool: Optional[pa.MemoryPool] = None,
+    chunks: Optional[List[int]] = None,
+    scalar_default: Optional[pa.Scalar] = None,
+) -> Union[pa.Array, pa.ChunkedArray]:
+    if scalar_default is None:
+        scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
+
+    if chunks is not None:
+        return pa.chunked_array(
+            [
+                pa.repeat(
+                    value=scalar_default,
+                    size=chunk_size,
+                    memory_pool=memory_pool
+                ) for chunk_size in chunks
+            ]
+        )
+
+    return pa.repeat(
+        value=scalar_default,
+        size=size,
+        memory_pool=memory_pool
+    )
+
+
+def default_python_scalar(hint: Any):
     if _is_optional(hint):
         return None
 
@@ -156,10 +237,6 @@ def default_from_hint(hint: Any):
 
     if hint in _SPECIAL_DEFAULTS:
         return _SPECIAL_DEFAULTS[hint]()
-
-    arrow_default = default_from_arrow_hint(hint)
-    if arrow_default is not dataclasses.MISSING:
-        return arrow_default
 
     origin = get_origin(hint)
 
@@ -181,3 +258,16 @@ def default_from_hint(hint: Any):
         return hint()
     except Exception as exc:
         raise TypeError(f"Cannot determine default value for {hint!r}") from exc
+
+
+def default_scalar(
+    hint: Union[
+        type,
+        pa.DataType, pa.Field,
+        "polars.DataType", "polars.Field"
+    ],
+    nullable: Optional[bool] = None
+):
+    if isinstance(hint, (pa.Field, pa.DataType)):
+        return default_arrow_scalar(dtype=hint, nullable=nullable)
+    return default_python_scalar(hint)

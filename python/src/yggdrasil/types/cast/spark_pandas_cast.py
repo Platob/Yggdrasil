@@ -1,6 +1,6 @@
 from typing import Optional
 
-from .arrow_cast import ArrowCastOptions
+from .arrow_cast import CastOptions
 from .registry import register_converter
 
 # Reuse existing Spark <-> Arrow helpers
@@ -59,7 +59,7 @@ else:
 @spark_pandas_converter(SparkDataFrame, PandasDataFrame)
 def spark_dataframe_to_pandas_dataframe(
     dataframe: "pyspark.sql.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pandas.DataFrame":
     """
     Convert a Spark DataFrame to a pandas DataFrame using Arrow as the bridge.
@@ -78,7 +78,7 @@ def spark_dataframe_to_pandas_dataframe(
     if pyspark is None or pandas is None:
         raise RuntimeError("Both pyspark and pandas are required for this conversion")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     # Spark -> Arrow (includes Arrow-side casting if target_schema is set)
     table = spark_dataframe_to_arrow_table(dataframe, opts)
@@ -90,7 +90,7 @@ def spark_dataframe_to_pandas_dataframe(
 @spark_pandas_converter(PandasDataFrame, SparkDataFrame)
 def pandas_dataframe_to_spark_dataframe(
     dataframe: "pandas.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """
     Convert a pandas DataFrame to a Spark DataFrame using Arrow as the bridge.
@@ -109,7 +109,7 @@ def pandas_dataframe_to_spark_dataframe(
     if pyspark is None or pandas is None:
         raise RuntimeError("Both pyspark and pandas are required for this conversion")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     # pandas -> Arrow (includes Arrow-side casting if target_schema is set)
     table = pandas_dataframe_to_arrow_table(dataframe, opts)

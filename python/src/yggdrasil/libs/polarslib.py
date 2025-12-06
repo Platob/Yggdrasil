@@ -47,6 +47,18 @@ except ImportError:
 POLARS_BASE_TO_ARROW = {v: k for k, v in ARROW_TO_POLARS.items()}
 
 
+__all__ = [
+    "polars",
+    "require_polars",
+    "ARROW_TO_POLARS",
+    "POLARS_BASE_TO_ARROW",
+    "arrow_type_to_polars_type",
+    "arrow_field_to_polars_field",
+    "polars_type_to_arrow_type",
+    "polars_field_to_arrow_field",
+]
+
+
 def require_polars():
     if polars is None:
         raise ImportError(
@@ -150,20 +162,20 @@ def arrow_type_to_polars_type(
 def arrow_field_to_polars_field(
     field: pa.Field,
     options: Optional[dict] = None,
-) -> Any:
+) -> "polars.Field":
     """
     Convert a pyarrow.Field to a Polars field representation.
 
     If polars.Field exists, returns a polars.Field(name, dtype).
-    Otherwise returns a (name, dtype) tuple.
     """
-    pl_dtype = arrow_type_to_polars_type(field.type)
+    built = polars.Field(field.name, arrow_type_to_polars_type(field.type))
 
-    field_cls = getattr(polars, "Field", None)
-    if callable(field_cls):
-        return field_cls(field.name, pl_dtype)
+    try:
+        setattr(built, "nullable", field.nullable)
+    except Exception:
+        pass
 
-    return field.name, pl_dtype
+    return built
 
 
 def _polars_base_type(pl_dtype: Any) -> Any:
@@ -187,7 +199,7 @@ def _polars_base_type(pl_dtype: Any) -> Any:
 
 
 def polars_type_to_arrow_type(
-    pl_type: Any,
+    pl_type: "polars.DataType",
     options: Optional[dict] = None,
 ) -> pa.DataType:
     """
@@ -198,59 +210,41 @@ def polars_type_to_arrow_type(
     base = _polars_base_type(pl_type)
 
     # Primitive base mapping
-    primitive = POLARS_BASE_TO_ARROW.get(base) or POLARS_BASE_TO_ARROW.get(type(pl_type))
-    if primitive is not None:
-        return primitive
+    existing = POLARS_BASE_TO_ARROW.get(base) or POLARS_BASE_TO_ARROW.get(type(pl_type))
 
-    # For parametric types we need to inspect attributes;
-    # import here to avoid issues if polars is missing.
-    List = getattr(polars, "List", None)
-    Struct = getattr(polars, "Struct", None)
-    Datetime = getattr(polars, "Datetime", None)
-    Duration = getattr(polars, "Duration", None)
-    Categorical = getattr(polars, "Categorical", None)
-    Enum = getattr(polars, "Enum", None)
+    if existing is not None:
+        return existing
 
-    # List(inner)
-    if List is not None and isinstance(pl_type, List):
-        inner_pl = pl_type.inner
-        inner_arrow = polars_type_to_arrow_type(inner_pl)
-        # Use large-list semantics by default for safety
-        return pa.list_(inner_arrow)
-
-    # Struct(fields)
-    if Struct is not None and isinstance(pl_type, Struct):
-        fields_def = pl_type.fields  # can be dict or list[Field]
-        arrow_fields: list[pa.Field] = []
-
-        from collections.abc import Mapping
-
-        if isinstance(fields_def, Mapping):
-            for name, dt in fields_def.items():
-                arrow_fields.append(pa.field(name, polars_type_to_arrow_type(dt)))
-        else:
-            # sequence of polars.Field
-            for f in fields_def:
-                arrow_fields.append(polars_field_to_arrow_field(f))
-
-        return pa.struct(arrow_fields)
-
-    # Datetime(time_unit, time_zone)
-    if Datetime is not None and isinstance(pl_type, Datetime):
-        unit = pl_type.time_unit or "us"  # Polars default is usually "us"
+    if isinstance(pl_type, polars.Datetime):
+        unit = pl_type.time_unit
         tz = pl_type.time_zone
-        # Arrow timestamp
         return pa.timestamp(unit, tz=tz)
 
-    # Duration(time_unit)
-    if Duration is not None and isinstance(pl_type, Duration):
-        unit = pl_type.time_unit or "us"
+    elif isinstance(pl_type, polars.Duration):
+        unit = pl_type.time_unit
         return pa.duration(unit)
 
+    elif isinstance(pl_type, polars.Decimal):
+        precision = pl_type.precision
+        scale = pl_type.scale
+        return pa.decimal128(precision, scale) if precision <= 38 else pa.decimal256(precision, scale)
+
+    elif isinstance(pl_type, polars.List):
+        inner = pl_type.inner
+        arrow_inner = polars_type_to_arrow_type(inner)
+
+        return pa.list_(arrow_inner)
+
+    elif isinstance(pl_type, polars.Struct):
+        fields = [
+            polars_field_to_arrow_field(_)
+            for _ in pl_type.fields
+        ]
+
+        return pa.struct(fields)
+
     # Categorical / Enum -> Arrow dictionary<string>
-    if (Categorical is not None and isinstance(pl_type, Categorical)) or (
-        Enum is not None and isinstance(pl_type, Enum)
-    ):
+    if isinstance(pl_type, polars.Categorical) or isinstance(pl_type, polars.Enum):
         # We don't have direct info on categories at the dtype level,
         # so choose a reasonable default: int32 index over string values.
         return pa.dictionary(index_type=pa.int32(), value_type=pa.string())
@@ -259,8 +253,8 @@ def polars_type_to_arrow_type(
 
 
 def polars_field_to_arrow_field(
-    field: Any,
-    options: Optional[dict] = None,
+    field: "polars.Field",
+    options: Optional["CastOptions"] = None,
 ) -> pa.Field:
     """
     Convert a Polars field to a pyarrow.Field.
@@ -269,24 +263,9 @@ def polars_field_to_arrow_field(
       - polars.datatypes.Field instances
       - (name, dtype) tuples
     """
-    field_cls = getattr(polars, "Field", None)
+    arrow_type = polars_type_to_arrow_type(field.dtype)
 
-    if field_cls is not None and isinstance(field, field_cls):
-        name = field.name
-        pl_dtype = field.dtype
-    else:
-        # Assume (name, dtype) tuple-like
-        try:
-            name, pl_dtype = field
-        except Exception as exc:
-            raise TypeError(
-                f"Unsupported Polars field representation: {field!r}"
-            ) from exc
-
-    arrow_type = polars_type_to_arrow_type(pl_dtype)
-    # Nullable=True by default; if you want strict nullability,
-    # you'll need to track that separately.
-    return pa.field(name, arrow_type, nullable=True)
+    return pa.field(field.name, arrow_type, nullable=getattr(field, "nullable", True))
 
 
 if polars is not None:
@@ -294,15 +273,3 @@ if polars is not None:
     register_converter(pa.Field, polars.Field)(arrow_field_to_polars_field)
     register_converter(polars.DataType, pa.DataType)(polars_type_to_arrow_type)
     register_converter(polars.Field, pa.Field)(polars_field_to_arrow_field)
-
-
-__all__ = [
-    "polars",
-    "require_polars",
-    "ARROW_TO_POLARS",
-    "POLARS_BASE_TO_ARROW",
-    "arrow_type_to_polars_type",
-    "arrow_field_to_polars_field",
-    "polars_type_to_arrow_type",
-    "polars_field_to_arrow_field",
-]

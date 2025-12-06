@@ -1,18 +1,18 @@
-from dataclasses import replace as dc_replace
-from pathlib import Path
-from typing import Any, Optional, Tuple, List
+from typing import Optional, Tuple, List
 
 import pyarrow as pa
 
 from .arrow_cast import (
-    ArrowCastOptions,
-    cast_arrow_table,
+    cast_arrow_tabular,
     record_batch_reader_to_table,
     record_batch_to_table, arrow_field_to_schema,
     to_spark_arrow_type,
 )
+from .cast_options import (
+    CastOptions,
+)
 from .registry import register_converter
-from ..python_defaults import default_from_arrow_hint
+from ..python_defaults import default_arrow_scalar
 from ...libs.sparklib import (
     pyspark,
     arrow_field_to_spark_field,
@@ -31,6 +31,10 @@ __all__ = [
     "arrow_record_batch_reader_to_spark_dataframe",
     "spark_schema_to_arrow_schema",
     "arrow_schema_to_spark_schema",
+    "arrow_field_to_spark_field",
+    "spark_field_to_arrow_field",
+    "arrow_type_to_spark_type",
+    "spark_type_to_arrow_type",
 ]
 
 # ---------------------------------------------------------------------------
@@ -71,11 +75,10 @@ else:  # pyspark missing -> dummies + no-op decorator
 # Spark DF / Column <-> Arrow using ArrowCastOptions
 # ---------------------------------------------------------------------------
 
-
 @spark_converter(SparkDataFrame, SparkDataFrame)
 def cast_spark_dataframe(
     dataframe: "pyspark.sql.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """
     Cast a Spark DataFrame using Arrow *types* but without collecting to Arrow.
@@ -91,139 +94,83 @@ def cast_spark_dataframe(
         * `default_value` if passed
         * otherwise `default_from_arrow_hint(field.type)`
     """
-    if pyspark is None:
-        raise RuntimeError("pyspark is required to cast a Spark DataFrame")
-
-    opts = ArrowCastOptions.check_arg(cast_options)
-    target_schema = opts.target_schema
+    options = CastOptions.check_arg(options)
+    sub_target_arrow_schema = options.target_arrow_schema
 
     # No target -> nothing to do
-    if target_schema is None:
+    if sub_target_arrow_schema is None:
         return dataframe
 
-    def _spark_compatible_schema(schema: pa.Schema) -> pa.Schema:
-        return pa.schema(
-            [
-                pa.field(
-                    f.name,
-                    to_spark_arrow_type(f.type),
-                    nullable=f.nullable,
-                    metadata=f.metadata,
+    source_spark_fields = dataframe.schema
+    source_arrow_fields = [spark_field_to_arrow_field(f) for f in source_spark_fields]
+
+    target_arrow_fields: list[pa.Field] = list(sub_target_arrow_schema)
+    child_target_spark_fields = [arrow_field_to_spark_field(f) for f in target_arrow_fields]
+    target_spark_schema = arrow_schema_to_spark_schema(sub_target_arrow_schema)
+
+    source_name_to_index = {
+        field.name: idx for idx, field in enumerate(source_arrow_fields)
+    }
+
+    if not options.strict_match_names:
+        source_name_to_index.update({
+            field.name.casefold(): idx for idx, field in enumerate(source_arrow_fields)
+        })
+
+    casted_columns: List[Tuple[SparkStructField, SparkColumn]] = []
+    found_source_names = set()
+
+    for sub_target_index, child_target_spark_field in enumerate(child_target_spark_fields):
+        child_target_arrow_field = target_arrow_fields[sub_target_index]
+
+        find_name = child_target_spark_field.name if options.strict_match_names else child_target_spark_field.name.casefold()
+        source_index = source_name_to_index.get(find_name)
+
+        if source_index is None:
+            if not options.add_missing_columns:
+                raise ValueError(f"Missing column {child_target_spark_field!r} in source data {child_target_spark_fields!r}")
+
+            dv = default_arrow_scalar(dtype=child_target_arrow_field.type, nullable=child_target_arrow_field.nullable)
+
+            casted_column = F.lit(dv.as_py()).cast(child_target_spark_field.dataType)
+        else:
+            child_source_arrow_field = source_arrow_fields[sub_target_index]
+            child_source_spark_field = source_spark_fields[sub_target_index]
+            found_source_names.add(child_source_spark_field.name)
+
+            casted_column = cast_spark_column(
+                dataframe[source_index],
+                options=options.copy(
+                    source_field=child_source_arrow_field,
+                    target_field=child_target_arrow_field
                 )
-                for f in schema
-            ],
-            metadata=schema.metadata,
+            )
+
+        casted_columns.append(
+            (child_target_spark_field, casted_column)
         )
 
-    def _cast_via_map_in_arrow(schema: pa.Schema) -> "pyspark.sql.DataFrame":
-        compatible_schema = _spark_compatible_schema(schema)
+    if options.allow_add_columns:
+        extra_columns = [
+            f.name for f in source_spark_fields
+            if f.name not in found_source_names
+        ]
 
-        def _cast_batches(batches):
-            compat_options = dc_replace(opts)
-            compat_options.target_schema = compatible_schema
+        if extra_columns:
+            for extra_column_name in extra_columns:
+                casted_columns.append(
+                    (source_spark_fields[extra_column_name], dataframe[extra_column_name])
+                )
 
-            for batch in batches:
-                table = record_batch_to_table(batch, compat_options)
-                casted = cast_arrow_table(table, compat_options)
-                yield from casted.to_batches()
+    result = dataframe.select(c for _, c in casted_columns)
 
-        spark_schema = arrow_schema_to_spark_schema(compatible_schema, opts)
-
-        spark = pyspark.sql.SparkSession.getActiveSession()  # type: ignore[union-attr]
-        if spark is None:
-            raise RuntimeError("An active SparkSession is required to cast with mapInArrow")
-
-        source_root = Path(__file__).resolve().parents[3]
-        spark.sparkContext.addPyFile(str(source_root))
-
-        return dataframe.mapInArrow(_cast_batches, spark_schema)
-
-    cast_schema = target_schema
-    try:
-        spark_schema = arrow_schema_to_spark_schema(target_schema, opts)
-    except TypeError:
-        cast_schema = _spark_compatible_schema(target_schema)
-        try:
-            spark_schema = arrow_schema_to_spark_schema(cast_schema, opts)
-        except TypeError:
-            return _cast_via_map_in_arrow(target_schema)
-
-    src_schema = dataframe.schema
-    src_names = [f.name for f in src_schema.fields]
-
-    exact_name_to_index = {name: idx for idx, name in enumerate(src_names)}
-    folded_name_to_index = {name.casefold(): idx for idx, name in enumerate(src_names)}
-
-    new_cols = []
-    f: List[Tuple[int, pa.Field]] = list(enumerate(cast_schema))
-
-    for i, field in f:
-        # ----- resolve source column name -----
-        source_name: Optional[str] = None
-        source_nullable: Optional[bool] = None
-
-        if field.name in exact_name_to_index:
-            idx = exact_name_to_index[field.name]
-            source_name = src_names[idx]
-            source_nullable = src_schema[idx].nullable
-        elif not opts.strict_match_names and field.name.casefold() in folded_name_to_index:
-            idx = folded_name_to_index[field.name.casefold()]
-            source_name = src_names[idx]
-            source_nullable = src_schema[idx].nullable
-        elif not opts.strict_match_names and len(src_names) > len(new_cols):
-            idx = len(new_cols)
-            source_name = src_names[idx]
-            source_nullable = src_schema[idx].nullable
-        elif opts.add_missing_columns:
-            # No source column: we’ll synthesize one with defaults
-            source_name = None
-            source_nullable = None
-        else:
-            raise TypeError(f"Missing column {field.name} while casting Spark DataFrame")
-
-        # ----- get target Spark type from Arrow field -----
-        spark_struct_field = arrow_field_to_spark_field(field, cast_options)
-        spark_type = spark_struct_field.dataType
-
-        # ----- build column expression -----
-        if source_name is None:
-            # construct default column
-            dv = default_from_arrow_hint(field).as_py()
-            col = F.lit(dv).cast(spark_type)
-        else:
-            col = F.col(source_name).cast(spark_type)
-
-            # If target field is non-nullable but Spark side might have nulls,
-            # fill them with defaults
-            if not field.nullable and (source_nullable is None or source_nullable):
-                dv = default_from_arrow_hint(field).as_py()
-                col = F.when(col.isNull(), F.lit(dv)).otherwise(col)
-
-        # Final alias to target name
-        new_cols.append(col.alias(field.name))
-
-    # Drop extra columns unless allowed
-    result = dataframe.select(*new_cols)
-
-    spark = pyspark.sql.SparkSession.getActiveSession()  # type: ignore[union-attr]
-    if spark is None:
-        raise RuntimeError("An active SparkSession is required to cast a Spark DataFrame")
-
-    if not opts.allow_add_columns:
-        return spark.createDataFrame(result.rdd, schema=spark_schema)
-
-    # Keep original columns + casted ones (casted override same names)
-    # To keep order as target_schema, select casted first, then any extras.
-    extra_cols = [c for c in dataframe.columns if c not in [f.name for f in target_schema]]
-    full_schema = SparkSchema(list(spark_schema) + [src_schema[exact_name_to_index[c]] for c in extra_cols])
-    result_with_extras = dataframe.select(*new_cols, *[F.col(c) for c in extra_cols])
-    return spark.createDataFrame(result_with_extras.rdd, schema=full_schema)
+    return result.sparkSession.createDataFrame(result.rdd, schema=target_spark_schema)
 
 
 @spark_converter(SparkColumn, SparkColumn)
 def cast_spark_column(
     column: "pyspark.sql.Column",
-    cast_options: Any = None,
+    options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.Column":
     """
     Cast a single Spark Column using an Arrow target *type*.
@@ -237,94 +184,126 @@ def cast_spark_column(
 
     This is a pure Spark cast: no collection or Arrow arrays involved.
     """
-    if pyspark is None:
-        raise RuntimeError("pyspark is required to cast a Spark column")
-
-    opts = ArrowCastOptions.check_arg(cast_options)
-    target_field = opts.target_field
+    options = CastOptions.check_arg(options)
+    target_field = options.get_target_spark_field()
 
     if target_field is None:
         # Nothing to cast to, return the column as-is
         return column
 
-    # If a schema is passed, normalize to a single field (first)
-    if isinstance(target_field, pa.Schema):
-        if len(target_field) != 1:
-            raise ValueError("cast_spark_column: Schema target must have exactly one field")
-        target_field = target_field[0]
-
-    # ArrowCastOptions built from a Schema may wrap it in a root struct field; unwrap it
-    if (
-        isinstance(target_field, pa.Field)
-        and pa.types.is_struct(target_field.type)
-        and len(target_field.type) == 1
-        and target_field.name == "root"
-    ):
-        target_field = target_field.type[0]
-
-    if not isinstance(target_field, pa.Field):
-        # treat DataType as a single anonymous field
-        target_field = pa.field("value", target_field, nullable=True)
-
-    compatible_field = pa.field(
-        target_field.name,
-        to_spark_arrow_type(target_field.type),
-        nullable=target_field.nullable,
-        metadata=target_field.metadata,
+    target_spark_type = target_field.dataType
+    source_field = options.get_source_spark_field() or T.StructField(
+        name=column.getAlias() or "col", dataType=column.dtype, nullable=True
     )
 
-    def _fill_default(field: pa.Field, col: "pyspark.sql.Column") -> "pyspark.sql.Column":
-        if not field.nullable:
-            dv = default_from_arrow_hint(field)
-            if hasattr(dv, "as_py"):
-                dv = dv.as_py()
-            if isinstance(dv, dict) and pa.types.is_struct(field.type):
-                default_fields = [
-                    F.lit(
-                        dv_value.as_py() if hasattr(dv_value := dv.get(child.name), "as_py") else dv_value
-                    ).alias(child.name)
-                    for child in field.type
-                ]
-                default_col = F.struct(*default_fields)
-                return F.when(col.isNull(), default_col).otherwise(col)
+    if isinstance(target_spark_type, T.StructType):
+        return cast_spark_column_to_struct(column, options=options)
+    else:
+        return (
+            check_column_nullability(column, source_field=source_field, target_field=target_field)
+            .alias(target_field.name)
+        )
 
-            return F.when(col.isNull(), F.lit(dv)).otherwise(col)
 
-        return col
+def check_column_nullability(
+    column: "pyspark.sql.Column",
+    source_field: Optional["T.StructField"] = None,
+    target_field: Optional["T.StructField"] = None,
+) -> "pyspark.sql.Column":
+    source_nullable = True if source_field is None else source_field.nullable
+    target_nullable = True if target_field is None else target_field.nullable
 
-    def _cast_to_field(field: pa.Field, col: "pyspark.sql.Column") -> "pyspark.sql.Column":
-        spark_struct_field = arrow_field_to_spark_field(field, cast_options)
-        spark_type = spark_struct_field.dataType
+    if source_nullable and not target_nullable:
+        dv = default_arrow_scalar(
+            dtype=to_spark_arrow_type(column.dtype),
+            nullable=False
+        ).as_py()
+        column = F.when(column.isNull(), F.lit(dv)).otherwise(column)
 
-        if isinstance(spark_type, T.StructType) and pa.types.is_struct(field.type):
-            child_cols = []
-            for child_field in field.type:
-                child_col = _cast_to_field(child_field, col.getField(child_field.name))
-                child_cols.append(child_col.alias(child_field.name))
+    return column
 
-            struct_col = F.struct(*child_cols)
-            return _fill_default(field, struct_col)
 
-        base_col = col.cast(spark_type)
-        return _fill_default(field, base_col)
+def cast_spark_column_to_struct(
+    column: "pyspark.sql.Column",
+    options: Optional[CastOptions] = None,
+) -> "pyspark.sql.Column":
+    """
+    Cast a Spark Column to a StructType using Arrow field type info.
 
-    try:
-        return _cast_to_field(target_field, column)
-    except TypeError:
-        # Normalize unsupported Arrow types (e.g., dictionary, large_*, extension)
-        # to Spark-compatible equivalents and retry.
-        return _cast_to_field(compatible_field, column)
+    This is a pure Spark cast: no collection or Arrow arrays involved.
+    """
+    options = CastOptions.check_arg(options)
+
+    target_arrow_field = options.target_field
+    target_spark_field = options.get_target_spark_field()
+
+    if target_arrow_field is None:
+        return column
+
+    target_spark_type: T.StructType = target_spark_field.dataType
+
+    source_spark_field = options.get_source_spark_field() or T.StructField(
+        name=column.getAlias() or "col", dataType=column.dtype, nullable=True
+    )
+    source_spark_type: T.StructType = source_spark_field.dataType
+
+    if not isinstance(source_spark_type, T.StructType):
+        raise ValueError(f"Cannot cast {source_spark_field} to {target_spark_field}")
+
+    source_spark_fields = list(source_spark_type.fields)
+    source_arrow_fields = [spark_field_to_arrow_field(f) for f in source_spark_fields]
+
+    target_arrow_fields: list[pa.Field] = list(options.target_field.type)
+    target_spark_fields = list(target_spark_type.fields)
+
+    name_to_index = {f.name: idx for idx, f in enumerate(source_spark_fields)}
+    if not options.strict_match_names:
+        name_to_index.update({
+            f.name.casefold(): idx for idx, f in enumerate(source_spark_fields)
+        })
+
+    children = []
+    found_source_names = set()
+
+    for child_target_index, child_target_spark_field in enumerate(target_spark_fields):
+        child_target_arrow_field: pa.Field = target_arrow_fields[child_target_index]
+
+        find_name = child_target_spark_field.name if options.strict_match_names else child_target_spark_field.name.casefold()
+        source_index = name_to_index.get(find_name)
+
+        if source_index is None:
+            if not options.add_missing_columns:
+                raise ValueError(f"Missing column {child_target_arrow_field!r} from {target_arrow_fields}")
+
+            dv = default_arrow_scalar(dtype=child_target_arrow_field.type, nullable=child_target_arrow_field.nullable)
+
+            casted_column = F.lit(dv.as_py()).cast(child_target_spark_field.dataType)
+        else:
+            child_source_arrow_field = source_arrow_fields[child_target_index]
+            child_source_spark_field = source_spark_fields[child_target_index]
+            found_source_names.add(child_source_spark_field.name)
+
+            casted_column = cast_spark_column(
+                column.getField(child_source_arrow_field.name),
+                options=options.copy(
+                    source_field=child_source_arrow_field,
+                    target_field=child_target_arrow_field
+                )
+            )
+
+        children.append(casted_column.alias(child_target_spark_field.name))
+
+    return F.struct(*children)
 
 
 # ---------------------------------------------------------------------------
 # Spark DataFrame <-> Arrow Table / RecordBatchReader
 # ---------------------------------------------------------------------------
 
-
 @spark_converter(SparkDataFrame, pa.Table)
 def spark_dataframe_to_arrow_table(
     dataframe: "pyspark.sql.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.Table:
     """Convert a Spark DataFrame to a pyarrow.Table.
 
@@ -336,34 +315,34 @@ def spark_dataframe_to_arrow_table(
     if pyspark is None:
         raise RuntimeError("pyspark is required to convert Spark to Arrow")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
-    if opts.target_schema is not None:
+    if opts.target_arrow_schema is not None:
         dataframe = cast_spark_dataframe(dataframe, opts)
-        arrow_schema = opts.target_schema
+        arrow_schema = opts.target_arrow_schema
     else:
         arrow_schema = pa.schema(
             [spark_field_to_arrow_field(f, cast_options) for f in dataframe.schema]
         )
 
-    return cast_arrow_table(dataframe.toArrow(), ArrowCastOptions.check_arg(arrow_schema))
+    return cast_arrow_tabular(dataframe.toArrow(), CastOptions.check_arg(arrow_schema))
 
 
 @spark_converter(SparkDataFrame, pa.RecordBatchReader)
 def spark_dataframe_to_record_batch_reader(
     dataframe: "pyspark.sql.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.RecordBatchReader:
     """Convert a Spark DataFrame to a pyarrow.RecordBatchReader."""
     table = spark_dataframe_to_arrow_table(dataframe, cast_options)
     batches = table.to_batches()
-    return pa.RecordBatchReader.from_batches(table.schema, batches)
+    return pa.RecordBatchReader.from_batches(table.schema, batches) # type: ignore[attr-defined]
 
 
 @spark_converter(pa.Table, SparkDataFrame)
 def arrow_table_to_spark_dataframe(
     table: pa.Table,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """Convert a pyarrow.Table to a Spark DataFrame.
 
@@ -375,10 +354,10 @@ def arrow_table_to_spark_dataframe(
     if pyspark is None:
         raise RuntimeError("pyspark is required to convert Arrow to Spark")
 
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
-    if opts.target_schema is not None:
-        table = cast_arrow_table(table, opts)
+    if opts.target_arrow_schema is not None:
+        table = cast_arrow_tabular(table, opts)
 
     spark = pyspark.sql.SparkSession.getActiveSession()  # type: ignore[union-attr]
     if spark is None:
@@ -394,7 +373,7 @@ def arrow_table_to_spark_dataframe(
 @spark_converter(pa.RecordBatch, SparkDataFrame)
 def arrow_record_batch_to_spark_dataframe(
     batch: pa.RecordBatch,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """Convert a pyarrow.RecordBatch to a Spark DataFrame."""
     table = record_batch_to_table(batch, cast_options)
@@ -404,7 +383,7 @@ def arrow_record_batch_to_spark_dataframe(
 @spark_converter(pa.RecordBatchReader, SparkDataFrame)
 def arrow_record_batch_reader_to_spark_dataframe(
     reader: pa.RecordBatchReader,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.DataFrame":
     """Convert a pyarrow.RecordBatchReader to a Spark DataFrame."""
     table = record_batch_reader_to_table(reader, cast_options)
@@ -417,7 +396,7 @@ def arrow_record_batch_reader_to_spark_dataframe(
 @spark_converter(SparkDataFrame, SparkDataType)
 def spark_dataframe_to_spark_type(
     df: SparkDataFrame,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     return df.schema
 
@@ -425,7 +404,7 @@ def spark_dataframe_to_spark_type(
 @spark_converter(SparkDataFrame, SparkStructField)
 def spark_dataframe_to_spark_field(
     df: SparkDataFrame,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     return SparkStructField(
         df.getAlias() or "root",
@@ -437,7 +416,7 @@ def spark_dataframe_to_spark_field(
 @spark_converter(SparkDataFrame, pa.Field)
 def spark_dataframe_to_arrow_field(
     df: SparkDataFrame,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     return spark_field_to_arrow_field(
         spark_dataframe_to_spark_field(df, cast_options),
@@ -448,7 +427,7 @@ def spark_dataframe_to_arrow_field(
 @spark_converter(SparkDataFrame, pa.Schema)
 def spark_dataframe_to_arrow_schema(
     df: SparkDataFrame,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     return arrow_field_to_schema(
         spark_field_to_arrow_field(
@@ -462,7 +441,7 @@ def spark_dataframe_to_arrow_schema(
 @spark_converter(pa.DataType, SparkDataType)
 def _arrow_type_to_spark_type_for_registry(
     dtype: pa.DataType,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "T.DataType":  # type: ignore[name-defined]
     """
     Registry wrapper: pyarrow.DataType -> pyspark.sql.types.DataType
@@ -473,7 +452,7 @@ def _arrow_type_to_spark_type_for_registry(
 @spark_converter(pa.Field, SparkStructField)
 def _arrow_field_to_spark_field_for_registry(
     field: pa.Field,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "T.StructField":  # type: ignore[name-defined]
     """
     Registry wrapper: pyarrow.Field -> pyspark.sql.types.StructField
@@ -484,7 +463,7 @@ def _arrow_field_to_spark_field_for_registry(
 @spark_converter(SparkDataType, pa.DataType)
 def _spark_type_to_arrow_type_for_registry(
     dtype: "T.DataType",  # type: ignore[name-defined]
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     """
     Registry wrapper: pyspark.sql.types.DataType -> pyarrow.DataType
@@ -495,7 +474,7 @@ def _spark_type_to_arrow_type_for_registry(
 @spark_converter(SparkStructField, pa.Field)
 def _spark_field_to_arrow_field_for_registry(
     field: "T.StructField",  # type: ignore[name-defined]
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.Field:
     """
     Registry wrapper: pyspark.sql.types.StructField -> pyarrow.Field
@@ -506,12 +485,12 @@ def _spark_field_to_arrow_field_for_registry(
 @spark_converter(SparkSchema, pa.Schema)
 def spark_schema_to_arrow_schema(
     schema: "T.StructType",  # type: ignore[name-defined]
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.Schema:
     """
     Convert a pyspark StructType to a pyarrow.Schema.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
     arrow_fields = [
         spark_field_to_arrow_field(field, opts)
         for field in schema.fields
@@ -522,12 +501,12 @@ def spark_schema_to_arrow_schema(
 @spark_converter(pa.Schema, SparkSchema)
 def arrow_schema_to_spark_schema(
     schema: pa.Schema,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "T.StructType":  # type: ignore[name-defined]
     """
     Convert a pyarrow.Schema to a pyspark StructType.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
     spark_fields = [
         arrow_field_to_spark_field(field, opts)
         for field in schema

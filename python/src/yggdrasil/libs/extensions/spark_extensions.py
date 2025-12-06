@@ -16,7 +16,7 @@ from ..sparklib import (
 from ...types.cast.registry import convert
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ...types.cast.arrow_cast import ArrowCastOptions
+    from ...types.cast.arrow_cast import CastOptions
 
 # Try to import pyspark.sql stuff if pyspark is actually there
 try:
@@ -219,7 +219,7 @@ def upsample(
         arrow_table_to_polars_dataframe,
         polars_dataframe_to_arrow_table,
     )
-    from ...types.cast.arrow_cast import ArrowCastOptions
+    from ...types.cast.arrow_cast import CastOptions
 
     df: pyspark.sql.DataFrame = df
 
@@ -233,7 +233,7 @@ def upsample(
     else:
         drop_col = None
 
-    options = ArrowCastOptions.check_arg(spark_type_to_arrow_type(df.schema))
+    options = CastOptions.check_arg(spark_type_to_arrow_type(df.schema))
     spark_schema = arrow_field_to_spark_field(options.target_field)
 
     def within_group(tb: pa.Table) -> pa.Table:

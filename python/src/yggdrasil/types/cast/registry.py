@@ -22,7 +22,7 @@ from typing import (
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    from .arrow_cast import ArrowCastOptions
+    from .arrow_cast import CastOptions
 
 __all__ = ["register_converter", "convert"]
 
@@ -196,12 +196,12 @@ def convert(
         type,
         pa.Field, pa.DataType, pa.Schema,
     ],
-    options: Optional[Union[ArrowCastOptions, pa.Field, pa.DataType, pa.Schema]] = None,
+    options: Optional[Union[CastOptions, pa.Field, pa.DataType, pa.Schema]] = None,
     **kwargs,
 ) -> Any:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
-    from yggdrasil.types.python_defaults import default_from_hint
-    from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
+    from yggdrasil.types.python_defaults import default_scalar
+    from yggdrasil.types.cast.arrow_cast import CastOptions
 
     is_optional, target_hint = _unwrap_optional(target_hint)
 
@@ -213,21 +213,20 @@ def convert(
             pass
 
         if value is None:
-            return None if is_optional else default_from_hint(target_hint)
+            return None if is_optional else default_scalar(target_hint)
 
-    options = ArrowCastOptions.check_arg(target_field=options, kwargs=kwargs)
+    options = CastOptions.check_arg(target_field=options, kwargs=kwargs)
     origin = get_origin(target_hint) or target_hint
     args = get_args(target_hint)
     source_hint = type(value)
 
     if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
-        options.target_field = convert(target_hint, pa.Field)
+        options.set_target_arrow_field(target_hint, cast=True)
 
         if isinstance(value, pa.Array):
             target_hint = pa.Array
         else:
-            target_hint = source_hint
-
+            target_hint = value.__class__
         converter = _find_converter(source_hint, target_hint)
     else:
         converter = _find_converter(source_hint, target_hint)
@@ -292,7 +291,7 @@ def convert(
             elif field.default_factory is not _dataclasses.MISSING:  # type: ignore[attr-defined]
                 field_value = field.default_factory()  # type: ignore[misc]
             else:
-                field_value = default_from_hint(field.type)
+                field_value = default_scalar(field.type)
 
             kwargs[field.name] = field_value
 

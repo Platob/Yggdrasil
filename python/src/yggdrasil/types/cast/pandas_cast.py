@@ -3,9 +3,9 @@ from typing import Optional
 import pyarrow as pa
 
 from .arrow_cast import (
-    ArrowCastOptions,
+    CastOptions,
     cast_arrow_array,
-    cast_arrow_table,
+    cast_arrow_tabular,
     cast_arrow_record_batch_reader,
 )
 from .registry import register_converter
@@ -58,7 +58,7 @@ else:
 @pandas_converter(PandasSeries, PandasSeries)
 def cast_pandas_series(
     series: "pandas.Series",
-    options: Optional[ArrowCastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "pandas.Series":
     """
     Cast a pandas Series to a target Arrow type using Arrow casting rules.
@@ -72,7 +72,7 @@ def cast_pandas_series(
       - default handling (via cast_arrow_array)
     We then convert back to pandas and restore index/name.
     """
-    options = ArrowCastOptions.check_arg(options)
+    options = CastOptions.check_arg(options)
 
     arrow_array = pa.array(series, from_pandas=True)
     casted = cast_arrow_array(arrow_array, options)
@@ -86,7 +86,7 @@ def cast_pandas_series(
 @pandas_converter(PandasDataFrame, PandasDataFrame)
 def cast_pandas_dataframe(
     dataframe: "pandas.DataFrame",
-    options: Optional[ArrowCastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "pandas.DataFrame":
     """
     Cast a pandas DataFrame to a target Arrow schema using Arrow casting rules.
@@ -100,12 +100,12 @@ def cast_pandas_dataframe(
           * True: extra pandas columns (not in the target schema / cast result)
                   are appended unchanged
     """
-    options = ArrowCastOptions.check_arg(options)
+    options = CastOptions.check_arg(options)
 
     original_index = dataframe.index
 
     arrow_table = pa.Table.from_pandas(dataframe, preserve_index=False)
-    casted_table = cast_arrow_table(arrow_table, options)
+    casted_table = cast_arrow_tabular(arrow_table, options)
 
     result = casted_table.to_pandas()
     result.index = original_index
@@ -131,13 +131,13 @@ def cast_pandas_dataframe(
 @pandas_converter(pa.ChunkedArray, PandasSeries)
 def arrow_array_to_pandas_series(
     array: pa.Array,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pandas.Series":
     """
     Convert a pyarrow.Array (or ChunkedArray) to a pandas Series,
     optionally applying Arrow casting via ArrowCastOptions before conversion.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     if isinstance(array, pa.ChunkedArray):
         array = array.combine_chunks()
@@ -149,16 +149,16 @@ def arrow_array_to_pandas_series(
 @pandas_converter(pa.Table, PandasDataFrame)
 def arrow_table_to_pandas_dataframe(
     table: pa.Table,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pandas.DataFrame":
     """
     Convert a pyarrow.Table to a pandas DataFrame, optionally applying Arrow
     casting rules first.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
-    if opts.target_schema is not None:
-        table = cast_arrow_table(table, opts)
+    if opts.target_arrow_schema is not None:
+        table = cast_arrow_tabular(table, opts)
 
     return table.to_pandas()
 
@@ -166,7 +166,7 @@ def arrow_table_to_pandas_dataframe(
 @pandas_converter(pa.RecordBatchReader, PandasDataFrame)
 def record_batch_reader_to_pandas_dataframe(
     reader: pa.RecordBatchReader,
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> "pandas.DataFrame":
     """
     Convert a pyarrow.RecordBatchReader to a pandas DataFrame.
@@ -174,9 +174,9 @@ def record_batch_reader_to_pandas_dataframe(
     - If cast_options.target_schema is set, we first apply
       `cast_arrow_record_batch_reader` and then collect to a Table and pandas DF.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
-    if opts.target_schema is not None:
+    if opts.target_arrow_schema is not None:
         reader = cast_arrow_record_batch_reader(reader, opts)
 
     batches = list(reader)
@@ -196,13 +196,13 @@ def record_batch_reader_to_pandas_dataframe(
 @pandas_converter(PandasSeries, pa.Array)
 def pandas_series_to_arrow_array(
     series: "pandas.Series",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.Array:
     """
     Convert a pandas Series to a pyarrow.Array, optionally applying Arrow
     casting via ArrowCastOptions.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     array = pa.array(series, from_pandas=True)
     return cast_arrow_array(array, opts)
@@ -211,31 +211,31 @@ def pandas_series_to_arrow_array(
 @pandas_converter(PandasDataFrame, pa.Table)
 def pandas_dataframe_to_arrow_table(
     dataframe: "pandas.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.Table:
     """
     Convert a pandas DataFrame to a pyarrow.Table, optionally applying Arrow
     casting rules via ArrowCastOptions.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     table = pa.Table.from_pandas(dataframe, preserve_index=False)
-    return cast_arrow_table(table, opts)
+    return cast_arrow_tabular(table, opts)
 
 
 @pandas_converter(PandasDataFrame, pa.RecordBatchReader)
 def pandas_dataframe_to_record_batch_reader(
     dataframe: "pandas.DataFrame",
-    cast_options: Optional[ArrowCastOptions] = None,
+    cast_options: Optional[CastOptions] = None,
 ) -> pa.RecordBatchReader:
     """
     Convert a pandas DataFrame to a pyarrow.RecordBatchReader, optionally
     applying Arrow casting via ArrowCastOptions.
     """
-    opts = ArrowCastOptions.check_arg(cast_options)
+    opts = CastOptions.check_arg(cast_options)
 
     table = pa.Table.from_pandas(dataframe, preserve_index=False)
-    table = cast_arrow_table(table, opts)
+    table = cast_arrow_tabular(table, opts)
 
     batches = table.to_batches()
     return pa.RecordBatchReader.from_batches(table.schema, batches)

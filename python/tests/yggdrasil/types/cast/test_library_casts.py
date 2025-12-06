@@ -1,9 +1,9 @@
 import pytest
 import pyarrow as pa
 
-from yggdrasil.types.cast.arrow_cast import ArrowCastOptions
+from yggdrasil.types.cast.cast_options import CastOptions
 from yggdrasil.types.cast.pandas_cast import cast_pandas_dataframe, cast_pandas_series
-from yggdrasil.types.cast.polars_cast import cast_polars_dataframe, cast_polars_series
+from yggdrasil.types.cast.polars_cast import cast_polars_dataframe, cast_polars_array
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def test_cast_polars_series_to_int():
     polars = pytest.importorskip("polars")
 
     series = polars.Series("numbers", ["1", "2", "3"])
-    result = cast_polars_series(series, pa.int64())
+    result = cast_polars_array(series, pa.int64())
 
     assert result.dtype == polars.Int64
     assert result.to_list() == [1, 2, 3]
@@ -35,7 +35,7 @@ def test_cast_polars_series_avoids_arrow_roundtrip(monkeypatch):
     monkeypatch.setattr(polars.Series, "to_arrow", fail)
 
     series = polars.Series("numbers", ["1", "2", "3"])
-    result = cast_polars_series(series, pa.int64())
+    result = cast_polars_array(series, pa.int64())
 
     assert result.to_list() == [1, 2, 3]
 
@@ -46,7 +46,7 @@ def test_cast_polars_series_fills_non_nullable_defaults():
     series = polars.Series("numbers", [1, None])
     target = pa.field("numbers", pa.int64(), nullable=False)
 
-    result = cast_polars_series(series, target)
+    result = cast_polars_array(series, target)
 
     assert result.to_list() == [1, 0]
     assert result.dtype == polars.Int64
@@ -56,7 +56,7 @@ def test_cast_polars_dataframe_with_missing_column(sample_arrow_schema):
     polars = pytest.importorskip("polars")
 
     dataframe = polars.DataFrame({"A": ["10", "20"]})
-    options = ArrowCastOptions.__safe_init__(target_field=sample_arrow_schema)
+    options = CastOptions.safe_init(target_field=sample_arrow_schema)
 
     result = cast_polars_dataframe(dataframe, options)
     table = result.to_arrow()
@@ -74,7 +74,7 @@ def test_cast_polars_dataframe_uses_target_schema_option(sample_arrow_schema):
     polars = pytest.importorskip("polars")
 
     dataframe = polars.DataFrame({"a": ["1", "2"]})
-    options = ArrowCastOptions.__safe_init__(target_field=sample_arrow_schema)
+    options = CastOptions.safe_init(target_field=sample_arrow_schema)
 
     result = cast_polars_dataframe(dataframe, options)
     table = result.to_arrow()
@@ -96,7 +96,7 @@ def test_cast_polars_dataframe_avoids_arrow_roundtrip(monkeypatch, sample_arrow_
 
     dataframe = polars.DataFrame({"a": [1]})
     result = cast_polars_dataframe(
-        dataframe, ArrowCastOptions.__safe_init__(target_field=sample_arrow_schema)
+        dataframe, CastOptions.safe_init(target_field=sample_arrow_schema)
     )
 
     assert result.schema == polars.Schema([("a", polars.Int64), ("b", polars.Utf8)])
@@ -116,7 +116,7 @@ def test_cast_pandas_dataframe_to_schema(sample_arrow_schema):
     pandas = pytest.importorskip("pandas", reason="pandas is optional")
 
     dataframe = pandas.DataFrame({"a": ["1", "2"], "B": ["x", "y"]})
-    options = ArrowCastOptions.__safe_init__(target_field=sample_arrow_schema)
+    options = CastOptions.safe_init(target_field=sample_arrow_schema)
 
     result = cast_pandas_dataframe(dataframe, options)
     casted_table = pa.Table.from_pandas(result, schema=sample_arrow_schema, preserve_index=False)
@@ -130,7 +130,7 @@ def test_cast_pandas_dataframe_uses_target_schema_option(sample_arrow_schema):
     pandas = pytest.importorskip("pandas", reason="pandas is optional")
 
     dataframe = pandas.DataFrame({"a": ["1", "2"]})
-    options = ArrowCastOptions.__safe_init__(target_field=sample_arrow_schema)
+    options = CastOptions.safe_init(target_field=sample_arrow_schema)
 
     result = cast_pandas_dataframe(dataframe, options)
     casted_table = pa.Table.from_pandas(result, schema=sample_arrow_schema, preserve_index=False)
@@ -158,7 +158,7 @@ def test_cast_polars_series_non_nullable_nested_list():
     series = polars.Series("nested", [[1, 2], None])
     target = pa.field("nested", pa.list_(pa.int64()), nullable=False)
 
-    result = cast_polars_series(series, target)
+    result = cast_polars_array(series, target)
 
     assert result.dtype == polars.List(polars.Int64)
     assert result.to_list() == [[1, 2], []]
@@ -183,7 +183,7 @@ def test_cast_polars_dataframe_struct_field():
         ]
     )
 
-    result = cast_polars_dataframe(dataframe, ArrowCastOptions.__safe_init__(target_field=schema))
+    result = cast_polars_dataframe(dataframe, CastOptions.safe_init(target_field=schema))
 
     assert result.schema == polars.Schema([("payload", polars.Struct({"x": polars.Int64, "y": polars.Utf8}))])
     assert result.select(polars.col("payload").struct.field("x")).to_series().to_list() == [1, 0]
