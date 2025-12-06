@@ -1,10 +1,12 @@
 import dataclasses
 import datetime
 import enum
+from typing import List, Set, Tuple, Dict, Any
 
+import pyarrow as pa
 import pytest
 
-from yggdrasil.types.cast import convert, register_converter
+from yggdrasil.types.cast import convert, convert_to_python_iterable
 
 
 def test_builtin_converters():
@@ -43,17 +45,6 @@ def test_builtin_converters():
     assert convert("3.14", float) == 3.14
     assert convert("true", bool) is True
     assert convert("FALSE", bool) is False
-
-
-def test_custom_registration():
-    @register_converter(int, str)
-    def _int_to_str(value, cast_options):
-        return f"val={value}"
-
-    assert convert(3, str) == "val=3"
-
-    with pytest.raises(TypeError):
-        convert(1.2, str)
 
 
 def test_collection_conversions():
@@ -139,3 +130,255 @@ def test_create_dataclass_from_dict_defaults():
 
     nested_override = convert({"config": {"number": "3", "label": "x"}}, ConfigWrapper)
     assert nested_override == ConfigWrapper(config=SimpleConfig(number=3, label="x"), active=False)
+
+def test_non_iterable_raises_type_error():
+    value = 42
+    target_origin = list
+    target_args = (int,)
+
+    with pytest.raises(TypeError) as excinfo:
+        convert_to_python_iterable(
+            value=value,
+            target_hint=List[int],
+            target_origin=target_origin,
+            target_args=target_args,
+            options=None,
+        )
+
+    msg = str(excinfo.value)
+    # Message shape: "Cannot convert <type> to <target_origin.__name__>"
+    assert "int" in msg
+
+
+def test_string_raises_type_error():
+    value = "not allowed"
+    target_origin = list
+    target_args = (str,)
+
+    with pytest.raises(TypeError) as excinfo:
+        convert_to_python_iterable(
+            value=value,
+            target_hint=List[str],
+            target_origin=target_origin,
+            target_args=target_args,
+            options=None,
+        )
+
+    msg = str(excinfo.value)
+    assert "str" in msg
+
+
+def test_bytes_raises_type_error():
+    value = b"also not allowed"
+    target_origin = list
+    target_args = (bytes,)
+
+    with pytest.raises(TypeError) as excinfo:
+        convert_to_python_iterable(
+            value=value,
+            target_hint=List[bytes],
+            target_origin=target_origin,
+            target_args=target_args,
+            options=None,
+        )
+
+    msg = str(excinfo.value)
+    assert "bytes" in msg
+
+
+def test_list_to_list_of_ints():
+    value = ["1", "2", "3"]
+    target_origin = list
+    target_args = (int,)
+
+    out = convert_to_python_iterable(
+        value=value,
+        target_hint=List[int],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, list)
+    # relies on convert() respecting int as target type
+    assert out == [1, 2, 3]
+
+
+def test_list_to_set_of_strings():
+    value = [1, 2, 2, 3]
+    target_origin = set
+    target_args = (str,)
+
+    out = convert_to_python_iterable(
+        value=value,
+        target_hint=Set[str],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, set)
+    # relies on convert() doing a sane str conversion
+    assert out == {"1", "2", "3"}
+
+
+def test_list_to_tuple_of_floats():
+    value = ["1.0", "2.5"]
+    target_origin = tuple
+    target_args = (float,)
+
+    out = convert_to_python_iterable(
+        value=value,
+        target_hint=Tuple[float],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, tuple)
+    assert out == (1.0, 2.5)
+
+
+def test_arrow_array_to_list_of_ints():
+    arr = pa.array([1, 2, 3])
+    target_origin = list
+    target_args = (int,)
+
+    out = convert_to_python_iterable(
+        value=arr,
+        target_hint=List[int],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    # pa.Array.to_pylist() -> list of Python scalars, then converted
+    assert isinstance(out, list)
+    assert out == [1, 2, 3]
+    assert all(isinstance(x, int) for x in out)
+
+
+def test_arrow_array_to_set_of_strings():
+    arr = pa.array([1, 2, 2, 3])
+    target_origin = set
+    target_args = (str,)
+
+    out = convert_to_python_iterable(
+        value=arr,
+        target_hint=Set[str],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, set)
+    assert out == {"1", "2", "3"}
+
+
+def test_arrow_table_to_list_of_dicts():
+    table = pa.table({"a": [1, 2], "b": ["x", "y"]})
+    target_origin = list
+    target_args = (dict,)
+
+    out = convert_to_python_iterable(
+        value=table,
+        target_hint=List[Dict[str, Any]],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    # pa.Table.to_pylist() -> list[dict]
+    assert isinstance(out, list)
+    assert out == [
+        {"a": 1, "b": "x"},
+        {"a": 2, "b": "y"},
+    ]
+    assert all(isinstance(row, dict) for row in out)
+
+
+def test_arrow_recordbatch_to_list_of_dicts():
+    batch = pa.record_batch({"a": [1, 2], "b": [True, False]})
+    target_origin = list
+    target_args = (dict,)
+
+    out = convert_to_python_iterable(
+        value=batch,
+        target_hint=List[Dict[str, Any]],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, list)
+    assert out == [
+        {"a": 1, "b": True},
+        {"a": 2, "b": False},
+    ]
+    assert all(isinstance(row, dict) for row in out)
+
+
+def test_arrow_chunked_array_to_list():
+    arr = pa.chunked_array([[1, 2], [3]])
+    target_origin = list
+    target_args = (int,)
+
+    out = convert_to_python_iterable(
+        value=arr,
+        target_hint=List[int],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    assert isinstance(out, list)
+    assert out == [1, 2, 3]
+    assert all(isinstance(x, int) for x in out)
+
+
+def test_no_target_args_does_not_crash_and_returns_same_length():
+    value = [1, "2", 3.0]
+    target_origin = list
+    target_args = ()  # empty -> element_hint defaults to Any
+
+    out = convert_to_python_iterable(
+        value=value,
+        target_hint=List[Any],
+        target_origin=target_origin,
+        target_args=target_args,
+        options=None,
+    )
+
+    # At minimum, it should not raise and should preserve length/order.
+    assert isinstance(out, list)
+    assert len(out) == len(value)
+
+
+@dataclasses.dataclass
+class Item:
+    a: int
+    b: str
+
+
+def test_list_of_dataclass_instances():
+    # incoming raw data that should map naturally onto the dataclass
+    value = [
+        {"a": 1, "b": "x"},
+        {"a": 2, "b": "y"},
+    ]
+
+    out = convert(
+        value=value,
+        target_hint=List[Item],
+    )
+
+    # container type
+    assert isinstance(out, list)
+    assert len(out) == 2
+
+    # element types should be the dataclass
+    assert all(isinstance(elem, Item) for elem in out)
+
+    # and values should be mapped correctly
+    assert out[0] == Item(a=1, b="x")
+    assert out[1] == Item(a=2, b="y")

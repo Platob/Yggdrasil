@@ -21,10 +21,14 @@ from typing import (
 
 import pyarrow as pa
 
-if TYPE_CHECKING:
-    from .arrow_cast import CastOptions
 
-__all__ = ["register_converter", "convert"]
+if TYPE_CHECKING:
+    from .cast_options import CastOptions
+
+__all__ = [
+    "register_converter", "convert",
+    "convert_to_python_iterable"
+]
 
 
 Converter = Callable[[Any, "ArrowCastOptions | dict | None"], Any]
@@ -216,8 +220,8 @@ def convert(
             return None if is_optional else default_scalar(target_hint)
 
     options = CastOptions.check_arg(target_field=options, kwargs=kwargs)
-    origin = get_origin(target_hint) or target_hint
-    args = get_args(target_hint)
+    target_origin = get_origin(target_hint) or target_hint
+    target_args = get_args(target_hint)
     source_hint = type(value)
 
     if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
@@ -235,109 +239,44 @@ def convert(
         return converter(value, options)
 
     if isinstance(target_hint, type) and issubclass(target_hint, enum.Enum):
-        if isinstance(value, target_hint):
-            return value
-
-        if isinstance(value, str):
-            vcsfld = value.casefold()
-
-            for member in target_hint:
-                if member.name.casefold() == vcsfld:
-                    return member
-                if str(member.value).casefold() == vcsfld:
-                    return member
-
-        try:
-            first_member = next(iter(target_hint))
-        except StopIteration:
-            raise TypeError(f"Cannot convert to empty Enum {target_hint.__name__}")
-
-        try:
-            converted_value = convert(
-                value,
-                type(first_member.value),
-                options=options,
-            )
-        except Exception:
-            converted_value = value
-
-        for member in target_hint:
-            if member.value == converted_value:
-                return member
-
-        raise TypeError(f"No matching Enum member for {value!r} in {target_hint.__name__}")
+        return convert_to_python_enum(value, target_hint, options=options)
 
     if isinstance(target_hint, type) and _dataclasses.is_dataclass(target_hint):
-        if isinstance(value, target_hint):
-            return value
+        return convert_to_python_dataclass(value, target_hint, options=options)
 
-        if not isinstance(value, Mapping):
-            raise TypeError(f"Cannot convert {type(value)} to dataclass {target_hint.__name__}")
+    if target_origin in {list, set}:
+        return convert_to_python_iterable(value, target_hint, target_origin, target_args, options)
 
-        hints = get_type_hints(target_hint)
-        kwargs = {}
-        for field in _dataclasses.fields(target_hint):
-            if not field.init or field.name.startswith("_"):
-                continue
-
-            if field.name in value:
-                field_value = convert(
-                    value[field.name],
-                    hints.get(field.name, Any),
-                    options=options,
-                )
-            elif field.default is not _dataclasses.MISSING:
-                field_value = field.default
-            elif field.default_factory is not _dataclasses.MISSING:  # type: ignore[attr-defined]
-                field_value = field.default_factory()  # type: ignore[misc]
-            else:
-                field_value = default_scalar(field.type)
-
-            kwargs[field.name] = field_value
-
-        return target_hint(**kwargs)
-
-    if origin in {list, set}:
-        if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
-            raise TypeError(f"Cannot convert {type(value)} to {origin.__name__}")
-
-        element_hint = args[0] if args else Any
-        converted = [
-            convert(item, element_hint, options=options)
-            for item in value
-        ]
-        return origin(converted)
-
-    if origin is tuple:
+    if target_origin is tuple:
         if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
             raise TypeError("Cannot convert non-iterable to tuple")
 
         values = tuple(value)
-        if len(args) == 2 and args[1] is Ellipsis:
-            element_hint = args[0]
+        if len(target_args) == 2 and target_args[1] is Ellipsis:
+            element_hint = target_args[0]
             return tuple(
                 convert(item, element_hint, options=options)
                 for item in values
             )
 
-        if args and len(args) != len(values):
+        if target_args and len(target_args) != len(values):
             raise TypeError("Tuple length does not match target annotation")
 
         return tuple(
             convert(
                 item,
-                target_hint=args[idx] if args else Any,
+                target_hint=target_args[idx] if target_args else Any,
                 options=options,
             )
             for idx, item in enumerate(values)
         )
 
-    if origin in {dict, Mapping}:
+    if target_origin in {dict, Mapping}:
         if not isinstance(value, Mapping):
             raise TypeError("Cannot convert non-mapping to dict")
 
-        key_hint, value_hint = (args + (Any, Any))[:2]
-        mapping_ctor = dict if origin is Mapping else origin
+        key_hint, value_hint = (target_args + (Any, Any))[:2]
+        mapping_ctor = dict if target_origin is Mapping else target_origin
         return mapping_ctor(
             (
                 convert(key, key_hint, options=options),
@@ -350,6 +289,112 @@ def convert(
         return value
 
     raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
+
+
+def convert_to_python_enum(
+    value: Any,
+    target_hint: type,
+    options: Optional[CastOptions] = None,
+):
+    if isinstance(value, target_hint):
+        return value
+
+    if isinstance(value, str):
+        vcsfld = value.casefold()
+
+        for member in target_hint:
+            if member.name.casefold() == vcsfld:
+                return member
+            if str(member.value).casefold() == vcsfld:
+                return member
+
+    try:
+        first_member = next(iter(target_hint))
+    except StopIteration:
+        raise TypeError(f"Cannot convert to empty Enum {target_hint.__name__}")
+
+    try:
+        converted_value = convert(
+            value,
+            type(first_member.value),
+            options=options,
+        )
+    except Exception:
+        converted_value = value
+
+    for member in target_hint:
+        if member.value == converted_value:
+            return member
+
+    raise TypeError(f"No matching Enum member for {value!r} in {target_hint.__name__}")
+
+
+def convert_to_python_dataclass(
+    value: Any,
+    target_hint: type,
+    options: Optional[CastOptions] = None,
+):
+    from yggdrasil.types.python_defaults import default_scalar
+
+    if isinstance(value, target_hint):
+        return value
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"Cannot convert {type(value)} to dataclass {target_hint.__name__}")
+
+    hints = get_type_hints(target_hint)
+    kwargs = {}
+    for field in _dataclasses.fields(target_hint):
+        if not field.init or field.name.startswith("_"):
+            continue
+
+        if field.name in value:
+            field_value = convert(
+                value[field.name],
+                hints.get(field.name, Any),
+                options=options,
+            )
+        elif field.default is not _dataclasses.MISSING:
+            field_value = field.default
+        elif field.default_factory is not _dataclasses.MISSING:  # type: ignore[attr-defined]
+            field_value = field.default_factory()  # type: ignore[misc]
+        else:
+            field_value = default_scalar(field.type)
+
+        kwargs[field.name] = field_value
+
+    return target_hint(**kwargs)
+
+
+def convert_to_python_iterable(
+    value: Union[
+        Iterable, list, set,
+        pa.Table, pa.RecordBatch, pa.Array,
+    ],
+    target_hint: type,
+    target_origin,
+    target_args,
+    options: Optional[CastOptions] = None,
+):
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
+
+    element_hint = target_args[0] if target_args else Any
+
+    if isinstance(value, (pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch)):
+        from .. import arrow_field_from_hint
+
+        casted = convert(value, arrow_field_from_hint(element_hint), options=options)
+        value = casted.to_pylist()
+
+    converted = [
+        convert(item, element_hint, options=options)
+        for item in value
+    ]
+
+    built = target_origin(converted)
+
+    return built
 
 
 @register_converter(str, int)

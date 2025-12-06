@@ -3,11 +3,11 @@ from typing import Optional
 import pyarrow as pa
 
 from .arrow_cast import (
-    CastOptions,
     cast_arrow_array,
     cast_arrow_tabular,
     cast_arrow_record_batch_reader,
 )
+from .cast_options import CastOptions
 from .registry import register_converter
 from ...libs.pandaslib import pandas, require_pandas
 

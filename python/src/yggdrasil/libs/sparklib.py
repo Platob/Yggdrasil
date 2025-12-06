@@ -60,6 +60,22 @@ except ImportError:  # pragma: no cover - Spark not available
 SPARK_TO_ARROW = {v: k for k, v in ARROW_TO_SPARK.items()}
 
 
+__all__ = [
+    "pyspark",
+    "require_pyspark",
+    "SparkSession",
+    "SparkDataFrame",
+    "SparkColumn",
+    "SparkDataType",
+    "ARROW_TO_SPARK",
+    "SPARK_TO_ARROW",
+    "arrow_type_to_spark_type",
+    "arrow_field_to_spark_field",
+    "spark_type_to_arrow_type",
+    "spark_field_to_arrow_field",
+]
+
+
 def require_pyspark(active_session: bool = False):
     """
     Optionally enforce that pyspark (and an active SparkSession) exists.
@@ -266,19 +282,3 @@ def spark_field_to_arrow_field(
         type=arrow_type,
         nullable=field.nullable,
     )
-
-
-__all__ = [
-    "pyspark",
-    "require_pyspark",
-    "SparkSession",
-    "SparkDataFrame",
-    "SparkColumn",
-    "SparkDataType",
-    "ARROW_TO_SPARK",
-    "SPARK_TO_ARROW",
-    "arrow_type_to_spark_type",
-    "arrow_field_to_spark_field",
-    "spark_type_to_arrow_type",
-    "spark_field_to_arrow_field",
-]
