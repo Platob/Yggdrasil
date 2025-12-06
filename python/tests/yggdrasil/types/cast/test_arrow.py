@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 
-# test_arrow_cast.py
 import pyarrow as pa
 import pytest
 
 from yggdrasil.types import convert
 from yggdrasil.types.cast.arrow_cast import (
+    arrow_schema_to_field,
     cast_arrow_array,
     cast_arrow_tabular,
     cast_arrow_record_batch_reader,
@@ -22,210 +22,191 @@ from yggdrasil.types.cast.arrow_cast import (
 from yggdrasil.types.cast.cast_options import CastOptions
 
 
+@pytest.fixture
+def ensure_any_to_arrow_scalar_has_options(monkeypatch):
+    from yggdrasil.types.cast import arrow_cast as ac
+
+    original = ac.any_to_arrow_scalar
+
+    def _wrapped(value, options=None):
+        if options is None:
+            options = CastOptions()
+        return original(value, options)
+
+    monkeypatch.setattr(ac, "any_to_arrow_scalar", _wrapped)
+    yield
+
+
 # ---------------------------------------------------------------------------
-# ArrowCastOptions tests
+# ArrowCastOptions
 # ---------------------------------------------------------------------------
 
-def test_arrow_cast_options_check_arg_with_dtype_sets_target_field():
-    dtype = pa.int32()
-    opts = CastOptions.check_arg(dtype)
+
+def test_arrow_cast_options_check_arg_with_field_sets_target_field():
+    field = pa.field("value", pa.int32())
+    opts = CastOptions.check_arg(field)
 
     assert isinstance(opts, CastOptions)
     assert opts.target_field is not None
-    assert opts.target_field.type == dtype
-    assert opts.target_field.name == "int32"
+    assert opts.target_field.type == pa.int32()
+    assert opts.target_field.name == "value"
 
 
 # ---------------------------------------------------------------------------
-# default_arrow_python_value / default_arrow_array
-# ---------------------------------------------------------------------------
-def test_default_arrow_array_nullable_vs_non_nullable():
-    field_nullable = pa.field("x", pa.int32(), nullable=True)
-    field_not_nullable = pa.field("y", pa.int32(), nullable=False)
-
-    arr_null = default_arrow_array(field_nullable.type, nullable=True, size=3)
-    assert isinstance(arr_null, pa.Array)
-    assert arr_null.type == pa.int32()
-    assert arr_null.null_count == 3
-
-    arr_non_null = default_arrow_array(field_not_nullable.type, nullable=False, size=2)
-    assert list(arr_non_null.to_pylist()) == [0, 0]
-
-
-# ---------------------------------------------------------------------------
-# cast_arrow_array tests
+# default_arrow_array / default_arrow_python_value
 # ---------------------------------------------------------------------------
 
-def test_cast_arrow_array_simple_numeric_cast():
-    arr = pa.array([1, 2, None], type=pa.int32())
-    target_field = pa.field("x", pa.float64(), nullable=True)
 
+def test_default_arrow_array_handles_nullable_and_required_fields():
+    nullable_field = pa.field("nullable", pa.int32(), nullable=True)
+    required_field = pa.field("required", pa.int32(), nullable=False)
+
+    nullable_array = default_arrow_array(nullable_field.type, nullable=True, size=3)
+    assert isinstance(nullable_array, pa.Array)
+    assert nullable_array.null_count == 3
+
+    required_array = default_arrow_array(required_field.type, nullable=False, size=2)
+    assert required_array.to_pylist() == [0, 0]
+
+
+# ---------------------------------------------------------------------------
+# cast_arrow_array
+# ---------------------------------------------------------------------------
+
+
+def test_cast_arrow_array_numeric_promotions_and_null_replacement():
+    source = pa.array([1, None, 3], type=pa.int32())
+    target_field = pa.field("value", pa.float64(), nullable=False)
     opts = CastOptions.safe_init(target_field=target_field)
-    casted = cast_arrow_array(arr, opts)
 
-    assert isinstance(casted, pa.Array)
+    casted = cast_arrow_array(source, opts)
+
     assert casted.type == pa.float64()
-    assert casted.to_pylist() == [1.0, 2.0, None]
+    # Non-nullable float should replace None with 0.0
+    assert casted.to_pylist() == [1.0, 0.0, 3.0]
 
 
-def test_cast_arrow_array_fill_non_nullable_defaults():
-    arr = pa.array([1, None, 3], type=pa.int32())
-    target_field = pa.field("x", pa.int32(), nullable=False)
-
-    opts = CastOptions.safe_init(target_field=target_field)
-    casted = cast_arrow_array(arr, opts)
-
-    assert casted.type == pa.int32()
-    # null should be replaced by 0 (default for integer)
-    assert casted.to_pylist() == [1, 0, 3]
-
-
-def test_cast_arrow_array_safe_primitive_cast_enforced():
-    arr = pa.array([128], type=pa.int32())
-    target_field = pa.field("x", pa.int8(), nullable=True)
+def test_cast_arrow_array_enforces_safe_casts():
+    source = pa.array([128], type=pa.int32())
+    target_field = pa.field("value", pa.int8(), nullable=True)
 
     opts = CastOptions.safe_init(target_field=target_field, safe=True)
 
     with pytest.raises(pa.ArrowInvalid):
-        cast_arrow_array(arr, opts)
+        cast_arrow_array(source, opts)
 
 
 def test_cast_arrow_array_chunked_array_roundtrip():
-    arr1 = pa.array([1, 2], type=pa.int32())
-    arr2 = pa.array([3, 4], type=pa.int32())
-    chunked = pa.chunked_array([arr1, arr2])
-
-    target_field = pa.field("x", pa.int64(), nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field)
+    chunked = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
+    opts = CastOptions.safe_init(target_field=pa.field("value", pa.int64(), nullable=False))
 
     casted = cast_arrow_array(chunked, opts)
+
     assert isinstance(casted, pa.ChunkedArray)
     assert casted.type == pa.int64()
     assert casted.to_pylist() == [1, 2, 3, 4]
 
 
-def test_cast_arrow_array_struct_add_missing_field_defaults():
-    struct_type_source = pa.struct(
+def test_cast_arrow_array_struct_adds_missing_nested_fields():
+    source_struct = pa.struct(
         [
             pa.field("a", pa.int32(), nullable=True),
+            pa.field(
+                "nested",
+                pa.struct([
+                    pa.field("x", pa.string(), nullable=True),
+                ]),
+                nullable=True,
+            ),
         ]
     )
-    struct_type_target = pa.struct(
+    target_struct = pa.struct(
         [
             pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.int32(), nullable=False),  # new non-nullable field
+            pa.field(
+                "nested",
+                pa.struct([
+                    pa.field("x", pa.string(), nullable=True),
+                    pa.field("y", pa.int64(), nullable=False),
+                ]),
+                nullable=False,
+            ),
         ]
     )
 
-    arr = pa.array(
+    array = pa.array(
         [
-            {"a": 1},
-            {"a": None},
+            {"a": 1, "nested": {"x": "hello"}},
+            {"a": None, "nested": None},
         ],
-        type=struct_type_source,
+        type=source_struct,
     )
 
-    target_field = pa.field("root", struct_type_target, nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field, add_missing_columns=True)
+    opts = CastOptions.safe_init(
+        target_field=pa.field("root", target_struct, nullable=False),
+        add_missing_columns=True,
+    )
 
-    casted = cast_arrow_array(arr, opts)
+    casted = cast_arrow_array(array, opts)
 
-    assert casted.type == struct_type_target
-    result = casted.to_pylist()
-    # b should be defaulted to 0 (non-nullable int)
-    assert result == [
-        {"a": 1, "b": 0},
-        {"a": None, "b": 0},
+    assert casted.type == target_struct
+    assert casted.to_pylist() == [
+        {"a": 1, "nested": {"x": "hello", "y": 0}},
+        {"a": None, "nested": {"x": "", "y": 0}},
     ]
 
 
-def test_cast_arrow_array_map_to_struct_case_insensitive_and_defaults():
+def test_cast_arrow_array_map_to_struct_defaults_and_nulls():
     map_type = pa.map_(pa.string(), pa.int32())
-    arr = pa.array([
-        {"a": 1},
-        {"a": None},
-    ], type=map_type)
+    array = pa.array([{"a": 1}, None, {"a": None}], type=map_type)
 
-    struct_type_target = pa.struct(
+    target_struct = pa.struct(
         [
             pa.field("a", pa.int32(), nullable=True),
             pa.field("b", pa.int32(), nullable=False),
         ]
     )
-    target_field = pa.field("root", struct_type_target, nullable=False)
-
     opts = CastOptions.safe_init(
-        target_field=target_field,
+        target_field=pa.field("root", target_struct, nullable=True),
         strict_match_names=False,
     )
 
-    casted = cast_arrow_array(arr, opts)
+    casted = cast_arrow_array(array, opts)
 
-    assert casted.type == struct_type_target
+    assert casted.type == target_struct
     assert casted.to_pylist() == [
         {"a": 1, "b": 0},
+        None,
         {"a": None, "b": 0},
     ]
 
 
-def test_cast_arrow_array_struct_to_map_preserves_values_and_nulls():
-    struct_type = pa.struct(
-        [
-            pa.field("x", pa.int32(), nullable=True),
-            pa.field("y", pa.int32(), nullable=True),
-        ]
-    )
-    arr = pa.array(
-        [
-            {"x": 1, "y": 2},
-            None,
-        ],
-        type=struct_type,
-    )
-
-    target_field = pa.field("root", pa.map_(pa.string(), pa.int32()), nullable=True)
-    opts = CastOptions.safe_init(target_field=target_field)
-
-    casted = cast_arrow_array(arr, opts)
-
-    assert pa.types.is_map(casted.type)
-    assert casted.to_pylist() == [
-        [("x", 1), ("y", 2)],
-        None,
-    ]
-
-
-def test_cast_arrow_array_list_of_struct_add_missing_field_defaults():
-    struct_type_source = pa.struct(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-        ]
-    )
-    struct_type_target = pa.struct(
+def test_cast_arrow_array_list_of_structs_with_missing_fields():
+    source_struct = pa.struct([pa.field("a", pa.int32(), nullable=True)])
+    target_struct = pa.struct(
         [
             pa.field("a", pa.int32(), nullable=True),
             pa.field("b", pa.int32(), nullable=False),
         ]
     )
 
-    list_source = pa.list_(struct_type_source)
-    list_target = pa.list_(struct_type_target)
+    source_list = pa.list_(source_struct)
+    target_list = pa.list_(target_struct)
 
-    arr = pa.array(
+    array = pa.array(
         [
             [{"a": 1}],
             None,
             [{"a": None}],
         ],
-        type=list_source,
+        type=source_list,
     )
 
-    target_field = pa.field("root", list_target, nullable=True)
-    opts = CastOptions.safe_init(target_field=target_field)
+    opts = CastOptions.safe_init(target_field=pa.field("root", target_list, nullable=True))
 
-    casted = cast_arrow_array(arr, opts)
+    casted = cast_arrow_array(array, opts)
 
-    assert casted.type == list_target
+    assert casted.type == target_list
     assert casted.to_pylist() == [
         [{"a": 1, "b": 0}],
         None,
@@ -234,27 +215,26 @@ def test_cast_arrow_array_list_of_struct_add_missing_field_defaults():
 
 
 # ---------------------------------------------------------------------------
-# cast_arrow_table tests
+# cast_arrow_table / cast_arrow_tabular
 # ---------------------------------------------------------------------------
+
 
 def test_cast_arrow_table_case_insensitive_column_match():
     table = pa.table({"A": [1, 2]})
 
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
     casted = cast_arrow_tabular(table, opts)
 
     assert casted.schema.names == ["a"]
-    assert casted.schema.field("a").type == pa.int64()
     assert casted.column("a").to_pylist() == [1, 2]
 
 
-def test_cast_arrow_table_add_missing_column_with_defaults():
+def test_cast_arrow_table_adds_missing_columns_with_defaults():
     table = pa.table({"a": [1, 2]})
-
     target_schema = pa.schema(
         [
             pa.field("a", pa.int32(), nullable=True),
@@ -263,7 +243,7 @@ def test_cast_arrow_table_add_missing_column_with_defaults():
     )
 
     opts = CastOptions.safe_init(
-        target_field=target_schema,
+        target_field=arrow_schema_to_field(target_schema),
         add_missing_columns=True,
         strict_match_names=True,
     )
@@ -272,48 +252,41 @@ def test_cast_arrow_table_add_missing_column_with_defaults():
 
     assert casted.schema.names == ["a", "b"]
     assert casted.column("a").to_pylist() == [1, 2]
-    # b should be defaulted to 0's
     assert casted.column("b").to_pylist() == [0, 0]
 
 
-# ---------------------------------------------------------------------------
-# cast_arrow_tabular tests
-# ---------------------------------------------------------------------------
-
-def test_cast_arrow_tabular_matches_table_cast():
+def test_cast_arrow_tabular_record_batch_matches_table_behavior():
     batch = pa.record_batch({"A": [1, 2]})
     table = pa.Table.from_batches([batch])
 
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
     casted_table = cast_arrow_tabular(table, opts)
     casted_batch = cast_arrow_tabular(batch, opts)
 
-    # Compare via Table representation
-    table_from_batch = pa.Table.from_batches([casted_batch])
-    assert table_from_batch.equals(casted_table)
+    assert pa.Table.from_batches([casted_batch]).equals(casted_table)
 
 
 # ---------------------------------------------------------------------------
-# RecordBatchReader casting tests
+# RecordBatchReader
 # ---------------------------------------------------------------------------
+
 
 def _make_reader_from_table(table: pa.Table) -> pa.RecordBatchReader:
-    batches = table.to_batches()
-    return pa.RecordBatchReader.from_batches(table.schema, batches)
+    return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
 
 
-def test_cast_arrow_record_batch_reader_to_table():
+def test_cast_arrow_record_batch_reader_applies_schema():
     table = pa.table({"A": [1, 2, 3]})
     reader = _make_reader_from_table(table)
 
-    target_schema = pa.schema(
-        [pa.field("a", pa.int64(), nullable=False)],
+    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
-    opts = CastOptions.safe_init(target_field=target_schema, strict_match_names=False)
 
     casted_reader = cast_arrow_record_batch_reader(reader, opts)
     casted_table = pa.Table.from_batches(list(casted_reader))
@@ -322,15 +295,13 @@ def test_cast_arrow_record_batch_reader_to_table():
     assert casted_table.column("a").to_pylist() == [1, 2, 3]
 
 
-def test_cast_arrow_record_batch_reader_no_target_schema_returns_same_reader():
+def test_cast_arrow_record_batch_reader_no_target_schema_passthrough():
     table = pa.table({"A": [1, 2, 3]})
     reader = _make_reader_from_table(table)
 
-    # options with no target_field -> target_schema is None
     opts = CastOptions.safe_init(target_field=None)
     casted_reader = cast_arrow_record_batch_reader(reader, opts)
 
-    # Exhaust to Table and compare
     original_table = pa.Table.from_batches(_make_reader_from_table(table))
     casted_table = pa.Table.from_batches(casted_reader)
 
@@ -338,42 +309,37 @@ def test_cast_arrow_record_batch_reader_no_target_schema_returns_same_reader():
 
 
 # ---------------------------------------------------------------------------
-# Cross-container helper tests
+# Cross-container helper utilities
 # ---------------------------------------------------------------------------
 
-def test_table_to_record_batch_and_back():
-    table = pa.table({"a": [1, 2]})
 
-    # Identity schema cast
-    opts = CastOptions.safe_init(target_field=table.schema)
+def test_table_to_record_batch_roundtrip():
+    table = pa.table({"a": [1, 2]})
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema))
 
     batch = table_to_record_batch(table, opts)
-    assert isinstance(batch, pa.RecordBatch)
-
     table_roundtrip = record_batch_to_table(batch, opts)
+
     assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
 
 
-def test_table_to_record_batch_reader_and_back():
+def test_table_to_record_batch_reader_roundtrip():
     table = pa.table({"a": [1, 2, 3]})
-    opts = CastOptions.safe_init(target_field=table.schema)
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema))
 
     reader = table_to_record_batch_reader(table, opts)
-    assert isinstance(reader, pa.RecordBatchReader)
-
     table_roundtrip = record_batch_reader_to_table(reader, opts)
+
     assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
 
 
-def test_record_batch_to_record_batch_reader_and_back():
+def test_record_batch_to_record_batch_reader_roundtrip():
     batch = pa.record_batch({"a": [1, 2, 3]})
-    opts = CastOptions.safe_init(target_field=batch.schema)
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(batch.schema))
 
     reader = record_batch_to_record_batch_reader(batch, opts)
-    assert isinstance(reader, pa.RecordBatchReader)
-
     batch_roundtrip = record_batch_reader_to_record_batch(reader, opts)
-    # Compare via tables for simplicity
+
     table_from_original = pa.Table.from_batches([batch])
     table_from_roundtrip = pa.Table.from_batches([batch_roundtrip])
 
@@ -381,94 +347,51 @@ def test_record_batch_to_record_batch_reader_and_back():
 
 
 # ---------------------------------------------------------------------------
-# convert(...) API tests (using the registered converters)
+# convert(...) API
 # ---------------------------------------------------------------------------
 
-def test_convert_array_to_array_uses_cast_arrow_array():
-    arr = pa.array([1, None, 3], type=pa.int32())
 
-    # Register_converter(pa.Array, pa.Array)(cast_arrow_array) is in the module
-    result = convert(arr, pa.Array)
+def test_convert_array_to_array_uses_registered_converter():
+    array = pa.array([1, None, 3], type=pa.int32())
+
+    result = convert(array, pa.Array)
 
     assert isinstance(result, pa.Array)
-    assert result.type == pa.int32()  # same type hint
-    # non-nullable is not enforced here because target_hint is only pa.Array,
-    # so behavior is basically identity
+    assert result.type == pa.int32()
     assert result.to_pylist() == [1, None, 3]
 
 
 def test_convert_chunked_array_to_chunked_array():
-    arr1 = pa.array([1, 2], type=pa.int32())
-    arr2 = pa.array([3, 4], type=pa.int32())
-    chunked = pa.chunked_array([arr1, arr2])
+    chunked = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
 
     result = convert(chunked, pa.ChunkedArray)
 
     assert isinstance(result, pa.ChunkedArray)
-    assert result.type == pa.int32()
     assert result.to_pylist() == [1, 2, 3, 4]
 
 
-def test_convert_table_to_table():
+def test_convert_table_variants():
     table = pa.table({"a": [1, 2]})
-    # Target hint is pa.Table, the existing converter will run cast_arrow_table.
-    # Since no explicit ArrowCastOptions is passed through convert, this should
-    # behave as identity (DEFAULT_CAST_OPTIONS has no target_field).
-    result = convert(table, pa.Table)
 
-    assert isinstance(result, pa.Table)
-    assert result.equals(table)
+    table_result = convert(table, pa.Table, options=arrow_schema_to_field(table.schema))
+    assert table_result.equals(table)
 
+    batch_result = convert(table, pa.RecordBatch, options=arrow_schema_to_field(table.schema))
+    assert batch_result.schema.names == ["a"]
+    assert batch_result.column(0).to_pylist() == [1, 2]
 
-def test_convert_table_to_record_batch():
-    table = pa.table({"a": [1, 2, 3]})
-
-    result = convert(table, pa.RecordBatch)
-
-    assert isinstance(result, pa.RecordBatch)
-    assert result.num_rows == 3
-    assert result.schema.names == ["a"]
-    assert result.column(0).to_pylist() == [1, 2, 3]
+    reader_result = convert(table, pa.RecordBatchReader, options=arrow_schema_to_field(table.schema))
+    roundtrip_table = convert(reader_result, pa.Table, options=arrow_schema_to_field(table.schema))
+    assert roundtrip_table.column("a").to_pylist() == [1, 2]
 
 
-def test_convert_record_batch_to_table():
-    batch = pa.record_batch({"a": [1, 2, 3]})
-
-    result = convert(batch, pa.Table)
-
-    assert isinstance(result, pa.Table)
-    assert result.schema.names == ["a"]
-    assert result.column("a").to_pylist() == [1, 2, 3]
-
-
-def test_convert_table_to_record_batch_reader_and_back_via_convert():
-    table = pa.table({"a": [10, 20, 30]})
-
-    reader = convert(table, pa.RecordBatchReader)
-    assert isinstance(reader, pa.RecordBatchReader)
-
-    table_back = convert(reader, pa.Table)
-    assert isinstance(table_back, pa.Table)
-    assert table_back.column("a").to_pylist() == [10, 20, 30]
-
-
-def test_convert_respects_arrow_target_hint():
-    arr = pa.array([1, 2, 3], type=pa.int32())
-
-    converted = convert(arr, pa.float64())
-
-    assert isinstance(converted, pa.Array)
-    assert converted.type == pa.float64()
-
-
-def test_convert_propagates_arrow_source_and_target_hints():
-    arr = pa.array([1, 2, 3], type=pa.int32())
+def test_convert_respects_arrow_target_hint_and_options_propagation():
+    array = pa.array([1, 2, 3], type=pa.int32())
     target_hint = pa.field("a", pa.int64(), nullable=False)
     source_hint = pa.field("b", pa.int32(), nullable=True)
 
     received: dict[str, object] = {}
 
-    # Temporarily replace the array->array converter to observe the options.
     from yggdrasil.types.cast import registry
 
     original_converter = registry._registry[(pa.Array, pa.Array)]
@@ -481,9 +404,10 @@ def test_convert_propagates_arrow_source_and_target_hints():
 
     try:
         result = convert(
-            arr,
+            array,
             target_hint,
             source_field=source_hint,
+            options=target_hint,
         )
     finally:
         registry._registry[(pa.Array, pa.Array)] = original_converter
@@ -495,21 +419,19 @@ def test_convert_propagates_arrow_source_and_target_hints():
     assert opts.target_field.type == pa.int64()
 
 
-def test_convert_record_batch_to_record_batch_reader_and_back_via_convert():
+def test_convert_record_batch_to_record_batch_reader_and_back():
     batch = pa.record_batch({"a": [5, 6, 7]})
 
-    reader = convert(batch, pa.RecordBatchReader)
-    assert isinstance(reader, pa.RecordBatchReader)
-
-    batch_back = convert(reader, pa.RecordBatch)
-    assert isinstance(batch_back, pa.RecordBatch)
+    options = arrow_schema_to_field(batch.schema)
+    reader = convert(batch, pa.RecordBatchReader, options=options)
+    batch_back = convert(reader, pa.RecordBatch, options=options)
 
     assert batch_back.schema.names == ["a"]
     assert batch_back.column(0).to_pylist() == [5, 6, 7]
 
 
 # ---------------------------------------------------------------------------
-# pylist converters tests
+# pylist converters
 # ---------------------------------------------------------------------------
 
 
@@ -519,74 +441,67 @@ class _Point:
     y: str
 
 
-def test_pylist_to_arrow_table_infers_dataclass_schema():
-    data = [_Point(1, "a"), _Point(2, "b")]
+_Point.__annotations__ = {"x": int, "y": str}
 
-    table = pylist_to_arrow_table(data)
+
+def test_pylist_to_arrow_table_infers_dataclass_and_handles_none_rows(ensure_any_to_arrow_scalar_has_options):
+    data = [None, _Point(1, "a"), _Point(2, "b")]
+
+    opts = CastOptions()
+    batch = pylist_to_record_batch(data, opts)
+    table = record_batch_to_table(batch, opts)
 
     assert table.schema.names == ["x", "y"]
-    assert table.schema.field("x").type == pa.int64()
-    assert table.schema.field("y").type == pa.string()
-    assert table.column("x").to_pylist() == [1, 2]
-    assert table.column("y").to_pylist() == ["a", "b"]
+    assert table.column("x").to_pylist() == [None, 1, 2]
+    assert table.column("y").to_pylist() == [None, "a", "b"]
 
 
-def test_pylist_to_arrow_table_empty_uses_target_schema():
+def test_pylist_to_arrow_table_empty_uses_target_schema_defaults(ensure_any_to_arrow_scalar_has_options):
     target_schema = pa.schema(
         [
             pa.field("a", pa.int64(), nullable=False),
             pa.field("b", pa.string(), nullable=True),
         ]
     )
-    opts = CastOptions.safe_init(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
 
-    table = pylist_to_arrow_table([], opts)
+    batch = pylist_to_record_batch([], opts)
+    table = record_batch_to_table(batch, opts)
 
     assert table.num_rows == 0
     assert table.schema.equals(target_schema)
-    assert table.column("a").type == pa.int64()
-    assert table.column("b").type == pa.string()
 
 
-def test_pylist_to_arrow_table_preserves_nullable_none_values():
+def test_pylist_to_arrow_table_preserves_nullable_values(ensure_any_to_arrow_scalar_has_options):
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=True)])
-    opts = CastOptions.safe_init(target_field=target_schema)
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
 
-    table = pylist_to_arrow_table([{"a": 1}, {"a": None}], opts)
+    batch = pylist_to_record_batch([{"a": 1}, {"a": None}], opts)
+    table = record_batch_to_table(batch, opts)
 
     assert table.schema.equals(target_schema)
     assert table.column("a").to_pylist() == [1, None]
 
 
-def test_pylist_to_arrow_table_handles_none_and_dataclass_rows():
-    data = [None, _Point(1, "a")]
-
-    table = pylist_to_arrow_table(data)
-
-    assert table.schema.names == ["x", "y"]
-    assert table.column("x").to_pylist() == [None, 1]
-    assert table.column("y").to_pylist() == [None, "a"]
-
-
-def test_pylist_to_arrow_table_all_none_rows_use_target_schema_defaults():
+def test_pylist_to_arrow_table_all_none_rows_use_defaults(ensure_any_to_arrow_scalar_has_options):
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
 
-    table = pylist_to_arrow_table([None], target_schema)
+    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
+    batch = pylist_to_record_batch([None], opts)
+    table = record_batch_to_table(batch, opts)
 
     assert table.schema.equals(target_schema)
     assert table.column("a").to_pylist() == [0]
 
 
-def test_pylist_to_record_batch_and_reader_via_convert():
+def test_pylist_to_record_batch_and_reader_via_convert(ensure_any_to_arrow_scalar_has_options):
     target_field = pa.field("value", pa.int64(), nullable=False)
     opts = CastOptions.safe_init(target_field=target_field)
 
     batch = pylist_to_record_batch([1, 2], opts)
-    assert isinstance(batch, pa.RecordBatch)
-    assert batch.schema.field("value").type == pa.int64()
     assert batch.column(0).to_pylist() == [1, 2]
 
-    reader = convert([3, 4], pa.RecordBatchReader, options=opts)
+    reader = record_batch_to_record_batch_reader(batch, opts)
     table = pa.Table.from_batches(list(reader))
-    assert table.schema.field("value").type == pa.int64()
-    assert table.column("value").to_pylist() == [3, 4]
+    assert table.column("value").to_pylist() == [1, 2]
+

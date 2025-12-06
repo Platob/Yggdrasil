@@ -140,9 +140,12 @@ class CastOptions:
         if isinstance(target_field, CastOptions):
             result = target_field
         else:
-            target_field = target_field if isinstance(target_field, pa.Field) else convert(target_field, pa.Field)
+            if target_field is None:
+                result = CastOptions()
+            else:
+                target_field = target_field if isinstance(target_field, pa.Field) else convert(target_field, pa.Field)
 
-            result = CastOptions(target_field=target_field)
+                result = CastOptions(target_field=target_field)
 
         if options:
             result = result.copy(**options)
