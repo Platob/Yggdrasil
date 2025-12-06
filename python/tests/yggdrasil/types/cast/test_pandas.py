@@ -1,169 +1,131 @@
-# tests/types/test_pandas_cast.py
-import math
-
 import pytest
 
 pa = pytest.importorskip("pyarrow")
 pandas = pytest.importorskip("pandas")
 
-from yggdrasil.types.cast.registry import convert
-from yggdrasil.types.cast.pandas_cast import (
-    cast_pandas_series,
-    cast_pandas_dataframe,
-    arrow_array_to_pandas_series,
-    arrow_table_to_pandas_dataframe,
-    record_batch_reader_to_pandas_dataframe,
-    pandas_series_to_arrow_array,
-    pandas_dataframe_to_arrow_table,
-    pandas_dataframe_to_record_batch_reader,
-)
+from yggdrasil.types.cast.arrow_cast import CastOptions, arrow_schema_to_field
+from yggdrasil.types.cast.pandas_cast import cast_pandas_dataframe, cast_pandas_series
 
 
-def test_cast_pandas_series_via_function_identity_int():
-    s = pandas.Series([1, 2, 3], name="col")
-    out = cast_pandas_series(s, options=None)
+# ---------------------------------------------------------------------------
+# Series casting tests
+# ---------------------------------------------------------------------------
 
-    assert isinstance(out, pandas.Series)
-    assert out.name == s.name
-    assert out.index.equals(s.index)
-    assert out.tolist() == [1, 2, 3]
+def test_cast_pandas_series_struct_child_defaults_and_missing_added():
+    series = pandas.Series([{"value": 1}, {"value": None}], name="payload")
 
-
-def test_cast_pandas_dataframe_via_function_identity_basic():
-    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
-    out = cast_pandas_dataframe(df, options=None)
-
-    assert isinstance(out, pandas.DataFrame)
-    # same columns and values, index preserved
-    pandas.testing.assert_frame_equal(out, df)
-
-
-def test_convert_pandas_series_to_pandas_series_registered():
-    s = pandas.Series([10, 20, 30], name="n")
-
-    out = convert(s, pandas.Series)
-
-    assert isinstance(out, pandas.Series)
-    assert out.tolist() == [10, 20, 30]
-    assert out.name == s.name
-    assert out.index.equals(s.index)
-
-
-def test_convert_pandas_series_to_arrow_array_registered():
-    s = pandas.Series([1, 2, None], name="n")
-
-    arr = convert(s, pa.Array)
-
-    assert isinstance(arr, pa.Array)
-    assert arr.to_pylist() == [1, 2, None]
-
-
-def test_convert_arrow_array_to_pandas_series_registered():
-    arr = pa.array([1, 2, 3])
-
-    s = convert(arr, pandas.Series)
-
-    assert isinstance(s, pandas.Series)
-    assert s.tolist() == [1, 2, 3]
-
-
-def test_convert_pandas_dataframe_to_arrow_table_registered():
-    df = pandas.DataFrame({"a": [1, 2], "b": ["u", "v"]})
-
-    table = convert(df, pa.Table)
-
-    assert isinstance(table, pa.Table)
-    assert table.column("a").to_pylist() == [1, 2]
-    assert table.column("b").to_pylist() == ["u", "v"]
-
-
-def test_convert_arrow_table_to_pandas_dataframe_registered():
-    df = pandas.DataFrame({"a": [1, 2], "b": ["u", "v"]})
-    table = pa.Table.from_pandas(df, preserve_index=False)
-
-    out = convert(table, pandas.DataFrame)
-
-    assert isinstance(out, pandas.DataFrame)
-    # Arrow may tweak dtypes but values/columns should match
-    pandas.testing.assert_frame_equal(out.reset_index(drop=True),
-                                      df.reset_index(drop=True))
-
-
-def test_convert_pandas_dataframe_to_record_batch_reader_registered():
-    df = pandas.DataFrame({"x": [1, 2, 3]})
-
-    reader = convert(df, pa.RecordBatchReader)
-
-    assert isinstance(reader, pa.RecordBatchReader)
-
-    # Re-materialize and compare roundtrip
-    batches = list(reader)
-    table = pa.Table.from_batches(batches)
-    df_roundtrip = table.to_pandas()
-
-    pandas.testing.assert_frame_equal(
-        df_roundtrip.reset_index(drop=True),
-        df.reset_index(drop=True),
+    target_field = pa.field(
+        "payload",
+        pa.struct(
+            [
+                pa.field("value", pa.int64(), nullable=False),
+                pa.field("label", pa.string(), nullable=False),
+            ]
+        ),
+        nullable=True,
     )
 
+    opts = CastOptions.safe_init(target_field=target_field, add_missing_columns=True)
+    casted = cast_pandas_series(series, opts)
 
-def test_convert_record_batch_reader_to_pandas_dataframe_registered():
-    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+    assert isinstance(casted, pandas.Series)
+    assert casted.name == series.name
+    assert casted.tolist() == [
+        {"value": 1, "label": ""},
+        {"value": 0, "label": ""},
+    ]
 
-    out = convert(reader, pandas.DataFrame)
 
-    assert isinstance(out, pandas.DataFrame)
-    pandas.testing.assert_frame_equal(
-        out.reset_index(drop=True),
-        df.reset_index(drop=True),
+def test_cast_pandas_series_list_of_structs_preserves_null_lists():
+    series = pandas.Series([[{"count": 1}], [{"count": None}], None], name="items")
+
+    target_field = pa.field(
+        "items",
+        pa.list_(
+            pa.field(
+                "item",
+                pa.struct([pa.field("count", pa.int64(), nullable=False)]),
+                nullable=True,
+            )
+        ),
+        nullable=True,
     )
 
+    casted = cast_pandas_series(series, CastOptions.safe_init(target_field=target_field))
+
+    assert isinstance(casted, pandas.Series)
+    assert casted.tolist() == [
+        [{"count": 1}],
+        [{"count": 0}],
+        None,
+    ]
 
 
-def test_arrow_array_to_pandas_series_direct_helper():
-    arr = pa.array([1.5, 2.5, None])
+# ---------------------------------------------------------------------------
+# DataFrame casting tests
+# ---------------------------------------------------------------------------
 
-    s = arrow_array_to_pandas_series(arr, cast_options=None)
-
-    assert isinstance(s, pandas.Series)
-    assert len(s) == 3
-    assert s.iloc[0] == 1.5
-    assert s.iloc[1] == 2.5
-    assert math.isnan(s.iloc[2])
-
-
-def test_arrow_table_to_pandas_dataframe_direct_helper():
-    df = pandas.DataFrame({"a": [1, 2], "b": ["x", "y"]})
-    table = pa.Table.from_pandas(df, preserve_index=False)
-
-    out = arrow_table_to_pandas_dataframe(table, cast_options=None)
-
-    assert isinstance(out, pandas.DataFrame)
-    pandas.testing.assert_frame_equal(
-        out.reset_index(drop=True),
-        df.reset_index(drop=True),
+def test_cast_pandas_dataframe_nested_schema_and_defaults():
+    df = pandas.DataFrame(
+        {
+            "Meta": [{"id": 1}, {"id": 2}],
+            "payload": [{"score": "7"}, {"score": None}],
+            "extra": [True, False],
+        }
     )
 
-
-def test_record_batch_reader_to_pandas_dataframe_direct_helper():
-    df = pandas.DataFrame({"a": [1, 2, 3]})
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
-
-    out = record_batch_reader_to_pandas_dataframe(reader, cast_options=None)
-
-    assert isinstance(out, pandas.DataFrame)
-    pandas.testing.assert_frame_equal(
-        out.reset_index(drop=True),
-        df.reset_index(drop=True),
+    target_schema = pa.schema(
+        [
+            pa.field(
+                "meta",
+                pa.struct(
+                    [
+                        pa.field("id", pa.int64(), nullable=False),
+                        pa.field("tag", pa.string(), nullable=False),
+                    ]
+                ),
+                nullable=False,
+            ),
+            pa.field(
+                "payload",
+                pa.struct([pa.field("score", pa.int64(), nullable=False)]),
+                nullable=False,
+            ),
+            pa.field("extra", pa.bool_(), nullable=True),
+        ]
     )
 
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(target_schema),
+        add_missing_columns=True,
+        allow_add_columns=False,
+        strict_match_names=False,
+    )
 
-def test_implicit_casts():
-    df = pandas.DataFrame({"a": [1, 2, 3]})
+    casted = cast_pandas_dataframe(df, opts)
 
-    field = convert(df, pa.Field)
+    assert list(casted.columns) == ["meta", "payload", "extra"]
+    assert casted["meta"].tolist() == [
+        {"id": 1, "tag": ""},
+        {"id": 2, "tag": ""},
+    ]
+    assert casted["payload"].tolist() == [
+        {"score": 7},
+        {"score": 0},
+    ]
+    assert casted["extra"].tolist() == [True, False]
 
-    assert field
+
+def test_cast_pandas_dataframe_preserves_extras_when_allowed():
+    df = pandas.DataFrame({"a": [1], "keep": [9]})
+
+    opts = CastOptions.safe_init(
+        target_field=arrow_schema_to_field(pa.schema([pa.field("a", pa.int64(), nullable=False)])),
+        allow_add_columns=True,
+    )
+
+    casted = cast_pandas_dataframe(df, opts)
+
+    assert list(casted.columns) == ["a", "keep"]
+    assert casted["a"].tolist() == [1]
+    assert casted["keep"].tolist() == [9]
