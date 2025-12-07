@@ -277,6 +277,7 @@ def spark_field_to_arrow_field(
     Convert a pyspark StructField to a pyarrow.Field.
     """
     arrow_type = spark_type_to_arrow_type(field.dataType, cast_options)
+
     return pa.field(
         name=field.name,
         type=arrow_type,

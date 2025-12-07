@@ -630,8 +630,9 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return
 
         if not isinstance(data, pyspark.sql.DataFrame):
-            data = convert(data, pa.Table, target_field=existing_schema)
-        data = cast_spark_dataframe(data, options=existing_schema)
+            data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
+        else:
+            data = cast_spark_dataframe(data, options=existing_schema)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
