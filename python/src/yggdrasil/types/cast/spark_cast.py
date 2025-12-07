@@ -12,6 +12,7 @@ from .cast_options import (
     CastOptions,
 )
 from .registry import register_converter
+from .. import default_python_scalar
 from ..python_defaults import default_arrow_scalar
 from ...libs.sparklib import (
     pyspark,
@@ -216,18 +217,15 @@ def cast_spark_column(
 
 def check_column_nullability(
     column: "pyspark.sql.Column",
-    source_field: Optional["T.StructField"] = None,
-    target_field: Optional["T.StructField"] = None,
+    source_field: "T.StructField",
+    target_field: "T.StructField",
     mask: Optional["pyspark.sql.Column"] = None
 ) -> "pyspark.sql.Column":
     source_nullable = True if source_field is None else source_field.nullable
     target_nullable = True if target_field is None else target_field.nullable
 
     if source_nullable and not target_nullable:
-        dv = default_arrow_scalar(
-            dtype=to_spark_arrow_type(column.dtype),
-            nullable=False
-        ).as_py()
+        dv = default_python_scalar(target_field).as_py()
         mask = mask or column.isNull()
 
         column = F.when(mask, F.lit(dv)).otherwise(column)
