@@ -49,17 +49,17 @@ _ARROW_DEFAULTS = {
     pa.uint32(): pa.scalar(0, type=pa.uint32()),
     pa.uint64(): pa.scalar(0, type=pa.uint64()),
 
-    pa.float16(): pa.scalar(0.0, type=pa.float16()),
+    # pa.float16(): pa.scalar(0.0, type=pa.float16()),
     pa.float32(): pa.scalar(0.0, type=pa.float32()),
     pa.float64(): pa.scalar(0.0, type=pa.float64()),
 
     pa.string(): pa.scalar("", type=pa.string()),
-    pa.large_string(): pa.scalar("", type=pa.large_string()),
     pa.string_view(): pa.scalar("", type=pa.string_view()),
+    pa.large_string(): pa.scalar("", type=pa.large_string()),
 
     pa.binary(): pa.scalar(b"", type=pa.binary()),
-    pa.large_binary(): pa.scalar(b"", type=pa.large_binary()),
     pa.binary_view(): pa.scalar(b"", type=pa.binary_view()),
+    pa.large_binary(): pa.scalar(b"", type=pa.large_binary()),
 }
 
 

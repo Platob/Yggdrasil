@@ -384,7 +384,10 @@ def convert_to_python_iterable(
     if isinstance(value, (pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch)):
         from .. import arrow_field_from_hint
 
-        casted = convert(value, arrow_field_from_hint(element_hint), options=options)
+        try:
+            casted = convert(value, arrow_field_from_hint(element_hint), options=options)
+        except TypeError:
+            casted = value
         value = casted.to_pylist()
 
     converted = [
