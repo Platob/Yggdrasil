@@ -19,7 +19,7 @@ from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...requests.session import YGGSession
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
-from ...types.cast.spark_cast import cast_spark_dataframe, arrow_table_to_spark_dataframe
+from ...types.cast.spark_cast import cast_spark_dataframe
 
 try:
     from delta.tables import DeltaTable
@@ -334,6 +334,9 @@ class DBXSQL(DBXWorkspaceObject):
             - On FAILED / CANCELED: raise SqlExecutionError
         - If wait=False: return initial execution handle without polling.
         """
+        if format is None:
+            format = Format.ARROW_STREAM
+
         if (disposition is None or disposition == Disposition.INLINE) and format in [Format.CSV, Format.ARROW_STREAM]:
             disposition = Disposition.EXTERNAL_LINKS
 
