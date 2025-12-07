@@ -850,7 +850,10 @@ FROM parquet.`{databricks_tmp_folder}`"""
         table_name = table_name or field.name
         catalog_name = catalog_name or "hive_metastore"
         schema_name = schema_name or "default"
-        full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+        full_table_name = cls._table_full_name(
+            catalog_name, schema_name, table_name,
+            safe_chars=True
+        )
 
         # Create the DDL statement
         sql = [f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{full_table_name} ("]

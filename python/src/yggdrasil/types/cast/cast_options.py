@@ -117,7 +117,7 @@ class CastOptions:
     @classmethod
     def check_arg(
         cls,
-        target_field: Union[
+        options: Union[
             "CastOptions",
             dict,
             pa.DataType,
@@ -125,8 +125,7 @@ class CastOptions:
             pa.Schema,
             None,
         ] = None,
-        kwargs: Optional[dict] = None,
-        **options
+        **kwargs
     ) -> "CastOptions":
         """
         Normalize an argument into an ArrowCastOptions instance.
@@ -137,23 +136,15 @@ class CastOptions:
           as `target_field` on top of DEFAULT_CAST_OPTIONS.
         - If arg is None, just use DEFAULT_CAST_OPTIONS.
         """
-        if isinstance(target_field, CastOptions):
-            result = target_field
-        elif target_field is None:
-            result = CastOptions()
+        if isinstance(options, CastOptions):
+            result = options
         else:
-            if target_field is None:
-                result = CastOptions()
-            else:
-                target_field = target_field if isinstance(target_field, pa.Field) else convert(target_field, pa.Field)
+            result = CastOptions()
 
-                result = CastOptions(target_field=target_field)
-
-        if options:
-            result = result.copy(**options)
+            result.set_target_arrow_field(value=options, cast=True)
 
         if kwargs:
-            result = result.copy(**kwargs, **options)
+            result = result.copy(**kwargs)
 
         return result
 
@@ -198,7 +189,7 @@ class CastOptions:
         """
         Set the target_field used during casting operations.
         """
-        if cast:
+        if value is not None and not isinstance(value, pa.Field) and cast:
             value = convert(value, Optional[pa.Field])
 
         object.__setattr__(self, "target_field", value)

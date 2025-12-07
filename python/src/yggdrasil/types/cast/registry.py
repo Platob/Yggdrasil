@@ -112,7 +112,10 @@ def _type_matches(actual: Any, registered: Any) -> bool:
     return False
 
 
-def _find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
+def find_converter(
+    from_type: Any,
+    to_hint: Any
+) -> Optional[Converter]:
     # 0) Fast path: exact key
     conv = _registry.get((from_type, to_hint))
     if conv is not None:
@@ -194,6 +197,17 @@ def _normalize_fractional_seconds(value: str) -> str:
     return value[:start] + normalized_fraction + value[end:]
 
 
+def is_runtime_value(x, origin) -> bool:
+    # True for "42", [], MyClass(), etc.
+    # False for MyClass, list[int], dict[str, int], etc.
+    if inspect.isclass(x):
+        return False
+    if origin is not None:
+        # typing stuff like list[int], dict[str, int], etc.
+        return False
+    return True
+
+
 def convert(
     value: Any,
     target_hint: Union[
@@ -219,21 +233,22 @@ def convert(
         if value is None:
             return None if is_optional else default_scalar(target_hint)
 
-    options = CastOptions.check_arg(target_field=options, kwargs=kwargs)
+    options = CastOptions.check_arg(options=options, kwargs=kwargs)
     target_origin = get_origin(target_hint) or target_hint
     target_args = get_args(target_hint)
     source_hint = type(value)
 
-    if isinstance(target_hint, (pa.Field, pa.DataType, pa.Schema)):
+    if is_runtime_value(target_hint):
         options.set_target_arrow_field(target_hint, cast=True)
 
         if isinstance(value, pa.Array):
             target_hint = pa.Array
         else:
             target_hint = value.__class__
-        converter = _find_converter(source_hint, target_hint)
+
+        converter = find_converter(source_hint, target_hint)
     else:
-        converter = _find_converter(source_hint, target_hint)
+        converter = find_converter(source_hint, target_hint)
 
     if converter is not None:
         return converter(value, options)
