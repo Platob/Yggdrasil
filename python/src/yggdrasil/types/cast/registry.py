@@ -197,12 +197,12 @@ def _normalize_fractional_seconds(value: str) -> str:
     return value[:start] + normalized_fraction + value[end:]
 
 
-def is_runtime_value(x, origin) -> bool:
+def is_runtime_value(x) -> bool:
     # True for "42", [], MyClass(), etc.
     # False for MyClass, list[int], dict[str, int], etc.
     if inspect.isclass(x):
         return False
-    if origin is not None:
+    if get_origin(x) is not None:
         # typing stuff like list[int], dict[str, int], etc.
         return False
     return True
