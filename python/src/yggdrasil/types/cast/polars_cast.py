@@ -40,6 +40,7 @@ if polars is not None:
     require_polars()
 
     PolarsSeries = polars.Series
+    PolarsExpr = polars.Expr
     PolarsDataFrame = polars.DataFrame
 
     def polars_converter(*args, **kwargs):
@@ -50,6 +51,7 @@ else:
         pass
 
     PolarsSeries = _PolarsDummy
+    PolarsExpr = _PolarsDummy
     PolarsDataFrame = _PolarsDummy
 
     def polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
@@ -63,6 +65,7 @@ else:
 # Core casting: Polars <-> Arrow types
 # ---------------------------------------------------------------------------
 @polars_converter(PolarsSeries, PolarsSeries)
+@polars_converter(PolarsExpr, PolarsExpr)
 def cast_polars_array(
     series: "polars.Series",
     options: Optional[CastOptions] = None,
@@ -110,7 +113,7 @@ def cast_polars_array(
         casted = casted.fill_null(dv)
 
     # Preserve original series name
-    return casted.alias(series.name)
+    return casted
 
 
 def cast_to_list_array(
@@ -219,7 +222,6 @@ def polars_strptime(
         return (
             series.str
             .strptime(polars_field.dtype, strict=options.safe)
-            .alias(polars_field.name)
         )
 
     # Try each pattern in sequence until one works
@@ -441,7 +443,7 @@ def arrow_table_to_polars_dataframe(
 @polars_converter(PolarsDataFrame, pa.RecordBatchReader)
 def polars_dataframe_to_record_batch_reader(
     dataframe: "polars.DataFrame",
-    cast_options: Optional[CastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> pa.RecordBatchReader:
     """
     Convert a Polars DataFrame to a pyarrow.RecordBatchReader.
@@ -449,7 +451,7 @@ def polars_dataframe_to_record_batch_reader(
     - If cast_options.target_schema is set, we apply `cast_polars_dataframe`
       first, then convert to Arrow and wrap as a RecordBatchReader.
     """
-    table = polars_dataframe_to_arrow_table(dataframe, cast_options)
+    table = polars_dataframe_to_arrow_table(dataframe, options)
     batches = table.to_batches()
     return pa.RecordBatchReader.from_batches(table.schema, batches)
 
@@ -457,7 +459,7 @@ def polars_dataframe_to_record_batch_reader(
 @polars_converter(pa.RecordBatchReader, PolarsDataFrame)
 def record_batch_reader_to_polars_dataframe(
     reader: pa.RecordBatchReader,
-    cast_options: Optional[CastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "polars.DataFrame":
     """
     Convert a pyarrow.RecordBatchReader to a Polars DataFrame.
@@ -465,10 +467,10 @@ def record_batch_reader_to_polars_dataframe(
     - If cast_options.target_schema is set, we first apply
       `cast_arrow_record_batch_reader` and then collect to a Table and Polars DF.
     """
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
-    if opts.target_arrow_schema is not None:
-        reader = cast_arrow_record_batch_reader(reader, opts)
+    if options.target_arrow_schema is not None:
+        reader = cast_arrow_record_batch_reader(reader, options)
 
     batches = list(reader)
     if not batches:

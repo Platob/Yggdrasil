@@ -16,7 +16,7 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints, Optional, List,
+    get_type_hints, Optional, List, TypeVar, Type,
 )
 
 import pyarrow as pa
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "register_converter", "convert",
-    "convert_to_python_iterable"
 ]
 
 
@@ -37,8 +36,9 @@ Converter = Callable[[Any, "ArrowCastOptions | dict | None"], Any]
 _registry: Dict[Tuple[Any, Any], Converter] = {}
 
 
-def identity(x, opt):
+def _identity(x, opt):
     return x
+
 
 def register_converter(
     from_hint: Union[Any, List[Any]],
@@ -116,13 +116,14 @@ def find_converter(
     from_type: Any,
     to_hint: Any
 ) -> Optional[Converter]:
+
     # 0) Fast path: exact key
     conv = _registry.get((from_type, to_hint))
     if conv is not None:
         return conv
 
-    if from_type == to_hint:
-        return identity
+    if from_type == to_hint or to_hint in (object, Any):
+        return _identity
 
     # Build from_mro and to_mro
     from_mro = _iter_mro(from_type)
@@ -208,15 +209,15 @@ def is_runtime_value(x) -> bool:
     return True
 
 
+T = TypeVar("T")
+
+
 def convert(
     value: Any,
-    target_hint: Union[
-        type,
-        pa.Field, pa.DataType, pa.Schema,
-    ],
+    target_hint: Type[T],
     options: Optional[Union[CastOptions, pa.Field, pa.DataType, pa.Schema]] = None,
     **kwargs,
-) -> Any:
+) -> T:
     """Convert ``value`` to ``target_hint`` using the registered converters."""
     from yggdrasil.types.python_defaults import default_scalar
     from yggdrasil.types.cast.cast_options import CastOptions
@@ -233,25 +234,16 @@ def convert(
         if value is None:
             return None if is_optional else default_scalar(target_hint)
 
-    options = CastOptions.check_arg(options=options, kwargs=kwargs)
-    target_origin = get_origin(target_hint) or target_hint
-    target_args = get_args(target_hint)
+    options = CastOptions.check_arg(options=options, **kwargs)
     source_hint = type(value)
 
-    if is_runtime_value(target_hint):
-        options.set_target_arrow_field(target_hint, cast=True)
-
-        if isinstance(value, pa.Array):
-            target_hint = pa.Array
-        else:
-            target_hint = value.__class__
-
-        converter = find_converter(source_hint, target_hint)
-    else:
-        converter = find_converter(source_hint, target_hint)
+    converter = find_converter(source_hint, target_hint)
 
     if converter is not None:
         return converter(value, options)
+
+    target_origin = get_origin(target_hint) or target_hint
+    target_args = get_args(target_hint)
 
     if isinstance(target_hint, type) and issubclass(target_hint, enum.Enum):
         return convert_to_python_enum(value, target_hint, options=options)

@@ -14,6 +14,7 @@ __all__ = ["arrow_field_from_hint"]
 _NONE_TYPE = type(None)
 
 _PRIMITIVE_ARROW_TYPES = {
+    _NONE_TYPE: pa.null(),
     str: pa.string(),
     int: pa.int64(),
     float: pa.float64(),
@@ -27,7 +28,7 @@ _SPECIAL_ARROW_TYPES = {
     datetime.time: pa.time64("us"),
     datetime.timedelta: pa.duration("us"),
     uuid.UUID: pa.uuid(),
-    decimal.Decimal: pa.decimal128(38),
+    decimal.Decimal: pa.decimal128(38, 18),
 }
 
 

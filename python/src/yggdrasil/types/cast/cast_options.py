@@ -1,5 +1,4 @@
 import dataclasses
-from dataclasses import replace as dc_replace
 from typing import Optional, Union, List
 
 import pyarrow as pa
@@ -32,8 +31,6 @@ class CastOptions:
     allow_add_columns:
         If True, allow additional columns beyond the target schema to remain.
         If False, extra columns are effectively ignored.
-    rename:
-        Reserved / placeholder for rename behavior (currently unused).
     source_field:
         Description of the source field/schema. Used to infer nullability behavior.
         Can be a pa.Field, pa.Schema, or pa.DataType (normalized elsewhere).
@@ -45,7 +42,7 @@ class CastOptions:
     add_missing_columns: bool = True
     strict_match_names: bool = False
     allow_add_columns: bool = False
-    rename: bool = True
+    eager: bool = False
     datetime_patterns: Optional[List[str]] = None
 
     source_field: Optional[pa.Field] = None
@@ -56,8 +53,7 @@ class CastOptions:
     _spark_target_field: Optional["pyspark.sql.types.StructField"] = dataclasses.field(default=None, init=False, repr=False)
     _polars_target_field: Optional["polars.Field"] = dataclasses.field(default=None, init=False, repr=False)
 
-    _memory_pool: Optional[pa.MemoryPool] = dataclasses.field(default=None, init=False, repr=False)
-    _spark_session: Optional["pyspark.sql.SparkSession"] = dataclasses.field(default=None, init=False, repr=False)
+    memory_pool: Optional[pa.MemoryPool] = dataclasses.field(default=None, init=False, repr=False)
 
     @classmethod
     def safe_init(cls, *args, **kwargs):
@@ -65,54 +61,14 @@ class CastOptions:
 
     def copy(
         self,
-        safe: Optional[bool] = None,
-        add_missing_columns: Optional[bool] = None,
-        strict_match_names: Optional[bool] = None,
-        allow_add_columns: Optional[bool] = None,
-        rename: Optional[bool] = None,
-        datetime_patterns: Optional[List[str]] = None,
-        source_field: Optional[pa.Field] = None,
-        target_field: Optional[pa.Field] = None,
-        memory_pool: Optional[pa.MemoryPool] = None,
-        spark_session: Optional["pyspark.sql.SparkSession"] = None,
         **kwargs
     ):
         """
         Return a new ArrowCastOptions instance with updated fields.
         """
-        instance = dc_replace(
-            self,
-            safe=self.safe if safe is None else safe,
-            add_missing_columns=(
-                self.add_missing_columns
-                if add_missing_columns is None
-                else add_missing_columns
-            ),
-            strict_match_names=(
-                self.strict_match_names
-                if strict_match_names is None
-                else strict_match_names
-            ),
-            allow_add_columns=(
-                self.allow_add_columns
-                if allow_add_columns is None
-                else allow_add_columns
-            ),
-            rename=self.rename if rename is None else rename,
-            datetime_patterns=datetime_patterns,
-            source_field=self.source_field if source_field is None else source_field,
-            target_field=self.target_field if target_field is None else target_field,
-        )
-
-        memory_pool = memory_pool or self.get_memory_pool()
-        if memory_pool is not None:
-            instance.set_memory_pool(memory_pool)
-
-        spark_session = spark_session or self.get_spark_session(raise_error=False)
-        if spark_session is not None:
-            instance.set_spark_session(spark_session)
-
-        return instance
+        if kwargs:
+            return dataclasses.replace(self, **kwargs)
+        return self
 
     @classmethod
     def check_arg(
@@ -147,31 +103,6 @@ class CastOptions:
             result = result.copy(**kwargs)
 
         return result
-
-    def get_memory_pool(self) -> Optional[pa.MemoryPool]:
-        """
-        Arrow memory pool used during casting operations.
-        """
-        return self._memory_pool
-
-    def set_memory_pool(self, value: pa.MemoryPool) -> None:
-        """
-        Set the Arrow memory pool used during casting operations.
-        """
-        object.__setattr__(self, "_memory_pool", value)
-
-    def get_spark_session(self, raise_error: bool = True) -> Optional["pyspark.sql.SparkSession"]:
-        """
-        Spark session used during casting operations.
-        """
-        if self._spark_session is None and pyspark is not None:
-            active = pyspark.sql.SparkSession.getActiveSession()
-
-            if raise_error and active is None:
-                raise ValueError("No active Spark session found. Please set the spark_session property explicitly.")
-
-            object.__setattr__(self, "_spark_session", active)
-        return self._spark_session
 
     def set_spark_session(self, value: "pyspark.sql.SparkSession") -> None:
         """

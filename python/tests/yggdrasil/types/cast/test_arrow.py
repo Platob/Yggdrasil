@@ -405,7 +405,7 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
     try:
         result = convert(
             array,
-            target_hint,
+            pa.Array,
             source_field=source_hint,
             options=target_hint,
         )

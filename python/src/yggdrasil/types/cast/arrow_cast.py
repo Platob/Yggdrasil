@@ -83,7 +83,7 @@ def cast_to_struct_array(
                     dtype=target_field.type,
                     nullable=target_field.nullable,
                     size=len(arr),
-                    memory_pool=options.get_memory_pool()
+                    memory_pool=options.memory_pool
                 )
                 child_source_field = array_to_field(child_arr, options)
             else:
@@ -123,7 +123,7 @@ def cast_to_struct_array(
         children,
         fields=list(target_type),
         mask=mask,
-        memory_pool=options.get_memory_pool()
+        memory_pool=options.memory_pool
     )
 
 
@@ -232,7 +232,7 @@ def cast_to_map_array(
             items,
             mask=mask,
             type=target_type,
-            pool=options.get_memory_pool()
+            pool=options.memory_pool
         )
 
     # Case 2: struct -> map (field.name => value)
@@ -280,7 +280,7 @@ def cast_to_map_array(
         pa.array(items, type=target_type.item_type),
         mask=mask,
         type=map_type,
-        pool=options.get_memory_pool()
+        pool=options.memory_pool
     )
 
 
@@ -302,7 +302,7 @@ def cast_primitive_array(
             arr,
             target_type=target_field.type,
             safe=options.safe,
-            memory_pool=options.get_memory_pool(),
+            memory_pool=options.memory_pool,
         )
 
         return check_array_nullability(casted, options)
@@ -514,7 +514,7 @@ def arrow_strptime(
             arr,
             target_type=target_field.type,
             safe=options.safe,
-            memory_pool=options.get_memory_pool(),
+            memory_pool=options.memory_pool,
         )
     else:
         last_error = None
@@ -527,7 +527,7 @@ def arrow_strptime(
                     format=pattern,
                     unit=target_field.type.unit,
                     error_is_null=not options.safe,
-                    memory_pool=options.get_memory_pool(),
+                    memory_pool=options.memory_pool,
                 )
                 break
             except Exception as e:
@@ -599,7 +599,7 @@ def cast_arrow_tabular(
                 dtype=target_field.type,
                 nullable=target_field.nullable,
                 size=data.num_rows,
-                memory_pool=options.get_memory_pool(),
+                memory_pool=options.memory_pool,
                 chunks=chunks
             )
         else:
@@ -678,7 +678,7 @@ def pylist_to_arrow_array(
             dtype=dtype,
             nullable=True,
             size=0,
-            memory_pool=options.get_memory_pool()
+            memory_pool=options.memory_pool
         )
 
     null_count = 0
@@ -700,7 +700,7 @@ def pylist_to_arrow_array(
             dtype=dtype,
             nullable=target_field.nullable,
             size=len(pylist),
-            memory_pool=options.get_memory_pool()
+            memory_pool=options.memory_pool
         )
 
     scalars = [

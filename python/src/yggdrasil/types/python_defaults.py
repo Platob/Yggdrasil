@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import decimal
+import inspect
 import types
 import uuid
 from collections.abc import Collection, Mapping, MutableMapping, MutableSequence, MutableSet
@@ -152,7 +153,7 @@ def _default_for_dataclass(hint):
 
 
 def default_arrow_scalar(
-    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
+    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType, pa.FixedSizeListType],
     nullable: bool
 ):
     if nullable:
@@ -240,6 +241,14 @@ def default_python_scalar(hint: Any):
 
     origin = get_origin(hint)
 
+    if origin is None and not inspect.isclass(hint):
+        from .cast import convert
+
+        arrow_field: pa.Field = convert(hint, pa.Field)
+        arrow_scalar = default_arrow_scalar(dtype=arrow_field.type, nullable=arrow_field.nullable)
+
+        return arrow_scalar.as_py(maps_as_pydict="strict")
+
     if hint in (list, set, dict, tuple):
         origin = hint
 
@@ -264,10 +273,12 @@ def default_scalar(
     hint: Union[
         type,
         pa.DataType, pa.Field,
-        "polars.DataType", "polars.Field"
     ],
     nullable: Optional[bool] = None
 ):
-    if isinstance(hint, (pa.Field, pa.DataType)):
+    if isinstance(hint, pa.Field):
+        nullable = hint.nullable if nullable is None else nullable
+        return default_arrow_scalar(dtype=hint.type, nullable=nullable)
+    if isinstance(hint, pa.DataType):
         return default_arrow_scalar(dtype=hint, nullable=nullable)
     return default_python_scalar(hint)

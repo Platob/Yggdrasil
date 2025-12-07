@@ -6,7 +6,7 @@ from typing import List, Set, Tuple, Dict, Any
 import pyarrow as pa
 import pytest
 
-from yggdrasil.types.cast import convert, convert_to_python_iterable
+from yggdrasil.types.cast.registry import convert, convert_to_python_iterable
 
 
 def test_builtin_converters():
@@ -339,7 +339,7 @@ def test_arrow_chunked_array_to_list():
 def test_no_target_args_does_not_crash_and_returns_same_length():
     value = [1, "2", 3.0]
     target_origin = list
-    target_args = ()  # empty -> element_hint defaults to Any
+    target_args = [Any]  # empty -> element_hint defaults to Any
 
     out = convert_to_python_iterable(
         value=value,
