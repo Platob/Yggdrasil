@@ -235,9 +235,9 @@ class DBXSQL(DBXWorkspaceObject):
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
-        assert catalog_name, "No catalog name give"
-        assert schema_name, "No schema name give"
-        assert table_name, "No table name give"
+        assert catalog_name, "No catalog name given"
+        assert schema_name, "No schema name given"
+        assert table_name, "No table name given"
 
         if safe_chars:
             return f"`{catalog_name}`.`{schema_name}`.`{table_name}`"
@@ -611,11 +611,11 @@ FROM parquet.`{databricks_tmp_folder}`"""
         if location:
             c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
-
-        location = location or self._table_full_name(
-            catalog_name=catalog_name, schema_name=schema_name,
-            table_name=table_name
-        )
+        else:
+            location = self._table_full_name(
+                catalog_name=catalog_name, schema_name=schema_name,
+                table_name=table_name
+            )
         spark_options = spark_options if spark_options else {}
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"

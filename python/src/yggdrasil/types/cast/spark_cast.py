@@ -5,15 +5,14 @@ import pyarrow as pa
 from .arrow_cast import (
     cast_arrow_tabular,
     record_batch_reader_to_table,
-    record_batch_to_table, arrow_field_to_schema,
-    to_spark_arrow_type,
+    record_batch_to_table,
+    arrow_field_to_schema,
 )
 from .cast_options import (
     CastOptions,
 )
 from .registry import register_converter
-from .. import default_python_scalar
-from ..python_defaults import default_arrow_scalar
+from ..python_defaults import default_arrow_scalar, default_python_scalar
 from ...libs.sparklib import (
     pyspark,
     arrow_field_to_spark_field,
