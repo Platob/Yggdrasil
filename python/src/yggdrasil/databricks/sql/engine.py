@@ -478,6 +478,8 @@ class DBXSQL(DBXWorkspaceObject):
                     schema_name=schema_name,
                     table_name=table_name,
                 )
+                # normalize arrow tabular input
+                data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
             except ValueError:
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
@@ -490,9 +492,6 @@ class DBXSQL(DBXWorkspaceObject):
                 )
                 self.execute(statement)
                 mode = "overwrite"
-
-            # normalize arrow tabular input
-            data = convert(convert(data, pa.Table), existing_schema, options=cast_options)
 
             # Write in temp volume
             databricks_tmp_folder = connected.temp_volume_folder(
@@ -625,17 +624,14 @@ FROM parquet.`{databricks_tmp_folder}`"""
                 catalog_name=catalog_name, schema_name=schema_name,
                 table_name=table_name,
             )
-            data = convert(data, target_hint=existing_schema)
         except ValueError:
             data = convert(data, pyspark.sql.DataFrame)
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
         if not isinstance(data, pyspark.sql.DataFrame):
-            data = convert(data, pa.Table, existing_schema)
-            data = arrow_table_to_spark_dataframe(data, existing_schema)
-
-        data = cast_spark_dataframe(data, existing_schema)
+            data = convert(data, pa.Table, target_field=existing_schema)
+        data = cast_spark_dataframe(data, options=existing_schema)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
@@ -705,7 +701,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-    ) -> pa.Schema:
+    ) -> pa.Field:
         full_name = self._table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
@@ -725,11 +721,9 @@ FROM parquet.`{databricks_tmp_folder}`"""
             for _ in table.columns
         ]
 
-        return pa.schema(
-            fields,
-            metadata={
-                b"name": table.name.encode(),
-            }
+        return pa.field(
+            table.name,
+            pa.struct(fields),
         )
 
     @staticmethod
