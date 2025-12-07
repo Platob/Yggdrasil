@@ -219,14 +219,13 @@ def check_column_nullability(
     column: "pyspark.sql.Column",
     source_field: "T.StructField",
     target_field: "T.StructField",
-    mask: Optional["pyspark.sql.Column"] = None
+    mask: "pyspark.sql.Column"
 ) -> "pyspark.sql.Column":
     source_nullable = True if source_field is None else source_field.nullable
     target_nullable = True if target_field is None else target_field.nullable
 
     if source_nullable and not target_nullable:
         dv = default_python_scalar(target_field).as_py()
-        mask = mask or column.isNull()
 
         column = F.when(mask, F.lit(dv)).otherwise(column)
 
