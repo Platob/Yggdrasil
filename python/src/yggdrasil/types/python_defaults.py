@@ -247,7 +247,7 @@ def default_python_scalar(hint: Any):
         arrow_field: pa.Field = convert(hint, pa.Field)
         arrow_scalar = default_arrow_scalar(dtype=arrow_field.type, nullable=arrow_field.nullable)
 
-        return arrow_scalar.as_py(maps_as_pydict="strict")
+        return arrow_scalar.as_py()
 
     if hint in (list, set, dict, tuple):
         origin = hint
