@@ -162,7 +162,7 @@ def cast_spark_dataframe(
                     (source_spark_fields[extra_column_name], dataframe[extra_column_name])
                 )
 
-    result = dataframe.select(c for _, c in casted_columns)
+    result = dataframe.select(*[c for _, c in casted_columns])
 
     return result.sparkSession.createDataFrame(result.rdd, schema=target_spark_schema)
 

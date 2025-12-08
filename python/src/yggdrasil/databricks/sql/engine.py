@@ -159,7 +159,7 @@ class DBXStatementResult:
 
         if not batches:
             # empty table with no columns
-            return pa.table([], self.arrow_schema)
+            return pa.Table.from_batches([], schema=self.arrow_schema)
 
         return pa.Table.from_batches(batches)
 
