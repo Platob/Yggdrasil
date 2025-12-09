@@ -32,11 +32,11 @@ def _normalize_freq(freq: str) -> str:
 
 def resample_step_intervals(
     df: "pl.DataFrame",
-    *,
+    ts_col: str,
+    next_ts_col: str,
     freq: str,                         # "15min", "1h", "daily", ...
+    *,
     group_cols: Optional[Sequence[str]] = None,
-    ts_col: str = "timestamp",
-    next_ts_col: str = "next_timestamp",
     value_col: str = "value",
     begin: Optional[datetime] = None,
     end: Optional[datetime] = None,
@@ -133,3 +133,7 @@ def resample_step_intervals(
         )
 
     return sampled
+
+
+if pl is not None:
+    setattr(pl.DataFrame, "resample_step_intervals", resample_step_intervals)
