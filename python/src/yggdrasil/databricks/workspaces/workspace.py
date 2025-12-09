@@ -23,6 +23,7 @@ from databricks.sdk.service.files import DirectoryEntry
 from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 from ...requests import MSALAuth
+from ...pyutils import retry
 
 if databricks_sdk is not None:
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
@@ -426,7 +427,7 @@ class DBXWorkspace:
     # ------------------------------------------------------------------ #
     # Upload helpers
     # ------------------------------------------------------------------ #
-
+    @retry(tries=3)
     def upload_content_file(
         self,
         content: Union[bytes, BinaryIO],
@@ -647,7 +648,7 @@ class DBXWorkspace:
 
         def _upload_dir(local_root: str, remote_root: str, ensure_dir: bool):
             # Ensure remote directory exists if requested
-            if ensure_dir and not existing_objs:
+            if ensure_dir:
                 sdk.workspace.mkdirs(remote_root)
 
             try:

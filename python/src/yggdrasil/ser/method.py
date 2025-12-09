@@ -343,14 +343,6 @@ class EmbeddedFunction:
         if not qualname:
             raise ValueError(f"Cannot derive qualname for {func!r}")
 
-        # 3) Reject functions that close over nonlocal variables
-        closure = inspect.getclosurevars(func)
-        if closure.nonlocals:
-            raise ValueError(
-                "EmbeddedFunction does not support local functions that capture "
-                "nonlocal variables in their closure"
-            )
-
         # 4) Extract raw source for the function
         try:
             raw_src = inspect.getsource(func)
