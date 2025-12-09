@@ -118,7 +118,7 @@ def test_parallelize_return_exceptions_collects_timeout():
 
 
 def test_parallelize_with_process_pool_executor():
-    @parallelize(executor_cls=cf.ProcessPoolExecutor)
+    @parallelize(executor_cls=cf.ProcessPoolExecutor, show_progress=True)
     def cube(x: int) -> int:
         return x * x * x
 

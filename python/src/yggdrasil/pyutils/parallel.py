@@ -1,41 +1,3 @@
-"""
-parallel.py
-
-Utilities to easily parallelize function/method calls using concurrent.futures.
-
-Core feature:
-- @parallelize(...) decorator that turns a function into a "parallel map"
-  over one of its arguments, executed via a concurrent.futures.Executor.
-
-Now returns a generator instead of a list, so results are not all collected
-into memory at once.
-
-Example
--------
-
-from concurrent.futures import ThreadPoolExecutor
-from yggdrasil.pyutils.parallel import parallelize
-
-
-@parallelize()  # default: ThreadPoolExecutor, arg_index=0
-def square(x: int) -> int:
-    return x * x
-
-# Result is a generator:
-result_iter = square(range(10))
-result = list(result_iter)  # -> [0, 1, 4, 9, ...]
-
-# For instance methods (self at index 0, data at index 1):
-
-class Foo:
-    @parallelize(arg_index=1)
-    def double(self, x: int) -> int:
-        return x * 2
-
-foo = Foo()
-out = list(foo.double(range(5)))  # -> [0, 2, 4, 6, 8]
-"""
-
 from __future__ import annotations
 
 import concurrent.futures as cf
@@ -50,6 +12,13 @@ from typing import (
     ParamSpec,
 )
 
+import dill
+
+from multiprocessing.reduction import ForkingPickler
+
+ForkingPickler.loads = dill.loads
+ForkingPickler.dumps = dill.dumps
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -61,6 +30,7 @@ def parallelize(
     arg_index: int = 0,
     timeout: Optional[float] = None,
     return_exceptions: bool = False,
+    show_progress: bool = False,  # 👈 new flag
 ) -> Callable[[Callable[P, R]], Callable[P, Iterator[R]]]:
     """
     Decorator to parallelize a function/method over one iterable argument
@@ -69,50 +39,6 @@ def parallelize(
     Returns
     -------
     A wrapper that returns an iterator (generator) of results, not a list.
-
-    Parameters
-    ----------
-    executor_cls:
-        Executor class to use (ThreadPoolExecutor, ProcessPoolExecutor, or
-        a custom subclass of concurrent.futures.Executor).
-    max_workers:
-        Max workers to pass to the executor when created internally.
-        If an executor is explicitly provided via `executor=` at call time,
-        this is ignored.
-    arg_index:
-        Index of the argument that should be treated as an iterable of tasks.
-        For a plain function `f(xs)`, use arg_index=0.
-        For a method `obj.f(xs)`, use arg_index=1 (since self is at 0).
-    timeout:
-        Optional per-future timeout (seconds) passed to `Future.result()`.
-        This does NOT limit total wall-clock time, only each individual task.
-    return_exceptions:
-        If False (default), the first exception will be raised and remaining
-        futures will be cancelled (if we own the executor).
-        If True, exceptions are yielded in the results stream in place of the
-        value for that task.
-
-    Call-time behaviour
-    -------------------
-    The decorated function returns an iterator of results, preserving the
-    original order of the iterable.
-
-    You may optionally pass an existing executor at call time:
-
-        @parallelize()
-        def work(x: int) -> int:
-            return x * 2
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            results_iter = work(range(100), executor=ex)
-            results = list(results_iter)
-
-    The executor is then NOT closed by the decorator.
-
-    Notes
-    -----
-    - The argument at `arg_index` must be iterable.
-    - All tasks share the same remaining args/kwargs.
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, Iterator[R]]:
@@ -125,6 +51,12 @@ def parallelize(
                 )
 
             iterable_arg = args[arg_index]
+
+            # Try to know total upfront for proper progress bar
+            try:
+                total = len(iterable_arg)  # type: ignore[arg-type]
+            except TypeError:
+                total = None
 
             try:
                 iterator = iter(iterable_arg)  # type: ignore[arg-type]
@@ -148,10 +80,35 @@ def parallelize(
             # Generator that will actually submit tasks and yield results
             def gen() -> Iterator[R]:
                 futures: list[cf.Future[R]] = []
+                processed = 0  # for progress
 
                 # If we created the executor, manage its lifetime with a context manager.
                 # If executor is external, use nullcontext so we don't close it.
                 ctx = executor if owns_executor else nullcontext(executor)
+
+                def _print_progress() -> None:
+                    if not show_progress:
+                        return
+
+                    nonlocal processed
+                    processed += 1
+
+                    # Known total: real progress bar
+                    if total is not None and total > 0:
+                        width = 40
+                        frac = processed / total
+                        filled = int(width * frac)
+                        bar = "#" * filled + "-" * (width - filled)
+                        print(
+                            f"\r[{bar}] {processed}/{total} ({frac:6.1%})",
+                            end="",
+                            flush=True,
+                        )
+                        if processed == total:
+                            print()  # newline at end
+                    else:
+                        # Unknown total: simple counter
+                        print(f"\rProcessed {processed} items", end="", flush=True)
 
                 with ctx:
                     # Submit all tasks first so they can run in parallel
@@ -171,6 +128,7 @@ def parallelize(
                             res = fut.result(timeout=timeout)
                         except Exception as e:
                             if return_exceptions:
+                                _print_progress()
                                 # type: ignore[list-item]
                                 yield e  # type: ignore[misc]
                                 continue
@@ -179,9 +137,17 @@ def parallelize(
                                 for f2 in futures:
                                     if not f2.done():
                                         f2.cancel()
+                            # ensure progress line ends cleanly
+                            if show_progress:
+                                print()
                             raise
                         else:
+                            _print_progress()
                             yield res
+
+                # if we printed a counter with unknown total, finish with newline
+                if show_progress and (total is None or total == 0):
+                    print()
 
             # Return generator; execution happens when iterated
             return gen()

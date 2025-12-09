@@ -86,8 +86,12 @@ def cast_polars_array(
     if not target_field:
         return series
 
-    source_field = options.source_field or pa.field(series.name, polars_type_to_arrow_type(series.dtype))
     target_polars_field = options.get_target_polars_field()
+
+    if series.dtype == polars.Null():
+        return series.cast(target_polars_field.dtype, strict=False)
+
+    source_arrow_field = options.source_field or pa.field(series.name, polars_type_to_arrow_type(series.dtype))
 
     # strict=True => fail on lossy casts
     if isinstance(target_polars_field.dtype, polars.Datetime):
@@ -108,7 +112,7 @@ def cast_polars_array(
         casted = series.cast(target_polars_field.dtype, strict=options.safe)
 
     # If Arrow says "non-nullable", fill nulls with a default value
-    if source_field.nullable and not target_field.nullable:
+    if source_arrow_field.nullable and not target_field.nullable:
         dv = default_arrow_scalar(target_field.type, nullable=target_field.nullable).as_py()
         casted = casted.fill_null(dv)
 

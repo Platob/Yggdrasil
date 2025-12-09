@@ -467,6 +467,17 @@ def cast_arrow_array(
 
     target_type = target_field.type
 
+    if pa.types.is_null(target_type):
+        return check_array_nullability(
+            pc.cast(
+                array, target_type,
+                safe=False, memory_pool=options.memory_pool
+            ),
+            options=options.copy(
+                source_field=None
+            )
+        )
+
     if pa.types.is_nested(target_type):
         if pa.types.is_struct(target_type):
             return cast_to_struct_array(array, options)
@@ -908,7 +919,7 @@ def array_to_field(
     return pa.field(
         str(array.type),
         array.type,
-        nullable=array.null_count > 0,
+        nullable=array.type == pa.null() or array.null_count > 0,
         metadata=None,
     )
 
