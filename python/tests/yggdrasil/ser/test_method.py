@@ -1,5 +1,4 @@
 # tests/test_embedded_function.py
-
 import json
 import math
 import os
@@ -160,3 +159,25 @@ def test_package_root_is_captured_for_module_defined_function():
     common = os.path.commonpath([this_file, os.path.abspath(emb.package_root)])
     # package_root should be an ancestor of this test file
     assert common == os.path.abspath(emb.package_root)
+
+
+def test_to_command_default_result_markers_present():
+    emb = EmbeddedFunction.from_callable(top_level_add)
+
+    cmd = emb.to_command(args=[1, 2], kwargs={}, env_keys=None)
+
+    assert "<<<EMBEDDED_RESULT_START>>>" in cmd
+    assert "<<<EMBEDDED_RESULT_END>>>" in cmd
+
+
+def test_to_command_custom_result_tag_replaces_markers():
+    emb = EmbeddedFunction.from_callable(top_level_add)
+    tag = "###RESULT###"
+
+    cmd = emb.to_command(
+        args=[1, 2], kwargs={}, env_keys=None, result_tag=tag, use_dill=True
+    )
+
+    expected_print = f"print({tag!r} + json.dumps(payload) + {tag!r})"
+    assert expected_print in cmd
+    assert "print('<<<EMBEDDED_RESULT_START>>>'" not in cmd
