@@ -62,6 +62,6 @@ assert isinstance(schema_field.type, pa.DataType)
 ```
 
 For a map of every submodule and its responsibilities, see
-`modules.md`. Detailed pages for each module live under `modules/`, and
-additional starter snippets are available in `developer-templates.md` in this
-directory.
+`modules.md`. Detailed pages for each module live under `modules/` (use
+`modules/README.md` for direct links), and additional starter snippets are
+available in `developer-templates.md` in this directory.

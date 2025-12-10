@@ -23,6 +23,12 @@ HTTP utilities with retry support and optional Microsoft identity integration.
 See the [requests module doc](modules/requests/README.md) for session defaults
 and MSAL configuration tips.
 
+## `yggdrasil.pyutils`
+
+Decorators for concurrency and retry workflows. See the
+[pyutils module doc](modules/pyutils/README.md) for parallelization patterns and
+customizable backoff controls.
+
 ## `yggdrasil.types`
 
 Type-hint aware helpers for cross-engine schema handling. The
@@ -34,4 +40,10 @@ inference, and backend-specific casting helpers.
 Databricks-focused helpers grouped by service area. Explore the
 [Databricks module doc](modules/databricks/README.md) for remote execution
 options, job config helpers, SQL utilities, and workspace setup patterns.
+
+## `yggdrasil.ser`
+
+Serialization helpers and dependency inspection utilities. The
+[ser module doc](modules/ser/README.md) summarizes dependency metadata types and
+introspection helpers for extracting function source.
 
