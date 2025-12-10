@@ -88,3 +88,11 @@ engine.insert_into(
 ### Notes
 - Functions guard imports with `require_databricks_sdk()` and `require_pyspark()` to give clear errors when dependencies are missing.
 - Many methods accept `CastOptions` to control Arrow/Pandas/Spark casting of SQL results.
+
+## Navigation
+- [Module overview](../../modules.md)
+- [Dataclasses](../dataclasses/README.md)
+- [Libs](../libs/README.md)
+- [Requests](../requests/README.md)
+- [Types](../types/README.md)
+- [Databricks](./README.md)
