@@ -23,6 +23,7 @@ from ...pyutils import retry
 from ...requests import MSALAuth
 
 if databricks_sdk is not None:
+    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
@@ -41,9 +42,10 @@ except ImportError:  # pragma: no cover
 
 
 __all__ = [
-    "DBXAuthType",
+    "AuthType",
     "DBXWorkspace",
-    "DBXWorkspaceObject",
+    "Workspace",
+    "WorkspaceObject",
 ]
 
 
@@ -79,12 +81,12 @@ def _get_remote_size(sdk, target_path: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
-class DBXAuthType(Enum):
+class AuthType(Enum):
     external_browser = "external-browser"
 
 
 @dataclass
-class DBXWorkspace:
+class Workspace:
     """
     Thin wrapper around Databricks WorkspaceClient with helpers for:
 
@@ -124,7 +126,7 @@ class DBXWorkspace:
     config_file: Optional[str] = None
 
     # HTTP / client behavior
-    auth_type: Optional[Union[str, DBXAuthType]] = None
+    auth_type: Optional[Union[str, AuthType]] = None
     http_timeout_seconds: Optional[int] = None
     retry_timeout_seconds: Optional[int] = None
     debug_truncate_bytes: Optional[int] = None
@@ -143,16 +145,16 @@ class DBXWorkspace:
     # Clone
     # ------------------------------------------------------------------ #
 
-    def clone(self, *, with_client: bool = False) -> "DBXWorkspace":
+    def clone(self, *, with_client: bool = False) -> "Workspace":
         """
         Create a shallow clone of this workspace config.
 
         with_client=False:
-            New DBXWorkspace with same config, no client yet.
+            New Workspace with same config, no client yet.
         with_client=True:
-            New DBXWorkspace with same config and a fresh WorkspaceClient.
+            New Workspace with same config and a fresh WorkspaceClient.
         """
-        clone = DBXWorkspace(
+        clone = Workspace(
             config=self.config,
             host=self.host,
             account_id=self.account_id,
@@ -190,7 +192,7 @@ class DBXWorkspace:
     # Context manager + lifecycle
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> "DBXWorkspace":
+    def __enter__(self) -> "Workspace":
         self._was_connected = self._sdk is not None
         self.connect()
         return self
@@ -267,7 +269,7 @@ class DBXWorkspace:
 
         Args:
             new_instance:
-                If True, build a fresh DBXWorkspace (via connect(new_instance=True))
+                If True, build a fresh Workspace (via connect(new_instance=True))
                 and return *its* WorkspaceClient. The current instance is left
                 untouched.
             reset:
@@ -281,7 +283,7 @@ class DBXWorkspace:
         self,
         reset: bool = False,
         new_instance: bool = False,
-    ) -> "DBXWorkspace":
+    ) -> "Workspace":
         """
         Ensure a WorkspaceClient is available.
 
@@ -290,7 +292,7 @@ class DBXWorkspace:
                 If True, always drop any existing client on *this* instance
                 and re-create it in-place.
             new_instance:
-                If True, build and return a completely new DBXWorkspace
+                If True, build and return a completely new Workspace
                 instance (with its own WorkspaceClient) based on the current
                 config. The original instance is not modified.
         """
@@ -307,12 +309,12 @@ class DBXWorkspace:
 
             # Normalize auth_type once
             auth_type = self.auth_type
-            if isinstance(auth_type, DBXAuthType):
+            if isinstance(auth_type, AuthType):
                 auth_type = auth_type.value
             elif self.token is None and auth_type is None:
                 # default to external browser on Windows if nothing else is set
                 if platform.system() == "Windows":
-                    auth_type = DBXAuthType.external_browser.value
+                    auth_type = AuthType.external_browser.value
 
             # Prepare kwargs for WorkspaceClient, dropping None so SDK defaults apply
             kwargs = {
@@ -850,10 +852,11 @@ class DBXWorkspace:
 # Workspace-bound base class
 # ---------------------------------------------------------------------------
 
+DBXWorkspace = Workspace
 
 @dataclass
-class DBXWorkspaceObject(ABC):
-    workspace: DBXWorkspace = dataclasses.field(default_factory=DBXWorkspace)
+class WorkspaceObject(ABC):
+    workspace: Workspace = dataclasses.field(default_factory=Workspace)
 
     def __enter__(self):
         self.workspace.__enter__()

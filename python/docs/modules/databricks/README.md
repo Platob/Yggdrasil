@@ -21,5 +21,5 @@ with SQL and workspace resources.
 - `exceptions.py` normalizes common SQL error shapes for easier handling.
 
 ## Workspace utilities (`workspaces/workspace.py`)
-- `DBXWorkspace` simplifies SDK client creation, host configuration, and token
+- `Workspace` simplifies SDK client creation, host configuration, and token
   management for Databricks workspaces.

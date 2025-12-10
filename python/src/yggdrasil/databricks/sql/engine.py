@@ -11,7 +11,7 @@ import pyarrow.ipc as pipc
 import pyarrow.parquet as pq
 
 from .types import column_info_to_arrow_field
-from ..workspaces import DBXWorkspace, DBXWorkspaceObject
+from ..workspaces import Workspace, WorkspaceObject
 from ...libs.databrickslib import databricks_sdk
 from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
@@ -56,7 +56,7 @@ class SqlExecutionError(RuntimeError):
 @dataclasses.dataclass
 class DBXStatementResult:
     base: StatementResponse
-    workspace: DBXWorkspace | None = None
+    workspace: Workspace | None = None
 
     @property
     def status(self):
@@ -222,7 +222,7 @@ class DBXStatementResult:
 
 
 @dataclasses.dataclass
-class DBXSQL(DBXWorkspaceObject):
+class DBXSQL(WorkspaceObject):
     warehouse_id: Optional[str] = None
 
     _http_path: str = dataclasses.field(init=False, default=None)

@@ -19,7 +19,7 @@ if databricks_sdk is not None:
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.compute import State, Language
 
-from ..workspaces.workspace import DBXWorkspace
+from ..workspaces.workspace import Workspace
 from ...ser import EmbeddedFunction
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
@@ -102,7 +102,7 @@ def _create_command_with_timeout(
 
 def databricks_remote_compute(
     cluster_id: Optional[str] = None,
-    workspace: Optional[Union[DBXWorkspace, str]] = None,
+    workspace: Optional[Union[Workspace, str]] = None,
     timeout: Optional[dt.timedelta] = None,
     force_local: Optional[bool] = None,
     env_keys: Optional[List[str]] = None
@@ -123,8 +123,8 @@ def databricks_remote_compute(
 
     Args:
         cluster_id: Target cluster ID.
-        workspace: Optional DBXWorkspace or host string. If None, a default
-            DBXWorkspace is created.
+        workspace: Optional Workspace or host string. If None, a default
+            Workspace is created.
         timeout: Optional timeout for remote execution (default 20 minutes).
         force_local: Optional bool to bypass remote compute
         env_keys: Environment keys
@@ -161,7 +161,7 @@ def remote_invoke(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     cluster_id: Optional[str] = None,
-    workspace: Optional[Union[DBXWorkspace, str]] = None,
+    workspace: Optional[Union[Workspace, str]] = None,
     timeout: Optional[dt.timedelta] = None,
     env_keys: Optional[List[str]] = None
 ) -> ReturnType:
@@ -173,7 +173,7 @@ def remote_invoke(
         args: Positional arguments for the call.
         kwargs: Keyword arguments for the call.
         cluster_id: Target cluster ID (required).
-        workspace: Optional DBXWorkspace or host string.
+        workspace: Optional Workspace or host string.
         timeout: Optional timeout for remote execution.
         env_keys: Environment keys
 
@@ -186,11 +186,11 @@ def remote_invoke(
     from databricks.sdk.service.compute import CommandStatus, Language, ResultType
 
     if workspace is None:
-        ws = DBXWorkspace()
-    elif isinstance(workspace, DBXWorkspace):
+        ws = Workspace()
+    elif isinstance(workspace, Workspace):
         ws = workspace
     else:
-        ws = DBXWorkspace(host=str(workspace))
+        ws = Workspace(host=str(workspace))
 
     if not cluster_id:
         raise ValueError("cluster_id is required for remote_invoke")
