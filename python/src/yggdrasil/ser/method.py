@@ -530,7 +530,9 @@ class EmbeddedFunction:
         self,
         args: list,
         kwargs: dict,
-        env_keys: Optional[List[str]] = None
+        env_keys: Optional[List[str]] = None,
+        use_dill: bool = False,
+        result_tag: Optional[str] = None,
     ) -> str:
         """
         Build a Python command string suitable for Databricks `command_execution`.
@@ -547,6 +549,17 @@ class EmbeddedFunction:
                   "stdout": "<captured stdout>",
                   "stderr": "<captured stderr>",
                 }
+
+        Args:
+            args: positional args to call the function with.
+            kwargs: keyword args to call the function with.
+            env_keys: optional environment variables to forward.
+            use_dill: when True, serialize the function itself with dill rather than
+                embedding its source code. Defaults to False to keep the existing
+                source-embedding behaviour.
+            result_tag: optional marker string to wrap the printed payload. When
+                provided, the payload is printed as ``<result_tag><json><result_tag>``
+                to simplify parsing downstream.
         """
         import dill  # driver-side
         import base64 as _b64
@@ -556,6 +569,13 @@ class EmbeddedFunction:
             roots = [_os.path.dirname(self.package_root)]
         else:
             roots = []
+
+        def _b64_dumps(obj: Any) -> str:
+            return _b64.b64encode(dill.dumps(obj)).decode("utf-8")
+
+        func_ser: Optional[str] = None
+        if use_dill:
+            func_ser = _b64_dumps(self._ensure_compiled())
 
         imports = set(d.submodule for d in self.dependencies_map)
 
@@ -609,26 +629,26 @@ class EmbeddedFunction:
             lines.append("for __name, __mod in __embedded_aliases.items():")
             lines.append("    globals()[__name] = importlib.import_module(__mod)")
 
-        # --- driver-side serialization helpers ---
-        def _b64_dumps(obj: Any) -> str:
-            return _b64.b64encode(dill.dumps(obj)).decode("utf-8")
-
         # Serialize args/kwargs as plain data
         args_ser = _b64_dumps(tuple(args))
         kwargs_ser = _b64_dumps(dict(kwargs))
 
-        # Prefer full file content if we have it, otherwise just the function source
-        source_block = self.source_file_content or self.source
-
-        lines.extend([
-            "",
-            source_block,
-            "",
-        ])
+        if use_dill:
+            lines.append(
+                f"_embedded_func = dill.loads(base64.b64decode({func_ser!r}.encode('utf-8')))"
+            )
+        else:
+            # Prefer full file content if we have it, otherwise just the function source
+            source_block = self.source_file_content or self.source
+            lines.extend([
+                "",
+                source_block,
+                "",
+                f"_embedded_func = {self.name}",
+            ])
 
         # --- remote-side deserialization + log capture ---
         lines.extend([
-            f"_embedded_func = {self.name}",
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
             f"_embedded_kwargs = dill.loads(base64.b64decode({kwargs_ser!r}.encode('utf-8')))",
             "",
@@ -641,7 +661,15 @@ class EmbeddedFunction:
             "payload = {",
             "    'result_b64': base64.b64encode(_ser_result).decode('utf-8'),",
             "}",
-            "print('<<<EMBEDDED_RESULT_START>>>' + json.dumps(payload) + '<<<EMBEDDED_RESULT_END>>>')",
         ])
+
+        if result_tag is not None:
+            lines.append(
+                f"print({result_tag!r} + json.dumps(payload) + {result_tag!r})"
+            )
+        else:
+            lines.append(
+                "print('<<<EMBEDDED_RESULT_START>>>' + json.dumps(payload) + '<<<EMBEDDED_RESULT_END>>>')"
+            )
 
         return "\n".join(lines)
