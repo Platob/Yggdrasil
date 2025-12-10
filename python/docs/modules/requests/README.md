@@ -29,3 +29,13 @@ auth = MSALAuth(tenant_id="...", client_id="...", client_secret="...", scopes=["
 sess = MSALSession(auth)
 response = sess.get("https://resource")
 ```
+
+## Navigation
+- [Module overview](../../modules.md)
+- [Dataclasses](../dataclasses/README.md)
+- [Libs](../libs/README.md)
+- [Requests](./README.md)
+- [Types](../types/README.md)
+- [Databricks](../databricks/README.md)
+- [Pyutils](../pyutils/README.md)
+- [Ser](../ser/README.md)

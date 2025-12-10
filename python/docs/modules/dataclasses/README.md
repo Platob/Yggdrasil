@@ -31,3 +31,13 @@ Returns True when the class or instance was decorated with `@yggdataclass`.
 
 ### `get_dataclass_arrow_field(obj)`
 Returns the cached `pyarrow.Field` for a yggdrasil dataclass or native dataclass by inspecting annotations.
+
+## Navigation
+- [Module overview](../../modules.md)
+- [Dataclasses](./README.md)
+- [Libs](../libs/README.md)
+- [Requests](../requests/README.md)
+- [Types](../types/README.md)
+- [Databricks](../databricks/README.md)
+- [Pyutils](../pyutils/README.md)
+- [Ser](../ser/README.md)

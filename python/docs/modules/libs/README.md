@@ -16,3 +16,13 @@ pl_type = arrow_type_to_polars_type(pa.int64())
 ```
 
 These helpers raise informative `ImportError`s when optional dependencies are missing so callers can gate functionality appropriately.
+
+## Navigation
+- [Module overview](../../modules.md)
+- [Dataclasses](../dataclasses/README.md)
+- [Libs](./README.md)
+- [Requests](../requests/README.md)
+- [Types](../types/README.md)
+- [Databricks](../databricks/README.md)
+- [Pyutils](../pyutils/README.md)
+- [Ser](../ser/README.md)
