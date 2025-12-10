@@ -843,9 +843,9 @@ class Workspace:
             raise
 
     def sql(self):
-        from ..sql import DBXSQL
+        from ..sql import SQLEngine
 
-        return DBXSQL(workspace=self)
+        return SQLEngine(workspace=self)
 
 
 # ---------------------------------------------------------------------------

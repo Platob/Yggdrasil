@@ -44,8 +44,8 @@ except ImportError:
     pass
 
 __all__ = [
-    "DBXSQL",
-    "DBXStatementResult"
+    "SQLEngine",
+    "StatementResult"
 ]
 
 
@@ -54,7 +54,7 @@ class SqlExecutionError(RuntimeError):
 
 
 @dataclasses.dataclass
-class DBXStatementResult:
+class StatementResult:
     base: StatementResponse
     workspace: Workspace | None = None
 
@@ -120,7 +120,7 @@ class DBXStatementResult:
 
     def wait(
         self,
-        engine: "DBXSQL",
+        engine: "SQLEngine",
         timeout: Optional[int] = None,
         poll_interval: Optional[float] = None
     ):
@@ -222,7 +222,7 @@ class DBXStatementResult:
 
 
 @dataclasses.dataclass
-class DBXSQL(WorkspaceObject):
+class SQLEngine(WorkspaceObject):
     warehouse_id: Optional[str] = None
 
     _http_path: str = dataclasses.field(init=False, default=None)
@@ -347,7 +347,7 @@ class DBXSQL(WorkspaceObject):
         with self as connected:
             wk = connected.workspace.sdk()
 
-            execution = DBXStatementResult(
+            execution = StatementResult(
                 base=wk.statement_execution.execute_statement(
                     statement=statement,
                     warehouse_id=self._get_or_default_warehouse_id(),
@@ -371,7 +371,7 @@ class DBXSQL(WorkspaceObject):
             return execution.wait(engine=connected, timeout=timeout, poll_interval=poll_interval)
 
     def get_statement(self, statement_id: str):
-        return DBXStatementResult(
+        return StatementResult(
             base=self.sdk().statement_execution.get_statement(statement_id),
             workspace=self.workspace,
         )
@@ -935,26 +935,26 @@ FROM parquet.`{databricks_tmp_folder}`"""
 
         # Handle primitive types
         if not pa.types.is_nested(field.type):
-            sql_type = DBXSQL._arrow_to_sql_type(field.type)
+            sql_type = SQLEngine._arrow_to_sql_type(field.type)
             return f"{name_str}{sql_type}{nullable_str}{comment_str}"
 
         # Handle struct type
         if pa.types.is_struct(field.type):
-            child_defs = [DBXSQL._field_to_ddl(child) for child in field.type]
+            child_defs = [SQLEngine._field_to_ddl(child) for child in field.type]
             struct_body = ", ".join(child_defs)
             return f"{name_str}STRUCT<{struct_body}>{nullable_str}{comment_str}"
 
         # Handle map type
         if pa.types.is_map(field.type):
             map_type: pa.MapType = field.type
-            key_type = DBXSQL._field_to_ddl(map_type.key_field, put_name=False, put_comment=False, put_not_null=False)
-            val_type = DBXSQL._field_to_ddl(map_type.item_field, put_name=False, put_comment=False, put_not_null=False)
+            key_type = SQLEngine._field_to_ddl(map_type.key_field, put_name=False, put_comment=False, put_not_null=False)
+            val_type = SQLEngine._field_to_ddl(map_type.item_field, put_name=False, put_comment=False, put_not_null=False)
             return f"{name_str}MAP<{key_type}, {val_type}>{nullable_str}{comment_str}"
 
         # Handle list type after map
         if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
             list_type: pa.ListType = field.type
-            elem_type = DBXSQL._field_to_ddl(list_type.value_field, put_name=False, put_comment=False, put_not_null=False)
+            elem_type = SQLEngine._field_to_ddl(list_type.value_field, put_name=False, put_comment=False, put_not_null=False)
             return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
 
         # Default fallback to string for unknown types
@@ -1005,3 +1005,8 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return "STRING"
         else:
             raise ValueError(f"Cannot make ddl type for {arrow_type}")
+
+
+# Backwards compatibility
+DBXSQL = SQLEngine
+DBXStatementResult = StatementResult
