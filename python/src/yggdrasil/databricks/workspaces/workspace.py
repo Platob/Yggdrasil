@@ -17,18 +17,17 @@ from typing import (
     Union,
 )
 
-from databricks.sdk.dbutils import FileInfo
-from databricks.sdk.service.files import DirectoryEntry
-
 from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
-from ...requests import MSALAuth
 from ...pyutils import retry
+from ...requests import MSALAuth
 
 if databricks_sdk is not None:
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
+    from databricks.sdk.dbutils import FileInfo
+    from databricks.sdk.service.files import DirectoryEntry
 
 try:
     from pyspark.sql import SparkSession
@@ -476,7 +475,7 @@ class DBXWorkspace:
             )
 
         with self.connect() as connected:
-            sdk = connected.sdk()
+            sdk = WorkspaceClient()
 
             # Normalize content to bytes once
             if hasattr(content, "read"):  # BinaryIO

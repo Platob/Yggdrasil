@@ -27,7 +27,7 @@ def test_arrow_to_polars_list_and_struct():
     list_type = pa.list_(inner)
     pl_list = arrow_type_to_polars_type(list_type)
     assert isinstance(pl_list, polars.List)
-    assert pl_list.inner is polars.Int64()
+    assert pl_list.inner == polars.Int64()
 
     struct_type = pa.struct(
         [
@@ -42,8 +42,8 @@ def test_arrow_to_polars_list_and_struct():
     field_names = [f.name for f in pl_struct.fields]
     assert field_names == ["a", "b"]
     dtypes = [f.dtype for f in pl_struct.fields]
-    assert dtypes[0] is polars.Int32()
-    assert dtypes[1] is polars.Utf8()
+    assert dtypes[0] == polars.Int32()
+    assert dtypes[1] == polars.Utf8()
 
 
 def test_arrow_to_polars_timestamp_and_duration():
