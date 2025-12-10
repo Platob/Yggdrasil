@@ -96,5 +96,3 @@ engine.insert_into(
 - [Requests](../requests/README.md)
 - [Types](../types/README.md)
 - [Databricks](./README.md)
-- [Pyutils](../pyutils/README.md)
-- [Ser](../ser/README.md)

@@ -7,7 +7,5 @@ Use this directory to jump directly into the detailed docs for each Yggdrasil Py
 - [yggdrasil.requests](requests/README.md)
 - [yggdrasil.types](types/README.md)
 - [yggdrasil.databricks](databricks/README.md)
-- [yggdrasil.pyutils](pyutils/README.md)
-- [yggdrasil.ser](ser/README.md)
 
 For a higher-level description of the project layout, start from the [docs README](../README.md).

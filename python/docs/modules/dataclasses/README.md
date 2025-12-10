@@ -39,5 +39,3 @@ Returns the cached `pyarrow.Field` for a yggdrasil dataclass or native dataclass
 - [Requests](../requests/README.md)
 - [Types](../types/README.md)
 - [Databricks](../databricks/README.md)
-- [Pyutils](../pyutils/README.md)
-- [Ser](../ser/README.md)

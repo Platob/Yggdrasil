@@ -7,50 +7,12 @@ Type conversion and Arrow interoperability utilities.
 ### `convert(value, target_hint, options=None, **kwargs)`
 Central entry point to cast runtime values to annotated types. It understands optionals, enums, dataclasses, iterables, mappings, and Arrow/Polars/Pandas/Spark-specific converters registered in `yggdrasil.types.cast.registry`.
 
-Examples:
+Example:
 ```python
 from yggdrasil.types.cast import convert
-import datetime
 
 convert("3.14", float)            # 3.14
 convert(["1", "2", "3"], list[int])  # [1, 2, 3]
-convert("2024-02-03T04:05:06Z", datetime.datetime)  # aware datetime
-
-import polars as pl
-import pandas as pd
-import pyarrow as pa
-
-pl_df = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
-pdf = convert(pl_df, pd.DataFrame)  # Polars -> pandas using the registered dataframe bridge
-
-from pyspark.sql import SparkSession, types as T
-from yggdrasil.types.cast import CastOptions
-
-spark = SparkSession.builder.master("local[1]").getOrCreate()
-spark_df = spark.createDataFrame([(1, "a"), (2, "b")], schema=T.StructType([
-    T.StructField("id", T.LongType(), nullable=False),
-    T.StructField("value", T.StringType(), nullable=True),
-]))
-
-schema_hint = CastOptions.check_arg(
-    target_field=pa.field("row", pa.struct([
-        pa.field("id", pa.int64(), nullable=False),
-        pa.field("value", pa.string()),
-    ]))
-)
-spark_pdf = convert(spark_df, pd.DataFrame, options=schema_hint)  # Enforce schema during Spark -> pandas casting
-
-# Arrow field <-> Spark schema for streamlined casting hints
-arrow_field = pa.field(
-    "payload",
-    pa.struct([
-        pa.field("id", pa.int64(), nullable=False),
-        pa.field("ts", pa.timestamp("us", tz="UTC")),
-    ]),
-)
-spark_struct = convert(arrow_field, T.StructField)
-spark_schema = T.StructType([spark_struct])
-roundtripped_arrow = convert(spark_schema, pa.Schema)
 ```
 
 ### `register_converter(from_hint, to_hint)`
@@ -89,5 +51,3 @@ Produce sensible default values for Python and Arrow types, including nested str
 - [Requests](../requests/README.md)
 - [Types](./README.md)
 - [Databricks](../databricks/README.md)
-- [Pyutils](../pyutils/README.md)
-- [Ser](../ser/README.md)
