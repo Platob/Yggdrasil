@@ -1,30 +1,20 @@
-# Yggdrasil Python Library
+# Yggdrasil Python documentation
 
-Yggdrasil provides helper utilities for data applications, including
+This directory is the landing page for all Python-facing guidance. Use the links
+below to jump directly to the reference or template you need.
 
-auto-enhanced dataclasses, runtime-managed dependencies, Arrow-compatible
-schema translation helpers, and HTTP session helpers for resilient,
-authenticated calls.
+## Quick links
 
-## Package highlights
-
-- **Enhanced dataclasses**: the custom `@dataclass` decorator adds
-  serialization helpers (`to_dict`, `from_dict`, `to_tuple`, `from_tuple`),
-  default instances, safe initialization, and Arrow schema generation on top
-  of the standard library behavior.
-- **Dependency guards**: helper decorators ensure optional ecosystems such as
-  Polars, pandas, PySpark, or Databricks SDK are available before executing
-  integration code.
-- **Data interchange**: conversion helpers map PyArrow types to engine-specific
-  schema classes for Polars and Spark to keep data pipelines consistent.
-- **HTTP and auth utilities**: HTTP sessions with retry behavior and optional
-  Microsoft identity (MSAL) token handling simplify authenticated API access.
-
-## Repository layout
-
-- `src/yggdrasil/` – library source code.
-- `tests/` – automated tests (if present) for the Python package.
-- `docs/` – documentation and developer templates.
+- [Module map](modules.md): brief descriptions of every package within
+  `yggdrasil`.
+- [Module index](modules/README.md): entry points to detailed docs for each
+  submodule (Databricks helpers, schema utilities, HTTP/auth helpers, etc.).
+- [Developer templates](developer-templates.md): copy/paste-ready snippets for
+  common setup and integration tasks.
+- [Python utility reference](pyutils.md): overview of cross-cutting helpers used
+  throughout the codebase.
+- [Serialization guide](ser.md): notes on how Yggdrasil handles structured data
+  and Arrow schema conversion.
 
 ## Installation
 
@@ -39,29 +29,6 @@ working in that environment.
 
 ## Quick start
 
-Here is a minimal example that uses the enhanced dataclass decorator together
-with the conversion helpers:
-
-```python
-from yggdrasil.dataclasses import yggdataclass
-from yggdrasil.types import arrow_field_from_hint
-import pyarrow as pa
-
-
-@yggdataclass
-class Example:
-    id: int
-    name: str
-
-
-example = Example.default_instance()
-print(example.to_dict())
-
-schema_field = Example.arrow_field("id")
-assert isinstance(schema_field.type, pa.DataType)
-```
-
-For a map of every submodule and its responsibilities, see
-`modules.md`. Detailed pages for each module live under `modules/` (use
-`modules/README.md` for direct links), and additional starter snippets are
-available in `developer-templates.md` in this directory.
+For a minimal example that uses the enhanced dataclass decorator together with
+Arrow schema helpers, see the **developer templates** or jump straight into the
+`yggdrasil.dataclasses` documentation via the module index above.
