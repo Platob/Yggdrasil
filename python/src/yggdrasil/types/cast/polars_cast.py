@@ -167,28 +167,43 @@ def cast_to_struct_array(
     source_arrow_fields = [polars_field_to_arrow_field(f) for f in source_polars_fields]
 
     target_arrow_fields: list[pa.Field] = list(target_arrow_field.type)
-    target_polars_fields = [arrow_field_to_polars_field(f)for f in target_arrow_fields]
+    target_polars_fields = [arrow_field_to_polars_field(f) for f in target_arrow_fields]
 
     name_to_index = {f.name: idx for idx, f in enumerate(source_polars_fields)}
     if not options.strict_match_names:
-        name_to_index.update({
-            f.name.casefold(): idx for idx, f in enumerate(source_polars_fields)
-        })
+        name_to_index.update(
+            {
+                f.name.casefold(): idx
+                for idx, f in enumerate(source_polars_fields)
+            }
+        )
 
     children = []
 
     for target_index, child_target_polars_field in enumerate(target_polars_fields):
         child_target_arrow_field: pa.Field = target_arrow_fields[target_index]
 
-        find_name = child_target_polars_field.name if options.strict_match_names else child_target_polars_field.name.casefold()
+        find_name = (
+            child_target_polars_field.name
+            if options.strict_match_names
+            else child_target_polars_field.name.casefold()
+        )
         source_index = name_to_index.get(find_name)
 
         if source_index is None:
             if not options.add_missing_columns:
-                raise ValueError(f"Missing column {child_target_arrow_field!r} from {target_arrow_fields}")
+                raise ValueError(
+                    f"Missing column {child_target_arrow_field!r} from {target_arrow_fields}"
+                )
 
-            dv = default_arrow_scalar(dtype=child_target_arrow_field.type, nullable=child_target_arrow_field.nullable)
-            casted_child = polars.lit(value=dv.as_py(), dtype=child_target_polars_field.dtype)
+            dv = default_arrow_scalar(
+                dtype=child_target_arrow_field.type,
+                nullable=child_target_arrow_field.nullable,
+            )
+            casted_child = polars.lit(
+                value=dv.as_py(),
+                dtype=child_target_polars_field.dtype,
+            )
         else:
             child_source_arrow_field: pa.Field = source_arrow_fields[source_index]
             child_source_polars_field: polars.Field = source_polars_fields[source_index]
@@ -197,13 +212,22 @@ def cast_to_struct_array(
                 series.struct.field(child_source_polars_field.name),
                 options=options.copy(
                     source_field=child_source_arrow_field,
-                    target_field=child_target_arrow_field
-                )
+                    target_field=child_target_arrow_field,
+                ),
             )
 
         children.append(casted_child.alias(child_target_polars_field.name))
 
-    return polars.struct(*children).alias(target_arrow_field.name)
+    # Build the struct from the cast children
+    result_struct = polars.struct(*children)
+
+    # 🔑 NEW: if the input struct series is null → whole result struct is null
+    return (
+        polars.when(series.is_null())
+        .then(None)
+        .otherwise(result_struct)
+        .alias(target_arrow_field.name)
+    )
 
 
 def polars_strptime(
