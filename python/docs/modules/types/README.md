@@ -43,3 +43,11 @@ Produce sensible default values for Python and Arrow types, including nested str
 - Primitive string, numeric, boolean, datetime, and timedelta parsers are included out of the box.
 - Iterable conversion supports lists, sets, tuples (including variadic tuples), and mappings with per-element casting.
 - Arrow/Polars/Spark conversions rely on optional dependencies; install the relevant libraries to enable those paths.
+
+## Navigation
+- [Module overview](../../modules.md)
+- [Dataclasses](../dataclasses/README.md)
+- [Libs](../libs/README.md)
+- [Requests](../requests/README.md)
+- [Types](./README.md)
+- [Databricks](../databricks/README.md)

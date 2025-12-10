@@ -2,7 +2,8 @@
 
 This guide summarizes the Python submodules shipped with the Yggdrasil package
 and how they fit together. Use it as a quick map before diving into code, the
-source docstrings, or the detailed module pages under `docs/modules/`.
+source docstrings, or the detailed module pages under `docs/modules/` (see
+`modules/README.md` for a directory-style index).
 
 ## `yggdrasil.dataclasses`
 
