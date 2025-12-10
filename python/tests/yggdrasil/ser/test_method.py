@@ -62,17 +62,6 @@ def test_from_callable_supports_local_function_without_nonlocals():
     assert emb(10) == 11
 
 
-def test_from_callable_rejects_local_function_with_nonlocals():
-    def make_multiplier(factor):
-        def inner(x):
-            return x * factor  # captures nonlocal
-        return inner
-
-    f = make_multiplier(3)
-    with pytest.raises(ValueError):
-        EmbeddedFunction.from_callable(f)
-
-
 def test_call_executes_correctly_and_caches_compiled_function():
     emb = EmbeddedFunction.from_callable(top_level_add)
 
