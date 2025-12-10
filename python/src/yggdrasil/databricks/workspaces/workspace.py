@@ -648,7 +648,12 @@ class DBXWorkspace:
 
         def _upload_dir(local_root: str, remote_root: str, ensure_dir: bool):
             # Ensure remote directory exists if requested
-            if ensure_dir:
+            existing_remote_root_obj = [
+                _ for _ in existing_objs
+                if _.path.startswith(remote_root)
+            ]
+
+            if ensure_dir and not existing_remote_root_obj:
                 sdk.workspace.mkdirs(remote_root)
 
             try:
