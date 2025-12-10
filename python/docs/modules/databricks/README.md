@@ -83,7 +83,51 @@ engine.insert_into(
 - Utilities for building `Task` structures with defaults and type-safe casting.
 
 ## Compute (`yggdrasil.databricks.compute`)
-- `DBXCluster` dataclass and `DBXCompute` helpers to create/get/delete clusters and manage remote file uploads for Spark jobs.
+Use `Cluster` to provision and manage clusters, track metadata via custom tags, install libraries, and execute commands directly on the driver node.
+
+```python
+from yggdrasil.databricks.compute import Cluster
+from yggdrasil.databricks.workspaces import Workspace
+
+cluster = Cluster(
+    workspace=Workspace(host="https://...", token="..."),
+    metadata={"owner": "platform-team", "env": "dev"},
+)
+
+# Create a small, on-demand cluster and persist metadata tags (prefixed with "yggdrasil:")
+cluster_id = cluster.create(
+    cluster_name="demo-cluster",
+    spark_version="14.3.x-scala2.12",
+    num_workers=1,
+    node_type_id="i3.xlarge",
+)
+
+# Discover an existing cluster by name and inspect cached info
+demo = cluster.find_cluster(name="demo-cluster")
+print(demo.info.metadata)
+
+# Update or prune metadata stored in custom tags
+cluster.update_metadata({"purpose": "ad-hoc"}, cluster_id=cluster_id)
+cluster.remove_metadata_keys(["env"], cluster_id=cluster_id)
+
+# Manage installed Python packages
+cluster.install_python_libraries([
+    "polars==1.0.0",
+    "pandas>=2.2",
+], cluster_id=cluster_id)
+
+# Bump to a runtime advertising Python 3.10
+cluster.update_runtime_by_python_version("3.10", cluster_id=cluster_id)
+
+# Ensure the cluster is running and execute a command on the driver
+cluster.check_started(cluster_id=cluster_id)
+print(
+    cluster.execute_command(
+        "import platform; print(platform.python_version())",
+        cluster_id=cluster_id,
+    )
+)
+```
 
 ### Notes
 - Functions guard imports with `require_databricks_sdk()` and `require_pyspark()` to give clear errors when dependencies are missing.
