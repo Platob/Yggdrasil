@@ -552,13 +552,10 @@ class EmbeddedFunction:
         import base64 as _b64
         import os as _os
 
-        # Collect unique, non-empty dependency root paths
-        roots = sorted({
-            _os.path.dirname(d.root_path) for d in self.dependencies_map if d.root_path
-        })
-
         if self.package_root:
-            roots += _os.path.dirname(self.package_root)
+            roots = [_os.path.dirname(self.package_root)]
+        else:
+            roots = []
 
         imports = set(d.submodule for d in self.dependencies_map)
 
