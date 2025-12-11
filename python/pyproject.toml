@@ -5,7 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yggdrasil"
 version = "0.1.0"
+description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [
+  { name = "Yggdrasil contributors" },
+]
+keywords = ["arrow", "polars", "pandas", "spark", "databricks", "typing", "dataclass", "serialization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Typing :: Typed",
+]
 dependencies = [
   "requests",
   "polars",
@@ -24,6 +45,11 @@ dev = [
   "ruff",
   "mypy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Platob/Yggdrasil"
+Repository = "https://github.com/Platob/Yggdrasil"
+Documentation = "https://github.com/Platob/Yggdrasil/tree/main/python/docs"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

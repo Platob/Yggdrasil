@@ -20,6 +20,13 @@ uv pip install -e .[dev]
 
 Then explore the quickstart examples in [`python/README.md`](python/README.md).
 
+## Publishing configuration
+The GitHub Actions workflow at [`.github/workflows/publish.yml`](.github/workflows/publish.yml) publishes the Python package on pushes to the `main` branch. To authorize uploads:
+
+1. In your PyPI account, create an **API token** scoped to the project (Account settings → API tokens → *Add API token*).
+2. In the GitHub repository settings, add a new **Actions secret** named `PYPI_API_TOKEN` with the token value. Use `__token__` as the username is already configured in the workflow.
+3. Push to `main` (or trigger the workflow manually). The workflow will build from `python/` and upload to PyPI using the stored secret.
+
 ## Type conversion highlights
 The `yggdrasil.types.cast.convert` entry point connects multiple dataframe ecosystems with optional Arrow-aware casting hints and convenient scalar parsing:
 
