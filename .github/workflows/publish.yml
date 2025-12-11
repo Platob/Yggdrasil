@@ -1,8 +1,9 @@
 name: Publish Python package
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -30,7 +31,7 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@v1.10.3
         with:
-          packages-dir: python/dist
+          packages_dir: python/dist
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          skip-existing: true
+          skip-existing: false
