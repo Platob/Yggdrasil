@@ -58,6 +58,9 @@ class StatementResult:
     base: StatementResponse
     workspace: Workspace | None = None
 
+    def __iter__(self):
+        return self.arrow_batches()
+
     @property
     def status(self):
         return self.base.status

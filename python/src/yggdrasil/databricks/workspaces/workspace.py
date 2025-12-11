@@ -221,11 +221,14 @@ class Workspace:
     # Path helpers
     # ------------------------------------------------------------------ #
 
-    def cache_volume_folder(self, suffix: Optional[str] = None) -> str:
+    @staticmethod
+    def cache_user_folder(
+        suffix: Optional[str] = None
+    ) -> str:
         """
         Shared cache base under Volumes for the current user.
         """
-        base = f"/Shared/.ygg/cache/{self.current_user.name}"
+        base = f"/Shared/.ygg/cache"
 
         if not suffix:
             return base
@@ -866,7 +869,7 @@ class WorkspaceObject(ABC):
         self.workspace.__exit__(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
     def connect(self):
-        self.workspace.connect()
+        self.workspace = self.workspace.connect()
         return self
 
     def sdk(self):
