@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.1.0"
+version = "0.1.1"  # bump this, 0.1.0 is cursed now
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
-readme = "README.md"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
   { name = "Yggdrasil contributors" },
@@ -34,7 +33,7 @@ dependencies = [
   "numpy>=1.26",
   "pyarrow>=16",
   "dill",
-  "databricks-sdk"
+  "databricks-sdk",
 ]
 
 [project.optional-dependencies]
@@ -52,7 +51,8 @@ Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://github.com/Platob/Yggdrasil/tree/main/python/docs"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

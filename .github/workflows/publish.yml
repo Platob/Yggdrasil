@@ -28,7 +28,7 @@ jobs:
       - name: Build sdist and wheel
         run: |
           cd python
-          rm -rf dist
+          rm -rf dist build .egg-info
           python -m build
 
       - name: Publish to PyPI (token)
@@ -36,5 +36,5 @@ jobs:
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: python/dist   # <--- IMPORTANT: relative to repo root
+          packages-dir: python/dist
           skip-existing: false
