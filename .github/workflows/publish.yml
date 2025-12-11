@@ -3,20 +3,15 @@ name: Publish Python package
 on:
   push:
     branches:
-      - main          # trigger on pushes to main
-  workflow_dispatch:   # also allow manual runs
+      - main
+  workflow_dispatch:
 
 permissions:
-  contents: read       # token-based auth, no OIDC needed
+  contents: read
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-
-    # All run: steps below will execute inside ./python
-    defaults:
-      run:
-        working-directory: python
 
     steps:
       - name: Checkout repository
@@ -30,16 +25,16 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade pip build
 
-      - name: Clean previous builds
-        run: rm -rf dist
-
       - name: Build sdist and wheel
-        run: python -m build
+        run: |
+          cd python
+          rm -rf dist
+          python -m build
 
       - name: Publish to PyPI (token)
         uses: pypa/gh-action-pypi-publish@v1.10.3
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: dist        # relative to working-directory (python/)
+          packages-dir: python/dist   # <--- IMPORTANT: relative to repo root
           skip-existing: false
