@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yggdrasil"
+name = "ygg"
 version = "0.1.0"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = "README.md"
