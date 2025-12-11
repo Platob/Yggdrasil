@@ -480,7 +480,7 @@ class Workspace:
             )
 
         with self.connect() as connected:
-            sdk = WorkspaceClient()
+            sdk = connected.sdk()
 
             # Normalize content to bytes once
             if hasattr(content, "read"):  # BinaryIO

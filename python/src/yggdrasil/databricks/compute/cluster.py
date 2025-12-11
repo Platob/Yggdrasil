@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import importlib
 import inspect
 import os
 import shutil
@@ -210,6 +211,7 @@ class Cluster(WorkspaceObject):
         self,
         cluster_name: Optional[str] = None,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ):
         found = self.find_cluster(
@@ -222,18 +224,21 @@ class Cluster(WorkspaceObject):
             return found.update(
                 cluster_name=cluster_name,
                 libraries=libraries,
+                upload_local_lib=upload_local_lib,
                 **cluster_spec
             )
 
         return self.create(
             cluster_name=cluster_name,
             libraries=libraries,
+            upload_local_lib=upload_local_lib,
             **cluster_spec
         )
 
     def create(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ) -> str:
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
@@ -245,16 +250,17 @@ class Cluster(WorkspaceObject):
             if k not in _CREATE_ARG_NAMES
         })
 
-        self.install_libraries(libraries=libraries)
+        self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
 
         return self
 
     def update(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ) -> "Cluster":
-        self.install_libraries(libraries=libraries)
+        self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
 
         existing_details = {
             k: v
@@ -503,6 +509,7 @@ print(path)
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        upload_local_lib: bool | None = None,
     ):
         if not libraries:
             return self
@@ -512,55 +519,114 @@ print(path)
         wsdk.libraries.install(
             cluster_id=self.cluster_id,
             libraries=[
-                self._check_library(_)
+                self._check_library(_, upload_local_lib=upload_local_lib)
                 for _ in libraries if _
             ]
         )
 
         return self
 
-    def _check_library(self, value: Any):
+    def _check_library(
+        self,
+        value,
+        upload_local_lib: bool | None = None,
+    ) -> Library:
         if isinstance(value, Library):
             return value
 
         if isinstance(value, str):
-            if os.path.isfile(value):
-                target_path = self.workspace.cache_user_folder(suffix=f"/clusters/{self.cluster_id}/libraries/{os.path.basename(value)}")
+            original_value = value
 
-                self.workspace.upload_local_file(
-                    local_path=value,
-                    target_path=target_path
-                )
+            # 1) If it's an existing path (file or dir), upload as-is
+            if os.path.exists(value):
+                value = self._upload_local_path(value)
 
-                value = target_path
-            elif os.path.isdir(value):
-                value = _zip_folder(value)  # now `value` is /tmp/.../my-lib.zip
+            # 2) If no path exists, but copy_local_lib=True, try to resolve from current env
+            elif upload_local_lib:
+                pkg_path = _resolve_local_package_path(original_value)
+                if pkg_path is not None and os.path.exists(pkg_path):
+                    value = self._upload_local_path(pkg_path)
+                # if we can't resolve it locally, we just fall through to PyPI handling
 
-                # keep your original logic
-                target_path = self.workspace.cache_user_folder(
-                    suffix=f"/clusters/{self.cluster_id}/libraries/{os.path.basename(value)}"
-                )
+            # 3) Now `value` is either:
+            #    - a workspace/DBFS path (dbfs:/.../something.whl/.zip/.jar/requirements.txt)
+            #    - or still the original string (e.g. "pandas") for PyPI install
 
-                self.workspace.upload_local_file(
-                    local_path=value,
-                    target_path=target_path,
-                )
-
-                # now `value` is the workspace/DBFS path, not local
-                value = target_path
-
+            # workspace / file-based libs
             if value.endswith(".jar"):
                 return Library(jar=value)
             elif value.endswith("requirements.txt"):
                 return Library(requirements=value)
             elif value.endswith(".whl"):
                 return Library(whl=value)
-            return Library(pypi=PythonPyPiLibrary(
-                package=value,
-                repo=os.getenv("PIP_EXTRA_INDEX_URL")
-            ))
+            elif value.endswith(".zip"):
+                # Databricks can install zip as Python lib via `whl` field (zip or whl path)
+                return Library(whl=value)
+
+            # 4) Fallback: treat as PyPI package name
+            return Library(
+                pypi=PythonPyPiLibrary(
+                    package=value,
+                    repo=os.getenv("PIP_EXTRA_INDEX_URL"),
+                )
+            )
 
         raise ValueError(f"Cannot build Library object from {type(value)}")
+
+    # ----------------- helpers ----------------
+    def _upload_local_path(self, local_path: str) -> str:
+        """
+        Given a local file/folder, optionally zip, upload to workspace cache, and
+        return the workspace/DBFS target path.
+        """
+        local_path = Path(local_path)
+
+        # If folder -> zip it first
+        if local_path.is_dir():
+            tmp_dir = Path(tempfile.mkdtemp())
+            zip_base = tmp_dir / local_path.name
+            archive_path = shutil.make_archive(
+                base_name=str(zip_base),
+                format="zip",
+                root_dir=str(local_path),
+            )
+            upload_source = Path(archive_path)
+        else:
+            upload_source = local_path
+
+        target_path = (
+            self.workspace.cache_user_folder(
+                suffix=f"/clusters/{self.cluster_id}/libraries/{upload_source.name}"
+            )
+        )
+
+        self.workspace.upload_local_file(
+            local_path=str(upload_source),
+            target_path=target_path,
+        )
+
+        return target_path
+
+
+def _resolve_local_package_path(pkg_name: str) -> str | None:
+    """Try to import a package/module from current env and return its folder/file path."""
+    try:
+        mod = importlib.import_module(pkg_name)
+    except ModuleNotFoundError:
+        return None
+
+    mod_file = getattr(mod, "__file__", None)
+    if not mod_file:
+        return None
+
+    p = Path(mod_file)
+
+    # package: /.../pkg/__init__.py -> use folder
+    if p.name == "__init__.py":
+        return str(p.parent)
+
+    # single module: /.../pkg.py -> use file directly
+    return str(p)
 
 
 def _zip_folder(folder_path: str) -> str:
