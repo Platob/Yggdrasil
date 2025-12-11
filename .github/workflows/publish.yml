@@ -1,8 +1,9 @@
 name: Publish Python package
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -33,4 +34,4 @@ jobs:
           packages-dir: python/dist
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          skip-existing: true
+          skip-existing: false
