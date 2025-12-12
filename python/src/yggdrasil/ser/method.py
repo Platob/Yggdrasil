@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import inspect
 import os
@@ -8,6 +9,8 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, List, Mapping
+
+import dill
 
 
 # ---------- small data structs -------------------------------------------------
@@ -62,6 +65,8 @@ def _find_package_root_from_file(module_file: str) -> str:
     # If the current dir itself is a package, mark it
     if os.path.isfile(os.path.join(current_dir, "__init__.py")):
         last_pkg_dir = current_dir
+    else:
+        return module_file
 
     # Walk upwards while parent is also a package
     while True:
@@ -223,7 +228,7 @@ def _build_dependency_infos(
 
 
 @dataclass
-class EmbeddedFunction:
+class SerializedFunction:
     """
     Function + its source code embedded as text.
 
@@ -251,9 +256,7 @@ class EmbeddedFunction:
     package_root: Optional[str] = None
 
     # internal cache for the rebuilt function
-    _compiled: Callable[..., Any] | None = field(
-        default=None, init=False, repr=False
-    )
+    _compiled: Callable[..., Any] | None = field(default=None, init=False, repr=False)
 
     # ---------- constructors ----------
     @classmethod
@@ -322,7 +325,7 @@ class EmbeddedFunction:
         return _build_dependency_infos(raw_deps)
 
     @classmethod
-    def from_callable(cls, func: Callable[..., Any]) -> "EmbeddedFunction":
+    def from_callable(cls, func: Callable[..., Any]) -> "SerializedFunction":
         """
         Build an EmbeddedFunction from a function.
 
@@ -528,11 +531,12 @@ class EmbeddedFunction:
 
     def to_command(
         self,
-        args: list,
-        kwargs: dict,
+        result_tag: str,
+        args: list = None,
+        kwargs: dict = None,
         env_keys: Optional[List[str]] = None,
         use_dill: bool = False,
-        result_tag: Optional[str] = None,
+
     ) -> str:
         """
         Build a Python command string suitable for Databricks `command_execution`.
@@ -630,8 +634,8 @@ class EmbeddedFunction:
             lines.append("    globals()[__name] = importlib.import_module(__mod)")
 
         # Serialize args/kwargs as plain data
-        args_ser = _b64_dumps(tuple(args))
-        kwargs_ser = _b64_dumps(dict(kwargs))
+        args_ser = _b64_dumps(tuple(args or []))
+        kwargs_ser = _b64_dumps(dict(kwargs or {}))
 
         if use_dill:
             lines.append(
@@ -649,27 +653,84 @@ class EmbeddedFunction:
 
         # --- remote-side deserialization + log capture ---
         lines.extend([
+            # deserialize args / kwargs
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
             f"_embedded_kwargs = dill.loads(base64.b64decode({kwargs_ser!r}.encode('utf-8')))",
             "",
-            "_embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
-            "try:",
-            "    _ser_result = dill.dumps(_embedded_result)",
-            "except Exception:",
-            "    _ser_result = dill.dumps(pandas.DataFrame(_embedded_result))",
+            "import traceback as _tb",
             "",
-            "payload = {",
-            "    'result_b64': base64.b64encode(_ser_result).decode('utf-8'),",
-            "}",
+            "try:",
+            "    _embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
+            "    try:",
+            "        _ser_result = dill.dumps(_embedded_result)",
+            "    except Exception:",
+            "        # fallback: try to coerce to pandas.DataFrame",
+            "        _ser_result = dill.dumps(pandas.DataFrame(_embedded_result))",
+            "    _error_payload = None",
+            "except Exception as _e:",
+            "    _error_payload = {",
+            "        'type': type(_e).__name__,",
+            "        'message': str(_e),",
+            "        'traceback': _tb.format_exc(),",
+            "    }",
+            "    _ser_result = dill.dumps(_error_payload)",
         ])
 
-        if result_tag is not None:
-            lines.append(
-                f"print({result_tag!r} + json.dumps(payload) + {result_tag!r})"
-            )
-        else:
-            lines.append(
-                "print('<<<EMBEDDED_RESULT_START>>>' + json.dumps(payload) + '<<<EMBEDDED_RESULT_END>>>')"
-            )
+        lines.append(
+            f"print({result_tag!r} + base64.b64encode(_ser_result).decode('utf-8') + {result_tag!r})"
+        )
 
         return "\n".join(lines)
+
+    def parse_command_result(self, result: str, raise_error: bool = True):
+        """
+        Decode + deserialize remote result.
+
+        On success:
+            returns whatever the remote function produced.
+
+        On remote error:
+            expects a dict payload:
+                {
+                    'type': <exception class name>,
+                    'message': <str(e)>,
+                    'traceback': <formatted traceback string>,
+                }
+            and raises RemoteExecutionError.
+        """
+        raw = base64.b64decode(result)
+        obj = dill.loads(raw)
+
+        # Error payload from remote
+        if isinstance(obj, dict) and "traceback" in obj and "type" in obj:
+            error = RemoteExecutionError(
+                remote_type=obj.get("type", "Exception"),
+                remote_message=obj.get("message", ""),
+                remote_traceback=obj.get("traceback", ""),
+            )
+
+            if raise_error:
+                raise error
+            return error
+
+        return obj
+
+
+class RemoteExecutionError(Exception):
+    """
+    Raised when remote code execution failed.
+
+    Carries remote exception type, message, and full traceback string
+    from the cluster side.
+    """
+
+    def __init__(self, remote_type: str, remote_message: str, remote_traceback: str):
+        self.remote_type = remote_type
+        self.remote_message = remote_message
+        self.remote_traceback = remote_traceback
+
+        msg = f"Remote {remote_type}: {remote_message}"
+        super().__init__(msg)
+
+    def __str__(self) -> str:
+        return f"{super().__str__()}\n\nRemote traceback:\n{self.remote_traceback}"

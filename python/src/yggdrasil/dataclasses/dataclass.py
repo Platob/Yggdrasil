@@ -10,8 +10,6 @@ __all__ = [
     "get_dataclass_arrow_field"
 ]
 
-from pandas.core.dtypes.inference import is_dataclass
-
 DATACLASS_ARROW_FIELD_CACHE: dict[type, pa.Field] = {}
 
 
@@ -31,7 +29,7 @@ def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
     if is_yggdataclass(cls_or_instance):
         return cls_or_instance.__arrow_field__()
 
-    if is_dataclass(cls_or_instance):
+    if dataclasses.is_dataclass(cls_or_instance):
         cls = cls_or_instance
         if not isclass(cls_or_instance):
             cls = cls_or_instance.__class__

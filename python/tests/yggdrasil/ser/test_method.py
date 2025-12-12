@@ -6,7 +6,7 @@ import types
 
 import pytest
 from yggdrasil.ser import (
-    EmbeddedFunction,
+    SerializedFunction,
     DependencyInfo,
     DependencyCheckResult,
 )
@@ -36,11 +36,11 @@ def test_from_callable_rejects_bound_method():
 
     f = Foo().bar
     with pytest.raises(ValueError):
-        EmbeddedFunction.from_callable(f)
+        SerializedFunction.from_callable(f)
 
 
 def test_from_callable_supports_top_level_function():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
 
     assert emb.name == "top_level_add"
     assert "def top_level_add" in emb.source
@@ -54,7 +54,7 @@ def test_from_callable_supports_local_function_without_nonlocals():
         return inner
 
     inner_fn = outer()
-    emb = EmbeddedFunction.from_callable(inner_fn)
+    emb = SerializedFunction.from_callable(inner_fn)
 
     # Should have extracted a valid def for inner
     assert "def inner" in emb.source
@@ -62,7 +62,7 @@ def test_from_callable_supports_local_function_without_nonlocals():
 
 
 def test_call_executes_correctly_and_caches_compiled_function():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
 
     result1 = emb(2, 3)
     assert result1 == 5
@@ -76,7 +76,7 @@ def test_call_executes_correctly_and_caches_compiled_function():
 
 
 def test_list_dependencies_single_module_shape_and_content():
-    emb = EmbeddedFunction.from_callable(uses_globals_and_modules)
+    emb = SerializedFunction.from_callable(uses_globals_and_modules)
 
     deps = emb.list_dependencies()
     assert isinstance(deps, list)
@@ -91,7 +91,7 @@ def test_list_dependencies_single_module_shape_and_content():
 
 
 def test_list_dependencies_multiple_modules_shape_and_content():
-    emb = EmbeddedFunction.from_callable(uses_multiple_modules)
+    emb = SerializedFunction.from_callable(uses_multiple_modules)
 
     deps = emb.list_dependencies()
     roots = {d.root_module for d in deps}
@@ -105,7 +105,7 @@ def test_list_dependencies_multiple_modules_shape_and_content():
 
 
 def test_list_dependencies_paths_are_directories_or_none():
-    emb = EmbeddedFunction.from_callable(uses_multiple_modules)
+    emb = SerializedFunction.from_callable(uses_multiple_modules)
 
     deps = emb.list_dependencies()
     for d in deps:
@@ -114,7 +114,7 @@ def test_list_dependencies_paths_are_directories_or_none():
 
 
 def test_check_dependencies_reports_importable_using_submodule():
-    emb = EmbeddedFunction.from_callable(uses_multiple_modules)
+    emb = SerializedFunction.from_callable(uses_multiple_modules)
 
     status = emb.check_dependencies()
 
@@ -129,7 +129,7 @@ def test_check_dependencies_reports_importable_using_submodule():
 
 
 def test_build_creates_independent_function_object():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
 
     fn1 = emb.build()
     fn2 = emb.build()
@@ -140,7 +140,7 @@ def test_build_creates_independent_function_object():
 
 
 def test_call_matches_build():
-    emb = EmbeddedFunction.from_callable(uses_globals_and_modules)
+    emb = SerializedFunction.from_callable(uses_globals_and_modules)
 
     via_call = emb(9.0)
     via_build = emb.build()(9.0)
@@ -149,7 +149,7 @@ def test_call_matches_build():
 
 
 def test_package_root_is_captured_for_module_defined_function():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
 
     # For functions defined in this test module, we expect some package root dir
     assert emb.package_root is not None
@@ -162,7 +162,7 @@ def test_package_root_is_captured_for_module_defined_function():
 
 
 def test_to_command_default_result_markers_present():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
 
     cmd = emb.to_command(args=[1, 2], kwargs={}, env_keys=None)
 
@@ -171,7 +171,7 @@ def test_to_command_default_result_markers_present():
 
 
 def test_to_command_custom_result_tag_replaces_markers():
-    emb = EmbeddedFunction.from_callable(top_level_add)
+    emb = SerializedFunction.from_callable(top_level_add)
     tag = "###RESULT###"
 
     cmd = emb.to_command(

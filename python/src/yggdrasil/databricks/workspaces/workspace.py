@@ -2,19 +2,19 @@ import base64
 import dataclasses
 import io
 import os
-import platform
 import posixpath
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import (
     Any,
     BinaryIO,
     Iterator,
     List,
     Optional,
-    Union,
+    Union, Set,
 )
 
 from ...libs import require_pyspark
@@ -50,6 +50,39 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+PROJECT_ROOT_MARKERS: Set[str] = {
+    ".git",
+    "pyproject.toml",
+    "setup.cfg",
+    "requirements.txt",
+    ".idea",
+}
+
+
+def infer_project_root(start: Optional[Path] = None) -> Path:
+    """
+    Infer the 'project root' from the current working directory by walking
+    upwards until we hit something that looks like a project boundary
+    (git repo, Python project, or IDE project).
+
+    If none of the markers are found, returns the starting directory.
+    """
+    path = (start or Path.cwd()).resolve()
+
+    for candidate in [path, *path.parents]:
+        if any((candidate / marker).exists() for marker in PROJECT_ROOT_MARKERS):
+            return candidate
+
+    return path
+
+
+def infer_project_name(start: Optional[Path] = None) -> str:
+    """
+    Infer a project name purely from the filesystem, based on the
+    inferred project root's directory name.
+    """
+    return infer_project_root(start).name
 
 
 def _get_remote_size(sdk, target_path: str) -> Optional[int]:
@@ -308,8 +341,6 @@ class Workspace:
         if self._sdk is None:
             require_databricks_sdk()
 
-
-
             # Normalize auth_type once
             auth_type = self.auth_type
             if isinstance(auth_type, AuthType):
@@ -340,8 +371,8 @@ class Workspace:
                 "debug_truncate_bytes": self.debug_truncate_bytes,
                 "debug_headers": self.debug_headers,
                 "rate_limit": self.rate_limit,
-                "product": self.product or os.getenv("DATABRICKS_PROJECT") or "unknown",
-                "product_version": self.product_version or os.getenv("DATABRICKS_PROJECT_VERSION") or "0.0.0",
+                "product": self.product or os.getenv("DATABRICKS_PRODUCT"),
+                "product_version": self.product_version or os.getenv("DATABRICKS_PRODUCT_VERSION"),
             }
 
             build_kwargs = {
@@ -855,6 +886,11 @@ class Workspace:
         from ..sql import SQLEngine
 
         return SQLEngine(workspace=self)
+    
+    def clusters(self):
+        from ..compute.cluster import Cluster
+
+        return Cluster(workspace=self)
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +902,10 @@ DBXWorkspace = Workspace
 @dataclass
 class WorkspaceObject(ABC):
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
+
+    def __post_init__(self):
+        if self.workspace is None:
+            self.workspace = Workspace()
 
     def __enter__(self):
         self.workspace.__enter__()

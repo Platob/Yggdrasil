@@ -36,6 +36,12 @@ def cast_to_struct_array(
     if target_field is None:
         return arr
 
+    source_field = options.source_field or arrow_array_to_field(arr, options)
+    source_type = source_field.type
+    struct_options = options.copy(
+        source_field=source_field
+    )
+
     if isinstance(arr, pa.ChunkedArray):
         casted_chunks = [
             cast_to_struct_array(chunk, options)
@@ -43,81 +49,122 @@ def cast_to_struct_array(
         ]
         return pa.chunked_array(casted_chunks, type=target_field.type)
 
-    source_field = options.source_field or array_to_field(arr, options)
+    if pa.types.is_struct(source_type):
+        return arrow_struct_to_struct_array(arr, struct_options)
+    elif pa.types.is_map(source_type):
+        return arrow_map_to_struct_array(arr, struct_options)
+    else:
+        raise ValueError(f"Cannot cast {source_field} to {target_field}")
+
+
+@register_converter(pa.MapArray, pa.StructArray)
+def arrow_map_to_struct_array(
+    arr: pa.MapArray,
+    options: Optional[CastOptions] = None,
+) -> pa.StructArray:
+    """Cast arrays to a struct Arrow array."""
+    options = CastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    source_field = options.source_field or arrow_array_to_field(arr, options)
     target_type: pa.StructType = target_field.type
 
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
     children: List[pa.Array] = []
 
-    # Case 1: struct -> struct
-    if pa.types.is_struct(arr.type):
-        name_to_index = {
-            field.name: idx for idx, field in enumerate(arr.type)
-        }
-        folded_to_index = {
-            field.name.casefold(): idx for idx, field in enumerate(arr.type)
-        }
+    map_type: pa.MapType = arr.type
 
-        for i, target_field in enumerate(target_type):
-            target_field: pa.Field = target_field
+    for child_target_field in target_type:
+        values = pc.map_lookup(arr, child_target_field.name, "first")
 
-            if target_field.name in name_to_index:
-                child_idx = name_to_index[target_field.name]
-                child_arr = arr.field(child_idx)
-                child_source_field = arr.type[child_idx]
-            elif (
-                not options.strict_match_names
-                and target_field.name.casefold() in folded_to_index
-            ):
-                child_idx = folded_to_index[target_field.name.casefold()]
-                child_arr = arr.field(child_idx)
-                child_source_field = arr.type[child_idx]
-            elif not options.strict_match_names and i < arr.type.num_fields:
-                # Positional fallback
-                child_idx = i
-                child_arr = arr.field(child_idx)
-                child_source_field = arr.type[child_idx]
-            elif options.add_missing_columns:
-                # Field missing -> create default-valued array
-                child_arr = default_arrow_array(
-                    dtype=target_field.type,
-                    nullable=target_field.nullable,
-                    size=len(arr),
-                    memory_pool=options.memory_pool
-                )
-                child_source_field = array_to_field(child_arr, options)
-            else:
-                raise pa.ArrowInvalid(
-                    f"Missing field {target_field.name} while casting struct"
-                )
+        casted = cast_arrow_array(
+            values,
+            options.copy(
+                source_field=map_type.item_field,
+                target_field=child_target_field
+            )
+        )
 
-            children.append(
-                cast_arrow_array(
-                    child_arr,
-                    options.copy(
-                        source_field=child_source_field,
-                        target_field=target_field
-                    )
-                )
+        children.append(casted)
+
+    return pa.StructArray.from_arrays(
+        children,
+        fields=list(target_type),
+        mask=mask,
+        memory_pool=options.memory_pool
+    )
+
+
+@register_converter(pa.StructArray, pa.StructArray)
+def arrow_struct_to_struct_array(
+    arr: pa.StructArray,
+    options: Optional[CastOptions] = None,
+) -> pa.StructArray:
+    """Cast arrays to a struct Arrow array."""
+    options = CastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    source_field = options.source_field or arrow_array_to_field(arr, options)
+    target_type: pa.StructType = target_field.type
+
+    mask = arr.is_null() if source_field.nullable and target_field.nullable else None
+    children: List[pa.Array] = []
+
+    name_to_index = {
+        field.name: idx for idx, field in enumerate(arr.type)
+    }
+    folded_to_index = {
+        field.name.casefold(): idx for idx, field in enumerate(arr.type)
+    }
+
+    for i, child_target_field in enumerate(target_type):
+        child_target_field: pa.Field = child_target_field
+
+        if child_target_field.name in name_to_index:
+            child_idx = name_to_index[child_target_field.name]
+            child_arr = arr.field(child_idx)
+            child_source_field = arr.type[child_idx]
+        elif (
+            not options.strict_match_names
+            and child_target_field.name.casefold() in folded_to_index
+        ):
+            child_idx = folded_to_index[child_target_field.name.casefold()]
+            child_arr = arr.field(child_idx)
+            child_source_field = arr.type[child_idx]
+        elif not options.strict_match_names and i < arr.type.num_fields:
+            # Positional fallback
+            child_idx = i
+            child_arr = arr.field(child_idx)
+            child_source_field = arr.type[child_idx]
+        elif options.add_missing_columns:
+            # Field missing -> create default-valued array
+            child_arr = default_arrow_array(
+                dtype=child_target_field.type,
+                nullable=child_target_field.nullable,
+                size=len(arr),
+                memory_pool=options.memory_pool
+            )
+            child_source_field = arrow_array_to_field(child_arr, options)
+        else:
+            raise pa.ArrowInvalid(
+                f"Missing field {child_target_field.name} while casting struct"
             )
 
-    # Case 2: map -> struct (e.g. map<string, value> with key-based lookup)
-    else:
-        map_arr = arr
-        map_type: pa.MapType = arr.type
-
-        for target_field in target_type:
-            values = pc.map_lookup(map_arr, target_field.name, "first")
-
-            casted = cast_arrow_array(
-                values,
+        children.append(
+            cast_arrow_array(
+                child_arr,
                 options.copy(
-                    source_field=map_type.item_field,
-                    target_field=target_field
+                    source_field=child_source_field,
+                    target_field=child_target_field
                 )
             )
-
-            children.append(casted)
+        )
 
     return pa.StructArray.from_arrays(
         children,
@@ -138,6 +185,8 @@ def cast_to_list_array(
     if target_field is None:
         return arr
 
+    source_field = options.source_field or arrow_array_to_field(arr, options)
+
     if isinstance(arr, pa.ChunkedArray):
         casted_chunks = [
             cast_to_list_array(chunk, options)
@@ -146,7 +195,6 @@ def cast_to_list_array(
         return pa.chunked_array(casted_chunks, type=target_field.type)
 
     target_type: Union[pa.ListType, pa.FixedSizeListType] = target_field.type
-    source_field = options.source_field or array_to_field(arr, options)
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
     if is_list_like(source_field.type):
@@ -199,6 +247,8 @@ def cast_to_map_array(
     if target_field is None:
         return arr
 
+    source_field = options.source_field or arrow_array_to_field(arr, options)
+
     if isinstance(arr, pa.ChunkedArray):
         casted_chunks = [
             cast_to_map_array(chunk, options)
@@ -206,38 +256,73 @@ def cast_to_map_array(
         ]
         return pa.chunked_array(casted_chunks, type=target_field.type)
 
-    source_field = options.source_field or array_to_field(arr, options)
+    sub_options = options.copy(
+        source_field=source_field
+    ) if options.source_field is None else options
+
+    # Case 1: map -> map
+    if pa.types.is_map(source_field.type):
+        return arrow_map_to_map_array(arr, sub_options)
+    elif pa.types.is_struct(source_field.type):
+        return arrow_struct_to_map_array(arr, sub_options)
+    else:
+        raise ValueError(f"Cannot cast {source_field} to {target_field}")
+
+
+@register_converter(pa.MapArray, pa.MapArray)
+def arrow_map_to_map_array(
+    arr: pa.MapArray,
+    options: Optional[CastOptions] = None,
+) -> pa.MapArray:
+    """Cast arrays to a map Arrow array."""
+    options = CastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    source_field = options.source_field or arrow_array_to_field(arr, options)
     target_type: pa.MapType = target_field.type
     mask = arr.is_null() if source_field.nullable and target_field.nullable else None
 
-    # Case 1: map -> map
-    if pa.types.is_map(arr.type):
-        keys = cast_arrow_array(
-            arr.keys,
-            options.copy(
-                source_field=arr.type.key_field,
-                target_field=target_type.key_field,
-            )
+    keys = cast_arrow_array(
+        arr.keys,
+        options.copy(
+            source_field=arr.type.key_field,
+            target_field=target_type.key_field,
         )
-        items = cast_arrow_array(
-            arr.items,
-            options.copy(
-                source_field=arr.type.item_field,
-                target_field=target_type.item_field,
-            )
+    )
+    items = cast_arrow_array(
+        arr.items,
+        options.copy(
+            source_field=arr.type.item_field,
+            target_field=target_type.item_field,
         )
-        return pa.MapArray.from_arrays(
-            arr.offsets,
-            keys,
-            items,
-            mask=mask,
-            type=target_type,
-            pool=options.memory_pool
-        )
+    )
 
-    # Case 2: struct -> map (field.name => value)
-    if not pa.types.is_struct(arr.type):
-        raise pa.ArrowInvalid(f"Cannot cast non-map array to map type {target_type}")
+    return pa.MapArray.from_arrays(
+        arr.offsets,
+        keys,
+        items,
+        mask=mask,
+        type=target_type,
+        pool=options.memory_pool
+    )
+
+
+@register_converter(pa.MapArray, pa.MapArray)
+def arrow_struct_to_map_array(
+    arr: pa.StructArray,
+    options: Optional[CastOptions] = None,
+) -> pa.MapArray:
+    """Cast arrays to a map Arrow array."""
+    options = CastOptions.check_arg(options)
+    target_field = options.target_field
+
+    if target_field is None:
+        return arr
+
+    target_type: pa.MapType = target_field.type
 
     num_rows = len(arr)
     offsets = [0]
@@ -285,14 +370,20 @@ def cast_to_map_array(
 
 
 def cast_primitive_array(
-    arr: pa.Array,
+    arr: Union[pa.ChunkedArray, pa.Array],
     options: CastOptions | None = None,
 ) -> pa.Array:
     """Cast simple scalar arrays via pyarrow.compute.cast."""
     options = CastOptions.check_arg(options)
+
+    source_field = options.source_field or arrow_array_to_field(arr, None)
     target_field = options.target_field
 
     if target_field is None:
+        return arr
+    elif source_field.type == target_field.type:
+        if source_field.nullable and not target_field.nullable:
+            return check_array_nullability(arr, options)
         return arr
 
     if is_string_like(target_field.type) and pa.types.is_timestamp(target_field.type):
@@ -323,7 +414,7 @@ def check_array_nullability(
     if target_field is None:
         return arr
 
-    source_field = options.source_field or array_to_field(arr, options)
+    source_field = options.source_field or arrow_array_to_field(arr, options)
 
     if not source_field.nullable or target_field.nullable:
         return arr
@@ -461,11 +552,20 @@ def cast_arrow_array(
     options = CastOptions.check_arg(options)
     target_field = options.target_field
 
-    # No target -> nothing to do
     if target_field is None:
         return array
 
+    source_field = options.source_field or arrow_array_to_field(array, None)
+
+    if source_field.type == target_field.type:
+        if source_field.nullable and not target_field.nullable:
+            return check_array_nullability(array, options)
+        return array
+
     target_type = target_field.type
+    sub_options = options.copy(
+        source_field=source_field
+    ) if options.source_field is None else options
 
     if pa.types.is_null(target_type):
         return check_array_nullability(
@@ -473,21 +573,19 @@ def cast_arrow_array(
                 array, target_type,
                 safe=False, memory_pool=options.memory_pool
             ),
-            options=options.copy(
-                source_field=None
-            )
+            options=sub_options
         )
 
     if pa.types.is_nested(target_type):
         if pa.types.is_struct(target_type):
-            return cast_to_struct_array(array, options)
+            return cast_to_struct_array(array, sub_options)
         elif is_list_like(target_type):
-            return cast_to_list_array(array, options)
+            return cast_to_list_array(array, sub_options)
         elif pa.types.is_map(target_type):
-            return cast_to_map_array(array, options)
+            return cast_to_map_array(array, sub_options)
         raise ValueError(f"Unsupported nested target type {target_type}")
     else:
-        return cast_primitive_array(array, options)
+        return cast_primitive_array(array, sub_options)
 
 
 def arrow_strptime(
@@ -909,7 +1007,7 @@ def to_polars_arrow_type(dtype: pa.DataType) -> pa.DataType:
 # ---------------------------------------------------------------------------
 @register_converter(pa.Array, pa.Field)
 @register_converter(pa.ChunkedArray, pa.Field)
-def array_to_field(
+def arrow_array_to_field(
     array: Union[pa.Array, pa.ChunkedArray],
     options: Optional[CastOptions] = None,
 ) -> pa.Field:

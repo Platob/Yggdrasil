@@ -9,8 +9,8 @@ for clusters. Metadata is stored in custom tags prefixed with
 
 from __future__ import annotations
 
-import base64
 import datetime as dt
+import functools
 import importlib
 import inspect
 import os
@@ -19,27 +19,29 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures.thread import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional, Union, List
+from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
 
+from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
+
+from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceObject, Workspace
 from ...libs.databrickslib import databricks_sdk
+from ...ser import SerializedFunction
 
 if databricks_sdk is None:  # pragma: no cover - import guard
     ResourceDoesNotExist = Exception  # type: ignore
-    Language = Any  # type: ignore
-    ResultType = Any  # type: ignore
-    SparkVersion = Any  # type: ignore
 else:  # pragma: no cover - runtime fallback when SDK is missing
     from databricks.sdk import WorkspaceClient, ClustersAPI
     from databricks.sdk.errors import ResourceDoesNotExist
     from databricks.sdk.service.compute import (
-        ClusterDetails, Language, ResultType, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary
+        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary
     )
 
     _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
     _EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
+
 
 __all__ = ["Cluster"]
 
@@ -61,6 +63,7 @@ _PYTHON_BY_DBR: dict[str, tuple[int, int]] = {
 }
 
 
+CURRENT_ENV_CLUSTER: Optional["Cluster"] = None  # whatever the class is
 
 
 @dataclass
@@ -77,20 +80,45 @@ class Cluster(WorkspaceObject):
         Optional existing cluster identifier. Methods that operate on a
         cluster will use this value when ``cluster_id`` is omitted.
     """
-    workspace: Workspace = field(default_factory=Workspace)
     cluster_id: Optional[str] = None
+    
     _details: Optional["ClusterDetails"] = None
 
-    def connect(self):
-        super().connect()
+    # host → Cluster instance
+    _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
 
-        self._details = self.clusters_client().get(cluster_id=self.cluster_id)
+    @classmethod
+    def replicated_current_environment(
+        cls,
+        workspace: Optional["Workspace"] = None,
+    ) -> "Cluster":
+        if workspace is None:
+            workspace = Workspace()  # your default, whatever it is
 
-        return self
+        host = workspace.host
+
+        # 🔥 return existing singleton for this host
+        if host in cls._env_clusters:
+            return cls._env_clusters[host]
+
+        # 🔥 first time for this host → create
+        inst = cls(workspace=workspace)
+
+        inst = inst.create_or_update(
+            cluster_name=inst.workspace.current_user.user_name,
+            python_version=sys.version_info,
+            single_user_name=inst.workspace.current_user.user_name,
+            runtime_engine=RuntimeEngine.PHOTON,
+            autotermination_minutes=30,
+            libraries=["ygg"],
+        )
+
+        cls._env_clusters[host] = inst
+        return inst
 
     @property
     def details(self):
-        if self._details is None:
+        if self._details is None and self.cluster_id is not None:
             self._details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
@@ -98,6 +126,38 @@ class Cluster(WorkspaceObject):
     def details(self, value: "ClusterDetails"):
         self._details = value
         self.cluster_id = value
+
+    @property
+    def spark_version(self) -> str:
+        d = self.details
+        if d is None:
+            return None
+        return d.spark_version
+
+    @property
+    def runtime_version(self):
+        # Extract "major.minor" from strings like "17.3.x-scala2.13-ml-gpu"
+        v = self.spark_version
+
+        if v is None:
+            return None
+
+        parts = v.split(".")
+        if len(parts) < 2:
+            return None
+        return ".".join(parts[:2])  # e.g. "17.3"
+
+    @property
+    def python_version(self) -> Optional[tuple[int, int]]:
+        """Return the cluster Python version as (major, minor), if known.
+
+        Uses the Databricks Runtime -> Python mapping in _PYTHON_BY_DBR.
+        When the runtime can't be mapped, returns ``None``.
+        """
+        v = self.runtime_version
+        if v is None:
+            return None
+        return _PYTHON_BY_DBR.get(v)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -155,6 +215,9 @@ class Cluster(WorkspaceObject):
 
             versions = [v for v in versions if py_for_key(v.key) == py_filter]
 
+            if not versions and py_filter > 12:
+                return self.spark_versions(photon=photon)
+
         return versions
 
     def latest_spark_version(
@@ -164,11 +227,14 @@ class Cluster(WorkspaceObject):
     ):
         versions = self.spark_versions(photon=photon, python_version=python_version)
 
-        max_version = None
+        max_version: SparkVersion = None
 
         for version in versions:
             if max_version is None or version.key > max_version.key:
                 max_version = version
+
+        if max_version is None:
+            raise ValueError(f"No databricks runtime version found for photon={photon} and python_version={python_version}")
 
         return max_version
 
@@ -328,10 +394,8 @@ class Cluster(WorkspaceObject):
 
     def ensure_running(
         self,
-    ):
-        self.details = self.clusters_client().wait_get_cluster_running(cluster_id=self.cluster_id)
-
-        if self._details.state != State.RUNNING:
+    ) -> "Cluster":
+        if self.details.state != State.RUNNING:
             return self.start()
 
         return self
@@ -339,14 +403,10 @@ class Cluster(WorkspaceObject):
     def start(
         self,
         timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
-    ):
+    ) -> "Cluster":
         r = self.clusters_client().start(cluster_id=self.cluster_id)
-
-        if timeout:
-            self.details = r.result(timeout=timeout)
-            return self
-
-        return r
+        self.details = r.result(timeout=timeout)
+        return self
 
     def restart(
         self,
@@ -365,154 +425,99 @@ class Cluster(WorkspaceObject):
     ) -> None:
         self.clusters_client().delete(cluster_id=self.cluster_id)
 
-    # ------------------------------------------------------------------ #
-    # Command execution
-    # ------------------------------------------------------------------ #
-    def execute_command(
+    def execution_context(
         self,
-        command: str,
+        language: Optional["Language"] = None,
+        context_id: Optional[str] = None
+    ) -> ExecutionContext:
+        return ExecutionContext(
+            cluster=self,
+            language=language,
+            context_id=context_id
+        )
+
+    def execute(
+        self,
+        obj: Union[str, Callable],
         *,
         language: Optional["Language"] = None,
+        args: List[Any] = None,
+        kwargs: Dict[str, Any] = None,
+        env_keys: Optional[List[str]] = None,
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
-    ) -> str:
-        """Execute a command string on the cluster and return its output.
+    ):
+        if language is None:
+            language = Language.PYTHON
 
-        Raises a :class:`RuntimeError` with the remote traceback attached
-        when the command fails.
-
-        Parameters
-        ----------
-        command:
-            The code to execute remotely.
-        language:
-            The language to execute (defaults to Python).
-        timeout:
-            Optional override for the execution timeout.
-        result_tag:
-            When provided, looks for two occurrences of this marker in the
-            command output. If found, anything before the first marker is
-            printed for visibility and the text between the markers is
-            returned. If the marker is not found twice, the raw output is
-            returned.
-        """
-        lang = language or Language.PYTHON
-        cid = self.cluster_id
-        timeout = timeout or dt.timedelta(minutes=20)
-
-        client = self._client()
-        context = client.command_execution.create_and_wait(
-            cluster_id=cid, language=lang
-        )
-        context_id = getattr(context, "id", None) or getattr(context, "context_id", None)
-        if not context_id:
-            raise RuntimeError("Failed to create command execution context")
-
-        try:
-            result = client.command_execution.execute_and_wait(
-                cluster_id=cid,
-                context_id=context_id,
-                language=lang,
-                command=command,
+        with self.execution_context(language=language) as ctx:
+            return ctx.execute(
+                obj=obj,
+                args=args,
+                kwargs=kwargs,
+                env_keys=env_keys,
                 timeout=timeout,
+                result_tag=result_tag
             )
-        finally:
-            try:
-                client.command_execution.destroy(
-                    cluster_id=cid, context_id=context_id
-                )
-            except Exception:
-                pass
 
-        if not getattr(result, "results", None):
-            raise RuntimeError("Command execution returned no results")
-
-        res = result.results
-        if res.result_type == ResultType.ERROR:
-            message = res.cause or "Command execution failed"
-            remote_tb = (
-                getattr(res, "data", None)
-                or getattr(res, "stack_trace", None)
-                or getattr(res, "traceback", None)
-            )
-            if remote_tb:
-                message = f"{message}\n\nRemote traceback:\n{remote_tb}"
-            raise RuntimeError(message)
-
-        if res.result_type == ResultType.TEXT:
-            output = getattr(res, "data", "") or ""
-        elif getattr(res, "data", None) is not None:
-            output = str(res.data)
-        else:
-            output = ""
-
-        if result_tag:
-            start = output.find(result_tag)
-            if start != -1:
-                content_start = start + len(result_tag)
-                end = output.find(result_tag, content_start)
-                if end != -1:
-                    before = output[:start]
-                    if before:
-                        print(before)
-                    return output[content_start:end]
-
-        return output
-
-    def upload_driver_file(
+    # ------------------------------------------------------------------
+    # decorator that routes function calls via `execute`
+    # ------------------------------------------------------------------
+    def remote_execute(
         self,
-        remote_path: str,
-        content: bytes | str,
+        _func: Optional[Callable] = None,
         *,
-        overwrite: bool = True,
-    ) -> str:
-        """Upload content directly to the cluster driver filesystem.
-
-        Parameters
-        ----------
-        remote_path:
-            Destination path on the cluster driver node.
-        content:
-            Data to write. ``str`` values are encoded as UTF-8 before upload;
-            ``bytes`` are written as-is.
-        overwrite:
-            Whether to replace an existing file. When ``False`` and the file
-            exists remotely, a ``FileExistsError`` is raised by the remote
-            command.
-
-        Returns
-        -------
-        str
-            The ``remote_path`` after a successful write.
+        language: Optional["Language"] = None,
+        env_keys: Optional[List[str]] = None,
+        timeout: Optional[dt.timedelta] = None,
+        result_tag: Optional[str] = None,
+    ):
         """
-        payload = (
-            content.encode("utf-8") if isinstance(content, str) else bytes(content)
-        )
-        encoded = base64.b64encode(payload).decode("utf-8")
+        Decorator to run a function via Workspace.execute instead of locally.
 
-        command = f"""
-import base64
-import os
+        Usage:
 
-path = {remote_path!r}
-data = base64.b64decode({encoded!r})
+            @ws.remote()
+            def f(x, y): ...
 
-if os.path.exists(path) and not {overwrite!r}:
-    raise FileExistsError(f"{remote_path} already exists")
+            @ws.remote(timeout=dt.timedelta(seconds=5))
+            def g(a): ...
 
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-with open(path, "wb") as fp:
-    fp.write(data)
-print(path)
-"""
+        You can also use it without parentheses:
 
-        return self.execute_command(command)
+            @ws.remote
+            def h(z): ...
+        """
+        context = self.execution_context(language=language or Language.PYTHON)
+
+        def decorator(func: Callable):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+                    return func(*args, **kwargs)
+
+                return context.execute(
+                    obj=func,
+                    args=list(args),
+                    kwargs=kwargs,
+                    env_keys=env_keys,
+                    timeout=timeout,
+                    result_tag=result_tag,
+                )
+
+            return wrapper
+
+        # Support both @ws.remote and @ws.remote(...)
+        if _func is not None and callable(_func):
+            return decorator(_func)
+
+        return decorator
 
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
         upload_local_lib: bool | None = None,
-    ):
+    ) -> "Cluster":
         if not libraries:
             return self
 
@@ -532,7 +537,7 @@ print(path)
         self,
         value,
         upload_local_lib: Optional[bool] = None,
-    ) -> Library:
+    ) -> "Library":
         if isinstance(value, Library):
             return value
 
@@ -641,7 +646,7 @@ print(path)
             ]
 
             try:
-                proc = subprocess.run(
+                _ = subprocess.run(
                     cmd,
                     check=True,
                     stdout=subprocess.PIPE,

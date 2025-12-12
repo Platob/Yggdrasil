@@ -94,7 +94,7 @@ def cast_spark_dataframe(
         * `default_value` if passed
         * otherwise `default_from_arrow_hint(field.type)`
     """
-    options = CastOptions.check_arg(options, **kwargs)
+    options = CastOptions.check_arg(options)
     sub_target_arrow_schema = options.target_arrow_schema
 
     # No target -> nothing to do
