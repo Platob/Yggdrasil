@@ -49,10 +49,19 @@ try:
     }
 except ImportError:  # pragma: no cover - Spark not available
     pyspark = None
-    SparkSession = None
-    SparkDataFrame = None
-    SparkColumn = None
-    SparkDataType = None
+
+    class SparkSession:
+        pass
+
+    class SparkDataFrame:
+        pass
+
+    class SparkColumn:
+        pass
+
+    class SparkDataType:
+        pass
+
     ARROW_TO_SPARK = {}
 
 

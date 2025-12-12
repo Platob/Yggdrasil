@@ -19,11 +19,9 @@ from typing import (
 
 from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
-from ...pyutils import retry
 from ...requests import MSALAuth
 
 if databricks_sdk is not None:
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
@@ -228,7 +226,7 @@ class Workspace:
         """
         Shared cache base under Volumes for the current user.
         """
-        base = f"/Shared/.ygg/cache"
+        base = "/Workspace/Shared/.ygg/cache"
 
         if not suffix:
             return base
@@ -310,14 +308,12 @@ class Workspace:
         if self._sdk is None:
             require_databricks_sdk()
 
+
+
             # Normalize auth_type once
             auth_type = self.auth_type
             if isinstance(auth_type, AuthType):
                 auth_type = auth_type.value
-            elif self.token is None and auth_type is None:
-                # default to external browser on Windows if nothing else is set
-                if platform.system() == "Windows":
-                    auth_type = AuthType.external_browser.value
 
             # Prepare kwargs for WorkspaceClient, dropping None so SDK defaults apply
             kwargs = {
@@ -348,11 +344,22 @@ class Workspace:
                 "product_version": self.product_version or os.getenv("DATABRICKS_PROJECT_VERSION") or "0.0.0",
             }
 
-            self._sdk = databricks_sdk.WorkspaceClient(**{
+            build_kwargs = {
                 k: v
                 for k, v in kwargs.items()
                 if v is not None
-            })
+            }
+
+            try:
+                self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+            except ValueError as e:
+                if auth_type is None and "cannot configure default credentials" in str(e):
+                    # default to external browser on Windows if nothing else is set
+                    build_kwargs["auth_type"] = AuthType.external_browser.value
+
+                    self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+                else:
+                    raise e
 
             # Fill in host/auth_type from resolved config if we didn't set them
             for key in kwargs.keys():
@@ -431,7 +438,6 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Upload helpers
     # ------------------------------------------------------------------ #
-    @retry(tries=3)
     def upload_content_file(
         self,
         content: Union[bytes, BinaryIO],
@@ -539,7 +545,7 @@ class Workspace:
 
                 sdk.workspace.upload(
                     path=target_path,
-                    format=ImportFormat.AUTO,
+                    format=ImportFormat.RAW,
                     content=data_bytes,
                     overwrite=overwrite,
                 )

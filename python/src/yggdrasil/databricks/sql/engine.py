@@ -26,7 +26,8 @@ try:
 
     SparkDeltaTable = DeltaTable
 except ImportError:
-    SparkDeltaTable = None
+    class SparkDeltaTable:
+        pass
 
 
 if databricks_sdk is not None:
@@ -35,13 +36,12 @@ if databricks_sdk is not None:
 
     StatementResponse = StatementResponse
 else:
-    StatementResponse = None
+    class StatementResponse:
+        pass
 
 
-try:
+if pyspark is not None:
     import pyspark.sql.functions as F
-except ImportError:
-    pass
 
 __all__ = [
     "SQLEngine",
@@ -418,26 +418,27 @@ class SQLEngine(WorkspaceObject):
         spark_session: Optional[SparkSession] = None,
         spark_options: Optional[Dict[str, Any]] = None
     ):
-        if SparkSession is not None:
-            spark_session = SparkSession.getActiveSession()
-
         # -------- existing logic you provided (kept intact) ----------
-        if spark_session or isinstance(data, SparkDataFrame):
-            return self.spark_insert_into(
-                data=data,
-                location=location,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name,
-                mode=mode,
-                cast_options=cast_options,
-                overwrite_schema=overwrite_schema,
-                match_by=match_by,
-                zorder_by=zorder_by,
-                optimize_after_merge=optimize_after_merge,
-                vacuum_hours=vacuum_hours,
-                spark_options=spark_options
-            )
+        if pyspark is not None:
+            if SparkSession is not None:
+                spark_session = SparkSession.getActiveSession()
+
+            if spark_session or isinstance(data, SparkDataFrame):
+                return self.spark_insert_into(
+                    data=data,
+                    location=location,
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    mode=mode,
+                    cast_options=cast_options,
+                    overwrite_schema=overwrite_schema,
+                    match_by=match_by,
+                    zorder_by=zorder_by,
+                    optimize_after_merge=optimize_after_merge,
+                    vacuum_hours=vacuum_hours,
+                    spark_options=spark_options
+                )
 
         return self.arrow_insert_into(
             data=data,
@@ -483,6 +484,7 @@ class SQLEngine(WorkspaceObject):
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     table_name=table_name,
+                    to_arrow_schema=True
                 )
                 # normalize arrow tabular input
                 data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
@@ -629,6 +631,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             existing_schema = self.get_table_schema(
                 catalog_name=catalog_name, schema_name=schema_name,
                 table_name=table_name,
+                to_arrow_schema=False
             )
         except ValueError:
             data = convert(data, pyspark.sql.DataFrame)
@@ -638,7 +641,8 @@ FROM parquet.`{databricks_tmp_folder}`"""
         if not isinstance(data, pyspark.sql.DataFrame):
             data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
         else:
-            data = cast_spark_dataframe(data, options=existing_schema)
+            cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
+            data = cast_spark_dataframe(data, options=cast_options)
 
         # --- Sanity checks & pre-cleaning (avoid nulls in keys) ---
         if match_by:
@@ -708,7 +712,8 @@ FROM parquet.`{databricks_tmp_folder}`"""
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-    ) -> pa.Field:
+        to_arrow_schema: bool = True
+    ) -> Union[pa.Field, pa.Schema]:
         full_name = self._table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
@@ -728,10 +733,9 @@ FROM parquet.`{databricks_tmp_folder}`"""
             for _ in table.columns
         ]
 
-        return pa.field(
-            table.name,
-            pa.struct(fields),
-        )
+        if to_arrow_schema:
+            return pa.schema(fields, metadata={b"name": table_name})
+        return pa.field(table.name, pa.struct(fields))
 
     @staticmethod
     def arrow_to_insert_statements(

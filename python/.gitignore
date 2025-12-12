@@ -1,9 +1,0 @@
-# Build outputs
-build/
-dist/
-*.egg-info/
-
-# Environments
-.venv/
-__pycache__/
-*.pyc

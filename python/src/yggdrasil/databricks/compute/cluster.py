@@ -15,8 +15,10 @@ import importlib
 import inspect
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union, List
@@ -529,7 +531,7 @@ print(path)
     def _check_library(
         self,
         value,
-        upload_local_lib: bool | None = None,
+        upload_local_lib: Optional[bool] = None,
     ) -> Library:
         if isinstance(value, Library):
             return value
@@ -537,33 +539,25 @@ print(path)
         if isinstance(value, str):
             original_value = value
 
-            # 1) If it's an existing path (file or dir), upload as-is
+            # Case 1: explicit local path
             if os.path.exists(value):
                 value = self._upload_local_path(value)
 
-            # 2) If no path exists, but copy_local_lib=True, try to resolve from current env
+            # Case 2: copy from current env (import pkg, find its folder, build wheel)
             elif upload_local_lib:
                 pkg_path = _resolve_local_package_path(original_value)
-                if pkg_path is not None and os.path.exists(pkg_path):
+                if pkg_path and os.path.exists(pkg_path):
                     value = self._upload_local_path(pkg_path)
-                # if we can't resolve it locally, we just fall through to PyPI handling
 
-            # 3) Now `value` is either:
-            #    - a workspace/DBFS path (dbfs:/.../something.whl/.zip/.jar/requirements.txt)
-            #    - or still the original string (e.g. "pandas") for PyPI install
-
-            # workspace / file-based libs
+            # Now value is either a dbfs:/ path or plain package name
             if value.endswith(".jar"):
                 return Library(jar=value)
             elif value.endswith("requirements.txt"):
                 return Library(requirements=value)
             elif value.endswith(".whl"):
                 return Library(whl=value)
-            elif value.endswith(".zip"):
-                # Databricks can install zip as Python lib via `whl` field (zip or whl path)
-                return Library(whl=value)
 
-            # 4) Fallback: treat as PyPI package name
+            # Fallback: treat as PyPI / private index package
             return Library(
                 pypi=PythonPyPiLibrary(
                     package=value,
@@ -574,35 +568,114 @@ print(path)
         raise ValueError(f"Cannot build Library object from {type(value)}")
 
     # ----------------- helpers ----------------
-    def _upload_local_path(self, local_path: str) -> str:
+    def _upload_local_path(
+        self,
+        local_path: str,
+        parallel_pool: Optional[Union[ThreadPoolExecutor, int]] = None,
+    ) -> str:
         """
-        Given a local file/folder, optionally zip, upload to workspace cache, and
-        return the workspace/DBFS target path.
+        Given a local file/folder, build an installable wheel when it's a directory,
+        upload to workspace cache, and return the workspace/DBFS target path.
+        If the package is already installed (e.g. datamanagement-2.2.87.dist-info),
+        reuse its version and dependencies for the generated wheel.
         """
         local_path = Path(local_path)
 
-        # If folder -> zip it first
+        # ---------------------------------------
+        # Folder: turn into a wheel first
+        # ---------------------------------------
         if local_path.is_dir():
-            tmp_dir = Path(tempfile.mkdtemp())
-            zip_base = tmp_dir / local_path.name
-            archive_path = shutil.make_archive(
-                base_name=str(zip_base),
-                format="zip",
-                root_dir=str(local_path),
-            )
-            upload_source = Path(archive_path)
+            tmp_root = Path(tempfile.mkdtemp())
+
+            # project root where setup.py lives
+            project_root = tmp_root / "project"
+            project_root.mkdir(parents=True, exist_ok=True)
+
+            pkg_name = local_path.name
+
+            # copy the folder as a package under project root:
+            #   <tmp>/project/<pkg_name>/...
+            shutil.copytree(local_path, project_root / pkg_name)
+
+            setup_py = project_root / "setup.py"
+
+            # detect existing installed version + deps
+            pkg_version, pkg_requires = _detect_installed_metadata(pkg_name)
+
+            # pretty-print install_requires
+            if pkg_requires:
+                requires_block = ",\n        ".join(repr(r) for r in pkg_requires)
+                install_requires_str = (
+                    "    install_requires=[\n"
+                    f"        {requires_block}\n"
+                    "    ],\n"
+                )
+            else:
+                install_requires_str = "    install_requires=[],\n"
+
+            # only generate setup.py if user hasn't provided one
+            if not setup_py.exists():
+                setup_py.write_text(
+                    "from setuptools import setup, find_packages\n"
+                    "setup(\n"
+                    f"    name='{pkg_name}',\n"
+                    f"    version='{pkg_version}',\n"
+                    "    packages=find_packages(),\n"
+                    f"{install_requires_str}"
+                    ")\n"
+                )
+
+            dist_dir = tmp_root / "dist"
+            dist_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                str(project_root),
+                "-w",
+                str(dist_dir),
+                "--no-deps",
+                "--no-build-isolation",
+            ]
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode(errors="ignore")
+                stdout = e.stdout.decode(errors="ignore")
+                raise RuntimeError(
+                    f"Failed to build wheel from {local_path}\n"
+                    f"CMD: {' '.join(cmd)}\n"
+                    f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+                ) from e
+
+            wheels = list(dist_dir.glob("*.whl"))
+            if not wheels:
+                raise RuntimeError(f"No wheel produced from {local_path}")
+
+            upload_source = wheels[0]
+
+        # ---------------------------------------
+        # File: upload as-is (whl/jar/requirements/etc)
+        # ---------------------------------------
         else:
             upload_source = local_path
 
-        target_path = (
-            self.workspace.cache_user_folder(
-                suffix=f"/clusters/{self.cluster_id}/libraries/{upload_source.name}"
-            )
+        target_path = self.workspace.cache_user_folder(
+            suffix=f"/clusters/{self.cluster_id}/libraries/{upload_source.name}"
         )
 
         self.workspace.upload_local_file(
             local_path=str(upload_source),
             target_path=target_path,
+            parallel_pool=parallel_pool,
         )
 
         return target_path
@@ -629,21 +702,17 @@ def _resolve_local_package_path(pkg_name: str) -> str | None:
     return str(p)
 
 
-def _zip_folder(folder_path: str) -> str:
-    folder_path = str(folder_path)
-    folder_name = os.path.basename(os.path.normpath(folder_path))
+def _detect_installed_metadata(pkg_name: str) -> tuple[str, list[str]]:
+    try:
+        from importlib import metadata as importlib_metadata
+    except ImportError:
+        import importlib_metadata  # type: ignore
 
-    # temp dir to hold the zip
-    tmp_dir = tempfile.mkdtemp()
+    try:
+        dist = importlib_metadata.distribution(pkg_name)
+    except importlib_metadata.PackageNotFoundError:
+        return "0.0.0", []
 
-    # base path *without* extension, make_archive adds `.zip`
-    zip_base = os.path.join(tmp_dir, folder_name)
-
-    # create zip archive
-    archive_path = shutil.make_archive(
-        base_name=zip_base,
-        format="zip",
-        root_dir=folder_path,
-    )
-
-    return archive_path  # e.g. /tmp/tmpabc123/my-lib.zip
+    version = dist.version
+    requires = dist.metadata.get_all("Requires-Dist") or []
+    return version, list(requires)
