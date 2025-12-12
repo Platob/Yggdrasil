@@ -2,22 +2,22 @@
 
 Serialization helpers and dependency inspection utilities.
 
-## `DependencyInfo` / `DependencyCheckResult`
-Dataclasses representing a dependency (root module, submodule, detected root path) and the outcome of an importability check.
+## When to use
+- You need to introspect optional dependencies and communicate missing modules clearly.
+- You want to extract and serialize function source code (including nested functions) for reproducibility.
 
-## Helpers
+## Core types
+- `DependencyInfo` – captures a dependency's root module, submodule, and detected root path.
+- `DependencyCheckResult` – outcome of an importability check for a dependency.
+
+## Helper functions
 - `_find_package_root_from_file(module_file)` — walk upward from a module `__file__` to locate the top-level package directory.
 - `_extract_function_source(raw_src, qualname, func_name)` — best-effort extraction of a specific function's source (supports nested functions) from inspected source text.
 - `_dedent_if_needed(src)` — normalize indentation for serialized snippets.
 
-These utilities support reflecting over functions, validating optional dependencies, and generating reproducible serialized code segments.
+## Notes
+- Designed to support reflection features used by other modules (e.g., dependency guards).
+- When extracting sources, ensure the original objects are defined in importable modules; dynamically generated functions may not round-trip well.
 
-## Navigation
-- [Module overview](../../modules.md)
-- [Dataclasses](../dataclasses/README.md)
-- [Libs](../libs/README.md)
-- [Requests](../requests/README.md)
-- [Types](../types/README.md)
-- [Databricks](../databricks/README.md)
-- [Pyutils](../pyutils/README.md)
-- [Ser](./README.md)
+## Related modules
+- [yggdrasil.libs](../libs/README.md) for dependency guards and auto-install utilities.

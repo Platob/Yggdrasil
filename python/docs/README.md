@@ -1,34 +1,25 @@
 # Yggdrasil Python documentation
 
-This directory is the landing page for all Python-facing guidance. Use the links
-below to jump directly to the reference or template you need.
+This directory is the entry point for all Python-facing documentation. Use the links below to navigate between guides, templates, and per-module reference pages.
 
-## Quick links
+## Table of contents
+- [Module overview](modules.md) – summary of each subpackage and when to use it.
+- [Module index](modules/README.md) – direct links to detailed pages for every submodule.
+- [Developer templates](developer-templates.md) – copy/paste snippets for common tasks.
+- [Python utility reference](pyutils.md) – concurrency and retry helpers.
+- [Serialization guide](ser.md) – dependency inspection and serialization utilities.
 
-- [Module map](modules.md): brief descriptions of every package within
-  `yggdrasil`.
-- [Module index](modules/README.md): entry points to detailed docs for each
-  submodule (Databricks helpers, schema utilities, HTTP/auth helpers, etc.).
-- [Developer templates](developer-templates.md): copy/paste-ready snippets for
-  common setup and integration tasks.
-- [Python utility reference](pyutils.md): overview of cross-cutting helpers used
-  throughout the codebase.
-- [Serialization guide](ser.md): notes on how Yggdrasil handles structured data
-  and Arrow schema conversion.
-
-## Installation
-
-Install the package into an existing environment:
+## Prerequisites
+- Python **3.10+**
+- Install Yggdrasil from the `python/` directory:
 
 ```bash
-pip install -e .[dev]
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e .[dev]
 ```
 
-The optional `dev` extras supply linting and Databricks dependencies if you are
-working in that environment.
+Install extras for the engines you plan to use (`.[polars]`, `.[pandas]`, `.[spark]`, `.[databricks]`).
 
-## Quick start
-
-For a minimal example that uses the enhanced dataclass decorator together with
-Arrow schema helpers, see the **developer templates** or jump straight into the
-`yggdrasil.dataclasses` documentation via the module index above.
+## Getting started
+Looking for a minimal example? Start with the **developer templates** or jump straight to [`yggdrasil.dataclasses`](modules/dataclasses/README.md) to learn how to build Arrow-aware dataclasses.
