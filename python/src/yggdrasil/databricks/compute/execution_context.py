@@ -3,7 +3,6 @@ import dataclasses as dc
 import datetime as dt
 import importlib
 import io
-import logging
 import os
 import posixpath
 import re
@@ -49,29 +48,29 @@ class ExecutionContext:
     language: Optional["Language"] = None
     context_id: Optional[str] = None
 
-    _remote_site_packages: Optional[str] = dc.field(default=None, init=False, repr=False)
+    _remote_site_packages_path: Optional[str] = dc.field(default=None, init=False, repr=False)
     _remote_installed_local_libs: Optional[Set[str]] = dc.field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self._remote_installed_local_libs = self._remote_installed_local_libs or set()
 
     def remote_site_packages_path(self) -> str:
-        if self._remote_site_packages is None:
+        if self._remote_site_packages_path is None:
             cmd = """import glob
 for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/python*/site-*', recursive=False):
     if path.endswith('site-packages'):
         print(path)
         break
 """
-            self._remote_site_packages = self.execute_command(
+            self._remote_site_packages_path = self.execute_command(
                 command=cmd,
                 result_tag="<<RESULT>>",
                 print_stdout=False,
             ).strip()
 
-            assert self._remote_site_packages, f"Cannot find remote_site_packages path in remote cluster {self.cluster}"
+            assert self._remote_site_packages_path, f"Cannot find remote_site_packages path in remote cluster {self.cluster}"
 
-        return self._remote_site_packages
+        return self._remote_site_packages_path
 
     # ------------ internal helpers ------------
     def _workspace_client(self):
@@ -196,9 +195,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
 
         serialized = func if isinstance(func, SerializedFunction) else SerializedFunction.from_callable(func)
 
-        if serialized.package_root not in self._remote_installed_local_libs:
-            self.upload_local_lib(local_lib=serialized.package_root)
-            self._remote_installed_local_libs.add(serialized.package_root)
+        self.install_temporary_libraries(libraries=serialized.package_root)
 
         # Use dill of same version
         use_dill = sys.version_info[:2] == self.cluster.python_version
@@ -231,7 +228,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             m = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
             if m:
                 missing_module = m.group(1)
-                self.upload_local_lib(local_lib=missing_module)
+                self.install_temporary_libraries(libraries=missing_module)
                 print(f"{message}, installed on {self.cluster}")
 
                 return self.execute_callable(
@@ -354,10 +351,10 @@ with zipfile.ZipFile(buf, "r") as zf:
     # ------------------------------------------------------------------
     # upload local lib into remote site-packages
     # ------------------------------------------------------------------
-    def upload_local_lib(
+    def install_temporary_libraries(
         self,
-        local_lib: Union[str, ModuleType],
-    ) -> Union[str, ModuleType]:
+        libraries: str | ModuleType | List[str | ModuleType],
+    ) -> Union[str, ModuleType, List[str | ModuleType]]:
         """
         Upload a local Python lib/module into the remote cluster's
         site-packages.
@@ -368,7 +365,10 @@ with zipfile.ZipFile(buf, "r") as zf:
         - module name       (e.g. "ygg")
         - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
         """
-        resolved = _resolve_local_lib_path(local_lib)
+        if isinstance(libraries, (list, tuple, set)):
+            return [self.install_temporary_libraries(l) for l in libraries]
+
+        resolved = _resolve_local_lib_path(libraries)
         remote_site_packages = self.remote_site_packages_path()
 
         if resolved.is_dir():
@@ -378,9 +378,17 @@ with zipfile.ZipFile(buf, "r") as zf:
             # site-packages/<module_file>
             remote_target = posixpath.join(remote_site_packages, resolved.name)
 
-        self.upload_local_path(str(resolved), remote_target)
+        resolved = str(resolved)
 
-        return local_lib
+        if resolved not in self._remote_installed_local_libs:
+            self._remote_installed_local_libs.add(resolved)
+            try:
+                self.upload_local_path(resolved, remote_target)
+            except:
+                self._remote_installed_local_libs.remove(resolved)
+                raise
+
+        return libraries
 
     def _decode_result(
         self,
@@ -402,7 +410,7 @@ with zipfile.ZipFile(buf, "r") as zf:
             m = re.search(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]", message)
             if m:
                 missing_module = m.group(1)
-                self.upload_local_lib(local_lib=missing_module)
+                self.install_temporary_libraries(libraries=missing_module)
                 print(f"{message}, i just installed it on {self.cluster}, retry again")
 
             remote_tb = (

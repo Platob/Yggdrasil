@@ -1,6 +1,7 @@
 import os
 import unittest
 
+from databricks.sdk.service.compute import Language
 from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.compute.cluster import Cluster
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
@@ -53,6 +54,12 @@ class TestCluster(unittest.TestCase):
         assert result["os"]
         assert result["value"] == 1
 
+    def test_install_temporary_lib(self):
+        Cluster(
+            workspace=self.workspace,
+            cluster_id="xxx"
+        ).install_temporary_libraries(["path/to/folder", "pandas"])
+
     def test_repeated_decorator(self):
         @self.cluster.remote_execute
         def decorated(a: int):
@@ -64,8 +71,8 @@ class TestCluster(unittest.TestCase):
         for i in range(2):
             result = decorated(i)
 
-        assert result["os"]
-        assert result["value"] == 1
+            assert result["os"]
+            assert result["value"] == i
 
     def test_databricks_remote_compute_decorator(self):
         @databricks_remote_compute(workspace=Workspace(host="xxx.cloud.databricks.com"))
@@ -79,3 +86,8 @@ class TestCluster(unittest.TestCase):
 
         assert result["os"]
         assert result["value"] == 1
+
+    def test_execute_sql(self):
+        result = self.cluster.execution_context(language=Language.SQL).execute("SELECT 1")
+
+        print(result)

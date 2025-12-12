@@ -9,6 +9,7 @@ for clusters. Metadata is stored in custom tags prefixed with
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import functools
 import importlib
@@ -18,9 +19,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
 
 from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
@@ -83,9 +86,14 @@ class Cluster(WorkspaceObject):
     cluster_id: Optional[str] = None
     
     _details: Optional["ClusterDetails"] = None
+    _details_refresh_time: float = dataclasses.field(default=0, init=False)
 
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
+
+    def __post_init__(self):
+        if self._details:
+            self._details_refresh_time = time.time()
 
     @classmethod
     def replicated_current_environment(
@@ -122,10 +130,20 @@ class Cluster(WorkspaceObject):
             self._details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
+    def fresh_details(self, max_delay: float):
+        if self.cluster_id and time.time() - self._details_refresh_time > max_delay:
+            self._details = self.clusters_client().get(cluster_id=self.cluster_id)
+            self._details_refresh_time = time.time()
+        return self._details
+
     @details.setter
     def details(self, value: "ClusterDetails"):
         self._details = value
         self.cluster_id = value
+
+    @property
+    def state(self):
+        return self.fresh_details(max_delay=10).state
 
     @property
     def spark_version(self) -> str:
@@ -395,7 +413,7 @@ class Cluster(WorkspaceObject):
     def ensure_running(
         self,
     ) -> "Cluster":
-        if self.details.state != State.RUNNING:
+        if self.state != State.RUNNING:
             return self.start()
 
         return self
@@ -532,6 +550,12 @@ class Cluster(WorkspaceObject):
         )
 
         return self
+
+    def install_temporary_libraries(
+        self,
+        libraries: str | ModuleType | List[str | ModuleType],
+    ):
+        return self.execution_context().install_temporary_libraries(libraries=libraries)
 
     def _check_library(
         self,
