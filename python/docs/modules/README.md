@@ -1,11 +1,11 @@
 # Module documentation index
 
-Use this directory to jump directly into the detailed docs for each Yggdrasil Python submodule. The overview in `../modules.md` mirrors these links if you prefer a single-page summary.
+Jump directly to the detailed docs for each Yggdrasil Python submodule. Start with the [overview](../modules.md) if you want context before drilling into specifics.
 
 - [yggdrasil.dataclasses](dataclasses/README.md)
+- [yggdrasil.types](types/README.md)
 - [yggdrasil.libs](libs/README.md)
 - [yggdrasil.requests](requests/README.md)
-- [yggdrasil.types](types/README.md)
 - [yggdrasil.databricks](databricks/README.md)
-
-For a higher-level description of the project layout, start from the [docs README](../README.md).
+- [yggdrasil.pyutils](pyutils/README.md)
+- [yggdrasil.ser](ser/README.md)

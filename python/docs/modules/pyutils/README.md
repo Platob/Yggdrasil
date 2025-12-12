@@ -2,8 +2,13 @@
 
 Utility decorators for concurrency and retry workflows.
 
-## `parallelize(executor_cls=ThreadPoolExecutor, max_workers=None, arg_index=0, timeout=None, return_exceptions=False, show_progress=False)`
-Decorator that turns a function into a generator producing results from concurrent execution over one iterable argument.
+## When to use
+- Parallelize work over an iterable without writing executor boilerplate.
+- Add retry/backoff behavior to fragile operations.
+- Apply the same helpers to both sync and async functions.
+
+## `parallelize`
+`parallelize(executor_cls=ThreadPoolExecutor, max_workers=None, arg_index=0, timeout=None, return_exceptions=False, show_progress=False)` turns a function into a generator producing results from concurrent execution over one iterable argument.
 
 ```python
 from yggdrasil.pyutils import parallelize
@@ -19,8 +24,8 @@ for body in fetch(urls):
 - Accepts a custom executor class (thread or process) and supports passing an existing executor via `executor` kwarg.
 - Preserves input order and can optionally return exceptions instead of raising.
 
-## `retry(exceptions=Exception, tries=3, delay=0.5, backoff=2.0, max_delay=None, jitter=None, logger=None, reraise=True, timeout=None)`
-Retry decorator that works for both sync and async callables with fixed or exponential backoff and optional jitter/timeout controls.
+## `retry`
+`retry(exceptions=Exception, tries=3, delay=0.5, backoff=2.0, max_delay=None, jitter=None, logger=None, reraise=True, timeout=None)` adds retry semantics to sync and async callables.
 
 ```python
 from yggdrasil.pyutils import retry
@@ -34,12 +39,6 @@ def unstable():
 - Optional logger hooks emit warnings/errors on retries and failures.
 - `timeout` stops scheduling new retries once the total elapsed time exceeds the limit.
 
-## Navigation
-- [Module overview](../../modules.md)
-- [Dataclasses](../dataclasses/README.md)
-- [Libs](../libs/README.md)
-- [Requests](../requests/README.md)
-- [Types](../types/README.md)
-- [Databricks](../databricks/README.md)
-- [Pyutils](./README.md)
-- [Ser](../ser/README.md)
+## Related modules
+- [yggdrasil.requests](../requests/README.md) for session-level retries.
+- [yggdrasil.libs](../libs/README.md) for dependency guards that pair well with retries.

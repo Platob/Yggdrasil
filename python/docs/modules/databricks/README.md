@@ -2,6 +2,11 @@
 
 Helpers built on the Databricks SDK for workspaces, SQL execution, jobs, and compute.
 
+## When to use
+- You need a lightweight wrapper around Databricks SDK clients with sane defaults.
+- You want typed SQL execution that returns Arrow tables or Spark DataFrames.
+- You manage clusters, jobs, or workspace files programmatically.
+
 ## Workspaces (`yggdrasil.databricks.workspaces`)
 - `Workspace` dataclass wraps `databricks.sdk.WorkspaceClient` configuration (host/token, Azure/GCP settings) and provides helpers to upload/download, list, and delete files across DBFS, Unity Catalog Volumes, and Workspace paths.
 - `WorkspaceObject` tracks remote file metadata and provides convenience methods for reading/writing.
@@ -14,6 +19,10 @@ ws = Workspace(host="https://...", token="...")
 with ws.client() as sdk:
     print(sdk.current_user.me())
 ```
+
+### Tips
+- Requires the `databricks-sdk` extra. For Azure-hosted workspaces, ensure the `host` points to the correct region-specific URL.
+- File helpers support DBFS and Unity Catalog volume prefixes; choose the storage type that matches your workspace permissions.
 
 ## SQL (`yggdrasil.databricks.sql`)
 - `SQLEngine(workspace, **kwargs)` issues SQL statements via the Databricks SQL API.
@@ -42,7 +51,6 @@ from yggdrasil.databricks.workspaces import Workspace
 
 engine = SQLEngine(Workspace(host="https://...", token="..."))
 
-# Append with automatic table creation if it does not exist
 data = pa.table({"id": [1, 2], "name": ["alice", "bob"]})
 engine.insert_into(
     data,
@@ -50,33 +58,12 @@ engine.insert_into(
     schema_name="demo",
     table_name="users",
 )
-
-# Upsert on matching keys and run post-merge optimization
-engine.insert_into(
-    data,
-    catalog_name="main",
-    schema_name="demo",
-    table_name="users",
-    match_by=["id"],  # MERGE ... WHEN MATCHED/NOT MATCHED
-    optimize_after_merge=True,
-    zorder_by=["id"],
-    vacuum_hours=168,  # keep 7 days of history
-)
-
-# Insert from Spark DataFrame
-from pyspark.sql import SparkSession
-
-spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
-df = spark.createDataFrame([(3, "carol")], ["id", "name"])
-
-engine.insert_into(
-    df,
-    catalog_name="main",
-    schema_name="demo",
-    table_name="users",
-    match_by=["id"],
-)
 ```
+
+### Common pitfalls
+- Ensure the workspace has permission to create the temporary volume used for Arrow ingestion.
+- When using `match_by`, the key columns must exist in the incoming data and target table.
+- Casting options control how timestamps/timezones are handled—pass `CastOptions` if you need strict enforcement.
 
 ## Jobs (`yggdrasil.databricks.jobs`)
 - `DBXJobSettings` and `TaskConfig` dataclasses (via `config.py`) to compose job/task payloads.
@@ -94,7 +81,6 @@ cluster = Cluster(
     metadata={"owner": "platform-team", "env": "dev"},
 )
 
-# Create a small, on-demand cluster and persist metadata tags (prefixed with "yggdrasil:")
 cluster_id = cluster.create(
     cluster_name="demo-cluster",
     spark_version="14.3.x-scala2.12",
@@ -102,24 +88,6 @@ cluster_id = cluster.create(
     node_type_id="i3.xlarge",
 )
 
-# Discover an existing cluster by name and inspect cached info
-demo = cluster.find_cluster(name="demo-cluster")
-print(demo.info.metadata)
-
-# Update or prune metadata stored in custom tags
-cluster.update_metadata({"purpose": "ad-hoc"}, cluster_id=cluster_id)
-cluster.remove_metadata_keys(["env"], cluster_id=cluster_id)
-
-# Manage installed Python packages
-cluster.install_python_libraries([
-    "polars==1.0.0",
-    "pandas>=2.2",
-], cluster_id=cluster_id)
-
-# Bump to a runtime advertising Python 3.10
-cluster.update_runtime_by_python_version("3.10", cluster_id=cluster_id)
-
-# Ensure the cluster is running and execute a command on the driver
 cluster.check_started(cluster_id=cluster_id)
 print(
     cluster.execute_command(
@@ -129,14 +97,66 @@ print(
 )
 ```
 
+### Common operations
+- **Create or update a cluster with sensible defaults**
+
+```python
+from yggdrasil.databricks.compute import Cluster
+from yggdrasil.databricks.workspaces import Workspace
+import datetime as dt
+
+cluster = Cluster(Workspace(host="https://...", token="..."))
+
+cluster.create_or_update(
+    cluster_name="ci-dev",
+    spark_version="17.3.x-scala2.13",
+    num_workers=1,
+    node_type_id="i3.xlarge",
+    autotermination_minutes=30,
+)
+
+cluster.ensure_running()  # starts the cluster if needed
+```
+
+- **Install local or PyPI libraries onto the cluster**
+
+```python
+# Install a local package from the current environment
+cluster.install_libraries(libraries=["my_package"], upload_local_lib=True)
+
+# Install directly from PyPI without building a wheel locally
+cluster.install_libraries(libraries=["pydantic==2.8.0"])
+```
+
+- **Execute code remotely on the driver node**
+
+```python
+# Run a one-off Python statement
+output = cluster.execute_command(
+    "import platform; print(platform.python_version())",
+    cluster_id=cluster.cluster_id,
+)
+print(output)
+
+# Send a function to run remotely with automatic serialization
+@cluster.remote_execute(timeout=dt.timedelta(seconds=10))
+def remote_sum(x, y):
+    return x + y
+
+print(remote_sum(2, 3))
+```
+
+- **Restart or delete clusters when finished**
+
+```python
+cluster.restart()
+cluster.delete()
+```
+
 ### Notes
 - Functions guard imports with `require_databricks_sdk()` and `require_pyspark()` to give clear errors when dependencies are missing.
 - Many methods accept `CastOptions` to control Arrow/Pandas/Spark casting of SQL results.
 
-## Navigation
-- [Module overview](../../modules.md)
-- [Dataclasses](../dataclasses/README.md)
-- [Libs](../libs/README.md)
-- [Requests](../requests/README.md)
-- [Types](../types/README.md)
-- [Databricks](./README.md)
+## Related modules
+- [yggdrasil.libs](../libs/README.md) for Spark dependency guards.
+- [yggdrasil.types](../types/README.md) for casting Arrow/Spark data.
