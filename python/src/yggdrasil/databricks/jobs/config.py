@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from inspect import isclass
 from typing import Any, Dict, List, get_type_hints, Optional, get_origin
+import logging
 
 from ...libs.sparklib import SparkSession
 from ...types.cast.registry import convert
@@ -14,6 +15,9 @@ __all__ = [
     "WidgetType",
     "NotebookConfig"
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 def type_is_iterable(tpe: type, origin=None):
@@ -118,7 +122,19 @@ class NotebookConfig:
             key_values[field_name] = field_value
 
         # Convert the dict to a dataclass instance
-        return convert(key_values, cls)
+        try:
+            return convert(key_values, cls)
+        except Exception as exc:
+            for field_name, field in class_fields.items():
+                field_value = key_values.get(field_name)
+                field_type = type_hints.get(field_name, Any)
+                logger.error(
+                    "Failed to cast widget field '%s' to %s (value type=%s)",
+                    field_name,
+                    field_type,
+                    type(field_value).__name__ if field_value is not None else "NoneType",
+                )
+            raise
 
     @classmethod
     def _determine_widget_type(cls, field_type) -> WidgetType:

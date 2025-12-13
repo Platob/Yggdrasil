@@ -3,6 +3,7 @@ import dataclasses
 import io
 import os
 import posixpath
+import logging
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -45,6 +46,9 @@ __all__ = [
     "Workspace",
     "WorkspaceObject",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -331,15 +335,19 @@ class Workspace:
                 config. The original instance is not modified.
         """
         if new_instance:
+            logger.debug("Cloning workspace configuration for host %s", self.host)
             clone = self.clone(with_client=False)
             clone.connect(reset=True, new_instance=False)
             return clone
 
         if reset:
+            logger.info("Resetting cached WorkspaceClient for host %s", self.host)
             self._sdk = None
 
         if self._sdk is None:
             require_databricks_sdk()
+
+            logger.info("Connecting to Databricks workspace host=%s", self.host)
 
             # Normalize auth_type once
             auth_type = self.auth_type
@@ -401,6 +409,8 @@ class Workspace:
 
                     if config_value is not None:
                         setattr(self, key, config_value)
+        else:
+            logger.debug("Reusing cached WorkspaceClient for host %s", self.host)
 
         return self
 
