@@ -2,6 +2,7 @@ import dataclasses
 import io
 import random
 import string
+import logging
 import time
 from functools import cached_property
 from typing import Optional, Union, Generator, Any, Dict, List
@@ -38,6 +39,9 @@ if databricks_sdk is not None:
 else:
     class StatementResponse:
         pass
+
+
+logger = logging.getLogger(__name__)
 
 
 if pyspark is not None:
@@ -478,6 +482,8 @@ class SQLEngine(WorkspaceObject):
 
         transaction_id = self._random_suffix()
 
+        existing_schema = None
+
         with self.workspace.connect() as connected:
             try:
                 existing_schema = self.get_table_schema(
@@ -488,7 +494,18 @@ class SQLEngine(WorkspaceObject):
                 )
                 # normalize arrow tabular input
                 data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
-            except ValueError:
+            except ValueError as exc:
+                logger.warning(
+                    "Falling back to create-or-overwrite for %s.%s.%s after cast failure: %s",
+                    catalog_name,
+                    schema_name,
+                    table_name,
+                    exc,
+                )
+                logger.debug(
+                    "Existing schema fields: %s",
+                    [f"{f.name}:{f.type}" for f in existing_schema] if existing_schema else None,
+                )
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
                 statement = self.create_table_ddl(
@@ -639,7 +656,16 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return
 
         if not isinstance(data, pyspark.sql.DataFrame):
-            data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
+            try:
+                data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
+            except Exception as exc:
+                logger.error(
+                    "Failed to cast data to Spark DataFrame for %s with schema %s: %s",
+                    location,
+                    [f"{f.name}:{f.dataType}" for f in existing_schema],
+                    exc,
+                )
+                raise
         else:
             cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
             data = cast_spark_dataframe(data, options=cast_options)
@@ -850,7 +876,17 @@ FROM parquet.`{databricks_tmp_folder}`"""
             A SQL string for creating the table
         """
         if not isinstance(field, pa.Field):
-            field = convert(field, pa.Field)
+            try:
+                field = convert(field, pa.Field)
+            except Exception as exc:
+                logger.error(
+                    "Failed to cast schema definition to pa.Field for %s.%s.%s: %s",
+                    catalog_name,
+                    schema_name,
+                    table_name,
+                    exc,
+                )
+                raise
 
         table_name = table_name or field.name
         catalog_name = catalog_name or "hive_metastore"

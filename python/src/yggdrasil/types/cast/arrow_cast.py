@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+import logging
 from dataclasses import is_dataclass
 from typing import Optional, Union, List, Tuple
 
@@ -23,6 +24,14 @@ __all__ = [
     "to_polars_arrow_type",
     "arrow_field_to_schema"
 ]
+
+logger = logging.getLogger(__name__)
+
+
+def _field_summary(field: Optional[pa.Field]) -> str:
+    if field is None:
+        return "<unknown field>"
+    return f"{field.name}:{field.type} (nullable={field.nullable})"
 
 
 def cast_to_struct_array(
@@ -54,6 +63,11 @@ def cast_to_struct_array(
     elif pa.types.is_map(source_type):
         return arrow_map_to_struct_array(arr, struct_options)
     else:
+        logger.error(
+            "Unsupported struct cast from %s to %s",
+            _field_summary(source_field),
+            _field_summary(target_field),
+        )
         raise ValueError(f"Cannot cast {source_field} to {target_field}")
 
 
@@ -152,6 +166,11 @@ def arrow_struct_to_struct_array(
             )
             child_source_field = arrow_array_to_field(child_arr, options)
         else:
+            logger.error(
+                "Missing struct field %s while casting; available fields: %s",
+                child_target_field.name,
+                list(name_to_index.keys()),
+            )
             raise pa.ArrowInvalid(
                 f"Missing field {child_target_field.name} while casting struct"
             )
@@ -209,6 +228,11 @@ def cast_to_list_array(
             )
         )
     else:
+        logger.error(
+            "Unsupported list cast from %s to %s",
+            _field_summary(source_field),
+            _field_summary(target_field),
+        )
         raise pa.ArrowInvalid(f"Unsupported list casting for type {arr.type}")
 
     if pa.types.is_list(target_type):
@@ -233,6 +257,7 @@ def cast_to_list_array(
             mask=mask
         )
     else:
+        logger.error("Cannot build arrow array for target list type %s", target_type)
         raise ValueError(f"Cannot build arrow array {target_type}")
 
 
@@ -266,6 +291,11 @@ def cast_to_map_array(
     elif pa.types.is_struct(source_field.type):
         return arrow_struct_to_map_array(arr, sub_options)
     else:
+        logger.error(
+            "Unsupported map cast from %s to %s",
+            _field_summary(source_field),
+            _field_summary(target_field),
+        )
         raise ValueError(f"Cannot cast {source_field} to {target_field}")
 
 
@@ -583,6 +613,11 @@ def cast_arrow_array(
             return cast_to_list_array(array, sub_options)
         elif pa.types.is_map(target_type):
             return cast_to_map_array(array, sub_options)
+        logger.error(
+            "Unsupported nested target type %s for source %s",
+            target_type,
+            _field_summary(source_field),
+        )
         raise ValueError(f"Unsupported nested target type {target_type}")
     else:
         return cast_primitive_array(array, sub_options)
@@ -607,6 +642,10 @@ def arrow_strptime(
         return arr
 
     if not pa.types.is_timestamp(target_field.type):
+        logger.error(
+            "arrow_strptime requires timestamp target; got %s",
+            _field_summary(target_field),
+        )
         raise ValueError("arrow_strptime requires target_field to be a timestamp type")
 
     if isinstance(arr, pa.ChunkedArray):
@@ -643,6 +682,12 @@ def arrow_strptime(
                 last_error = e
 
         if casted is None:
+            logger.error(
+                "Failed to parse timestamps with provided patterns %s for target %s; last error: %s",
+                patterns,
+                _field_summary(target_field),
+                last_error,
+            )
             raise last_error if last_error else ValueError("Failed to parse timestamps with provided patterns")
 
     return check_array_nullability(casted, options)
@@ -702,6 +747,11 @@ def cast_arrow_tabular(
 
         if source_index is None:
             if not options.add_missing_columns:
+                logger.error(
+                    "Missing column %s while casting table; source columns: %s",
+                    target_field.name,
+                    list(source_arrow_schema.names),
+                )
                 raise pa.ArrowInvalid(f"Missing column {target_field.name!r} in source data {source_arrow_schema.names}")
 
             array = default_arrow_array(
