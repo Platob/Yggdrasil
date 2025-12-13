@@ -15,9 +15,16 @@ class Cities(DynamicDocument):
 class TestCluster(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace(host="xxx.cloud.databricks.com")
+        self.workspace = Workspace(host="xxx.cloud.databricks.com").connect()
         self.cluster = Cluster.replicated_current_environment(workspace=self.workspace)
-        self.cluster.restart()
+        # self.cluster.restart()
+
+        b = Workspace(
+            host=self.workspace.host,
+            token=self.workspace.current_token()
+        ).connect()
+
+        print(b.current_user)
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details

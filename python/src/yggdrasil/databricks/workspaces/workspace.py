@@ -7,7 +7,6 @@ import posixpath
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import (
     Any,
@@ -20,6 +19,7 @@ from typing import (
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
+    from databricks.sdk import WorkspaceClient, CredentialsStrategy
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
@@ -28,7 +28,6 @@ if databricks_sdk is not None:
 
 
 __all__ = [
-    "AuthType",
     "DBXWorkspace",
     "Workspace",
     "WorkspaceService",
@@ -98,48 +97,40 @@ def _get_remote_size(sdk, target_path: str) -> Optional[int]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Auth + Workspace
-# ---------------------------------------------------------------------------
-
-
-class AuthType(Enum):
-    external_browser = "external-browser"
-
-
 @dataclass
 class Workspace:
     # Databricks / generic
     host: Optional[str] = None
     account_id: Optional[str] = None
-    token: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    token_audience: Optional[str] = None
+    token: Optional[str] = dataclasses.field(default=None, repr=False)
+    client_id: Optional[str] = dataclasses.field(default=None, repr=False)
+    client_secret: Optional[str] = dataclasses.field(default=None, repr=False)
+    token_audience: Optional[str] = dataclasses.field(default=None, repr=False)
+    credentials_strategy: Optional["CredentialsStrategy"] = dataclasses.field(default=None, repr=False)
 
     # Azure
-    azure_workspace_resource_id: Optional[str] = None
-    azure_use_msi: Optional[bool] = None
-    azure_client_secret: Optional[str] = None
-    azure_client_id: Optional[str] = None
-    azure_tenant_id: Optional[str] = None
-    azure_environment: Optional[str] = None
+    azure_workspace_resource_id: Optional[str] = dataclasses.field(default=None, repr=False)
+    azure_use_msi: Optional[bool] = dataclasses.field(default=None, repr=False)
+    azure_client_secret: Optional[str] = dataclasses.field(default=None, repr=False)
+    azure_client_id: Optional[str] = dataclasses.field(default=None, repr=False)
+    azure_tenant_id: Optional[str] = dataclasses.field(default=None, repr=False)
+    azure_environment: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # GCP
-    google_credentials: Optional[str] = None
-    google_service_account: Optional[str] = None
+    google_credentials: Optional[str] = dataclasses.field(default=None, repr=False)
+    google_service_account: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # Config profile
     profile: Optional[str] = None
-    config_file: Optional[str] = None
+    config_file: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # HTTP / client behavior
-    auth_type: Optional[Union[str, "AuthType"]] = None
-    http_timeout_seconds: Optional[int] = None
-    retry_timeout_seconds: Optional[int] = None
-    debug_truncate_bytes: Optional[int] = None
-    debug_headers: Optional[bool] = None
-    rate_limit: Optional[int] = None
+    auth_type: Optional[str] = None
+    http_timeout_seconds: Optional[int] = dataclasses.field(default=None, repr=False)
+    retry_timeout_seconds: Optional[int] = dataclasses.field(default=None, repr=False)
+    debug_truncate_bytes: Optional[int] = dataclasses.field(default=None, repr=False)
+    debug_headers: Optional[bool] = dataclasses.field(default=None, repr=False)
+    rate_limit: Optional[int] = dataclasses.field(default=None, repr=False)
 
     # Extras
     product: Optional[str] = None
@@ -148,23 +139,33 @@ class Workspace:
     # Runtime cache (never serialized)
     _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
     _was_connected: bool = dataclasses.field(init=False, default=False, repr=False, compare=False)
+    _cached_token: Optional[str] = dataclasses.field(init=False, default=None, repr=False, compare=False)
 
     # -------------------------
     # Pickle support
     # -------------------------
     def __getstate__(self):
         state = self.__dict__.copy()
-        # Drop runtime-only non-serializable stuff
         state.pop("_sdk", None)
-        state.pop("config", None)
+
+        was_connected = self._sdk is not None
+        self.connect()
+
+        state["_was_connected"] = was_connected
+        state["_cached_token"] = self.current_token()
+
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._sdk = None
+
+        if self.is_in_databricks_environment():
+            if self.auth_type == "external-browser":
+                self.auth_type = None
+
         if self._was_connected:
             self.connect(reset=True)
-        self.config = None
 
     def __enter__(self) -> "Workspace":
         self._was_connected = self._sdk is not None
@@ -179,49 +180,12 @@ class Workspace:
     # Clone
     # -------------------------
     def clone(self) -> "Workspace":
-        clone = Workspace(
-            # plain fields
-            host=self.host,
-            account_id=self.account_id,
-            token=self.token,
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            token_audience=self.token_audience,
-
-            azure_workspace_resource_id=self.azure_workspace_resource_id,
-            azure_use_msi=self.azure_use_msi,
-            azure_client_secret=self.azure_client_secret,
-            azure_client_id=self.azure_client_id,
-            azure_tenant_id=self.azure_tenant_id,
-            azure_environment=self.azure_environment,
-
-            google_credentials=self.google_credentials,
-            google_service_account=self.google_service_account,
-
-            profile=self.profile,
-            config_file=self.config_file,
-
-            auth_type=self.auth_type,
-            http_timeout_seconds=self.http_timeout_seconds,
-            retry_timeout_seconds=self.retry_timeout_seconds,
-            debug_truncate_bytes=self.debug_truncate_bytes,
-            debug_headers=self.debug_headers,
-            rate_limit=self.rate_limit,
-
-            product=self.product,
-            product_version=self.product_version,
-        )
-
-        return clone
+        return Workspace().__setstate__(self.__getstate__())
 
     # -------------------------
     # SDK connection
     # -------------------------
-    def connect(self, reset: bool = False, new_instance: bool = False) -> "Workspace":
-        if new_instance:
-            logger.debug("Cloning workspace configuration for host %s", self.host)
-            return self.clone()
-
+    def connect(self, reset: bool = False) -> "Workspace":
         if reset:
             logger.info("Resetting cached WorkspaceClient for host %s", self.host)
             self._sdk = None
@@ -238,6 +202,7 @@ class Workspace:
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
                 "token_audience": self.token_audience,
+                "credentials_strategy": self.credentials_strategy,
                 "azure_workspace_resource_id": self.azure_workspace_resource_id,
                 "azure_use_msi": self.azure_use_msi,
                 "azure_client_secret": self.azure_client_secret,
@@ -261,16 +226,22 @@ class Workspace:
             build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
             try:
-                self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+                self._sdk = WorkspaceClient(**build_kwargs)
             except ValueError as e:
-                if self.auth_type is None and "cannot configure default credentials" in str(e):
-                    build_kwargs["auth_type"] = AuthType.external_browser.value
-                    self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+                if self.auth_type is None:
+                    if self.is_in_databricks_environment() and self._cached_token:
+                        build_kwargs["token"] = self._cached_token
+                    elif "cannot configure default credentials" in str(e):
+                        build_kwargs["auth_type"] = "external-browser"
+                    else:
+                        raise e
+
+                    self._sdk = WorkspaceClient(**build_kwargs)
                 else:
-                    raise
+                    raise e
 
             # backfill resolved config values
-            for key in list(build_kwargs.keys()):
+            for key in list(kwargs.keys()):
                 if getattr(self, key, None) is None:
                     v = getattr(self._sdk.config, key, None)
                     if v is not None:
@@ -293,10 +264,16 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Properties
     # ------------------------------------------------------------------ #
-
     @property
     def current_user(self):
         return self.sdk().current_user.me()
+
+    def current_token(self) -> str:
+        sdk = self.sdk()
+        conf = sdk.config
+        token = conf._credentials_strategy(conf)()["Authorization"].replace("Bearer ", "")
+
+        return token
 
     # ------------------------------------------------------------------ #
     # Path helpers
@@ -342,26 +319,8 @@ class Workspace:
     # SDK access / connection
     # ------------------------------------------------------------------ #
 
-    def sdk(
-        self,
-        *,
-        new_instance: bool = False,
-        reset: bool = False,
-    ):
-        """
-        Return the underlying WorkspaceClient.
-
-        Args:
-            new_instance:
-                If True, build a fresh Workspace (via connect(new_instance=True))
-                and return *its* WorkspaceClient. The current instance is left
-                untouched.
-            reset:
-                If True and new_instance is False, drop any cached client on this
-                instance and create a new one in-place.
-        """
-        ws = self.connect(reset=reset, new_instance=new_instance)
-        return ws._sdk
+    def sdk(self) -> "WorkspaceClient":
+        return self.connect()._sdk
 
     # ------------------------------------------------------------------ #
     # UC volume + directory management
