@@ -51,7 +51,10 @@ except ImportError:  # pragma: no cover - Spark not available
     pyspark = None
 
     class SparkSession:
-        pass
+
+        @classmethod
+        def getActiveSession(cls):
+            return None
 
     class SparkDataFrame:
         pass

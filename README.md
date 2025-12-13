@@ -58,7 +58,7 @@ from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.workspaces import Workspace
 
 engine = SQLEngine(Workspace(host="https://<workspace>", token="<token>"))
-result = engine.execute("SELECT 1 AS value").wait(engine)
+result = engine.execute("SELECT 1 AS value").wait()
 print(result.arrow_table().to_pandas())
 ```
 

@@ -34,7 +34,7 @@ from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.workspaces import Workspace
 
 engine = SQLEngine(Workspace(host="https://...", token="..."))
-result = engine.execute("SELECT 1 AS v").wait(engine)
+result = engine.execute("SELECT 1 AS v").wait()
 print(result.arrow_table().to_pandas())
 ```
 
@@ -138,10 +138,12 @@ output = cluster.execute_command(
 )
 print(output)
 
+
 # Send a function to run remotely with automatic serialization
-@cluster.remote_execute(timeout=dt.timedelta(seconds=10))
+@cluster.execution_decorator(timeout=dt.timedelta(seconds=10))
 def remote_sum(x, y):
     return x + y
+
 
 print(remote_sum(2, 3))
 ```

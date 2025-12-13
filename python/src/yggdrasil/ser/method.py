@@ -455,6 +455,7 @@ class SerializedFunction:
 
         # 3) Exec the function source
         exec(self.source, globals_ns)  # noqa: S102 - intentional
+
         fn = globals_ns.get(self.name)
         if not callable(fn):
             raise RuntimeError(
@@ -661,11 +662,7 @@ class SerializedFunction:
             "",
             "try:",
             "    _embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
-            "    try:",
-            "        _ser_result = dill.dumps(_embedded_result)",
-            "    except Exception:",
-            "        # fallback: try to coerce to pandas.DataFrame",
-            "        _ser_result = dill.dumps(pandas.DataFrame(_embedded_result))",
+            "    _ser_result = dill.dumps(_embedded_result)",
             "    _error_payload = None",
             "except Exception as _e:",
             "    _error_payload = {",

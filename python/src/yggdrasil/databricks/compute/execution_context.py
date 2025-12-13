@@ -79,7 +79,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
     def _workspace_client(self):
         return self.cluster.workspace.sdk()
 
-    def _create_command_with_timeout(
+    def _create_command(
         self,
         language: "Language",
     ) -> any:
@@ -90,18 +90,19 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
           - retry once with the same timeout
         """
         self.cluster.ensure_running()
-        cid = self.cluster.cluster_id
 
         logger.debug(
-            "Creating Databricks command execution context for cluster_id=%s", cid
+            "Creating Databricks command execution context for cluster_id=%s",
+            self.cluster.cluster_id
         )
 
-        created = self._workspace_client().command_execution.create(
-            cluster_id=cid,
+        created = self._workspace_client().command_execution.create_and_wait(
+            cluster_id=self.cluster.cluster_id,
             language=language,
         )
+        created = getattr(created, "response", created)
 
-        return created.result(dt.timedelta(seconds=10))
+        return created
 
     def connect(
         self,
@@ -124,7 +125,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         if self.cluster.runtime_version < "15" and self.language == Language.PYTHON:
             raise RuntimeError(f"Cannot remote execute commands for runtime version {self.cluster.runtime_version} with {self.language} language")
 
-        ctx = self._create_command_with_timeout(language=self.language)
+        ctx = self._create_command(language=self.language)
 
         context_id = ctx.id
         if not context_id:
@@ -182,11 +183,6 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
     ):
-        logger.debug(
-            "Executing %s in execution context (cluster_id=%s)",
-            "command" if isinstance(obj, str) else getattr(obj, "__name__", type(obj)),
-            self.cluster.cluster_id,
-        )
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
@@ -203,6 +199,9 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             )
         raise ValueError(f"Cannot execute {type(obj)}")
 
+    def is_in_databricks_environment(self):
+        return self.cluster.is_in_databricks_environment()
+
     def execute_callable(
         self,
         func: Callable | SerializedFunction,
@@ -213,7 +212,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         timeout: Optional[dt.timedelta] = None,
         command: Optional[str] = None,
     ) -> str:
-        if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+        if self.is_in_databricks_environment():
             args = args or []
             kwargs = kwargs or {}
             return func(*args, **kwargs)
@@ -242,17 +241,10 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             result_tag=result_tag,
         ) if not command else command
 
-        client = self._workspace_client()
-
-        result = client.command_execution.execute_and_wait(
-            cluster_id=self.cluster.cluster_id,
-            context_id=self.context_id,
-            language=self.language,
-            command=command,
-            timeout=timeout
+        raw_result = self.execute_command(
+            command,
+            timeout=timeout, result_tag=result_tag, print_stdout=print_stdout
         )
-
-        raw_result = self._decode_result(result, result_tag=result_tag, print_stdout=print_stdout)
         result = serialized.parse_command_result(raw_result, raise_error=False)
 
         if isinstance(result, RemoteExecutionError):
@@ -263,7 +255,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             if m:
                 missing_module = m.group(1)
                 self.install_temporary_libraries(libraries=missing_module)
-                print(f"{message}, installed on {self.cluster}")
+                logger.warning(f"{message}, installed on {self.cluster}")
 
                 return self.execute_callable(
                     func=serialized,
@@ -441,11 +433,11 @@ with zipfile.ZipFile(buf, "r") as zf:
         if res.result_type == ResultType.ERROR:
             message = res.cause or "Command execution failed"
 
-            m = re.search(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]", message)
+            m = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
             if m:
                 missing_module = m.group(1)
-                self.install_temporary_libraries(libraries=missing_module)
-                print(f"{message}, i just installed it on {self.cluster}, retry again")
+                self.cluster.install_libraries(libraries=[missing_module])
+                logger.warning(f"{message}, just installed it on {self.cluster}, try again")
 
             remote_tb = (
                 getattr(res, "data", None)

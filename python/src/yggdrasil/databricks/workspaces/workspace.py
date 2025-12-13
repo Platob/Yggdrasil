@@ -1,9 +1,9 @@
 import base64
 import dataclasses
 import io
+import logging
 import os
 import posixpath
-import logging
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -15,12 +15,9 @@ from typing import (
     Iterator,
     List,
     Optional,
-    Union, Set,
-)
+    Union, Set, )
 
-from ...libs import require_pyspark
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
-from ...requests import MSALAuth
 
 if databricks_sdk is not None:
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
@@ -29,22 +26,12 @@ if databricks_sdk is not None:
     from databricks.sdk.dbutils import FileInfo
     from databricks.sdk.service.files import DirectoryEntry
 
-try:
-    from pyspark.sql import SparkSession
-except ImportError:  # pragma: no cover
-    SparkSession = None
-
-try:
-    from delta.tables import DeltaTable
-except ImportError:  # pragma: no cover
-    DeltaTable = None
-
 
 __all__ = [
     "AuthType",
     "DBXWorkspace",
     "Workspace",
-    "WorkspaceObject",
+    "WorkspaceService",
 ]
 
 
@@ -122,20 +109,6 @@ class AuthType(Enum):
 
 @dataclass
 class Workspace:
-    """
-    Thin wrapper around Databricks WorkspaceClient with helpers for:
-
-    - connecting / disconnecting
-    - temp + cache volume folders
-    - uploading local files/folders
-    - listing / opening / deleting paths across DBFS, UC Volumes, Workspace
-    """
-
-    # Full-ish mirror of WorkspaceClient config
-
-    # raw Config object, if caller wants to pass it directly
-    config: Any = None  # typically databricks.sdk.core.Config
-
     # Databricks / generic
     host: Optional[str] = None
     account_id: Optional[str] = None
@@ -161,7 +134,7 @@ class Workspace:
     config_file: Optional[str] = None
 
     # HTTP / client behavior
-    auth_type: Optional[Union[str, AuthType]] = None
+    auth_type: Optional[Union[str, "AuthType"]] = None
     http_timeout_seconds: Optional[int] = None
     retry_timeout_seconds: Optional[int] = None
     debug_truncate_bytes: Optional[int] = None
@@ -169,63 +142,29 @@ class Workspace:
     rate_limit: Optional[int] = None
 
     # Extras
-    msal_auth: Optional[MSALAuth] = None
     product: Optional[str] = None
     product_version: Optional[str] = None
 
-    _sdk: "databricks_sdk.WorkspaceClient" = dataclasses.field(init=False, default=None)
-    _was_connected: bool = dataclasses.field(init=False, default=False)
+    # Runtime cache (never serialized)
+    _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
+    _was_connected: bool = dataclasses.field(init=False, default=False, repr=False, compare=False)
 
-    # ------------------------------------------------------------------ #
-    # Clone
-    # ------------------------------------------------------------------ #
+    # -------------------------
+    # Pickle support
+    # -------------------------
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Drop runtime-only non-serializable stuff
+        state.pop("_sdk", None)
+        state.pop("config", None)
+        return state
 
-    def clone(self, *, with_client: bool = False) -> "Workspace":
-        """
-        Create a shallow clone of this workspace config.
-
-        with_client=False:
-            New Workspace with same config, no client yet.
-        with_client=True:
-            New Workspace with same config and a fresh WorkspaceClient.
-        """
-        clone = Workspace(
-            config=self.config,
-            host=self.host,
-            account_id=self.account_id,
-            token=self.token,
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            token_audience=self.token_audience,
-            azure_workspace_resource_id=self.azure_workspace_resource_id,
-            azure_use_msi=self.azure_use_msi,
-            azure_client_secret=self.azure_client_secret,
-            azure_client_id=self.azure_client_id,
-            azure_tenant_id=self.azure_tenant_id,
-            azure_environment=self.azure_environment,
-            google_credentials=self.google_credentials,
-            google_service_account=self.google_service_account,
-            profile=self.profile,
-            config_file=self.config_file,
-            auth_type=self.auth_type,
-            http_timeout_seconds=self.http_timeout_seconds,
-            retry_timeout_seconds=self.retry_timeout_seconds,
-            debug_truncate_bytes=self.debug_truncate_bytes,
-            debug_headers=self.debug_headers,
-            rate_limit=self.rate_limit,
-            msal_auth=self.msal_auth,
-            product=self.product,
-            product_version=self.product_version,
-        )
-
-        if with_client:
-            clone.connect(reset=True, new_instance=False)
-
-        return clone
-
-    # ------------------------------------------------------------------ #
-    # Context manager + lifecycle
-    # ------------------------------------------------------------------ #
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._sdk = None
+        if self._was_connected:
+            self.connect(reset=True)
+        self.config = None
 
     def __enter__(self) -> "Workspace":
         self._was_connected = self._sdk is not None
@@ -235,6 +174,117 @@ class Workspace:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if not self._was_connected:
             self.close()
+
+    # -------------------------
+    # Clone
+    # -------------------------
+    def clone(self) -> "Workspace":
+        clone = Workspace(
+            # plain fields
+            host=self.host,
+            account_id=self.account_id,
+            token=self.token,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            token_audience=self.token_audience,
+
+            azure_workspace_resource_id=self.azure_workspace_resource_id,
+            azure_use_msi=self.azure_use_msi,
+            azure_client_secret=self.azure_client_secret,
+            azure_client_id=self.azure_client_id,
+            azure_tenant_id=self.azure_tenant_id,
+            azure_environment=self.azure_environment,
+
+            google_credentials=self.google_credentials,
+            google_service_account=self.google_service_account,
+
+            profile=self.profile,
+            config_file=self.config_file,
+
+            auth_type=self.auth_type,
+            http_timeout_seconds=self.http_timeout_seconds,
+            retry_timeout_seconds=self.retry_timeout_seconds,
+            debug_truncate_bytes=self.debug_truncate_bytes,
+            debug_headers=self.debug_headers,
+            rate_limit=self.rate_limit,
+
+            product=self.product,
+            product_version=self.product_version,
+        )
+
+        return clone
+
+    # -------------------------
+    # SDK connection
+    # -------------------------
+    def connect(self, reset: bool = False, new_instance: bool = False) -> "Workspace":
+        if new_instance:
+            logger.debug("Cloning workspace configuration for host %s", self.host)
+            return self.clone()
+
+        if reset:
+            logger.info("Resetting cached WorkspaceClient for host %s", self.host)
+            self._sdk = None
+
+        if self._sdk is None:
+            require_databricks_sdk()
+            logger.info("Connecting to Databricks workspace host=%s", self.host)
+
+            # If caller provided a live Config object, use it (runtime-only).
+            if self.config is not None:
+                build_kwargs = {"config": self.config}
+            else:
+                # Build Config from config_dict if available, else from fields.
+                kwargs = {
+                    "host": self.host,
+                    "account_id": self.account_id,
+                    "token": self.token,
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "token_audience": self.token_audience,
+                    "azure_workspace_resource_id": self.azure_workspace_resource_id,
+                    "azure_use_msi": self.azure_use_msi,
+                    "azure_client_secret": self.azure_client_secret,
+                    "azure_client_id": self.azure_client_id,
+                    "azure_tenant_id": self.azure_tenant_id,
+                    "azure_environment": self.azure_environment,
+                    "google_credentials": self.google_credentials,
+                    "google_service_account": self.google_service_account,
+                    "profile": self.profile,
+                    "config_file": self.config_file,
+                    "auth_type": self.auth_type,
+                    "http_timeout_seconds": self.http_timeout_seconds,
+                    "retry_timeout_seconds": self.retry_timeout_seconds,
+                    "debug_truncate_bytes": self.debug_truncate_bytes,
+                    "debug_headers": self.debug_headers,
+                    "rate_limit": self.rate_limit,
+                    "product": self.product,
+                    "product_version": self.product_version,
+                }
+
+                build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+            try:
+                self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+            except ValueError as e:
+                if self.auth_type is None and "cannot configure default credentials" in str(e):
+                    build_kwargs["auth_type"] = AuthType.external_browser.value
+                    self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
+                else:
+                    raise
+
+            # backfill resolved config values
+            for key in list(build_kwargs.keys()):
+                if getattr(self, key, None) is None:
+                    v = getattr(self._sdk.config, key, None)
+                    if v is not None:
+                        setattr(self, key, v)
+
+        return self
+
+    # ------------------------------------------------------------------ #
+    # Context manager + lifecycle
+    # ------------------------------------------------------------------ #
 
     def close(self) -> None:
         """
@@ -257,7 +307,7 @@ class Workspace:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def cache_user_folder(
+    def shared_cache_path(
         suffix: Optional[str] = None
     ) -> str:
         """
@@ -317,111 +367,6 @@ class Workspace:
         ws = self.connect(reset=reset, new_instance=new_instance)
         return ws._sdk
 
-    def connect(
-        self,
-        reset: bool = False,
-        new_instance: bool = False,
-    ) -> "Workspace":
-        """
-        Ensure a WorkspaceClient is available.
-
-        Args:
-            reset:
-                If True, always drop any existing client on *this* instance
-                and re-create it in-place.
-            new_instance:
-                If True, build and return a completely new Workspace
-                instance (with its own WorkspaceClient) based on the current
-                config. The original instance is not modified.
-        """
-        if new_instance:
-            logger.debug("Cloning workspace configuration for host %s", self.host)
-            clone = self.clone(with_client=False)
-            clone.connect(reset=True, new_instance=False)
-            return clone
-
-        if reset:
-            logger.info("Resetting cached WorkspaceClient for host %s", self.host)
-            self._sdk = None
-
-        if self._sdk is None:
-            require_databricks_sdk()
-
-            logger.info("Connecting to Databricks workspace host=%s", self.host)
-
-            # Normalize auth_type once
-            auth_type = self.auth_type
-            if isinstance(auth_type, AuthType):
-                auth_type = auth_type.value
-
-            # Prepare kwargs for WorkspaceClient, dropping None so SDK defaults apply
-            kwargs = {
-                "config": self.config,
-                "host": self.host,
-                "account_id": self.account_id,
-                "token": self.token,
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "token_audience": self.token_audience,
-                "azure_workspace_resource_id": self.azure_workspace_resource_id,
-                "azure_use_msi": self.azure_use_msi,
-                "azure_client_secret": self.azure_client_secret,
-                "azure_client_id": self.azure_client_id,
-                "azure_tenant_id": self.azure_tenant_id,
-                "azure_environment": self.azure_environment,
-                "google_credentials": self.google_credentials,
-                "google_service_account": self.google_service_account,
-                "profile": self.profile,
-                "config_file": self.config_file,
-                "auth_type": auth_type,
-                "http_timeout_seconds": self.http_timeout_seconds,
-                "retry_timeout_seconds": self.retry_timeout_seconds,
-                "debug_truncate_bytes": self.debug_truncate_bytes,
-                "debug_headers": self.debug_headers,
-                "rate_limit": self.rate_limit,
-                "product": self.product or os.getenv("DATABRICKS_PRODUCT"),
-                "product_version": self.product_version or os.getenv("DATABRICKS_PRODUCT_VERSION"),
-            }
-
-            build_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if v is not None
-            }
-
-            try:
-                self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
-            except ValueError as e:
-                if auth_type is None and "cannot configure default credentials" in str(e):
-                    # default to external browser on Windows if nothing else is set
-                    build_kwargs["auth_type"] = AuthType.external_browser.value
-
-                    self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)
-                else:
-                    raise e
-
-            # Fill in host/auth_type from resolved config if we didn't set them
-            for key in kwargs.keys():
-                self_value = getattr(self, key, None)
-
-                if self_value is None:
-                    config_value = getattr(self._sdk.config, key, None)
-
-                    if config_value is not None:
-                        setattr(self, key, config_value)
-        else:
-            logger.debug("Reusing cached WorkspaceClient for host %s", self.host)
-
-        return self
-
-    # ------------------------------------------------------------------ #
-    # Spark helpers
-    # ------------------------------------------------------------------ #
-
-    def spark_session(self):
-        require_pyspark(active_session=True)
-        return SparkSession.getActiveSession()
-
     # ------------------------------------------------------------------ #
     # UC volume + directory management
     # ------------------------------------------------------------------ #
@@ -479,7 +424,7 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Upload helpers
     # ------------------------------------------------------------------ #
-    def upload_content_file(
+    def upload_file_content(
         self,
         content: Union[bytes, BinaryIO],
         target_path: str,
@@ -517,7 +462,7 @@ class Workspace:
 
             # use a cloned workspace so clients don't collide across threads
             return parallel_pool.submit(
-                self.clone(with_client=True).upload_content_file,
+                self.clone().upload_file_content,
                 content=data,
                 target_path=target_path,
                 makedirs=makedirs,
@@ -591,6 +536,33 @@ class Workspace:
                     overwrite=overwrite,
                 )
 
+    def upload_local_path(
+        self,
+        local_path: str,
+        target_path: str,
+        makedirs: bool = True,
+        overwrite: bool = True,
+        only_if_size_diff: bool = False,
+        parallel_pool: Optional[ThreadPoolExecutor] = None,
+    ):
+        if os.path.isfile(local_path):
+            return self.upload_local_file(
+                local_path=local_path,
+                target_path=target_path,
+                makedirs=makedirs,
+                overwrite=overwrite,
+                only_if_size_diff=only_if_size_diff,
+                parallel_pool=parallel_pool
+            )
+        else:
+            return self.upload_local_folder(
+                local_path=local_path,
+                target_path=target_path,
+                makedirs=makedirs,
+                only_if_size_diff=only_if_size_diff,
+                parallel_pool=parallel_pool
+            )
+
     def upload_local_file(
         self,
         local_path: str,
@@ -641,7 +613,7 @@ class Workspace:
         with open(local_path, "rb") as f:
             content = f.read()
 
-        return self.upload_content_file(
+        return self.upload_file_content(
             content=content,
             target_path=target_path,
             makedirs=makedirs,
@@ -652,8 +624,8 @@ class Workspace:
 
     def upload_local_folder(
         self,
-        local_dir: str,
-        target_dir: str,
+        local_path: str,
+        target_path: str,
         makedirs: bool = True,
         only_if_size_diff: bool = True,
         exclude_dir_names: Optional[List[str]] = None,
@@ -668,8 +640,8 @@ class Workspace:
         - Can upload files in parallel using a ThreadPoolExecutor.
 
         Args:
-            local_dir: Local directory to upload from.
-            target_dir: Workspace path to upload into.
+            local_path: Local directory to upload from.
+            target_path: Workspace path to upload into.
             makedirs: Create remote directories as needed.
             only_if_size_diff: Skip upload if remote file exists with same size and newer mtime.
             exclude_dir_names: Directory names to skip entirely.
@@ -677,11 +649,11 @@ class Workspace:
             parallel_pool: None | ThreadPoolExecutor | int (max_workers).
         """
         sdk = self.sdk()
-        local_dir = os.path.abspath(local_dir)
+        local_path = os.path.abspath(local_path)
         exclude_dirs_set = set(exclude_dir_names or [])
 
         try:
-            existing_objs = list(sdk.workspace.list(target_dir))
+            existing_objs = list(sdk.workspace.list(target_path))
         except ResourceDoesNotExist:
             existing_objs = []
 
@@ -754,11 +726,10 @@ class Workspace:
 
             # ---- upload files in this directory ----
             for local_entry in local_files:
-                local_path = local_entry.path
                 remote_path = posixpath.join(remote_root, local_entry.name)
 
-                fut = self.upload_local_file(
-                    local_path=local_path,
+                entry_fut = self.upload_local_file(
+                    local_path=local_entry.path,
                     target_path=remote_path,
                     makedirs=False,
                     overwrite=True,
@@ -767,7 +738,7 @@ class Workspace:
                 )
 
                 if pool is not None:
-                    futures.append(fut)
+                    futures.append(entry_fut)
 
             # ---- recurse into subdirectories ----
             for local_entry in local_dirs:
@@ -778,7 +749,7 @@ class Workspace:
                 )
 
         try:
-            _upload_dir(local_dir, target_dir, ensure_dir=makedirs)
+            _upload_dir(local_path, target_path, ensure_dir=makedirs)
 
             if pool is not None:
                 for fut in as_completed(futures):
@@ -892,6 +863,10 @@ class Workspace:
                 return
             raise
 
+    @staticmethod
+    def is_in_databricks_environment():
+        return os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
+
     def sql(self):
         from ..sql import SQLEngine
 
@@ -909,8 +884,9 @@ class Workspace:
 
 DBXWorkspace = Workspace
 
+
 @dataclass
-class WorkspaceObject(ABC):
+class WorkspaceService(ABC):
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
 
     def __post_init__(self):
@@ -923,6 +899,9 @@ class WorkspaceObject(ABC):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.workspace.__exit__(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
+
+    def is_in_databricks_environment(self):
+        return self.workspace.is_in_databricks_environment()
 
     def connect(self):
         self.workspace = self.workspace.connect()

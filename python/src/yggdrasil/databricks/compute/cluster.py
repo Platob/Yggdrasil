@@ -12,32 +12,26 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import functools
-import importlib
 import inspect
+import logging
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
-import logging
 
 from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
 
 from .execution_context import ExecutionContext
-from ..workspaces.workspace import WorkspaceObject, Workspace
+from ..workspaces.workspace import WorkspaceService, Workspace
 from ...libs.databrickslib import databricks_sdk
 from ...ser import SerializedFunction
 
 if databricks_sdk is None:  # pragma: no cover - import guard
     ResourceDoesNotExist = Exception  # type: ignore
 else:  # pragma: no cover - runtime fallback when SDK is missing
-    from databricks.sdk import WorkspaceClient, ClustersAPI
+    from databricks.sdk import ClustersAPI
     from databricks.sdk.errors import ResourceDoesNotExist
     from databricks.sdk.service.compute import (
         ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary
@@ -74,7 +68,7 @@ CURRENT_ENV_CLUSTER: Optional["Cluster"] = None  # whatever the class is
 
 
 @dataclass
-class Cluster(WorkspaceObject):
+class Cluster(WorkspaceService):
     """Helper for creating, retrieving, updating, and deleting clusters.
 
     Parameters
@@ -95,9 +89,22 @@ class Cluster(WorkspaceObject):
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
 
+    @property
+    def id(self):
+        return self.cluster_id
+
+    @property
+    def name(self) -> str:
+        if not self.cluster_id:
+            return "unknown"
+        return self.details.cluster_name
+
     def __post_init__(self):
         if self._details:
             self._details_refresh_time = time.time()
+
+    def is_in_databricks_environment(self):
+        return self.workspace.is_in_databricks_environment()
 
     @classmethod
     def replicated_current_environment(
@@ -109,15 +116,8 @@ class Cluster(WorkspaceObject):
 
         host = workspace.host
 
-        logger.debug("Requesting replicated cluster for host %s", host)
-
         # 🔥 return existing singleton for this host
         if host in cls._env_clusters:
-            logger.debug(
-                "Reusing existing replicated cluster for host %s (cluster_id=%s)",
-                host,
-                cls._env_clusters[host].cluster_id,
-            )
             return cls._env_clusters[host]
 
         # 🔥 first time for this host → create
@@ -144,14 +144,14 @@ class Cluster(WorkspaceObject):
 
     def fresh_details(self, max_delay: float):
         if self.cluster_id and time.time() - self._details_refresh_time > max_delay:
-            self._details = self.clusters_client().get(cluster_id=self.cluster_id)
-            self._details_refresh_time = time.time()
+            self.details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
     @details.setter
     def details(self, value: "ClusterDetails"):
+        self._details_refresh_time = time.time()
         self._details = value
-        self.cluster_id = value
+        self.cluster_id = value.cluster_id
 
     @property
     def state(self):
@@ -192,12 +192,8 @@ class Cluster(WorkspaceObject):
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
-    def _client(self) -> "WorkspaceClient":
-        """Return a connected WorkspaceClient instance."""
-        return self.workspace.sdk()
-
     def clusters_client(self) -> "ClustersAPI":
-        return self._client().clusters
+        return self.workspace.sdk().clusters
 
     def spark_versions(
         self,
@@ -232,10 +228,10 @@ class Cluster(WorkspaceObject):
 
             def dbr_from_key(key: str) -> Optional[str]:
                 # "17.3.x-gpu-ml-scala2.13" -> "17.3"
-                parts = key.split(".")
-                if len(parts) < 2:
+                dbr_version_parts = key.split(".")
+                if len(dbr_version_parts) < 2:
                     return None
-                return ".".join(parts[:2])
+                return ".".join(dbr_version_parts[:2])
 
             def py_for_key(key: str) -> Optional[tuple[int, int]]:
                 dbr = dbr_from_key(key)
@@ -287,7 +283,9 @@ class Cluster(WorkspaceObject):
             details.cluster_name = self.workspace.current_user.user_name
 
         if details.spark_version is None or python_version:
-            details.spark_version = self.latest_spark_version(photon=False, python_version=python_version).key
+            details.spark_version = self.latest_spark_version(
+                photon=False, python_version=python_version
+            ).key
 
         if details.single_user_name:
             if not details.data_security_mode:
@@ -309,7 +307,6 @@ class Cluster(WorkspaceObject):
         self,
         cluster_name: Optional[str] = None,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ):
         logger.info(
@@ -327,21 +324,18 @@ class Cluster(WorkspaceObject):
             return found.update(
                 cluster_name=cluster_name,
                 libraries=libraries,
-                upload_local_lib=upload_local_lib,
                 **cluster_spec
             )
 
         return self.create(
             cluster_name=cluster_name,
             libraries=libraries,
-            upload_local_lib=upload_local_lib,
             **cluster_spec
         )
 
     def create(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ) -> str:
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
@@ -365,14 +359,13 @@ class Cluster(WorkspaceObject):
             self.details.cluster_id,
         )
 
-        self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
+        self.install_libraries(libraries=libraries)
 
         return self
 
     def update(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ) -> "Cluster":
         logger.info(
@@ -380,7 +373,7 @@ class Cluster(WorkspaceObject):
             cluster_spec.get("cluster_name", self.details.cluster_name if self.details else None),
             self.cluster_id,
         )
-        self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
+        self.install_libraries(libraries=libraries)
 
         existing_details = {
             k: v
@@ -458,25 +451,17 @@ class Cluster(WorkspaceObject):
 
     def start(
         self,
-        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ) -> "Cluster":
         logger.info("Starting Databricks cluster %s", self.cluster_id)
-        r = self.clusters_client().start(cluster_id=self.cluster_id)
-        self.details = r.result(timeout=timeout)
+        self.details = self.clusters_client().start_and_wait(cluster_id=self.cluster_id)
         return self
 
     def restart(
         self,
-        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ):
         logger.info("Restarting Databricks cluster %s", self.cluster_id)
-        r = self.clusters_client().restart(cluster_id=self.cluster_id)
-
-        if timeout:
-            self.details = r.result(timeout=timeout)
-            return self
-
-        return r
+        self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
+        return self
 
     def delete(
         self
@@ -525,7 +510,7 @@ class Cluster(WorkspaceObject):
     # ------------------------------------------------------------------
     # decorator that routes function calls via `execute`
     # ------------------------------------------------------------------
-    def remote_execute(
+    def execution_decorator(
         self,
         _func: Optional[Callable] = None,
         *,
@@ -550,16 +535,17 @@ class Cluster(WorkspaceObject):
             @ws.remote
             def h(z): ...
         """
-        context = self.execution_context(language=language or Language.PYTHON)
-
         def decorator(func: Callable):
+            context = self.execution_context(language=language or Language.PYTHON)
+            serialized = func if isinstance(func, SerializedFunction) else SerializedFunction.from_callable(func)
+
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
                     return func(*args, **kwargs)
 
                 return context.execute(
-                    obj=func,
+                    obj=serialized,
                     args=list(args),
                     kwargs=kwargs,
                     env_keys=env_keys,
@@ -578,7 +564,6 @@ class Cluster(WorkspaceObject):
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        upload_local_lib: bool | None = None,
     ) -> "Cluster":
         if not libraries:
             return self
@@ -588,7 +573,7 @@ class Cluster(WorkspaceObject):
         wsdk.libraries.install(
             cluster_id=self.cluster_id,
             libraries=[
-                self._check_library(_, upload_local_lib=upload_local_lib)
+                self._check_library(_)
                 for _ in libraries if _
             ]
         )
@@ -604,23 +589,17 @@ class Cluster(WorkspaceObject):
     def _check_library(
         self,
         value,
-        upload_local_lib: Optional[bool] = None,
     ) -> "Library":
         if isinstance(value, Library):
             return value
 
         if isinstance(value, str):
-            original_value = value
-
-            # Case 1: explicit local path
             if os.path.exists(value):
-                value = self._upload_local_path(value)
-
-            # Case 2: copy from current env (import pkg, find its folder, build wheel)
-            elif upload_local_lib:
-                pkg_path = _resolve_local_package_path(original_value)
-                if pkg_path and os.path.exists(pkg_path):
-                    value = self._upload_local_path(pkg_path)
+                target_path = self.workspace.shared_cache_path(
+                    suffix=f"/clusters/{self.cluster_id}/{os.path.basename(value)}"
+                )
+                self.workspace.upload_local_path(local_path=value, target_path=target_path)
+                value = target_path
 
             # Now value is either a dbfs:/ path or plain package name
             if value.endswith(".jar"):
@@ -639,153 +618,3 @@ class Cluster(WorkspaceObject):
             )
 
         raise ValueError(f"Cannot build Library object from {type(value)}")
-
-    # ----------------- helpers ----------------
-    def _upload_local_path(
-        self,
-        local_path: str,
-        parallel_pool: Optional[Union[ThreadPoolExecutor, int]] = None,
-    ) -> str:
-        """
-        Given a local file/folder, build an installable wheel when it's a directory,
-        upload to workspace cache, and return the workspace/DBFS target path.
-        If the package is already installed (e.g. datamanagement-2.2.87.dist-info),
-        reuse its version and dependencies for the generated wheel.
-        """
-        local_path = Path(local_path)
-
-        # ---------------------------------------
-        # Folder: turn into a wheel first
-        # ---------------------------------------
-        if local_path.is_dir():
-            tmp_root = Path(tempfile.mkdtemp())
-
-            # project root where setup.py lives
-            project_root = tmp_root / "project"
-            project_root.mkdir(parents=True, exist_ok=True)
-
-            pkg_name = local_path.name
-
-            # copy the folder as a package under project root:
-            #   <tmp>/project/<pkg_name>/...
-            shutil.copytree(local_path, project_root / pkg_name)
-
-            setup_py = project_root / "setup.py"
-
-            # detect existing installed version + deps
-            pkg_version, pkg_requires = _detect_installed_metadata(pkg_name)
-
-            # pretty-print install_requires
-            if pkg_requires:
-                requires_block = ",\n        ".join(repr(r) for r in pkg_requires)
-                install_requires_str = (
-                    "    install_requires=[\n"
-                    f"        {requires_block}\n"
-                    "    ],\n"
-                )
-            else:
-                install_requires_str = "    install_requires=[],\n"
-
-            # only generate setup.py if user hasn't provided one
-            if not setup_py.exists():
-                setup_py.write_text(
-                    "from setuptools import setup, find_packages\n"
-                    "setup(\n"
-                    f"    name='{pkg_name}',\n"
-                    f"    version='{pkg_version}',\n"
-                    "    packages=find_packages(),\n"
-                    f"{install_requires_str}"
-                    ")\n"
-                )
-
-            dist_dir = tmp_root / "dist"
-            dist_dir.mkdir(parents=True, exist_ok=True)
-
-            cmd = [
-                sys.executable,
-                "-m",
-                "pip",
-                "wheel",
-                str(project_root),
-                "-w",
-                str(dist_dir),
-                "--no-deps",
-                "--no-build-isolation",
-            ]
-
-            try:
-                _ = subprocess.run(
-                    cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except subprocess.CalledProcessError as e:
-                stderr = e.stderr.decode(errors="ignore")
-                stdout = e.stdout.decode(errors="ignore")
-                raise RuntimeError(
-                    f"Failed to build wheel from {local_path}\n"
-                    f"CMD: {' '.join(cmd)}\n"
-                    f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
-                ) from e
-
-            wheels = list(dist_dir.glob("*.whl"))
-            if not wheels:
-                raise RuntimeError(f"No wheel produced from {local_path}")
-
-            upload_source = wheels[0]
-
-        # ---------------------------------------
-        # File: upload as-is (whl/jar/requirements/etc)
-        # ---------------------------------------
-        else:
-            upload_source = local_path
-
-        target_path = self.workspace.cache_user_folder(
-            suffix=f"/clusters/{self.cluster_id}/libraries/{upload_source.name}"
-        )
-
-        self.workspace.upload_local_file(
-            local_path=str(upload_source),
-            target_path=target_path,
-            parallel_pool=parallel_pool,
-        )
-
-        return target_path
-
-
-def _resolve_local_package_path(pkg_name: str) -> str | None:
-    """Try to import a package/module from current env and return its folder/file path."""
-    try:
-        mod = importlib.import_module(pkg_name)
-    except ModuleNotFoundError:
-        return None
-
-    mod_file = getattr(mod, "__file__", None)
-    if not mod_file:
-        return None
-
-    p = Path(mod_file)
-
-    # package: /.../pkg/__init__.py -> use folder
-    if p.name == "__init__.py":
-        return str(p.parent)
-
-    # single module: /.../pkg.py -> use file directly
-    return str(p)
-
-
-def _detect_installed_metadata(pkg_name: str) -> tuple[str, list[str]]:
-    try:
-        from importlib import metadata as importlib_metadata
-    except ImportError:
-        import importlib_metadata  # type: ignore
-
-    try:
-        dist = importlib_metadata.distribution(pkg_name)
-    except importlib_metadata.PackageNotFoundError:
-        return "0.0.0", []
-
-    version = dist.version
-    requires = dist.metadata.get_all("Requires-Dist") or []
-    return version, list(requires)

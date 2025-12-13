@@ -1,8 +1,8 @@
 import dataclasses
 import io
+import logging
 import random
 import string
-import logging
 import time
 from functools import cached_property
 from typing import Optional, Union, Generator, Any, Dict, List
@@ -12,7 +12,7 @@ import pyarrow.ipc as pipc
 import pyarrow.parquet as pq
 
 from .types import column_info_to_arrow_field
-from ..workspaces import Workspace, WorkspaceObject
+from ..workspaces import WorkspaceService
 from ...libs.databrickslib import databricks_sdk
 from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
@@ -23,12 +23,14 @@ from ...types.cast.registry import convert
 from ...types.cast.spark_cast import cast_spark_dataframe
 
 try:
-    from delta.tables import DeltaTable
-
-    SparkDeltaTable = DeltaTable
+    from delta.tables import DeltaTable as SparkDeltaTable
 except ImportError:
     class SparkDeltaTable:
-        pass
+        @classmethod
+        def forName(cls, *args, **kwargs):
+            from delta.tables import DeltaTable
+
+            return DeltaTable.forName(*args, **kwargs)
 
 
 if databricks_sdk is not None:
@@ -58,178 +60,7 @@ class SqlExecutionError(RuntimeError):
 
 
 @dataclasses.dataclass
-class StatementResult:
-    base: StatementResponse
-    workspace: Workspace | None = None
-
-    def __iter__(self):
-        return self.arrow_batches()
-
-    @property
-    def status(self):
-        return self.base.status
-
-    @property
-    def state(self):
-        return self.status.state
-
-    @property
-    def statement_id(self):
-        return self.base.statement_id
-
-    @property
-    def manifest(self):
-        return self.base.manifest
-
-    @property
-    def result(self):
-        return self.base.result
-
-    @property
-    def external_links(self):
-        return self.base.result.external_links
-
-    def _fetch_chunk(self, chunk_index: int):
-        if not self.workspace:
-            raise ValueError("Workspace is required to fetch additional result chunks")
-
-        sdk = self.workspace.sdk()
-        return sdk.statement_execution.get_statement_result_chunk_n(
-            statement_id=self.statement_id,
-            chunk_index=chunk_index,
-        )
-
-    @property
-    def done(self):
-        return self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
-
-    @property
-    def failed(self):
-        return self.state in [StatementState.CANCELED, StatementState.FAILED]
-
-    def raise_for_status(self):
-        if self.failed:
-            # grab error info if present
-            err = self.status.error
-            message = err.message or "Unknown SQL error"
-            error_code = err.error_code
-            sql_state = getattr(err, "sql_state", None)
-
-            parts = [message]
-            if error_code:
-                parts.append(f"error_code={error_code}")
-            if sql_state:
-                parts.append(f"sql_state={sql_state}")
-
-            raise SqlExecutionError(
-                f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
-            )
-
-    def wait(
-        self,
-        engine: "SQLEngine",
-        timeout: Optional[int] = None,
-        poll_interval: Optional[float] = None
-    ):
-        start = time.time()
-        poll_interval = poll_interval or 1
-        current = self
-
-        while True:
-            current = engine.get_statement(current.statement_id)
-            current.raise_for_status()
-
-            if current.done:
-                break
-
-            # still running / queued / pending
-            if timeout is not None and (time.time() - start) > timeout:
-                raise TimeoutError(
-                    f"Statement {current.statement_id} did not finish within {timeout} seconds "
-                    f"(last state={current})"
-                )
-
-            poll_interval = max(10, poll_interval * 1.2)
-            time.sleep(poll_interval)
-
-        return current
-
-    @cached_property
-    def arrow_schema(self):
-        fields = [
-            column_info_to_arrow_field(_) for _ in self.manifest.schema.columns
-        ]
-        return pa.schema(fields)
-
-    def arrow_table(self, max_workers: int | None = None) -> pa.Table:
-        batches = list(self.arrow_batches(max_workers=max_workers))
-
-        if not batches:
-            # empty table with no columns
-            return pa.Table.from_batches([], schema=self.arrow_schema)
-
-        return pa.Table.from_batches(batches)
-
-    def arrow_batches(self, max_workers: int | None = None):
-        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-        result_data = self.result
-
-        if result_data.external_links is not None:
-            session = YGGSession()
-            link = None
-
-            while True:
-                for link in result_data.external_links:
-                    resp = session.get(link.external_link, verify=False, timeout=10)
-                    resp.raise_for_status()
-
-                    buf = pa.BufferReader(resp.content)
-
-                    # If it's an IPC *stream*:
-                    reader = pipc.open_stream(buf)
-
-                    # If it’s an IPC *file*, use:
-                    # reader = pipc.open_file(buf)
-
-                    # reader yields RecordBatch objects
-                    for batch in reader:
-                        yield batch
-
-                    if not link.next_chunk_internal_link:
-                        break
-
-                    # /api/2.0/sql/statements/01f0d056-0596-194e-b011-aef9049504bf/result/chunks/1
-                    try:
-                        chunk_index = int(link.next_chunk_internal_link.split("/")[-1])
-                        result_data = self.workspace.sdk().statement_execution.get_statement_result_chunk_n(
-                            statement_id=self.statement_id,
-                            chunk_index=chunk_index
-                        )
-                    except Exception as e:
-                        raise SqlExecutionError(
-                            f"Cannot retrieve data batch from {link.next_chunk_internal_link!r}: {e}")
-
-                break
-        else:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-    def to_pandas(
-        self,
-        max_workers: int | None = None
-    ) -> "pandas.DataFrame":
-        return self.arrow_table(max_workers=max_workers).to_pandas()
-
-    def to_polars(
-        self,
-        max_workers: int | None = None
-    ) -> "polars.DataFrame":
-        return polars.DataFrame(self.arrow_table(max_workers=max_workers))
-
-
-@dataclasses.dataclass
-class SQLEngine(WorkspaceObject):
+class SQLEngine(WorkspaceService):
     warehouse_id: Optional[str] = None
 
     _http_path: str = dataclasses.field(init=False, default=None)
@@ -354,33 +185,34 @@ class SQLEngine(WorkspaceObject):
         with self as connected:
             wk = connected.workspace.sdk()
 
+            response = wk.statement_execution.execute_statement(
+                statement=statement,
+                warehouse_id=self._get_or_default_warehouse_id(),
+                byte_limit=byte_limit,
+                disposition=disposition,
+                format=format,
+                on_wait_timeout=on_wait_timeout,
+                parameters=parameters,
+                row_limit=row_limit,
+                wait_timeout=wait_timeout,
+                catalog=catalog_name,
+                schema=schema_name,
+                **kwargs,
+            )
             execution = StatementResult(
-                base=wk.statement_execution.execute_statement(
-                    statement=statement,
-                    warehouse_id=self._get_or_default_warehouse_id(),
-                    byte_limit=byte_limit,
-                    disposition=disposition,
-                    format=format,
-                    on_wait_timeout=on_wait_timeout,
-                    parameters=parameters,
-                    row_limit=row_limit,
-                    wait_timeout=wait_timeout,
-                    catalog=catalog_name,
-                    schema=schema_name,
-                    **kwargs,
-                ),
-                workspace=self.workspace,
+                engine=connected,
+                response=response
             )
 
             if not wait:
                 # Caller handles polling / status themselves
                 return execution
-            return execution.wait(engine=connected, timeout=timeout, poll_interval=poll_interval)
+            return execution.wait(timeout=timeout, poll_interval=poll_interval)
 
     def get_statement(self, statement_id: str):
         return StatementResult(
-            base=self.sdk().statement_execution.get_statement(statement_id),
-            workspace=self.workspace,
+            engine=self,
+            response=self.sdk().statement_execution.get_statement(statement_id),
         )
 
     def spark_table(
@@ -424,8 +256,7 @@ class SQLEngine(WorkspaceObject):
     ):
         # -------- existing logic you provided (kept intact) ----------
         if pyspark is not None:
-            if SparkSession is not None:
-                spark_session = SparkSession.getActiveSession()
+            spark_session = SparkSession.getActiveSession()
 
             if spark_session or isinstance(data, SparkDataFrame):
                 return self.spark_insert_into(
@@ -484,9 +315,9 @@ class SQLEngine(WorkspaceObject):
 
         existing_schema = None
 
-        with self.workspace.connect() as connected:
+        with self as connected:
             try:
-                existing_schema = self.get_table_schema(
+                existing_schema = connected.get_table_schema(
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     table_name=table_name,
@@ -508,14 +339,14 @@ class SQLEngine(WorkspaceObject):
                 )
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
-                statement = self.create_table_ddl(
+                statement = connected.create_table_ddl(
                     field=existing_schema,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     table_name=table_name,
                     if_not_exists=False
                 )
-                self.execute(statement)
+                connected.execute(statement)
                 mode = "overwrite"
 
             # Write in temp volume
@@ -539,7 +370,7 @@ class SQLEngine(WorkspaceObject):
             )
 
             # build fully-qualified table name
-            full_table = self._table_full_name(
+            full_table = connected._table_full_name(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name
@@ -597,7 +428,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             try:
                 for stmt in statements:
                     # trim and run
-                    self.execute(stmt.strip())
+                    connected.execute(stmt.strip())
             finally:
                 connected.delete_path(databricks_tmp_folder, recursive=True)
 
@@ -605,13 +436,13 @@ FROM parquet.`{databricks_tmp_folder}`"""
             if zorder_by:
                 zcols = ", ".join([f"`{c}`" for c in zorder_by])
                 optimize_sql = f"OPTIMIZE {full_table} ZORDER BY ({zcols})"
-                self.execute(optimize_sql)
+                connected.execute(optimize_sql)
 
             if optimize_after_merge and match_by:
-                self.execute(f"OPTIMIZE {full_table}")
+                connected.execute(f"OPTIMIZE {full_table}")
 
             if vacuum_hours is not None:
-                self.execute(f"VACUUM {full_table} RETAIN {vacuum_hours} HOURS")
+                connected.execute(f"VACUUM {full_table} RETAIN {vacuum_hours} HOURS")
 
         return None
 
@@ -763,90 +594,6 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return pa.schema(fields, metadata={b"name": table_name})
         return pa.field(table.name, pa.struct(fields))
 
-    @staticmethod
-    def arrow_to_insert_statements(
-        data: Union[pa.Table, pa.RecordBatch],
-        table_name: str,
-        catalog: Optional[str] = None,
-        schema: Optional[str] = None,
-        batch_size: int = 100
-    ) -> Generator[str, None, None]:
-        """
-        Convert an Arrow Table or RecordBatch to SQL INSERT statements.
-
-        Args:
-            data: PyArrow Table or RecordBatch to convert
-            table_name: The name of the table to insert into
-            catalog: Optional catalog name (defaults to the connection's default_catalog)
-            schema: Optional schema name (defaults to the connection's default_schema)
-            batch_size: Number of rows per INSERT statement
-
-        Returns:
-            Generator of INSERT SQL statements
-        """
-        # Ensure data is a Table
-        if isinstance(data, pa.RecordBatch):
-            data = pa.Table.from_batches([data])
-
-        # Build fully qualified table name
-        qualified_table_name = table_name
-        if schema:
-            qualified_table_name = f"{schema}.{qualified_table_name}"
-        if catalog:
-            qualified_table_name = f"{catalog}.{qualified_table_name}"
-
-        # Get column names
-        column_names = data.column_names
-        columns_clause = ", ".join(f"`{col}`" for col in column_names)
-
-        def format_value(v):
-            """Helper function to format values for SQL, handling nested structures"""
-            if v is None:
-                return "NULL"
-            elif isinstance(v, (int, float)):
-                return str(v)
-            elif isinstance(v, bool):
-                return "TRUE" if v else "FALSE"
-            elif isinstance(v, (list, tuple)):
-                # Format array values
-                formatted_items = [format_value(item) for item in v]
-                array_str = ", ".join(formatted_items)
-                return f"ARRAY[{array_str}]"
-            elif isinstance(v, dict):
-                # Format struct/map values
-                formatted_items = [
-                    f"{format_value(k)} => {format_value(v)}"
-                    for k, v in v.items()
-                ]
-                map_str = ", ".join(formatted_items)
-                return f"MAP({map_str})"
-            else:
-                # Escape single quotes and wrap in quotes for strings
-                val_str = str(v).replace("'", "''")
-                return f"'{val_str}'"
-
-        # Process in batches
-        num_rows = data.num_rows
-        for i in range(0, num_rows, batch_size):
-            batch = data.slice(i, min(batch_size, num_rows - i))
-
-            # Start building the INSERT statement
-            insert_stmt = f"INSERT INTO {qualified_table_name} ({columns_clause}) VALUES "
-
-            # Add value tuples
-            values = []
-            for row_idx in range(batch.num_rows):
-                row_values = []
-                for col_idx, col_name in enumerate(column_names):
-                    val = batch.column(col_idx)[row_idx].as_py()
-                    formatted_val = format_value(val)
-                    row_values.append(formatted_val)
-
-                values.append(f"({', '.join(row_values)})")
-
-            insert_stmt += ", ".join(values)
-            yield insert_stmt
-
     @classmethod
     def create_table_ddl(
         cls,
@@ -876,17 +623,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             A SQL string for creating the table
         """
         if not isinstance(field, pa.Field):
-            try:
-                field = convert(field, pa.Field)
-            except Exception as exc:
-                logger.error(
-                    "Failed to cast schema definition to pa.Field for %s.%s.%s: %s",
-                    catalog_name,
-                    schema_name,
-                    table_name,
-                    exc,
-                )
-                raise
+            field = convert(field, pa.Field)
 
         table_name = table_name or field.name
         catalog_name = catalog_name or "hive_metastore"
@@ -931,22 +668,23 @@ FROM parquet.`{databricks_tmp_folder}`"""
             sql.append(f"\nCOMMENT '{comment}'")
 
         # Add options if provided
+        option_strs = []
+
         if options:
-            option_strs = []
             for key, value in options.items():
                 if isinstance(value, str):
                     option_strs.append(f"'{key}' = '{value}'")
                 else:
                     option_strs.append(f"'{key}' = {value}")
 
-            for dft in (
-                "'delta.autoOptimize.optimizeWrite' = 'true'",
-                "'delta.autoOptimize.autoCompact' = 'true'"
-            ):
-                option_strs.append(dft)
+        for dft in (
+            "'delta.autoOptimize.optimizeWrite' = 'true'",
+            "'delta.autoOptimize.autoCompact' = 'true'"
+        ):
+            option_strs.append(dft)
 
-            if option_strs:
-                sql.append(f"\nTBLPROPERTIES ({', '.join(option_strs)})")
+        if option_strs:
+            sql.append(f"\nTBLPROPERTIES ({', '.join(option_strs)})")
 
         return "\n".join(sql)
 
@@ -1004,7 +742,9 @@ FROM parquet.`{databricks_tmp_folder}`"""
         raise TypeError(f"Cannot make ddl field from {field}")
 
     @staticmethod
-    def _arrow_to_sql_type(arrow_type: pa.DataType) -> str:
+    def _arrow_to_sql_type(
+        arrow_type: Union[pa.DataType, pa.Decimal128Type]
+    ) -> str:
         """
         Convert an Arrow data type to SQL data type.
 
@@ -1050,6 +790,178 @@ FROM parquet.`{databricks_tmp_folder}`"""
             raise ValueError(f"Cannot make ddl type for {arrow_type}")
 
 
-# Backwards compatibility
-DBXSQL = SQLEngine
-DBXStatementResult = StatementResult
+@dataclasses.dataclass
+class StatementResult:
+    engine: SQLEngine
+    response: StatementResponse
+
+    def __iter__(self):
+        return self.arrow_batches()
+
+    @property
+    def workspace(self):
+        return self.engine.workspace
+
+    @property
+    def status(self):
+        return self.response.status
+
+    @property
+    def state(self):
+        return self.status.state
+
+    @property
+    def statement_id(self):
+        return self.response.statement_id
+
+    @property
+    def manifest(self):
+        return self.response.manifest
+
+    @property
+    def result(self):
+        return self.response.result
+
+    @property
+    def external_links(self):
+        return self.response.result.external_links
+
+    def _fetch_chunk(self, chunk_index: int):
+        if not self.workspace:
+            raise ValueError("Workspace is required to fetch additional result chunks")
+
+        sdk = self.workspace.sdk()
+        return sdk.statement_execution.get_statement_result_chunk_n(
+            statement_id=self.statement_id,
+            chunk_index=chunk_index,
+        )
+
+    @property
+    def done(self):
+        return self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
+
+    @property
+    def failed(self):
+        return self.state in [StatementState.CANCELED, StatementState.FAILED]
+
+    def raise_for_status(self):
+        if self.failed:
+            # grab error info if present
+            err = self.status.error
+            message = err.message or "Unknown SQL error"
+            error_code = err.error_code
+            sql_state = getattr(err, "sql_state", None)
+
+            parts = [message]
+            if error_code:
+                parts.append(f"error_code={error_code}")
+            if sql_state:
+                parts.append(f"sql_state={sql_state}")
+
+            raise SqlExecutionError(
+                f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
+            )
+
+    def wait(
+        self,
+        timeout: Optional[int] = None,
+        poll_interval: Optional[float] = None
+    ):
+        start = time.time()
+        poll_interval = poll_interval or 1
+        current = self
+
+        while True:
+            current = self.engine.get_statement(current.statement_id)
+            current.raise_for_status()
+
+            if current.done:
+                break
+
+            # still running / queued / pending
+            if timeout is not None and (time.time() - start) > timeout:
+                raise TimeoutError(
+                    f"Statement {current.statement_id} did not finish within {timeout} seconds "
+                    f"(last state={current})"
+                )
+
+            poll_interval = max(10, poll_interval * 1.2)
+            time.sleep(poll_interval)
+
+        return current
+
+    @cached_property
+    def arrow_schema(self):
+        fields = [
+            column_info_to_arrow_field(_) for _ in self.manifest.schema.columns
+        ]
+        return pa.schema(fields)
+
+    def arrow_table(self, max_workers: int | None = None) -> pa.Table:
+        batches = list(self.arrow_batches(max_workers=max_workers))
+
+        if not batches:
+            # empty table with no columns
+            return pa.Table.from_batches([], schema=self.arrow_schema)
+
+        return pa.Table.from_batches(batches)
+
+    def arrow_batches(
+        self, max_workers: int | None = None
+    ) -> Generator[pa.RecordBatch, None, None]:
+        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+        result_data = self.result
+
+        if result_data.external_links is not None:
+            session = YGGSession()
+            link = None
+
+            while True:
+                for link in result_data.external_links:
+                    resp = session.get(link.external_link, verify=False, timeout=10)
+                    resp.raise_for_status()
+
+                    buf = pa.BufferReader(resp.content)
+
+                    # If it's an IPC *stream*:
+                    reader = pipc.open_stream(buf)
+
+                    # If it’s an IPC *file*, use:
+                    # reader = pipc.open_file(buf)
+
+                    # reader yields RecordBatch objects
+                    for batch in reader:
+                        yield batch
+
+                    if not link.next_chunk_internal_link:
+                        break
+
+                    # /api/2.0/sql/statements/01f0d056-0596-194e-b011-aef9049504bf/result/chunks/1
+                    try:
+                        chunk_index = int(link.next_chunk_internal_link.split("/")[-1])
+                        result_data = self.workspace.sdk().statement_execution.get_statement_result_chunk_n(
+                            statement_id=self.statement_id,
+                            chunk_index=chunk_index
+                        )
+                    except Exception as e:
+                        raise SqlExecutionError(
+                            f"Cannot retrieve data batch from {link.next_chunk_internal_link!r}: {e}")
+
+                break
+        else:
+            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
+
+    def to_pandas(
+        self,
+        max_workers: int | None = None
+    ) -> "pandas.DataFrame":
+        return self.arrow_table(max_workers=max_workers).to_pandas()
+
+    def to_polars(
+        self,
+        max_workers: int | None = None
+    ) -> "polars.DataFrame":
+        return polars.DataFrame(self.arrow_table(max_workers=max_workers))
+

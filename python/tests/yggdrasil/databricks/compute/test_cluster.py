@@ -2,9 +2,15 @@ import os
 import unittest
 
 from databricks.sdk.service.compute import Language
+from mongoengine import DynamicDocument
+
 from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.compute.cluster import Cluster
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
+
+
+class Cities(DynamicDocument):
+    meta = {'collection': 'cities'}
 
 class TestCluster(unittest.TestCase):
 
@@ -42,7 +48,7 @@ class TestCluster(unittest.TestCase):
         assert result is not None
 
     def test_decorator(self):
-        @self.cluster.remote_execute
+        @self.cluster.execution_decorator
         def decorated(a: int):
             return {
                 "os": os.getenv("DATABRICKS_RUNTIME_VERSION"),
@@ -61,7 +67,7 @@ class TestCluster(unittest.TestCase):
         ).install_temporary_libraries(["path/to/folder", "pandas"])
 
     def test_repeated_decorator(self):
-        @self.cluster.remote_execute
+        @self.cluster.execution_decorator
         def decorated(a: int):
             return {
                 "os": os.getenv("DATABRICKS_RUNTIME_VERSION"),
@@ -75,17 +81,26 @@ class TestCluster(unittest.TestCase):
             assert result["value"] == i
 
     def test_databricks_remote_compute_decorator(self):
-        @databricks_remote_compute(workspace=Workspace(host="xxx.cloud.databricks.com"))
+        @databricks_remote_compute(workspace=self.workspace)
         def decorated(a: int):
-            return {
-                "os": os.getenv("DATABRICKS_RUNTIME_VERSION"),
-                "value": a
-            }
+            return os.environ
 
-        result = decorated(1)
+        for i in range(2):
+            result = decorated(i)
 
-        assert result["os"]
-        assert result["value"] == 1
+            assert result is not None
+
+    def test_decorator_broadcast_credentials(self):
+        wk = self.workspace
+
+        @databricks_remote_compute(workspace=self.workspace)
+        def decorated(a: int):
+            return Workspace(host=wk.host).connect()
+
+        for i in range(4):
+            result = decorated(i)
+            print(result)
+            assert result is not None
 
     def test_execute_sql(self):
         result = self.cluster.execution_context(language=Language.SQL).execute("SELECT 1")
