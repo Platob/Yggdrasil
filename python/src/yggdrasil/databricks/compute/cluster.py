@@ -465,9 +465,9 @@ class Cluster(WorkspaceService):
 
     def delete(
         self
-    ) -> None:
+    ):
         logger.info("Deleting Databricks cluster %s", self.cluster_id)
-        self.clusters_client().delete(cluster_id=self.cluster_id)
+        return self.clusters_client().delete(cluster_id=self.cluster_id)
 
     def execution_context(
         self,

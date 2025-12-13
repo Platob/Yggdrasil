@@ -230,39 +230,35 @@ class Workspace:
             require_databricks_sdk()
             logger.info("Connecting to Databricks workspace host=%s", self.host)
 
-            # If caller provided a live Config object, use it (runtime-only).
-            if self.config is not None:
-                build_kwargs = {"config": self.config}
-            else:
-                # Build Config from config_dict if available, else from fields.
-                kwargs = {
-                    "host": self.host,
-                    "account_id": self.account_id,
-                    "token": self.token,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "token_audience": self.token_audience,
-                    "azure_workspace_resource_id": self.azure_workspace_resource_id,
-                    "azure_use_msi": self.azure_use_msi,
-                    "azure_client_secret": self.azure_client_secret,
-                    "azure_client_id": self.azure_client_id,
-                    "azure_tenant_id": self.azure_tenant_id,
-                    "azure_environment": self.azure_environment,
-                    "google_credentials": self.google_credentials,
-                    "google_service_account": self.google_service_account,
-                    "profile": self.profile,
-                    "config_file": self.config_file,
-                    "auth_type": self.auth_type,
-                    "http_timeout_seconds": self.http_timeout_seconds,
-                    "retry_timeout_seconds": self.retry_timeout_seconds,
-                    "debug_truncate_bytes": self.debug_truncate_bytes,
-                    "debug_headers": self.debug_headers,
-                    "rate_limit": self.rate_limit,
-                    "product": self.product,
-                    "product_version": self.product_version,
-                }
+            # Build Config from config_dict if available, else from fields.
+            kwargs = {
+                "host": self.host,
+                "account_id": self.account_id,
+                "token": self.token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "token_audience": self.token_audience,
+                "azure_workspace_resource_id": self.azure_workspace_resource_id,
+                "azure_use_msi": self.azure_use_msi,
+                "azure_client_secret": self.azure_client_secret,
+                "azure_client_id": self.azure_client_id,
+                "azure_tenant_id": self.azure_tenant_id,
+                "azure_environment": self.azure_environment,
+                "google_credentials": self.google_credentials,
+                "google_service_account": self.google_service_account,
+                "profile": self.profile,
+                "config_file": self.config_file,
+                "auth_type": self.auth_type,
+                "http_timeout_seconds": self.http_timeout_seconds,
+                "retry_timeout_seconds": self.retry_timeout_seconds,
+                "debug_truncate_bytes": self.debug_truncate_bytes,
+                "debug_headers": self.debug_headers,
+                "rate_limit": self.rate_limit,
+                "product": self.product,
+                "product_version": self.product_version,
+            }
 
-                build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
             try:
                 self._sdk = databricks_sdk.WorkspaceClient(**build_kwargs)

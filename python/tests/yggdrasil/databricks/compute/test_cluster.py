@@ -17,6 +17,7 @@ class TestCluster(unittest.TestCase):
     def setUp(self):
         self.workspace = Workspace(host="xxx.cloud.databricks.com")
         self.cluster = Cluster.replicated_current_environment(workspace=self.workspace)
+        self.cluster.restart()
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
