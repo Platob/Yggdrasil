@@ -3,6 +3,7 @@ import dataclasses as dc
 import datetime as dt
 import importlib
 import io
+import logging
 import os
 import posixpath
 import re
@@ -24,6 +25,8 @@ if databricks_sdk is not None:
 __all__ = [
     "ExecutionContext"
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dc.dataclass()
@@ -89,6 +92,10 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         self.cluster.ensure_running()
         cid = self.cluster.cluster_id
 
+        logger.debug(
+            "Creating Databricks command execution context for cluster_id=%s", cid
+        )
+
         created = self._workspace_client().command_execution.create(
             cluster_id=cid,
             language=language,
@@ -102,6 +109,11 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
     ) -> "ExecutionContext":
         """Create a remote command execution context if not already open."""
         if self.context_id is not None:
+            logger.debug(
+                "Execution context already open for cluster_id=%s (context_id=%s)",
+                self.cluster.cluster_id,
+                self.context_id,
+            )
             return self
 
         self.language = language or self.language
@@ -119,6 +131,12 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             raise RuntimeError("Failed to create command execution context")
 
         self.context_id = context_id
+        logger.info(
+            "Opened execution context for cluster_id=%s (context_id=%s, language=%s)",
+            self.cluster.cluster_id,
+            self.context_id,
+            self.language,
+        )
         return self
 
     def close(self) -> None:
@@ -126,6 +144,11 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         if self.context_id is None:
             return
 
+        logger.debug(
+            "Closing execution context for cluster_id=%s (context_id=%s)",
+            self.cluster.cluster_id,
+            self.context_id,
+        )
         try:
             self._workspace_client().command_execution.destroy(
                 cluster_id=self.cluster.cluster_id,
@@ -159,6 +182,11 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
     ):
+        logger.debug(
+            "Executing %s in execution context (cluster_id=%s)",
+            "command" if isinstance(obj, str) else getattr(obj, "__name__", type(obj)),
+            self.cluster.cluster_id,
+        )
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
@@ -192,6 +220,12 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
 
         """Execute a command in this context and return decoded output."""
         self.connect(language=Language.PYTHON)
+
+        logger.info(
+            "Executing callable %s on cluster_id=%s",
+            getattr(func, "__name__", type(func)),
+            self.cluster.cluster_id,
+        )
 
         serialized = func if isinstance(func, SerializedFunction) else SerializedFunction.from_callable(func)
 

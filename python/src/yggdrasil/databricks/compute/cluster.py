@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
+import logging
 
 from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
 
@@ -47,6 +48,9 @@ else:  # pragma: no cover - runtime fallback when SDK is missing
 
 
 __all__ = ["Cluster"]
+
+
+logger = logging.getLogger(__name__)
 
 
 # module-level mapping Databricks Runtime -> (major, minor) Python version
@@ -105,11 +109,19 @@ class Cluster(WorkspaceObject):
 
         host = workspace.host
 
+        logger.debug("Requesting replicated cluster for host %s", host)
+
         # 🔥 return existing singleton for this host
         if host in cls._env_clusters:
+            logger.debug(
+                "Reusing existing replicated cluster for host %s (cluster_id=%s)",
+                host,
+                cls._env_clusters[host].cluster_id,
+            )
             return cls._env_clusters[host]
 
         # 🔥 first time for this host → create
+        logger.info("Creating replicated cluster for host %s", host)
         inst = cls(workspace=workspace)
 
         inst = inst.create_or_update(
@@ -300,6 +312,11 @@ class Cluster(WorkspaceObject):
         upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ):
+        logger.info(
+            "Ensuring cluster exists (cluster_id=%s, cluster_name=%s)",
+            self.cluster_id,
+            cluster_name,
+        )
         found = self.find_cluster(
             cluster_id=self.cluster_id,
             cluster_name=cluster_name,
@@ -330,11 +347,23 @@ class Cluster(WorkspaceObject):
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
         update_details = self._check_details(details=ClusterDetails(), **cluster_spec)
 
+        logger.info(
+            "Creating Databricks cluster %s with spec keys=%s",
+            update_details.cluster_name,
+            sorted(update_details.as_shallow_dict().keys()),
+        )
+
         self.details = self.clusters_client().create_and_wait(**{
             k: v
             for k, v in update_details.as_shallow_dict().items()
             if k not in _CREATE_ARG_NAMES
         })
+
+        logger.info(
+            "Created Databricks cluster %s (cluster_id=%s)",
+            self.details.cluster_name,
+            self.details.cluster_id,
+        )
 
         self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
 
@@ -346,6 +375,11 @@ class Cluster(WorkspaceObject):
         upload_local_lib: bool | None = None,
         **cluster_spec: Any
     ) -> "Cluster":
+        logger.info(
+            "Updating Databricks cluster %s (cluster_id=%s)",
+            cluster_spec.get("cluster_name", self.details.cluster_name if self.details else None),
+            self.cluster_id,
+        )
         self.install_libraries(libraries=libraries, upload_local_lib=upload_local_lib)
 
         existing_details = {
@@ -389,6 +423,7 @@ class Cluster(WorkspaceObject):
             raise ValueError("Either name or cluster_id must be provided")
 
         if cluster_id:
+            logger.debug("Looking up cluster by cluster_id=%s", cluster_id)
             try:
                 details = self.clusters_client().get(cluster_id=cluster_id)
             except ResourceDoesNotExist:
@@ -402,6 +437,8 @@ class Cluster(WorkspaceObject):
 
         cluster_name_cf = cluster_name.casefold()
 
+        logger.debug("Searching for cluster with name=%s", cluster_name)
+
         for cluster in self.list_clusters():
             if cluster_name_cf == cluster.details.cluster_name.casefold():
                 return cluster
@@ -414,6 +451,7 @@ class Cluster(WorkspaceObject):
         self,
     ) -> "Cluster":
         if self.state != State.RUNNING:
+            logger.info("Starting cluster %s because state=%s", self.cluster_id, self.state)
             return self.start()
 
         return self
@@ -422,6 +460,7 @@ class Cluster(WorkspaceObject):
         self,
         timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ) -> "Cluster":
+        logger.info("Starting Databricks cluster %s", self.cluster_id)
         r = self.clusters_client().start(cluster_id=self.cluster_id)
         self.details = r.result(timeout=timeout)
         return self
@@ -430,6 +469,7 @@ class Cluster(WorkspaceObject):
         self,
         timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ):
+        logger.info("Restarting Databricks cluster %s", self.cluster_id)
         r = self.clusters_client().restart(cluster_id=self.cluster_id)
 
         if timeout:
@@ -441,6 +481,7 @@ class Cluster(WorkspaceObject):
     def delete(
         self
     ) -> None:
+        logger.info("Deleting Databricks cluster %s", self.cluster_id)
         self.clusters_client().delete(cluster_id=self.cluster_id)
 
     def execution_context(
@@ -448,6 +489,9 @@ class Cluster(WorkspaceObject):
         language: Optional["Language"] = None,
         context_id: Optional[str] = None
     ) -> ExecutionContext:
+        logger.debug(
+            "Creating execution context for cluster_id=%s with language=%s", self.cluster_id, language
+        )
         return ExecutionContext(
             cluster=self,
             language=language,
