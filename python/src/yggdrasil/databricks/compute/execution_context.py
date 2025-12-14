@@ -122,9 +122,6 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         if self.language is None:
             self.language = Language.PYTHON
 
-        # if self.cluster.runtime_version < "15" and self.language == Language.PYTHON:
-        #     raise RuntimeError(f"Cannot remote execute commands for runtime version {self.cluster.runtime_version} with {self.language} language")
-
         ctx = self._create_command(language=self.language)
 
         context_id = ctx.id

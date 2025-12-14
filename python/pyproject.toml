@@ -27,12 +27,12 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "requests",
-  "polars",
+  "requests>=2",
+  "polars>=1.3",
   "pandas>=2",
-  "pyarrow>=16",
-  "dill",
-  "databricks-sdk",
+  "pyarrow>=20",
+  "dill>=0.4",
+  "databricks-sdk>=0.71",
 ]
 
 [project.optional-dependencies]
