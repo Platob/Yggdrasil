@@ -21,10 +21,9 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
 
-from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
-
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
+from ... import retry
 from ...libs.databrickslib import databricks_sdk
 from ...ser import SerializedFunction
 
@@ -32,10 +31,11 @@ if databricks_sdk is None:  # pragma: no cover - import guard
     ResourceDoesNotExist = Exception  # type: ignore
 else:  # pragma: no cover - runtime fallback when SDK is missing
     from databricks.sdk import ClustersAPI
-    from databricks.sdk.errors import ResourceDoesNotExist
+    from databricks.sdk.errors import ResourceDoesNotExist, DatabricksError
     from databricks.sdk.service.compute import (
-        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary
-    )
+        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus
+)
+    from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
 
     _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
     _EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
@@ -110,6 +110,8 @@ class Cluster(WorkspaceService):
     def replicated_current_environment(
         cls,
         workspace: Optional["Workspace"] = None,
+        cluster_name: Optional[str] = None,
+        single_user_name: Optional[str] = None
     ) -> "Cluster":
         if workspace is None:
             workspace = Workspace()  # your default, whatever it is
@@ -126,13 +128,13 @@ class Cluster(WorkspaceService):
         inst = cls(workspace=workspace)
 
         inst = inst.create_or_update(
-            cluster_name=workspace.current_user.user_name,
+            cluster_name=cluster_name or workspace.current_user.user_name,
             python_version=sys.version_info,
-            single_user_name=workspace.current_user.user_name,
+            single_user_name=single_user_name or workspace.current_user.user_name,
             runtime_engine=RuntimeEngine.PHOTON,
-            autotermination_minutes=30,
             libraries=[
-                # "ygg"
+                "ygg",
+                "dill"
             ],
         )
 
@@ -158,7 +160,13 @@ class Cluster(WorkspaceService):
 
     @property
     def state(self):
-        return self.fresh_details(max_delay=10).state
+        if self.cluster_id:
+            return self.fresh_details(max_delay=10).state
+        return State.UNKNOWN
+
+    @property
+    def is_running(self):
+        return self.state == State.RUNNING
 
     @property
     def spark_version(self) -> str:
@@ -419,7 +427,6 @@ class Cluster(WorkspaceService):
             raise ValueError("Either name or cluster_id must be provided")
 
         if cluster_id:
-            logger.debug("Looking up cluster by cluster_id=%s", cluster_id)
             try:
                 details = self.clusters_client().get(cluster_id=cluster_id)
             except ResourceDoesNotExist:
@@ -433,8 +440,6 @@ class Cluster(WorkspaceService):
 
         cluster_name_cf = cluster_name.casefold()
 
-        logger.debug("Searching for cluster with name=%s", cluster_name)
-
         for cluster in self.list_clusters():
             if cluster_name_cf == cluster.details.cluster_name.casefold():
                 return cluster
@@ -446,25 +451,27 @@ class Cluster(WorkspaceService):
     def ensure_running(
         self,
     ) -> "Cluster":
-        if self.state != State.RUNNING:
-            logger.info("Starting cluster %s because state=%s", self.cluster_id, self.state)
-            return self.start()
+        return self.start()
 
-        return self
-
+    @retry(tries=4)
     def start(
         self,
     ) -> "Cluster":
-        logger.info("Starting Databricks cluster %s", self.cluster_id)
-        self.details = self.clusters_client().start_and_wait(cluster_id=self.cluster_id)
+        if not self.is_running:
+            logger.info("Starting cluster %s", self.cluster_id)
+            self.details = self.clusters_client().start_and_wait(cluster_id=self.cluster_id)
+            return self.wait_installed_libraries()
         return self
 
+    @retry(tries=4)
     def restart(
         self,
     ):
-        logger.info("Restarting Databricks cluster %s", self.cluster_id)
-        self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
-        return self
+        if self.is_running:
+            logger.info("Restarting Databricks cluster %s", self.cluster_id)
+            self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
+            return self.wait_installed_libraries()
+        return self.start()
 
     def delete(
         self
@@ -564,6 +571,7 @@ class Cluster(WorkspaceService):
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=5)
     ) -> "Cluster":
         if not libraries:
             return self
@@ -577,6 +585,50 @@ class Cluster(WorkspaceService):
                 for _ in libraries if _
             ]
         )
+
+        if timeout:
+            self.wait_installed_libraries(timeout=timeout)
+
+        return self
+
+    def wait_installed_libraries(
+        self,
+        timeout: dt.timedelta = dt.timedelta(minutes=5)
+    ):
+        wsdk = self.workspace.sdk()
+        statuses = list(wsdk.libraries.cluster_status(cluster_id=self.cluster_id))
+        max_time = time.time() + timeout.total_seconds()
+
+        while True:
+            failed = [
+                _.library for _ in statuses
+                if _.library and _.status == LibraryInstallStatus.FAILED
+            ]
+
+            if failed:
+                raise DatabricksError(
+                    "Libraries %s in cluster '%s' failed to install" % (
+                        failed, self.cluster_id
+                    )
+                )
+
+            running = [
+                _ for _ in statuses if _.status in (
+                    LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING,
+                    LibraryInstallStatus.RESOLVING
+                )
+            ]
+
+            if not running:
+                break
+
+            if time.time() > max_time:
+                raise TimeoutError(
+                    "Waiting cluster '%s' installed libraries timed out" % self.cluster_id
+                )
+
+            time.sleep(10)
+            statuses = list(wsdk.libraries.cluster_status(cluster_id=self.cluster_id))
 
         return self
 
@@ -600,6 +652,8 @@ class Cluster(WorkspaceService):
                 )
                 self.workspace.upload_local_path(local_path=value, target_path=target_path)
                 value = target_path
+            elif "." in value and not "/" in value:
+                value = value.split(".")[0]
 
             # Now value is either a dbfs:/ path or plain package name
             if value.endswith(".jar"):

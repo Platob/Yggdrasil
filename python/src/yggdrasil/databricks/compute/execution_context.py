@@ -1,7 +1,6 @@
 import base64
 import dataclasses as dc
 import datetime as dt
-import importlib
 import io
 import logging
 import os
@@ -9,11 +8,13 @@ import posixpath
 import re
 import sys
 import zipfile
-from pathlib import Path
+from pickle import UnpicklingError
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Set
 
 from ...libs.databrickslib import databricks_sdk
+from ...pyutils.exceptions import raise_parsed_traceback
+from ...pyutils.modules import resolve_local_lib_path, module_dependencies
 from ...ser import SerializedFunction, RemoteExecutionError
 
 if TYPE_CHECKING:
@@ -242,27 +243,15 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             command,
             timeout=timeout, result_tag=result_tag, print_stdout=print_stdout
         )
-        result = serialized.parse_command_result(raw_result, raise_error=False)
 
-        if isinstance(result, RemoteExecutionError):
-            error: RemoteExecutionError = result
-            message = error.remote_message
-
-            m = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
-            if m:
-                missing_module = m.group(1)
-                self.install_temporary_libraries(libraries=missing_module)
-                logger.warning(f"{message}, installed on {self.cluster}")
-
-                return self.execute_callable(
-                    func=serialized,
-                    args=args,
-                    kwargs=kwargs,
-                    print_stdout=print_stdout,
-                    timeout=timeout,
-                    command=command,
+        try:
+            result = serialized.parse_command_result(raw_result)
+        except UnpicklingError as e:
+            raise RuntimeError(
+                "Failed to parse result of remote computed method in cluster '%s': %s\n%s" % (
+                    self.cluster.cluster_id, e, serialized.source
                 )
-            raise error
+            )
 
         return result
 
@@ -286,7 +275,29 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             timeout=timeout or dt.timedelta(minutes=20)
         )
 
-        return self._decode_result(result, result_tag=result_tag, print_stdout=print_stdout)
+        try:
+            return self._decode_result(result, result_tag=result_tag, print_stdout=print_stdout)
+        except ModuleNotFoundError as remote_module_error:
+            _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
+            module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
+            module_name = module_name.group(1) if module_name else None
+            module_name = module_name.split(".")[0]
+
+            if module_name:
+                self.cluster.install_libraries(libraries=[module_name])
+
+                logger.warning(
+                    "%s, installed missing temporary module in cluster '%s', for future install it permanently in libraries",
+                    remote_module_error, self.cluster.details.cluster_name
+                )
+
+                return self.execute_command(
+                    command=command,
+                    timeout=timeout,
+                    result_tag=result_tag,
+                    print_stdout=print_stdout
+                )
+            raise remote_module_error
 
     # ------------------------------------------------------------------
     # generic local → remote uploader, via remote python
@@ -377,6 +388,7 @@ with zipfile.ZipFile(buf, "r") as zf:
     def install_temporary_libraries(
         self,
         libraries: str | ModuleType | List[str | ModuleType],
+        with_dependencies: bool = True
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
         """
         Upload a local Python lib/module into the remote cluster's
@@ -389,26 +401,28 @@ with zipfile.ZipFile(buf, "r") as zf:
         - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
         """
         if isinstance(libraries, (list, tuple, set)):
-            return [self.install_temporary_libraries(l) for l in libraries]
+            return [
+                self.install_temporary_libraries(l) for l in libraries
+            ]
 
-        resolved = _resolve_local_lib_path(libraries)
-        remote_site_packages = self.remote_site_packages_path()
+        resolved = resolve_local_lib_path(libraries)
+        resolved_str = str(resolved)
 
-        if resolved.is_dir():
-            # site-packages/<package_name>/
-            remote_target = posixpath.join(remote_site_packages, resolved.name)
-        else:
-            # site-packages/<module_file>
-            remote_target = posixpath.join(remote_site_packages, resolved.name)
+        if resolved_str not in self._remote_installed_local_libs:
+            self._remote_installed_local_libs.add(resolved_str)
 
-        resolved = str(resolved)
-
-        if resolved not in self._remote_installed_local_libs:
-            self._remote_installed_local_libs.add(resolved)
             try:
+                remote_site_packages_path = self.remote_site_packages_path()
+                if resolved.is_dir():
+                    # site-packages/<package_name>/
+                    remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+                else:
+                    # site-packages/<module_file>
+                    remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+
                 self.upload_local_path(resolved, remote_target)
             except:
-                self._remote_installed_local_libs.remove(resolved)
+                self._remote_installed_local_libs.remove(resolved_str)
                 raise
 
         return libraries
@@ -430,11 +444,8 @@ with zipfile.ZipFile(buf, "r") as zf:
         if res.result_type == ResultType.ERROR:
             message = res.cause or "Command execution failed"
 
-            m = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
-            if m:
-                missing_module = m.group(1)
-                self.cluster.install_libraries(libraries=[missing_module])
-                logger.warning(f"{message}, just installed it on {self.cluster}, try again")
+            if self.language == Language.PYTHON:
+                raise_parsed_traceback(message)
 
             remote_tb = (
                 getattr(res, "data", None)
@@ -467,90 +478,3 @@ with zipfile.ZipFile(buf, "r") as zf:
                     return output[content_start:end]
 
         return output
-
-
-def _resolve_local_lib_path(
-    lib: Union[str, ModuleType],
-) -> Path:
-    """
-    Resolve a lib spec (path string, module name, or module object)
-    into a concrete filesystem path.
-
-    Rules:
-    - If it's a path and exists:
-        * if it's a file:
-            - if it's __init__.py -> treat as start of a package, then walk up
-              until top-most directory that still has __init__.py
-            - else -> just that file
-        * if it's a dir:
-            - if it (or parents) contain __init__.py, walk up to the
-              top-most dir that still has __init__.py
-            - else -> that dir as-is
-    - Else treat as module name:
-        * import, use __file__, apply same logic as above.
-    """
-    # Module object case
-    if isinstance(lib, ModuleType):
-        mod = lib
-        mod_file = getattr(mod, "__file__", None)
-        if not mod_file:
-            raise ValueError(
-                f"Module {mod.__name__!r} has no __file__; cannot determine path"
-            )
-        path = Path(mod_file).resolve()
-    else:
-        # First, treat as path
-        p = Path(lib)
-        if p.exists():
-            path = p.resolve()
-        else:
-            # Not a path -> try as module name
-            try:
-                mod = importlib.import_module(lib)
-            except ImportError as e:
-                raise FileNotFoundError(
-                    f"'{lib}' is neither an existing path nor an importable module"
-                ) from e
-
-            mod_file = getattr(mod, "__file__", None)
-            if not mod_file:
-                raise ValueError(
-                    f"Module {mod.__name__!r} has no __file__; cannot determine path"
-                )
-            path = Path(mod_file).resolve()
-
-    # If it's a file, maybe part of a package
-    if path.is_file():
-        # If it's __init__.py, start from its directory
-        if path.name == "__init__.py":
-            pkg_dir = path.parent
-        else:
-            # Regular module: see if its parent is a package
-            pkg_dir = path.parent
-    else:
-        # Directory given. Might be a package root or inside a package.
-        pkg_dir = path
-
-    # Walk up to the top-most directory that still looks like a package
-    # (has __init__.py). If none found, just use the original dir/file.
-    top_pkg_dir = None
-    current = pkg_dir
-
-    while True:
-        init_file = current / "__init__.py"
-        if init_file.exists():
-            top_pkg_dir = current
-            # try going higher
-            parent = current.parent
-            # stop at filesystem root
-            if parent == current:
-                break
-            current = parent
-        else:
-            break
-
-    if top_pkg_dir is not None:
-        return top_pkg_dir
-
-    # Not in a package context -> return original path
-    return path

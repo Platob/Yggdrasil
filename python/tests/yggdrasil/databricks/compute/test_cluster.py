@@ -2,7 +2,7 @@ import os
 import unittest
 
 from databricks.sdk.service.compute import Language
-from mongoengine import DynamicDocument
+from mongoengine import DynamicDocument, connect
 
 from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.compute.cluster import Cluster
@@ -102,7 +102,14 @@ class TestCluster(unittest.TestCase):
 
         @databricks_remote_compute(workspace=self.workspace)
         def decorated(a: int):
-            return wk.connect().current_user
+            # Connect to local MongoDB (standalone mode)
+            connect(
+                db="database",
+                alias="default",
+                host="mongodb+srv://xxxx",
+            )
+
+            return list(Cities.objects.limit(10)), wk.current_user
 
         for i in range(4):
             result = decorated(i)

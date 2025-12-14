@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 def databricks_remote_compute(
     cluster_id: Optional[str] = None,
+    cluster_name: Optional[str] = None,
     workspace: Optional[Workspace] = None,
     cluster: Optional["Cluster"] = None,
     timeout: Optional[dt.timedelta] = None,
@@ -36,7 +37,10 @@ def databricks_remote_compute(
             cluster = Cluster(workspace=workspace, cluster_id=cluster_id)
         else:
             logger.info("Replicating current environment into Databricks cluster")
-            cluster = Cluster.replicated_current_environment(workspace=workspace)
+            cluster = Cluster.replicated_current_environment(
+                workspace=workspace,
+                cluster_name=cluster_name
+            )
 
     return cluster.execution_decorator(
         env_keys=env_keys,
