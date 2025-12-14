@@ -657,20 +657,8 @@ class SerializedFunction:
             # deserialize args / kwargs
             f"_embedded_args = dill.loads(base64.b64decode({args_ser!r}.encode('utf-8')))",
             f"_embedded_kwargs = dill.loads(base64.b64decode({kwargs_ser!r}.encode('utf-8')))",
-            "",
-            "import traceback as _tb",
-            "",
-            "try:",
-            "    _embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
-            "    _ser_result = dill.dumps(_embedded_result)",
-            "    _error_payload = None",
-            "except Exception as _e:",
-            "    _error_payload = {",
-            "        'type': type(_e).__name__,",
-            "        'message': str(_e),",
-            "        'traceback': _tb.format_exc(),",
-            "    }",
-            "    _ser_result = dill.dumps(_error_payload)",
+            "_embedded_result = _embedded_func(*_embedded_args, **_embedded_kwargs)",
+            "_ser_result = dill.dumps(_embedded_result)",
         ])
 
         lines.append(
@@ -697,18 +685,6 @@ class SerializedFunction:
         """
         raw = base64.b64decode(result)
         obj = dill.loads(raw)
-
-        # Error payload from remote
-        if isinstance(obj, dict) and "traceback" in obj and "type" in obj:
-            error = RemoteExecutionError(
-                remote_type=obj.get("type", "Exception"),
-                remote_message=obj.get("message", ""),
-                remote_traceback=obj.get("traceback", ""),
-            )
-
-            if raise_error:
-                raise error
-            return error
 
         return obj
 

@@ -1,5 +1,4 @@
 import datetime as dt
-import functools
 import logging
 from typing import (
     Callable,
@@ -9,7 +8,6 @@ from typing import (
 )
 
 from ..workspaces.workspace import Workspace
-from ...ser import SerializedFunction
 
 ReturnType = TypeVar("ReturnType")
 

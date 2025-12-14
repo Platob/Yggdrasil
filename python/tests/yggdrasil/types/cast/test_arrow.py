@@ -16,7 +16,6 @@ from yggdrasil.types.cast.arrow_cast import (
     record_batch_reader_to_table,
     record_batch_to_record_batch_reader,
     record_batch_reader_to_record_batch,
-    pylist_to_arrow_table,
     pylist_to_record_batch,
 )
 from yggdrasil.types.cast.cast_options import CastOptions
@@ -396,8 +395,8 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
 
     original_converter = registry._registry[(pa.Array, pa.Array)]
 
-    def _spy(value, cast_options):  # type: ignore[override]
-        received["cast_options"] = cast_options
+    def _spy(value, options):  # type: ignore[override]
+        received["options"] = options
         return value
 
     registry._registry[(pa.Array, pa.Array)] = _spy
@@ -406,7 +405,7 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
         result = convert(
             array,
             pa.Array,
-            source_field=source_hint,
+            source_arrow_field=source_hint,
             options=target_hint,
         )
     finally:
@@ -414,7 +413,7 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
 
     assert isinstance(result, pa.Array)
 
-    opts = received["cast_options"]
+    opts = received["options"]
     assert isinstance(opts, CastOptions)
     assert opts.target_field.type == pa.int64()
 

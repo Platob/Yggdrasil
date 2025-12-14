@@ -19,7 +19,7 @@ from typing import (
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
-    from databricks.sdk import WorkspaceClient, CredentialsStrategy
+    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
@@ -106,7 +106,6 @@ class Workspace:
     client_id: Optional[str] = dataclasses.field(default=None, repr=False)
     client_secret: Optional[str] = dataclasses.field(default=None, repr=False)
     token_audience: Optional[str] = dataclasses.field(default=None, repr=False)
-    credentials_strategy: Optional["CredentialsStrategy"] = dataclasses.field(default=None, repr=False)
 
     # Azure
     azure_workspace_resource_id: Optional[str] = dataclasses.field(default=None, repr=False)
@@ -160,9 +159,8 @@ class Workspace:
         self.__dict__.update(state)
         self._sdk = None
 
-        if self.is_in_databricks_environment():
-            if self.auth_type == "external-browser":
-                self.auth_type = None
+        if self.auth_type in ["external-browser", "runtime"]:
+            self.auth_type = None
 
         if self._was_connected:
             self.connect(reset=True)
@@ -202,7 +200,6 @@ class Workspace:
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
                 "token_audience": self.token_audience,
-                "credentials_strategy": self.credentials_strategy,
                 "azure_workspace_resource_id": self.azure_workspace_resource_id,
                 "azure_use_msi": self.azure_use_msi,
                 "azure_client_secret": self.azure_client_secret,
@@ -228,15 +225,32 @@ class Workspace:
             try:
                 self._sdk = WorkspaceClient(**build_kwargs)
             except ValueError as e:
-                if self.auth_type is None:
-                    if self.is_in_databricks_environment() and self._cached_token:
-                        build_kwargs["token"] = self._cached_token
-                    elif "cannot configure default credentials" in str(e):
-                        build_kwargs["auth_type"] = "external-browser"
-                    else:
-                        raise e
+                if "cannot configure default credentials" in str(e) and self.auth_type is None:
+                    last_error = e
 
-                    self._sdk = WorkspaceClient(**build_kwargs)
+                    auth_types = ["runtime"] if self.is_in_databricks_environment() else ["external-browser"]
+
+                    for auth_type in auth_types:
+                        build_kwargs["auth_type"] = auth_type
+
+                        try:
+                            self._sdk = WorkspaceClient(**build_kwargs)
+                            break
+                        except Exception as se:
+                            last_error = se
+                            build_kwargs.pop("auth_type")
+
+                    if self._sdk is None:
+                        if self.is_in_databricks_environment() and self._cached_token:
+                            build_kwargs["token"] = self._cached_token
+
+                            try:
+                                self._sdk = WorkspaceClient(**build_kwargs)
+                            except Exception as se:
+                                last_error = se
+
+                    if self._sdk is None:
+                        raise last_error
                 else:
                     raise e
 
@@ -269,6 +283,9 @@ class Workspace:
         return self.sdk().current_user.me()
 
     def current_token(self) -> str:
+        if self.token:
+            return self.token
+
         sdk = self.sdk()
         conf = sdk.config
         token = conf._credentials_strategy(conf)()["Authorization"].replace("Bearer ", "")

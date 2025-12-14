@@ -114,6 +114,7 @@ class Cluster(WorkspaceService):
         if workspace is None:
             workspace = Workspace()  # your default, whatever it is
 
+        workspace.connect()
         host = workspace.host
 
         # 🔥 return existing singleton for this host
@@ -125,12 +126,14 @@ class Cluster(WorkspaceService):
         inst = cls(workspace=workspace)
 
         inst = inst.create_or_update(
-            cluster_name=inst.workspace.current_user.user_name,
+            cluster_name=workspace.current_user.user_name,
             python_version=sys.version_info,
-            single_user_name=inst.workspace.current_user.user_name,
+            single_user_name=workspace.current_user.user_name,
             runtime_engine=RuntimeEngine.PHOTON,
             autotermination_minutes=30,
-            libraries=["ygg"],
+            libraries=[
+                # "ygg"
+            ],
         )
 
         cls._env_clusters[host] = inst
@@ -494,9 +497,6 @@ class Cluster(WorkspaceService):
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
     ):
-        if language is None:
-            language = Language.PYTHON
-
         with self.execution_context(language=language) as ctx:
             return ctx.execute(
                 obj=obj,

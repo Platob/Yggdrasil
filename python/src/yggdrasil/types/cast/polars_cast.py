@@ -1,20 +1,16 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Dict, Any
 
 import pyarrow as pa
 
 from .arrow_cast import (
     cast_arrow_array,
     cast_arrow_tabular,
-    cast_arrow_record_batch_reader,
+    cast_arrow_record_batch_reader, is_arrow_type_binary_like, is_arrow_type_string_like, is_arrow_type_list_like,
 )
 from .cast_options import CastOptions
 from .registry import register_converter
 from ..python_defaults import default_arrow_scalar
-from ...libs.polarslib import (
-    polars, require_polars,
-    arrow_type_to_polars_type, polars_type_to_arrow_type,
-    arrow_field_to_polars_field, polars_field_to_arrow_field
-)
+from ...libs.polarslib import polars
 
 __all__ = [
     "cast_polars_array",
@@ -30,6 +26,12 @@ __all__ = [
     "arrow_table_to_polars_dataframe",
     "polars_dataframe_to_record_batch_reader",
     "record_batch_reader_to_polars_dataframe",
+    "PolarsSeries",
+    "PolarsExpr",
+    "PolarsDataFrame",
+    "PolarsField",
+    "PolarsSchema",
+    "PolarsDataType",
 ]
 
 # ---------------------------------------------------------------------------
@@ -37,15 +39,50 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 if polars is not None:
-    require_polars()
-
     PolarsSeries = polars.Series
     PolarsExpr = polars.Expr
     PolarsDataFrame = polars.DataFrame
+    PolarsField = polars.Field
+    PolarsSchema = polars.Schema
+    PolarsDataType = polars.DataType
+
+    # Primitive Arrow -> Polars dtype mapping (base, non-nested types).
+    # These are Polars *dtype classes* (not instances), so they can be used
+    # directly in schemas (e.g. pl.Struct({"a": pl.Int64})).
+    ARROW_TO_POLARS: Dict[pa.DataType, polars.DataType] = {
+        pa.null(): polars.Null(),
+        pa.bool_(): polars.Boolean(),
+
+        pa.int8(): polars.Int8(),
+        pa.int16(): polars.Int16(),
+        pa.int32(): polars.Int32(),
+        pa.int64(): polars.Int64(),
+
+        pa.uint8(): polars.UInt8(),
+        pa.uint16(): polars.UInt16(),
+        pa.uint32(): polars.UInt32(),
+        pa.uint64(): polars.UInt64(),
+
+        pa.float16(): polars.Float32(),  # best-effort
+        pa.float32(): polars.Float32(),
+        pa.float64(): polars.Float64(),
+
+        pa.string(): polars.Utf8(),
+        pa.string_view(): polars.Utf8(),
+        pa.large_string(): polars.Utf8(),
+
+        pa.binary(): polars.Binary(),
+        pa.binary_view(): polars.Binary(),
+        pa.large_binary(): polars.Binary(),
+
+        pa.date32(): polars.Date(),
+    }
 
     def polars_converter(*args, **kwargs):
         return register_converter(*args, **kwargs)
 else:
+    ARROW_TO_POLARS = {}
+
     # Dummy types so annotations/decorators don't explode without Polars
     class _PolarsDummy:  # pragma: no cover - only used when Polars not installed
         pass
@@ -53,12 +90,17 @@ else:
     PolarsSeries = _PolarsDummy
     PolarsExpr = _PolarsDummy
     PolarsDataFrame = _PolarsDummy
+    PolarsField = _PolarsDummy
+    PolarsSchema = _PolarsDummy
+    PolarsDataType = _PolarsDummy
 
     def polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
         def _decorator(func):
             return func
-
         return _decorator
+
+
+POLARS_BASE_TO_ARROW = {v: k for k, v in ARROW_TO_POLARS.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +109,9 @@ else:
 @polars_converter(PolarsSeries, PolarsSeries)
 @polars_converter(PolarsExpr, PolarsExpr)
 def cast_polars_array(
-    series: "polars.Series",
+    array: Union[PolarsSeries, PolarsExpr],
     options: Optional[CastOptions] = None,
-) -> "polars.Series":
+) -> Union[PolarsSeries, PolarsExpr]:
     """
     Cast a Polars Series to a target Arrow type using Polars casting rules.
 
@@ -81,92 +123,124 @@ def cast_polars_array(
       when nullable=False (using default_from_arrow_hint).
     """
     options = CastOptions.check_arg(options)
-    target_field = options.target_field
 
-    if not target_field:
-        return series
+    if not options.need_polars_type_cast(source_obj=array):
+        if options.need_nullability_check(source_obj=array):
+            dv = default_arrow_scalar(
+                options.target_field.type,
+                nullable=options.target_field.nullable
+            ).as_py()
 
-    target_polars_field = options.get_target_polars_field()
+            return array.fill_null(dv)
+        return array
 
-    if series.dtype == polars.Null():
-        return series.cast(target_polars_field.dtype, strict=False)
+    source_polars_field = options.source_polars_field
+    target_polars_field = options.target_polars_field
 
-    source_arrow_field = options.source_field or pa.field(series.name, polars_type_to_arrow_type(series.dtype))
+    if source_polars_field.dtype == polars.Null():
+        return array.cast(target_polars_field.dtype, strict=False)
 
     # strict=True => fail on lossy casts
-    if isinstance(target_polars_field.dtype, polars.Datetime):
-        if isinstance(series.dtype, polars.Utf8):
-            casted = polars_strptime(series, options=options)
+    if isinstance(target_polars_field.dtype, polars.datatypes.TemporalType):
+        if isinstance(source_polars_field.dtype, (polars.Utf8, polars.Binary)):
+            casted = polars_strptime(array, options=options)
         else:
-            casted = series.cast(
+            casted = array.cast(
                 target_polars_field.dtype,
                 strict=options.safe
             )
     elif isinstance(target_polars_field.dtype, polars.List):
         # For Structs, we need to cast each subfield individually to respect nullability
-        casted = cast_to_list_array(series, options=options)
+        casted = cast_to_list_array(array, options=options)
     elif isinstance(target_polars_field.dtype, polars.Struct):
         # For Structs, we need to cast each subfield individually to respect nullability
-        casted = cast_to_struct_array(series, options=options)
+        casted = cast_to_struct_array(array, options=options)
     else:
-        casted = series.cast(target_polars_field.dtype, strict=options.safe)
+        casted = array.cast(target_polars_field.dtype, strict=options.safe)
 
-    # If Arrow says "non-nullable", fill nulls with a default value
-    if source_arrow_field.nullable and not target_field.nullable:
-        dv = default_arrow_scalar(target_field.type, nullable=target_field.nullable).as_py()
-        casted = casted.fill_null(dv)
+    if options.need_nullability_check(source_obj=array):
+        dv = default_arrow_scalar(
+            options.target_field.type, nullable=options.target_field.nullable
+        ).as_py()
 
-    # Preserve original series name
+        return casted.fill_null(dv)
     return casted
 
 
 def cast_to_list_array(
-    series: "polars.Series",
+    array: PolarsSeries,
     options: Optional["CastOptions"] = None,
-) -> "polars.Series":
-    """
-    Cast a Polars List Series to a target Arrow List type using *our own*
-    cast_polars_series logic for the inner elements.
-
-    Steps:
-    - explode list elements
-    - cast inner values via cast_polars_series
-    - group back into lists
-    - restore null-list rows as None
-    """
+) -> PolarsSeries:
     options = CastOptions.check_arg(options)
-    from .arrow_cast import cast_to_list_array
 
-    arrow_array = polars_series_to_arrow_array(series)
-    casted = cast_to_list_array(arrow_array, options)
+    if not options.need_polars_type_cast(source_obj=array):
+        if options.need_nullability_check(source_obj=array):
+            dv = default_arrow_scalar(
+                options.target_field.type,
+                nullable=options.target_field.nullable
+            ).as_py()
 
-    return arrow_array_to_polars_series(casted, options)
+            return array.fill_null(dv)
+        return array
+
+    if not isinstance(options.source_polars_field.dtype, polars.List):
+        raise TypeError(f"expected List series, got {array.dtype}")
+
+    element_options = options.copy(
+        source_arrow_field=options.source_child_arrow_field(index=0),
+        target_arrow_field=options.target_child_arrow_field(index=0)
+    )
+
+    # ✅ Fast path: cast elements in-place (no explode)
+    df = array.to_frame("__x")
+    out = df.select(
+        polars.col("__x")
+        .list.eval(
+            cast_polars_array(polars.element(), element_options),
+            parallel=True,
+        )
+        .alias("__x")
+    )["__x"]
+
+    # Enforce list-level nullability if required
+    if options.need_nullability_check(source_obj=array):
+        dv = default_arrow_scalar(
+            options.target_field.type,
+            nullable=options.target_field.nullable,
+        ).as_py()
+        out = out.fill_null(dv)
+
+    return out.alias(options.target_field.name)
 
 
 def cast_to_struct_array(
-    series: "polars.Series",
+    array: PolarsSeries,
     options: Optional[CastOptions] = None,
-) -> "polars.Series":
+) -> PolarsSeries:
     """
     Cast a Polars Struct Series to a target Arrow Struct type using Polars casting rules.
 
     Each subfield is cast individually.
     """
     options = CastOptions.check_arg(options)
-    target_arrow_field = options.target_field
 
-    if not target_arrow_field:
-        return series
+    if not options.need_polars_type_cast(source_obj=array):
+        if options.need_nullability_check(source_obj=array):
+            dv = default_arrow_scalar(
+                options.target_field.type,
+                nullable=options.target_field.nullable
+            ).as_py()
 
-    source_polars_type = series.dtype
+            return array.fill_null(dv)
+        return array
 
-    if not isinstance(source_polars_type, polars.Struct):
-        raise ValueError(f"Cannot make struct polars series from {source_polars_type}")
+    if not isinstance(options.source_polars_field.dtype, polars.Struct):
+        raise ValueError(f"Cannot make struct polars series from {options.source_polars_field}")
 
-    source_polars_fields = source_polars_type.fields
+    source_polars_fields = options.source_polars_field.dtype.fields
     source_arrow_fields = [polars_field_to_arrow_field(f) for f in source_polars_fields]
 
-    target_arrow_fields: list[pa.Field] = list(target_arrow_field.type)
+    target_arrow_fields: list[pa.Field] = list(options.target_arrow_field.type)
     target_polars_fields = [arrow_field_to_polars_field(f) for f in target_arrow_fields]
 
     name_to_index = {f.name: idx for idx, f in enumerate(source_polars_fields)}
@@ -199,9 +273,9 @@ def cast_to_struct_array(
             dv = default_arrow_scalar(
                 dtype=child_target_arrow_field.type,
                 nullable=child_target_arrow_field.nullable,
-            )
+            ).as_py()
             casted_child = polars.lit(
-                value=dv.as_py(),
+                value=dv,
                 dtype=child_target_polars_field.dtype,
             )
         else:
@@ -209,36 +283,39 @@ def cast_to_struct_array(
             child_source_polars_field: polars.Field = source_polars_fields[source_index]
 
             casted_child = cast_polars_array(
-                series.struct.field(child_source_polars_field.name),
+                array.struct.field(child_source_polars_field.name),
                 options=options.copy(
-                    source_field=child_source_arrow_field,
-                    target_field=child_target_arrow_field,
+                    source_arrow_field=child_source_arrow_field,
+                    target_arrow_field=child_target_arrow_field,
                 ),
             )
 
         children.append(casted_child.alias(child_target_polars_field.name))
 
     # Build the struct from the cast children
-    result_struct = polars.struct(*children)
-
-    # 🔑 NEW: if the input struct series is null → whole result struct is null
-    return (
-        polars.when(series.is_null())
-        .then(None)
-        .otherwise(result_struct)
-        .alias(target_arrow_field.name)
+    result_struct = polars.struct(
+        *children,
     )
+
+    if options.source_field.nullable and options.target_field.nullable:
+        return (
+            polars.when(array.is_null())
+            .then(None)
+            .otherwise(result_struct)
+            .alias(options.target_field.name)
+        )
+    return result_struct.alias(options.target_field.name)
 
 
 def polars_strptime(
-    series: "polars.Series",
+    series: PolarsSeries,
     options: Optional[CastOptions] = None,
-) -> "polars.Series":
+) -> PolarsSeries:
     """
     Helper to parse strings to datetime in Polars using optional patterns.
     """
     options = CastOptions.check_arg(options)
-    polars_field = options.get_target_polars_field()
+    polars_field = options.target_polars_field
 
     if polars_field is None:
         polars_field = polars.Field(series.name, polars.Datetime("us", "UTC"))
@@ -274,9 +351,9 @@ def polars_strptime(
 
 @polars_converter(PolarsDataFrame, PolarsDataFrame)
 def cast_polars_dataframe(
-    data: "polars.DataFrame",
+    dataframe: PolarsDataFrame,
     options: Optional[CastOptions] = None,
-) -> "polars.DataFrame":
+) -> PolarsDataFrame:
     """
     Cast a Polars DataFrame to a target Arrow schema using Arrow casting rules.
 
@@ -289,11 +366,11 @@ def cast_polars_dataframe(
     target_arrow_schema = options.target_arrow_schema
 
     if target_arrow_schema is None:
-        return data
+        return dataframe
 
     sub_source_polars_fields = [
         polars.Field(name, d)
-        for name, d in data.schema.items()
+        for name, d in dataframe.schema.items()
     ]
     sub_source_arrow_fields = [
         polars_field_to_arrow_field(f)
@@ -331,34 +408,34 @@ def cast_polars_dataframe(
             )
             series = polars.repeat(
                 value=dv.as_py(),
-                n=data.shape[0],
+                n=dataframe.shape[0],
                 dtype=sub_target_field.dtype
             )
         else:
             source_field = sub_source_arrow_fields[source_index]
             found_column_names.add(source_field.name)
-            source_series = data[:, source_index]
+            source_series = dataframe[:, source_index]
             series = cast_polars_array(
                 source_series,
                 options=options.copy(
-                    source_field=source_field,
-                    target_field=target_arrow_field
+                    source_arrow_field=source_field,
+                    target_arrow_field=target_arrow_field
                 )
             )
 
         columns.append((sub_target_field, series.alias(sub_target_field.name)))
 
     # Start with only the casted schema columns
-    result = data.select(c for _, c in columns)
+    result = dataframe.select(c for _, c in columns)
 
     # If we allow extra columns, horizontally concat them back
     if options.allow_add_columns:
         extra_cols = [
-            name for name in data.columns if name not in found_column_names
+            name for name in dataframe.columns if name not in found_column_names
         ]
 
         if extra_cols:
-            extra_df = data.select(extra_cols)
+            extra_df = dataframe.select(extra_cols)
             result = polars.concat([result, extra_df], how="horizontal")
 
     return result
@@ -369,7 +446,7 @@ def cast_polars_dataframe(
 # ---------------------------------------------------------------------------
 @polars_converter(PolarsSeries, pa.Array)
 def polars_series_to_arrow_array(
-    series: "polars.Series",
+    series: PolarsSeries,
     options: Optional[CastOptions] = None,
 ) -> pa.Array:
     """
@@ -394,7 +471,7 @@ def polars_series_to_arrow_array(
 
 @polars_converter(PolarsDataFrame, pa.Table)
 def polars_dataframe_to_arrow_table(
-    data: "polars.DataFrame",
+    data: PolarsDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.Table:
     """
@@ -424,7 +501,7 @@ def polars_dataframe_to_arrow_table(
 def arrow_array_to_polars_series(
     arr: pa.Array,
     options: Optional[CastOptions] = None,
-) -> "polars.Series":
+) -> PolarsSeries:
     """
     Convert a pyarrow.Array (or ChunkedArray) to a Polars Series.
 
@@ -448,7 +525,7 @@ def arrow_array_to_polars_series(
 def arrow_table_to_polars_dataframe(
     table: pa.Table,
     options: Optional[CastOptions] = None,
-) -> "polars.DataFrame":
+) -> PolarsDataFrame:
     """
     Convert a pyarrow.Table to a Polars DataFrame.
 
@@ -466,11 +543,9 @@ def arrow_table_to_polars_dataframe(
 # ---------------------------------------------------------------------------
 # RecordBatchReader <-> Polars DataFrame
 # ---------------------------------------------------------------------------
-
-
 @polars_converter(PolarsDataFrame, pa.RecordBatchReader)
 def polars_dataframe_to_record_batch_reader(
-    dataframe: "polars.DataFrame",
+    dataframe: PolarsDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.RecordBatchReader:
     """
@@ -488,7 +563,7 @@ def polars_dataframe_to_record_batch_reader(
 def record_batch_reader_to_polars_dataframe(
     reader: pa.RecordBatchReader,
     options: Optional[CastOptions] = None,
-) -> "polars.DataFrame":
+) -> PolarsDataFrame:
     """
     Convert a pyarrow.RecordBatchReader to a Polars DataFrame.
 
@@ -509,3 +584,230 @@ def record_batch_reader_to_polars_dataframe(
     table = pa.Table.from_batches(batches)
     # opts already applied above if needed; no need to double-cast
     return arrow_table_to_polars_dataframe(table, None)
+
+# ---------------------------------------------------------------------------
+# PyArrow Types <-> Polars Types
+# ---------------------------------------------------------------------------
+@polars_converter(pa.DataType, PolarsDataType)
+def arrow_type_to_polars_type(
+    arrow_type: pa.DataType,
+    options: Optional[dict] = None,
+) -> PolarsDataType:
+    """
+    Convert a pyarrow.DataType to a Polars dtype.
+
+    Returns a Polars dtype object (e.g. pl.Int64, pl.List(pl.Utf8), ...).
+    Raises TypeError for unsupported types.
+    """
+    import pyarrow.types as pat
+
+    # Fast path: exact primitive mapping
+    dtype = ARROW_TO_POLARS.get(arrow_type)
+
+    if dtype is not None:
+        return dtype
+
+    # Timestamp
+    if pat.is_timestamp(arrow_type):
+        unit = arrow_type.unit  # "s", "ms", "us", "ns"
+        tz = arrow_type.tz
+        # Polars supports "ns", "us", "ms". Upcast seconds.
+        if unit == "s":
+            unit = "ms"
+        return polars.Datetime(time_unit=unit, time_zone=tz)
+
+    if pat.is_time(arrow_type):
+        return polars.Time()
+
+    # Duration
+    if pat.is_duration(arrow_type):
+        unit = arrow_type.unit  # "s", "ms", "us", "ns"
+        if unit == "s":
+            unit = "ms"
+        return polars.Duration(time_unit=unit)
+
+    if is_arrow_type_binary_like(arrow_type):
+        return polars.Binary()
+
+    if is_arrow_type_string_like(arrow_type):
+        return polars.Utf8()
+
+    # Dictionary -> Categorical (no categories info at dtype level)
+    if pat.is_dictionary(arrow_type):
+        return polars.Categorical()
+
+    # Map -> represented as List(Struct({"key": ..., "value": ...}))
+    if pat.is_map(arrow_type):
+        key_type = arrow_type.key_type
+        item_type = arrow_type.item_type
+        pl_key = arrow_type_to_polars_type(key_type)
+        pl_val = arrow_type_to_polars_type(item_type)
+        # Struct fields: we prefer real pl.Field if available
+        field_cls = getattr(polars, "Field", None)
+        if callable(field_cls):
+            struct_dtype = polars.Struct(
+                [
+                    field_cls("key", pl_key),
+                    field_cls("value", pl_val),
+                ]
+            )
+        else:
+            struct_dtype = polars.Struct({"key": pl_key, "value": pl_val})
+        return polars.List(struct_dtype)
+
+    # List / LargeList
+    if is_arrow_type_list_like(arrow_type):
+        inner = arrow_type.value_type
+        inner_pl = arrow_type_to_polars_type(inner)
+        return polars.List(inner_pl)
+
+    # Struct
+    if pat.is_struct(arrow_type):
+        field_cls = getattr(polars, "Field", None)
+        if callable(field_cls):
+            fields = [
+                field_cls(f.name, arrow_type_to_polars_type(f.type))
+                for f in arrow_type
+            ]
+            return polars.Struct(fields)
+        else:
+            return polars.Struct(
+                {f.name: arrow_type_to_polars_type(f.type) for f in arrow_type}
+            )
+
+    raise TypeError(f"Unsupported or unknown Arrow type for Polars conversion: {arrow_type!r}")
+
+
+@polars_converter(pa.Field, PolarsField)
+def arrow_field_to_polars_field(
+    field: pa.Field,
+    options: Optional[dict] = None,
+) -> PolarsField:
+    """
+    Convert a pyarrow.Field to a Polars field representation.
+
+    If polars.Field exists, returns a polars.Field(name, dtype).
+    """
+    built = polars.Field(field.name, arrow_type_to_polars_type(field.type))
+
+    try:
+        setattr(built, "nullable", field.nullable)
+    except Exception:
+        pass
+
+    return built
+
+
+def _polars_base_type(pl_dtype: Any) -> Any:
+    """
+    Normalize a Polars dtype or dtype class to its base_type class,
+    so we can key into POLARS_BASE_TO_ARROW.
+    """
+    # dtype is an instance
+    base_method = getattr(pl_dtype, "base_type", None)
+    if callable(base_method):
+        return base_method()
+    # dtype is a class (e.g. pl.Int64)
+    try:
+        instance = pl_dtype()
+    except Exception:
+        return pl_dtype
+    base_method = getattr(instance, "base_type", None)
+    if callable(base_method):
+        return base_method()
+    return pl_dtype
+
+
+@polars_converter(PolarsDataType, pa.DataType)
+def polars_type_to_arrow_type(
+    pl_type: PolarsDataType,
+    options: Optional[dict] = None,
+) -> pa.DataType:
+    """
+    Convert a Polars dtype (class or instance) to a pyarrow.DataType.
+
+    Handles primitives via POLARS_BASE_TO_ARROW and common nested/temporal types.
+    """
+    base = _polars_base_type(pl_type)
+
+    # Primitive base mapping
+    existing = POLARS_BASE_TO_ARROW.get(base) or POLARS_BASE_TO_ARROW.get(type(pl_type))
+
+    if existing is not None:
+        return existing
+
+    if isinstance(pl_type, polars.Datetime):
+        unit = pl_type.time_unit
+        tz = pl_type.time_zone
+        return pa.timestamp(unit, tz=tz)
+
+    elif isinstance(pl_type, polars.Duration):
+        unit = pl_type.time_unit
+        return pa.duration(unit)
+
+    elif isinstance(pl_type, polars.Decimal):
+        precision = pl_type.precision
+        scale = pl_type.scale
+        return pa.decimal128(precision, scale) if precision <= 38 else pa.decimal256(precision, scale)
+
+    elif isinstance(pl_type, polars.List):
+        inner = pl_type.inner
+        arrow_inner = polars_type_to_arrow_type(inner)
+
+        return pa.list_(arrow_inner)
+
+    elif isinstance(pl_type, polars.Struct):
+        fields = [
+            polars_field_to_arrow_field(_)
+            for _ in pl_type.fields
+        ]
+
+        return pa.struct(fields)
+
+    # Categorical / Enum -> Arrow dictionary<string>
+    if isinstance(pl_type, polars.Categorical) or isinstance(pl_type, polars.Enum):
+        # We don't have direct info on categories at the dtype level,
+        # so choose a reasonable default: int32 index over string values.
+        return pa.dictionary(index_type=pa.int32(), value_type=pa.string())
+
+    raise TypeError(f"Unsupported or unknown Polars dtype for Arrow conversion: {pl_type!r}")
+
+
+@polars_converter(PolarsField, pa.Field)
+def polars_field_to_arrow_field(
+    field: PolarsField,
+    options: Optional["CastOptions"] = None,
+) -> pa.Field:
+    """
+    Convert a Polars field to a pyarrow.Field.
+
+    Accepts:
+      - polars.datatypes.Field instances
+      - (name, dtype) tuples
+    """
+    arrow_type = polars_type_to_arrow_type(field.dtype)
+
+    return pa.field(field.name, arrow_type, nullable=getattr(field, "nullable", True))
+
+
+@polars_converter(PolarsSeries, pa.Field)
+@polars_converter(PolarsExpr, pa.Field)
+def polars_array_to_arrow_field(
+    array: Union[PolarsSeries, PolarsExpr],
+    options: Optional[CastOptions] = None
+) -> pa.Field:
+    options = CastOptions.check_arg(options)
+
+    if options.source_arrow_field:
+        return options.source_arrow_field
+
+    name = array.name
+    atype = polars_type_to_arrow_type(array.dtype)
+    nullable = array.null_count() > 0
+
+    return pa.field(
+        name,
+        atype,
+        nullable=nullable,
+        metadata=None
+    )

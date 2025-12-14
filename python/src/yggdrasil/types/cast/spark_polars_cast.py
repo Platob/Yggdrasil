@@ -2,31 +2,12 @@ from typing import Optional
 
 import pyarrow as pa
 
-from .arrow_cast import CastOptions
+from .cast_options import CastOptions
+from .polars_cast import *
 from .registry import register_converter
-
-# Spark <-> Arrow helpers
-from .spark_cast import (
-    spark_dataframe_to_arrow_table,
-    arrow_table_to_spark_dataframe,
-)
-
-# Polars <-> Arrow helpers
-from .polars_cast import (
-    polars_dataframe_to_arrow_table,
-    arrow_table_to_polars_dataframe,
-)
-
-from ...libs.sparklib import (
-    pyspark,
-    arrow_field_to_spark_field,
-    spark_field_to_arrow_field,
-)
-from ...libs.polarslib import (
-    polars,
-    require_polars,
-    arrow_type_to_polars_type,
-)
+from .spark_cast import *
+from ...libs.polarslib import polars
+from ...libs.sparklib import pyspark
 
 __all__ = [
     "spark_dataframe_to_polars_dataframe",
@@ -40,37 +21,10 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Type aliases + decorator wrapper (safe when Spark/Polars are missing)
 # ---------------------------------------------------------------------------
-
 if pyspark is not None and polars is not None:
-    require_polars()
-
-    from pyspark.sql.types import DataType as SparkDataTypeCls, StructField as SparkStructFieldCls
-    from polars.datatypes import DataType as PolarsDataTypeCls, Field as PolarsFieldCls
-
-    SparkDataFrame = pyspark.sql.DataFrame
-    SparkDataType = SparkDataTypeCls
-    SparkStructField = SparkStructFieldCls
-
-    PolarsDataFrame = polars.DataFrame
-    PolarsDataType = PolarsDataTypeCls
-    PolarsField = PolarsFieldCls
-
     def spark_polars_converter(*args, **kwargs):
         return register_converter(*args, **kwargs)
-
 else:
-    # Dummy stand-ins so decorators/annotations don't explode if one side is missing
-    class _Dummy:  # pragma: no cover - only used when Spark or Polars not installed
-        pass
-
-    SparkDataFrame = _Dummy
-    SparkDataType = _Dummy
-    SparkStructField = _Dummy
-
-    PolarsDataFrame = _Dummy
-    PolarsDataType = _Dummy
-    PolarsField = _Dummy
-
     def spark_polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
         def _decorator(func):
             return func
@@ -81,13 +35,11 @@ else:
 # ---------------------------------------------------------------------------
 # Spark DataFrame <-> Polars DataFrame via Arrow
 # ---------------------------------------------------------------------------
-
-
 @spark_polars_converter(SparkDataFrame, PolarsDataFrame)
 def spark_dataframe_to_polars_dataframe(
-    dataframe: "pyspark.sql.DataFrame",
-    cast_options: Optional[CastOptions] = None,
-) -> "polars.DataFrame":
+    dataframe: SparkDataFrame,
+    options: Optional[CastOptions] = None,
+) -> PolarsDataFrame:
     """
     Convert a Spark DataFrame to a Polars DataFrame using Arrow as the bridge.
 
@@ -105,20 +57,18 @@ def spark_dataframe_to_polars_dataframe(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
-
     # Spark -> Arrow (includes Arrow-side casting if target_schema is set)
-    table = spark_dataframe_to_arrow_table(dataframe, opts)
+    table = spark_dataframe_to_arrow_table(dataframe, options)
 
     # Arrow -> Polars (no extra casting; table already conforms to target schema)
-    return arrow_table_to_polars_dataframe(table, None)
+    return arrow_table_to_polars_dataframe(table, options)
 
 
 @spark_polars_converter(PolarsDataFrame, SparkDataFrame)
 def polars_dataframe_to_spark_dataframe(
-    dataframe: "polars.DataFrame",
-    cast_options: Optional[CastOptions] = None,
-) -> "pyspark.sql.DataFrame":
+    dataframe: PolarsDataFrame,
+    options: Optional[CastOptions] = None,
+) -> SparkDataFrame:
     """
     Convert a Polars DataFrame to a Spark DataFrame using Arrow as the bridge.
 
@@ -136,24 +86,22 @@ def polars_dataframe_to_spark_dataframe(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
     # Polars -> Arrow (includes Arrow-side casting if target_schema is set)
-    table = polars_dataframe_to_arrow_table(dataframe, opts)
+    table = polars_dataframe_to_arrow_table(dataframe, options)
 
     # Arrow -> Spark (no extra casting; table already conforms to target schema)
-    return arrow_table_to_spark_dataframe(table, None)
+    return arrow_table_to_spark_dataframe(table, options)
 
 
 # ---------------------------------------------------------------------------
 # Spark DataType <-> Polars DataType via Arrow
 # ---------------------------------------------------------------------------
-
-
 @spark_polars_converter(SparkDataType, PolarsDataType)
 def spark_dtype_to_polars_dtype(
     dtype: "pyspark.sql.types.DataType",
-    cast_options: Optional[CastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "polars.datatypes.DataType":
     """
     Convert a Spark DataType to a Polars DataType via Arrow.
@@ -168,20 +116,20 @@ def spark_dtype_to_polars_dtype(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
     # Wrap Spark DataType into a StructField so we can reuse existing helper
     sf = pyspark.sql.types.StructField("value", dtype, nullable=True)
-    arrow_field = spark_field_to_arrow_field(sf, opts)
+    arrow_field = spark_field_to_arrow_field(sf, options)
     arrow_type = arrow_field.type
 
-    return arrow_type_to_polars_type(arrow_type, opts)
+    return arrow_type_to_polars_type(arrow_type, options)
 
 
 @spark_polars_converter(PolarsDataType, SparkDataType)
 def polars_dtype_to_spark_dtype(
     dtype: "polars.datatypes.DataType",
-    cast_options: Optional[CastOptions] = None,
+    options: Optional[CastOptions] = None,
 ) -> "pyspark.sql.types.DataType":
     """
     Convert a Polars DataType to a Spark DataType via Arrow.
@@ -198,7 +146,7 @@ def polars_dtype_to_spark_dtype(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
     # Build an empty Series just to obtain the Arrow dtype
     s = polars.Series("value", [], dtype=dtype)
@@ -208,20 +156,18 @@ def polars_dtype_to_spark_dtype(
     arrow_type = arr.type
 
     arrow_field = pa.field("value", arrow_type, nullable=True)
-    spark_field = arrow_field_to_spark_field(arrow_field, opts)
+    spark_field = arrow_field_to_spark_field(arrow_field, options)
     return spark_field.dataType
 
 
 # ---------------------------------------------------------------------------
 # Spark StructField <-> Polars Field via Arrow
 # ---------------------------------------------------------------------------
-
-
 @spark_polars_converter(SparkStructField, PolarsField)
 def spark_field_to_polars_field(
-    field: "pyspark.sql.types.StructField",
-    cast_options: Optional[CastOptions] = None,
-) -> "polars.datatypes.Field":
+    field: SparkStructField,
+    options: Optional[CastOptions] = None,
+) -> PolarsField:
     """
     Convert a Spark StructField to a Polars Field via Arrow.
 
@@ -235,10 +181,10 @@ def spark_field_to_polars_field(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
-    arrow_field = spark_field_to_arrow_field(field, opts)
-    pl_dtype = arrow_type_to_polars_type(arrow_field.type, opts)
+    arrow_field = spark_field_to_arrow_field(field, options)
+    pl_dtype = arrow_type_to_polars_type(arrow_field.type, options)
 
     # Polars Field does not encode nullability explicitly; dtype will be nullable by default
     return PolarsField(arrow_field.name, pl_dtype)
@@ -246,9 +192,9 @@ def spark_field_to_polars_field(
 
 @spark_polars_converter(PolarsField, SparkStructField)
 def polars_field_to_spark_field(
-    field: "polars.datatypes.Field",
-    cast_options: Optional[CastOptions] = None,
-) -> "pyspark.sql.types.StructField":
+    field: PolarsField,
+    options: Optional[CastOptions] = None,
+) -> SparkStructField:
     """
     Convert a Polars Field to a Spark StructField via Arrow.
 
@@ -263,7 +209,7 @@ def polars_field_to_spark_field(
     if pyspark is None or polars is None:
         raise RuntimeError("Both pyspark and polars are required for this conversion")
 
-    opts = CastOptions.check_arg(cast_options)
+    options = CastOptions.check_arg(options)
 
     # field.dtype is a Polars DataType
     pl_dtype = field.dtype
@@ -276,5 +222,5 @@ def polars_field_to_spark_field(
 
     # We default nullable=True; if you want strict nullability you can extend this
     arrow_field = pa.field(field.name, arrow_type, nullable=True)
-    spark_field = arrow_field_to_spark_field(arrow_field, opts)
+    spark_field = arrow_field_to_spark_field(arrow_field, options)
     return spark_field

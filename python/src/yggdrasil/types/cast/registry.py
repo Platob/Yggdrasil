@@ -16,7 +16,7 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints, Optional, List, TypeVar, Type,
+    get_type_hints, Optional, List, Type, TypeVar,
 )
 
 import pyarrow as pa
@@ -30,27 +30,25 @@ __all__ = [
 ]
 
 
-Converter = Callable[[Any, "ArrowCastOptions | dict | None"], Any]
-
-
-_registry: Dict[Tuple[Any, Any], Converter] = {}
-
-
 def _identity(x, opt):
     return x
 
+ReturnType = TypeVar("ReturnType")
+Converter = Callable[[Any, "CastOptions"], ReturnType]
+_registry: Dict[Tuple[Any, Any], Converter] = {}
+_any_registry: Dict[Any, Converter] = {}
 
 def register_converter(
-    from_hint: Union[Any, List[Any]],
-    to_hint: Any
-) -> Callable[[Callable[..., Any]], Converter]:
+    from_hint: Any,
+    to_hint: ReturnType
+) -> Callable[[Callable[..., ReturnType]], Converter]:
     """Register a converter from ``from_hint`` to ``to_hint``.
 
     The decorated callable receives ``(value, options)`` and should return the
     converted value.
     """
 
-    def decorator(func: Callable[..., Any]) -> Converter:
+    def decorator(func: Callable[..., ReturnType]) -> Converter:
         sig = inspect.signature(func)
         params = list(sig.parameters.values())
         if any(
@@ -61,16 +59,16 @@ def register_converter(
                 "Converters must accept exactly two positional arguments: (value, options)"
             )
 
-        if len(params) != 2:
+        if len(params) < 2:
             raise TypeError(
-                "Converters must accept exactly two positional arguments: (value, options)"
+                "Converters must accept at least two positional arguments: (value, options)"
             )
 
-        if isinstance(from_hint, list):
-            for h in from_hint:
-                _registry[(h, to_hint)] = func
+        if from_hint in (Any, object):
+            _any_registry[to_hint] = func
         else:
             _registry[(from_hint, to_hint)] = func
+
         return func
 
     return decorator
@@ -183,6 +181,10 @@ def find_converter(
                 return _c2(intermediate, options)
 
             return composed
+
+    conv = _any_registry.get(to_hint)
+    if conv is not None:
+        return conv
 
     return None
 

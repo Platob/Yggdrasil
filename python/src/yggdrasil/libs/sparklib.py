@@ -34,12 +34,12 @@ try:
         pa.float64(): T.DoubleType(),
 
         pa.string(): T.StringType(),
-        pa.string_view(): T.StringType(),
-        pa.large_string(): T.StringType(),
+        getattr(pa, "string_view", pa.string)(): T.StringType(),
+        getattr(pa, "large_string", pa.string)(): T.BinaryType(),
 
         pa.binary(): T.BinaryType(),
-        pa.binary_view(): T.BinaryType(),
-        pa.large_binary(): T.BinaryType(),
+        getattr(pa, "binary_view", pa.binary)(): T.BinaryType(),
+        getattr(pa, "large_binary", pa.binary)(): T.BinaryType(),
 
         pa.date32(): T.DateType(),
         pa.date64(): T.DateType(),  # drop time-of-day

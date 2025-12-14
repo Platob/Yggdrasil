@@ -3,7 +3,7 @@ import pytest
 
 polars = pytest.importorskip("polars")
 
-from yggdrasil.libs.polarslib import (
+from yggdrasil.types.cast.polars_cast import (
     arrow_type_to_polars_type,
     arrow_field_to_polars_field,
     polars_type_to_arrow_type,

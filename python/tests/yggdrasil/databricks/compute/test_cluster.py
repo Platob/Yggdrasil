@@ -19,12 +19,11 @@ class TestCluster(unittest.TestCase):
         self.cluster = Cluster.replicated_current_environment(workspace=self.workspace)
         # self.cluster.restart()
 
-        b = Workspace(
+    def test_get_current_token(self):
+        assert Workspace(
             host=self.workspace.host,
             token=self.workspace.current_token()
-        ).connect()
-
-        print(b.current_user)
+        ).current_user.user_name == self.workspace.current_user.user_name
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
@@ -59,7 +58,7 @@ class TestCluster(unittest.TestCase):
         @self.cluster.execution_decorator
         def decorated(a: int):
             return {
-                "os": os.getenv("DATABRICKS_RUNTIME_VERSION"),
+                "os": os.environ,
                 "value": a
             }
 
@@ -78,7 +77,7 @@ class TestCluster(unittest.TestCase):
         @self.cluster.execution_decorator
         def decorated(a: int):
             return {
-                "os": os.getenv("DATABRICKS_RUNTIME_VERSION"),
+                "os": os.environ,
                 "value": a
             }
 
@@ -103,7 +102,7 @@ class TestCluster(unittest.TestCase):
 
         @databricks_remote_compute(workspace=self.workspace)
         def decorated(a: int):
-            return Workspace(host=wk.host).connect()
+            return wk.connect().current_user
 
         for i in range(4):
             result = decorated(i)

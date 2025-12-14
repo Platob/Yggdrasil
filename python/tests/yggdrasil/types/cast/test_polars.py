@@ -1,4 +1,6 @@
 # test_polars_cast.py
+import datetime
+import zoneinfo
 
 import pyarrow as pa
 import pytest
@@ -25,7 +27,7 @@ from yggdrasil.types import convert
 # ---------------------------------------------------------------------------
 
 def test_cast_polars_series_struct_child_defaults_and_missing_added():
-    series = polars.Series("payload", [{"value": 1}, {"value": None}])
+    series = pl.Series("payload", [{"value": 1}, {"value": None}])
 
     target_field = pa.field(
         "payload",
@@ -38,15 +40,15 @@ def test_cast_polars_series_struct_child_defaults_and_missing_added():
         nullable=True,
     )
 
-    opts = CastOptions.safe_init(target_field=target_field, add_missing_columns=True)
+    opts = CastOptions.safe_init(target_field=target_field)
     casted = cast_polars_array(series, opts)
     evaluated = (
-        polars.DataFrame({"payload": series})
+        pl.DataFrame({"payload": series})
         .with_columns(casted)
         .get_column("payload")
     )
 
-    assert isinstance(evaluated, polars.Series)
+    assert isinstance(evaluated, pl.Series)
     assert evaluated.dtype.fields[0].name == "value"
     assert evaluated.to_list() == [
         {"value": 1, "label": ""},
@@ -55,28 +57,34 @@ def test_cast_polars_series_struct_child_defaults_and_missing_added():
 
 
 def test_cast_polars_series_list_of_structs_preserves_null_lists():
-    series = polars.Series("items", [[{"count": 1}], [{"count": None}], None])
+    series = pl.Series("items", [[{"count": 1, "timestamp": "2025-12-10 10:00:00"}], [{"count": None}], None])
 
     target_field = pa.field(
         "items",
         pa.list_(
             pa.field(
                 "item",
-                pa.struct([pa.field("count", pa.int64(), nullable=False)]),
-                nullable=True,
+                pa.struct([
+                    pa.field("count", pa.int64(), nullable=False),
+                    pa.field("timestamp", pa.timestamp("us", "UTC"), nullable=False)
+                ]),
+                nullable=False,
             )
         ),
-        nullable=True,
+        nullable=False,
     )
 
     casted = cast_polars_array(series, CastOptions.safe_init(target_field=target_field))
 
-    assert isinstance(casted, polars.Series)
-    assert casted.dtype.inner == polars.Struct([polars.Field("count", polars.Int64)])
+    assert isinstance(casted, pl.Series)
+    assert casted.dtype.inner == pl.Struct([
+        pl.Field("count", pl.Int64),
+        pl.Field("timestamp", pl.Datetime("us", "UTC"))
+    ])
     assert casted.to_list() == [
-        [{"count": 1}],
-        [{"count": 0}],
-        None,
+        [{"count": 1, 'timestamp': datetime.datetime(2025, 12, 10, 10, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC'))}],
+        [{"count": 0, 'timestamp': datetime.datetime(1970, 1, 1, 0, 0, tzinfo=zoneinfo.ZoneInfo(key='UTC'))}],
+        [],
     ]
 
 
@@ -85,7 +93,7 @@ def test_cast_polars_series_list_of_structs_preserves_null_lists():
 # ---------------------------------------------------------------------------
 
 def test_cast_polars_dataframe_nested_schema_and_defaults():
-    df = polars.DataFrame(
+    df = pl.DataFrame(
         {
             "Meta": [{"id": 1}, {"id": 2}],
             "payload": [{"score": "7"}, {"score": None}],
@@ -136,7 +144,7 @@ def test_cast_polars_dataframe_nested_schema_and_defaults():
 
 
 def test_cast_polars_dataframe_preserves_extras_when_allowed():
-    df = polars.DataFrame({"a": [1], "keep": [9]})
+    df = pl.DataFrame({"a": [1], "keep": [9]})
 
     opts = CastOptions.safe_init(
         target_field=arrow_schema_to_field(pa.schema([pa.field("a", pa.int64(), nullable=False)])),
@@ -155,19 +163,19 @@ def test_cast_polars_dataframe_preserves_extras_when_allowed():
 # ---------------------------------------------------------------------------
 
 def test_polars_series_to_arrow_array_and_back():
-    s = polars.Series("a", [1, 2, 3])
+    s = pl.Series("a", [1, 2, 3])
 
     arr = polars_series_to_arrow_array(s)
     assert isinstance(arr, pa.Array)
     assert arr.to_pylist() == [1, 2, 3]
 
     s2 = arrow_array_to_polars_series(arr)
-    assert isinstance(s2, polars.Series)
+    assert isinstance(s2, pl.Series)
     assert s2.to_list() == [1, 2, 3]
 
 
 def test_polars_dataframe_to_arrow_table_with_cast_options():
-    df = polars.DataFrame({"vals": [[1, 2], [None, 3]]})
+    df = pl.DataFrame({"vals": [[1, 2], [None, 3]]})
 
     target_schema = pa.schema(
         [
@@ -209,7 +217,7 @@ def test_arrow_table_to_polars_dataframe_round_trip_structs():
         table,
         CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema)),
     )
-    assert isinstance(df, polars.DataFrame)
+    assert isinstance(df, pl.DataFrame)
     assert df["data"].to_list() == [
         {"count": 1, "label": "x"},
         {"count": None, "label": "y"},
@@ -241,7 +249,7 @@ def test_record_batch_reader_to_polars_dataframe_with_cast():
 
 
 def test_polars_dataframe_to_record_batch_reader_roundtrip():
-    df = polars.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
     rbr = polars_dataframe_to_record_batch_reader(df)
     assert isinstance(rbr, pa.RecordBatchReader)
@@ -255,7 +263,7 @@ def test_polars_dataframe_to_record_batch_reader_roundtrip():
 # ---------------------------------------------------------------------------
 
 def test_convert_polars_dataframe_to_arrow_table_with_schema_hint():
-    df = polars.DataFrame({"amount": [1, None]})
+    df = pl.DataFrame({"amount": [1, None]})
     target_schema = pa.schema([pa.field("amount", pa.int64(), nullable=False)])
 
     table = convert(
@@ -278,7 +286,7 @@ def test_convert_arrow_record_batch_reader_to_polars_with_cast():
         target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
 
-    df = convert(rbr, polars.DataFrame, options=opts)
+    df = convert(rbr, pl.DataFrame, options=opts)
 
     assert df.columns == ["a"]
     assert df["a"].to_list() == [1, 0, 3]

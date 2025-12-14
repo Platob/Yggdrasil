@@ -18,6 +18,7 @@ from ...libs.pandaslib import pandas
 from ...libs.polarslib import polars
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...requests.session import YGGSession
+from ...types import is_arrow_type_string_like, is_arrow_type_binary_like
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
 from ...types.cast.spark_cast import cast_spark_dataframe
@@ -34,8 +35,10 @@ except ImportError:
 
 
 if databricks_sdk is not None:
-    from databricks.sdk.service.sql import StatementState, StatementResponse, Disposition, Format, \
-    ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
+    from databricks.sdk.service.sql import (
+        StatementState, StatementResponse, Disposition, Format,
+        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
+    )
 
     StatementResponse = StatementResponse
 else:
@@ -150,10 +153,10 @@ class SQLEngine(WorkspaceService):
         statement: Optional[str] = None,
         *,
         byte_limit: Optional[int] = None,
-        disposition: Optional[Disposition] = None,
-        format: Optional[Format] = None,
-        on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
-        parameters: Optional[List[StatementParameterListItem]] = None,
+        disposition: Optional["Disposition"] = None,
+        format: Optional["Format"] = None,
+        on_wait_timeout: Optional["ExecuteStatementRequestOnWaitTimeout"] = None,
+        parameters: Optional[List["StatementParameterListItem"]] = None,
         row_limit: Optional[int] = None,
         wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
@@ -323,7 +326,12 @@ class SQLEngine(WorkspaceService):
                     table_name=table_name,
                     to_arrow_schema=True
                 )
+
                 # normalize arrow tabular input
+                cast_options = CastOptions.check_arg(
+                    cast_options, target_field=existing_schema
+                )
+
                 data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
             except ValueError as exc:
                 logger.warning(
@@ -768,9 +776,9 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return "FLOAT"
         elif pa.types.is_float64(arrow_type):
             return "DOUBLE"
-        elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type) or pa.types.is_string_view(arrow_type):
+        elif is_arrow_type_string_like(arrow_type):
             return "STRING"
-        elif pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type) or pa.types.is_binary_view(arrow_type) or pa.types.is_fixed_size_binary(arrow_type):
+        elif is_arrow_type_binary_like(arrow_type):
             return "BINARY"
         elif pa.types.is_timestamp(arrow_type):
             tz = getattr(arrow_type, "tz", None)
@@ -964,4 +972,3 @@ class StatementResult:
         max_workers: int | None = None
     ) -> "polars.DataFrame":
         return polars.DataFrame(self.arrow_table(max_workers=max_workers))
-
