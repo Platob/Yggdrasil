@@ -15,6 +15,16 @@ __all__ = [
     "is_arrow_type_list_like",
 ]
 
+for key, func in [
+    ("string_view", lambda: pa.string()),
+    ("is_string_view", lambda x: x == pa.string()),
+    ("binary_view", lambda: pa.binary()),
+    ("is_binary_view", lambda x: x == pa.binary()),
+    ("uuid", lambda x: x == pa.binary(16))
+]:
+    if not hasattr(pa.types, key):
+        setattr(pa.types, key, func)
+
 _NONE_TYPE = type(None)
 
 _PRIMITIVE_ARROW_TYPES = {
@@ -36,16 +46,6 @@ _SPECIAL_ARROW_TYPES = {
 }
 
 _INT_UNITS_ORDER = {"s": 0, "ms": 1, "us": 2, "ns": 3}
-
-
-for key, func in [
-    ("string_view", lambda: pa.string()),
-    ("is_string_view", lambda x: x == pa.string()),
-    ("binary_view", lambda: pa.binary()),
-    ("is_binary_view", lambda x: x == pa.binary()),
-]:
-    if not hasattr(pa.types, key):
-        setattr(pa.types, key, func)
 
 
 def _is_optional(hint) -> bool:

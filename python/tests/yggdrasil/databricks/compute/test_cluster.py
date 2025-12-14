@@ -17,7 +17,7 @@ class TestCluster(unittest.TestCase):
     def setUp(self):
         self.workspace = Workspace(host="xxx.cloud.databricks.com").connect()
         self.cluster = Cluster.replicated_current_environment(workspace=self.workspace)
-        # self.cluster.restart()
+        self.cluster.restart()
 
     def test_get_current_token(self):
         assert Workspace(
