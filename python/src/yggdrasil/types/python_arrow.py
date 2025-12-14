@@ -17,13 +17,21 @@ __all__ = [
 
 for key, func in [
     ("string_view", lambda: pa.string()),
-    ("is_string_view", lambda x: x == pa.string()),
     ("binary_view", lambda: pa.binary()),
-    ("is_binary_view", lambda x: x == pa.binary()),
-    ("uuid", lambda x: x == pa.binary(16))
+    ("uuid", lambda: pa.binary(16))
+]:
+    if not hasattr(pa, key):
+        setattr(pa, key, func)
+
+
+for key, func in [
+    ("is_string_view", lambda x: x == pa.string_view()),
+    ("is_binary_view", lambda x: x == pa.binary_view()),
+    ("is_uuid", lambda x: x == pa.uuid()),
 ]:
     if not hasattr(pa.types, key):
         setattr(pa.types, key, func)
+
 
 _NONE_TYPE = type(None)
 
