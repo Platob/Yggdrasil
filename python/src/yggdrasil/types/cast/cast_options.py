@@ -151,7 +151,7 @@ class CastOptions:
         if isinstance(options, CastOptions):
             result = options
         else:
-            return cls.safe_init(
+            result = cls.safe_init(
                 target_field=options,
                 **kwargs
             )

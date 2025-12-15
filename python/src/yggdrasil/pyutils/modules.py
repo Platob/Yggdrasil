@@ -1,78 +1,77 @@
+# modules.py
+from __future__ import annotations
+
 import dataclasses as dc
 import importlib
+import json
+import os
 import re
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Union, Optional, List
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
     # py3.8+
-    import importlib.metadata as ilm
+    import importlib.metadata as ilm  # type: ignore
 except Exception:  # pragma: no cover
     ilm = None  # type: ignore
+
+try:
+    # Usually present because pip depends on it (but treat as optional)
+    from packaging.requirements import Requirement  # type: ignore
+except Exception:  # pragma: no cover
+    Requirement = None  # type: ignore
 
 
 __all__ = [
     "DependencyMetadata",
+    "PipIndexSettings",
     "module_name_to_project_name",
     "resolve_local_lib_path",
-    "module_dependencies"
+    "module_dependencies",
+    "get_pip_index_settings",
 ]
 
 
 MODULE_PROJECT_NAMES_ALIASES = {
     "yggdrasil": "ygg",
-    "jwt": "PyJWT"
+    "jwt": "PyJWT",
 }
 
 
-def module_name_to_project_name(module_name: str):
+def module_name_to_project_name(module_name: str) -> str:
     return MODULE_PROJECT_NAMES_ALIASES.get(module_name, module_name)
 
 
-def resolve_local_lib_path(
-    lib: Union[str, ModuleType],
-) -> Path:
+def resolve_local_lib_path(lib: Union[str, ModuleType]) -> Path:
     """
     Resolve a lib spec (path string, module name, or module object)
     into a concrete filesystem path.
 
-    Rules:
-    - If it's a path and exists:
-        * if it's a file:
-            - if it's __init__.py -> treat as start of a package, then walk up
-              until top-most directory that still has __init__.py
-            - else -> just that file
-        * if it's a dir:
-            - if it (or parents) contain __init__.py, walk up to the
-              top-most dir that still has __init__.py
-            - else -> that dir as-is
-    - Else treat as module name:
-        * import, use __file__, apply same logic as above.
+    Package-walk rule:
+    - If the resolved path is inside a Python package (dir containing __init__.py),
+      walk upward and return the *top-most* directory that still contains __init__.py.
+    - If not in a package context, return the resolved file/dir.
     """
-    # Module object case
     if isinstance(lib, ModuleType):
-        mod = lib
-        mod_file = getattr(mod, "__file__", None)
+        mod_file = getattr(lib, "__file__", None)
         if not mod_file:
-            raise ValueError(
-                f"Module {mod.__name__!r} has no __file__; cannot determine path"
-            )
+            raise ValueError(f"Module {lib.__name__!r} has no __file__; cannot determine path")
         path = Path(mod_file).resolve()
     else:
-        # First, treat as path
         p = Path(lib)
         if p.exists():
             path = p.resolve()
         else:
-            # Not a path -> try as module name
             try:
                 mod = importlib.import_module(lib)
             except ImportError as e:
                 raise ModuleNotFoundError(
                     f"'{lib}' is neither an existing path nor an importable module"
                 ) from e
-
             mod_file = getattr(mod, "__file__", None)
             if not mod_file:
                 raise ModuleNotFoundError(
@@ -80,66 +79,66 @@ def resolve_local_lib_path(
                 )
             path = Path(mod_file).resolve()
 
-    # If it's a file, maybe part of a package
-    if path.is_file():
-        # If it's __init__.py, start from its directory
-        if path.name == "__init__.py":
-            pkg_dir = path.parent
-        else:
-            # Regular module: see if its parent is a package
-            pkg_dir = path.parent
-    else:
-        # Directory given. Might be a package root or inside a package.
-        pkg_dir = path
+    # Determine a directory to start package-walk from
+    start_dir = path.parent if path.is_file() else path
 
-    # Walk up to the top-most directory that still looks like a package
-    # (has __init__.py). If none found, just use the original dir/file.
-    top_pkg_dir = None
-    current = pkg_dir
+    top_pkg_dir: Optional[Path] = None
+    current = start_dir
 
     while True:
-        init_file = current / "__init__.py"
-        if init_file.exists():
+        if (current / "__init__.py").exists():
             top_pkg_dir = current
-            # try going higher
             parent = current.parent
-            # stop at filesystem root
             if parent == current:
                 break
             current = parent
         else:
             break
 
-    if top_pkg_dir is not None:
-        return top_pkg_dir
-
-    # Not in a package context -> return original path
-    return path
+    return top_pkg_dir.resolve() if top_pkg_dir is not None else path
 
 
-_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")  # PEP 508-ish
+# Fallback regex (only used when packaging isn't available)
+_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 @dc.dataclass(frozen=True)
 class DependencyMetadata:
-    project: str                 # pip/distribution name (e.g. "cryptography")
-    requirement: str             # raw Requires-Dist line
-    installed: bool              # is the dist installed locally
-    version: Optional[str]       # installed version if present
-    dist_root: Optional[Path]    # install root (site-packages path for that dist)
-    metadata_path: Optional[Path]  # .../<name>-*.dist-info/METADATA if available
+    project: str
+    requirement: str
+    installed: bool
+    version: Optional[str]
+    dist_root: Optional[Path]
+    metadata_path: Optional[Path]
 
 
 def _req_project_name(req_line: str) -> Optional[str]:
+    """
+    Best-effort extraction of the project name from a Requires-Dist line.
+    Prefer a real PEP 508 parser (packaging) when available; fall back to regex.
+    """
     left = req_line.split(";", 1)[0].strip()
+    if not left:
+        return None
+
+    if Requirement is not None:
+        try:
+            r = Requirement(left)
+            return r.name
+        except Exception:
+            return None
+
     m = _REQ_NAME_RE.match(left)
     if not m:
         return None
     name = m.group(1)
-    return name.split("[", 1)[0]  # drop extras
+    return name.split("[", 1)[0]
 
 
-def _distribution_for_module(mod: Union[str, ModuleType]) -> Optional["ilm.Distribution"]:
+def _distribution_for_module(mod: Union[str, ModuleType]):
+    if ilm is None:
+        raise RuntimeError("importlib.metadata is not available")
+
     if isinstance(mod, ModuleType):
         module_name = mod.__name__
     else:
@@ -150,16 +149,15 @@ def _distribution_for_module(mod: Union[str, ModuleType]) -> Optional["ilm.Distr
     mapping = ilm.packages_distributions()
     dists = mapping.get(top)
     if not dists:
-        raise ModuleNotFoundError(f"Can't find installed distribution that provides top-level module '{top}'")
-
+        raise ModuleNotFoundError(
+            f"Can't find installed distribution that provides top-level module '{top}'"
+        )
     return ilm.distribution(dists[0])
 
 
 def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]:
     """
-    Return a list of DepMetadata for all Requires-Dist dependencies of `lib`'s distribution.
-    - Works only when importlib.metadata is available (py3.8+).
-    - If a dependency is not installed locally, installed=False and fields are None.
+    Return DependencyMetadata for all Requires-Dist deps of `lib`'s distribution.
     """
     if ilm is None:
         return []
@@ -178,13 +176,9 @@ def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]
             version = dep_dist.version
             dist_root = Path(dep_dist.locate_file("")).resolve()
 
-            # Best-effort METADATA path
             metadata_path = None
             try:
-                meta_rel = dep_dist.read_text("METADATA")
-                if meta_rel is not None:
-                    # read_text worked, now try to locate the actual file path
-                    # Many dists have _path pointing at the dist-info dir (private but practical).
+                if dep_dist.read_text("METADATA") is not None:
                     p = getattr(dep_dist, "_path", None)
                     if p is not None:
                         mp = Path(p) / "METADATA"
@@ -216,3 +210,113 @@ def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]
             )
 
     return out
+
+
+def _run_pip(*args: str) -> Tuple[int, str, str]:
+    p = subprocess.run(
+        [sys.executable, "-m", "pip", *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+@dc.dataclass(frozen=True)
+class PipIndexSettings:
+    index_url: Optional[str] = None
+    extra_index_urls: List[str] = dc.field(default_factory=list)
+    sources: Dict[str, Dict[str, Any]] = dc.field(default_factory=dict)  # {"env": {...}, "config": {...}}
+
+    @classmethod
+    def default_settings(cls):
+        return DEFAULT_PIP_INDEX_SETTINGS
+
+    def as_dict(self) -> dict:
+        return dc.asdict(self)
+
+
+def get_pip_index_settings() -> PipIndexSettings:
+    """
+    Inspect pip settings:
+      - env (PIP_INDEX_URL / PIP_EXTRA_INDEX_URL)
+      - pip config (merged view from `pip config list`)
+
+    Precedence:
+      env overrides config.
+    """
+    sources: Dict[str, Dict[str, Any]] = {"env": {}, "config": {}}
+
+    env_index = os.environ.get("PIP_INDEX_URL")
+    env_extra = os.environ.get("PIP_EXTRA_INDEX_URL")
+
+    if env_index:
+        sources["env"]["PIP_INDEX_URL"] = env_index
+    if env_extra:
+        sources["env"]["PIP_EXTRA_INDEX_URL"] = env_extra
+
+    env_extra_urls: List[str] = shlex.split(env_extra) if env_extra else []
+
+    # Read pip config (best-effort)
+    rc, out, _err = _run_pip("config", "list", "--format=json")
+    config_index_url: Optional[str] = None
+    config_extra_raw: List[Any] = []
+
+    if rc == 0 and out:
+        cfg = json.loads(out)
+        for k, v in cfg.items():
+            lk = k.lower()
+            if lk.endswith("index-url"):
+                sources["config"][k] = v
+                if lk.endswith("index-url") and not lk.endswith("extra-index-url"):
+                    config_index_url = str(v)
+                elif lk.endswith("extra-index-url"):
+                    if isinstance(v, list):
+                        config_extra_raw.extend(v)
+                    else:
+                        config_extra_raw.append(v)
+    else:
+        rc2, out2, _ = _run_pip("config", "list")
+        if rc2 == 0 and out2:
+            for line in out2.splitlines():
+                if "=" not in line:
+                    continue
+                k, v = [x.strip() for x in line.split("=", 1)]
+                lk = k.lower()
+                if lk.endswith("extra-index-url"):
+                    sources["config"][k] = v
+                    config_extra_raw.append(v)
+                elif lk.endswith("index-url") and not lk.endswith("extra-index-url"):
+                    sources["config"][k] = v
+                    config_index_url = v
+
+    # Apply precedence
+    index_url = env_index or config_index_url
+
+    # extras: if env is set, it replaces config (pip behavior)
+    if env_extra_urls:
+        candidates = list(env_extra_urls)  # already tokenized; do NOT split again
+    else:
+        # config entries might contain multiple URLs in a single string => split them
+        candidates: List[str] = []
+        for item in config_extra_raw:
+            if item is None:
+                continue
+            candidates.extend(shlex.split(str(item)))
+
+    # Dedup preserving order
+    seen = set()
+    extra_index_urls: List[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            extra_index_urls.append(u)
+
+    return PipIndexSettings(index_url=index_url, extra_index_urls=extra_index_urls, sources=sources)
+
+
+try:
+    DEFAULT_PIP_INDEX_SETTINGS = get_pip_index_settings()
+except:
+    DEFAULT_PIP_INDEX_SETTINGS = PipIndexSettings()

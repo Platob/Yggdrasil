@@ -25,6 +25,7 @@ from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
 from ... import retry
 from ...libs.databrickslib import databricks_sdk
+from ...pyutils.modules import PipIndexSettings
 from ...ser import SerializedFunction
 
 if databricks_sdk is None:  # pragma: no cover - import guard
@@ -144,7 +145,7 @@ class Cluster(WorkspaceService):
     @property
     def details(self):
         if self._details is None and self.cluster_id is not None:
-            self._details = self.clusters_client().get(cluster_id=self.cluster_id)
+            self.details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
     def fresh_details(self, max_delay: float):
@@ -571,7 +572,8 @@ class Cluster(WorkspaceService):
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=5)
+        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=5),
+        pip_settings: Optional[PipIndexSettings] = None
     ) -> "Cluster":
         if not libraries:
             return self
@@ -581,7 +583,7 @@ class Cluster(WorkspaceService):
         wsdk.libraries.install(
             cluster_id=self.cluster_id,
             libraries=[
-                self._check_library(_)
+                self._check_library(_, pip_settings=pip_settings)
                 for _ in libraries if _
             ]
         )
@@ -641,6 +643,7 @@ class Cluster(WorkspaceService):
     def _check_library(
         self,
         value,
+        pip_settings: Optional[PipIndexSettings] = None,
     ) -> "Library":
         if isinstance(value, Library):
             return value
@@ -664,10 +667,15 @@ class Cluster(WorkspaceService):
                 return Library(whl=value)
 
             # Fallback: treat as PyPI / private index package
+            if pip_settings:
+                repo = pip_settings.extra_index_urls[0] if pip_settings.extra_index_urls else None
+            else:
+                repo = None
+
             return Library(
                 pypi=PythonPyPiLibrary(
                     package=value,
-                    repo=os.getenv("PIP_EXTRA_INDEX_URL"),
+                    repo=repo,
                 )
             )
 

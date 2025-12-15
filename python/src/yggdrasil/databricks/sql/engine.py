@@ -326,13 +326,6 @@ class SQLEngine(WorkspaceService):
                     table_name=table_name,
                     to_arrow_schema=True
                 )
-
-                # normalize arrow tabular input
-                cast_options = CastOptions.check_arg(
-                    cast_options, target_field=existing_schema
-                )
-
-                data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
             except ValueError as exc:
                 logger.warning(
                     "Falling back to create-or-overwrite for %s.%s.%s after cast failure: %s",
@@ -343,7 +336,7 @@ class SQLEngine(WorkspaceService):
                 )
                 logger.debug(
                     "Existing schema fields: %s",
-                    [f"{f.name}:{f.type}" for f in existing_schema] if existing_schema else None,
+                    existing_schema,
                 )
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
@@ -352,13 +345,15 @@ class SQLEngine(WorkspaceService):
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     table_name=table_name,
-                    if_not_exists=False
+                    if_not_exists=True
                 )
                 connected.execute(statement)
                 mode = "overwrite"
 
+            data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
+
             # Write in temp volume
-            databricks_tmp_folder = connected.temp_volume_folder(
+            databricks_tmp_folder = connected.workspace.temp_volume_folder(
                 suffix=transaction_id,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
@@ -372,7 +367,7 @@ class SQLEngine(WorkspaceService):
             pq.write_table(data, buffer, compression="snappy")
             buffer.seek(0)
 
-            connected.upload_content_file(
+            connected.workspace.upload_file_content(
                 target_path=databricks_tmp_path,
                 content=buffer,
             )
@@ -438,7 +433,10 @@ FROM parquet.`{databricks_tmp_folder}`"""
                     # trim and run
                     connected.execute(stmt.strip())
             finally:
-                connected.delete_path(databricks_tmp_folder, recursive=True)
+                try:
+                    connected.workspace.delete_path(databricks_tmp_folder, recursive=True)
+                except Exception as e:
+                    logger.error(e)
 
             # Optionally run OPTIMIZE / ZORDER / VACUUM if requested (Databricks SQL)
             if zorder_by:
@@ -495,16 +493,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return
 
         if not isinstance(data, pyspark.sql.DataFrame):
-            try:
-                data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
-            except Exception as exc:
-                logger.error(
-                    "Failed to cast data to Spark DataFrame for %s with schema %s: %s",
-                    location,
-                    [f"{f.name}:{f.dataType}" for f in existing_schema],
-                    exc,
-                )
-                raise
+            data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
         else:
             cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
             data = cast_spark_dataframe(data, options=cast_options)
@@ -528,21 +517,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             # Build merge condition on the composite key
             cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in match_by])
 
-            if mode.casefold() == "auto":
-                update_cols = [c for c in data.columns if c not in match_by]
-                set_expr = {
-                    c: F.expr(f"s.`{c}`") for c in update_cols
-                }
-
-                # Execute MERGE - update matching records first, then insert new ones
-                (
-                    target.alias("t")
-                    .merge(data.alias("s"), cond)
-                    .whenMatchedUpdate(set=set_expr)  # update matched rows
-                    .whenNotMatchedInsertAll()  # insert new rows
-                    .execute()
-                )
-            else:
+            if mode.casefold() == "overwrite":
                 data = data.cache()
 
                 # Step 1: get unique key combos from source
@@ -557,6 +532,20 @@ FROM parquet.`{databricks_tmp_folder}`"""
 
                 # Step 3: append the clean batch
                 data.write.format("delta").mode("append").saveAsTable(location)
+            else:
+                update_cols = [c for c in data.columns if c not in match_by]
+                set_expr = {
+                    c: F.expr(f"s.`{c}`") for c in update_cols
+                }
+
+                # Execute MERGE - update matching records first, then insert new ones
+                (
+                    target.alias("t")
+                    .merge(data.alias("s"), cond)
+                    .whenMatchedUpdate(set=set_expr)  # update matched rows
+                    .whenNotMatchedInsertAll()  # insert new rows
+                    .execute()
+                )
         else:
             if mode == "auto":
                 mode = "append"

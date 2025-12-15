@@ -8,7 +8,6 @@ from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.compute.cluster import Cluster
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
-
 class Cities(DynamicDocument):
     meta = {'collection': 'cities'}
 
@@ -104,9 +103,9 @@ class TestCluster(unittest.TestCase):
         def decorated(a: int):
             # Connect to local MongoDB (standalone mode)
             connect(
-                db="database",
+                db="db",
                 alias="default",
-                host="mongodb+srv://xxxx",
+                host="mongodb+srv://xxx",
             )
 
             return list(Cities.objects.limit(10)), wk.current_user

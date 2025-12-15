@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Se
 
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.exceptions import raise_parsed_traceback
-from ...pyutils.modules import resolve_local_lib_path, module_dependencies
-from ...ser import SerializedFunction, RemoteExecutionError
+from ...pyutils.modules import resolve_local_lib_path, PipIndexSettings
+from ...ser import SerializedFunction
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -64,8 +64,8 @@ class ExecutionContext:
 for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/python*/site-*', recursive=False):
     if path.endswith('site-packages'):
         print(path)
-        break
-"""
+        break"""
+
             self._remote_site_packages_path = self.execute_command(
                 command=cmd,
                 result_tag="<<RESULT>>",
@@ -284,7 +284,9 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             module_name = module_name.split(".")[0]
 
             if module_name:
-                self.cluster.install_libraries(libraries=[module_name])
+                self.cluster.install_libraries(
+                    libraries=[module_name],
+                )
 
                 logger.warning(
                     "%s, installed missing temporary module in cluster '%s', for future install it permanently in libraries",

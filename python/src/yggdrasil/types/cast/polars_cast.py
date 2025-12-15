@@ -376,7 +376,7 @@ def cast_polars_dataframe(
         polars_field_to_arrow_field(f)
         for f in sub_source_polars_fields
     ]
-    szb_target_polars_fields = [
+    sub_target_polars_fields = [
         arrow_field_to_polars_field(f)
         for f in target_arrow_schema
     ]
@@ -393,7 +393,7 @@ def cast_polars_dataframe(
     columns: list[Tuple[polars.Field, polars.Series]] = []
     found_column_names = set()
 
-    for sub_target_index, sub_target_field in enumerate(szb_target_polars_fields):
+    for sub_target_index, sub_target_field in enumerate(sub_target_polars_fields):
         sub_target_field: polars.Field = sub_target_field
         target_arrow_field = target_arrow_schema.field(sub_target_index)
         source_index = source_name_to_index.get(sub_target_field.name)

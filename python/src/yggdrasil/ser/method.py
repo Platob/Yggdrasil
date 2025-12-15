@@ -687,23 +687,3 @@ class SerializedFunction:
         obj = dill.loads(raw)
 
         return obj
-
-
-class RemoteExecutionError(Exception):
-    """
-    Raised when remote code execution failed.
-
-    Carries remote exception type, message, and full traceback string
-    from the cluster side.
-    """
-
-    def __init__(self, remote_type: str, remote_message: str, remote_traceback: str):
-        self.remote_type = remote_type
-        self.remote_message = remote_message
-        self.remote_traceback = remote_traceback
-
-        msg = f"Remote {remote_type}: {remote_message}"
-        super().__init__(msg)
-
-    def __str__(self) -> str:
-        return f"{super().__str__()}\n\nRemote traceback:\n{self.remote_traceback}"
