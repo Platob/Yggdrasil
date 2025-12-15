@@ -313,10 +313,10 @@ class SQLEngine(WorkspaceService):
         if location:
             c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
+        else:
+            location = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name, safe_chars=True)
 
         transaction_id = self._random_suffix()
-
-        existing_schema = None
 
         with self as connected:
             try:
@@ -327,19 +327,14 @@ class SQLEngine(WorkspaceService):
                     to_arrow_schema=True
                 )
             except ValueError as exc:
-                logger.warning(
-                    "Falling back to create-or-overwrite for %s.%s.%s after cast failure: %s",
-                    catalog_name,
-                    schema_name,
-                    table_name,
-                    exc,
-                )
-                logger.debug(
-                    "Existing schema fields: %s",
-                    existing_schema,
-                )
                 data = convert(data, pa.Table)
                 existing_schema = data.schema
+                logger.warning(
+                    "Table %s not found, %s, creating it based on input data %s",
+                    location,
+                    exc,
+                    existing_schema.names
+                )
                 statement = connected.create_table_ddl(
                     field=existing_schema,
                     catalog_name=catalog_name,

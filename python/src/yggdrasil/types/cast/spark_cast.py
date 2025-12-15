@@ -197,7 +197,7 @@ def cast_spark_column(
         return column
 
     target_spark_type = target_spark_field.dataType
-    source_field = options.source_spark_field()
+    source_field = options.source_spark_field
 
     if isinstance(target_spark_type, T.StructType):
         casted = cast_spark_column_to_struct(column, options=options)
@@ -256,7 +256,7 @@ def cast_spark_column_to_list(
 
     target_spark_type: T.ArrayType = target_spark_field.dataType
 
-    source_spark_field = options.source_spark_field() or T.StructField(
+    source_spark_field = options.source_spark_field or T.StructField(
         name=column.getAlias() or "col",
         dataType=column.dtype,
         nullable=True,
@@ -327,7 +327,7 @@ def cast_spark_column_to_struct(
 
     target_spark_type: T.StructType = target_spark_field.dataType
 
-    source_spark_field = options.source_spark_field() or T.StructField(
+    source_spark_field = options.source_spark_field or T.StructField(
         name=column.getAlias() or "col", dataType=column.dtype, nullable=True
     )
     source_spark_type: T.StructType = source_spark_field.dataType
@@ -400,7 +400,7 @@ def cast_spark_column_to_map(
 
     target_spark_type: T.MapType = target_spark_field.dataType
 
-    source_spark_field = options.source_spark_field() or T.StructField(
+    source_spark_field = options.source_spark_field or T.StructField(
         name=column.getAlias() or "col",
         dataType=column.dtype,
         nullable=True,
