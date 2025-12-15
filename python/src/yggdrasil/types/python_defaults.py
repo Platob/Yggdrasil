@@ -211,15 +211,25 @@ def default_arrow_array(
     if scalar_default is None:
         scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
 
+    # ✅ PyArrow compatibility: repeat(size=0) can throw "Must pass at least one array"
+    if size == 0 and (chunks is None):
+        return pa.array([], type=dtype)
+
     if chunks is not None:
+        if len(chunks) == 0:
+            # also avoid "must pass at least one array" from chunked_array([])
+            return pa.chunked_array([], type=dtype)
+
         return pa.chunked_array(
             [
                 pa.repeat(
                     value=scalar_default,
                     size=chunk_size,
                     memory_pool=memory_pool
-                ) for chunk_size in chunks
-            ]
+                ) if chunk_size > 0 else pa.array([], type=dtype)
+                for chunk_size in chunks
+            ],
+            type=dtype,
         )
 
     return pa.repeat(
