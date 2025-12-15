@@ -120,6 +120,7 @@ class Cluster(WorkspaceService):
     def replicated_current_environment(
         cls,
         workspace: Optional["Workspace"] = None,
+        cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
         single_user_name: Optional[str] = None,
         runtime_engine: Optional["RuntimeEngine"] = None,
@@ -137,8 +138,27 @@ class Cluster(WorkspaceService):
             return cls._env_clusters[host]
 
         # 🔥 first time for this host → create
-        inst = cls(workspace=workspace)
+        inst = cls._env_clusters[host] = (
+            cls(workspace=workspace, cluster_id=cluster_id, cluster_name=cluster_name)
+            .replicate_current_environment(
+                single_user_name=single_user_name,
+                runtime_engine=runtime_engine,
+                libraries=libraries,
+                **kwargs
+            )
+        )
 
+        return inst
+    
+    def replicate_current_environment(
+        self,
+        cluster_id: Optional[str] = None,
+        cluster_name: Optional[str] = None,
+        single_user_name: Optional[str] = None,
+        runtime_engine: Optional["RuntimeEngine"] = None,
+        libraries: Optional[list[str]] = None,
+        **kwargs
+    ) -> "Cluster":
         libraries = list(libraries) if libraries is not None else []
         libraries.extend([
             _ for _ in [
@@ -147,19 +167,18 @@ class Cluster(WorkspaceService):
             ] if _ not in libraries
         ])
 
-        inst = inst.create_or_update(
-            cluster_name=cluster_name or workspace.current_user.user_name,
+        inst = self.create_or_update(
+            cluster_id=cluster_id,
+            cluster_name=cluster_name or self.cluster_name or self.workspace.current_user.user_name,
             python_version=sys.version_info,
-            single_user_name=single_user_name or workspace.current_user.user_name,
+            single_user_name=single_user_name or self.workspace.current_user.user_name,
             runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
             libraries=libraries,
             **kwargs
         )
 
-        cls._env_clusters[host] = inst
-
         return inst
-
+    
     @property
     def details(self):
         if self._details is None and self.cluster_id is not None:
@@ -337,12 +356,13 @@ class Cluster(WorkspaceService):
 
     def create_or_update(
         self,
+        cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ):
         found = self.find_cluster(
-            cluster_id=self.cluster_id,
+            cluster_id=cluster_id or self.cluster_id,
             cluster_name=cluster_name,
             raise_error=False
         )
