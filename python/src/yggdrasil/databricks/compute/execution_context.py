@@ -214,7 +214,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         """Execute a command in this context and return decoded output."""
         self.connect(language=Language.PYTHON)
 
-        logger.info(
+        logger.debug(
             "Executing callable %s with %s",
             getattr(func, "__name__", type(func)),
             self,

@@ -66,9 +66,6 @@ class SqlExecutionError(RuntimeError):
 class SQLEngine(WorkspaceService):
     warehouse_id: Optional[str] = None
 
-    _http_path: str = dataclasses.field(init=False, default=None)
-    _was_connected: bool = dataclasses.field(init=False, default=False)
-
     @staticmethod
     def _table_full_name(
         catalog_name: Optional[str] = None,

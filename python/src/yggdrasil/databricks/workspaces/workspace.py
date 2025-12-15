@@ -7,14 +7,14 @@ import posixpath
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
 from typing import (
     Any,
     BinaryIO,
     Iterator,
     List,
     Optional,
-    Union, Set, )
+    Union
+)
 
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
@@ -40,39 +40,38 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _get_env_product():
+    v = os.getenv("DATABRICKS_PRODUCT")
 
-PROJECT_ROOT_MARKERS: Set[str] = {
-    ".git",
-    "pyproject.toml",
-    "setup.cfg",
-    "requirements.txt",
-    ".idea",
-}
+    if not v:
+        return None
+    return v.strip().lower()
 
 
-def infer_project_root(start: Optional[Path] = None) -> Path:
-    """
-    Infer the 'project root' from the current working directory by walking
-    upwards until we hit something that looks like a project boundary
-    (git repo, Python project, or IDE project).
+def _get_env_product_version():
+    v = os.getenv("DATABRICKS_PRODUCT_VERSION")
 
-    If none of the markers are found, returns the starting directory.
-    """
-    path = (start or Path.cwd()).resolve()
-
-    for candidate in [path, *path.parents]:
-        if any((candidate / marker).exists() for marker in PROJECT_ROOT_MARKERS):
-            return candidate
-
-    return path
+    if not v:
+        return None
+    return v.strip().lower()
 
 
-def infer_project_name(start: Optional[Path] = None) -> str:
-    """
-    Infer a project name purely from the filesystem, based on the
-    inferred project root's directory name.
-    """
-    return infer_project_root(start).name
+def _get_env_cost_center():
+    v = os.getenv("DATABRICKS_COST_CENTER")
+
+    if not v:
+        return None
+
+    return v.strip().lower()
+
+
+def _get_env_cost_center_tag():
+    v = os.getenv("DATABRICKS_COST_CENTER_TAG")
+
+    if not v:
+        return "default"
+
+    return v.strip().lower()
 
 
 def _get_remote_size(sdk, target_path: str) -> Optional[int]:
@@ -132,8 +131,10 @@ class Workspace:
     rate_limit: Optional[int] = dataclasses.field(default=None, repr=False)
 
     # Extras
-    product: Optional[str] = dataclasses.field(default=None, repr=False)
-    product_version: Optional[str] = dataclasses.field(default=None, repr=False)
+    product: Optional[str] = dataclasses.field(default_factory=_get_env_product, repr=False)
+    product_version: Optional[str] = dataclasses.field(default_factory=_get_env_product_version, repr=False)
+    cost_center: Optional[str] = dataclasses.field(default_factory=_get_env_cost_center, repr=False)
+    cost_center_tag: Optional[str] = dataclasses.field(default_factory=_get_env_cost_center_tag, repr=False)
 
     # Runtime cache (never serialized)
     _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
@@ -188,7 +189,7 @@ class Workspace:
 
         if self._sdk is None:
             require_databricks_sdk()
-            logger.info("Connecting to Databricks workspace %s", self)
+            logger.debug("Connecting %s", self)
 
             # Build Config from config_dict if available, else from fields.
             kwargs = {
@@ -259,12 +260,13 @@ class Workspace:
                     if v is not None:
                         setattr(self, key, v)
 
+            logger.info("Connected %s", self)
+
         return self
 
     # ------------------------------------------------------------------ #
     # Context manager + lifecycle
     # ------------------------------------------------------------------ #
-
     def close(self) -> None:
         """
         Drop the cached WorkspaceClient (no actual close needed, but this
