@@ -120,7 +120,7 @@ class Workspace:
     google_service_account: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # Config profile
-    profile: Optional[str] = None
+    profile: Optional[str] = dataclasses.field(default=None, repr=False)
     config_file: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # HTTP / client behavior
@@ -132,8 +132,8 @@ class Workspace:
     rate_limit: Optional[int] = dataclasses.field(default=None, repr=False)
 
     # Extras
-    product: Optional[str] = None
-    product_version: Optional[str] = None
+    product: Optional[str] = dataclasses.field(default=None, repr=False)
+    product_version: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # Runtime cache (never serialized)
     _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
@@ -148,7 +148,6 @@ class Workspace:
         state.pop("_sdk", None)
 
         was_connected = self._sdk is not None
-        self.connect()
 
         state["_was_connected"] = was_connected
         state["_cached_token"] = self.current_token()
@@ -185,12 +184,11 @@ class Workspace:
     # -------------------------
     def connect(self, reset: bool = False) -> "Workspace":
         if reset:
-            logger.info("Resetting cached WorkspaceClient for host %s", self.host)
             self._sdk = None
 
         if self._sdk is None:
             require_databricks_sdk()
-            logger.info("Connecting to Databricks workspace host=%s", self.host)
+            logger.info("Connecting to Databricks workspace %s", self)
 
             # Build Config from config_dict if available, else from fields.
             kwargs = {

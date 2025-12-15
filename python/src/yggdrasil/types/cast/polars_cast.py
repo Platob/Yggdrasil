@@ -131,8 +131,8 @@ def cast_polars_array(
                 nullable=options.target_field.nullable
             ).as_py()
 
-            return array.fill_null(dv)
-        return array
+            array = array.fill_null(dv)
+        return array.alias(options.target_field_name)
 
     source_polars_field = options.source_polars_field
     target_polars_field = options.target_polars_field
@@ -163,8 +163,8 @@ def cast_polars_array(
             options.target_field.type, nullable=options.target_field.nullable
         ).as_py()
 
-        return casted.fill_null(dv)
-    return casted
+        casted = casted.fill_null(dv)
+    return casted.alias(options.target_field_name)
 
 
 def cast_to_list_array(
@@ -210,7 +210,7 @@ def cast_to_list_array(
         ).as_py()
         out = out.fill_null(dv)
 
-    return out.alias(options.target_field.name)
+    return out
 
 
 def cast_to_struct_array(

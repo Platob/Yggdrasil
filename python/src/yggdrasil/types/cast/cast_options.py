@@ -276,7 +276,9 @@ class CastOptions:
     @property
     def target_field_name(self):
         if self.target_field is None:
-            return ""
+            if self.source_field is not None:
+                return self.source_field.name
+            return None
 
         if not self.target_field.name and self.source_field:
             return self.source_field.name

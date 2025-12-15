@@ -93,8 +93,8 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         self.cluster.ensure_running()
 
         logger.debug(
-            "Creating Databricks command execution context for cluster_id=%s",
-            self.cluster.cluster_id
+            "Creating Databricks command execution context for %s",
+            self.cluster
         )
 
         created = self._workspace_client().command_execution.create_and_wait(
@@ -112,9 +112,8 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         """Create a remote command execution context if not already open."""
         if self.context_id is not None:
             logger.debug(
-                "Execution context already open for cluster_id=%s (context_id=%s)",
-                self.cluster.cluster_id,
-                self.context_id,
+                "Execution context already open for %s",
+                self
             )
             return self
 
@@ -131,10 +130,8 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
 
         self.context_id = context_id
         logger.info(
-            "Opened execution context for cluster_id=%s (context_id=%s, language=%s)",
-            self.cluster.cluster_id,
-            self.context_id,
-            self.language,
+            "Opened execution context for %s",
+            self
         )
         return self
 
@@ -144,9 +141,8 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             return
 
         logger.debug(
-            "Closing execution context for cluster_id=%s (context_id=%s)",
-            self.cluster.cluster_id,
-            self.context_id,
+            "Closing execution context for %s",
+            self
         )
         try:
             self._workspace_client().command_execution.destroy(
@@ -219,9 +215,9 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         self.connect(language=Language.PYTHON)
 
         logger.info(
-            "Executing callable %s on cluster_id=%s",
+            "Executing callable %s with %s",
             getattr(func, "__name__", type(func)),
-            self.cluster.cluster_id,
+            self,
         )
 
         serialized = func if isinstance(func, SerializedFunction) else SerializedFunction.from_callable(func)
@@ -248,8 +244,8 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             result = serialized.parse_command_result(raw_result)
         except UnpicklingError as e:
             raise RuntimeError(
-                "Failed to parse result of remote computed method in cluster '%s': %s\n%s" % (
-                    self.cluster.cluster_id, e, serialized.source
+                "Failed to parse result of %s: %s\n%s" % (
+                    self, e, serialized.source
                 )
             )
 
@@ -286,11 +282,6 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             if module_name:
                 self.cluster.install_libraries(
                     libraries=[module_name],
-                )
-
-                logger.warning(
-                    "%s, installed missing temporary module in cluster '%s', for future install it permanently in libraries",
-                    remote_module_error, self.cluster.details.cluster_name
                 )
 
                 return self.execute_command(
@@ -474,7 +465,7 @@ with zipfile.ZipFile(buf, "r") as zf:
                 content_start = start + len(result_tag)
                 end = output.find(result_tag, content_start)
                 if end != -1:
-                    before = output[:start]
+                    before = output[:start].strip()
                     if before and print_stdout:
                         print(before)
                     return output[content_start:end]

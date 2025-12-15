@@ -83,12 +83,23 @@ class Cluster(WorkspaceService):
         cluster will use this value when ``cluster_id`` is omitted.
     """
     cluster_id: Optional[str] = None
+    cluster_name: Optional[str] = None
     
-    _details: Optional["ClusterDetails"] = None
-    _details_refresh_time: float = dataclasses.field(default=0, init=False)
+    _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False)
+    _details_refresh_time: float = dataclasses.field(default=0, init=False, repr=False)
 
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_details", None)
+        state.pop("_details_refresh_time", None)
+
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     @property
     def id(self):
@@ -96,13 +107,11 @@ class Cluster(WorkspaceService):
 
     @property
     def name(self) -> str:
-        if not self.cluster_id:
-            return "unknown"
-        return self.details.cluster_name
+        return self.cluster_name
 
     def __post_init__(self):
-        if self._details:
-            self._details_refresh_time = time.time()
+        if self._details is not None:
+            self.details = self._details
 
     def is_in_databricks_environment(self):
         return self.workspace.is_in_databricks_environment()
@@ -128,10 +137,9 @@ class Cluster(WorkspaceService):
             return cls._env_clusters[host]
 
         # 🔥 first time for this host → create
-        logger.info("Creating replicated cluster for host %s", host)
         inst = cls(workspace=workspace)
 
-        libraries = list(libraries) or []
+        libraries = list(libraries) if libraries is not None else []
         libraries.extend([
             _ for _ in [
                 "ygg",
@@ -167,7 +175,9 @@ class Cluster(WorkspaceService):
     def details(self, value: "ClusterDetails"):
         self._details_refresh_time = time.time()
         self._details = value
+
         self.cluster_id = value.cluster_id
+        self.cluster_name = value.cluster_name
 
     @property
     def state(self):
@@ -331,11 +341,6 @@ class Cluster(WorkspaceService):
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ):
-        logger.info(
-            "Ensuring cluster exists (cluster_id=%s, cluster_name=%s)",
-            self.cluster_id,
-            cluster_name,
-        )
         found = self.find_cluster(
             cluster_id=self.cluster_id,
             cluster_name=cluster_name,
@@ -376,7 +381,7 @@ class Cluster(WorkspaceService):
         })
 
         logger.info(
-            "Created Databricks cluster %s (cluster_id=%s)",
+            "Created Databricks cluster %s (cluster '%s')",
             self.details.cluster_name,
             self.details.cluster_id,
         )
@@ -390,12 +395,7 @@ class Cluster(WorkspaceService):
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ) -> "Cluster":
-        logger.info(
-            "Updating Databricks cluster %s (cluster_id=%s)",
-            cluster_spec.get("cluster_name", self.details.cluster_name if self.details else None),
-            self.cluster_id,
-        )
-        self.install_libraries(libraries=libraries)
+        self.install_libraries(libraries=libraries, timeout=None)
 
         existing_details = {
             k: v
@@ -410,6 +410,12 @@ class Cluster(WorkspaceService):
         }
 
         if update_details != existing_details:
+            logger.info(
+                "Updating Databricks cluster %s (cluster '%s')",
+                cluster_spec.get("cluster_name", self.details.cluster_name if self.details else None),
+                self.cluster_id,
+            )
+
             self.details = self.clusters_client().edit_and_wait(**update_details)
 
         return self
@@ -496,7 +502,7 @@ class Cluster(WorkspaceService):
         context_id: Optional[str] = None
     ) -> ExecutionContext:
         logger.debug(
-            "Creating execution context for cluster_id=%s with language=%s", self.cluster_id, language
+            "Creating execution context for cluster '%s' with language=%s", self.cluster_id, language
         )
         return ExecutionContext(
             cluster=self,
@@ -598,7 +604,7 @@ class Cluster(WorkspaceService):
             ]
         )
 
-        if timeout:
+        if timeout is not None:
             self.wait_installed_libraries(timeout=timeout)
 
         return self
@@ -607,6 +613,9 @@ class Cluster(WorkspaceService):
         self,
         timeout: dt.timedelta = dt.timedelta(minutes=5)
     ):
+        if not self.is_running:
+            return self
+
         wsdk = self.workspace.sdk()
         statuses = list(wsdk.libraries.cluster_status(cluster_id=self.cluster_id))
         max_time = time.time() + timeout.total_seconds()

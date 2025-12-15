@@ -1,4 +1,6 @@
+import logging
 import os
+import sys
 import unittest
 
 from databricks.sdk.service.compute import Language
@@ -10,6 +12,20 @@ from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
 class Cities(DynamicDocument):
     meta = {'collection': 'cities'}
+
+
+
+# ---- logging to stdout ----
+logger = logging.getLogger("test")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
 
 class TestCluster(unittest.TestCase):
 
@@ -99,14 +115,18 @@ class TestCluster(unittest.TestCase):
     def test_decorator_broadcast_credentials(self):
         wk = self.workspace
 
+        logger.info("driver")
+
         @databricks_remote_compute(workspace=self.workspace)
         def decorated(a: int):
             # Connect to local MongoDB (standalone mode)
             connect(
-                db="db",
+                db="xxx",
                 alias="default",
                 host="mongodb+srv://xxx",
             )
+
+            logger.info("remote")
 
             return list(Cities.objects.limit(10)), wk.current_user
 
