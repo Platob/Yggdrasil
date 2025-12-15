@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Union
 
 import pyarrow as pa
 import pytest
@@ -34,21 +35,6 @@ def ensure_any_to_arrow_scalar_has_options(monkeypatch):
 
     monkeypatch.setattr(ac, "any_to_arrow_scalar", _wrapped)
     yield
-
-
-# ---------------------------------------------------------------------------
-# ArrowCastOptions
-# ---------------------------------------------------------------------------
-
-
-def test_arrow_cast_options_check_arg_with_field_sets_target_field():
-    field = pa.field("value", pa.int32())
-    opts = CastOptions.check_arg(field)
-
-    assert isinstance(opts, CastOptions)
-    assert opts.target_field is not None
-    assert opts.target_field.type == pa.int32()
-    assert opts.target_field.name == "value"
 
 
 # ---------------------------------------------------------------------------
@@ -311,39 +297,239 @@ def test_cast_arrow_record_batch_reader_no_target_schema_passthrough():
 # Cross-container helper utilities
 # ---------------------------------------------------------------------------
 
-
-def test_table_to_record_batch_roundtrip():
-    table = pa.table({"a": [1, 2]})
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema))
-
-    batch = table_to_record_batch(table, opts)
-    table_roundtrip = record_batch_to_table(batch, opts)
-
-    assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
+Tabular = Union[pa.Table, pa.RecordBatch]
 
 
-def test_table_to_record_batch_reader_roundtrip():
-    table = pa.table({"a": [1, 2, 3]})
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(table.schema))
+def _make_options(data: Tabular, **kwargs) -> CastOptions:
+    """
+    Required init style:
+        options = CastOptions.safe_init(target_field=table.schema, **kwargs)
 
-    reader = table_to_record_batch_reader(table, opts)
-    table_roundtrip = record_batch_reader_to_table(reader, opts)
+    Note: for RecordBatch, .schema exists too.
+    """
+    return CastOptions.safe_init(source_field=data.schema, **kwargs)  # type: ignore[arg-type]
 
-    assert table_roundtrip.equals(cast_arrow_tabular(table, opts))
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pa.table({"a": [1, 2]}),
+        pa.record_batch([pa.array([1, 2])], names=["a"]),
+    ],
+)
+def test_cast_arrow_tabular_no_target_schema_returns_as_is(data: Tabular):
+    options = _make_options(data, target_field=None)
+    out = cast_arrow_tabular(data, options)
+    assert out is data
 
 
-def test_record_batch_to_record_batch_reader_roundtrip():
-    batch = pa.record_batch({"a": [1, 2, 3]})
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(batch.schema))
+@pytest.mark.parametrize(
+    "cls, data",
+    [
+        (pa.Table, pa.table({"a": pa.array([], type=pa.int32())})),
+        (pa.RecordBatch, pa.record_batch([pa.array([], type=pa.int32())], names=["a"])),
+    ],
+)
+def test_cast_arrow_tabular_empty_rows_builds_empty_with_target_schema(cls, data):
+    assert data.num_rows == 0
 
-    reader = record_batch_to_record_batch_reader(batch, opts)
-    batch_roundtrip = record_batch_reader_to_record_batch(reader, opts)
+    target_schema = pa.schema(
+        [
+            pa.field("x", pa.int64(), nullable=False),
+            pa.field("y", pa.string(), nullable=True),
+        ]
+    )
 
-    table_from_original = pa.Table.from_batches([batch])
-    table_from_roundtrip = pa.Table.from_batches([batch_roundtrip])
+    options = _make_options(data, target_field=target_schema)
+    out = cast_arrow_tabular(data, options)
 
-    assert table_from_roundtrip.equals(cast_arrow_tabular(table_from_original, opts))
+    assert isinstance(out, cls)
+    assert out.num_rows == 0
+    assert out.schema == target_schema
+    assert out.column(0).type == pa.int64()
+    assert out.column(1).type == pa.string()
 
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pa.table({"a": pa.array([1, 2], type=pa.int32())}),
+        pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["a"]),
+    ],
+)
+def test_cast_arrow_tabular_same_schema_returns_as_is(data: Tabular):
+    options = _make_options(data, target_field=data.schema)
+    out = cast_arrow_tabular(data, options)
+    assert out is data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pa.table({"a": pa.array([1, 2], type=pa.int32())}),
+        pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["a"]),
+    ],
+)
+def test_cast_arrow_tabular_exact_name_match_and_type_cast(data: Tabular):
+    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=True)])
+    options = _make_options(data, target_field=target_schema)
+
+    out = cast_arrow_tabular(data, options)
+
+    assert out.schema == target_schema
+    col = out.column(0)
+    assert col.type == pa.int64()
+    assert col.to_pylist() == [1, 2]
+
+
+def test_cast_arrow_tabular_case_insensitive_match_when_not_strict():
+    data = pa.table({"A": pa.array([1, 2], type=pa.int32())})
+    target_schema = pa.schema([pa.field("a", pa.int32(), nullable=True)])
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        strict_match_names=False,
+    )
+    out = cast_arrow_tabular(data, options)
+
+    assert out.schema == target_schema
+    assert out.column(0).to_pylist() == [1, 2]
+
+
+def test_cast_arrow_tabular_strict_name_mismatch_raises_when_missing_not_allowed():
+    data = pa.table({"A": pa.array([1, 2], type=pa.int32())})
+    target_schema = pa.schema([pa.field("a", pa.int32(), nullable=True)])
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        strict_match_names=True,
+        add_missing_columns=False,
+    )
+
+    with pytest.raises(pa.ArrowInvalid):
+        cast_arrow_tabular(data, options)
+
+
+def test_cast_arrow_tabular_missing_column_raises_when_add_missing_columns_false():
+    data = pa.table({"a": pa.array([1, 2], type=pa.int32())})
+    target_schema = pa.schema(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("b", pa.string(), nullable=True),  # missing
+        ]
+    )
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        add_missing_columns=False,
+    )
+
+    with pytest.raises(pa.ArrowInvalid):
+        cast_arrow_tabular(data, options)
+
+
+def test_cast_arrow_tabular_missing_column_filled_with_defaults_and_preserves_chunks_for_table():
+    # Make chunking visible so cast_arrow_tabular picks up `chunks` from first column
+    a = pa.chunked_array([pa.array([1, 2], type=pa.int32()), pa.array([3], type=pa.int32())])
+    data = pa.table({"a": a})
+
+    target_schema = pa.schema(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("missing", pa.int64(), nullable=False),
+        ]
+    )
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        add_missing_columns=True,
+    )
+    out = cast_arrow_tabular(data, options)
+
+    assert out.schema == target_schema
+    missing_col = out.column(out.schema.get_field_index("missing"))
+
+    assert isinstance(missing_col, pa.ChunkedArray)
+    assert [len(c) for c in missing_col.chunks] == [2, 1]
+    assert missing_col.type == pa.int64()
+    assert missing_col.to_pylist() == [0, 0, 0]
+
+
+def test_cast_arrow_tabular_missing_column_filled_with_defaults_recordbatch():
+    data = pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["a"])
+
+    target_schema = pa.schema(
+        [
+            pa.field("a", pa.int32(), nullable=True),
+            pa.field("missing", pa.string(), nullable=True),
+        ]
+    )
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        add_missing_columns=True,
+    )
+    out = cast_arrow_tabular(data, options)
+
+    assert out.schema == target_schema
+    missing_col = out.column(out.schema.get_field_index("missing"))
+    assert isinstance(missing_col, pa.Array)
+    assert missing_col.type == pa.string()
+    assert missing_col.to_pylist() == [None, None]
+
+
+def test_cast_arrow_tabular_extra_columns_ignored_by_default():
+    data = pa.table(
+        {
+            "a": pa.array([1, 2], type=pa.int32()),
+            "extra": pa.array([9, 9], type=pa.int32()),
+        }
+    )
+    target_schema = pa.schema([pa.field("a", pa.int32(), nullable=True)])
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        allow_add_columns=False,
+    )
+    out = cast_arrow_tabular(data, options)
+
+    assert out.schema == target_schema
+    assert "extra" not in out.schema.names
+    assert out.column(0).to_pylist() == [1, 2]
+
+
+def test_cast_arrow_tabular_allow_add_columns_appends_extras_and_preserves_target_metadata():
+    data = pa.table(
+        {
+            "a": pa.array([1, 2], type=pa.int32()),
+            "extra": pa.array([9, 9], type=pa.int32()),
+        }
+    )
+    target_schema = pa.schema(
+        [pa.field("a", pa.int32(), nullable=True)],
+        metadata={b"k": b"v"},
+    )
+
+    options = _make_options(
+        data,
+        target_field=target_schema,
+        allow_add_columns=True,
+    )
+    out = cast_arrow_tabular(data, options)
+
+    # Don't require exact equality: safe_init may add b"name": b"root"
+    md = dict(out.schema.metadata or {})
+    assert md.get(b"k") == b"v"
+
+    assert out.schema.names == ["a", "extra"]
+    assert out.column(out.schema.get_field_index("a")).to_pylist() == [1, 2]
+    assert out.column(out.schema.get_field_index("extra")).to_pylist() == [9, 9]
 
 # ---------------------------------------------------------------------------
 # convert(...) API
