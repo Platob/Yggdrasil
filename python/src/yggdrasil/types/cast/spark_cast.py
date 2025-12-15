@@ -190,7 +190,7 @@ def cast_spark_column(
     This is a pure Spark cast: no collection or Arrow arrays involved.
     """
     options = CastOptions.check_arg(options)
-    target_spark_field = options.target_spark_field()
+    target_spark_field = options.target_spark_field
 
     if target_spark_field is None:
         # Nothing to cast to, return the column as-is
@@ -248,7 +248,7 @@ def cast_spark_column_to_list(
     options = CastOptions.check_arg(options)
 
     target_arrow_field = options.target_field
-    target_spark_field = options.target_spark_field()
+    target_spark_field = options.target_spark_field
 
     if target_arrow_field is None:
         # No target type info, just pass through
@@ -320,7 +320,7 @@ def cast_spark_column_to_struct(
     options = CastOptions.check_arg(options)
 
     target_arrow_field = options.target_field
-    target_spark_field = options.target_spark_field()
+    target_spark_field = options.target_spark_field
 
     if target_arrow_field is None:
         return column
@@ -393,7 +393,7 @@ def cast_spark_column_to_map(
     options = CastOptions.check_arg(options)
 
     target_arrow_field = options.target_field
-    target_spark_field = options.target_spark_field()
+    target_spark_field = options.target_spark_field
 
     if target_arrow_field is None:
         return column
