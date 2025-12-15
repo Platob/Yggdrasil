@@ -142,9 +142,10 @@ def cast_spark_dataframe(
             child_source_arrow_field = source_arrow_fields[sub_target_index]
             child_source_spark_field = source_spark_fields[sub_target_index]
             found_source_names.add(child_source_spark_field.name)
+            df_col: SparkColumn = dataframe[source_index]
 
             casted_column = cast_spark_column(
-                dataframe[source_index],
+                df_col,
                 options=options.copy(
                     source_arrow_field=child_source_arrow_field,
                     target_arrow_field=child_target_arrow_field
@@ -197,7 +198,8 @@ def cast_spark_column(
         return column
 
     target_spark_type = target_spark_field.dataType
-    source_field = options.source_spark_field
+    source_spark_field = options.source_spark_field
+    assert source_spark_field, "No source spark field found in cast options"
 
     if isinstance(target_spark_type, T.StructType):
         casted = cast_spark_column_to_struct(column, options=options)
@@ -211,7 +213,7 @@ def cast_spark_column(
     return (
         check_column_nullability(
             casted,
-            source_field=source_field,
+            source_field=source_spark_field,
             target_field=target_spark_field,
             mask=column.isNull()
         )
@@ -247,53 +249,23 @@ def cast_spark_column_to_list(
     """
     options = CastOptions.check_arg(options)
 
-    target_arrow_field = options.target_field
+    target_arrow_field = options.target_arrow_field
     target_spark_field = options.target_spark_field
 
     if target_arrow_field is None:
         # No target type info, just pass through
         return column
 
-    target_spark_type: T.ArrayType = target_spark_field.dataType
-
-    source_spark_field = options.source_spark_field or T.StructField(
-        name=column.getAlias() or "col",
-        dataType=column.dtype,
-        nullable=True,
-    )
+    source_spark_field = options.source_spark_field
     source_spark_type = source_spark_field.dataType
 
     if not isinstance(source_spark_type, T.ArrayType):
         raise ValueError(f"Cannot cast {source_spark_field} to {target_spark_field}")
 
-    # ---- Arrow element fields ----
-    target_list_type = target_arrow_field.type
-
-    # Handle list / large_list / fixed_size_list
-    if pa.types.is_list(target_list_type) or pa.types.is_large_list(target_list_type):
-        target_element_arrow_field: pa.Field = target_list_type.value_field
-    elif pa.types.is_fixed_size_list(target_list_type):
-        target_element_arrow_field: pa.Field = target_list_type.value_field
-    else:
-        raise ValueError(
-            f"Expected list-like Arrow type for {target_arrow_field}, "
-            f"got {target_list_type}"
-        )
-
-    # Build a synthetic "element field" for the source array
-    source_element_spark_field = T.StructField(
-        name=source_spark_field.name,
-        dataType=source_spark_type.elementType,
-        nullable=source_spark_type.containsNull,
-    )
-    source_element_arrow_field = spark_field_to_arrow_field(
-        source_element_spark_field
-    )
-
     # Options for casting individual elements
     element_cast_options = options.copy(
-        source_arrow_field=source_element_arrow_field,
-        target_arrow_field=target_element_arrow_field,
+        source_field=options.source_child_arrow_field(index=0),
+        target_field=options.target_child_arrow_field(index=0),
     )
 
     # Cast each element using the same Arrow-aware machinery
@@ -303,7 +275,7 @@ def cast_spark_column_to_list(
     )
 
     # Final cast to enforce the exact Spark ArrayType (element type + containsNull)
-    casted = casted.cast(target_spark_type)
+    casted = casted.cast(target_spark_field.dataType)
 
     return casted
 

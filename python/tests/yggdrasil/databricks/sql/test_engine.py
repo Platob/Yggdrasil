@@ -14,6 +14,8 @@ def test_fetch():
     # in databricks will use current identity
     workspace = Workspace()
     workspace = Workspace(host="xxx.cloud.databricks.com")
+    token = workspace.current_token()  # Current PAT or bearer token
+    current_auth_workspace = Workspace(host="xxx.cloud.databricks.com", token=token)
 
     read = (
         workspace.sql()
