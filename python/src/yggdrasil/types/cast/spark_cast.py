@@ -299,9 +299,7 @@ def cast_spark_column_to_struct(
 
     target_spark_type: T.StructType = target_spark_field.dataType
 
-    source_spark_field = options.source_spark_field or T.StructField(
-        name=column.getAlias() or "col", dataType=column.dtype, nullable=True
-    )
+    source_spark_field = options.source_spark_field
     source_spark_type: T.StructType = source_spark_field.dataType
 
     if not isinstance(source_spark_type, T.StructType):
@@ -372,11 +370,7 @@ def cast_spark_column_to_map(
 
     target_spark_type: T.MapType = target_spark_field.dataType
 
-    source_spark_field = options.source_spark_field or T.StructField(
-        name=column.getAlias() or "col",
-        dataType=column.dtype,
-        nullable=True,
-    )
+    source_spark_field = options.source_spark_field
     source_spark_type = source_spark_field.dataType
 
     if not isinstance(source_spark_type, T.MapType):
