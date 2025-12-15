@@ -38,6 +38,6 @@ def test_fetch():
 
     @cluster.execution_decorator
     def remote_executed(value: Any):
-        return os.environ, value
+        return os.environ, value, workspace.current_user
 
     remote_result = remote_executed(1)

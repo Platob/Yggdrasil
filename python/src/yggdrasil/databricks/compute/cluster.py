@@ -112,7 +112,10 @@ class Cluster(WorkspaceService):
         cls,
         workspace: Optional["Workspace"] = None,
         cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = None
+        single_user_name: Optional[str] = None,
+        runtime_engine: Optional["RuntimeEngine"] = None,
+        libraries: Optional[list[str]] = None,
+        **kwargs
     ) -> "Cluster":
         if workspace is None:
             workspace = Workspace()  # your default, whatever it is
@@ -128,18 +131,25 @@ class Cluster(WorkspaceService):
         logger.info("Creating replicated cluster for host %s", host)
         inst = cls(workspace=workspace)
 
+        libraries = list(libraries) or []
+        libraries.extend([
+            _ for _ in [
+                "ygg",
+                "dill"
+            ] if _ not in libraries
+        ])
+
         inst = inst.create_or_update(
             cluster_name=cluster_name or workspace.current_user.user_name,
             python_version=sys.version_info,
             single_user_name=single_user_name or workspace.current_user.user_name,
-            runtime_engine=RuntimeEngine.PHOTON,
-            libraries=[
-                "ygg",
-                "dill"
-            ],
+            runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
+            libraries=libraries,
+            **kwargs
         )
 
         cls._env_clusters[host] = inst
+
         return inst
 
     @property

@@ -229,7 +229,7 @@ def check_column_nullability(
     target_nullable = True if target_field is None else target_field.nullable
 
     if source_nullable and not target_nullable:
-        dv = default_python_scalar(target_field).as_py()
+        dv = default_python_scalar(target_field)
 
         column = F.when(mask, F.lit(dv)).otherwise(column)
 
