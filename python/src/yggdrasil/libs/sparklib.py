@@ -35,7 +35,7 @@ try:
 
         pa.string(): T.StringType(),
         getattr(pa, "string_view", pa.string)(): T.StringType(),
-        getattr(pa, "large_string", pa.string)(): T.BinaryType(),
+        getattr(pa, "large_string", pa.string)(): T.StringType(),
 
         pa.binary(): T.BinaryType(),
         getattr(pa, "binary_view", pa.binary)(): T.BinaryType(),
