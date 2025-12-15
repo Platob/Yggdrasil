@@ -112,8 +112,8 @@ class CastOptions:
             allow_add_columns=self.allow_add_columns or allow_add_columns,
             eager=self.eager or eager,
             datetime_patterns=self.datetime_patterns or datetime_patterns,
-            source_arrow_field=source_arrow_field,
-            target_arrow_field=target_arrow_field
+            source_arrow_field=self.source_arrow_field if source_arrow_field is None else source_arrow_field,
+            target_arrow_field=self.target_arrow_field if target_arrow_field is None else target_arrow_field,
         )
 
         if source_field is not None:
@@ -151,19 +151,20 @@ class CastOptions:
         if isinstance(options, CastOptions):
             result = options
         else:
-            result = cls.safe_init(
-                target_field=options,
+            t = target_field if target_field is not None else options
+
+            return cls.safe_init(
+                source_field=source_field,
+                target_field=t,
                 **kwargs
             )
 
-        if source_field is not None:
-            result.source_field = source_field
-
-        if target_field is not None:
-            result.target_field = target_field
-
-        if kwargs:
-            result = result.copy(**kwargs)
+        if kwargs or source_field is not None or target_field is not None:
+            result = result.copy(
+                target_field=target_field,
+                source_field=source_field,
+                **kwargs
+            )
 
         return result
 
@@ -197,7 +198,7 @@ class CastOptions:
 
         self.check_source(source_obj)
 
-        return self.target_spark_field.dataType != self.target_spark_field.dataType
+        return self.source_spark_field.dataType != self.target_spark_field.dataType
 
     def need_nullability_check(self, source_obj: Any):
         if self.target_field is None:
@@ -262,7 +263,7 @@ class CastOptions:
         if self.source_arrow_field is not None and self._source_spark_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
-            setattr(self, "_spark_source_field", arrow_field_to_spark_field(self.source_field))
+            setattr(self, "_source_spark_field", arrow_field_to_spark_field(self.source_field))
         return self._source_spark_field
 
     @property
