@@ -7,6 +7,7 @@ import posixpath
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import (
     Any,
     BinaryIO,
@@ -16,6 +17,7 @@ from typing import (
     Union
 )
 
+from .databricks_path import DatabricksPath
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
@@ -56,17 +58,8 @@ def _get_env_product_version():
     return v.strip().lower()
 
 
-def _get_env_cost_center():
-    v = os.getenv("DATABRICKS_COST_CENTER")
-
-    if not v:
-        return None
-
-    return v.strip().lower()
-
-
-def _get_env_cost_center_tag():
-    v = os.getenv("DATABRICKS_COST_CENTER_TAG")
+def _get_env_product_tag():
+    v = os.getenv("DATABRICKS_PRODUCT_TAG")
 
     if not v:
         return "default"
@@ -133,8 +126,7 @@ class Workspace:
     # Extras
     product: Optional[str] = dataclasses.field(default_factory=_get_env_product, repr=False)
     product_version: Optional[str] = dataclasses.field(default_factory=_get_env_product_version, repr=False)
-    cost_center: Optional[str] = dataclasses.field(default_factory=_get_env_cost_center, repr=False)
-    cost_center_tag: Optional[str] = dataclasses.field(default_factory=_get_env_cost_center_tag, repr=False)
+    product_tag: Optional[str] = dataclasses.field(default_factory=_get_env_product_tag, repr=False)
 
     # Runtime cache (never serialized)
     _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
@@ -278,9 +270,30 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Properties
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _local_cache_token_path():
+        oauth_dir = Path.home() / ".config" / "databricks-sdk-py" / "oauth"
+        if not oauth_dir.is_dir():
+            return None
+
+        # "first" = lexicographically first (stable)
+        files = sorted(p for p in oauth_dir.iterdir() if p.is_file())
+        return str(files[0]) if files else None
+
+    def reset_local_cache(self):
+        local_cache = self._local_cache_token_path()
+
+        if local_cache:
+            os.remove(local_cache)
+
     @property
     def current_user(self):
-        return self.sdk().current_user.me()
+        try:
+            return self.sdk().current_user.me()
+        except:
+            if self.auth_type == "external-browser":
+                self.reset_local_cache()
+            raise
 
     def current_token(self) -> str:
         if self.token:
@@ -295,6 +308,12 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Path helpers
     # ------------------------------------------------------------------ #
+    def path(self, *parts, workspace: Optional["Workspace"] = None, **kwargs):
+        return DatabricksPath(
+            *parts,
+            workspace=self if workspace is None else workspace,
+            **kwargs
+        )
 
     @staticmethod
     def shared_cache_path(
@@ -321,7 +340,10 @@ class Workspace:
         """
         Temporary folder either under a UC Volume or dbfs:/FileStore/.ygg/tmp/<user>.
         """
-        if catalog_name and schema_name and volume_name:
+        if volume_name:
+            catalog_name = catalog_name or os.getenv("DATABRICKS_CATALOG_NAME")
+            schema_name = schema_name or os.getenv("DATABRICKS_SCHEMA_NAME")
+
             base = f"/Volumes/{catalog_name}/{schema_name}/{volume_name}"
         else:
             base = f"dbfs:/FileStore/.ygg/tmp/{self.current_user.user_name}"
@@ -453,9 +475,12 @@ class Workspace:
                 data = content
 
             if not isinstance(data, (bytes, bytearray)):
-                raise TypeError(
-                    f"content must be bytes or BinaryIO, got {type(content)!r}"
-                )
+                if isinstance(data, str):
+                    data = data.encode()
+                else:
+                    raise TypeError(
+                        f"content must be bytes or BinaryIO, got {type(content)!r}"
+                    )
 
             data_bytes = bytes(data)
             local_size = len(data_bytes)
@@ -569,7 +594,7 @@ class Workspace:
         sdk = self.sdk()
 
         local_size = os.path.getsize(local_path)
-        large_threshold = 4 * 1024 * 1024  # 4 MiB
+        large_threshold = 32 * 1024
 
         if only_if_size_diff and local_size > large_threshold:
             try:
@@ -839,15 +864,46 @@ class Workspace:
     def is_in_databricks_environment():
         return os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
 
-    def sql(self):
+    def default_tags(self):
+        return {
+            k: v
+            for k, v in (
+                ("Product", self.product),
+                ("ProductVersion", self.product_version),
+                ("ProductTag", self.product_tag),
+            )
+            if v
+        }
+
+    def merge_tags(self, existing: dict | None = None):
+        if existing:
+            return self.default_tags()
+
+    def sql(
+        self,
+        workspace: Optional["Workspace"] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        **kwargs
+    ):
         from ..sql import SQLEngine
 
-        return SQLEngine(workspace=self)
-    
-    def clusters(self):
+        return SQLEngine(
+            workspace=self if workspace is None else workspace,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            **kwargs
+        )
+
+    def cluster(self, **kwargs):
         from ..compute.cluster import Cluster
 
-        return Cluster(workspace=self)
+        return Cluster(workspace=self, **kwargs)
+
+    def clusters(self, **kwargs):
+        from ..compute.cluster import Cluster
+
+        return Cluster(workspace=self, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +934,9 @@ class WorkspaceService(ABC):
     def connect(self):
         self.workspace = self.workspace.connect()
         return self
+
+    def path(self, *parts, workspace: Optional["Workspace"] = None, **kwargs):
+        return self.workspace.path(*parts, workspace=workspace, **kwargs)
 
     def sdk(self):
         return self.workspace.sdk()

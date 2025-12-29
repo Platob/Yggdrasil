@@ -233,6 +233,12 @@ class PipIndexSettings:
     def default_settings(cls):
         return DEFAULT_PIP_INDEX_SETTINGS
 
+    @property
+    def extra_index_url(self):
+        if self.extra_index_urls:
+            return self.extra_index_urls[0]
+        return None
+
     def as_dict(self) -> dict:
         return dc.asdict(self)
 

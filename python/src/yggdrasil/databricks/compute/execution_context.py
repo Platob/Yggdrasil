@@ -2,20 +2,21 @@ import base64
 import dataclasses as dc
 import datetime as dt
 import io
+import json
 import logging
 import os
 import posixpath
 import re
 import sys
+import threading
 import zipfile
-from pickle import UnpicklingError
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Set
+from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.exceptions import raise_parsed_traceback
-from ...pyutils.modules import resolve_local_lib_path, PipIndexSettings
-from ...ser import SerializedFunction
+from ...pyutils.modules import resolve_local_lib_path
+from ...pyutils.callable_serde import CallableSerde
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -30,7 +31,28 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-@dc.dataclass()
+@dc.dataclass
+class RemoteMetadata:
+    site_packages_path: Optional[str] = dc.field(default=None)
+    os_env: Dict[str, str] = dc.field(default_factory=dict)
+    requirements: Optional[str] = dc.field(default=None)
+    version_info: Tuple[int, int, int] = dc.field(default=(0, 0, 0))
+
+    def os_env_diff(
+        self,
+        current: Optional[Dict] = None
+    ):
+        if current is None:
+            current = os.environ
+
+        return {
+            k: v
+            for k, v in current.items()
+            if k not in self.os_env.keys()
+        }
+
+
+@dc.dataclass
 class ExecutionContext:
     """
     Lightweight wrapper around Databricks command execution context for a cluster.
@@ -52,29 +74,80 @@ class ExecutionContext:
     language: Optional["Language"] = None
     context_id: Optional[str] = None
 
-    _remote_site_packages_path: Optional[str] = dc.field(default=None, init=False, repr=False)
-    _remote_installed_local_libs: Optional[Set[str]] = dc.field(default=None, init=False, repr=False)
+    _was_connected: Optional[bool] = None
+    _remote_metadata: Optional[RemoteMetadata] = None
 
-    def __post_init__(self):
-        self._remote_installed_local_libs = self._remote_installed_local_libs or set()
+    _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False)
 
-    def remote_site_packages_path(self) -> str:
-        if self._remote_site_packages_path is None:
-            cmd = """import glob
+    # --- Pickle / cloudpickle support (don’t serialize locks or cached remote metadata) ---
+    def __getstate__(self):
+        state = self.__dict__.copy()
+
+        # name-mangled field for _lock in instance dict:
+        state.pop("_lock", None)
+
+        return state
+
+    def __setstate__(self, state):
+        state["_lock"] = state.get("_lock", threading.RLock())
+
+        self.__dict__.update(state)
+
+    def __enter__(self) -> "ExecutionContext":
+        self.cluster.__enter__()
+        self._was_connected = self.context_id is not None
+        return self.connect()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._was_connected:
+            self.close()
+        self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
+
+    def __del__(self):
+        self.close()
+
+    @property
+    def remote_metadata(self) -> RemoteMetadata:
+        # fast path (no lock)
+        rm = self._remote_metadata
+        if rm is not None:
+            return rm
+
+        # slow path guarded
+        with self._lock:
+            # double-check after acquiring lock
+            if self._remote_metadata is None:
+                cmd = r"""import glob
+import json
+import os
+from yggdrasil.pyutils.python_env import PythonEnv
+
+current_env = PythonEnv.get_current()
+meta = {}
+
 for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/python*/site-*', recursive=False):
     if path.endswith('site-packages'):
-        print(path)
-        break"""
+        meta["site_packages_path"] = path
+        break
 
-            self._remote_site_packages_path = self.execute_command(
-                command=cmd,
-                result_tag="<<RESULT>>",
-                print_stdout=False,
-            ).strip()
+os_env = meta["os_env"] = {}
+for k, v in os.environ.items():
+    os_env[k] = v
+    
+meta["requirements"] = current_env.export_requirements_matrix()
+meta["version_info"] = current_env.version_info
 
-            assert self._remote_site_packages_path, f"Cannot find remote_site_packages path in remote cluster {self.cluster}"
+print(json.dumps(meta))"""
 
-        return self._remote_site_packages_path
+                content = self.execute_command(
+                    command=cmd,
+                    result_tag="<<RESULT>>",
+                    print_stdout=False,
+                )
+
+                self._remote_metadata = RemoteMetadata(**json.loads(content))
+
+            return self._remote_metadata
 
     # ------------ internal helpers ------------
     def _workspace_client(self):
@@ -155,33 +228,25 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         finally:
             self.context_id = None
 
-    def __enter__(self) -> "ExecutionContext":
-        self.cluster.__enter__()
-        return self.connect()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-        self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
-
-    def __del__(self):
-        self.close()
-
     # ------------ public API ------------
     def execute(
         self,
-        obj: Union[str, Callable, SerializedFunction],
+        obj: Union[str, Callable],
         *,
         args: List[Any] = None,
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[List[str]] = None,
+        env_variables: Optional[dict[str, str]] = None,
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
+        **options
     ):
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
                 timeout=timeout,
-                result_tag=result_tag
+                result_tag=result_tag,
+                **options
             )
         elif callable(obj):
             return self.execute_callable(
@@ -189,7 +254,9 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
                 args=args,
                 kwargs=kwargs,
                 env_keys=env_keys,
+                env_variables=env_variables,
                 timeout=timeout,
+                **options
             )
         raise ValueError(f"Cannot execute {type(obj)}")
 
@@ -198,14 +265,16 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
 
     def execute_callable(
         self,
-        func: Callable | SerializedFunction,
+        func: Callable | CallableSerde,
         args: List[Any] = None,
         kwargs: Dict[str, Any] = None,
-        env_keys: Optional[List[str]] = None,
+        env_keys: Optional[Iterable[str]] = None,
+        env_variables: Optional[Dict[str, str]] = None,
         print_stdout: Optional[bool] = True,
         timeout: Optional[dt.timedelta] = None,
         command: Optional[str] = None,
-    ) -> str:
+        use_dill: Optional[bool] = None
+    ) -> Any:
         if self.is_in_databricks_environment():
             args = args or []
             kwargs = kwargs or {}
@@ -220,18 +289,24 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             self,
         )
 
-        serialized = func if isinstance(func, SerializedFunction) else SerializedFunction.from_callable(func)
+        serialized = CallableSerde.from_callable(func)
 
         self.install_temporary_libraries(libraries=serialized.package_root)
 
         # Use dill of same version
-        use_dill = sys.version_info[:2] == self.cluster.python_version
+        current_version = (sys.version_info.major, sys.version_info.minor)
+
+        if use_dill is None:
+            if current_version == self.cluster.python_version:
+                use_dill = True
+            else:
+                use_dill = False
+
         result_tag = "<<<RESULT>>>"
+
         command = serialized.to_command(
             args=args,
             kwargs=kwargs,
-            env_keys=env_keys,
-            use_dill=use_dill,
             result_tag=result_tag,
         ) if not command else command
 
@@ -241,13 +316,33 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         )
 
         try:
-            result = serialized.parse_command_result(raw_result)
-        except UnpicklingError as e:
-            raise RuntimeError(
-                "Failed to parse result of %s: %s\n%s" % (
-                    self, e, serialized.source
+            result = serialized.parse_command_result(raw_result, result_tag=result_tag)
+        except ModuleNotFoundError as remote_module_error:
+            _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
+            module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
+            module_name = module_name.group(1) if module_name else None
+            module_name = module_name.split(".")[0]
+
+            if module_name:
+                self.close()
+                self.cluster.install_libraries(
+                    libraries=[module_name],
+                    raise_error=True,
+                    restart=True
                 )
-            )
+
+                return self.execute_callable(
+                    func=func,
+                    args=args,
+                    kwargs=kwargs,
+                    env_keys=env_keys,
+                    env_variables=env_variables,
+                    print_stdout=print_stdout,
+                    timeout=timeout,
+                    command=command,
+                    use_dill=use_dill
+                )
+            raise remote_module_error
 
         return result
 
@@ -255,7 +350,7 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
         self,
         command: str,
         *,
-        timeout: Optional[dt.timedelta] = None,
+        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
         result_tag: Optional[str] = None,
         print_stdout: Optional[bool] = True,
     ) -> str:
@@ -280,8 +375,11 @@ for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/pyt
             module_name = module_name.split(".")[0]
 
             if module_name:
+                self.close()
                 self.cluster.install_libraries(
                     libraries=[module_name],
+                    raise_error=True,
+                    restart=True
                 )
 
                 return self.execute_command(
@@ -401,22 +499,15 @@ with zipfile.ZipFile(buf, "r") as zf:
         resolved = resolve_local_lib_path(libraries)
         resolved_str = str(resolved)
 
-        if resolved_str not in self._remote_installed_local_libs:
-            self._remote_installed_local_libs.add(resolved_str)
+        remote_site_packages_path = self.remote_metadata.site_packages_path
+        if resolved.is_dir():
+            # site-packages/<package_name>/
+            remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+        else:
+            # site-packages/<module_file>
+            remote_target = posixpath.join(remote_site_packages_path, resolved.name)
 
-            try:
-                remote_site_packages_path = self.remote_site_packages_path()
-                if resolved.is_dir():
-                    # site-packages/<package_name>/
-                    remote_target = posixpath.join(remote_site_packages_path, resolved.name)
-                else:
-                    # site-packages/<module_file>
-                    remote_target = posixpath.join(remote_site_packages_path, resolved.name)
-
-                self.upload_local_path(resolved, remote_target)
-            except:
-                self._remote_installed_local_libs.remove(resolved_str)
-                raise
+        self.upload_local_path(resolved, remote_target)
 
         return libraries
 
@@ -446,7 +537,7 @@ with zipfile.ZipFile(buf, "r") as zf:
                 or getattr(res, "traceback", None)
             )
             if remote_tb:
-                message = f"{message}\n\nRemote traceback:\n{remote_tb}"
+                message = f"{message}\n{remote_tb}"
 
             raise RuntimeError(message)
 

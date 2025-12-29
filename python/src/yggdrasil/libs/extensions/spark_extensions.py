@@ -1,6 +1,7 @@
 import datetime
+import inspect
 import re
-from typing import List, Union, Optional, Iterable, Callable, TYPE_CHECKING
+from typing import List, Union, Optional, Iterable, Callable, TYPE_CHECKING, Mapping, Any
 
 import pyarrow as pa
 
@@ -9,28 +10,19 @@ from ..sparklib import (
     pyspark,
     SparkDataFrame,
     SparkColumn,
-    SparkDataType,
     spark_type_to_arrow_type,
     arrow_field_to_spark_field,
 )
 from ...types.cast.registry import convert
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ...types.cast.arrow_cast import CastOptions
+    from ...types.cast.cast_options import CastOptions
 
-# Try to import pyspark.sql stuff if pyspark is actually there
-try:
-    if pyspark is not None:
-        import pyspark.sql
-        import pyspark.sql.types as T
-        import pyspark.sql.functions as F
-    else:
-        T = None
-        F = None
-except ImportError:  # safety net if env is weird
-    pyspark = None
-    T = None
-    F = None
+if pyspark is not None:
+    import pyspark.sql
+    import pyspark.sql.types as T
+    import pyspark.sql.functions as F
+
 
 __all__ = []
 
@@ -64,14 +56,6 @@ def getAlias(
 ) -> str:
     """
     Parse a column name out of a PySpark Column repr string.
-
-    Examples it will handle:
-      "Column<'curve_name'>"        -> "curve_name"
-      'Column<"`weird-name`">'      -> "weird-name"
-      'Column<"table.col">'         -> "table.col"
-      " Column<'  x  '> "           -> "  x  " (keeps whitespace inside quotes)
-
-    Returns the extracted string, or the original string if it's already a str.
     """
     if isinstance(obj, str):
         return obj
@@ -86,8 +70,6 @@ def getAlias(
             return None
 
         plan = jdf.queryExecution().analyzed().toString()
-        # Logical plan contains something like:
-        # SubqueryAlias my_alias, ...
         for line in plan.split("\n"):
             line = line.strip()
             if line.startswith("SubqueryAlias "):
@@ -105,63 +87,11 @@ def getAlias(
     return result
 
 
-def safe_spark_column(obj: Union[str, SparkColumn], holder: SparkDataFrame) -> SparkColumn:
-    """Convert string or Spark Column into a Spark Column safely."""
-    _require_pyspark("safe_spark_column")
-
-    if isinstance(obj, SparkColumn):
-        return obj
-    elif isinstance(obj, str):
-        names = holder.schema.fieldNames()
-        if names and obj in names:
-            return holder[obj]
-        return F.col(obj)
-    elif isinstance(obj, (datetime.datetime, datetime.date)):
-        return F.lit(obj)
-    else:
-        raise ValueError(f"Invalid type for obj: {type(obj)}")
-
-
-def truncate(
-    column: SparkColumn,
-    dataType: SparkDataType,
-    value: int,
-    name: str = None,
-) -> SparkColumn:
-    _require_pyspark("truncate")
-
-    name = getAlias(column, full=False) if name is None else name
-
-    if isinstance(dataType, T.IntegerType) or isinstance(dataType, T.LongType):
-        value = int(value)
-        truncated = (column.cast(dataType) / F.lit(value)).cast(dataType) * F.lit(value)
-        return truncated
-
-    if isinstance(dataType, T.TimestampType):
-        if isinstance(value, datetime.timedelta):
-            value = value // datetime.timedelta(seconds=1)
-
-        truncated = truncate(
-            column=column.cast(T.LongType()),
-            dataType=T.LongType(),
-            value=value,
-            name=name,
-        ).cast(dataType)
-
-        return truncated
-
-    raise ValueError(f"Cannot truncate {dataType} with {type(value)}")
-
-
 def latest(
     df: SparkDataFrame,
     partitionBy: List[Union[str, SparkColumn]],
     orderBy: List[Union[str, SparkColumn]],
 ) -> SparkDataFrame:
-    """
-    Return latest rows from Spark DataFrame based on grouping and ordering.
-    Preserves original column case.
-    """
     _require_pyspark("latest")
 
     partition_col_names = getAliases(partitionBy)
@@ -180,27 +110,29 @@ def latest(
     )
 
 
-def withNextValue(
-    df: SparkDataFrame,
-    orderBy: Union[str, SparkColumn],
-    name: str,
-    partitionBy: Optional[List[Union[str, SparkColumn]]] = None,
-) -> SparkDataFrame:
+def _infer_time_col_spark(df: "pyspark.sql.DataFrame") -> str:
     """
-    Add a column with the next value of a given column for each row.
+    Match the Polars extension behavior: if time not provided, pick the first TimestampType column.
+    (Datetime-only inference; DateType does NOT count.)
     """
-    _require_pyspark("withNextValue")
+    _require_pyspark("_infer_time_col_spark")
+    for f in df.schema.fields:
+        if isinstance(f.dataType, T.TimestampType):
+            return f.name
+    raise ValueError("resample: time not provided and no TimestampType column found in Spark schema.")
 
-    partition_col_names = getAliases(partitionBy)
-    order_col_names = getAliases(orderBy)
 
-    window_spec = (
-        pyspark.sql.Window
-        .partitionBy(*partition_col_names)
-        .orderBy(*order_col_names)
-    )
+def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+    sig = inspect.signature(fn)  # type: ignore[arg-type]
+    allowed = set(sig.parameters.keys())
+    return {k: v for k, v in kwargs.items() if (k in allowed and v is not None)}
 
-    return df.withColumn(name, F.lead(order_col_names[0]).over(window_spec))
+
+def _append_drop_col_to_spark_schema(schema: "T.StructType", drop_col: str) -> "T.StructType":
+    _require_pyspark("_append_drop_col_to_spark_schema")
+    if drop_col in schema.fieldNames():
+        return schema
+    return T.StructType(list(schema.fields) + [T.StructField(drop_col, T.IntegerType(), True)])
 
 
 def upsample(
@@ -219,7 +151,7 @@ def upsample(
         arrow_table_to_polars_dataframe,
         polars_dataframe_to_arrow_table,
     )
-    from ...types.cast.arrow_cast import CastOptions
+    from ...types.cast.cast_options import CastOptions
 
     df: pyspark.sql.DataFrame = df
 
@@ -252,6 +184,136 @@ def upsample(
         df
         .groupBy(*partition_col_names)
         .applyInArrow(within_group, schema=spark_schema.dataType)
+    )
+
+    if drop_col:
+        result = result.drop(drop_col)
+
+    return result
+
+
+def resample(
+    df: SparkDataFrame,
+    every: Union[str, datetime.timedelta],
+    time: Optional[Union[str, SparkColumn]] = None,
+    partitionBy: Optional[List[Union[str, SparkColumn]]] = None,
+    agg: Optional[Mapping[str, Any]] = None,
+    fill: Optional[str] = "forward",
+    period: Optional[Union[str, datetime.timedelta]] = None,
+    offset: Optional[Union[str, datetime.timedelta]] = None,
+    closed: str = "left",
+    label: str = "left",
+    start_by: str = "window",
+    schema: Optional[Union["T.StructType", str]] = None,
+) -> SparkDataFrame:
+    """
+    Spark DataFrame .resample(...) implemented via Polars inside applyInArrow.
+
+    Behavior:
+      - If agg is None: UPSAMPLE mode (insert missing timestamps), then fill (forward/backward/zero/none)
+      - If agg is provided: DOWNSAMPLE mode using polars group_by_dynamic + aggregations
+
+    Notes / constraints:
+      - time can be omitted: we infer the first Spark TimestampType column (Datetime-only)
+      - For agg != None, you SHOULD pass `schema` (Spark StructType or schema string).
+        Spark requires the output schema for applyInArrow.
+        If schema is not provided, we raise.
+      - agg should be a dict mapping column -> aggregator, e.g. {"qty":"sum","px":"last"}.
+        (Keep it picklable; don't pass Polars Exprs here.)
+
+    This uses the Polars DataFrame `.resample(...)` extension you added, so the
+    upsample-with-group keys stays correct even on older Polars versions.
+    """
+    _require_pyspark("resample")
+
+    from ...types.cast.polars_cast import (
+        arrow_table_to_polars_dataframe,
+        polars_dataframe_to_arrow_table,
+    )
+    from ...types.cast.cast_options import CastOptions
+
+    df: pyspark.sql.DataFrame = df
+
+    partition_col_names = getAliases(partitionBy) or []
+
+    # Infer time column if not given (Datetime-only: TimestampType)
+    if time is None:
+        time_col_name = _infer_time_col_spark(df)
+    else:
+        time_col_name = getAlias(time, full=False)
+
+    # If no partition keys, force a single group like upsample()
+    if not partition_col_names:
+        drop_col = "__repart"
+        df = df.withColumn(drop_col, F.lit(1))
+        partition_col_names = [drop_col]
+    else:
+        drop_col = None
+
+    # Input conversion options always based on the (possibly augmented) input schema
+    in_options = CastOptions.check_arg(spark_type_to_arrow_type(df.schema))
+
+    # Output schema/options:
+    # - upsample mode defaults to input schema
+    # - downsample mode requires explicit schema
+    if agg is None:
+        out_options = in_options
+        spark_schema_for_apply = arrow_field_to_spark_field(out_options.target_field).dataType
+    else:
+        if schema is None:
+            raise ValueError(
+                "resample: agg provided but schema is None. "
+                "Spark applyInArrow requires the output schema for aggregated resample."
+            )
+        spark_schema_for_apply = convert(schema, T.StructType)
+
+        # If we injected drop_col, it will be present in Polars output (as a group key).
+        # So the applyInArrow schema must include it too, then we drop it after.
+        if drop_col is not None:
+            spark_schema_for_apply = _append_drop_col_to_spark_schema(spark_schema_for_apply, drop_col)
+
+        # Build output cast options from the declared output schema
+        out_arrow_field = convert(spark_schema_for_apply, pa.Field)
+        out_options = CastOptions.check_arg(out_arrow_field)
+
+    def within_group(tb: pa.Table) -> pa.Table:
+        from .polars_extensions import resample
+
+        pdf = arrow_table_to_polars_dataframe(tb, in_options)
+
+        # Call your Polars extension resample
+        if agg is None:
+            res = resample(
+                pdf,
+                time_col=time_col_name,
+                every=every,
+                group_by=partition_col_names,
+                fill=(fill or "none"),
+                period=period,
+                offset=offset,
+                closed=closed,
+                label=label,
+                start_by=start_by,
+            )
+        else:
+            res = resample(
+                pdf,
+                time_col=time_col_name,
+                every=every,
+                group_by=partition_col_names,
+                agg=dict(agg),
+                period=period,
+                offset=offset,
+                closed=closed,
+                label=label,
+                start_by=start_by,
+            )
+
+        return polars_dataframe_to_arrow_table(res, out_options)
+
+    result = (
+        df.groupBy(*partition_col_names)
+        .applyInArrow(within_group, schema=spark_schema_for_apply)
     )
 
     if drop_col:
@@ -356,8 +418,8 @@ def checkMapInPandas(
 if pyspark is not None:
     for method in [
         latest,
-        withNextValue,
         upsample,
+        resample,
         checkJoin,
         getAlias,
         checkMapInArrow,
@@ -366,7 +428,6 @@ if pyspark is not None:
         setattr(SparkDataFrame, method.__name__, method)
 
     for method in [
-        truncate,
         getAlias,
     ]:
         setattr(SparkColumn, method.__name__, method)

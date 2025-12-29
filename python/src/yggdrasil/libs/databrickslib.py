@@ -5,8 +5,12 @@ try:
     databricks = databricks
     databricks_sdk = databricks.sdk
 except ImportError:
-    databricks = None
-    databricks_sdk = None
+    class _DatabricksDummy:
+        def __getattr__(self, item):
+            require_databricks_sdk()
+
+    databricks = _DatabricksDummy
+    databricks_sdk = _DatabricksDummy
 
 
 def require_databricks_sdk():

@@ -1,45 +1,27 @@
-import os
-from typing import Any
-
-import pandas
+import unittest
+import pyarrow as pa
 
 from yggdrasil.databricks.workspaces import Workspace
 
 
-def test_fetch():
-    from yggdrasil.databricks import Workspace, Cluster
+class TestSQLEngine(unittest.TestCase):
 
-    # infer from local environment
-    # running locally will use SSO
-    # in databricks will use current identity
-    workspace = Workspace()
-    workspace = Workspace(host="xxx.cloud.databricks.com")
-    token = workspace.current_token()  # Current PAT or bearer token
-    current_auth_workspace = Workspace(host="xxx.cloud.databricks.com", token=token)
+    def setUp(self):
+        self.workspace = Workspace()
+        self.engine = self.workspace.sql(catalog_name="trading", schema_name="unittest")
 
-    read = (
-        workspace.sql()
-        .execute(statement="SELECT 1")
-        .to_pandas() # or .to_polars(), .arrow_batches()
-    )
+    def test_insert_read_same(self):
+        data = pa.table([
+            pa.array(["a", None, "c"]),
+            pa.array([1, 2, 3])
+        ], names=["c0", "c1"])
 
-    write = (
-        workspace.sql()
-        .insert_into(
-            data=pandas.DataFrame, # or other polars.DataFrame, pyspark.sql.DataFrame, list
-            catalog_name="catalog",
-            schema_name="schema",
-            table_name="name",
-            mode="auto", # set overwrite to overwrite table, or clean update kys before merge
-            match_by=[] # Add matching keys to update
-        )
-    )
+        self.engine.insert_into(data, table_name="test_insert", mode="overwrite")
 
-    cluster = workspace.clusters().find_cluster(cluster_id="123", cluster_name="abc")
-    cluster = Cluster.replicated_current_environment(workspace=workspace)
+        n = self.engine.table_full_name(table_name="test_insert")
 
-    @cluster.execution_decorator
-    def remote_executed(value: Any):
-        return os.environ, value, workspace.current_user
+        read = self.engine.execute(
+            f"SELECT * from {n}"
+        ).to_arrow_table()
 
-    remote_result = remote_executed(1)
+        assert data == read

@@ -20,7 +20,8 @@ def databricks_remote_compute(
     workspace: Optional[Workspace] = None,
     cluster: Optional["Cluster"] = None,
     timeout: Optional[dt.timedelta] = None,
-    env_keys: Optional[List[str]] = None
+    env_keys: Optional[List[str]] = None,
+    **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     from .. import Cluster
 
@@ -39,6 +40,7 @@ def databricks_remote_compute(
     return cluster.execution_decorator(
         env_keys=env_keys,
         timeout=timeout,
+        **options
     )
 
 

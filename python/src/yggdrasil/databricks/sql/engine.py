@@ -4,20 +4,16 @@ import logging
 import random
 import string
 import time
-from functools import cached_property
-from typing import Optional, Union, Generator, Any, Dict, List
+from typing import Optional, Union, Any, Dict, List
 
 import pyarrow as pa
-import pyarrow.ipc as pipc
 import pyarrow.parquet as pq
 
+from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
 from ..workspaces import WorkspaceService
 from ...libs.databrickslib import databricks_sdk
-from ...libs.pandaslib import pandas
-from ...libs.polarslib import polars
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
-from ...requests.session import YGGSession
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -36,7 +32,7 @@ except ImportError:
 
 if databricks_sdk is not None:
     from databricks.sdk.service.sql import (
-        StatementState, StatementResponse, Disposition, Format,
+        StatementResponse, Disposition, Format,
         ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
     )
 
@@ -65,14 +61,19 @@ class SqlExecutionError(RuntimeError):
 @dataclasses.dataclass
 class SQLEngine(WorkspaceService):
     warehouse_id: Optional[str] = None
+    catalog_name: Optional[str] = None
+    schema_name: Optional[str] = None
 
-    @staticmethod
-    def _table_full_name(
+    def table_full_name(
+        self,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
         assert catalog_name, "No catalog name given"
         assert schema_name, "No schema name given"
         assert table_name, "No table name given"
@@ -81,8 +82,8 @@ class SQLEngine(WorkspaceService):
             return f"`{catalog_name}`.`{schema_name}`.`{table_name}`"
         return f"{catalog_name}.{schema_name}.{table_name}"
 
-    @staticmethod
     def _catalog_schema_table_names(
+        self,
         full_name: str,
     ):
         parts = [
@@ -90,13 +91,17 @@ class SQLEngine(WorkspaceService):
         ]
 
         if len(parts) == 0:
-            return None, None, None
+            return self.catalog_name, self.schema_name, None
         if len(parts) == 1:
-            return None, None, parts[0]
+            return self.catalog_name, self.schema_name, parts[0]
         if len(parts) == 2:
-            return None, parts[0], parts[1]
+            return self.catalog_name, parts[0], parts[1]
 
-        return parts[-3], parts[-2], parts[-1]
+        catalog_name, schema_name, table_name = parts[-3], parts[-2], parts[-1]
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
+        return catalog_name, schema_name, table_name
 
     def _default_warehouse(
         self,
@@ -131,14 +136,6 @@ class SQLEngine(WorkspaceService):
             self.warehouse_id = dft.id
         return self.warehouse_id
 
-    def _get_temp_volume(
-        self,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
-    ):
-        pass
-
     @staticmethod
     def _random_suffix(prefix: str = "") -> str:
         unique = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
@@ -149,6 +146,7 @@ class SQLEngine(WorkspaceService):
         self,
         statement: Optional[str] = None,
         *,
+        warehouse_id: Optional[str] = None,
         byte_limit: Optional[int] = None,
         disposition: Optional["Disposition"] = None,
         format: Optional["Format"] = None,
@@ -159,11 +157,8 @@ class SQLEngine(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        wait: bool = True,
-        timeout: Optional[float] = 600.0,
-        poll_interval: float = 1.0,
         **kwargs,
-    ):
+    ) -> "StatementResult":
         """
         Execute a SQL statement on a SQL warehouse.
 
@@ -172,6 +167,19 @@ class SQLEngine(WorkspaceService):
             - On FAILED / CANCELED: raise SqlExecutionError
         - If wait=False: return initial execution handle without polling.
         """
+        if pyspark is not None:
+            spark_session = SparkSession.getActiveSession()
+
+            if spark_session is not None:
+                result = spark_session.sql(statement)
+
+                return StatementResult(
+                    engine=self,
+                    statement_id="sparksql",
+                    disposition=Disposition.EXTERNAL_LINKS,
+                    _spark_df=result
+                )
+
         if format is None:
             format = Format.ARROW_STREAM
 
@@ -179,41 +187,36 @@ class SQLEngine(WorkspaceService):
             disposition = Disposition.EXTERNAL_LINKS
 
         if not statement:
-            full_name = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name)
+            full_name = self.table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name)
             statement = f"SELECT * FROM {full_name}"
 
-        with self as connected:
-            wk = connected.workspace.sdk()
+        if not warehouse_id:
+            warehouse_id = self._get_or_default_warehouse_id()
 
-            response = wk.statement_execution.execute_statement(
-                statement=statement,
-                warehouse_id=self._get_or_default_warehouse_id(),
-                byte_limit=byte_limit,
-                disposition=disposition,
-                format=format,
-                on_wait_timeout=on_wait_timeout,
-                parameters=parameters,
-                row_limit=row_limit,
-                wait_timeout=wait_timeout,
-                catalog=catalog_name,
-                schema=schema_name,
-                **kwargs,
-            )
-            execution = StatementResult(
-                engine=connected,
-                response=response
-            )
-
-            if not wait:
-                # Caller handles polling / status themselves
-                return execution
-            return execution.wait(timeout=timeout, poll_interval=poll_interval)
-
-    def get_statement(self, statement_id: str):
-        return StatementResult(
-            engine=self,
-            response=self.sdk().statement_execution.get_statement(statement_id),
+        response = self.workspace.sdk().statement_execution.execute_statement(
+            statement=statement,
+            warehouse_id=warehouse_id,
+            byte_limit=byte_limit,
+            disposition=disposition,
+            format=format,
+            on_wait_timeout=on_wait_timeout,
+            parameters=parameters,
+            row_limit=row_limit,
+            wait_timeout=wait_timeout,
+            catalog=catalog_name or self.catalog_name,
+            schema=schema_name or self.schema_name,
+            **kwargs,
         )
+
+        execution = StatementResult(
+            engine=self,
+            statement_id=response.statement_id,
+            _response=response,
+            _response_refresh_time=time.time(),
+            disposition=disposition
+        )
+
+        return execution
 
     def spark_table(
         self,
@@ -223,7 +226,7 @@ class SQLEngine(WorkspaceService):
         table_name: Optional[str] = None,
     ):
         if not full_name:
-            full_name = self._table_full_name(
+            full_name = self.table_full_name(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name
@@ -256,9 +259,9 @@ class SQLEngine(WorkspaceService):
     ):
         # -------- existing logic you provided (kept intact) ----------
         if pyspark is not None:
-            spark_session = SparkSession.getActiveSession()
+            spark_session = SparkSession.getActiveSession() if spark_session is None else spark_session
 
-            if spark_session or isinstance(data, SparkDataFrame):
+            if spark_session is not None or isinstance(data, SparkDataFrame):
                 return self.spark_insert_into(
                     data=data,
                     location=location,
@@ -306,70 +309,78 @@ class SQLEngine(WorkspaceService):
         zorder_by: list[str] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
+        existing_schema: pa.Schema | None = None
     ):
-        if location:
-            c, s, t = self._catalog_schema_table_names(location)
-            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
-        else:
-            location = self._table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name, safe_chars=True)
-
-        transaction_id = self._random_suffix()
+        location, catalog_name, schema_name, table_name = self._check_location_params(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            safe_chars=True
+        )
 
         with self as connected:
-            try:
-                existing_schema = connected.get_table_schema(
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    to_arrow_schema=True
-                )
-            except ValueError as exc:
-                data = convert(data, pa.Table)
-                existing_schema = data.schema
-                logger.warning(
-                    "Table %s not found, %s, creating it based on input data %s",
-                    location,
-                    exc,
-                    existing_schema.names
-                )
-                statement = connected.create_table_ddl(
-                    field=existing_schema,
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    if_not_exists=True
-                )
-                connected.execute(statement)
-                mode = "overwrite"
+            if existing_schema is None:
+                try:
+                    existing_schema = connected.get_table_schema(
+                        catalog_name=catalog_name,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        to_arrow_schema=True
+                    )
+                except ValueError as exc:
+                    data = convert(data, pa.Table)
+                    existing_schema = data.schema
+                    logger.warning(
+                        "Table %s not found, %s, creating it based on input data %s",
+                        location,
+                        exc,
+                        existing_schema.names
+                    )
+
+                    connected.create_table(
+                        field=existing_schema,
+                        catalog_name=catalog_name,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        if_not_exists=True
+                    )
+
+                    try:
+                        return connected.arrow_insert_into(
+                            data=data,
+                            location=location,
+                            catalog_name=catalog_name,
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            mode="overwrite",
+                            cast_options=cast_options,
+                            overwrite_schema=overwrite_schema,
+                            match_by=match_by,
+                            zorder_by=zorder_by,
+                            optimize_after_merge=optimize_after_merge,
+                            vacuum_hours=vacuum_hours,
+                            existing_schema=existing_schema
+                        )
+                    except:
+                        try:
+                            connected.drop_table(location=location)
+                        except Exception as e:
+                            logger.warning("Failed to drop table %s after auto creation on error: %s", location, e)
+                        raise
+
+            transaction_id = self._random_suffix()
 
             data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
 
             # Write in temp volume
-            databricks_tmp_folder = connected.workspace.temp_volume_folder(
-                suffix=transaction_id,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                volume_name="tmp"
+            databricks_tmp_path = connected.path(
+                "/Volumes", catalog_name, schema_name, "tmp", transaction_id, "data.parquet",
             )
-            databricks_tmp_path = databricks_tmp_folder + "/data.parquet"
+            databricks_tmp_folder = databricks_tmp_path.parent
 
-            buffer = io.BytesIO()
-
-            # remove pandas index if present in the schema helper
-            pq.write_table(data, buffer, compression="snappy")
-            buffer.seek(0)
-
-            connected.workspace.upload_file_content(
-                target_path=databricks_tmp_path,
-                content=buffer,
-            )
-
-            # build fully-qualified table name
-            full_table = connected._table_full_name(
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name
-            )
+            with databricks_tmp_path.open(mode="wb") as f:
+                pq.write_table(data, f, compression="snappy")
 
             # get column list from arrow schema
             columns = [c for c in existing_schema.names]
@@ -397,7 +408,7 @@ class SQLEngine(WorkspaceService):
                 # build INSERT clause
                 insert_clause = f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
 
-                merge_sql = f"""MERGE INTO {full_table} AS T
+                merge_sql = f"""MERGE INTO {location} AS T
 USING (
   SELECT {cols_quoted} FROM parquet.`{databricks_tmp_folder}`
 ) AS S
@@ -409,12 +420,12 @@ ON {on_condition}
             else:
                 # No match_by -> plain insert
                 if mode.lower() in ("overwrite",):
-                    insert_sql = f"""INSERT OVERWRITE {full_table}
+                    insert_sql = f"""INSERT OVERWRITE {location}
 SELECT {cols_quoted}
 FROM parquet.`{databricks_tmp_folder}`"""
                 else:
                     # default: append
-                    insert_sql = f"""INSERT INTO {full_table} ({cols_quoted})
+                    insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 SELECT {cols_quoted}
 FROM parquet.`{databricks_tmp_folder}`"""
                 statements.append(insert_sql)
@@ -426,21 +437,22 @@ FROM parquet.`{databricks_tmp_folder}`"""
                     connected.execute(stmt.strip())
             finally:
                 try:
-                    connected.workspace.delete_path(databricks_tmp_folder, recursive=True)
+                    databricks_tmp_folder.rmdir(recursive=True)
                 except Exception as e:
+                    raise e
                     logger.error(e)
 
             # Optionally run OPTIMIZE / ZORDER / VACUUM if requested (Databricks SQL)
             if zorder_by:
                 zcols = ", ".join([f"`{c}`" for c in zorder_by])
-                optimize_sql = f"OPTIMIZE {full_table} ZORDER BY ({zcols})"
+                optimize_sql = f"OPTIMIZE {location} ZORDER BY ({zcols})"
                 connected.execute(optimize_sql)
 
             if optimize_after_merge and match_by:
-                connected.execute(f"OPTIMIZE {full_table}")
+                connected.execute(f"OPTIMIZE {location}")
 
             if vacuum_hours is not None:
-                connected.execute(f"VACUUM {full_table} RETAIN {vacuum_hours} HOURS")
+                connected.execute(f"VACUUM {location} RETAIN {vacuum_hours} HOURS")
 
         return None
 
@@ -461,14 +473,14 @@ FROM parquet.`{databricks_tmp_folder}`"""
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
         spark_options: Optional[Dict[str, Any]] = None,
     ):
-        if location:
-            c, s, t = self._catalog_schema_table_names(location)
-            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
-        else:
-            location = self._table_full_name(
-                catalog_name=catalog_name, schema_name=schema_name,
-                table_name=table_name
-            )
+        location, catalog_name, schema_name, table_name = self._check_location_params(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            safe_chars=True
+        )
+
         spark_options = spark_options if spark_options else {}
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"
@@ -560,7 +572,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
         table_name: Optional[str] = None,
         to_arrow_schema: bool = True
     ) -> Union[pa.Field, pa.Schema]:
-        full_name = self._table_full_name(
+        full_name = self.table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
@@ -583,17 +595,38 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return pa.schema(fields, metadata={b"name": table_name})
         return pa.field(table.name, pa.struct(fields))
 
-    @classmethod
-    def create_table_ddl(
-        cls,
+    def drop_table(
+        self,
+        location: Optional[str] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+    ):
+        location, _, _, _ = self._check_location_params(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            safe_chars=True
+        )
+
+        return self.execute(f"DROP TABLE IF EXISTS {location}")
+
+    def create_table(
+        self,
         field: pa.Field,
+        location: Optional[str] = None,
         table_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         partition_by: Optional[list[str]] = None,
+        cluster_by: Optional[bool | list[str]] = True,
         comment: Optional[str] = None,
         options: Optional[dict] = None,
-        if_not_exists: bool = True
+        if_not_exists: bool = True,
+        optimize_write: bool = True,
+        auto_compact: bool = True,
+        execute: bool = True
     ) -> str:
         """
         Generate DDL (Data Definition Language) SQL for creating a table from a PyField schema.
@@ -614,16 +647,16 @@ FROM parquet.`{databricks_tmp_folder}`"""
         if not isinstance(field, pa.Field):
             field = convert(field, pa.Field)
 
-        table_name = table_name or field.name
-        catalog_name = catalog_name or "hive_metastore"
-        schema_name = schema_name or "default"
-        full_table_name = cls._table_full_name(
-            catalog_name, schema_name, table_name,
+        location, catalog_name, schema_name, table_name = self._check_location_params(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
             safe_chars=True
         )
 
         # Create the DDL statement
-        sql = [f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{full_table_name} ("]
+        sql = [f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{location} ("]
 
         # Generate column definitions
         column_defs = []
@@ -634,7 +667,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
             children = [field]
 
         for child in children:
-            column_def = cls._field_to_ddl(child)
+            column_def = self._field_to_ddl(child)
             column_defs.append(column_def)
 
         sql.append(",\n  ".join(column_defs))
@@ -643,8 +676,11 @@ FROM parquet.`{databricks_tmp_folder}`"""
         # Add partition by clause if provided
         if partition_by and len(partition_by) > 0:
             sql.append(f"\nPARTITIONED BY ({', '.join(partition_by)})")
-        else:
-            sql.append(f"\nCLUSTER BY AUTO")
+        elif cluster_by:
+            if isinstance(cluster_by, bool):
+                sql.append(f"\nCLUSTER BY AUTO")
+            else:
+                sql.append(f"\nCLUSTER BY ({', '.join(cluster_by)})")
 
         # Add comment if provided
         if not comment and field.metadata:
@@ -657,25 +693,52 @@ FROM parquet.`{databricks_tmp_folder}`"""
             sql.append(f"\nCOMMENT '{comment}'")
 
         # Add options if provided
+        options = {} if options is None else options
+        options.update({
+            "delta.autoOptimize.optimizeWrite": optimize_write,
+            "delta.autoOptimize.autoCompact": auto_compact
+        })
+
         option_strs = []
 
         if options:
             for key, value in options.items():
                 if isinstance(value, str):
                     option_strs.append(f"'{key}' = '{value}'")
+                elif isinstance(value, bool):
+                    b_value = "true" if value else "false"
+                    option_strs.append(f"'{key}' = '{b_value}'")
                 else:
                     option_strs.append(f"'{key}' = {value}")
-
-        for dft in (
-            "'delta.autoOptimize.optimizeWrite' = 'true'",
-            "'delta.autoOptimize.autoCompact' = 'true'"
-        ):
-            option_strs.append(dft)
 
         if option_strs:
             sql.append(f"\nTBLPROPERTIES ({', '.join(option_strs)})")
 
-        return "\n".join(sql)
+        statement = "\n".join(sql)
+
+        if execute:
+            return self.execute(statement)
+        return statement
+
+    def _check_location_params(
+        self,
+        location: Optional[str] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+        safe_chars: bool = True
+    ):
+        if location:
+            c, s, t = self._catalog_schema_table_names(location)
+            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
+
+        location = self.table_full_name(
+            catalog_name=catalog_name, schema_name=schema_name,
+            table_name=table_name,
+            safe_chars=safe_chars
+        )
+
+        return location, catalog_name or self.catalog_name, schema_name or self.schema_name, table_name
 
     @staticmethod
     def _field_to_ddl(
@@ -777,179 +840,3 @@ FROM parquet.`{databricks_tmp_folder}`"""
             return "STRING"
         else:
             raise ValueError(f"Cannot make ddl type for {arrow_type}")
-
-
-@dataclasses.dataclass
-class StatementResult:
-    engine: SQLEngine
-    response: StatementResponse
-
-    def __iter__(self):
-        return self.arrow_batches()
-
-    @property
-    def workspace(self):
-        return self.engine.workspace
-
-    @property
-    def status(self):
-        return self.response.status
-
-    @property
-    def state(self):
-        return self.status.state
-
-    @property
-    def statement_id(self):
-        return self.response.statement_id
-
-    @property
-    def manifest(self):
-        return self.response.manifest
-
-    @property
-    def result(self):
-        return self.response.result
-
-    @property
-    def external_links(self):
-        return self.response.result.external_links
-
-    def _fetch_chunk(self, chunk_index: int):
-        if not self.workspace:
-            raise ValueError("Workspace is required to fetch additional result chunks")
-
-        sdk = self.workspace.sdk()
-        return sdk.statement_execution.get_statement_result_chunk_n(
-            statement_id=self.statement_id,
-            chunk_index=chunk_index,
-        )
-
-    @property
-    def done(self):
-        return self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
-
-    @property
-    def failed(self):
-        return self.state in [StatementState.CANCELED, StatementState.FAILED]
-
-    def raise_for_status(self):
-        if self.failed:
-            # grab error info if present
-            err = self.status.error
-            message = err.message or "Unknown SQL error"
-            error_code = err.error_code
-            sql_state = getattr(err, "sql_state", None)
-
-            parts = [message]
-            if error_code:
-                parts.append(f"error_code={error_code}")
-            if sql_state:
-                parts.append(f"sql_state={sql_state}")
-
-            raise SqlExecutionError(
-                f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
-            )
-
-    def wait(
-        self,
-        timeout: Optional[int] = None,
-        poll_interval: Optional[float] = None
-    ):
-        start = time.time()
-        poll_interval = poll_interval or 1
-        current = self
-
-        while True:
-            current = self.engine.get_statement(current.statement_id)
-            current.raise_for_status()
-
-            if current.done:
-                break
-
-            # still running / queued / pending
-            if timeout is not None and (time.time() - start) > timeout:
-                raise TimeoutError(
-                    f"Statement {current.statement_id} did not finish within {timeout} seconds "
-                    f"(last state={current})"
-                )
-
-            poll_interval = max(10, poll_interval * 1.2)
-            time.sleep(poll_interval)
-
-        return current
-
-    @cached_property
-    def arrow_schema(self):
-        fields = [
-            column_info_to_arrow_field(_) for _ in self.manifest.schema.columns
-        ]
-        return pa.schema(fields)
-
-    def arrow_table(self, max_workers: int | None = None) -> pa.Table:
-        batches = list(self.arrow_batches(max_workers=max_workers))
-
-        if not batches:
-            # empty table with no columns
-            return pa.Table.from_batches([], schema=self.arrow_schema)
-
-        return pa.Table.from_batches(batches)
-
-    def arrow_batches(
-        self, max_workers: int | None = None
-    ) -> Generator[pa.RecordBatch, None, None]:
-        if self.manifest and self.manifest.format != Format.ARROW_STREAM:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-        result_data = self.result
-
-        if result_data.external_links is not None:
-            session = YGGSession()
-            link = None
-
-            while True:
-                for link in result_data.external_links:
-                    resp = session.get(link.external_link, verify=False, timeout=10)
-                    resp.raise_for_status()
-
-                    buf = pa.BufferReader(resp.content)
-
-                    # If it's an IPC *stream*:
-                    reader = pipc.open_stream(buf)
-
-                    # If it’s an IPC *file*, use:
-                    # reader = pipc.open_file(buf)
-
-                    # reader yields RecordBatch objects
-                    for batch in reader:
-                        yield batch
-
-                    if not link.next_chunk_internal_link:
-                        break
-
-                    # /api/2.0/sql/statements/01f0d056-0596-194e-b011-aef9049504bf/result/chunks/1
-                    try:
-                        chunk_index = int(link.next_chunk_internal_link.split("/")[-1])
-                        result_data = self.workspace.sdk().statement_execution.get_statement_result_chunk_n(
-                            statement_id=self.statement_id,
-                            chunk_index=chunk_index
-                        )
-                    except Exception as e:
-                        raise SqlExecutionError(
-                            f"Cannot retrieve data batch from {link.next_chunk_internal_link!r}: {e}")
-
-                break
-        else:
-            raise ValueError("Cannot convert to arrow batches, run execute(..., format=Format.ARROW_STREAM)")
-
-    def to_pandas(
-        self,
-        max_workers: int | None = None
-    ) -> "pandas.DataFrame":
-        return self.arrow_table(max_workers=max_workers).to_pandas()
-
-    def to_polars(
-        self,
-        max_workers: int | None = None
-    ) -> "polars.DataFrame":
-        return polars.DataFrame(self.arrow_table(max_workers=max_workers))
