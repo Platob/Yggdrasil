@@ -108,33 +108,6 @@ class DatabricksPath(SysPath, PurePosixPath):
 
         return str(PurePosixPath(*(_seg_to_str(s) for s in pathsegments)))
 
-    def _init(self, template: Optional["DatabricksPath"] = None) -> None:
-        """
-        pathlib creates derived paths (parent, /, joinpath, with_name, etc.) via _from_parts
-        which bypasses __new__. _init(template=...) is the hook to carry our metadata forward.
-        """
-        if isinstance(template, DatabricksPath):
-            # Recompute kind for the NEW path string (don’t blindly copy _kind)
-            kind, ws, _ = DatabricksPathKind.parse(str(self), workspace=getattr(template, "_workspace", None))
-
-            self._kind = kind
-            self._workspace = ws if ws is not None else getattr(template, "_workspace", None)
-
-            # Never inherit caches from template
-            self._is_file = None
-            self._is_dir = None
-            self._raw_status = None
-            self._raw_status_refresh_time = 0.0
-        else:
-            kind, ws, _ = DatabricksPathKind.parse(str(self))
-            self._kind = kind
-            self._workspace = ws
-
-            self._is_file = None
-            self._is_dir = None
-            self._raw_status = None
-            self._raw_status_refresh_time = 0.0
-
     def __new__(
         cls,
         *pathsegments: Any,
@@ -171,6 +144,22 @@ class DatabricksPath(SysPath, PurePosixPath):
         # pathlib paths are effectively immutable; all init happens in __new__ / _init
         pass
 
+    def __truediv__(self, other):
+        if not other:
+            return self
+
+        built = super().__truediv__(other)
+
+        built._kind = self._kind
+        built._workspace = self._workspace
+
+        built._is_file = None
+        built._is_dir = None
+        built._raw_status = None
+        built._raw_status_refresh_time = 0.0
+
+        return built
+
     def __enter__(self):
         self.workspace.__enter__()
         return self
@@ -178,32 +167,92 @@ class DatabricksPath(SysPath, PurePosixPath):
     def __exit__(self, exc_type, exc_val, exc_tb):
         return self.workspace.__exit__(exc_type, exc_val, exc_tb)
 
+    def _clone_meta_from(self, template: "DatabricksPath") -> None:
+        """
+        Copy *connection/meta* state, but never copy caches.
+        Centralizes the logic so every creation path stays consistent.
+        """
+        # Keep workspace threading; kind should match the NEW path string.
+        kind, ws, _ = DatabricksPathKind.parse(str(self), workspace=getattr(template, "_workspace", None))
+        self._kind = kind
+        self._workspace = ws if ws is not None else getattr(template, "_workspace", None)
+
+        # Reset caches
+        self._is_file = None
+        self._is_dir = None
+        self._raw_status = None
+        self._raw_status_refresh_time = 0.0
+
+    @property
+    def parent(self):
+        built = super().parent
+
+        built._clone_meta_from(self)
+
+        return built
+
+    @classmethod
+    def _from_parsed_parts(cls, drv, root, parts):
+        """
+        pathlib internal factory. It may pass a template in some Python versions,
+        but if not, we still return a valid DatabricksPath with initialized state.
+        """
+        built = super()._from_parsed_parts(drv, root, parts)  # type: ignore[misc]
+
+        # Best effort: if pathlib gave us a template on the object, use it.
+        # Otherwise ensure we at least have valid defaults.
+        if isinstance(built, DatabricksPath) and isinstance(getattr(built, "_workspace", None), object):
+            # If the object already has workspace/kind via _init, don't stomp it.
+            # But if it's missing _kind (common failure), derive it.
+            if not hasattr(built, "_kind"):
+                kind, ws, _ = DatabricksPathKind.parse(str(built), workspace=getattr(built, "_workspace", None))
+                built._kind = kind
+                built._workspace = ws if ws is not None else getattr(built, "_workspace", None)
+
+            # Always reset caches (derived path => cache invalid)
+            built._is_file = None
+            built._is_dir = None
+            built._raw_status = None
+            built._raw_status_refresh_time = 0.0
+        else:
+            # Safety defaults (should be rare)
+            kind, ws, _ = DatabricksPathKind.parse(str(built))
+            built._kind = kind
+            built._workspace = ws
+            built._is_file = None
+            built._is_dir = None
+            built._raw_status = None
+            built._raw_status_refresh_time = 0.0
+
+        return built
+
+    def _make_child(self, args):
+        built = super()._make_child(args)  # type: ignore[misc]
+
+        # Ensure type + meta carryover
+        if isinstance(built, DatabricksPath):
+            built._clone_meta_from(self)
+        else:
+            # if for some reason super didn't return our type, try to coerce
+            built = type(self)(built, workspace=getattr(self, "_workspace", None))
+
+        return built
+
     @property
     def workspace(self):
-        try:
-            if self._workspace is None:
-                from .workspace import Workspace
-
-                self._workspace = Workspace()
-        except AttributeError:
-            self._init(template=self)
-
+        if self._workspace is None:
             from .workspace import Workspace
 
-            if self._workspace is None:
-                from .workspace import Workspace
-
-                self._workspace = Workspace()
-
+            self._workspace = Workspace()
         return self._workspace
+
+    @workspace.setter
+    def workspace(self, value):
+        self._workspace = value
 
     @property
     def kind(self):
-        try:
-            return self._kind
-        except AttributeError:
-            self._init(template=self)
-            return self._kind
+        return self._kind
 
     @kind.setter
     def kind(self, value: DatabricksPathKind):

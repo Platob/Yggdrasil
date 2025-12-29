@@ -439,8 +439,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
                 try:
                     databricks_tmp_folder.rmdir(recursive=True)
                 except Exception as e:
-                    raise e
-                    logger.error(e)
+                    logger.warning(e)
 
             # Optionally run OPTIMIZE / ZORDER / VACUUM if requested (Databricks SQL)
             if zorder_by:
