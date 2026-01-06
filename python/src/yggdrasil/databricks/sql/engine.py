@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
+from .. import DatabricksPathKind
 from ..workspaces import WorkspaceService
 from ...libs.databrickslib import databricks_sdk
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
@@ -374,8 +375,9 @@ class SQLEngine(WorkspaceService):
             data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
 
             # Write in temp volume
-            databricks_tmp_path = connected.path(
-                "/Volumes", catalog_name, schema_name, "tmp", transaction_id, "data.parquet",
+            databricks_tmp_path = connected.dbfs_path(
+                kind=DatabricksPathKind.VOLUME,
+                parts=[catalog_name, schema_name, "tmp", transaction_id, "data.parquet"]
             )
             databricks_tmp_folder = databricks_tmp_path.parent
 

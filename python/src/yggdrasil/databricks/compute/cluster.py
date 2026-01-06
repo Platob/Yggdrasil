@@ -135,13 +135,13 @@ class Cluster(WorkspaceService):
         )
 
         return inst
-    
+
     def push_python_environment(
         self,
         source: Optional[PythonEnv] = None,
         cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = None,
+        single_user_name: Optional[str] = "current",
         runtime_engine: Optional["RuntimeEngine"] = None,
         libraries: Optional[list[str]] = None,
         **kwargs
@@ -153,7 +153,6 @@ class Cluster(WorkspaceService):
         libraries.extend([
             _ for _ in [
                 "ygg",
-                "dill",
                 "uv",
             ] if _ not in libraries
         ])
@@ -165,11 +164,22 @@ class Cluster(WorkspaceService):
         elif python_version[1] < 11:
             python_version = None
 
+        current_user_name = self.workspace.current_user.user_name
+
+        if single_user_name == "current":
+            single_user_name = current_user_name
+
+        cluster_id = cluster_id or self.cluster_id
+        cluster_name = cluster_name or self.cluster_name
+
+        if not cluster_id and not cluster_name:
+            cluster_name = current_user_name
+
         inst = self.create_or_update(
             cluster_id=cluster_id,
-            cluster_name=cluster_name or self.cluster_name or self.workspace.current_user.user_name,
+            cluster_name=cluster_name,
             python_version=python_version,
-            single_user_name=single_user_name or self.workspace.current_user.user_name,
+            single_user_name=single_user_name,
             runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
             libraries=libraries,
             **kwargs
@@ -179,23 +189,32 @@ class Cluster(WorkspaceService):
 
     def pull_python_environment(
         self,
-        target: Optional[PythonEnv] = None,
+        name: Optional[str] = None,
+        target: PythonEnv | str | None = None,
     ):
         with self.context() as c:
             m = c.remote_metadata
-            requirements = m.requirements
             version_info = m.version_info
+
+        python_version = ".".join(str(_) for _ in version_info)
 
         if target is None:
             target = PythonEnv.create(
-                name=f"dbx-{self.name}",
-                python=".".join(str(_) for _ in version_info)
+                name=name or self.name,
+                python=python_version
             )
-        else:
-            target.update(
-                requirements=requirements,
-                python=".".join(str(_) for _ in version_info)
-            )
+        elif isinstance(target, str):
+            if target.casefold() == "current":
+                target = PythonEnv.get_current()
+            else:
+                target = PythonEnv.create(
+                    name=target,
+                    python=python_version
+                )
+
+        target.update(
+            python=python_version,
+        )
 
         return target
     
@@ -642,7 +661,6 @@ class Cluster(WorkspaceService):
         self,
         _func: Optional[Callable] = None,
         *,
-        before: Optional[Callable] = None,
         language: Optional["Language"] = None,
         env_keys: Optional[List[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
@@ -667,16 +685,16 @@ class Cluster(WorkspaceService):
             def h(z): ...
         """
         def decorator(func: Callable):
+            if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+                return func
+
             context = self.context(language=language or Language.PYTHON)
             serialized = CallableSerde.from_callable(func)
-            do_before = CallableSerde.from_callable(before)
 
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
                     return func(*args, **kwargs)
-
-                do_before()
 
                 return context.execute(
                     obj=serialized,
@@ -850,8 +868,11 @@ class Cluster(WorkspaceService):
                 target_path = self.workspace.shared_cache_path(
                     suffix=f"/clusters/{self.cluster_id}/{os.path.basename(value)}"
                 )
-                self.workspace.upload_local_path(local_path=value, target_path=target_path)
-                value = target_path
+
+                with open(value, mode="rb") as f:
+                    target_path.write_bytes(f.read())
+
+                value = str(target_path)
             elif "." in value and not "/" in value:
                 value = value.split(".")[0]
 
@@ -865,13 +886,12 @@ class Cluster(WorkspaceService):
 
             repo = None
 
-            if pip_settings.extra_index_url:
-                if (
-                    value.startswith("datamanagement")
-                    or value.startswith("TSSecrets")
-                    or value.startswith("tgp_")
-                ):
-                    repo = pip_settings.extra_index_url
+            if pip_settings.extra_index_url and (
+                value.startswith("datamanagement")
+                or value.startswith("TSSecrets")
+                or value.startswith("tgp_")
+            ):
+                repo = pip_settings.extra_index_url
 
             return Library(
                 pypi=PythonPyPiLibrary(

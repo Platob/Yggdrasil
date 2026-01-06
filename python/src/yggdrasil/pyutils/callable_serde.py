@@ -7,7 +7,6 @@ import inspect
 import json
 import struct
 import sys
-import textwrap
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +45,7 @@ def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
         top_pkg_dir = d
         d = d.parent
 
-    return top_pkg_dir.parent if top_pkg_dir else None
+    return top_pkg_dir if top_pkg_dir else None
 
 
 def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional[int]]:
@@ -248,7 +247,10 @@ class CallableSerde:
     def from_callable(cls: type[T], x: Union[Callable[..., Any], T]) -> T:
         if isinstance(x, cls):
             return x
-        return cls(fn=x)  # type: ignore[return-value]
+
+        obj = cls(fn=x)  # type: ignore[return-value]
+
+        return obj
 
     # ----- lazy-ish properties (computed on access) -----
 
@@ -421,6 +423,7 @@ class CallableSerde:
         Prints one line: "{result_tag}:{base64(blob)}"
         where blob is raw dill bytes or framed+zlib.
         """
+        args = args or ()
         kwargs = kwargs or {}
 
         serde_dict = self.dump(

@@ -96,7 +96,7 @@ class StatementResult:
         if self.is_spark_sql:
             return self._response
 
-        if not self.done and self.statement_id and time.time() - self._response_refresh_time > delay:
+        if self.statement_id and not self.done and time.time() - self._response_refresh_time > delay:
             self.response = self.workspace.sdk().statement_execution.get_statement(self.statement_id)
 
         return self._response
@@ -143,11 +143,25 @@ class StatementResult:
 
     @property
     def done(self):
-        return self.persisted or self.state in [StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED]
+        if self.persisted:
+            return True
+
+        if self._response is None:
+            return False
+
+        return self._response.status.state in [
+            StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED
+        ]
 
     @property
     def failed(self):
-        return self.state in [StatementState.CANCELED, StatementState.FAILED]
+        if self.persisted:
+            return True
+
+        if self._response is None:
+            return False
+
+        return self._response.status.state in [StatementState.CANCELED, StatementState.FAILED]
 
     @property
     def persisted(self):
@@ -163,6 +177,7 @@ class StatementResult:
             self, self.disposition, Disposition.EXTERNAL_LINKS
         )
 
+        self.wait()
         result_data = self.result
         wsdk = self.workspace.sdk()
 

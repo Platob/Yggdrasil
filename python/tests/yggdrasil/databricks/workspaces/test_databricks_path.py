@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import unittest
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from yggdrasil.databricks.workspaces.databricks_path import DatabricksPath
 
@@ -26,7 +28,7 @@ class DatabricksIntegrationBase(unittest.TestCase):
     def setUpClass(cls):
         from yggdrasil.databricks.workspaces.workspace import Workspace
 
-        cls.workspace = Workspace()
+        cls.workspace = Workspace().connect()
 
         # hard gate: if auth/network is broken, skip all tests in this file
         try:
@@ -34,33 +36,33 @@ class DatabricksIntegrationBase(unittest.TestCase):
         except Exception as e:
             raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
 
-        cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/tmp/yggdrasil_databricks_path_it")
+        cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/dbfs/tmp/unittest")
         cls.workspace_root = os.getenv(
             "DATABRICKS_TEST_WORKSPACE_BASE",
-            f"/Users/{cls.workspace.current_user.user_name}/yggdrasil_databricks_path_it",
+            f"/Workspace/Users/{cls.workspace.current_user.user_name}/unittest",
         )
         cls.schema_root = os.getenv(
             "DATABRICKS_TEST_VOLUME_BASE",
             "/Volumes/trading/unittest"
         )  # may be None
 
-    def setUp(self):
         # Unique per test so parallel runs don’t punch each other
-        self.test_id = "unittest"
+        cls.test_id = "unittest"
 
-        self.dbfs_base = DatabricksPath(f"{self.dbfs_root}/{self.test_id}", workspace=self.workspace)
-        self.ws_base = DatabricksPath(f"{self.workspace_root}/{self.test_id}", workspace=self.workspace)
-        self.vol_base = DatabricksPath(f"{self.schema_root}/{self.test_id}", workspace=self.workspace)
+        cls.dbfs_base = DatabricksPath.parse(f"{cls.dbfs_root}/{cls.test_id}", workspace=cls.workspace)
+        cls.ws_base = DatabricksPath.parse(f"{cls.workspace_root}/{cls.test_id}", workspace=cls.workspace)
+        cls.vol_base = DatabricksPath.parse(f"{cls.schema_root}/{cls.test_id}", workspace=cls.workspace)
 
-    def tearDown(self):
+    @classmethod
+    def tearDownClass(cls):
         # Best-effort cleanup; don’t fail teardown
-        for p in (self.vol_base, self.ws_base, self.dbfs_base):
+        for p in (cls.vol_base, cls.ws_base, cls.dbfs_base):
             if p is None:
                 continue
             try:
                 p.rmdir(recursive=True)
-            except Exception:
-                pass
+            except Exception as e:
+                print(e)
 
 
 class TestDatabricksPathIntegrationDBFS(DatabricksIntegrationBase):
@@ -68,28 +70,19 @@ class TestDatabricksPathIntegrationDBFS(DatabricksIntegrationBase):
         d = self.dbfs_base / "dir"
         f = d / "hello.txt"
 
-        from yggdrasil.databricks import Workspace
-
-        workspace = Workspace()
-
-        filepath = workspace.path("/Volumes/trading/schema/volume/data.bin")
-        with filepath.open("wb") as out:
+        with f.open("wb") as out:
             out.write(b"hello from DBFS integration")
 
-        self.assertTrue(filepath.exists())
+        self.assertTrue(f.exists())
 
-        with filepath.open("r") as inp:
+        with f.open("r") as inp:
             got = inp.read()
-
-        filepath.rmfile()
-        filepath.parent.rmdir()
-        filepath.remove()
 
         self.assertEqual(got, "hello from DBFS integration")
 
-        files = list(d.ls(raise_error=False))
+        files = list(d.ls())
 
-        assert f not in files
+        assert f in files
 
     def test_dbfs_roundtrip_binary(self):
         d = self.dbfs_base / "dirbin"
@@ -207,6 +200,10 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
         assert f in files
 
+        d.rmdir()
+
+        self.assertFalse(d.exists())
+
     def test_volume_roundtrip_binary(self):
         d = self.vol_base / "nestedbin"
 
@@ -238,3 +235,65 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
         # Not raise error if not exists
         d.rmdir()
+
+    def test_read_write_data(self):
+        d = self.vol_base / "datafolder"
+        f = d / "data.parquet"
+
+        table = pa.table({
+            "col1": [1, 2, 3],
+            "col2": ["a", "b", "c"]
+        })
+
+        with f.open("wb") as out:
+            pq.write_table(table, out)
+
+        with f.open("rb") as inp:
+            read_table = pq.read_table(inp)
+
+        self.assertTrue(table.equals(read_table))
+
+        d.rmdir()
+
+    def test_io(self):
+        from yggdrasil.databricks import Workspace
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        workspace = Workspace(
+            host="dbc-e646c5f9-8a44.cloud.databricks.com",
+            token="dbx.....", # Replace with your actual token
+            client_id="....",  # Replace with your actual client ID
+            client_secret="....",
+        )
+
+        file = workspace.dbfs_path("/Volumes/trading/unittest/unittest/file.parquet")
+        folder = file.parent
+
+        table = pa.table({
+            "col1": [1, 2, 3],
+            "col2": ["a", "b", "c"]
+        })
+
+        with file.open("wb") as out:
+            pq.write_table(table, out)
+
+        with file.open("rb") as inp:
+            read_table = pq.read_table(inp)
+            print(read_table)
+
+        for child in folder.ls(recursive=True):
+            with child.open("rb") as inp:
+                child_table = pq.read_table(inp)
+                print(child_table)
+
+        print(read_table)
+
+        # SQL
+        query = f"SELECT * FROM parquet.`{folder}` LIMIT 10"
+        result = workspace.sql().execute(query)
+        sql_table = result.to_arrow_table()
+        pdf = result.to_pandas()
+        polars = result.to_polars()
+
+        print(sql_table)

@@ -4,8 +4,11 @@ from typing import (
     Callable,
     Optional,
     TypeVar,
-    List,
+    List, TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    from .cluster import Cluster
 
 from ..workspaces.workspace import Workspace
 
@@ -23,16 +26,17 @@ def databricks_remote_compute(
     env_keys: Optional[List[str]] = None,
     **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
-    from .. import Cluster
-
     if isinstance(workspace, str):
         workspace = Workspace(host=workspace)
 
     if cluster is None:
-        if cluster_id:
-            cluster = Cluster(workspace=workspace, cluster_id=cluster_id)
+        if cluster_id or cluster_name:
+            cluster = workspace.clusters(
+                cluster_id=cluster_id,
+                cluster_name=cluster_name
+            )
         else:
-            cluster = Cluster.replicated_current_environment(
+            cluster = workspace.clusters().replicated_current_environment(
                 workspace=workspace,
                 cluster_name=cluster_name
             )

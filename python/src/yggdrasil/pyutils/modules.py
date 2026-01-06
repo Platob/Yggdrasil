@@ -236,7 +236,7 @@ class PipIndexSettings:
     @property
     def extra_index_url(self):
         if self.extra_index_urls:
-            return self.extra_index_urls[0]
+            return " ".join(self.extra_index_urls)
         return None
 
     def as_dict(self) -> dict:

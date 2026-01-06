@@ -13,7 +13,7 @@ class TestSQLEngine(unittest.TestCase):
     def test_insert_read_same(self):
         data = pa.table([
             pa.array(["a", None, "c"]),
-            pa.array([1, 2, 3])
+            pa.array([1, 2, 4])
         ], names=["c0", "c1"])
 
         self.engine.insert_into(data, table_name="test_insert", mode="overwrite")

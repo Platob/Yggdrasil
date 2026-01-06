@@ -273,7 +273,6 @@ print(json.dumps(meta))"""
         print_stdout: Optional[bool] = True,
         timeout: Optional[dt.timedelta] = None,
         command: Optional[str] = None,
-        use_dill: Optional[bool] = None
     ) -> Any:
         if self.is_in_databricks_environment():
             args = args or []
@@ -291,16 +290,18 @@ print(json.dumps(meta))"""
 
         serialized = CallableSerde.from_callable(func)
 
-        self.install_temporary_libraries(libraries=serialized.package_root)
+        if serialized.pkg_root:
+            self.install_temporary_libraries(libraries=serialized.pkg_root)
 
-        # Use dill of same version
         current_version = (sys.version_info.major, sys.version_info.minor)
 
-        if use_dill is None:
-            if current_version == self.cluster.python_version:
-                use_dill = True
-            else:
-                use_dill = False
+        if current_version != self.cluster.python_version[:2]:
+            raise RuntimeError(
+                f"Cannot execute callable: local Python version "
+                f"{current_version[0]}.{current_version[1]} does not match "
+                f"remote cluster Python version "
+                f"{self.cluster.python_version[0]}.{self.cluster.python_version[1]}"
+            )
 
         result_tag = "<<<RESULT>>>"
 
@@ -340,7 +341,6 @@ print(json.dumps(meta))"""
                     print_stdout=print_stdout,
                     timeout=timeout,
                     command=command,
-                    use_dill=use_dill
                 )
             raise remote_module_error
 
@@ -497,7 +497,6 @@ with zipfile.ZipFile(buf, "r") as zf:
             ]
 
         resolved = resolve_local_lib_path(libraries)
-        resolved_str = str(resolved)
 
         remote_site_packages_path = self.remote_metadata.site_packages_path
         if resolved.is_dir():

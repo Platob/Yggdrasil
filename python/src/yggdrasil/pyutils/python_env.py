@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 import base64
-import io
+import datetime as _dt
 import json
 import logging
 import os
@@ -13,11 +13,12 @@ import subprocess
 import sys
 import tempfile
 import threading
-import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Optional, Union, List
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Optional, Union, List, Tuple
+
+from yggdrasil.pyutils.modules import PipIndexSettings
 
 log = logging.getLogger(__name__)
 
@@ -131,9 +132,20 @@ def _run_cmd(
     *,
     cwd: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
-    check: bool = True,
+    native_tls: bool = False,
+    extra_index_url: Optional[Union[str, List[str]]] = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd_s = [str(x) for x in cmd]
+
+    if native_tls and "--native-tls" not in cmd_s:
+        cmd_s = cmd_s + ["--native-tls"]
+
+    if extra_index_url and "--extra-index-url" not in cmd_s:
+        if isinstance(extra_index_url, list):
+            extra_index_url = " ".join(extra_index_url)
+
+        cmd_s = cmd_s + ["--extra-index-url", extra_index_url]
+
     log.debug("exec: %s", " ".join(cmd_s))
     if cwd:
         log.debug("cwd: %s", str(cwd))
@@ -146,9 +158,6 @@ def _run_cmd(
         capture_output=True,
     )
     if p.returncode != 0:
-        log.warning("fail: rc=%s cmd=%s", p.returncode, " ".join(cmd_s))
-
-    if check and p.returncode != 0:
         raise PythonEnvError(
             f"Command failed ({p.returncode})\n"
             f"--- cmd ---\n{cmd_s}\n"
@@ -250,7 +259,7 @@ def _pip_install_uv_in_current(
     cmd.append("uv")
 
     log.info("installing uv via pip (upgrade=%s user=%s)", upgrade, user)
-    _run_cmd(cmd, env=None, check=check)
+    _run_cmd(cmd, env=None)
 
 
 # -----------------------
@@ -315,12 +324,6 @@ class PythonEnv:
     @classmethod
     def ensure_uv(
         cls,
-        *,
-        check: bool = True,
-        upgrade: bool = True,
-        user: bool = True,
-        index_url: Optional[str] = None,
-        extra_pip_args: Optional[Iterable[str]] = None,
     ) -> str:
         uv = _uv_exe_on_path()
         if uv:
@@ -332,13 +335,7 @@ class PythonEnv:
                 return uv
 
             log.info("uv not found; attempting pip install (thread-safe)")
-            _pip_install_uv_in_current(
-                upgrade=upgrade,
-                user=user,
-                index_url=index_url,
-                extra_pip_args=extra_pip_args,
-                check=check,
-            )
+            _pip_install_uv_in_current()
 
         uv = _uv_exe_on_path()
         if uv:
@@ -445,11 +442,8 @@ class PythonEnv:
         pip_args: Optional[Iterable[str]] = None,
         cwd: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
-        check: bool = True,
-        uv_upgrade: bool = True,
-        uv_user: bool = True,
-        uv_index_url: Optional[str] = None,
-        uv_extra_pip_args: Optional[Iterable[str]] = None,
+        index_url: Optional[str] = None,
+        extra_index_url: str | list[str] | None = None,
     ) -> "PythonEnv":
         """
         Create env under ~/.python/envs/<name>.
@@ -475,8 +469,6 @@ class PythonEnv:
                 else:
                     env_obj = cls(root)
                     if not env_obj.exists():
-                        import datetime as _dt
-
                         ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                         moved = root.with_name(root.name + f".broken-{ts}")
                         log.warning("env exists but python missing; moving aside: %s -> %s", str(root), str(moved))
@@ -491,25 +483,16 @@ class PythonEnv:
                             recreate_if_broken=True,
                             cwd=cwd,
                             env=env,
-                            check=check,
-                            uv_upgrade=uv_upgrade,
-                            uv_user=uv_user,
-                            uv_index_url=uv_index_url,
-                            uv_extra_pip_args=uv_extra_pip_args,
+                            index_url=index_url,
+                            extra_index_url=extra_index_url,
                         )
                         return env_obj
 
-            uv = cls.ensure_uv(
-                check=check,
-                upgrade=uv_upgrade,
-                user=uv_user,
-                index_url=uv_index_url,
-                extra_pip_args=uv_extra_pip_args,
-            )
+            uv = cls.ensure_uv()
 
             py = str(Path(python).expanduser()) if isinstance(python, Path) else str(python)
             log.info("creating env: name=%s root=%s python=%s", name, str(root), py)
-            _run_cmd([uv, "venv", str(root), "--python", py], cwd=cwd, env=env, check=check)
+            _run_cmd([uv, "venv", str(root), "--python", py], cwd=cwd, env=env, native_tls=True)
 
             env_obj = cls(root)
             if not env_obj.exists():
@@ -524,12 +507,10 @@ class PythonEnv:
                 recreate_if_broken=True,
                 cwd=cwd,
                 env=env,
-                check=check,
-                uv_upgrade=uv_upgrade,
-                uv_user=uv_user,
-                uv_index_url=uv_index_url,
-                uv_extra_pip_args=uv_extra_pip_args,
+                index_url=index_url,
+                extra_index_url=extra_index_url,
             )
+
             return env_obj
 
     def update(
@@ -543,12 +524,8 @@ class PythonEnv:
         recreate_if_broken: bool = True,
         cwd: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
-        check: bool = True,
-        upgrade_pip: bool = False,
-        uv_upgrade: bool = True,
-        uv_user: bool = True,
-        uv_index_url: Optional[str] = None,
-        uv_extra_pip_args: Optional[Iterable[str]] = None,
+        index_url: Optional[str] = None,
+        extra_index_url: str | list[str] | None = None,
     ) -> "PythonEnv":
         """
         Install deps into *this* env (uv-only).
@@ -569,17 +546,13 @@ class PythonEnv:
                     clear=False,
                     cwd=cwd,
                     env=env,
-                    check=check,
-                    uv_upgrade=uv_upgrade,
-                    uv_user=uv_user,
-                    uv_index_url=uv_index_url,
-                    uv_extra_pip_args=uv_extra_pip_args,
+                    index_url=index_url,
+                    extra_index_url=extra_index_url,
                 )
 
             if not env_obj.exists():
                 if not recreate_if_broken:
                     raise PythonEnvError(f"Env exists but python missing: {env_obj.root}")
-                import datetime as _dt
 
                 ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 moved = env_obj.root.with_name(env_obj.root.name + f".broken-{ts}")
@@ -593,40 +566,25 @@ class PythonEnv:
                     clear=False,
                     cwd=cwd,
                     env=env,
-                    check=check,
-                    uv_upgrade=uv_upgrade,
-                    uv_user=uv_user,
-                    uv_index_url=uv_index_url,
-                    uv_extra_pip_args=uv_extra_pip_args,
+                    index_url=index_url,
                 )
 
-            uv = self.__class__.ensure_uv(
-                check=check,
-                upgrade=uv_upgrade,
-                user=uv_user,
-                index_url=uv_index_url,
-                extra_pip_args=uv_extra_pip_args,
-            )
+            uv = self.__class__.ensure_uv()
 
             extra = list(pip_args or [])
             base_uv = [uv, "pip", "install", "--python", str(env_obj.python_executable)]
-
-            if upgrade_pip:
-                log.info("upgrading pip in env: %s", str(env_obj.root))
-                _run_cmd(base_uv + ["-U", "pip"] + extra, cwd=cwd, env=env, check=check)
 
             if packages:
                 pkgs = [packages] if isinstance(packages, str) else list(packages)
 
                 if pkgs:
                     log.info("installing packages into env %s: %s", str(env_obj.root), pkgs)
-                    _run_cmd(base_uv + ["-U"] + pkgs + extra, cwd=cwd, env=env, check=check)
+                    _run_cmd(base_uv + ["-U"] + pkgs + extra, cwd=cwd, env=env)
 
             if requirements:
                 # requirements can be:
                 #   - Path / str path to an existing file
                 #   - raw requirements content (str) if path doesn't exist
-                req_path: Optional[Path] = None
                 tmp_ctx: Optional[tempfile.TemporaryDirectory] = None
 
                 try:
@@ -648,7 +606,11 @@ class PythonEnv:
                         raise PythonEnvError("requirements must be a path-like string/Path or raw requirements text")
 
                     log.info("installing requirements into env %s: %s", str(env_obj.root), str(req_path))
-                    _run_cmd(base_uv + ["-U", "-r", str(req_path)] + extra, cwd=cwd, env=env, check=check)
+                    _run_cmd(
+                        base_uv + ["-U", "-r", str(req_path)] + extra,
+                        cwd=cwd, env=env,
+                        extra_index_url=PipIndexSettings.default_settings().extra_index_url
+                    )
 
                 finally:
                     if tmp_ctx is not None:
@@ -760,37 +722,33 @@ class PythonEnv:
         root = Path(self.root).expanduser().resolve()
         parent = root.parent
 
-        uv = self.__class__.ensure_uv(check=True)
+        uv = self.__class__.ensure_uv()
 
         frozen_text: Optional[str] = None
         if keep_packages and self.exists():
-            p = _run_cmd([uv, "pip", "freeze", "--python", str(self.python_executable)], check=True)
+            p = _run_cmd([uv, "pip", "freeze", "--python", str(self.python_executable)])
             frozen_text = p.stdout or ""
 
         with _locked_env(root):
             if root.exists():
-                import datetime as _dt
-
                 ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 backup = parent / f"{root.name}.pychange-{_slug(req_str)}-{ts}"
                 log.info("changing python version; moving aside: %s -> %s", str(root), str(backup))
                 root.rename(backup)
 
             log.info("recreating env with python=%s at %s", req_str, str(root))
-            _run_cmd([uv, "venv", str(root), "--python", req_str], check=True)
+            _run_cmd([uv, "venv", str(root), "--python", req_str])
 
             new_env = self.__class__(root)
             if not new_env.exists():
                 raise PythonEnvError(f"Recreated env but python missing: {new_env.python_executable}")
 
             if keep_packages and frozen_text and frozen_text.strip():
-                import datetime as _dt
-
                 ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 req_path = parent / f".{root.name}.freeze-{ts}.txt"
                 req_path.write_text(frozen_text, encoding="utf-8")
                 try:
-                    _run_cmd([uv, "pip", "install", "--python", str(new_env.python_executable), "-r", str(req_path)], check=True)
+                    _run_cmd([uv, "pip", "install", "--python", str(new_env.python_executable), "-r", str(req_path)])
                 finally:
                     try:
                         req_path.unlink(missing_ok=True)
@@ -802,23 +760,30 @@ class PythonEnv:
     # -----------------------
     # requirements matrix
     # -----------------------
+    def requirements(
+        self,
+        out_dir: Optional[Union[str, Path]] = None,
+        base_name: str = "requirements",
+        include_frozen: bool = True,
+        include_input: bool = True,
+        buffers: Optional[MutableMapping[str, str]] = None,
+    ):
+        return self.export_requirements_matrix(
+            python_versions=[self.python_executable],
+            out_dir=out_dir, base_name=base_name, include_frozen=include_frozen,
+            include_input=include_input, buffers=buffers or {},
+        )[str(self.python_executable)]
 
     def export_requirements_matrix(
         self,
-        python_versions: Iterable[Union[str, Path]] = None,
+        python_versions: Iterable[Union[str, Path]],
         *,
         out_dir: Optional[Union[str, Path]] = None,
         base_name: str = "requirements",
         include_frozen: bool = True,
         include_input: bool = True,
-        check: bool = True,
         buffers: Optional[MutableMapping[str, str]] = None,
-        # ensure_uv knobs
-        uv_upgrade: bool = True,
-        uv_user: bool = True,
-        uv_index_url: Optional[str] = None,
-        uv_extra_pip_args: Optional[Iterable[str]] = None,
-    ) -> dict[str, Union[Path, str]]:
+    ) -> Union[str, dict[str, Union[Path, str]]]:
         """
         Generate requirements to duplicate this env across multiple Python versions.
 
@@ -835,15 +800,6 @@ class PythonEnv:
           - {base_name}.frozen.txt
           - {base_name}-py<slug>.txt
         """
-        if not python_versions:
-            return self.export_requirements_matrix(
-                python_versions=[self.python_executable],
-                out_dir=out_dir, base_name=base_name, include_frozen=include_frozen,
-                include_input=include_input, check=check, buffers=buffers or {},
-                uv_upgrade=uv_upgrade, uv_user=uv_user, uv_index_url=uv_index_url,
-                uv_extra_pip_args=uv_extra_pip_args
-            )[str(self.python_executable)]
-
         def _slug(s: str) -> str:
             s = (s or "").strip()
             if not s:
@@ -858,13 +814,7 @@ class PythonEnv:
         if not self.exists():
             raise PythonEnvError(f"Python executable not found in env: {self.python_executable}")
 
-        uv = self.__class__.ensure_uv(
-            check=check,
-            upgrade=uv_upgrade,
-            user=uv_user,
-            index_url=uv_index_url,
-            extra_pip_args=uv_extra_pip_args,
-        )
+        uv = self.__class__.ensure_uv()
 
         write_files = out_dir is not None
 
@@ -919,12 +869,8 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                         parse_json=True,
                         print_prefix_lines=False,
                         strip_payload=True,
-                        check=check,
-                        uv_upgrade=uv_upgrade,
-                        uv_user=uv_user,
-                        uv_index_url=uv_index_url,
-                        uv_extra_pip_args=uv_extra_pip_args,
                     )
+
                     if not isinstance(top_level, list) or not all(isinstance(x, str) for x in top_level):
                         raise PythonEnvError(f"Unexpected top-level requirements payload: {top_level!r}")
 
@@ -939,7 +885,7 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                 frozen_path = out_root / f"{base_name}.frozen.txt"
                 if include_frozen:
                     log.info("exporting frozen requirements: %s", str(frozen_path))
-                    p = _run_cmd([uv, "pip", "freeze", "--python", str(self.python_executable)], check=check)
+                    p = _run_cmd([uv, "pip", "freeze", "--python", str(self.python_executable)])
                     frozen_text = p.stdout or ""
                     if write_files:
                         frozen_path.write_text(frozen_text, encoding="utf-8")
@@ -958,7 +904,7 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                     log.info("compiling requirements for python=%s -> %s", py_req, str(out_path))
 
                     cmd = [uv, "pip", "compile", str(req_in_path), "--python", py_req, "-o", str(out_path)]
-                    _run_cmd(cmd, check=check)
+                    _run_cmd(cmd)
 
                     if write_files:
                         compiled_paths[py_req] = out_path
@@ -976,6 +922,21 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             if tmp_ctx is not None:
                 tmp_ctx.cleanup()
 
+    def installed_packages(self, parsed: bool = False) -> List[Tuple[str, str]]:
+        req = self.requirements()
+
+        r = [
+            line.strip()
+            for line in req.splitlines() if line.strip() and not line.strip().startswith("#")
+        ]
+
+        if parsed:
+            return [
+                tuple(re.split(r"==|>=|<=|>|<|~=|!=", line, 1)) if re.search(r"==|>=|<=|>|<|~=|!=", line) else (line, "")
+                for line in r
+            ]
+        return r
+
     # -----------------------
     # execute (uv run always)
     # -----------------------
@@ -988,10 +949,6 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         cwd: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
         check: bool = True,
-        uv_upgrade: bool = True,
-        uv_user: bool = True,
-        uv_index_url: Optional[str] = None,
-        uv_extra_pip_args: Optional[Iterable[str]] = None,
     ) -> str:
         # pick interpreter (default = env python)
         if python is None:
@@ -1003,17 +960,10 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             if not py.exists():
                 raise PythonEnvError(f"Python executable not found: {py}")
 
-        uv = PythonEnv.ensure_uv(
-            check=check,
-            upgrade=uv_upgrade,
-            user=uv_user,
-            index_url=uv_index_url,
-            extra_pip_args=uv_extra_pip_args,
-        )
-
+        uv = PythonEnv.ensure_uv()
         cmd = [uv, "run", "--python", str(py), "--", "python", "-c", code]
         log.debug("exec_code env=%s python=%s", str(self.root), str(py))
-        p = _run_cmd(cmd, cwd=cwd, env=env, check=check)
+        p = _run_cmd(cmd, cwd=cwd, env=env)
         return p.stdout or ""
 
     def exec_code_and_return(
@@ -1028,10 +978,6 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         parse_json: bool = False,
         print_prefix_lines: bool = True,
         strip_payload: bool = True,
-        uv_upgrade: bool = True,
-        uv_user: bool = True,
-        uv_index_url: Optional[str] = None,
-        uv_extra_pip_args: Optional[Iterable[str]] = None,
     ) -> Any:
         stdout = self.exec_code(
             code,
@@ -1039,10 +985,6 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             cwd=cwd,
             env=env,
             check=check,
-            uv_upgrade=uv_upgrade,
-            uv_user=uv_user,
-            uv_index_url=uv_index_url,
-            uv_extra_pip_args=uv_extra_pip_args,
         )
 
         before_lines, payload = _split_on_tag(stdout, result_tag)
@@ -1141,124 +1083,6 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         return payload
 
     # -----------------------
-    # zip helpers
-    # -----------------------
-
-    def zip_bytes(
-        self,
-        *,
-        include_cache: bool = False,
-        include_pycache: bool = False,
-        include_dist_info: bool = True,
-        extra_exclude_globs: Optional[Iterable[str]] = None,
-        compression: int = zipfile.ZIP_DEFLATED,
-    ) -> bytes:
-        buf = io.BytesIO()
-        self._zip_to_fileobj(
-            buf,
-            include_cache=include_cache,
-            include_pycache=include_pycache,
-            include_dist_info=include_dist_info,
-            extra_exclude_globs=extra_exclude_globs,
-            compression=compression,
-        )
-        return buf.getvalue()
-
-    def zip_to(
-        self,
-        out_zip: Path,
-        *,
-        include_cache: bool = False,
-        include_pycache: bool = False,
-        include_dist_info: bool = True,
-        extra_exclude_globs: Optional[Iterable[str]] = None,
-        compression: int = zipfile.ZIP_DEFLATED,
-        in_memory: bool = False,
-    ) -> Union[Path, bytes]:
-        if in_memory:
-            return self.zip_bytes(
-                include_cache=include_cache,
-                include_pycache=include_pycache,
-                include_dist_info=include_dist_info,
-                extra_exclude_globs=extra_exclude_globs,
-                compression=compression,
-            )
-
-        out_zip = Path(out_zip).expanduser().resolve()
-        out_zip.parent.mkdir(parents=True, exist_ok=True)
-
-        with out_zip.open("wb") as f:
-            self._zip_to_fileobj(
-                f,
-                include_cache=include_cache,
-                include_pycache=include_pycache,
-                include_dist_info=include_dist_info,
-                extra_exclude_globs=extra_exclude_globs,
-                compression=compression,
-                out_zip_path=out_zip,
-            )
-        return out_zip
-
-    def _zip_to_fileobj(
-        self,
-        fileobj,
-        *,
-        include_cache: bool,
-        include_pycache: bool,
-        include_dist_info: bool,
-        extra_exclude_globs: Optional[Iterable[str]],
-        compression: int,
-        out_zip_path: Optional[Path] = None,
-    ) -> None:
-        root = Path(self.root).expanduser().resolve()
-        if not root.exists():
-            raise PythonEnvError(f"Env root does not exist: {root}")
-        if not root.is_dir():
-            raise PythonEnvError(f"Env root is not a directory: {root}")
-
-        extra_exclude_globs = list(extra_exclude_globs or [])
-
-        def _match_any(rel_posix: str, patterns: list[str]) -> bool:
-            # IMPORTANT: use PurePosixPath for stable glob matching across OSes
-            p = PurePosixPath(rel_posix)
-            for pat in patterns:
-                if p.match(pat):
-                    return True
-            return False
-
-        exclude_patterns: list[str] = []
-        if not include_pycache:
-            exclude_patterns += ["**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
-        if not include_cache:
-            exclude_patterns += [
-                "**/.cache/**",
-                "**/pip-cache/**",
-                "**/pip/**/cache/**",
-                "**/Cache/**",
-                "**/Caches/**",
-            ]
-        if not include_dist_info:
-            exclude_patterns += ["**/*.dist-info/**"]
-
-        exclude_patterns += extra_exclude_globs
-
-        if out_zip_path is not None:
-            try:
-                rel_out = out_zip_path.relative_to(root).as_posix()
-                exclude_patterns.append(rel_out)
-            except ValueError:
-                pass
-
-        with zipfile.ZipFile(fileobj, mode="w", compression=compression) as zf:
-            for abs_path in root.rglob("*"):
-                if abs_path.is_dir():
-                    continue
-                rel_posix = abs_path.relative_to(root).as_posix()
-                if _match_any(rel_posix, exclude_patterns):
-                    continue
-                zf.write(abs_path, rel_posix)
-
-    # -----------------------
     # CLI (uv everywhere)
     # -----------------------
 
@@ -1312,12 +1136,7 @@ print("RESULT:" + json.dumps(top_level))""".strip()
 
         try:
             if args.cmd == "ensure-uv":
-                uv = cls.ensure_uv(
-                    upgrade=not args.no_upgrade,
-                    user=not args.no_user,
-                    index_url=args.index_url,
-                    extra_pip_args=args.pip_arg or None,
-                )
+                uv = cls.ensure_uv()
                 print(uv)
                 return 0
 

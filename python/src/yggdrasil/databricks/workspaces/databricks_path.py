@@ -1,13 +1,13 @@
 # src/yggdrasil/databricks/workspaces/databricks_path.py
 from __future__ import annotations
 
+import dataclasses
 import io
 import time
-import urllib.parse as urlparse
 from contextlib import contextmanager
 from enum import Enum
-from pathlib import PurePosixPath, Path as SysPath
-from typing import Any, BinaryIO, Iterator, Optional, Tuple, Union, TYPE_CHECKING
+from pathlib import PurePosixPath
+from typing import BinaryIO, Iterator, Optional, Tuple, Union, TYPE_CHECKING, List
 
 from databricks.sdk.service.catalog import VolumeType
 
@@ -37,11 +37,19 @@ __all__ = [
 ]
 
 
-def _seg_to_str(s) -> str:
-    # Handles DatabricksPath, PurePosixPath, Windows Path, etc.
-    if isinstance(s, SysPath):
-        return s.as_posix()
-    return str(s)
+def _flatten_parts(parts: Union[list[str], str]) -> list[str]:
+    if isinstance(parts, str):
+        parts = [parts]
+
+    if any("/" in part for part in parts):
+        # flatten parts with slashes
+        new_parts = []
+        for part in parts:
+            split_parts = part.split("/")
+            new_parts.extend(split_parts)
+        parts = new_parts
+
+    return parts
 
 
 class DatabricksPathKind(str, Enum):
@@ -49,221 +57,156 @@ class DatabricksPathKind(str, Enum):
     VOLUME = "volume"
     DBFS = "dbfs"
 
+
+@dataclasses.dataclass
+class DatabricksPath:
+    kind: "DatabricksPathKind"
+    parts: List[str]
+    workspace: Optional["Workspace"] = None
+
+    _is_file: Optional[bool] = None
+    _is_dir: Optional[bool] = None
+
+    _raw_status: Optional[dict] = None
+    _raw_status_refresh_time: float = 0.0
+
     @classmethod
     def parse(
         cls,
-        path: str,
+        parts: Union[List[str], str],
         workspace: Optional["Workspace"] = None,
-    ) -> Tuple["DatabricksPathKind", Optional["Workspace"], str]:
-        from .workspace import Workspace
-
-        if path.startswith("/Workspace") or path.startswith("/Users") or path.startswith("/Shared"):
-            if path.startswith("/Users/me"):
-                workspace = Workspace() if workspace is None else workspace
-                path = path.replace("/Users/me", "/Users/%s" % workspace.current_user.user_name)
-
-            return cls.WORKSPACE, workspace, path
-
-        if path.startswith("/Volumes"):
-            return cls.VOLUME, workspace, path
-
-        if path.startswith("dbfs://"):
-            parsed = urlparse.urlparse(path)
-
-            # inner path is the URL path (e.g. /tmp/x or /Volumes/...)
-            kind, _, inner_path = cls.parse(parsed.path, workspace=workspace)
-
-            # hostname can be None for malformed/dbfs:// variants; fall back to default Workspace()
-            if workspace is None:
-                workspace = Workspace(host=parsed.hostname) if parsed.hostname else Workspace()
-
-            return kind, workspace, inner_path
-
-        return cls.DBFS, workspace, path
-
-
-class DatabricksPath(SysPath, PurePosixPath):
-    _kind: "DatabricksPathKind"
-    _workspace: Optional["Workspace"]
-
-    _is_file: Optional[bool]
-    _is_dir: Optional[bool]
-
-    _raw_status: Optional[dict]
-    _raw_status_refresh_time: float
-
-    @staticmethod
-    def _join_segments(pathsegments: tuple[Any, ...]) -> str:
-        if not pathsegments:
-            return ""
-
-        first = _seg_to_str(pathsegments[0])
-
-        # Keep dbfs:// URL-ish paths URL-ish (don't let PurePosixPath normalize it)
-        if first.startswith("dbfs://"):
-            rest = (_seg_to_str(s).lstrip("/") for s in pathsegments[1:])
-            first = first.rstrip("/")
-            tail = "/".join(rest)
-            return f"{first}/{tail}" if tail else first
-
-        return str(PurePosixPath(*(_seg_to_str(s) for s in pathsegments)))
-
-    def __new__(
-        cls,
-        *pathsegments: Any,
-        workspace: Optional["Workspace"] = None,
-        is_file: Optional[bool] = None,
-        is_dir: Optional[bool] = None,
-        raw_status: Optional[dict] = None,
-        raw_status_refresh_time: float = 0.0,
     ) -> "DatabricksPath":
-        joined = cls._join_segments(pathsegments)
-        kind, parsed_ws, pure_path = DatabricksPathKind.parse(joined, workspace=workspace)
+        if not parts:
+            return DatabricksPath(
+                kind=DatabricksPathKind.DBFS,
+                parts=[],
+                workspace=workspace,
+            )
 
-        self = cls._from_parts([pure_path])  # pathlib-style construction (calls _init)
+        parts = _flatten_parts(parts)
 
-        # Override with constructor-provided metadata
-        self._kind = kind
-        self._workspace = parsed_ws if workspace is None else workspace
-        self._is_file = is_file
-        self._is_dir = is_dir
-        self._raw_status = raw_status
-        self._raw_status_refresh_time = float(raw_status_refresh_time)
+        if not parts[0]:
+            parts = parts[1:]
 
-        return self
+        if not parts:
+            return DatabricksPath(
+                kind=DatabricksPathKind.DBFS,
+                parts=[],
+                workspace=workspace,
+            )
 
-    def __init__(
-        self,
-        *pathsegments: Any,
-        workspace: Optional["Workspace"] = None,
-        is_file: Optional[bool] = None,
-        is_dir: Optional[bool] = None,
-        raw_status: Optional[dict] = None,
-        raw_status_refresh_time: float = 0.0,
-    ) -> None:
-        # pathlib paths are effectively immutable; all init happens in __new__ / _init
-        pass
+        head, *tail = parts
+
+        if head == "dbfs":
+            kind = DatabricksPathKind.DBFS
+        elif head == "Workspace":
+            kind = DatabricksPathKind.WORKSPACE
+        elif head == "Volumes":
+            kind = DatabricksPathKind.VOLUME
+        else:
+            raise ValueError(f"Invalid DatabricksPath prefix: {parts!r}")
+
+        return DatabricksPath(
+            kind=kind,
+            parts=tail,
+            workspace=workspace,
+        )
+
+    def __hash__(self):
+        return hash((self.kind, tuple(self.parts)))
+
+    def __eq__(self, other):
+        if not isinstance(other, DatabricksPath):
+            if isinstance(other, str):
+                return str(self) == other
+            return False
+        return self.kind == other.kind and self.parts == other.parts
 
     def __truediv__(self, other):
         if not other:
             return self
 
-        built = super().__truediv__(other)
+        other_parts = _flatten_parts(other)
 
-        built._kind = self._kind
-        built._workspace = self._workspace
-
-        built._is_file = None
-        built._is_dir = None
-        built._raw_status = None
-        built._raw_status_refresh_time = 0.0
+        built = DatabricksPath(
+            kind=self.kind,
+            parts=self.parts + other_parts,
+            workspace=self.workspace,
+        )
 
         return built
 
     def __enter__(self):
-        self.workspace.__enter__()
+        self.safe_workspace.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        return self.workspace.__exit__(exc_type, exc_val, exc_tb)
+        return self.safe_workspace.__exit__(exc_type, exc_val, exc_tb)
 
-    def _clone_meta_from(self, template: "DatabricksPath") -> None:
-        """
-        Copy *connection/meta* state, but never copy caches.
-        Centralizes the logic so every creation path stays consistent.
-        """
-        # Keep workspace threading; kind should match the NEW path string.
-        kind, ws, _ = DatabricksPathKind.parse(str(self), workspace=getattr(template, "_workspace", None))
-        self._kind = kind
-        self._workspace = ws if ws is not None else getattr(template, "_workspace", None)
+    def __str__(self):
+        if self.kind == DatabricksPathKind.DBFS:
+            return self.as_dbfs_api_path()
+        elif self.kind == DatabricksPathKind.WORKSPACE:
+            return self.as_workspace_api_path()
+        elif self.kind == DatabricksPathKind.VOLUME:
+            return self.as_files_api_path()
+        else:
+            raise ValueError(f"Unknown DatabricksPath kind: {self.kind!r}")
 
-        # Reset caches
-        self._is_file = None
-        self._is_dir = None
-        self._raw_status = None
-        self._raw_status_refresh_time = 0.0
+    def __repr__(self):
+        return "dbfs://%s" % self.__str__()
 
     @property
     def parent(self):
-        built = super().parent
+        if not self.parts:
+            return self
 
-        built._clone_meta_from(self)
-
-        return built
-
-    @classmethod
-    def _from_parsed_parts(cls, drv, root, parts):
-        """
-        pathlib internal factory. It may pass a template in some Python versions,
-        but if not, we still return a valid DatabricksPath with initialized state.
-        """
-        built = super()._from_parsed_parts(drv, root, parts)  # type: ignore[misc]
-
-        # Best effort: if pathlib gave us a template on the object, use it.
-        # Otherwise ensure we at least have valid defaults.
-        if isinstance(built, DatabricksPath) and isinstance(getattr(built, "_workspace", None), object):
-            # If the object already has workspace/kind via _init, don't stomp it.
-            # But if it's missing _kind (common failure), derive it.
-            if not hasattr(built, "_kind"):
-                kind, ws, _ = DatabricksPathKind.parse(str(built), workspace=getattr(built, "_workspace", None))
-                built._kind = kind
-                built._workspace = ws if ws is not None else getattr(built, "_workspace", None)
-
-            # Always reset caches (derived path => cache invalid)
-            built._is_file = None
-            built._is_dir = None
-            built._raw_status = None
-            built._raw_status_refresh_time = 0.0
+        if self._is_file is not None or self._is_dir is not None:
+            _is_file, _is_dir = False, True
         else:
-            # Safety defaults (should be rare)
-            kind, ws, _ = DatabricksPathKind.parse(str(built))
-            built._kind = kind
-            built._workspace = ws
-            built._is_file = None
-            built._is_dir = None
-            built._raw_status = None
-            built._raw_status_refresh_time = 0.0
+            _is_file, _is_dir = None, None
 
-        return built
-
-    def _make_child(self, args):
-        built = super()._make_child(args)  # type: ignore[misc]
-
-        # Ensure type + meta carryover
-        if isinstance(built, DatabricksPath):
-            built._clone_meta_from(self)
-        else:
-            # if for some reason super didn't return our type, try to coerce
-            built = type(self)(built, workspace=getattr(self, "_workspace", None))
+        built = DatabricksPath(
+            kind=self.kind,
+            parts=self.parts[:-1],
+            workspace=self.workspace,
+            _is_file=_is_file,
+            _is_dir=_is_dir,
+        )
 
         return built
 
     @property
-    def workspace(self):
-        if self._workspace is None:
+    def safe_workspace(self):
+        if self.workspace is None:
             from .workspace import Workspace
 
-            self._workspace = Workspace()
-        return self._workspace
+            self.workspace = Workspace()
+        return self.workspace
 
-    @workspace.setter
-    def workspace(self, value):
-        self._workspace = value
+    @safe_workspace.setter
+    def safe_workspace(self, value):
+        self.workspace = value
 
     @property
-    def kind(self):
-        return self._kind
+    def name(self) -> str:
+        if not self.parts:
+            return ""
+        return self.parts[-1]
 
-    @kind.setter
-    def kind(self, value: DatabricksPathKind):
-        self._kind = value
+    @property
+    def extension(self) -> str:
+        name = self.name
+        if '.' in name:
+            return name.split('.')[-1]
+        return ''
 
-    def is_file(self, *, follow_symlinks=True):
+    def is_file(self):
         if self._is_file is None:
             self.refresh_status()
         return self._is_file
 
-    def is_dir(self, *, follow_symlinks=True):
+    def is_dir(self):
         if self._is_dir is None:
             self.refresh_status()
         return self._is_dir
@@ -272,29 +215,15 @@ class DatabricksPath(SysPath, PurePosixPath):
         if self.kind != DatabricksPathKind.VOLUME:
             return None, None, None, None
 
-        s = str(self)
-        segs = s.split("/")  # ['', 'Volumes', catalog?, schema?, volume?, ...]
+        catalog = self.parts[0] if len(self.parts) > 0 and self.parts[0] else None
+        schema = self.parts[1] if len(self.parts) > 1 and self.parts[1] else None
+        volume = self.parts[2] if len(self.parts) > 2 and self.parts[2] else None
 
-        # still keep the basic sanity check
-        if len(segs) < 2 or segs[1] != "Volumes":
-            raise ValueError(f"Invalid volume path: {s!r}")
-
-        catalog = segs[2] if len(segs) > 2 and segs[2] else None
-        schema = segs[3] if len(segs) > 3 and segs[3] else None
-        volume = segs[4] if len(segs) > 4 and segs[4] else None
-
-        # rel path only makes sense after /Volumes/<catalog>/<schema>/<volume>
-        if len(segs) > 5:
-            rel = "/".join(segs[5:])
-            rel_path = PurePosixPath(rel) if rel else PurePosixPath(".")
-        else:
-            rel_path = None
-
-        return catalog, schema, volume, rel_path
+        return catalog, schema, volume, self.parts[3:]
 
     def refresh_status(self):
         with self as connected:
-            sdk = connected.workspace.sdk()
+            sdk = connected.safe_workspace.sdk()
 
             try:
                 if connected.kind == DatabricksPathKind.VOLUME:
@@ -339,38 +268,29 @@ class DatabricksPath(SysPath, PurePosixPath):
         Workspace API typically uses paths like /Users/... (not /Workspace/Users/...)
         so we strip the leading /Workspace when present.
         """
-        s = str(self)
-        return s[len("/Workspace") :] if s.startswith("/Workspace") else s
+        return "/Workspace/%s" % "/".join(self.parts) if self.parts else "/Workspace"
 
     def as_dbfs_api_path(self) -> str:
         """
         DBFS REST wants absolute DBFS paths like /tmp/x.
         If the user passes /dbfs/tmp/x (FUSE-style), strip the /dbfs prefix.
         """
-        s = str(self)
-        return s[len("/dbfs") :] if s.startswith("/dbfs") else s
+        return "/dbfs/%s" % "/".join(self.parts) if self.parts else "/dbfs"
 
     def as_files_api_path(self) -> str:
         """
         Files API takes absolute paths, e.g. /Volumes/<...>/file
         """
-        return str(self)
+        return "/Volumes/%s" % "/".join(self.parts) if self.parts else "/Volumes"
 
-    def with_segments(self, *pathsegments):
-        """Construct a new path object from any number of path-like objects.
-        Subclasses may override this method to customize how new path objects
-        are created from methods like `iterdir()`.
-        """
-        return type(self)(*pathsegments, workspace=self._workspace)
-
-    def exists(self, *, follow_symlinks=True) -> bool:
+    def exists(self) -> bool:
         if self.is_file():
             return True
         if self.is_dir():
             return True
         return False
 
-    def mkdir(self, mode=0o777, parents=True, exist_ok=True):
+    def mkdir(self, parents=True, exist_ok=True):
         """
         Create a new directory at this given path.
         """
@@ -379,11 +299,11 @@ class DatabricksPath(SysPath, PurePosixPath):
 
             try:
                 if connected.kind == DatabricksPathKind.WORKSPACE:
-                    connected.workspace.sdk().workspace.mkdirs(self.as_workspace_api_path())
+                    connected.safe_workspace.sdk().workspace.mkdirs(self.as_workspace_api_path())
                 elif connected.kind == DatabricksPathKind.VOLUME:
-                    return connected._create_volume_dir(mode=mode, parents=parents, exist_ok=exist_ok)
-                elif connected._kind == DatabricksPathKind.DBFS:
-                    connected.workspace.sdk().dbfs.mkdirs(self.as_dbfs_api_path())
+                    return connected._create_volume_dir(parents=parents, exist_ok=exist_ok)
+                elif connected.kind == DatabricksPathKind.DBFS:
+                    connected.safe_workspace.sdk().dbfs.mkdirs(self.as_dbfs_api_path())
 
                 connected._is_file, connected._is_dir = False, True
             except (NotFound, ResourceDoesNotExist):
@@ -391,14 +311,14 @@ class DatabricksPath(SysPath, PurePosixPath):
                     raise
 
                 connected.parent.mkdir(parents=True, exist_ok=True)
-                connected.mkdir(mode, parents=False, exist_ok=exist_ok)
+                connected.mkdir(parents=False, exist_ok=exist_ok)
             except (AlreadyExists, ResourceAlreadyExists):
                 if not exist_ok:
                     raise
 
     def _ensure_volume(self, exist_ok: bool = True):
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         if catalog_name:
             try:
@@ -426,9 +346,9 @@ class DatabricksPath(SysPath, PurePosixPath):
                 if not exist_ok:
                     raise
 
-    def _create_volume_dir(self, mode=0o777, parents=True, exist_ok=True):
+    def _create_volume_dir(self, parents=True, exist_ok=True):
         path = self.as_files_api_path()
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         try:
             sdk.files.create_directory(path)
@@ -438,7 +358,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
             message = str(e)
 
-            if "not exist" in message:
+            if "olume" in message and "not exist" in message:
                 self._ensure_volume()
 
             sdk.files.create_directory(path)
@@ -467,7 +387,7 @@ class DatabricksPath(SysPath, PurePosixPath):
             self.clear_cache()
 
     def _remove_volume_file(self):
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         try:
             sdk.files.delete(self.as_files_api_path())
@@ -475,7 +395,7 @@ class DatabricksPath(SysPath, PurePosixPath):
             pass
 
     def _remove_workspace_file(self):
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         try:
             sdk.workspace.delete(self.as_workspace_api_path(), recursive=True)
@@ -483,7 +403,7 @@ class DatabricksPath(SysPath, PurePosixPath):
             pass
 
     def _remove_dbfs_file(self):
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         try:
             sdk.dbfs.delete(self.as_dbfs_api_path(), recursive=True)
@@ -494,14 +414,14 @@ class DatabricksPath(SysPath, PurePosixPath):
         with self as connected:
             try:
                 if connected.kind == DatabricksPathKind.WORKSPACE:
-                    connected.workspace.sdk().workspace.delete(
+                    connected.safe_workspace.sdk().workspace.delete(
                         self.as_workspace_api_path(),
                         recursive=recursive,
                     )
                 elif connected.kind == DatabricksPathKind.VOLUME:
                     return self._remove_volume_dir(recursive=recursive)
                 else:
-                    connected.workspace.sdk().dbfs.delete(
+                    connected.safe_workspace.sdk().dbfs.delete(
                         self.as_dbfs_api_path(),
                         recursive=recursive,
                     )
@@ -514,19 +434,9 @@ class DatabricksPath(SysPath, PurePosixPath):
         root_path = self.as_files_api_path()
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
 
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
-        if rel is None:
-            try:
-                sdk.volumes.delete(f"{catalog_name}.{schema_name}.{volume_name}")
-            except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-                pass
-        elif volume_name is None:
-            try:
-                sdk.schemas.delete(f"{catalog_name}.{schema_name}", force=True)
-            except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-                pass
-        else:
+        if rel:
             try:
                 sdk.files.delete_directory(root_path)
             except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied) as e:
@@ -538,6 +448,16 @@ class DatabricksPath(SysPath, PurePosixPath):
                     sdk.files.delete_directory(root_path)
                 else:
                     pass
+        elif volume_name:
+            try:
+                sdk.volumes.delete(f"{catalog_name}.{schema_name}.{volume_name}")
+            except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
+                pass
+        elif schema_name:
+            try:
+                sdk.schemas.delete(f"{catalog_name}.{schema_name}", force=True)
+            except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
+                pass
 
         self.clear_cache()
 
@@ -546,15 +466,15 @@ class DatabricksPath(SysPath, PurePosixPath):
             for _ in self._ls_volume(recursive=recursive, fetch_size=fetch_size, raise_error=raise_error):
                 yield _
         elif self.kind == DatabricksPathKind.WORKSPACE:
-            for _ in self._ls_workspace(recursive=recursive, fetch_size=fetch_size, raise_error=raise_error):
+            for _ in self._ls_workspace(recursive=recursive, raise_error=raise_error):
                 yield _
         elif self.kind == DatabricksPathKind.DBFS:
-            for _ in self._ls_dbfs(recursive=recursive, fetch_size=fetch_size, raise_error=raise_error):
+            for _ in self._ls_dbfs(recursive=recursive, raise_error=raise_error):
                 yield _
 
     def _ls_volume(self, recursive: bool = False, fetch_size: int = None, raise_error: bool = True):
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
-        sdk = self.workspace.sdk()
+        sdk = self.safe_workspace.sdk()
 
         if rel is None:
             if volume_name is None:
@@ -564,10 +484,11 @@ class DatabricksPath(SysPath, PurePosixPath):
                         schema_name=schema_name,
                     ):
                         base = DatabricksPath(
-                            f"/Volumes/{info.catalog_name}/{info.schema_name}/{info.name}",
-                            workspace=self.workspace,
-                            is_file=False,
-                            is_dir=True,
+                            kind=DatabricksPathKind.VOLUME,
+                            parts = [info.catalog_name, info.schema_name, info.name],
+                            workspace=self.safe_workspace,
+                            _is_file=False,
+                            _is_dir=True,
                         )
 
                         if recursive:
@@ -582,10 +503,11 @@ class DatabricksPath(SysPath, PurePosixPath):
                 try:
                     for info in sdk.schemas.list(catalog_name=catalog_name):
                         base = DatabricksPath(
-                            f"/Volumes/{info.catalog_name}/{info.name}",
-                            workspace=self.workspace,
-                            is_file=False,
-                            is_dir=True,
+                            kind=DatabricksPathKind.VOLUME,
+                            parts=[info.catalog_name, info.name],
+                            workspace=self.safe_workspace,
+                            _is_file=False,
+                            _is_dir=True,
                         )
 
                         if recursive:
@@ -600,10 +522,11 @@ class DatabricksPath(SysPath, PurePosixPath):
                 try:
                     for info in sdk.catalogs.list():
                         base = DatabricksPath(
-                            f"/Volumes/{info.name}",
-                            workspace=self.workspace,
-                            is_file=False,
-                            is_dir=True,
+                            kind=DatabricksPathKind.VOLUME,
+                            parts=[info.name],
+                            workspace=self.safe_workspace,
+                            _is_file=False,
+                            _is_dir=True,
                         )
 
                         if recursive:
@@ -618,10 +541,11 @@ class DatabricksPath(SysPath, PurePosixPath):
             try:
                 for info in sdk.files.list_directory_contents(self.as_files_api_path(), page_size=fetch_size):
                     base = DatabricksPath(
-                        info.path,
-                        workspace=self.workspace,
-                        is_file=not info.is_directory,
-                        is_dir=info.is_directory,
+                        kind=DatabricksPathKind.VOLUME,
+                        parts=info.path.split("/")[2:],
+                        workspace=self.safe_workspace,
+                        _is_file=not info.is_directory,
+                        _is_dir=info.is_directory,
                     )
 
                     if recursive and info.is_directory:
@@ -633,36 +557,40 @@ class DatabricksPath(SysPath, PurePosixPath):
                 if raise_error:
                     raise
 
-    def _ls_workspace(self, recursive: bool = True, fetch_size: int = None, raise_error: bool = True):
-        sdk = self.workspace.sdk()
+    def _ls_workspace(self, recursive: bool = True, raise_error: bool = True):
+        sdk = self.safe_workspace.sdk()
 
         try:
             for info in sdk.workspace.list(self.as_workspace_api_path(), recursive=recursive):
                 is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
                 base = DatabricksPath(
-                    info.path,
-                    workspace=self.workspace,
-                    is_file=not is_dir,
-                    is_dir=is_dir,
+                    kind=DatabricksPathKind.WORKSPACE,
+                    parts=info.path.split("/")[2:],
+                    workspace=self.safe_workspace,
+                    _is_file=not is_dir,
+                    _is_dir=is_dir,
                 )
                 yield base
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
             if raise_error:
                 raise
 
-    def _ls_dbfs(self, recursive: bool = True, fetch_size: int = None, raise_error: bool = True):
-        sdk = self.workspace.sdk()
+    def _ls_dbfs(self, recursive: bool = True, raise_error: bool = True):
+        sdk = self.safe_workspace.sdk()
 
         try:
             # FIX: DBFS listing should use DBFS-normalized path, not workspace path
-            p = "/dbfs/" + self.as_dbfs_api_path() + "/"
+            p = self.as_dbfs_api_path()
+
             for info in sdk.dbfs.list(p, recursive=recursive):
                 base = DatabricksPath(
-                    info.path,
-                    workspace=self.workspace,
-                    is_file=not info.is_dir,
-                    is_dir=info.is_dir,
+                    kind=DatabricksPathKind.DBFS,
+                    parts=info.path.split("/")[2:],
+                    workspace=self.safe_workspace,
+                    _is_file=not info.is_dir,
+                    _is_dir=info.is_dir,
                 )
+
                 yield base
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
             if raise_error:
@@ -672,13 +600,7 @@ class DatabricksPath(SysPath, PurePosixPath):
     def open(
         self,
         mode="r",
-        buffering=-1,
         encoding=None,
-        errors=None,
-        newline=None,
-        *,
-        workspace: Optional["Workspace"] = None,
-        overwrite: bool = True,
     ) -> Iterator[Union[BinaryIO, io.TextIOBase]]:
         """
         Open this Databricks path using databricks-sdk's WorkspaceClient.
@@ -716,7 +638,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_read_volume(self, encoding: str | None = None):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_files_api_path()
 
         resp = workspace_client.files.download(path)
@@ -731,7 +653,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_read_workspace(self, encoding: str | None = None):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_workspace_api_path()
 
         raw = workspace_client.workspace.download(path)  # returns BinaryIO
@@ -746,7 +668,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_read_dbfs(self, encoding: str | None = None):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_dbfs_api_path()
 
         raw = workspace_client.dbfs.open(path, read=True)
@@ -773,7 +695,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_write_volume(self, encoding: str | None = None, overwrite: bool = True):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_files_api_path()
 
         buf = io.BytesIO()
@@ -807,7 +729,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_write_workspace(self, encoding: str | None = None, overwrite: bool = True):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_workspace_api_path()
 
         buf = io.BytesIO()
@@ -859,7 +781,7 @@ class DatabricksPath(SysPath, PurePosixPath):
 
     @contextmanager
     def _open_write_dbfs(self, encoding: str | None = None, overwrite: bool = True):
-        workspace_client = self.workspace.sdk()
+        workspace_client = self.safe_workspace.sdk()
         path = self.as_dbfs_api_path()
 
         raw = workspace_client.dbfs.open(path, write=True, overwrite=overwrite)

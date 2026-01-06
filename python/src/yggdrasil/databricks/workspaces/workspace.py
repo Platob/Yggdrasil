@@ -1,29 +1,28 @@
-import base64
 import dataclasses
-import io
 import logging
 import os
 import posixpath
 from abc import ABC
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
     BinaryIO,
     Iterator,
-    List,
     Optional,
-    Union
+    Union, TYPE_CHECKING, List
 )
 
-from .databricks_path import DatabricksPath
+if TYPE_CHECKING:
+    from ..compute.cluster import Cluster
+
+from .databricks_path import DatabricksPath, DatabricksPathKind
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import ResourceDoesNotExist, NotFound
-    from databricks.sdk.service.workspace import ImportFormat, ExportFormat, ObjectInfo
+    from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
     from databricks.sdk.service import catalog as catalog_svc
     from databricks.sdk.dbutils import FileInfo
     from databricks.sdk.service.files import DirectoryEntry
@@ -62,31 +61,8 @@ def _get_env_product_tag():
     v = os.getenv("DATABRICKS_PRODUCT_TAG")
 
     if not v:
-        return "default"
-
-    return v.strip().lower()
-
-
-def _get_remote_size(sdk, target_path: str) -> Optional[int]:
-    """
-    Best-effort fetch remote file size for target_path across
-    DBFS, Volumes, and Workspace. Returns None if not found.
-    """
-    try:
-        if target_path.startswith("dbfs:/"):
-            st = sdk.dbfs.get_status(target_path)
-            return getattr(st, "file_size", None)
-
-        if target_path.startswith("/Volumes"):
-            st = sdk.files.get_status(file_path=target_path)
-            return getattr(st, "file_size", None)
-
-        # Workspace path
-        st = sdk.workspace.get_status(target_path)
-        return getattr(st, "size", None)
-
-    except ResourceDoesNotExist:
         return None
+    return v.strip().lower()
 
 
 @dataclass
@@ -140,9 +116,7 @@ class Workspace:
         state = self.__dict__.copy()
         state.pop("_sdk", None)
 
-        was_connected = self._sdk is not None
-
-        state["_was_connected"] = was_connected
+        state["_was_connected"] = self._sdk is not None
         state["_cached_token"] = self.current_token()
 
         return state
@@ -169,8 +143,13 @@ class Workspace:
     # -------------------------
     # Clone
     # -------------------------
-    def clone(self) -> "Workspace":
-        return Workspace().__setstate__(self.__getstate__())
+    def clone(
+        self,
+        **kwargs
+    ) -> "Workspace":
+        state = self.__getstate__()
+        state.update(kwargs)
+        return Workspace().__setstate__(state)
 
     # -------------------------
     # SDK connection
@@ -308,17 +287,30 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Path helpers
     # ------------------------------------------------------------------ #
-    def path(self, *parts, workspace: Optional["Workspace"] = None, **kwargs):
+    def dbfs_path(
+        self,
+        parts: Union[List[str], str],
+        kind: Optional[DatabricksPathKind] = None,
+        workspace: Optional["Workspace"] = None
+    ):
+        workspace = self if workspace is None else workspace
+
+        if kind is None or isinstance(parts, str):
+            return DatabricksPath.parse(
+                parts=parts,
+                workspace=workspace
+            )
+
         return DatabricksPath(
-            *parts,
-            workspace=self if workspace is None else workspace,
-            **kwargs
+            kind=kind,
+            parts=parts,
+            workspace=workspace
         )
 
-    @staticmethod
     def shared_cache_path(
+        self,
         suffix: Optional[str] = None
-    ) -> str:
+    ) -> DatabricksPath:
         """
         Shared cache base under Volumes for the current user.
         """
@@ -328,31 +320,7 @@ class Workspace:
             return base
 
         suffix = suffix.lstrip("/")
-        return f"{base}/{suffix}"
-
-    def temp_volume_folder(
-        self,
-        suffix: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
-    ) -> str:
-        """
-        Temporary folder either under a UC Volume or dbfs:/FileStore/.ygg/tmp/<user>.
-        """
-        if volume_name:
-            catalog_name = catalog_name or os.getenv("DATABRICKS_CATALOG_NAME")
-            schema_name = schema_name or os.getenv("DATABRICKS_SCHEMA_NAME")
-
-            base = f"/Volumes/{catalog_name}/{schema_name}/{volume_name}"
-        else:
-            base = f"dbfs:/FileStore/.ygg/tmp/{self.current_user.user_name}"
-
-        if not suffix:
-            return base
-
-        suffix = suffix.lstrip("/")
-        return f"{base}/{suffix}"
+        return self.dbfs_path(f"{base}/{suffix}")
 
     # ------------------------------------------------------------------ #
     # SDK access / connection
@@ -414,346 +382,6 @@ class Workspace:
 
         # 4) finally create the directory path itself
         sdk.files.create_directory(target_path)
-
-    # ------------------------------------------------------------------ #
-    # Upload helpers
-    # ------------------------------------------------------------------ #
-    def upload_file_content(
-        self,
-        content: Union[bytes, BinaryIO],
-        target_path: str,
-        makedirs: bool = True,
-        overwrite: bool = True,
-        only_if_size_diff: bool = False,
-        parallel_pool: Optional[ThreadPoolExecutor] = None,
-    ):
-        """
-        Upload a single content blob into Databricks (Workspace / Volumes / DBFS).
-
-        content:
-            bytes or a binary file-like object.
-
-        target_path:
-            - "dbfs:/..."    → DBFS via dbfs.put
-            - "/Volumes/..." → Unity Catalog Volumes via files.upload
-            - anything else  → Workspace via workspace.upload
-
-        If parallel_pool is provided, this schedules the upload on the pool
-        and returns a Future. The underlying call is non-parallel (no nested pool).
-
-        If only_if_size_diff=True, it will:
-          - compute local content size (len(bytes))
-          - fetch remote size (best-effort)
-          - skip upload if sizes match.
-        """
-        # If we're doing this in a pool, normalize content to bytes *before*
-        # submitting so we don't share a live file handle across threads.
-        if parallel_pool is not None:
-            if hasattr(content, "read"):
-                data = content.read()
-            else:
-                data = content
-
-            # use a cloned workspace so clients don't collide across threads
-            return parallel_pool.submit(
-                self.clone().upload_file_content,
-                content=data,
-                target_path=target_path,
-                makedirs=makedirs,
-                overwrite=overwrite,
-                only_if_size_diff=only_if_size_diff,
-                parallel_pool=None,
-            )
-
-        with self.connect() as connected:
-            sdk = connected.sdk()
-
-            # Normalize content to bytes once
-            if hasattr(content, "read"):  # BinaryIO
-                data = content.read()
-            else:
-                data = content
-
-            if not isinstance(data, (bytes, bytearray)):
-                if isinstance(data, str):
-                    data = data.encode()
-                else:
-                    raise TypeError(
-                        f"content must be bytes or BinaryIO, got {type(content)!r}"
-                    )
-
-            data_bytes = bytes(data)
-            local_size = len(data_bytes)
-
-            # Only-if-size-diff: check remote size and bail early if equal
-            if only_if_size_diff:
-                remote_size = _get_remote_size(sdk, target_path)
-                if remote_size is not None and remote_size == local_size:
-                    # Same size remotely -> skip upload
-                    return None
-
-            # Ensure parent directory if requested
-            parent = os.path.dirname(target_path)
-
-            if target_path.startswith("dbfs:/"):
-                # --- DBFS path ---
-                if makedirs and parent and parent != "dbfs:/":
-                    sdk.dbfs.mkdirs(parent)
-
-                data_str = base64.b64encode(data_bytes).decode("utf-8")
-                sdk.dbfs.put(
-                    path=target_path,
-                    contents=data_str,
-                    overwrite=overwrite,
-                )
-
-            elif target_path.startswith("/Volumes"):
-                # --- Unity Catalog Volumes path ---
-                if makedirs and parent and parent != "/":
-                    try:
-                        sdk.files.create_directory(parent)
-                    except NotFound:
-                        connected.ensure_uc_volume_and_dir(parent)
-
-                sdk.files.upload(
-                    file_path=target_path,
-                    contents=io.BytesIO(data_bytes),
-                    overwrite=overwrite,
-                )
-
-            else:
-                # --- Workspace Files / Notebooks ---
-                if makedirs and parent:
-                    sdk.workspace.mkdirs(parent)
-
-                sdk.workspace.upload(
-                    path=target_path,
-                    format=ImportFormat.RAW,
-                    content=data_bytes,
-                    overwrite=overwrite,
-                )
-
-    def upload_local_path(
-        self,
-        local_path: str,
-        target_path: str,
-        makedirs: bool = True,
-        overwrite: bool = True,
-        only_if_size_diff: bool = False,
-        parallel_pool: Optional[ThreadPoolExecutor] = None,
-    ):
-        if os.path.isfile(local_path):
-            return self.upload_local_file(
-                local_path=local_path,
-                target_path=target_path,
-                makedirs=makedirs,
-                overwrite=overwrite,
-                only_if_size_diff=only_if_size_diff,
-                parallel_pool=parallel_pool
-            )
-        else:
-            return self.upload_local_folder(
-                local_path=local_path,
-                target_path=target_path,
-                makedirs=makedirs,
-                only_if_size_diff=only_if_size_diff,
-                parallel_pool=parallel_pool
-            )
-
-    def upload_local_file(
-        self,
-        local_path: str,
-        target_path: str,
-        makedirs: bool = True,
-        overwrite: bool = True,
-        only_if_size_diff: bool = False,
-        parallel_pool: Optional[ThreadPoolExecutor] = None,
-    ):
-        """
-        Upload a single local file into Databricks.
-
-        If parallel_pool is provided, this schedules the upload on the pool
-        and returns a Future.
-
-        If only_if_size_diff=True, it will:
-          - For large files (>4 MiB), check remote file status
-          - Skip upload if remote size == local size
-        """
-        if parallel_pool is not None:
-            # Submit a *non-parallel* variant into the pool
-            return parallel_pool.submit(
-                self.upload_local_file,
-                local_path=local_path,
-                target_path=target_path,
-                makedirs=makedirs,
-                overwrite=overwrite,
-                only_if_size_diff=only_if_size_diff,
-                parallel_pool=None,
-            )
-
-        sdk = self.sdk()
-
-        local_size = os.path.getsize(local_path)
-        large_threshold = 32 * 1024
-
-        if only_if_size_diff and local_size > large_threshold:
-            try:
-                info = sdk.workspace.get_status(path=target_path)
-                remote_size = getattr(info, "size", None)
-
-                if remote_size is not None and remote_size == local_size:
-                    return
-            except ResourceDoesNotExist:
-                # Doesn't exist → upload below
-                pass
-
-        with open(local_path, "rb") as f:
-            content = f.read()
-
-        return self.upload_file_content(
-            content=content,
-            target_path=target_path,
-            makedirs=makedirs,
-            overwrite=overwrite,
-            only_if_size_diff=False,
-            parallel_pool=parallel_pool,
-        )
-
-    def upload_local_folder(
-        self,
-        local_path: str,
-        target_path: str,
-        makedirs: bool = True,
-        only_if_size_diff: bool = True,
-        exclude_dir_names: Optional[List[str]] = None,
-        exclude_hidden: bool = True,
-        parallel_pool: Optional[Union[ThreadPoolExecutor, int]] = None,
-    ):
-        """
-        Recursively upload a local folder into Databricks Workspace Files.
-
-        - Traverses subdirectories recursively.
-        - Optionally skips files that match size/mtime of remote entries.
-        - Can upload files in parallel using a ThreadPoolExecutor.
-
-        Args:
-            local_path: Local directory to upload from.
-            target_path: Workspace path to upload into.
-            makedirs: Create remote directories as needed.
-            only_if_size_diff: Skip upload if remote file exists with same size and newer mtime.
-            exclude_dir_names: Directory names to skip entirely.
-            exclude_hidden: Skip dot-prefixed files/directories.
-            parallel_pool: None | ThreadPoolExecutor | int (max_workers).
-        """
-        sdk = self.sdk()
-        local_path = os.path.abspath(local_path)
-        exclude_dirs_set = set(exclude_dir_names or [])
-
-        try:
-            existing_objs = list(sdk.workspace.list(target_path))
-        except ResourceDoesNotExist:
-            existing_objs = []
-
-        # --- setup pool semantics ---
-        created_pool: Optional[ThreadPoolExecutor] = None
-        if isinstance(parallel_pool, int):
-            created_pool = ThreadPoolExecutor(max_workers=parallel_pool)
-            pool: Optional[ThreadPoolExecutor] = created_pool
-        elif isinstance(parallel_pool, ThreadPoolExecutor):
-            pool = parallel_pool
-        else:
-            pool = None
-
-        futures = []
-
-        def _upload_dir(local_root: str, remote_root: str, ensure_dir: bool):
-            # Ensure remote directory exists if requested
-            existing_remote_root_obj = [
-                _ for _ in existing_objs
-                if _.path.startswith(remote_root)
-            ]
-
-            if ensure_dir and not existing_remote_root_obj:
-                sdk.workspace.mkdirs(remote_root)
-
-            try:
-                local_entries = list(os.scandir(local_root))
-            except FileNotFoundError:
-                return
-
-            local_files = []
-            local_dirs = []
-
-            for local_entry in local_entries:
-                # Skip hidden if requested
-                if exclude_hidden and local_entry.name.startswith("."):
-                    continue
-
-                if local_entry.is_dir():
-                    if local_entry.name in exclude_dirs_set:
-                        continue
-                    local_dirs.append(local_entry)
-                elif existing_objs:
-                    found_same_remote = None
-                    for exiting_obj in existing_objs:
-                        existing_obj_name = os.path.basename(exiting_obj.path)
-                        if existing_obj_name == local_entry.name:
-                            found_same_remote = exiting_obj
-                            break
-
-                    if found_same_remote:
-                        found_same_remote_epoch = found_same_remote.modified_at / 1000
-                        local_stats = local_entry.stat()
-
-                        if (
-                            only_if_size_diff
-                            and found_same_remote.size
-                            and found_same_remote.size != local_stats.st_size
-                        ):
-                            pass  # size diff -> upload
-                        elif local_stats.st_mtime < found_same_remote_epoch:
-                            # remote is newer -> skip
-                            continue
-                        else:
-                            local_files.append(local_entry)
-                    else:
-                        local_files.append(local_entry)
-                else:
-                    local_files.append(local_entry)
-
-            # ---- upload files in this directory ----
-            for local_entry in local_files:
-                remote_path = posixpath.join(remote_root, local_entry.name)
-
-                entry_fut = self.upload_local_file(
-                    local_path=local_entry.path,
-                    target_path=remote_path,
-                    makedirs=False,
-                    overwrite=True,
-                    only_if_size_diff=False,
-                    parallel_pool=pool,
-                )
-
-                if pool is not None:
-                    futures.append(entry_fut)
-
-            # ---- recurse into subdirectories ----
-            for local_entry in local_dirs:
-                _upload_dir(
-                    local_entry.path,
-                    posixpath.join(remote_root, local_entry.name),
-                    ensure_dir=makedirs,
-                )
-
-        try:
-            _upload_dir(local_path, target_path, ensure_dir=makedirs)
-
-            if pool is not None:
-                for fut in as_completed(futures):
-                    fut.result()
-        finally:
-            if created_pool is not None:
-                created_pool.shutdown(wait=True)
 
     # ------------------------------------------------------------------ #
     # List / open / delete / SQL
@@ -895,15 +523,15 @@ class Workspace:
             **kwargs
         )
 
-    def cluster(self, **kwargs):
+    def clusters(
+        self,
+        cluster_id: Optional[str] = None,
+        cluster_name: Optional[str] = None,
+        **kwargs
+    ) -> "Cluster":
         from ..compute.cluster import Cluster
 
-        return Cluster(workspace=self, **kwargs)
-
-    def clusters(self, **kwargs):
-        from ..compute.cluster import Cluster
-
-        return Cluster(workspace=self, **kwargs)
+        return Cluster(workspace=self, cluster_id=cluster_id, cluster_name=cluster_name, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -935,8 +563,17 @@ class WorkspaceService(ABC):
         self.workspace = self.workspace.connect()
         return self
 
-    def path(self, *parts, workspace: Optional["Workspace"] = None, **kwargs):
-        return self.workspace.path(*parts, workspace=workspace, **kwargs)
+    def dbfs_path(
+        self,
+        parts: Union[List[str], str],
+        kind: Optional[DatabricksPathKind] = None,
+        workspace: Optional["Workspace"] = None
+    ):
+        return self.workspace.dbfs_path(
+            kind=kind,
+            parts=parts,
+            workspace=workspace
+        )
 
     def sdk(self):
         return self.workspace.sdk()

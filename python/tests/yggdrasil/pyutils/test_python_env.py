@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+
 from yggdrasil.pyutils import python_env as pe
 from yggdrasil.pyutils.python_env import PythonEnv, PythonEnvError
 
@@ -69,8 +70,8 @@ def _create_uv_env(root: Path) -> PythonEnv:
     """
     Create a real venv using uv, offline-friendly (no pip installs).
     """
-    uv = PythonEnv.ensure_uv(check=True)
-    pe._run_cmd([uv, "venv", str(root), "--python", sys.executable], check=True)
+    uv = PythonEnv.ensure_uv()
+    pe._run_cmd([uv, "venv", str(root), "--python", sys.executable])
     env = PythonEnv(root)
     assert env.exists(), f"uv venv created but python missing at {env.python_executable}"
 
@@ -387,17 +388,22 @@ def test_change_python_version_path_recreates_and_moves_aside(real_env: PythonEn
 # ------------------------------------------------------------
 # export_requirements_matrix (needs uv, real env)
 # ------------------------------------------------------------
-def test_export_requirements_matrix_out_dir_none_returns_text_from_self(real_env: PythonEnv):
-    res = real_env.export_requirements_matrix(
+def test_requirements_matrix_out_dir_none_returns_text_from_self(real_env: PythonEnv):
+    res = real_env.requirements(
         out_dir=None,
         base_name="requirements",
         include_input=True,
         include_frozen=False,  # keep it stable/fast
-        check=True,
     )
 
     assert isinstance(res, str)
     assert res
+
+
+def test_installed_packages(real_env: PythonEnv):
+    pkgs = real_env.installed_packages(parsed=True)
+    names = [p[0] for p in pkgs]
+    assert "pandas" in names
 
 
 def test_export_requirements_matrix_out_dir_none_returns_text(real_env: PythonEnv):
@@ -410,7 +416,6 @@ def test_export_requirements_matrix_out_dir_none_returns_text(real_env: PythonEn
         include_input=True,
         include_frozen=False,  # keep it stable/fast
         buffers=buffers,
-        check=True,
     )
 
     assert sys.executable in res
@@ -432,7 +437,6 @@ def test_export_requirements_matrix_out_dir_writes_files(real_env: PythonEnv, tm
         include_input=True,
         include_frozen=True,
         buffers=buffers,
-        check=True,
     )
 
     p = res[sys.executable]
@@ -447,73 +451,3 @@ def test_export_requirements_matrix_out_dir_writes_files(real_env: PythonEnv, tm
     assert "reqs.in" in buffers
     assert "reqs.frozen.txt" in buffers
     assert expected_compiled.name in buffers
-
-
-# ------------------------------------------------------------
-# zip helpers (no uv needed)
-# ------------------------------------------------------------
-
-def test_zip_bytes_excludes_cache_and_pycache_by_default(tmp_path: Path):
-    root = tmp_path / "envzip"
-    root.mkdir()
-
-    (root / "__pycache__").mkdir()
-    (root / "__pycache__" / "x.pyc").write_bytes(b"x")
-    (root / ".cache").mkdir()
-    (root / ".cache" / "y").write_text("y", encoding="utf-8")
-
-    (root / "ok.txt").write_text("ok", encoding="utf-8")
-
-    (root / "pkg-1.0.0.dist-info").mkdir()
-    (root / "pkg-1.0.0.dist-info" / "METADATA").write_text("meta", encoding="utf-8")
-
-    env = PythonEnv(root)
-    zbytes = env.zip_bytes()
-
-    import io, zipfile
-    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
-        names = set(zf.namelist())
-
-    assert "ok.txt" in names
-    assert "__pycache__/x.pyc" not in names
-    assert ".cache/y" in names
-    # dist-info included by default
-    assert "pkg-1.0.0.dist-info/METADATA" in names
-
-
-def test_zip_bytes_can_exclude_dist_info(tmp_path: Path):
-    root = tmp_path / "envzip2"
-    root.mkdir()
-
-    (root / "ok.txt").write_text("ok", encoding="utf-8")
-    (root / "pkg-1.0.0.dist-info").mkdir()
-    (root / "pkg-1.0.0.dist-info" / "METADATA").write_text("meta", encoding="utf-8")
-
-    env = PythonEnv(root)
-    zbytes = env.zip_bytes(include_dist_info=False)
-
-    import io, zipfile
-    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
-        names = set(zf.namelist())
-
-    assert "ok.txt" in names
-    assert "pkg-1.0.0.dist-info/METADATA" in names
-
-
-def test_zip_to_excludes_out_zip_when_inside_root(tmp_path: Path):
-    root = tmp_path / "envzip3"
-    root.mkdir()
-    (root / "ok.txt").write_text("ok", encoding="utf-8")
-
-    env = PythonEnv(root)
-    out_zip = root / "out.zip"
-    env.zip_to(out_zip, in_memory=False)
-
-    assert out_zip.exists()
-
-    import zipfile
-    with zipfile.ZipFile(out_zip, "r") as zf:
-        names = set(zf.namelist())
-
-    assert "ok.txt" in names
-    assert "out.zip" not in names
