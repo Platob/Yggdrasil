@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import os
 import unittest
+
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 
-from yggdrasil.databricks.workspaces.databricks_path import DatabricksPath
+from yggdrasil.databricks.workspaces.path import DatabricksPath
 
 
 class DatabricksIntegrationBase(unittest.TestCase):
@@ -115,7 +117,7 @@ class TestDatabricksPathIntegrationDBFS(DatabricksIntegrationBase):
         # Not raise error if not exists
         d.rmdir()
 
-        files = list(d.ls(raise_error=False))
+        files = list(d.ls())
 
         assert len(files) == 0
 
@@ -255,45 +257,34 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
         d.rmdir()
 
-    def test_io(self):
-        from yggdrasil.databricks import Workspace
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+    def test_path_data_io(self):
+        filepath = self.vol_base / "file.parquet"
+        folder_path = self.vol_base / "folder.parquet/"
 
-        workspace = Workspace(
-            host="dbc-e646c5f9-8a44.cloud.databricks.com",
-            token="dbx.....", # Replace with your actual token
-            client_id="....",  # Replace with your actual client ID
-            client_secret="....",
-        )
-
-        file = workspace.dbfs_path("/Volumes/trading/unittest/unittest/file.parquet")
-        folder = file.parent
-
-        table = pa.table({
+        my_arrow_table = pa.table({
             "col1": [1, 2, 3],
             "col2": ["a", "b", "c"]
         })
 
-        with file.open("wb") as out:
-            pq.write_table(table, out)
+        filepath.write_arrow(my_arrow_table)
+        folder_path.write_arrow(my_arrow_table)
+        arrow_dataset = folder_path.arrow_dataset()
 
-        with file.open("rb") as inp:
-            read_table = pq.read_table(inp)
-            print(read_table)
+        self.assertTrue(my_arrow_table.equals(filepath.read_arrow_table()))
+        self.assertTrue(my_arrow_table.equals(folder_path.read_arrow_table()))
+        self.assertTrue(my_arrow_table.equals(arrow_dataset.to_table()))
+        self.assertTrue(my_arrow_table.equals(filepath.sql(f"SELECT * from dbfs.`{filepath}`")))
 
-        for child in folder.ls(recursive=True):
-            with child.open("rb") as inp:
-                child_table = pq.read_table(inp)
-                print(child_table)
+    def test_pyarrow_filesystem(self):
+        folder_path = self.vol_base / "arrow_dataset"
 
-        print(read_table)
+        my_arrow_table = pa.table({
+            "col1": [1, 2, 3],
+            "col2": ["a", "b", "c"]
+        })
 
-        # SQL
-        query = f"SELECT * FROM parquet.`{folder}` LIMIT 10"
-        result = workspace.sql().execute(query)
-        sql_table = result.to_arrow_table()
-        pdf = result.to_pandas()
-        polars = result.to_polars()
+        folder_path.mkdir()
 
-        print(sql_table)
+        folder_path.write_arrow(my_arrow_table)
+
+        self.assertEqual(my_arrow_table, folder_path.read_arrow_table())

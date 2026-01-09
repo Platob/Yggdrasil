@@ -6,6 +6,7 @@ from typing import Optional, Union, List, Tuple, Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as pds
 
 from .cast_options import CastOptions
 from .registry import register_converter
@@ -1094,6 +1095,14 @@ def record_batch_reader_to_record_batch(
     table = record_batch_reader_to_table(data, options)
     return table_to_record_batch(table, options)
 
+
+@register_converter(pds.Dataset, pa.Table)
+def arrow_dataset_to_table(
+    data: pds.Dataset,
+    options: Optional[CastOptions] = None,
+) -> pa.Field:
+    table = data.to_table()
+    return cast_arrow_tabular(table, options)
 
 # ---------------------------------------------------------------------------
 # Field / Schema converters

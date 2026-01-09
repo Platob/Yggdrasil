@@ -102,6 +102,18 @@ def _split_top_level_commas(s: str):
     return parts
 
 
+def _safe_bytes(obj):
+    if not isinstance(obj, bytes):
+        if not obj:
+            return b""
+
+        if not isinstance(obj, str):
+            obj = str(obj)
+
+        return obj.encode("utf-8")
+    return obj
+
+
 def parse_sql_type_to_pa(type_str: str) -> pa.DataType:
     """
     Adapted parser that:
@@ -170,6 +182,10 @@ def column_info_to_arrow_field(col: Union[SQLColumnInfo, CatalogColumnInfo]):
     if isinstance(col, CatalogColumnInfo):
         parsed = json.loads(col.type_json)
         md = parsed.get("metadata", {}) or {}
+        md = {
+            _safe_bytes(k): _safe_bytes(v)
+            for k, v in md.items()
+        }
         nullable = col.nullable
     elif isinstance(col, SQLColumnInfo):
         md = {}

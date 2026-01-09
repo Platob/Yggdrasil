@@ -16,7 +16,7 @@ from typing import (
 if TYPE_CHECKING:
     from ..compute.cluster import Cluster
 
-from .databricks_path import DatabricksPath, DatabricksPathKind
+from .path import DatabricksPath, DatabricksPathKind
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
@@ -133,17 +133,19 @@ class Workspace:
 
     def __enter__(self) -> "Workspace":
         self._was_connected = self._sdk is not None
-        self.connect()
-        return self
+        return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if not self._was_connected:
             self.close()
 
+    def __del__(self):
+        self.close()
+
     # -------------------------
     # Clone
     # -------------------------
-    def clone(
+    def clone_instance(
         self,
         **kwargs
     ) -> "Workspace":
@@ -154,86 +156,94 @@ class Workspace:
     # -------------------------
     # SDK connection
     # -------------------------
-    def connect(self, reset: bool = False) -> "Workspace":
+    @property
+    def connected(self):
+        return self._sdk is not None
+
+    def connect(self, reset: bool = False, clone: bool = False) -> "Workspace":
         if reset:
             self._sdk = None
 
-        if self._sdk is None:
-            require_databricks_sdk()
-            logger.debug("Connecting %s", self)
+        if self._sdk is not None:
+            return self
 
-            # Build Config from config_dict if available, else from fields.
-            kwargs = {
-                "host": self.host,
-                "account_id": self.account_id,
-                "token": self.token,
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "token_audience": self.token_audience,
-                "azure_workspace_resource_id": self.azure_workspace_resource_id,
-                "azure_use_msi": self.azure_use_msi,
-                "azure_client_secret": self.azure_client_secret,
-                "azure_client_id": self.azure_client_id,
-                "azure_tenant_id": self.azure_tenant_id,
-                "azure_environment": self.azure_environment,
-                "google_credentials": self.google_credentials,
-                "google_service_account": self.google_service_account,
-                "profile": self.profile,
-                "config_file": self.config_file,
-                "auth_type": self.auth_type,
-                "http_timeout_seconds": self.http_timeout_seconds,
-                "retry_timeout_seconds": self.retry_timeout_seconds,
-                "debug_truncate_bytes": self.debug_truncate_bytes,
-                "debug_headers": self.debug_headers,
-                "rate_limit": self.rate_limit,
-                "product": self.product,
-                "product_version": self.product_version,
-            }
+        instance = self.clone_instance() if clone else self
 
-            build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        require_databricks_sdk()
+        logger.debug("Connecting %s", self)
 
-            try:
-                self._sdk = WorkspaceClient(**build_kwargs)
-            except ValueError as e:
-                if "cannot configure default credentials" in str(e) and self.auth_type is None:
-                    last_error = e
+        # Build Config from config_dict if available, else from fields.
+        kwargs = {
+            "host": instance.host,
+            "account_id": instance.account_id,
+            "token": instance.token,
+            "client_id": instance.client_id,
+            "client_secret": instance.client_secret,
+            "token_audience": instance.token_audience,
+            "azure_workspace_resource_id": instance.azure_workspace_resource_id,
+            "azure_use_msi": instance.azure_use_msi,
+            "azure_client_secret": instance.azure_client_secret,
+            "azure_client_id": instance.azure_client_id,
+            "azure_tenant_id": instance.azure_tenant_id,
+            "azure_environment": instance.azure_environment,
+            "google_credentials": instance.google_credentials,
+            "google_service_account": instance.google_service_account,
+            "profile": instance.profile,
+            "config_file": instance.config_file,
+            "auth_type": instance.auth_type,
+            "http_timeout_seconds": instance.http_timeout_seconds,
+            "retry_timeout_seconds": instance.retry_timeout_seconds,
+            "debug_truncate_bytes": instance.debug_truncate_bytes,
+            "debug_headers": instance.debug_headers,
+            "rate_limit": instance.rate_limit,
+            "product": instance.product,
+            "product_version": instance.product_version,
+        }
 
-                    auth_types = ["runtime"] if self.is_in_databricks_environment() else ["external-browser"]
+        build_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-                    for auth_type in auth_types:
-                        build_kwargs["auth_type"] = auth_type
+        try:
+            instance._sdk = WorkspaceClient(**build_kwargs)
+        except ValueError as e:
+            if "cannot configure default credentials" in str(e) and instance.auth_type is None:
+                last_error = e
+
+                auth_types = ["runtime"] if instance.is_in_databricks_environment() else ["external-browser"]
+
+                for auth_type in auth_types:
+                    build_kwargs["auth_type"] = auth_type
+
+                    try:
+                        instance._sdk = WorkspaceClient(**build_kwargs)
+                        break
+                    except Exception as se:
+                        last_error = se
+                        build_kwargs.pop("auth_type")
+
+                if instance._sdk is None:
+                    if instance.is_in_databricks_environment() and instance._cached_token:
+                        build_kwargs["token"] = instance._cached_token
 
                         try:
-                            self._sdk = WorkspaceClient(**build_kwargs)
-                            break
+                            instance._sdk = WorkspaceClient(**build_kwargs)
                         except Exception as se:
                             last_error = se
-                            build_kwargs.pop("auth_type")
 
-                    if self._sdk is None:
-                        if self.is_in_databricks_environment() and self._cached_token:
-                            build_kwargs["token"] = self._cached_token
+                if instance._sdk is None:
+                    raise last_error
+            else:
+                raise e
 
-                            try:
-                                self._sdk = WorkspaceClient(**build_kwargs)
-                            except Exception as se:
-                                last_error = se
+        # backfill resolved config values
+        for key in list(kwargs.keys()):
+            if getattr(instance, key, None) is None:
+                v = getattr(instance._sdk.config, key, None)
+                if v is not None:
+                    setattr(instance, key, v)
 
-                    if self._sdk is None:
-                        raise last_error
-                else:
-                    raise e
+        logger.info("Connected %s", instance)
 
-            # backfill resolved config values
-            for key in list(kwargs.keys()):
-                if getattr(self, key, None) is None:
-                    v = getattr(self._sdk.config, key, None)
-                    if v is not None:
-                        setattr(self, key, v)
-
-            logger.info("Connected %s", self)
-
-        return self
+        return instance
 
     # ------------------------------------------------------------------ #
     # Context manager + lifecycle
@@ -287,6 +297,20 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Path helpers
     # ------------------------------------------------------------------ #
+    def filesytem(
+        self,
+        workspace: Optional["Workspace"] = None,
+    ):
+        from .filesytem import DatabricksFileSystem, DatabricksFileSystemHandler
+
+        handler = DatabricksFileSystemHandler(
+            workspace=self if workspace is None else workspace
+        )
+
+        return DatabricksFileSystem(
+            handler=handler
+        )
+
     def dbfs_path(
         self,
         parts: Union[List[str], str],
@@ -297,14 +321,14 @@ class Workspace:
 
         if kind is None or isinstance(parts, str):
             return DatabricksPath.parse(
-                parts=parts,
+                obj=parts,
                 workspace=workspace
             )
 
         return DatabricksPath(
             kind=kind,
             parts=parts,
-            workspace=workspace
+            _workspace=workspace
         )
 
     def shared_cache_path(
@@ -328,60 +352,6 @@ class Workspace:
 
     def sdk(self) -> "WorkspaceClient":
         return self.connect()._sdk
-
-    # ------------------------------------------------------------------ #
-    # UC volume + directory management
-    # ------------------------------------------------------------------ #
-
-    def ensure_uc_volume_and_dir(
-        self,
-        target_path: str,
-    ) -> None:
-        """
-        Ensure catalog, schema, volume exist for a UC volume path
-        like /Volumes/<catalog>/<schema>/<volume>/...,
-        then create the directory.
-        """
-        sdk = self.sdk()
-        parts = target_path.split("/")
-
-        # basic sanity check
-        if len(parts) < 5 or parts[1] != "Volumes":
-            raise ValueError(
-                f"Unexpected UC volume path: {target_path!r}. "
-                "Expected /Volumes/<catalog>/<schema>/<volume>/..."
-            )
-
-        # /Volumes/<catalog>/<schema>/<volume>/...
-        _, _, catalog_name, schema_name, volume_name, *subpath = parts
-
-        # 1) ensure catalog
-        try:
-            sdk.catalogs.get(name=catalog_name)
-        except NotFound:
-            sdk.catalogs.create(name=catalog_name)
-
-        # 2) ensure schema
-        schema_full_name = f"{catalog_name}.{schema_name}"
-        try:
-            sdk.schemas.get(full_name=schema_full_name)
-        except NotFound:
-            sdk.schemas.create(name=schema_name, catalog_name=catalog_name)
-
-        # 3) ensure volume (managed volume is simplest)
-        volume_full_name = f"{catalog_name}.{schema_name}.{volume_name}"
-        try:
-            sdk.volumes.read(name=volume_full_name)
-        except NotFound:
-            sdk.volumes.create(
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                name=volume_name,
-                volume_type=catalog_svc.VolumeType.MANAGED,
-            )
-
-        # 4) finally create the directory path itself
-        sdk.files.create_directory(target_path)
 
     # ------------------------------------------------------------------ #
     # List / open / delete / SQL
@@ -462,31 +432,8 @@ class Workspace:
 
         # Workspace path
         fmt = workspace_format or ExportFormat.AUTO
+
         return sdk.workspace.download(path=path, format=fmt)
-
-    def delete_path(
-        self,
-        target_path: str,
-        recursive: bool = True,
-        ignore_missing: bool = True,
-    ) -> None:
-        """
-        Delete a path in Databricks Workspace (file or directory).
-
-        - If recursive=True and target_path is a directory, deletes entire tree.
-        - If ignore_missing=True, missing paths won't raise.
-        """
-        sdk = self.sdk()
-
-        try:
-            sdk.workspace.delete(
-                path=target_path,
-                recursive=recursive,
-            )
-        except ResourceDoesNotExist:
-            if ignore_missing:
-                return
-            raise
 
     @staticmethod
     def is_in_databricks_environment():

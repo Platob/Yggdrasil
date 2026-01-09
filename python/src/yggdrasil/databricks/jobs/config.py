@@ -2,11 +2,11 @@ import builtins
 import dataclasses
 import datetime as dt
 import inspect
+import logging
 from dataclasses import dataclass, fields
 from enum import Enum
 from inspect import isclass
-from typing import Any, Dict, List, get_type_hints, Optional, get_origin
-import logging
+from typing import Any, Dict, List, get_type_hints, get_origin
 
 from ...libs.sparklib import SparkSession
 from ...types.cast.registry import convert
@@ -308,31 +308,3 @@ class NotebookConfig:
                 spark_session.conf.set("spark.sql.session.timeZone", "UTC")
 
         return cls.from_environment()
-
-
-class ExampleEnum(Enum):
-    """Example enum for widget demonstration"""
-    OPTION1 = "option1"
-    OPTION2 = "option2"
-    OPTION3 = "option3"
-
-
-@dataclass
-class CompleteNotebookConfig(NotebookConfig):
-    """Example JobConfig with various field types to demonstrate widget handling"""
-    # Basic types
-    text_field: str
-    integer_field: int = 42
-    float_field: float = 3.14
-    boolean_field: bool = True
-
-    # Special types
-    date_field: dt.date = dt.date(2023, 1, 1)
-    datetime_field: dt.datetime = dt.datetime(2023, 1, 1, 12, 0, 0)
-    enum_field: ExampleEnum = ExampleEnum.OPTION1
-
-    # Collection types
-    list_of_strings: List[str] = None  # Will be displayed as multiselect
-
-    # Optional fields
-    optional_text: Optional[str] = None

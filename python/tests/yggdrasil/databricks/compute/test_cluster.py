@@ -3,17 +3,10 @@ import os
 import sys
 import unittest
 
+import pytest
 from databricks.sdk.service.compute import Language
-from mongoengine import DynamicDocument, connect
 
 from yggdrasil.databricks import Workspace
-from yggdrasil.databricks.compute.cluster import Cluster
-from yggdrasil.databricks.compute.remote import databricks_remote_compute
-
-class Cities(DynamicDocument):
-    meta = {'collection': 'cities'}
-
-
 
 # ---- logging to stdout ----
 logger = logging.getLogger("test")
@@ -26,19 +19,13 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 
 
-
 class TestCluster(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace(host="xxx.cloud.databricks.com").connect()
-        self.cluster = Cluster.replicated_current_environment(workspace=self.workspace)
+        self.workspace = Workspace().connect()
+        self.cluster = self.workspace.clusters().push_python_environment()
         # self.cluster.restart()
-
-    def test_get_current_token(self):
-        assert Workspace(
-            host=self.workspace.host,
-            token=self.workspace.current_token()
-        ).current_user.user_name == self.workspace.current_user.user_name
+        self.venv = self.cluster.pull_python_environment()
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
@@ -46,7 +33,7 @@ class TestCluster(unittest.TestCase):
 
     def test_list_spark_versions(self):
         result = self.cluster.spark_versions()
-        latest = self.cluster.latest_spark_version(python_version="current")
+        latest = self.cluster.latest_spark_version(python_version=sys.version_info)
 
         assert result
         assert latest
@@ -55,19 +42,18 @@ class TestCluster(unittest.TestCase):
         def test():
             return "ok"
 
-        with self.cluster.execution_context() as context:
+        with self.cluster.context() as context:
             result = context.execute(test)
 
-        assert result is not None
+        self.assertEqual("ok", result)
 
     def test_execute_error(self):
-        def test():
+        def f():
             raise ValueError("error")
 
-        with self.cluster.execution_context() as context:
-            result = context.execute(test)
-
-        assert result is not None
+        with pytest.raises(ValueError):
+            with self.cluster.context() as context:
+                _ = context.execute(f)
 
     def test_decorator(self):
         @self.cluster.execution_decorator
@@ -83,59 +69,9 @@ class TestCluster(unittest.TestCase):
         assert result["value"] == 1
 
     def test_install_temporary_lib(self):
-        Cluster(
-            workspace=self.workspace,
-            cluster_id="xxx"
-        ).install_temporary_libraries(["path/to/folder", "pandas"])
-
-    def test_repeated_decorator(self):
-        @self.cluster.execution_decorator
-        def decorated(a: int):
-            return {
-                "os": os.environ,
-                "value": a
-            }
-
-        for i in range(2):
-            result = decorated(i)
-
-            assert result["os"]
-            assert result["value"] == i
-
-    def test_databricks_remote_compute_decorator(self):
-        @databricks_remote_compute(workspace=self.workspace)
-        def decorated(a: int):
-            return os.environ
-
-        for i in range(2):
-            result = decorated(i)
-
-            assert result is not None
-
-    def test_decorator_broadcast_credentials(self):
-        wk = self.workspace
-
-        logger.info("driver")
-
-        @databricks_remote_compute(workspace=self.workspace)
-        def decorated(a: int):
-            # Connect to local MongoDB (standalone mode)
-            connect(
-                db="xxx",
-                alias="default",
-                host="mongodb+srv://xxx",
-            )
-
-            logger.info("remote")
-
-            return list(Cities.objects.limit(10)), wk.current_user
-
-        for i in range(4):
-            result = decorated(i)
-            print(result)
-            assert result is not None
+        self.cluster.install_temporary_libraries(["path/to/folder", "pandas"])
 
     def test_execute_sql(self):
-        result = self.cluster.execution_context(language=Language.SQL).execute("SELECT 1")
+        result = self.cluster.context(language=Language.SQL).execute("SELECT 1")
 
-        print(result)
+        self.assertTrue(result)
