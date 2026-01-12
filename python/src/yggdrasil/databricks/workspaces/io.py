@@ -426,17 +426,18 @@ class DatabricksIO(ABC, IO):
     def write_table(
         self,
         table: Union[pa.Table, pa.RecordBatch, PolarsDataFrame, PandasDataFrame],
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         **kwargs
     ):
         if isinstance(table, pa.Table):
-            return self.write_arrow_table(table, batch_size=batch_size, **kwargs)
+            return self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
         elif isinstance(table, pa.RecordBatch):
-            return self.write_arrow_batch(table, batch_size=batch_size, **kwargs)
+            return self.write_arrow_batch(table, file_format=file_format, batch_size=batch_size, **kwargs)
         elif isinstance(table, PolarsDataFrame):
-            return self.write_polars(table, batch_size=batch_size, **kwargs)
+            return self.write_polars(table, file_format=file_format, batch_size=batch_size, **kwargs)
         elif isinstance(table, PandasDataFrame):
-            return self.write_pandas(table, batch_size=batch_size, **kwargs)
+            return self.write_pandas(table, file_format=file_format, batch_size=batch_size, **kwargs)
         else:
             raise ValueError(f"Cannot write {type(table)} to {self.path}")
 
@@ -485,7 +486,7 @@ class DatabricksIO(ABC, IO):
         buffer = io.BytesIO()
 
         if isinstance(file_format, ParquetFileFormat):
-            pq.write_table(table, buffer, **kwargs)
+            pq.write_table(table, buffer, write_batch_size=batch_size, **kwargs)
 
         elif isinstance(file_format, CsvFileFormat):
             pcsv.write_csv(table, buffer, **kwargs)
@@ -498,11 +499,12 @@ class DatabricksIO(ABC, IO):
     def write_arrow_batch(
         self,
         batch: pa.RecordBatch,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         **kwargs
     ):
         table = pa.Table.from_batches([batch])
-        self.write_arrow_table(table, batch_size=batch_size, **kwargs)
+        self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
 
     def read_arrow_batches(
         self,
@@ -561,16 +563,18 @@ class DatabricksIO(ABC, IO):
         **kwargs
     ):
         file_format = self.path.file_format if file_format is None else FileFormat
-        self._reset_for_write()
+        buffer = io.BytesIO()
 
         if isinstance(file_format, ParquetFileFormat):
-            df.write_parquet(self, **kwargs)
+            df.write_parquet(buffer, **kwargs)
 
         elif isinstance(file_format, CsvFileFormat):
-            df.write_csv(self, **kwargs)
+            df.write_csv(buffer, **kwargs)
 
         else:
             raise ValueError(f"Unsupported file format for Polars DataFrame: {file_format}")
+
+        self.write_all_bytes(data=buffer.getvalue())
 
 
 class DatabricksWorkspaceIO(DatabricksIO):

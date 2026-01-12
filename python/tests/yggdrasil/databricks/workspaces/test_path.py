@@ -6,9 +6,8 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyarrow.dataset as ds
 
-from yggdrasil.databricks.workspaces.path import DatabricksPath
+from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
 
 
 class DatabricksIntegrationBase(unittest.TestCase):
@@ -28,13 +27,11 @@ class DatabricksIntegrationBase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from yggdrasil.databricks.workspaces.workspace import Workspace
-
         cls.workspace = Workspace().connect()
 
         # hard gate: if auth/network is broken, skip all tests in this file
         try:
-            cls.workspace.sdk().current_user.me()
+            _ = cls.workspace.current_user
         except Exception as e:
             raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
 
@@ -175,13 +172,6 @@ class TestDatabricksPathIntegrationWorkspace(DatabricksIntegrationBase):
 
 
 class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
-    def setUp(self):
-        super().setUp()
-        if not self.schema_root:
-            self.skipTest(
-                "Set DATABRICKS_TEST_VOLUME_BASE to an existing volume path, "
-                "e.g. /Volumes/<catalog>/<schema>/<volume>/yggdrasil_databricks_path_it"
-            )
 
     def test_volume_roundtrip_text(self):
         # Ensure parent directory exists (Files API won’t auto-create parents on upload)
@@ -288,3 +278,21 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         folder_path.write_arrow(my_arrow_table)
 
         self.assertEqual(my_arrow_table, folder_path.read_arrow_table())
+
+    def test_duckdb(self):
+        import duckdb
+
+        folder_path = self.vol_base / "duckdb_arrow_dataset"
+
+        my_arrow_table = pa.table({
+            "col1": [1, 2, 3],
+            "col2": ["a", "b", "c"]
+        })
+
+        folder_path.mkdir()
+
+        folder_path.write_arrow(my_arrow_table)
+
+        arrow_dataset = folder_path.arrow_dataset()
+
+        self.assertEqual(my_arrow_table, duckdb.sql("select * from arrow_dataset").to_arrow_table())

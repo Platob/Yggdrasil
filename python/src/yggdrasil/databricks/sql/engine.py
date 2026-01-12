@@ -1,17 +1,16 @@
 import dataclasses
-import io
 import logging
 import random
 import string
 import time
-from typing import Optional, Union, Any, Dict, List
+from typing import Optional, Union, Any, Dict, List, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
-from .. import DatabricksPathKind
+from .. import DatabricksPathKind, DatabricksPath
 from ..workspaces import WorkspaceService
 from ...libs.databrickslib import databricks_sdk
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
@@ -147,6 +146,7 @@ class SQLEngine(WorkspaceService):
         self,
         statement: Optional[str] = None,
         *,
+        engine: Optional[Literal["spark", "api"]] = None,
         warehouse_id: Optional[str] = None,
         byte_limit: Optional[int] = None,
         disposition: Optional["Disposition"] = None,
@@ -158,6 +158,7 @@ class SQLEngine(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
+        wait_result: bool = True,
         **kwargs,
     ) -> "StatementResult":
         """
@@ -168,18 +169,25 @@ class SQLEngine(WorkspaceService):
             - On FAILED / CANCELED: raise SqlExecutionError
         - If wait=False: return initial execution handle without polling.
         """
-        if pyspark is not None:
+        if not engine:
+            if pyspark is not None:
+                spark_session = SparkSession.getActiveSession()
+
+                if spark_session is not None:
+                    engine = "spark"
+
+        if engine == "spark":
             spark_session = SparkSession.getActiveSession()
 
-            if spark_session is not None:
-                result = spark_session.sql(statement)
+            if spark_session is None:
+                raise ValueError("No spark session found to run sql query")
 
-                return StatementResult(
-                    engine=self,
-                    statement_id="sparksql",
-                    disposition=Disposition.EXTERNAL_LINKS,
-                    _spark_df=result
-                )
+            return StatementResult(
+                engine=self,
+                statement_id="sparksql",
+                disposition=Disposition.EXTERNAL_LINKS,
+                _spark_df=spark_session.sql(statement)
+            )
 
         if format is None:
             format = Format.ARROW_STREAM
@@ -217,7 +225,7 @@ class SQLEngine(WorkspaceService):
             disposition=disposition
         )
 
-        return execution
+        return execution.wait() if wait_result else wait_result
 
     def spark_table(
         self,
@@ -310,7 +318,8 @@ class SQLEngine(WorkspaceService):
         zorder_by: list[str] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
-        existing_schema: pa.Schema | None = None
+        existing_schema: pa.Schema | None = None,
+        temp_volume_path: Optional[Union[str, DatabricksPath]] = None
     ):
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
@@ -375,14 +384,14 @@ class SQLEngine(WorkspaceService):
             data = convert(data, pa.Table, options=cast_options, target_field=existing_schema)
 
             # Write in temp volume
-            databricks_tmp_path = connected.dbfs_path(
+            temp_volume_path = connected.dbfs_path(
                 kind=DatabricksPathKind.VOLUME,
-                parts=[catalog_name, schema_name, "tmp", transaction_id, "data.parquet"]
-            )
-            databricks_tmp_folder = databricks_tmp_path.parent
+                parts=[catalog_name, schema_name, "tmp", "sql", transaction_id]
+            ) if temp_volume_path is None else DatabricksPath.parse(obj=temp_volume_path, workspace=connected.workspace)
 
-            with databricks_tmp_path.open(mode="wb") as f:
-                pq.write_table(data, f, compression="snappy")
+            temp_volume_path.mkdir()
+
+            temp_volume_path.write_arrow_table(data)
 
             # get column list from arrow schema
             columns = [c for c in existing_schema.names]
@@ -412,7 +421,7 @@ class SQLEngine(WorkspaceService):
 
                 merge_sql = f"""MERGE INTO {location} AS T
 USING (
-  SELECT {cols_quoted} FROM parquet.`{databricks_tmp_folder}`
+  SELECT {cols_quoted} FROM parquet.`{temp_volume_path}`
 ) AS S
 ON {on_condition}
 {update_clause}
@@ -424,12 +433,12 @@ ON {on_condition}
                 if mode.lower() in ("overwrite",):
                     insert_sql = f"""INSERT OVERWRITE {location}
 SELECT {cols_quoted}
-FROM parquet.`{databricks_tmp_folder}`"""
+FROM parquet.`{temp_volume_path}`"""
                 else:
                     # default: append
                     insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 SELECT {cols_quoted}
-FROM parquet.`{databricks_tmp_folder}`"""
+FROM parquet.`{temp_volume_path}`"""
                 statements.append(insert_sql)
 
             # Execute statements (use your existing execute helper)
@@ -439,7 +448,7 @@ FROM parquet.`{databricks_tmp_folder}`"""
                     connected.execute(stmt.strip())
             finally:
                 try:
-                    databricks_tmp_folder.rmdir(recursive=True)
+                    temp_volume_path.rmdir(recursive=True)
                 except Exception as e:
                     logger.warning(e)
 
@@ -656,23 +665,22 @@ FROM parquet.`{databricks_tmp_folder}`"""
             safe_chars=True
         )
 
-        # Create the DDL statement
-        sql = [f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{location} ("]
-
-        # Generate column definitions
-        column_defs = []
-
         if pa.types.is_struct(field.type):
             children = list(field.type)
         else:
             children = [field]
 
-        for child in children:
-            column_def = self._field_to_ddl(child)
-            column_defs.append(column_def)
+        # Create the DDL statement
+        column_definitions = [
+            self._field_to_ddl(child)
+            for child in children
+        ]
 
-        sql.append(",\n  ".join(column_defs))
-        sql.append(")")
+        sql = [
+            f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{location} (",
+            ",\n  ".join(column_definitions),
+            ")"
+        ]
 
         # Add partition by clause if provided
         if partition_by and len(partition_by) > 0:

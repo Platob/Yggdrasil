@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 from dataclasses import is_dataclass
+from functools import partial
 from typing import Optional, Union, List, Tuple, Any
 
 import pyarrow as pa
@@ -741,6 +742,19 @@ def cast_arrow_tabular(
     return data.__class__.from_arrays(all_arrays, schema=target_arrow_schema)
 
 
+@register_converter(pds.Dataset, pds.Dataset)
+def cast_arrow_dataset(data: pds.Dataset, options: Optional[CastOptions] = None) -> pds.Dataset:
+    if options is None:
+        return data
+
+    caster = partial(cast_arrow_tabular, options=options)
+
+    return pds.dataset(map(caster, data.to_batches(
+        batch_size=256 * 1024,
+        memory_pool=options.arrow_memory_pool
+    )))
+
+
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)
 def cast_arrow_record_batch_reader(
     data: pa.RecordBatchReader,
@@ -1100,9 +1114,20 @@ def record_batch_reader_to_record_batch(
 def arrow_dataset_to_table(
     data: pds.Dataset,
     options: Optional[CastOptions] = None,
-) -> pa.Field:
+) -> pa.Table:
     table = data.to_table()
     return cast_arrow_tabular(table, options)
+
+
+@register_converter(pa.Table, pds.Dataset)
+@register_converter(pa.RecordBatch, pds.Dataset)
+def arrow_tabular_to_dataset(
+    data: Union[pa.Table, pa.RecordBatch],
+    options: Optional[CastOptions] = None,
+) -> pa.Field:
+    data = cast_arrow_tabular(data, options)
+    return pds.dataset([data])
+
 
 # ---------------------------------------------------------------------------
 # Field / Schema converters

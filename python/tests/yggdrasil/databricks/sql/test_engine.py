@@ -7,7 +7,7 @@ from yggdrasil.databricks.workspaces import Workspace
 class TestSQLEngine(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace()
+        self.workspace = Workspace().connect()
         self.engine = self.workspace.sql(catalog_name="trading", schema_name="unittest")
 
     def test_insert_read_same(self):
@@ -25,3 +25,9 @@ class TestSQLEngine(unittest.TestCase):
         ).to_arrow_table()
 
         assert data == read
+
+        self.engine.drop_table(table_name="test_insert")
+
+    def test_daft(self):
+        import daft
+

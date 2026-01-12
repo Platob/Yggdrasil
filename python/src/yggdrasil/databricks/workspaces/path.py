@@ -935,6 +935,7 @@ class DatabricksPath:
     def write_arrow_table(
         self,
         table: pa.Table,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         **kwargs
     ):
@@ -946,12 +947,13 @@ class DatabricksPath:
                     part_path = connected / f"{seed}-{i:05d}-{_rand_str(4)}.parquet"
 
                     with part_path.open(mode="wb") as f:
-                        f.write_arrow_batch(batch)
+                        f.write_arrow_batch(batch, file_format=file_format)
 
                 return connected
 
             connected.open(mode="wb", clone=False).write_arrow_table(
                 table,
+                file_format=file_format,
                 batch_size=batch_size,
                 **kwargs
             )
@@ -960,7 +962,7 @@ class DatabricksPath:
 
     def read_pandas(
         self,
-        batch_size: int = 0,
+        batch_size: Optional[int] = None,
         concat: bool = True,
         **kwargs
     ):

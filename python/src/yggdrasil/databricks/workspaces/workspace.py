@@ -17,13 +17,13 @@ if TYPE_CHECKING:
     from ..compute.cluster import Cluster
 
 from .path import DatabricksPath, DatabricksPathKind
+from ...version import __version__ as YGGDRASIL_VERSION
 from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
 
 if databricks_sdk is not None:
     from databricks.sdk import WorkspaceClient
-    from databricks.sdk.errors import ResourceDoesNotExist, NotFound
+    from databricks.sdk.errors import ResourceDoesNotExist
     from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
-    from databricks.sdk.service import catalog as catalog_svc
     from databricks.sdk.dbutils import FileInfo
     from databricks.sdk.service.files import DirectoryEntry
 
@@ -45,7 +45,7 @@ def _get_env_product():
     v = os.getenv("DATABRICKS_PRODUCT")
 
     if not v:
-        return None
+        return "yggdrasil"
     return v.strip().lower()
 
 
@@ -53,7 +53,7 @@ def _get_env_product_version():
     v = os.getenv("DATABRICKS_PRODUCT_VERSION")
 
     if not v:
-        return None
+        return YGGDRASIL_VERSION
     return v.strip().lower()
 
 
@@ -479,7 +479,6 @@ class Workspace:
         from ..compute.cluster import Cluster
 
         return Cluster(workspace=self, cluster_id=cluster_id, cluster_name=cluster_name, **kwargs)
-
 
 # ---------------------------------------------------------------------------
 # Workspace-bound base class
