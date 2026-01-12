@@ -1,3 +1,5 @@
+"""requests.msal module documentation."""
+
 # auth_session.py
 import os
 import time
@@ -38,12 +40,43 @@ class MSALAuth:
     _access_token: Optional[str] = None
 
     def __setitem__(self, key, value):
+        """
+        __setitem__ documentation.
+        
+        Args:
+            key: Parameter.
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.__setattr__(key, value)
 
     def __getitem__(self, item):
+        """
+        __getitem__ documentation.
+        
+        Args:
+            item: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return getattr(self, item)
 
     def __post_init__(self):
+        """
+        __post_init__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.tenant_id = self.tenant_id or os.environ.get("AZURE_TENANT_ID")
         self.client_id = self.client_id or os.environ.get("AZURE_CLIENT_ID")
         self.client_secret = self.client_secret or os.environ.get("AZURE_CLIENT_SECRET")
@@ -81,6 +114,17 @@ class MSALAuth:
         env: Mapping = None,
         prefix: Optional[str] = None
     ) -> "MSALAuth":
+        """
+        find_in_env documentation.
+        
+        Args:
+            env: Parameter.
+            prefix: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not env:
             env = os.environ
         prefix = prefix or "AZURE_"
@@ -105,6 +149,16 @@ class MSALAuth:
         return None
 
     def export_to(self, to: dict = os.environ):
+        """
+        export_to documentation.
+        
+        Args:
+            to: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         for key, value in (
             ("AZURE_CLIENT_ID", self.client_id),
             ("AZURE_CLIENT_SECRET", self.client_secret),
@@ -116,6 +170,16 @@ class MSALAuth:
 
     @property
     def auth_app(self) -> ConfidentialClientApplication:
+        """
+        auth_app documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self._auth_app:
             self._auth_app = ConfidentialClientApplication(
                 client_id=self.client_id,
@@ -127,19 +191,59 @@ class MSALAuth:
 
     @property
     def expires_in(self) -> float:
+        """
+        expires_in documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return time.time() - self.expires_at
 
     @property
     def expires_at(self) -> float:
+        """
+        expires_at documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.refresh()
 
         return self._expires_at
 
     @property
     def expired(self) -> bool:
+        """
+        expired documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return not self._expires_at or time.time() >= self._expires_at
 
     def refresh(self, force: bool | None = None):
+        """
+        refresh documentation.
+        
+        Args:
+            force: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.expired or force:
             app = self.auth_app
             result = app.acquire_token_for_client(scopes=self.scopes)
@@ -167,6 +271,16 @@ class MSALAuth:
         return f"Bearer {self.access_token}"
 
     def requests_session(self, **kwargs):
+        """
+        requests_session documentation.
+        
+        Args:
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return MSALSession(
             msal_auth=self,
             **kwargs
@@ -182,12 +296,34 @@ class MSALSession(YGGSession):
         *args,
         **kwargs: dict
     ):
+        """
+        __init__ documentation.
+        
+        Args:
+            msal_auth: Parameter.
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            None.
+        """
+
         super().__init__(*args, **kwargs)
         self.msal_auth = msal_auth
 
 
     def prepare_request(self, request):
         # called before sending; ensure header exists
+        """
+        prepare_request documentation.
+        
+        Args:
+            request: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.msal_auth is not None:
             request.headers["Authorization"] = request.headers.get("Authorization", self.msal_auth.authorization)
 

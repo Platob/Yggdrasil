@@ -1,3 +1,5 @@
+"""types.cast.pandas_cast module documentation."""
+
 from typing import Optional
 
 import pyarrow as pa
@@ -33,6 +35,17 @@ if pandas is not None:
     PandasDataFrame = pandas.DataFrame
 
     def pandas_converter(*args, **kwargs):
+        """
+        pandas_converter documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return register_converter(*args, **kwargs)
 
 else:
@@ -44,7 +57,28 @@ else:
     PandasDataFrame = _PandasDummy
 
     def pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """
+        pandas_converter documentation.
+        
+        Args:
+            *_args: Parameter.
+            **_kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         def _decorator(func):
+            """
+            _decorator documentation.
+            
+            Args:
+                func: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             return func
 
         return _decorator

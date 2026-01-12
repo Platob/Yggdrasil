@@ -1,3 +1,5 @@
+"""databricks.sql.engine module documentation."""
+
 import dataclasses
 import logging
 import random
@@ -25,6 +27,17 @@ except ImportError:
     class SparkDeltaTable:
         @classmethod
         def forName(cls, *args, **kwargs):
+            """
+            forName documentation.
+            
+            Args:
+                *args: Parameter.
+                **kwargs: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             from delta.tables import DeltaTable
 
             return DeltaTable.forName(*args, **kwargs)
@@ -71,6 +84,19 @@ class SQLEngine(WorkspaceService):
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
+        """
+        table_full_name documentation.
+        
+        Args:
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            safe_chars: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
 
@@ -86,6 +112,16 @@ class SQLEngine(WorkspaceService):
         self,
         full_name: str,
     ):
+        """
+        _catalog_schema_table_names documentation.
+        
+        Args:
+            full_name: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         parts = [
             _.strip("`") for _ in full_name.split(".")
         ]
@@ -107,6 +143,16 @@ class SQLEngine(WorkspaceService):
         self,
         cluster_size: str = "Small"
     ):
+        """
+        _default_warehouse documentation.
+        
+        Args:
+            cluster_size: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         wk = self.workspace.sdk()
         existing = list(wk.warehouses.list())
         first = None
@@ -130,6 +176,16 @@ class SQLEngine(WorkspaceService):
         self,
         cluster_size = "Small"
     ):
+        """
+        _get_or_default_warehouse_id documentation.
+        
+        Args:
+            cluster_size: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.warehouse_id:
             dft = self._default_warehouse(cluster_size=cluster_size)
 
@@ -138,6 +194,16 @@ class SQLEngine(WorkspaceService):
 
     @staticmethod
     def _random_suffix(prefix: str = "") -> str:
+        """
+        _random_suffix documentation.
+        
+        Args:
+            prefix: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         unique = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
         timestamp = int(time.time() * 1000)
         return f"{prefix}{timestamp}_{unique}"
@@ -234,6 +300,19 @@ class SQLEngine(WorkspaceService):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ):
+        """
+        spark_table documentation.
+        
+        Args:
+            full_name: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not full_name:
             full_name = self.table_full_name(
                 catalog_name=catalog_name,
@@ -267,6 +346,29 @@ class SQLEngine(WorkspaceService):
         spark_options: Optional[Dict[str, Any]] = None
     ):
         # -------- existing logic you provided (kept intact) ----------
+        """
+        insert_into documentation.
+        
+        Args:
+            data: Parameter.
+            location: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            mode: Parameter.
+            cast_options: Parameter.
+            overwrite_schema: Parameter.
+            match_by: Parameter.
+            zorder_by: Parameter.
+            optimize_after_merge: Parameter.
+            vacuum_hours: Parameter.
+            spark_session: Parameter.
+            spark_options: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if pyspark is not None:
             spark_session = SparkSession.getActiveSession() if spark_session is None else spark_session
 
@@ -321,6 +423,29 @@ class SQLEngine(WorkspaceService):
         existing_schema: pa.Schema | None = None,
         temp_volume_path: Optional[Union[str, DatabricksPath]] = None
     ):
+        """
+        arrow_insert_into documentation.
+        
+        Args:
+            data: Parameter.
+            location: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            mode: Parameter.
+            cast_options: Parameter.
+            overwrite_schema: Parameter.
+            match_by: Parameter.
+            zorder_by: Parameter.
+            optimize_after_merge: Parameter.
+            vacuum_hours: Parameter.
+            existing_schema: Parameter.
+            temp_volume_path: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -483,6 +608,28 @@ FROM parquet.`{temp_volume_path}`"""
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
         spark_options: Optional[Dict[str, Any]] = None,
     ):
+        """
+        spark_insert_into documentation.
+        
+        Args:
+            data: Parameter.
+            location: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            mode: Parameter.
+            cast_options: Parameter.
+            overwrite_schema: Parameter.
+            match_by: Parameter.
+            zorder_by: Parameter.
+            optimize_after_merge: Parameter.
+            vacuum_hours: Parameter.
+            spark_options: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -582,6 +729,19 @@ FROM parquet.`{temp_volume_path}`"""
         table_name: Optional[str] = None,
         to_arrow_schema: bool = True
     ) -> Union[pa.Field, pa.Schema]:
+        """
+        get_table_schema documentation.
+        
+        Args:
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            to_arrow_schema: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         full_name = self.table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
@@ -612,6 +772,19 @@ FROM parquet.`{temp_volume_path}`"""
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ):
+        """
+        drop_table documentation.
+        
+        Args:
+            location: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         location, _, _, _ = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -737,6 +910,20 @@ FROM parquet.`{temp_volume_path}`"""
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
+        """
+        _check_location_params documentation.
+        
+        Args:
+            location: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            table_name: Parameter.
+            safe_chars: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if location:
             c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t

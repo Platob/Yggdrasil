@@ -1,3 +1,5 @@
+"""types.python_arrow module documentation."""
+
 import dataclasses
 import datetime
 import decimal
@@ -57,6 +59,15 @@ _INT_UNITS_ORDER = {"s": 0, "ms": 1, "us": 2, "ns": 3}
 
 
 def _is_optional(hint) -> bool:
+    """
+    Determine whether a typing hint includes None (i.e., Optional).
+
+    Args:
+        hint: The typing hint to inspect.
+
+    Returns:
+        True if the hint includes None; otherwise False.
+    """
     origin = get_origin(hint)
 
     if origin is Annotated:
@@ -69,6 +80,15 @@ def _is_optional(hint) -> bool:
 
 
 def _strip_optional(hint):
+    """
+    Remove Optional/None from typing hints, preserving Annotated metadata.
+
+    Args:
+        hint: The typing hint to normalize.
+
+    Returns:
+        The hint without Optional/None wrapping.
+    """
     origin = get_origin(hint)
 
     if origin is Annotated:
@@ -89,6 +109,16 @@ def _strip_optional(hint):
 
 
 def _field_name(hint, index: int | None) -> str:
+    """
+    Resolve a field name from a hint or positional index.
+
+    Args:
+        hint: The typing hint to inspect.
+        index: Optional positional index for unnamed fields.
+
+    Returns:
+        A field name string.
+    """
     name = getattr(hint, "__name__", None)
 
     if name:
@@ -101,6 +131,15 @@ def _field_name(hint, index: int | None) -> str:
 
 
 def _struct_from_dataclass(hint) -> pa.StructType:
+    """
+    Build a struct type from a dataclass definition.
+
+    Args:
+        hint: The dataclass type to inspect.
+
+    Returns:
+        A pyarrow.StructType for the dataclass fields.
+    """
     fields = []
 
     for field in dataclasses.fields(hint):
@@ -113,6 +152,16 @@ def _struct_from_dataclass(hint) -> pa.StructType:
 
 
 def _struct_from_tuple(args, names: list[str] | None = None) -> pa.StructType:
+    """
+    Build a struct type for a tuple, optionally using provided names.
+
+    Args:
+        args: Tuple element type arguments.
+        names: Optional names to apply to tuple fields.
+
+    Returns:
+        A pyarrow.StructType representing the tuple.
+    """
     if names is not None and len(names) != len(args):
         raise TypeError("Tuple metadata names length must match tuple elements")
 
@@ -125,6 +174,16 @@ def _struct_from_tuple(args, names: list[str] | None = None) -> pa.StructType:
 
 
 def _arrow_type_from_metadata(base_hint, metadata):
+    """
+    Infer an Arrow type from Annotated metadata or mapping hints.
+
+    Args:
+        base_hint: The base typing hint.
+        metadata: Annotated metadata entries.
+
+    Returns:
+        A pyarrow.DataType if metadata specifies one; otherwise None.
+    """
     merged_metadata: dict[str, Any] = {}
 
     for item in metadata:
@@ -187,6 +246,15 @@ def _arrow_type_from_metadata(base_hint, metadata):
 
 
 def _arrow_type_from_hint(hint):
+    """
+    Infer an Arrow DataType from a Python type hint.
+
+    Args:
+        hint: The typing hint to convert.
+
+    Returns:
+        A pyarrow.DataType inferred from the hint.
+    """
     if get_origin(hint) is Annotated:
         base_hint, *metadata = get_args(hint)
         metadata_type = _arrow_type_from_metadata(base_hint, metadata)
@@ -229,6 +297,17 @@ def _arrow_type_from_hint(hint):
 
 
 def arrow_field_from_hint(hint, name: str | None = None, index: int | None = None) -> pa.Field:
+    """
+    Build a pyarrow Field from a Python type hint.
+
+    Args:
+        hint: The typing hint to convert.
+        name: Optional field name override.
+        index: Optional positional index used to derive a name.
+
+    Returns:
+        A pyarrow.Field derived from the hint.
+    """
     nullable = _is_optional(hint)
     base_hint = _strip_optional(hint) if nullable else hint
 
@@ -239,7 +318,15 @@ def arrow_field_from_hint(hint, name: str | None = None, index: int | None = Non
 
 
 def is_arrow_type_list_like(arrow_type: pa.DataType) -> bool:
-    """Check if an Arrow type is list-like."""
+    """
+    Check if an Arrow type is list-like.
+
+    Args:
+        arrow_type: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is list-like; otherwise False.
+    """
     return (
         pa.types.is_list(arrow_type)
         or pa.types.is_large_list(arrow_type)
@@ -249,7 +336,15 @@ def is_arrow_type_list_like(arrow_type: pa.DataType) -> bool:
 
 
 def is_arrow_type_string_like(arrow_type: pa.DataType) -> bool:
-    """Check if an Arrow type is string-like."""
+    """
+    Check if an Arrow type is string-like.
+
+    Args:
+        arrow_type: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is string-like; otherwise False.
+    """
     return (
         pa.types.is_string(arrow_type)
         or pa.types.is_large_string(arrow_type)
@@ -258,7 +353,15 @@ def is_arrow_type_string_like(arrow_type: pa.DataType) -> bool:
 
 
 def is_arrow_type_binary_like(arrow_type: pa.DataType) -> bool:
-    """Check if an Arrow type is string-like."""
+    """
+    Check if an Arrow type is binary-like.
+
+    Args:
+        arrow_type: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is binary-like; otherwise False.
+    """
     return (
         pa.types.is_binary(arrow_type)
         or pa.types.is_large_binary(arrow_type)
@@ -269,6 +372,16 @@ def is_arrow_type_binary_like(arrow_type: pa.DataType) -> bool:
 
 
 def _merge_metadata(left: Optional[Dict[bytes, bytes]], right: Optional[Dict[bytes, bytes]]) -> Optional[Dict[bytes, bytes]]:
+    """
+    Combine Arrow metadata dicts, preferring values from the right.
+
+    Args:
+        left: Left-hand metadata mapping.
+        right: Right-hand metadata mapping.
+
+    Returns:
+        A merged metadata dict, or None when both inputs are empty.
+    """
     if not left and not right:
         return None
     out: Dict[bytes, bytes] = {}
@@ -281,31 +394,94 @@ def _merge_metadata(left: Optional[Dict[bytes, bytes]], right: Optional[Dict[byt
 
 
 def _is_null(dt: pa.DataType) -> bool:
+    """
+    Determine whether the Arrow type is null.
+
+    Args:
+        dt: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is null; otherwise False.
+    """
     return pa.types.is_null(dt)
 
 
 def _is_integer(dt: pa.DataType) -> bool:
+    """
+    Determine whether the Arrow type is an integer.
+
+    Args:
+        dt: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is an integer; otherwise False.
+    """
     return pa.types.is_integer(dt)
 
 
 def _is_signed_integer(dt: pa.DataType) -> bool:
+    """
+    Determine whether the Arrow type is a signed integer.
+
+    Args:
+        dt: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is a signed integer; otherwise False.
+    """
     return pa.types.is_signed_integer(dt)
 
 
 def _is_unsigned_integer(dt: pa.DataType) -> bool:
+    """
+    Determine whether the Arrow type is an unsigned integer.
+
+    Args:
+        dt: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is an unsigned integer; otherwise False.
+    """
     return pa.types.is_unsigned_integer(dt)
 
 
 def _is_floating(dt: pa.DataType) -> bool:
+    """
+    Determine whether the Arrow type is floating point.
+
+    Args:
+        dt: The Arrow data type to inspect.
+
+    Returns:
+        True if the type is floating point; otherwise False.
+    """
     return pa.types.is_floating(dt)
 
 
 def _int_bit_width(dt: pa.DataType) -> int:
+    """
+    Return the bit width for an Arrow integer type.
+
+    Args:
+        dt: The Arrow integer data type.
+
+    Returns:
+        Integer bit width for the provided type.
+    """
     # int8/int16/int32/int64/uint8/...
     return dt.bit_width
 
 
 def _digits_for_uint_bits(bits: int) -> int:
+    """
+    Return a safe decimal digit count for an unsigned integer width.
+
+    Args:
+        bits: The unsigned integer bit width.
+
+    Returns:
+        The number of decimal digits needed to represent the max value.
+    """
     # max uint bits -> decimal digits upper bound:
     # uint64 max = 18446744073709551615 => 20 digits
     # 2**bits - 1 has ceil(bits*log10(2)) digits, use safe upper bound
@@ -321,6 +497,13 @@ def _promote_int_types(left: pa.DataType, right: pa.DataType) -> pa.DataType:
       - If both unsigned -> max bit width unsigned
       - If mixed signed/unsigned -> try signed with enough bits (unsigned bits + 1)
         - If that exceeds 64, fall back to decimal128(precision>=digits, scale=0)
+
+    Args:
+        left: Left-hand integer type.
+        right: Right-hand integer type.
+
+    Returns:
+        A compatible Arrow integer or decimal type.
     """
     l_bits = _int_bit_width(left)
     r_bits = _int_bit_width(right)
@@ -364,10 +547,29 @@ def _promote_int_types(left: pa.DataType, right: pa.DataType) -> pa.DataType:
 
 def _promote_decimal_types(left: pa.Decimal128Type | pa.Decimal256Type,
                            right: pa.Decimal128Type | pa.Decimal256Type) -> pa.DataType:
+    """
+    Promote decimal types to a compatible precision and scale.
+
+    Args:
+        left: Left-hand decimal type.
+        right: Right-hand decimal type.
+
+    Returns:
+        A decimal type that can represent both inputs.
+    """
     # Match scale, then set precision to fit both after scale alignment.
     scale = max(left.scale, right.scale)
 
     def adj_precision(d: pa.DataType) -> int:
+        """
+        Adjust precision to preserve integer digits at the target scale.
+
+        Args:
+            d: The decimal data type to inspect.
+
+        Returns:
+            The adjusted precision value.
+        """
         # Increasing scale can require increasing precision to keep same integer digits.
         # integer_digits = precision - scale
         integer_digits = d.precision - d.scale
@@ -382,6 +584,16 @@ def _promote_decimal_types(left: pa.Decimal128Type | pa.Decimal256Type,
 
 
 def _promote_numeric(left: pa.DataType, right: pa.DataType) -> pa.DataType:
+    """
+    Promote numeric Arrow types to a compatible type.
+
+    Args:
+        left: Left-hand numeric type.
+        right: Right-hand numeric type.
+
+    Returns:
+        A numeric type that can represent values from both inputs.
+    """
     # decimal dominates ints/floats if present? Depends on your semantics.
     # Here: decimals keep exactness when mixing with ints; floats win when mixing float+anything non-decimal.
     if pa.types.is_decimal(left) and pa.types.is_decimal(right):
@@ -409,6 +621,16 @@ def _promote_numeric(left: pa.DataType, right: pa.DataType) -> pa.DataType:
 
 
 def _merge_time_units(left_unit: str, right_unit: str) -> str:
+    """
+    Return the higher-resolution time unit between two units.
+
+    Args:
+        left_unit: Left-hand time unit.
+        right_unit: Right-hand time unit.
+
+    Returns:
+        The finer-grained time unit.
+    """
     # choose finer resolution (higher order index)
     return left_unit if _INT_UNITS_ORDER[left_unit] >= _INT_UNITS_ORDER[right_unit] else right_unit
 
@@ -418,6 +640,17 @@ def merge_arrow_types(
     right: Union[pa.DataType, pa.TimestampType, pa.ListType, pa.MapType, pa.StructType],
     add_missing_columns: bool = True
 ) -> pa.DataType:
+    """
+    Merge two Arrow types into a compatible type.
+
+    Args:
+        left: Left-hand Arrow type.
+        right: Right-hand Arrow type.
+        add_missing_columns: Whether to add missing struct fields during merge.
+
+    Returns:
+        A compatible Arrow data type.
+    """
     # null is identity
     if _is_null(left):
         return right
@@ -563,6 +796,17 @@ def merge_arrow_fields(
     right: pa.Field,
     add_missing_columns: bool = True
 ) -> pa.Field:
+    """
+    Merge two Arrow fields into a compatible field.
+
+    Args:
+        left: Left-hand Arrow field.
+        right: Right-hand Arrow field.
+        add_missing_columns: Whether to include missing struct fields.
+
+    Returns:
+        A compatible Arrow field combining both inputs.
+    """
     if left.name != right.name:
         raise TypeError(f"Cannot merge fields with different names: {left.name!r} vs {right.name!r}")
 

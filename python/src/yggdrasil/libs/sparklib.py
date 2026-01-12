@@ -1,3 +1,5 @@
+"""libs.sparklib module documentation."""
+
 from typing import Any
 
 import pyarrow as pa
@@ -54,6 +56,16 @@ except ImportError:  # pragma: no cover - Spark not available
 
         @classmethod
         def getActiveSession(cls):
+            """
+            getActiveSession documentation.
+            
+            Args:
+                None.
+            
+            Returns:
+                The result.
+            """
+
             return None
 
     class SparkDataFrame:

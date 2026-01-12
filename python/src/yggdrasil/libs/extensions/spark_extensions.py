@@ -1,3 +1,5 @@
+"""libs.extensions.spark_extensions module documentation."""
+
 import datetime
 import inspect
 import re
@@ -30,6 +32,16 @@ _COL_RE = re.compile(r"Column<\s*['\"]?`?(.+?)`?['\"]?\s*>")
 
 
 def _require_pyspark(fn_name: str) -> None:
+    """
+    _require_pyspark documentation.
+    
+    Args:
+        fn_name: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if pyspark is None or F is None or T is None:
         raise RuntimeError(
             f"{fn_name} requires PySpark to be available. "
@@ -41,6 +53,17 @@ def getAliases(
     obj: Union[SparkDataFrame, SparkColumn, str, Iterable[Union[SparkDataFrame, SparkColumn, str]]],
     full: bool = True,
 ) -> list[str]:
+    """
+    getAliases documentation.
+    
+    Args:
+        obj: Parameter.
+        full: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if obj is None:
         return []
 
@@ -92,6 +115,18 @@ def latest(
     partitionBy: List[Union[str, SparkColumn]],
     orderBy: List[Union[str, SparkColumn]],
 ) -> SparkDataFrame:
+    """
+    latest documentation.
+    
+    Args:
+        df: Parameter.
+        partitionBy: Parameter.
+        orderBy: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _require_pyspark("latest")
 
     partition_col_names = getAliases(partitionBy)
@@ -123,12 +158,34 @@ def _infer_time_col_spark(df: "pyspark.sql.DataFrame") -> str:
 
 
 def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    _filter_kwargs_for_callable documentation.
+    
+    Args:
+        fn: Parameter.
+        kwargs: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     sig = inspect.signature(fn)  # type: ignore[arg-type]
     allowed = set(sig.parameters.keys())
     return {k: v for k, v in kwargs.items() if (k in allowed and v is not None)}
 
 
 def _append_drop_col_to_spark_schema(schema: "T.StructType", drop_col: str) -> "T.StructType":
+    """
+    _append_drop_col_to_spark_schema documentation.
+    
+    Args:
+        schema: Parameter.
+        drop_col: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _require_pyspark("_append_drop_col_to_spark_schema")
     if drop_col in schema.fieldNames():
         return schema
@@ -169,6 +226,16 @@ def upsample(
     spark_schema = arrow_field_to_spark_field(options.target_field)
 
     def within_group(tb: pa.Table) -> pa.Table:
+        """
+        within_group documentation.
+        
+        Args:
+            tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         res = (
             arrow_table_to_polars_dataframe(tb, options)
             .sort(time_col_name)
@@ -277,6 +344,16 @@ def resample(
         out_options = CastOptions.check_arg(out_arrow_field)
 
     def within_group(tb: pa.Table) -> pa.Table:
+        """
+        within_group documentation.
+        
+        Args:
+            tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         from .polars_extensions import resample
 
         pdf = arrow_table_to_polars_dataframe(tb, in_options)
@@ -329,6 +406,20 @@ def checkJoin(
     *args,
     **kwargs,
 ):
+    """
+    checkJoin documentation.
+    
+    Args:
+        df: Parameter.
+        other: Parameter.
+        on: Parameter.
+        *args: Parameter.
+        **kwargs: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _require_pyspark("checkJoin")
 
     other = convert(other, SparkDataFrame)
@@ -371,12 +462,36 @@ def checkMapInArrow(
     *args,
     **kwargs,
 ):
+    """
+    checkMapInArrow documentation.
+    
+    Args:
+        df: Parameter.
+        func: Parameter.
+        schema: Parameter.
+        *args: Parameter.
+        **kwargs: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _require_pyspark("mapInArrow")
 
     spark_schema = convert(schema, T.StructType)
     arrow_schema = convert(schema, pa.Field)
 
     def patched(batches: Iterable[pa.RecordBatch]):
+        """
+        patched documentation.
+        
+        Args:
+            batches: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         for src in func(batches):
             yield convert(src, pa.RecordBatch, arrow_schema)
 
@@ -395,6 +510,20 @@ def checkMapInPandas(
     *args,
     **kwargs,
 ):
+    """
+    checkMapInPandas documentation.
+    
+    Args:
+        df: Parameter.
+        func: Parameter.
+        schema: Parameter.
+        *args: Parameter.
+        **kwargs: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _require_pyspark("mapInPandas")
 
     import pandas as _pd  # local import so we don't shadow the ..pandas module
@@ -403,6 +532,16 @@ def checkMapInPandas(
     arrow_schema = convert(schema, pa.Field)
 
     def patched(batches: Iterable[_pd.DataFrame]):
+        """
+        patched documentation.
+        
+        Args:
+            batches: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         for src in func(batches):
             yield convert(src, _pd.DataFrame, arrow_schema)
 

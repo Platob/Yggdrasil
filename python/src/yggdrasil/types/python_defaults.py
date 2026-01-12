@@ -1,3 +1,5 @@
+"""types.python_defaults module documentation."""
+
 import dataclasses
 import datetime
 import decimal
@@ -96,6 +98,15 @@ except ImportError:
     _POLARS_DEFAULTS = {}
 
 def _is_optional(hint) -> bool:
+    """
+    Determine whether a typing hint includes None (i.e., Optional).
+
+    Args:
+        hint: The typing hint to inspect.
+
+    Returns:
+        True if the hint includes None; otherwise False.
+    """
     origin = get_origin(hint)
 
     if origin in (Union, types.UnionType):
@@ -105,6 +116,15 @@ def _is_optional(hint) -> bool:
 
 
 def _default_for_collection(origin):
+    """
+    Return an empty default instance for collection-like origins.
+
+    Args:
+        origin: The collection origin type.
+
+    Returns:
+        An empty collection instance, or None if the origin is unsupported.
+    """
     if origin in (list, MutableSequence):
         return []
 
@@ -124,6 +144,15 @@ def _default_for_collection(origin):
 
 
 def _default_for_tuple_args(args):
+    """
+    Build a tuple default using argument defaults or an empty tuple.
+
+    Args:
+        args: Tuple type arguments to use for defaults.
+
+    Returns:
+        A tuple containing default values for each argument.
+    """
     if not args:
         return tuple()
 
@@ -134,6 +163,15 @@ def _default_for_tuple_args(args):
 
 
 def _default_for_dataclass(hint):
+    """
+    Instantiate a dataclass using field defaults or nested defaults.
+
+    Args:
+        hint: The dataclass type to instantiate.
+
+    Returns:
+        An instance of the dataclass populated with defaults.
+    """
     kwargs = {}
 
     for field in dataclasses.fields(hint):
@@ -156,6 +194,16 @@ def default_arrow_scalar(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType, pa.FixedSizeListType],
     nullable: bool
 ):
+    """
+    Return a default Arrow scalar for the provided type and nullability.
+
+    Args:
+        dtype: The Arrow data type for the scalar.
+        nullable: Whether the scalar should be nullable.
+
+    Returns:
+        A pyarrow.Scalar representing a default value for the type.
+    """
     if nullable:
         return pa.scalar(None, type=dtype)
 
@@ -208,6 +256,20 @@ def default_arrow_array(
     chunks: Optional[List[int]] = None,
     scalar_default: Optional[pa.Scalar] = None,
 ) -> Union[pa.Array, pa.ChunkedArray]:
+    """
+    Return a default Arrow array or chunked array with requested sizing.
+
+    Args:
+        dtype: The Arrow data type for the array.
+        nullable: Whether the array values can be null.
+        size: Number of elements to repeat when building a single array.
+        memory_pool: Optional Arrow memory pool to use for allocation.
+        chunks: Optional chunk sizes for building a chunked array.
+        scalar_default: Optional scalar default to repeat; computed if omitted.
+
+    Returns:
+        A pyarrow.Array or pyarrow.ChunkedArray populated with default values.
+    """
     if scalar_default is None:
         scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
 
@@ -240,6 +302,15 @@ def default_arrow_array(
 
 
 def default_python_scalar(hint: Any):
+    """
+    Return a default Python scalar based on a typing hint.
+
+    Args:
+        hint: The typing hint or concrete type to inspect.
+
+    Returns:
+        A Python scalar default derived from the hint.
+    """
     if _is_optional(hint):
         return None
 
@@ -286,6 +357,16 @@ def default_scalar(
     ],
     nullable: Optional[bool] = None
 ):
+    """
+    Return a default scalar for a Python type or Arrow type.
+
+    Args:
+        hint: A Python type, Arrow DataType, or Arrow Field.
+        nullable: Optional override for Arrow nullability.
+
+    Returns:
+        A default scalar value for the provided hint.
+    """
     if isinstance(hint, pa.Field):
         nullable = hint.nullable if nullable is None else nullable
         return default_arrow_scalar(dtype=hint.type, nullable=nullable)

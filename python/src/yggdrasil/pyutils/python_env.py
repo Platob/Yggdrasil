@@ -1,3 +1,5 @@
+"""pyutils.python_env module documentation."""
+
 # yggdrasil/pyutils/python_env.py
 from __future__ import annotations
 
@@ -93,16 +95,47 @@ def _filter_non_pipable_linux_packages(requirements: Iterable[str]) -> List[str]
 
 
 def _is_windows() -> bool:
+    """
+    _is_windows documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     return os.name == "nt"
 
 
 def _norm_env(base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """
+    _norm_env documentation.
+    
+    Args:
+        base: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     env = dict(base or os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 
 def _split_on_tag(stdout: str, tag: str) -> tuple[list[str], Optional[str]]:
+    """
+    _split_on_tag documentation.
+    
+    Args:
+        stdout: Parameter.
+        tag: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     lines = (stdout or "").splitlines()
     before: list[str] = []
     payload: Optional[str] = None
@@ -116,6 +149,16 @@ def _split_on_tag(stdout: str, tag: str) -> tuple[list[str], Optional[str]]:
 
 
 def _dedupe_keep_order(items: Iterable[str]) -> list[str]:
+    """
+    _dedupe_keep_order documentation.
+    
+    Args:
+        items: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     seen: set[str] = set()
     out: list[str] = []
     for x in items:
@@ -135,6 +178,20 @@ def _run_cmd(
     native_tls: bool = False,
     extra_index_url: Optional[Union[str, List[str]]] = None,
 ) -> subprocess.CompletedProcess[str]:
+    """
+    _run_cmd documentation.
+    
+    Args:
+        cmd: Parameter.
+        cwd: Parameter.
+        env: Parameter.
+        native_tls: Parameter.
+        extra_index_url: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     cmd_s = [str(x) for x in cmd]
 
     if native_tls and "--native-tls" not in cmd_s:
@@ -172,14 +229,44 @@ def _run_cmd(
 # -----------------------
 
 def _user_python_dir() -> Path:
+    """
+    _user_python_dir documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     return (Path.home() / ".python").expanduser().resolve()
 
 
 def _user_envs_dir() -> Path:
+    """
+    _user_envs_dir documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     return (_user_python_dir() / "envs").resolve()
 
 
 def _safe_env_name(name: str) -> str:
+    """
+    _safe_env_name documentation.
+    
+    Args:
+        name: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     n = (name or "").strip()
     if not n:
         raise PythonEnvError("Env name cannot be empty")
@@ -194,11 +281,31 @@ def _safe_env_name(name: str) -> str:
 # -----------------------
 
 def _uv_exe_on_path() -> Optional[str]:
+    """
+    _uv_exe_on_path documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     uv = shutil.which("uv")
     return uv
 
 
 def _current_env_script(name: str) -> Optional[Path]:
+    """
+    _current_env_script documentation.
+    
+    Args:
+        name: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     exe = Path(sys.executable).resolve()
     bindir = exe.parent
     if _is_windows():
@@ -212,6 +319,16 @@ def _current_env_script(name: str) -> Optional[Path]:
 
 
 def _ensure_pip_available(*, check: bool = True) -> None:
+    """
+    _ensure_pip_available documentation.
+    
+    Args:
+        check: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     log.debug("checking pip availability")
     p = subprocess.run(
         [sys.executable, "-m", "pip", "--version"],
@@ -245,6 +362,20 @@ def _pip_install_uv_in_current(
     extra_pip_args: Optional[Iterable[str]] = None,
     check: bool = True,
 ) -> None:
+    """
+    _pip_install_uv_in_current documentation.
+    
+    Args:
+        upgrade: Parameter.
+        user: Parameter.
+        index_url: Parameter.
+        extra_pip_args: Parameter.
+        check: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     _ensure_pip_available(check=check)
 
     cmd = [sys.executable, "-m", "pip", "install"]
@@ -267,10 +398,30 @@ def _pip_install_uv_in_current(
 # -----------------------
 
 def _env_lock_key(root: Path) -> str:
+    """
+    _env_lock_key documentation.
+    
+    Args:
+        root: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return str(Path(root).expanduser().resolve())
 
 
 def _get_env_lock(root: Path) -> threading.RLock:
+    """
+    _get_env_lock documentation.
+    
+    Args:
+        root: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     key = _env_lock_key(root)
     with _LOCKS_GUARD:
         lk = _ENV_LOCKS.get(key)
@@ -282,6 +433,16 @@ def _get_env_lock(root: Path) -> threading.RLock:
 
 @contextmanager
 def _locked_env(root: Path):
+    """
+    _locked_env documentation.
+    
+    Args:
+        root: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     lk = _get_env_lock(root)
     lk.acquire()
     try:
@@ -299,6 +460,16 @@ class PythonEnv:
     root: Path
 
     def __post_init__(self) -> None:
+        """
+        __post_init__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
 
     # -----------------------
@@ -307,6 +478,16 @@ class PythonEnv:
 
     @classmethod
     def get_current(cls) -> "PythonEnv":
+        """
+        get_current documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         venv = os.environ.get("VIRTUAL_ENV")
         if venv:
             log.debug("current env from VIRTUAL_ENV=%s", venv)
@@ -325,6 +506,16 @@ class PythonEnv:
     def ensure_uv(
         cls,
     ) -> str:
+        """
+        ensure_uv documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         uv = _uv_exe_on_path()
         if uv:
             return uv
@@ -373,6 +564,19 @@ class PythonEnv:
         require_python: bool = True,
         dedupe: bool = True,
     ) -> Iterator["PythonEnv"]:
+        """
+        iter_user_envs documentation.
+        
+        Args:
+            max_depth: Parameter.
+            include_hidden: Parameter.
+            require_python: Parameter.
+            dedupe: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         base = _user_envs_dir()
         if not base.exists() or not base.is_dir():
             return
@@ -380,6 +584,16 @@ class PythonEnv:
         seen: set[str] = set()
 
         def _python_exe(d: Path) -> Path:
+            """
+            _python_exe documentation.
+            
+            Args:
+                d: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             if os.name == "nt":
                 return d / "Scripts" / "python.exe"
             return d / "bin" / "python"
@@ -418,10 +632,31 @@ class PythonEnv:
 
     @classmethod
     def _user_env_root(cls, name: str) -> Path:
+        """
+        _user_env_root documentation.
+        
+        Args:
+            name: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return _user_envs_dir() / _safe_env_name(name)
 
     @classmethod
     def get(cls, name: str, *, require_python: bool = False) -> Optional["PythonEnv"]:
+        """
+        get documentation.
+        
+        Args:
+            name: Parameter.
+            require_python: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         root = cls._user_env_root(name)
         if not root.exists() or not root.is_dir():
             return None
@@ -620,6 +855,17 @@ class PythonEnv:
 
     @classmethod
     def delete(cls, name: str, *, missing_ok: bool = True) -> None:
+        """
+        delete documentation.
+        
+        Args:
+            name: Parameter.
+            missing_ok: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         root = cls._user_env_root(name)
         with _locked_env(root):
             if not root.exists():
@@ -635,6 +881,16 @@ class PythonEnv:
 
     @property
     def bindir(self) -> Path:
+        """
+        bindir documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if _is_windows():
             scripts = self.root / "Scripts"
             return scripts if scripts.is_dir() else self.root
@@ -642,24 +898,74 @@ class PythonEnv:
 
     @property
     def name(self) -> str:
+        """
+        name documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         n = self.root.name
         return n if n else str(self.root)
 
     @property
     def python_executable(self) -> Path:
+        """
+        python_executable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         exe = "python.exe" if _is_windows() else "python"
         return self.bindir / exe
 
     def exists(self) -> bool:
+        """
+        exists documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.python_executable.exists()
 
     @property
     def version(self) -> str:
+        """
+        version documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         out = self.exec_code("import sys; print(sys.version.split()[0])", check=True)
         return out.strip()
 
     @property
     def version_info(self) -> tuple[int, int, int]:
+        """
+        version_info documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         v = self.version
         m = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)\s*$", v)
         if not m:
@@ -715,6 +1021,16 @@ class PythonEnv:
                 return self
 
         def _slug(s: str) -> str:
+            """
+            _slug documentation.
+            
+            Args:
+                s: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             s = (s or "").strip()
             s = re.sub(r"[^A-Za-z0-9._+-]+", "-", s)
             return s.strip("-") or "unknown"
@@ -768,6 +1084,20 @@ class PythonEnv:
         include_input: bool = True,
         buffers: Optional[MutableMapping[str, str]] = None,
     ):
+        """
+        requirements documentation.
+        
+        Args:
+            out_dir: Parameter.
+            base_name: Parameter.
+            include_frozen: Parameter.
+            include_input: Parameter.
+            buffers: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.export_requirements_matrix(
             python_versions=[self.python_executable],
             out_dir=out_dir, base_name=base_name, include_frozen=include_frozen,
@@ -801,6 +1131,16 @@ class PythonEnv:
           - {base_name}-py<slug>.txt
         """
         def _slug(s: str) -> str:
+            """
+            _slug documentation.
+            
+            Args:
+                s: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             s = (s or "").strip()
             if not s:
                 return "unknown"
@@ -923,6 +1263,16 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                 tmp_ctx.cleanup()
 
     def installed_packages(self, parsed: bool = False) -> List[Tuple[str, str]]:
+        """
+        installed_packages documentation.
+        
+        Args:
+            parsed: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         req = self.requirements()
 
         r = [
@@ -951,6 +1301,20 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         check: bool = True,
     ) -> str:
         # pick interpreter (default = env python)
+        """
+        exec_code documentation.
+        
+        Args:
+            code: Parameter.
+            python: Parameter.
+            cwd: Parameter.
+            env: Parameter.
+            check: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if python is None:
             if not self.exists():
                 raise PythonEnvError(f"Python executable not found in env: {self.python_executable}")
@@ -979,6 +1343,24 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         print_prefix_lines: bool = True,
         strip_payload: bool = True,
     ) -> Any:
+        """
+        exec_code_and_return documentation.
+        
+        Args:
+            code: Parameter.
+            result_tag: Parameter.
+            python: Parameter.
+            cwd: Parameter.
+            env: Parameter.
+            check: Parameter.
+            parse_json: Parameter.
+            print_prefix_lines: Parameter.
+            strip_payload: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         stdout = self.exec_code(
             code,
             python=python,
@@ -1003,6 +1385,16 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             payload = payload.strip()
 
         def _try_parse_obj(s: str) -> Optional[Any]:
+            """
+            _try_parse_obj documentation.
+            
+            Args:
+                s: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             s2 = s.strip()
             if not s2:
                 return None
@@ -1016,6 +1408,17 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                 return None
 
         def _decode_value(val: Any, encoding: Optional[str]) -> Any:
+            """
+            _decode_value documentation.
+            
+            Args:
+                val: Parameter.
+                encoding: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             enc = (encoding or "").strip().lower()
             if enc in ("", "none", "raw", "plain"):
                 return val
@@ -1088,6 +1491,16 @@ print("RESULT:" + json.dumps(top_level))""".strip()
 
     @classmethod
     def cli(cls, argv: Optional[list[str]] = None) -> int:
+        """
+        cli documentation.
+        
+        Args:
+            argv: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         import argparse
 
         parser = argparse.ArgumentParser(prog="python_env", description="User env CRUD + exec (uv everywhere)")

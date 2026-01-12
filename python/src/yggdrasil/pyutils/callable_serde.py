@@ -1,3 +1,5 @@
+"""pyutils.callable_serde module documentation."""
+
 from __future__ import annotations
 
 import base64
@@ -26,6 +28,17 @@ _FLAG_COMPRESSED = 1
 
 
 def _resolve_attr_chain(mod: Any, qualname: str) -> Any:
+    """
+    _resolve_attr_chain documentation.
+    
+    Args:
+        mod: Parameter.
+        qualname: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     obj = mod
     for part in qualname.split("."):
         obj = getattr(obj, part)
@@ -49,6 +62,16 @@ def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
 
 
 def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional[int]]:
+    """
+    _callable_file_line documentation.
+    
+    Args:
+        fn: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     file = None
     line = None
     try:
@@ -85,6 +108,16 @@ def _referenced_global_names(fn: Callable[..., Any]) -> Set[str]:
 
 
 def _is_importable_reference(fn: Callable[..., Any]) -> bool:
+    """
+    _is_importable_reference documentation.
+    
+    Args:
+        fn: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     mod_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
     if not mod_name or not qualname:
@@ -245,6 +278,16 @@ class CallableSerde:
 
     @classmethod
     def from_callable(cls: type[T], x: Union[Callable[..., Any], T]) -> T:
+        """
+        from_callable documentation.
+        
+        Args:
+            x: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if isinstance(x, cls):
             return x
 
@@ -256,14 +299,44 @@ class CallableSerde:
 
     @property
     def module(self) -> Optional[str]:
+        """
+        module documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._module or (getattr(self.fn, "__module__", None) if self.fn else None)
 
     @property
     def qualname(self) -> Optional[str]:
+        """
+        qualname documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._qualname or (getattr(self.fn, "__qualname__", None) if self.fn else None)
 
     @property
     def file(self) -> Optional[str]:
+        """
+        file documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.fn:
             return None
         f, _ = _callable_file_line(self.fn)
@@ -271,6 +344,16 @@ class CallableSerde:
 
     @property
     def line(self) -> Optional[int]:
+        """
+        line documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.fn:
             return None
         _, ln = _callable_file_line(self.fn)
@@ -278,6 +361,16 @@ class CallableSerde:
 
     @property
     def pkg_root(self) -> Optional[str]:
+        """
+        pkg_root documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._pkg_root:
             return self._pkg_root
         if not self.file:
@@ -287,6 +380,16 @@ class CallableSerde:
 
     @property
     def relpath_from_pkg_root(self) -> Optional[str]:
+        """
+        relpath_from_pkg_root documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.file or not self.pkg_root:
             return None
         try:
@@ -296,6 +399,16 @@ class CallableSerde:
 
     @property
     def importable(self) -> bool:
+        """
+        importable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.fn is None:
             return bool(self.module and self.qualname and "<locals>" not in (self.qualname or ""))
         return _is_importable_reference(self.fn)
@@ -309,6 +422,18 @@ class CallableSerde:
         dump_env: str = "none",          # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
     ) -> Dict[str, Any]:
+        """
+        dump documentation.
+        
+        Args:
+            prefer: Parameter.
+            dump_env: Parameter.
+            filter_used_globals: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         kind = prefer
         if kind == "import" and not self.importable:
             kind = "dill"
@@ -352,6 +477,17 @@ class CallableSerde:
 
     @classmethod
     def load(cls: type[T], d: Dict[str, Any], *, add_pkg_root_to_syspath: bool = True) -> T:
+        """
+        load documentation.
+        
+        Args:
+            d: Parameter.
+            add_pkg_root_to_syspath: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         obj = cls(
             fn=None,
             _kind=d.get("kind", "auto"),
@@ -369,6 +505,16 @@ class CallableSerde:
         return obj  # type: ignore[return-value]
 
     def materialize(self, *, add_pkg_root_to_syspath: bool = True) -> Callable[..., Any]:
+        """
+        materialize documentation.
+        
+        Args:
+            add_pkg_root_to_syspath: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.fn is not None:
             return self.fn
 
@@ -402,6 +548,17 @@ class CallableSerde:
         raise ValueError(f"Unknown kind: {kind}")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        __call__ documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         fn = self.materialize()
         return fn(*args, **kwargs)
 

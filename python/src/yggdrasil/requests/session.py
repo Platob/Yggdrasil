@@ -1,3 +1,5 @@
+"""requests.session module documentation."""
+
 from typing import Optional, Dict
 
 from requests import Session
@@ -17,6 +19,19 @@ class YGGSession(Session):
         *args,
         **kwargs
     ):
+        """
+        __init__ documentation.
+        
+        Args:
+            num_retry: Parameter.
+            headers: Parameter.
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            None.
+        """
+
         super(YGGSession, self).__init__()
 
         retry = Retry(

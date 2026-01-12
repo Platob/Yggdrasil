@@ -1,3 +1,5 @@
+"""pyutils.parallel module documentation."""
+
 from __future__ import annotations
 
 import concurrent.futures as cf
@@ -42,9 +44,30 @@ def parallelize(
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, Iterator[R]]:
+        """
+        decorator documentation.
+        
+        Args:
+            func: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         @wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterator[R]:  # type: ignore[misc]
             # Basic sanity checks
+            """
+            wrapper documentation.
+            
+            Args:
+                *args: Parameter.
+                **kwargs: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             if arg_index < 0 or arg_index >= len(args):
                 raise ValueError(
                     f"arg_index {arg_index} out of range for {len(args)} positional args"
@@ -79,6 +102,16 @@ def parallelize(
 
             # Generator that will actually submit tasks and yield results
             def gen() -> Iterator[R]:
+                """
+                gen documentation.
+                
+                Args:
+                    None.
+                
+                Returns:
+                    The result.
+                """
+
                 futures: list[cf.Future[R]] = []
                 processed = 0  # for progress
 
@@ -87,6 +120,16 @@ def parallelize(
                 ctx = executor if owns_executor else nullcontext(executor)
 
                 def _print_progress() -> None:
+                    """
+                    _print_progress documentation.
+                    
+                    Args:
+                        None.
+                    
+                    Returns:
+                        The result.
+                    """
+
                     if not show_progress:
                         return
 

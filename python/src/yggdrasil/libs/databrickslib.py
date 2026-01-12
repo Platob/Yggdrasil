@@ -1,3 +1,5 @@
+"""libs.databrickslib module documentation."""
+
 try:
     import databricks
     import databricks.sdk  # type: ignore
@@ -7,6 +9,16 @@ try:
 except ImportError:
     class _DatabricksDummy:
         def __getattr__(self, item):
+            """
+            __getattr__ documentation.
+            
+            Args:
+                item: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             require_databricks_sdk()
 
     databricks = _DatabricksDummy
@@ -14,6 +26,16 @@ except ImportError:
 
 
 def require_databricks_sdk():
+    """
+    require_databricks_sdk documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     if databricks_sdk is None:
         raise ImportError(
             "databricks_sdk is required to use this function. "

@@ -1,3 +1,5 @@
+"""databricks.sql.statement_result module documentation."""
+
 import dataclasses
 import threading
 import time
@@ -22,6 +24,17 @@ except ImportError:
     class SparkDeltaTable:
         @classmethod
         def forName(cls, *args, **kwargs):
+            """
+            forName documentation.
+            
+            Args:
+                *args: Parameter.
+                **kwargs: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             from delta.tables import DeltaTable
 
             return DeltaTable.forName(*args, **kwargs)
@@ -60,6 +73,16 @@ class StatementResult:
     _arrow_table: Optional[pa.Table] = dataclasses.field(default=None, repr=False)
 
     def __getstate__(self):
+        """
+        __getstate__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         state = self.__dict__.copy()
 
         _spark_df = state.pop("_spark_df", None)
@@ -70,29 +93,89 @@ class StatementResult:
         return state
 
     def __setstate__(self, state):
+        """
+        __setstate__ documentation.
+        
+        Args:
+            state: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         _spark_df = state.pop("_spark_df")
 
     def __iter__(self):
+        """
+        __iter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.to_arrow_batches()
 
     @property
     def is_spark_sql(self):
+        """
+        is_spark_sql documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._spark_df is not None
 
     @property
     def response(self):
+        """
+        response documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._response is None and not self.is_spark_sql:
             self.response = self.workspace.sdk().statement_execution.get_statement(self.statement_id)
         return self._response
 
     @response.setter
     def response(self, value: "StatementResponse"):
+        """
+        response documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._response = value
         self._response_refresh_time = time.time()
 
         self.statement_id = self._response.statement_id
 
     def fresh_response(self, delay: float):
+        """
+        fresh_response documentation.
+        
+        Args:
+            delay: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_spark_sql:
             return self._response
 
@@ -102,6 +185,16 @@ class StatementResult:
         return self._response
 
     def result_data_at(self, chunk_index: int):
+        """
+        result_data_at documentation.
+        
+        Args:
+            chunk_index: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
 
         return sdk.statement_execution.get_statement_result_chunk_n(
@@ -111,10 +204,30 @@ class StatementResult:
 
     @property
     def workspace(self):
+        """
+        workspace documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.engine.workspace
 
     @property
     def status(self):
+        """
+        status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             return StatementStatus(
                 state=StatementState.SUCCEEDED
@@ -129,20 +242,60 @@ class StatementResult:
 
     @property
     def state(self):
+        """
+        state documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.status.state
 
     @property
     def manifest(self):
+        """
+        manifest documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_spark_sql:
             return None
         return self.response.manifest
 
     @property
     def result(self):
+        """
+        result documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.response.result
 
     @property
     def done(self):
+        """
+        done documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             return True
 
@@ -155,6 +308,16 @@ class StatementResult:
 
     @property
     def failed(self):
+        """
+        failed documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             return True
 
@@ -165,14 +328,44 @@ class StatementResult:
 
     @property
     def persisted(self):
+        """
+        persisted documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._spark_df is not None or self._arrow_table is not None
 
     def persist(self):
+        """
+        persist documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.persisted:
             self._arrow_table = self.to_arrow_table()
         return self
 
     def external_links(self):
+        """
+        external_links documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         assert self.disposition == Disposition.EXTERNAL_LINKS, "Cannot get from %s, disposition %s != %s" % (
             self, self.disposition, Disposition.EXTERNAL_LINKS
         )
@@ -222,6 +415,16 @@ class StatementResult:
                 )
 
     def raise_for_status(self):
+        """
+        raise_for_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.failed:
             # grab error info if present
             err = self.status.error
@@ -244,6 +447,17 @@ class StatementResult:
         timeout: Optional[int] = None,
         poll_interval: Optional[float] = None
     ):
+        """
+        wait documentation.
+        
+        Args:
+            timeout: Parameter.
+            poll_interval: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.done:
             return self
 
@@ -265,6 +479,16 @@ class StatementResult:
         return current
 
     def arrow_schema(self):
+        """
+        arrow_schema documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             if self._arrow_table is not None:
                 return self._arrow_table.schema
@@ -277,6 +501,16 @@ class StatementResult:
         return pa.schema(fields)
 
     def to_arrow_table(self, parallel_pool: Optional[int] = 4) -> pa.Table:
+        """
+        to_arrow_table documentation.
+        
+        Args:
+            parallel_pool: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             if self._arrow_table:
                 return self._arrow_table
@@ -295,6 +529,16 @@ class StatementResult:
         self,
         parallel_pool: Optional[int] = 4
     ) -> Iterator[pa.RecordBatch]:
+        """
+        to_arrow_batches documentation.
+        
+        Args:
+            parallel_pool: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.persisted:
             if self._arrow_table is not None:
                 for batch in self._arrow_table.to_batches(max_chunksize=64 * 1024):
@@ -307,6 +551,16 @@ class StatementResult:
 
             def _get_session():
                 # requests.Session-style objects are not reliably thread-safe, so keep one per thread
+                """
+                _get_session documentation.
+                
+                Args:
+                    None.
+                
+                Returns:
+                    The result.
+                """
+
                 s = getattr(_tls, "session", None)
                 if s is None:
                     s = YGGSession()
@@ -314,6 +568,16 @@ class StatementResult:
                 return s
 
             def _fetch_bytes(link):
+                """
+                _fetch_bytes documentation.
+                
+                Args:
+                    link: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 s = _get_session()
                 resp = s.get(link.external_link, verify=False, timeout=10)
                 resp.raise_for_status()
@@ -337,6 +601,16 @@ class StatementResult:
                 next_idx = 0
 
                 def submit_more(ex):
+                    """
+                    submit_more documentation.
+                    
+                    Args:
+                        ex: Parameter.
+                    
+                    Returns:
+                        The result.
+                    """
+
                     while len(pending) < max_in_flight:
                         try:
                             idx, link = next(links_iter)
@@ -379,15 +653,45 @@ class StatementResult:
         self,
         parallel_pool: Optional[int] = 4
     ) -> "pandas.DataFrame":
+        """
+        to_pandas documentation.
+        
+        Args:
+            parallel_pool: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.to_arrow_table(parallel_pool=parallel_pool).to_pandas()
 
     def to_polars(
         self,
         parallel_pool: Optional[int] = 4
     ) -> "polars.DataFrame":
+        """
+        to_polars documentation.
+        
+        Args:
+            parallel_pool: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return polars.from_arrow(self.to_arrow_table(parallel_pool=parallel_pool))
 
     def to_spark(self):
+        """
+        to_spark documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._spark_df:
             return self._spark_df
 

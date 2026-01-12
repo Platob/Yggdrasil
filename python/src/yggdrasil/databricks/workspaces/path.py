@@ -1,3 +1,5 @@
+"""databricks.workspaces.path module documentation."""
+
 # src/yggdrasil/databricks/workspaces/databricks_path.py
 from __future__ import annotations
 
@@ -49,6 +51,16 @@ __all__ = [
 
 
 def _flatten_parts(parts: Union[list[str], str]) -> list[str]:
+    """
+    _flatten_parts documentation.
+    
+    Args:
+        parts: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if isinstance(parts, str):
         parts = [parts]
 
@@ -64,6 +76,16 @@ def _flatten_parts(parts: Union[list[str], str]) -> list[str]:
 
 
 def _rand_str(n: int) -> str:
+    """
+    _rand_str documentation.
+    
+    Args:
+        n: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     alphabet = string.ascii_letters + string.digits
     return "".join(random.choices(alphabet, k=n))
 
@@ -113,6 +135,17 @@ class DatabricksPath:
         obj: Union["DatabricksPath", str, List[str]],
         workspace: Optional["Workspace"] = None,
     ) -> "DatabricksPath":
+        """
+        parse documentation.
+        
+        Args:
+            obj: Parameter.
+            workspace: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not obj:
             return DatabricksPath(kind=DatabricksPathKind.DBFS, parts=[], _workspace=workspace)
 
@@ -153,9 +186,29 @@ class DatabricksPath:
         return DatabricksPath(kind=kind, parts=tail, _workspace=workspace)
 
     def __hash__(self):
+        """
+        __hash__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return hash(self.full_path())
 
     def __eq__(self, other):
+        """
+        __eq__ documentation.
+        
+        Args:
+            other: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not isinstance(other, DatabricksPath):
             if isinstance(other, str):
                 return str(self) == other
@@ -163,6 +216,16 @@ class DatabricksPath:
         return self.kind == other.kind and self.parts == other.parts
 
     def __truediv__(self, other):
+        """
+        __truediv__ documentation.
+        
+        Args:
+            other: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not other:
             return self
 
@@ -175,25 +238,97 @@ class DatabricksPath:
         )
 
     def __enter__(self):
+        """
+        __enter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.connect(clone=False)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        __exit__ documentation.
+        
+        Args:
+            exc_type: Parameter.
+            exc_val: Parameter.
+            exc_tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self._workspace is not None:
             self._workspace.__exit__(exc_type, exc_val, exc_tb)
 
     def __str__(self):
+        """
+        __str__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.full_path()
 
     def __repr__(self):
+        """
+        __repr__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.url()
 
     def __fspath__(self):
+        """
+        __fspath__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.full_path()
 
     def url(self):
+        """
+        url documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return "dbfs://%s" % self.full_path()
 
     def full_path(self) -> str:
+        """
+        full_path documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind == DatabricksPathKind.DBFS:
             return self.dbfs_full_path()
         elif self.kind == DatabricksPathKind.WORKSPACE:
@@ -204,10 +339,30 @@ class DatabricksPath:
             raise ValueError(f"Unknown DatabricksPath kind: {self.kind!r}")
 
     def filesystem(self, workspace: Optional["Workspace"] = None):
+        """
+        filesystem documentation.
+        
+        Args:
+            workspace: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.filesytem(workspace=workspace)
 
     @property
     def parent(self):
+        """
+        parent documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.parts:
             return self
 
@@ -226,6 +381,16 @@ class DatabricksPath:
 
     @property
     def workspace(self):
+        """
+        workspace documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._workspace is None:
             from .workspace import Workspace
 
@@ -234,10 +399,30 @@ class DatabricksPath:
 
     @workspace.setter
     def workspace(self, value):
+        """
+        workspace documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._workspace = value
 
     @property
     def name(self) -> str:
+        """
+        name documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.parts:
             return ""
 
@@ -248,6 +433,16 @@ class DatabricksPath:
 
     @property
     def extension(self) -> str:
+        """
+        extension documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         name = self.name
         if "." in name:
             return name.split(".")[-1]
@@ -255,6 +450,16 @@ class DatabricksPath:
 
     @property
     def file_format(self) -> FileFormat:
+        """
+        file_format documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         ext = self.extension
 
         if ext == "parquet":
@@ -270,22 +475,62 @@ class DatabricksPath:
 
     @property
     def content_length(self):
+        """
+        content_length documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._size is None:
             self.refresh_status()
         return self._size
 
     @content_length.setter
     def content_length(self, value: int):
+        """
+        content_length documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._size = value
 
     @property
     def mtime(self) -> Optional[float]:
+        """
+        mtime documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._mtime is None:
             self.refresh_status()
         return self._mtime
 
     @mtime.setter
     def mtime(self, value: float):
+        """
+        mtime documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not isinstance(value, float):
             if isinstance(value, dt.datetime):
                 value = value.timestamp()
@@ -297,6 +542,16 @@ class DatabricksPath:
 
     @property
     def file_type(self):
+        """
+        file_type documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file():
             return FileType.File
         elif self.is_dir():
@@ -306,6 +561,16 @@ class DatabricksPath:
 
     @property
     def file_info(self):
+        """
+        file_info documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return FileInfo(
             path=self.full_path(),
             type=self.file_type,
@@ -314,23 +579,73 @@ class DatabricksPath:
         )
 
     def is_file(self):
+        """
+        is_file documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._is_file is None:
             self.refresh_status()
         return self._is_file
 
     def is_dir(self):
+        """
+        is_dir documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._is_dir is None:
             self.refresh_status()
         return self._is_dir
 
     def is_dir_sink(self):
+        """
+        is_dir_sink documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.is_dir() or (self.parts and self.parts[-1] == "")
 
     @property
     def connected(self) -> bool:
+        """
+        connected documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._workspace is not None and self._workspace.connected
 
     def connect(self, clone: bool = False) -> "DatabricksPath":
+        """
+        connect documentation.
+        
+        Args:
+            clone: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         workspace = self.workspace.connect(clone=clone)
 
         if clone:
@@ -343,9 +658,29 @@ class DatabricksPath:
         return self
 
     def close(self):
+        """
+        close documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         pass
 
     def volume_parts(self) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[PurePosixPath]]:
+        """
+        volume_parts documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind != DatabricksPathKind.VOLUME:
             return None, None, None, None
 
@@ -358,6 +693,16 @@ class DatabricksPath:
         return catalog, schema, volume, self.parts[3:]  # type: ignore[return-value]
 
     def refresh_status(self) -> "DatabricksPath":
+        """
+        refresh_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind == DatabricksPathKind.VOLUME:
             self._refresh_volume_status()
         elif self.kind == DatabricksPathKind.WORKSPACE:
@@ -367,6 +712,16 @@ class DatabricksPath:
         return self
 
     def _refresh_volume_status(self):
+        """
+        _refresh_volume_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         full_path = self.files_full_path()
         sdk = self.workspace.sdk()
 
@@ -398,6 +753,16 @@ class DatabricksPath:
         return self
 
     def _refresh_workspace_status(self):
+        """
+        _refresh_workspace_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
 
         try:
@@ -419,6 +784,16 @@ class DatabricksPath:
         return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
 
     def _refresh_dbfs_status(self):
+        """
+        _refresh_dbfs_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
 
         try:
@@ -445,6 +820,19 @@ class DatabricksPath:
         size: Optional[int] = None,
         mtime: Optional[float] = None,
     ):
+        """
+        reset_metadata documentation.
+        
+        Args:
+            is_file: Parameter.
+            is_dir: Parameter.
+            size: Parameter.
+            mtime: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._is_file = is_file
         self._is_dir = is_dir
         self._size = size
@@ -455,6 +843,16 @@ class DatabricksPath:
     # ---- API path normalization helpers ----
 
     def workspace_full_path(self) -> str:
+        """
+        workspace_full_path documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.parts:
             return "/Workspace"
 
@@ -463,6 +861,16 @@ class DatabricksPath:
         return "/Workspace/%s" % "/".join(parts)
 
     def dbfs_full_path(self) -> str:
+        """
+        dbfs_full_path documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.parts:
             return "/dbfs"
 
@@ -471,6 +879,16 @@ class DatabricksPath:
         return "/dbfs/%s" % "/".join(parts)
 
     def files_full_path(self) -> str:
+        """
+        files_full_path documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if not self.parts:
             return "/Volumes"
 
@@ -479,9 +897,31 @@ class DatabricksPath:
         return "/Volumes/%s" % "/".join(parts)
 
     def exists(self, *, follow_symlinks=True) -> bool:
+        """
+        exists documentation.
+        
+        Args:
+            follow_symlinks: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return bool(self.is_file() or self.is_dir())
 
     def mkdir(self, mode=None, parents=True, exist_ok=True):
+        """
+        mkdir documentation.
+        
+        Args:
+            mode: Parameter.
+            parents: Parameter.
+            exist_ok: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         try:
             if self.kind == DatabricksPathKind.WORKSPACE:
                 self.make_workspace_dir(parents=parents, exist_ok=exist_ok)
@@ -502,6 +942,17 @@ class DatabricksPath:
         return self
 
     def _ensure_volume(self, exist_ok: bool = True, sdk=None):
+        """
+        _ensure_volume documentation.
+        
+        Args:
+            exist_ok: Parameter.
+            sdk: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
         sdk = self.workspace.sdk() if sdk is None else sdk
 
@@ -532,6 +983,17 @@ class DatabricksPath:
                     raise
 
     def make_volume_dir(self, parents=True, exist_ok=True):
+        """
+        make_volume_dir documentation.
+        
+        Args:
+            parents: Parameter.
+            exist_ok: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         path = self.files_full_path()
         sdk = self.workspace.sdk()
 
@@ -553,6 +1015,17 @@ class DatabricksPath:
         return self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
 
     def make_workspace_dir(self, parents=True, exist_ok=True):
+        """
+        make_workspace_dir documentation.
+        
+        Args:
+            parents: Parameter.
+            exist_ok: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         path = self.workspace_full_path()
         sdk = self.workspace.sdk()
 
@@ -565,6 +1038,17 @@ class DatabricksPath:
         return self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
 
     def make_dbfs_dir(self, parents=True, exist_ok=True):
+        """
+        make_dbfs_dir documentation.
+        
+        Args:
+            parents: Parameter.
+            exist_ok: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         path = self.dbfs_full_path()
         sdk = self.workspace.sdk()
 
@@ -577,6 +1061,16 @@ class DatabricksPath:
         return self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
 
     def remove(self, recursive: bool = True):
+        """
+        remove documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind == DatabricksPathKind.VOLUME:
             return self._remove_volume_obj(recursive=recursive)
         elif self.kind == DatabricksPathKind.WORKSPACE:
@@ -585,21 +1079,61 @@ class DatabricksPath:
             return self._remove_dbfs_obj(recursive=recursive)
 
     def _remove_volume_obj(self, recursive: bool = True):
+        """
+        _remove_volume_obj documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file():
             return self._remove_volume_file()
         return self._remove_volume_dir(recursive=recursive)
 
     def _remove_workspace_obj(self, recursive: bool = True):
+        """
+        _remove_workspace_obj documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file():
             return self._remove_workspace_file()
         return self._remove_workspace_dir(recursive=recursive)
 
     def _remove_dbfs_obj(self, recursive: bool = True):
+        """
+        _remove_dbfs_obj documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file():
             return self._remove_dbfs_file()
         return self._remove_dbfs_dir(recursive=recursive)
 
     def rmfile(self):
+        """
+        rmfile documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         try:
             if self.kind == DatabricksPathKind.VOLUME:
                 return self._remove_volume_file()
@@ -612,6 +1146,16 @@ class DatabricksPath:
         return self
 
     def _remove_volume_file(self):
+        """
+        _remove_volume_file documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         try:
             sdk.files.delete(self.files_full_path())
@@ -620,6 +1164,16 @@ class DatabricksPath:
         return self
 
     def _remove_workspace_file(self):
+        """
+        _remove_workspace_file documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         try:
             sdk.workspace.delete(self.workspace_full_path(), recursive=True)
@@ -628,6 +1182,16 @@ class DatabricksPath:
         return self
 
     def _remove_dbfs_file(self):
+        """
+        _remove_dbfs_file documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         try:
             sdk.dbfs.delete(self.dbfs_full_path(), recursive=True)
@@ -636,6 +1200,16 @@ class DatabricksPath:
         return self
 
     def rmdir(self, recursive: bool = True):
+        """
+        rmdir documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind == DatabricksPathKind.VOLUME:
             return self._remove_volume_dir(recursive=recursive)
         elif self.kind == DatabricksPathKind.WORKSPACE:
@@ -644,6 +1218,16 @@ class DatabricksPath:
             return self._remove_dbfs_dir(recursive=recursive)
 
     def _remove_workspace_dir(self, recursive: bool = True):
+        """
+        _remove_workspace_dir documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         try:
             sdk.workspace.delete(self.workspace_full_path(), recursive=recursive)
@@ -653,6 +1237,16 @@ class DatabricksPath:
         return self
 
     def _remove_dbfs_dir(self, recursive: bool = True):
+        """
+        _remove_dbfs_dir documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         try:
             sdk.dbfs.delete(self.dbfs_full_path(), recursive=recursive)
@@ -662,6 +1256,16 @@ class DatabricksPath:
         return self
 
     def _remove_volume_dir(self, recursive: bool = True):
+        """
+        _remove_volume_dir documentation.
+        
+        Args:
+            recursive: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         root_path = self.files_full_path()
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
         sdk = self.workspace.sdk()
@@ -691,6 +1295,18 @@ class DatabricksPath:
         return self.reset_metadata()
 
     def ls(self, recursive: bool = False, fetch_size: int = None, allow_not_found: bool = True):
+        """
+        ls documentation.
+        
+        Args:
+            recursive: Parameter.
+            fetch_size: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.kind == DatabricksPathKind.VOLUME:
             yield from self._ls_volume(recursive=recursive, fetch_size=fetch_size, allow_not_found=allow_not_found)
         elif self.kind == DatabricksPathKind.WORKSPACE:
@@ -699,6 +1315,18 @@ class DatabricksPath:
             yield from self._ls_dbfs(recursive=recursive, allow_not_found=allow_not_found)
 
     def _ls_volume(self, recursive: bool = False, fetch_size: int = None, allow_not_found: bool = True):
+        """
+        _ls_volume documentation.
+        
+        Args:
+            recursive: Parameter.
+            fetch_size: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
         sdk = self.workspace.sdk()
 
@@ -780,6 +1408,17 @@ class DatabricksPath:
                     raise
 
     def _ls_workspace(self, recursive: bool = True, allow_not_found: bool = True):
+        """
+        _ls_workspace documentation.
+        
+        Args:
+            recursive: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         full_path = self.workspace_full_path()
 
@@ -799,6 +1438,17 @@ class DatabricksPath:
                 raise
 
     def _ls_dbfs(self, recursive: bool = True, allow_not_found: bool = True):
+        """
+        _ls_dbfs documentation.
+        
+        Args:
+            recursive: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         full_path = self.dbfs_full_path()
 
@@ -822,6 +1472,18 @@ class DatabricksPath:
         encoding=None,
         clone: bool = False,
     ) -> DatabricksIO:
+        """
+        open documentation.
+        
+        Args:
+            mode: Parameter.
+            encoding: Parameter.
+            clone: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         path = self.connect(clone=clone)
 
         return (
@@ -835,6 +1497,17 @@ class DatabricksPath:
         dest: Union["DatabricksIO", "DatabricksPath", str],
         allow_not_found: bool = True,
     ) -> None:
+        """
+        copy_to documentation.
+        
+        Args:
+            dest: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file() and dest.is_file():
             with self.open(mode="rb") as src:
                 src.copy_to(dest=dest)
@@ -869,6 +1542,18 @@ class DatabricksPath:
         filesystem: Optional[FileSystem] = None,
         **kwargs
     ):
+        """
+        arrow_dataset documentation.
+        
+        Args:
+            workspace: Parameter.
+            filesystem: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         filesystem = self.filesystem(workspace=workspace) if filesystem is None else filesystem
 
         return ds.dataset(
@@ -883,6 +1568,18 @@ class DatabricksPath:
         concat: bool = True,
         **kwargs
     ) -> pa.Table:
+        """
+        read_arrow_table documentation.
+        
+        Args:
+            batch_size: Parameter.
+            concat: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_file():
             with self.open("rb") as f:
                 return f.read_arrow_table(batch_size=batch_size, **kwargs)
@@ -923,6 +1620,18 @@ class DatabricksPath:
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_arrow documentation.
+        
+        Args:
+            table: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not isinstance(table, pa.Table):
             table = convert(table, pa.Table)
 
@@ -939,6 +1648,19 @@ class DatabricksPath:
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_arrow_table documentation.
+        
+        Args:
+            table: Parameter.
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         with self.connect(clone=False) as connected:
             if connected.is_dir_sink():
                 seed = int(time.time() * 1000)
@@ -966,6 +1688,18 @@ class DatabricksPath:
         concat: bool = True,
         **kwargs
     ):
+        """
+        read_pandas documentation.
+        
+        Args:
+            batch_size: Parameter.
+            concat: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if concat:
             return self.read_arrow_table(batch_size=batch_size, concat=True, **kwargs).to_pandas()
 
@@ -978,6 +1712,18 @@ class DatabricksPath:
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_pandas documentation.
+        
+        Args:
+            df: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.write_arrow_table(pa.table(df), batch_size=batch_size, **kwargs)
 
     def read_polars(
@@ -988,6 +1734,20 @@ class DatabricksPath:
         concat: bool = True,
         **kwargs
     ):
+        """
+        read_polars documentation.
+        
+        Args:
+            batch_size: Parameter.
+            how: Parameter.
+            rechunk: Parameter.
+            concat: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         import polars as pl
 
         if self.is_file():
@@ -1059,6 +1819,17 @@ class DatabricksPath:
         query: str,
         engine: str = "auto"
     ):
+        """
+        sql documentation.
+        
+        Args:
+            query: Parameter.
+            engine: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if engine == "auto":
             try:
                 import duckdb
@@ -1105,6 +1876,17 @@ def databricks_path_to_arrow_table(
     data: DatabricksPath,
     options: Optional[CastOptions] = None,
 ) -> pa.Table:
+    """
+    databricks_path_to_arrow_table documentation.
+    
+    Args:
+        data: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return cast_arrow_tabular(
         data.read_arrow_table(),
         options
@@ -1116,6 +1898,17 @@ def databricks_path_to_polars(
     data: DatabricksPath,
     options: Optional[CastOptions] = None,
 ) -> PolarsDataFrame:
+    """
+    databricks_path_to_polars documentation.
+    
+    Args:
+        data: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return cast_polars_dataframe(
         data.read_polars(),
         options

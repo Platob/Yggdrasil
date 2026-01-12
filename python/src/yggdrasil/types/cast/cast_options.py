@@ -1,3 +1,5 @@
+"""types.cast.cast_options module documentation."""
+
 import dataclasses
 from typing import Optional, Union, List, Any
 
@@ -69,6 +71,24 @@ class CastOptions:
         target_field: pa.Field | pa.Schema | pa.DataType | None = None,
         **kwargs
     ):
+        """
+        safe_init documentation.
+        
+        Args:
+            safe: Parameter.
+            add_missing_columns: Parameter.
+            strict_match_names: Parameter.
+            allow_add_columns: Parameter.
+            eager: Parameter.
+            datetime_patterns: Parameter.
+            source_field: Parameter.
+            target_field: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         built = CastOptions(
             safe=safe,
             add_missing_columns=add_missing_columns,
@@ -169,6 +189,16 @@ class CastOptions:
         return result
 
     def check_source(self, obj: Any):
+        """
+        check_source documentation.
+        
+        Args:
+            obj: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.source_field is not None or obj is None:
             return self
 
@@ -177,6 +207,16 @@ class CastOptions:
         return self
 
     def need_arrow_type_cast(self, source_obj: Any):
+        """
+        need_arrow_type_cast documentation.
+        
+        Args:
+            source_obj: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_field is None:
             return False
 
@@ -185,6 +225,16 @@ class CastOptions:
         return self.source_field.type != self.target_field.type
 
     def need_polars_type_cast(self, source_obj: Any):
+        """
+        need_polars_type_cast documentation.
+        
+        Args:
+            source_obj: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_polars_field is None:
             return False
 
@@ -193,6 +243,16 @@ class CastOptions:
         return self.source_polars_field.dtype != self.target_polars_field.dtype
 
     def need_spark_type_cast(self, source_obj: Any):
+        """
+        need_spark_type_cast documentation.
+        
+        Args:
+            source_obj: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_spark_field is None:
             return False
 
@@ -201,6 +261,16 @@ class CastOptions:
         return self.source_spark_field.dataType != self.target_spark_field.dataType
 
     def need_nullability_check(self, source_obj: Any):
+        """
+        need_nullability_check documentation.
+        
+        Args:
+            source_obj: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_field is None:
             return False
 
@@ -213,6 +283,17 @@ class CastOptions:
         arrow_field: pa.Field,
         index: int
     ):
+        """
+        _child_arrow_field documentation.
+        
+        Args:
+            arrow_field: Parameter.
+            index: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         source_type: Union[
             pa.DataType, pa.ListType, pa.StructType, pa.MapType
         ] = arrow_field.type
@@ -235,6 +316,16 @@ class CastOptions:
 
     @property
     def source_field(self):
+        """
+        source_field documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.source_arrow_field
 
     @source_field.setter
@@ -248,10 +339,30 @@ class CastOptions:
         object.__setattr__(self, "source_arrow_field", value)
 
     def source_child_arrow_field(self, index: int):
+        """
+        source_child_arrow_field documentation.
+        
+        Args:
+            index: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self._child_arrow_field(self.source_arrow_field, index=index)
 
     @property
     def source_polars_field(self):
+        """
+        source_polars_field documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.source_arrow_field is not None and self._source_polars_field is None:
             from ...types.cast.polars_cast import arrow_field_to_polars_field
 
@@ -260,6 +371,16 @@ class CastOptions:
 
     @property
     def source_spark_field(self):
+        """
+        source_spark_field documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.source_arrow_field is not None and self._source_spark_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
@@ -275,6 +396,16 @@ class CastOptions:
 
     @property
     def target_field_name(self):
+        """
+        target_field_name documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_field is None:
             if self.source_field is not None:
                 return self.source_field.name
@@ -295,10 +426,30 @@ class CastOptions:
         object.__setattr__(self, "target_arrow_field", value)
 
     def target_child_arrow_field(self, index: int):
+        """
+        target_child_arrow_field documentation.
+        
+        Args:
+            index: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self._child_arrow_field(self.target_arrow_field, index=index)
 
     @property
     def target_polars_field(self):
+        """
+        target_polars_field documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_arrow_field is not None and self._target_polars_field is None:
             from ...types.cast.polars_cast import arrow_field_to_polars_field
 
@@ -307,6 +458,16 @@ class CastOptions:
 
     @property
     def target_spark_field(self):
+        """
+        target_spark_field documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.target_arrow_field is not None and self._target_spark_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
@@ -329,6 +490,16 @@ class CastOptions:
 
     @property
     def target_spark_schema(self) -> Optional["pyspark.sql.types.StructType"]:
+        """
+        target_spark_schema documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         arrow_schema = self.target_arrow_schema
 
         if arrow_schema is not None:

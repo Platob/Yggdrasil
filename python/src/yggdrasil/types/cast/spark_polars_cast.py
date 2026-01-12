@@ -1,3 +1,5 @@
+"""types.cast.spark_polars_cast module documentation."""
+
 from typing import Optional
 
 import pyarrow as pa
@@ -23,10 +25,42 @@ __all__ = [
 # ---------------------------------------------------------------------------
 if pyspark is not None and polars is not None:
     def spark_polars_converter(*args, **kwargs):
+        """
+        spark_polars_converter documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return register_converter(*args, **kwargs)
 else:
     def spark_polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """
+        spark_polars_converter documentation.
+        
+        Args:
+            *_args: Parameter.
+            **_kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         def _decorator(func):
+            """
+            _decorator documentation.
+            
+            Args:
+                func: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             return func
 
         return _decorator

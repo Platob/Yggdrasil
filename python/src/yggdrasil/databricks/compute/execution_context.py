@@ -1,3 +1,5 @@
+"""databricks.compute.execution_context module documentation."""
+
 import base64
 import dataclasses as dc
 import datetime as dt
@@ -42,6 +44,16 @@ class RemoteMetadata:
         self,
         current: Optional[Dict] = None
     ):
+        """
+        os_env_diff documentation.
+        
+        Args:
+            current: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if current is None:
             current = os.environ
 
@@ -81,6 +93,16 @@ class ExecutionContext:
 
     # --- Pickle / cloudpickle support (don’t serialize locks or cached remote metadata) ---
     def __getstate__(self):
+        """
+        __getstate__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         state = self.__dict__.copy()
 
         # name-mangled field for _lock in instance dict:
@@ -89,26 +111,78 @@ class ExecutionContext:
         return state
 
     def __setstate__(self, state):
+        """
+        __setstate__ documentation.
+        
+        Args:
+            state: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         state["_lock"] = state.get("_lock", threading.RLock())
 
         self.__dict__.update(state)
 
     def __enter__(self) -> "ExecutionContext":
+        """
+        __enter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.cluster.__enter__()
         self._was_connected = self.context_id is not None
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        __exit__ documentation.
+        
+        Args:
+            exc_type: Parameter.
+            exc_val: Parameter.
+            exc_tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self._was_connected:
             self.close()
         self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
     def __del__(self):
+        """
+        __del__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.close()
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
         # fast path (no lock)
+        """
+        remote_metadata documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         rm = self._remote_metadata
         if rm is not None:
             return rm
@@ -151,6 +225,16 @@ print(json.dumps(meta))"""
 
     # ------------ internal helpers ------------
     def _workspace_client(self):
+        """
+        _workspace_client documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.cluster.workspace.sdk()
 
     def _create_command(
@@ -241,6 +325,23 @@ print(json.dumps(meta))"""
         result_tag: Optional[str] = None,
         **options
     ):
+        """
+        execute documentation.
+        
+        Args:
+            obj: Parameter.
+            args: Parameter.
+            kwargs: Parameter.
+            env_keys: Parameter.
+            env_variables: Parameter.
+            timeout: Parameter.
+            result_tag: Parameter.
+            **options: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
@@ -261,6 +362,16 @@ print(json.dumps(meta))"""
         raise ValueError(f"Cannot execute {type(obj)}")
 
     def is_in_databricks_environment(self):
+        """
+        is_in_databricks_environment documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.cluster.is_in_databricks_environment()
 
     def execute_callable(
@@ -274,6 +385,23 @@ print(json.dumps(meta))"""
         timeout: Optional[dt.timedelta] = None,
         command: Optional[str] = None,
     ) -> Any:
+        """
+        execute_callable documentation.
+        
+        Args:
+            func: Parameter.
+            args: Parameter.
+            kwargs: Parameter.
+            env_keys: Parameter.
+            env_variables: Parameter.
+            print_stdout: Parameter.
+            timeout: Parameter.
+            command: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_in_databricks_environment():
             args = args or []
             kwargs = kwargs or {}

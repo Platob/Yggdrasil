@@ -1,3 +1,5 @@
+"""pyutils.exceptions module documentation."""
+
 import builtins
 import dataclasses as dc
 import re
@@ -34,10 +36,30 @@ class ParsedException:
 class RemoteTraceback(Exception):
     """Holds a traceback *string* and prints it as the chained cause."""
     def __init__(self, traceback_text: str):
+        """
+        __init__ documentation.
+        
+        Args:
+            traceback_text: Parameter.
+        
+        Returns:
+            None.
+        """
+
         super().__init__("Remote traceback (text)")
         self.traceback_text = traceback_text
 
     def __str__(self) -> str:
+        """
+        __str__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return f"{self.args[0]}\n\n{self.traceback_text}"
 
 

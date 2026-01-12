@@ -1,3 +1,5 @@
+"""databricks.workspaces.path_kind module documentation."""
+
 from enum import Enum
 
 
