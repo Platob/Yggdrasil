@@ -1,3 +1,5 @@
+"""Workspace configuration and Databricks SDK helpers."""
+
 import dataclasses
 import logging
 import os
@@ -67,6 +69,7 @@ def _get_env_product_tag():
 
 @dataclass
 class Workspace:
+    """Configuration wrapper for connecting to a Databricks workspace."""
     # Databricks / generic
     host: Optional[str] = None
     account_id: Optional[str] = None
@@ -113,6 +116,11 @@ class Workspace:
     # Pickle support
     # -------------------------
     def __getstate__(self):
+        """Serialize the workspace state for pickling.
+
+        Returns:
+            A pickle-ready state dictionary.
+        """
         state = self.__dict__.copy()
         state.pop("_sdk", None)
 
@@ -122,6 +130,11 @@ class Workspace:
         return state
 
     def __setstate__(self, state):
+        """Restore workspace state after unpickling.
+
+        Args:
+            state: Serialized state dictionary.
+        """
         self.__dict__.update(state)
         self._sdk = None
 
@@ -132,10 +145,25 @@ class Workspace:
             self.connect(reset=True)
 
     def __enter__(self) -> "Workspace":
+        """Enter a context manager and connect to the workspace.
+
+        Returns:
+            The connected Workspace instance.
+        """
         self._was_connected = self._sdk is not None
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit the context manager and close if newly connected.
+
+        Args:
+            exc_type: Exception type, if raised.
+            exc_val: Exception value, if raised.
+            exc_tb: Exception traceback, if raised.
+
+        Returns:
+            None.
+        """
         if not self._was_connected:
             self.close()
 
@@ -149,6 +177,14 @@ class Workspace:
         self,
         **kwargs
     ) -> "Workspace":
+        """Clone the workspace config with overrides.
+
+        Args:
+            **kwargs: Field overrides for the clone.
+
+        Returns:
+            A new Workspace instance with updated fields.
+        """
         state = self.__getstate__()
         state.update(kwargs)
         return Workspace().__setstate__(state)
@@ -158,9 +194,23 @@ class Workspace:
     # -------------------------
     @property
     def connected(self):
+        """Return True when a WorkspaceClient is cached.
+
+        Returns:
+            True if connected, otherwise False.
+        """
         return self._sdk is not None
 
     def connect(self, reset: bool = False, clone: bool = False) -> "Workspace":
+        """Connect to the workspace and cache the SDK client.
+
+        Args:
+            reset: Whether to reset the cached client before connecting.
+            clone: Whether to connect a cloned instance.
+
+        Returns:
+            The connected Workspace instance.
+        """
         if reset:
             self._sdk = None
 
@@ -270,6 +320,11 @@ class Workspace:
         return str(files[0]) if files else None
 
     def reset_local_cache(self):
+        """Remove cached browser OAuth tokens.
+
+        Returns:
+            None.
+        """
         local_cache = self._local_cache_token_path()
 
         if local_cache:
@@ -277,6 +332,11 @@ class Workspace:
 
     @property
     def current_user(self):
+        """Return the current Databricks user.
+
+        Returns:
+            The current user object from the SDK.
+        """
         try:
             return self.sdk().current_user.me()
         except:
@@ -285,6 +345,11 @@ class Workspace:
             raise
 
     def current_token(self) -> str:
+        """Return the active API token for this workspace.
+
+        Returns:
+            The bearer token string.
+        """
         if self.token:
             return self.token
 
@@ -301,6 +366,14 @@ class Workspace:
         self,
         workspace: Optional["Workspace"] = None,
     ):
+        """Return a PyArrow filesystem for Databricks paths.
+
+        Args:
+            workspace: Optional workspace override.
+
+        Returns:
+            A DatabricksFileSystem instance.
+        """
         from .filesytem import DatabricksFileSystem, DatabricksFileSystemHandler
 
         handler = DatabricksFileSystemHandler(
@@ -317,6 +390,16 @@ class Workspace:
         kind: Optional[DatabricksPathKind] = None,
         workspace: Optional["Workspace"] = None
     ):
+        """Create a DatabricksPath in this workspace.
+
+        Args:
+            parts: Path parts or string to parse.
+            kind: Optional path kind override.
+            workspace: Optional workspace override.
+
+        Returns:
+            A DatabricksPath instance.
+        """
         workspace = self if workspace is None else workspace
 
         if kind is None or isinstance(parts, str):
@@ -337,6 +420,12 @@ class Workspace:
     ) -> DatabricksPath:
         """
         Shared cache base under Volumes for the current user.
+
+        Args:
+            suffix: Optional path suffix to append.
+
+        Returns:
+            A DatabricksPath pointing at the shared cache location.
         """
         base = "/Workspace/Shared/.ygg/cache"
 
@@ -351,6 +440,11 @@ class Workspace:
     # ------------------------------------------------------------------ #
 
     def sdk(self) -> "WorkspaceClient":
+        """Return the connected WorkspaceClient.
+
+        Returns:
+            The WorkspaceClient instance.
+        """
         return self.connect()._sdk
 
     # ------------------------------------------------------------------ #
@@ -370,6 +464,13 @@ class Workspace:
           - other paths      -> Workspace paths (sdk.workspace.list)
 
         If recursive=True, yield all nested files/directories.
+
+        Args:
+            path: Path string to list.
+            recursive: Whether to list recursively.
+
+        Returns:
+            An iterator of workspace/DBFS/volume entries.
         """
         sdk = self.sdk()
 
@@ -422,6 +523,13 @@ class Workspace:
           via workspace.download(...).
 
         Returned object is a BinaryIO context manager.
+
+        Args:
+            path: Path to open.
+            workspace_format: Optional export format for workspace paths.
+
+        Returns:
+            A BinaryIO stream for reading.
         """
         sdk = self.sdk()
 
@@ -437,9 +545,19 @@ class Workspace:
 
     @staticmethod
     def is_in_databricks_environment():
+        """Return True when running on a Databricks runtime.
+
+        Returns:
+            True if running on Databricks, otherwise False.
+        """
         return os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
 
     def default_tags(self):
+        """Return default resource tags for Databricks assets.
+
+        Returns:
+            A dict of default tags.
+        """
         return {
             k: v
             for k, v in (
@@ -451,6 +569,14 @@ class Workspace:
         }
 
     def merge_tags(self, existing: dict | None = None):
+        """Merge default tags with an existing set.
+
+        Args:
+            existing: Optional existing tags.
+
+        Returns:
+            A dict of merged tags.
+        """
         if existing:
             return self.default_tags()
 
@@ -461,6 +587,17 @@ class Workspace:
         schema_name: Optional[str] = None,
         **kwargs
     ):
+        """Return a SQLEngine configured for this workspace.
+
+        Args:
+            workspace: Optional workspace override.
+            catalog_name: Optional catalog name.
+            schema_name: Optional schema name.
+            **kwargs: Additional SQLEngine parameters.
+
+        Returns:
+            A SQLEngine instance.
+        """
         from ..sql import SQLEngine
 
         return SQLEngine(
@@ -476,6 +613,16 @@ class Workspace:
         cluster_name: Optional[str] = None,
         **kwargs
     ) -> "Cluster":
+        """Return a Cluster helper bound to this workspace.
+
+        Args:
+            cluster_id: Optional cluster id.
+            cluster_name: Optional cluster name.
+            **kwargs: Additional Cluster parameters.
+
+        Returns:
+            A Cluster instance.
+        """
         from ..compute.cluster import Cluster
 
         return Cluster(workspace=self, cluster_id=cluster_id, cluster_name=cluster_name, **kwargs)
@@ -489,23 +636,54 @@ DBXWorkspace = Workspace
 
 @dataclass
 class WorkspaceService(ABC):
+    """Base class for helpers that depend on a Workspace."""
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
 
     def __post_init__(self):
+        """Ensure a Workspace instance is available.
+
+        Returns:
+            None.
+        """
         if self.workspace is None:
             self.workspace = Workspace()
 
     def __enter__(self):
+        """Enter a context manager and connect the workspace.
+
+        Returns:
+            The current WorkspaceService instance.
+        """
         self.workspace.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the context manager and close the workspace.
+
+        Args:
+            exc_type: Exception type, if raised.
+            exc_val: Exception value, if raised.
+            exc_tb: Exception traceback, if raised.
+
+        Returns:
+            None.
+        """
         self.workspace.__exit__(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
     def is_in_databricks_environment(self):
+        """Return True when running on a Databricks runtime.
+
+        Returns:
+            True if running on Databricks, otherwise False.
+        """
         return self.workspace.is_in_databricks_environment()
 
     def connect(self):
+        """Connect the underlying workspace.
+
+        Returns:
+            The current WorkspaceService instance.
+        """
         self.workspace = self.workspace.connect()
         return self
 
@@ -515,6 +693,16 @@ class WorkspaceService(ABC):
         kind: Optional[DatabricksPathKind] = None,
         workspace: Optional["Workspace"] = None
     ):
+        """Create a DatabricksPath in the underlying workspace.
+
+        Args:
+            parts: Path parts or string to parse.
+            kind: Optional path kind override.
+            workspace: Optional workspace override.
+
+        Returns:
+            A DatabricksPath instance.
+        """
         return self.workspace.dbfs_path(
             kind=kind,
             parts=parts,
@@ -522,8 +710,18 @@ class WorkspaceService(ABC):
         )
 
     def sdk(self):
+        """Return the WorkspaceClient for the underlying workspace.
+
+        Returns:
+            The WorkspaceClient instance.
+        """
         return self.workspace.sdk()
 
     @property
     def current_user(self):
+        """Return the current Databricks user.
+
+        Returns:
+            The current user object from the SDK.
+        """
         return self.workspace.current_user

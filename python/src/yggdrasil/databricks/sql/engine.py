@@ -1,3 +1,5 @@
+"""Databricks SQL engine utilities and helpers."""
+
 import dataclasses
 import logging
 import random
@@ -55,11 +57,12 @@ __all__ = [
 
 
 class SqlExecutionError(RuntimeError):
-    pass
+    """Raised when a SQL statement execution fails."""
 
 
 @dataclasses.dataclass
 class SQLEngine(WorkspaceService):
+    """Execute SQL statements and manage tables via Databricks."""
     warehouse_id: Optional[str] = None
     catalog_name: Optional[str] = None
     schema_name: Optional[str] = None
@@ -71,6 +74,17 @@ class SQLEngine(WorkspaceService):
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
+        """Build a fully qualified table name for the current catalog/schema.
+
+        Args:
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Table name to qualify.
+            safe_chars: Whether to wrap identifiers in backticks.
+
+        Returns:
+            The fully qualified table name.
+        """
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
 
@@ -86,6 +100,14 @@ class SQLEngine(WorkspaceService):
         self,
         full_name: str,
     ):
+        """Parse a catalog.schema.table string into components.
+
+        Args:
+            full_name: A fully qualified name or partial name.
+
+        Returns:
+            A tuple of (catalog_name, schema_name, table_name).
+        """
         parts = [
             _.strip("`") for _ in full_name.split(".")
         ]
@@ -107,6 +129,14 @@ class SQLEngine(WorkspaceService):
         self,
         cluster_size: str = "Small"
     ):
+        """Return a default SQL warehouse matching the desired size.
+
+        Args:
+            cluster_size: Desired warehouse size filter.
+
+        Returns:
+            The matched warehouse object.
+        """
         wk = self.workspace.sdk()
         existing = list(wk.warehouses.list())
         first = None
@@ -130,6 +160,14 @@ class SQLEngine(WorkspaceService):
         self,
         cluster_size = "Small"
     ):
+        """Return the configured warehouse id or a default one.
+
+        Args:
+            cluster_size: Desired warehouse size filter.
+
+        Returns:
+            The warehouse id string.
+        """
         if not self.warehouse_id:
             dft = self._default_warehouse(cluster_size=cluster_size)
 
@@ -138,6 +176,14 @@ class SQLEngine(WorkspaceService):
 
     @staticmethod
     def _random_suffix(prefix: str = "") -> str:
+        """Generate a unique suffix for temporary resources.
+
+        Args:
+            prefix: Optional prefix to prepend.
+
+        Returns:
+            A unique suffix string.
+        """
         unique = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
         timestamp = int(time.time() * 1000)
         return f"{prefix}{timestamp}_{unique}"
@@ -168,6 +214,26 @@ class SQLEngine(WorkspaceService):
             - On SUCCEEDED: return final statement object
             - On FAILED / CANCELED: raise SqlExecutionError
         - If wait=False: return initial execution handle without polling.
+
+        Args:
+            statement: SQL statement to execute. If omitted, selects from the table.
+            engine: Execution engine ("spark" or "api").
+            warehouse_id: Optional warehouse id override.
+            byte_limit: Optional byte limit for results.
+            disposition: Result disposition mode.
+            format: Result format for Databricks SQL API.
+            on_wait_timeout: Timeout behavior for waiting.
+            parameters: Optional statement parameters.
+            row_limit: Optional row limit.
+            wait_timeout: Optional API wait timeout.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            wait_result: Whether to block until completion.
+            **kwargs: Additional API parameters.
+
+        Returns:
+            A StatementResult wrapper for the execution.
         """
         if not engine:
             if pyspark is not None:
@@ -234,6 +300,17 @@ class SQLEngine(WorkspaceService):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ):
+        """Return a DeltaTable handle for a given table name.
+
+        Args:
+            full_name: Fully qualified table name.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+
+        Returns:
+            A Spark DeltaTable handle.
+        """
         if not full_name:
             full_name = self.table_full_name(
                 catalog_name=catalog_name,
@@ -266,6 +343,27 @@ class SQLEngine(WorkspaceService):
         spark_session: Optional[SparkSession] = None,
         spark_options: Optional[Dict[str, Any]] = None
     ):
+        """Insert data into a table using Spark or Arrow paths.
+
+        Args:
+            data: Arrow or Spark data to insert.
+            location: Fully qualified table name override.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            mode: Insert mode ("auto", "append", "overwrite").
+            cast_options: Optional casting options.
+            overwrite_schema: Whether to overwrite schema (Spark).
+            match_by: Optional merge keys for upserts.
+            zorder_by: Optional Z-ORDER columns.
+            optimize_after_merge: Whether to run OPTIMIZE after merge.
+            vacuum_hours: Optional VACUUM retention window.
+            spark_session: Optional SparkSession override.
+            spark_options: Optional Spark write options.
+
+        Returns:
+            None for Arrow inserts, or the Spark insert result.
+        """
         # -------- existing logic you provided (kept intact) ----------
         if pyspark is not None:
             spark_session = SparkSession.getActiveSession() if spark_session is None else spark_session
@@ -321,6 +419,27 @@ class SQLEngine(WorkspaceService):
         existing_schema: pa.Schema | None = None,
         temp_volume_path: Optional[Union[str, DatabricksPath]] = None
     ):
+        """Insert Arrow data by staging to a temp volume and running SQL.
+
+        Args:
+            data: Arrow table/batch data to insert.
+            location: Fully qualified table name override.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            mode: Insert mode ("auto", "append", "overwrite").
+            cast_options: Optional casting options.
+            overwrite_schema: Whether to overwrite schema.
+            match_by: Optional merge keys for upserts.
+            zorder_by: Optional Z-ORDER columns.
+            optimize_after_merge: Whether to run OPTIMIZE after merge.
+            vacuum_hours: Optional VACUUM retention window.
+            existing_schema: Optional pre-fetched schema.
+            temp_volume_path: Optional temp volume path override.
+
+        Returns:
+            None.
+        """
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -483,6 +602,26 @@ FROM parquet.`{temp_volume_path}`"""
         vacuum_hours: int | None = None,  # e.g., 168 for 7 days
         spark_options: Optional[Dict[str, Any]] = None,
     ):
+        """Insert a Spark DataFrame into a Delta table with optional merge semantics.
+
+        Args:
+            data: Spark DataFrame to insert.
+            location: Fully qualified table name override.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            mode: Insert mode ("auto", "append", "overwrite").
+            cast_options: Optional casting options.
+            overwrite_schema: Whether to overwrite schema.
+            match_by: Optional merge keys for upserts.
+            zorder_by: Optional Z-ORDER columns.
+            optimize_after_merge: Whether to run OPTIMIZE after merge.
+            vacuum_hours: Optional VACUUM retention window.
+            spark_options: Optional Spark write options.
+
+        Returns:
+            None.
+        """
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -582,6 +721,17 @@ FROM parquet.`{temp_volume_path}`"""
         table_name: Optional[str] = None,
         to_arrow_schema: bool = True
     ) -> Union[pa.Field, pa.Schema]:
+        """Fetch a table schema from Unity Catalog as Arrow types.
+
+        Args:
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            to_arrow_schema: Whether to return an Arrow schema or field.
+
+        Returns:
+            Arrow Schema or Field representing the table.
+        """
         full_name = self.table_full_name(
             catalog_name=catalog_name,
             schema_name=schema_name,
@@ -612,6 +762,17 @@ FROM parquet.`{temp_volume_path}`"""
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ):
+        """Drop a table if it exists.
+
+        Args:
+            location: Fully qualified table name override.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+
+        Returns:
+            The StatementResult from executing the drop statement.
+        """
         location, _, _, _ = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -737,6 +898,18 @@ FROM parquet.`{temp_volume_path}`"""
         table_name: Optional[str] = None,
         safe_chars: bool = True
     ):
+        """Resolve location/catalog/schema/table parameters to a full name.
+
+        Args:
+            location: Fully qualified table name override.
+            catalog_name: Optional catalog override.
+            schema_name: Optional schema override.
+            table_name: Optional table name override.
+            safe_chars: Whether to wrap identifiers in backticks.
+
+        Returns:
+            A tuple of (location, catalog_name, schema_name, table_name).
+        """
         if location:
             c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t

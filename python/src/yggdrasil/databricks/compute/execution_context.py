@@ -1,3 +1,5 @@
+"""Remote execution helpers for Databricks command contexts."""
+
 import base64
 import dataclasses as dc
 import datetime as dt
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 @dc.dataclass
 class RemoteMetadata:
+    """Metadata describing the remote cluster execution environment."""
     site_packages_path: Optional[str] = dc.field(default=None)
     os_env: Dict[str, str] = dc.field(default_factory=dict)
     requirements: Optional[str] = dc.field(default=None)
@@ -42,6 +45,7 @@ class RemoteMetadata:
         self,
         current: Optional[Dict] = None
     ):
+        """Return environment variables present locally but missing remotely."""
         if current is None:
             current = os.environ
 
@@ -81,6 +85,7 @@ class ExecutionContext:
 
     # --- Pickle / cloudpickle support (don’t serialize locks or cached remote metadata) ---
     def __getstate__(self):
+        """Serialize context state, excluding locks and remote metadata."""
         state = self.__dict__.copy()
 
         # name-mangled field for _lock in instance dict:
@@ -89,25 +94,30 @@ class ExecutionContext:
         return state
 
     def __setstate__(self, state):
+        """Restore context state, rehydrating locks if needed."""
         state["_lock"] = state.get("_lock", threading.RLock())
 
         self.__dict__.update(state)
 
     def __enter__(self) -> "ExecutionContext":
+        """Enter a context manager, opening a remote execution context."""
         self.cluster.__enter__()
         self._was_connected = self.context_id is not None
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the context manager and close the remote context if created."""
         if not self._was_connected:
             self.close()
         self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
     def __del__(self):
+        """Best-effort cleanup for the remote execution context."""
         self.close()
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
+        """Fetch and cache remote environment metadata for the cluster."""
         # fast path (no lock)
         rm = self._remote_metadata
         if rm is not None:
@@ -151,17 +161,24 @@ print(json.dumps(meta))"""
 
     # ------------ internal helpers ------------
     def _workspace_client(self):
+        """Return the Databricks SDK client for command execution.
+
+        Returns:
+            The underlying WorkspaceClient instance.
+        """
         return self.cluster.workspace.sdk()
 
     def _create_command(
         self,
         language: "Language",
     ) -> any:
-        """
-        Wrap `client.command_execution.create` in a 10s timeout.
-        On timeout:
-          - ensure the cluster is running
-          - retry once with the same timeout
+        """Create a command execution context, retrying if needed.
+
+        Args:
+            language: The Databricks command language to use.
+
+        Returns:
+            The created command execution context response.
         """
         self.cluster.ensure_running()
 
@@ -182,7 +199,14 @@ print(json.dumps(meta))"""
         self,
         language: Optional["Language"] = None
     ) -> "ExecutionContext":
-        """Create a remote command execution context if not already open."""
+        """Create a remote command execution context if not already open.
+
+        Args:
+            language: Optional language override for the context.
+
+        Returns:
+            The connected ExecutionContext instance.
+        """
         if self.context_id is not None:
             logger.debug(
                 "Execution context already open for %s",
@@ -209,7 +233,11 @@ print(json.dumps(meta))"""
         return self
 
     def close(self) -> None:
-        """Destroy the remote command execution context if it exists."""
+        """Destroy the remote command execution context if it exists.
+
+        Returns:
+            None.
+        """
         if self.context_id is None:
             return
 
@@ -241,6 +269,21 @@ print(json.dumps(meta))"""
         result_tag: Optional[str] = None,
         **options
     ):
+        """Execute a string command or a callable in the remote context.
+
+        Args:
+            obj: Command string or callable to execute.
+            args: Optional positional arguments for callables.
+            kwargs: Optional keyword arguments for callables.
+            env_keys: Environment variable names to forward.
+            env_variables: Environment variables to inject remotely.
+            timeout: Optional timeout for execution.
+            result_tag: Optional result tag for parsing output.
+            **options: Additional execution options.
+
+        Returns:
+            The decoded execution result.
+        """
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
@@ -261,6 +304,7 @@ print(json.dumps(meta))"""
         raise ValueError(f"Cannot execute {type(obj)}")
 
     def is_in_databricks_environment(self):
+        """Return True when running on a Databricks runtime."""
         return self.cluster.is_in_databricks_environment()
 
     def execute_callable(
@@ -274,12 +318,26 @@ print(json.dumps(meta))"""
         timeout: Optional[dt.timedelta] = None,
         command: Optional[str] = None,
     ) -> Any:
+        """Execute a Python callable remotely and return the decoded result.
+
+        Args:
+            func: Callable or serialized callable to run remotely.
+            args: Positional arguments for the callable.
+            kwargs: Keyword arguments for the callable.
+            env_keys: Environment variable names to forward.
+            env_variables: Environment variables to inject remotely.
+            print_stdout: Whether to print stdout from the command output.
+            timeout: Optional timeout for execution.
+            command: Optional prebuilt command string override.
+
+        Returns:
+            The decoded return value from the remote execution.
+        """
         if self.is_in_databricks_environment():
             args = args or []
             kwargs = kwargs or {}
             return func(*args, **kwargs)
 
-        """Execute a command in this context and return decoded output."""
         self.connect(language=Language.PYTHON)
 
         logger.debug(
@@ -354,7 +412,17 @@ print(json.dumps(meta))"""
         result_tag: Optional[str] = None,
         print_stdout: Optional[bool] = True,
     ) -> str:
-        """Execute a command in this context and return decoded output."""
+        """Execute a command in this context and return decoded output.
+
+        Args:
+            command: The command string to execute.
+            timeout: Optional timeout for execution.
+            result_tag: Optional tag to extract a specific result segment.
+            print_stdout: Whether to print stdout for tagged output.
+
+        Returns:
+            The decoded command output string.
+        """
         self.connect()
 
         client = self._workspace_client()
@@ -402,6 +470,12 @@ print(json.dumps(meta))"""
         - If local_path is a directory:
               remote_path is the *directory root* on remote; the directory
               contents are mirrored under it.
+        Args:
+            local_path: Local file or directory to upload.
+            remote_path: Target path on the remote cluster.
+
+        Returns:
+            None.
         """
         local_path = os.path.abspath(local_path)
         if not os.path.exists(local_path):
@@ -490,6 +564,12 @@ with zipfile.ZipFile(buf, "r") as zf:
         - path to a file    (e.g. "./ygg/__init__.py")
         - module name       (e.g. "ygg")
         - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
+        Args:
+            libraries: Library path, name, module, or iterable of these.
+            with_dependencies: Whether to include dependencies (unused).
+
+        Returns:
+            The resolved library or list of libraries uploaded.
         """
         if isinstance(libraries, (list, tuple, set)):
             return [
@@ -517,7 +597,16 @@ with zipfile.ZipFile(buf, "r") as zf:
         result_tag: Optional[str],
         print_stdout: Optional[bool] = True
     ) -> str:
-        """Mirror the old Cluster.execute_command result handling."""
+        """Mirror the old Cluster.execute_command result handling.
+
+        Args:
+            result: Raw command execution response.
+            result_tag: Optional tag to extract a segment from output.
+            print_stdout: Whether to print stdout when using tags.
+
+        Returns:
+            The decoded output string.
+        """
         if not getattr(result, "results", None):
             raise RuntimeError("Command execution returned no results")
 

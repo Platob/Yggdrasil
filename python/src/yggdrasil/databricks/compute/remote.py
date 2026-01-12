@@ -1,3 +1,5 @@
+"""Convenience decorator for running functions on Databricks clusters."""
+
 import datetime as dt
 import logging
 from typing import (
@@ -26,6 +28,20 @@ def databricks_remote_compute(
     env_keys: Optional[List[str]] = None,
     **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
+    """Return a decorator that executes functions on a remote cluster.
+
+    Args:
+        cluster_id: Optional cluster id to target.
+        cluster_name: Optional cluster name to target.
+        workspace: Workspace instance or host string for lookup.
+        cluster: Pre-configured Cluster instance to reuse.
+        timeout: Optional execution timeout for remote calls.
+        env_keys: Optional environment variable names to forward.
+        **options: Extra options forwarded to the execution decorator.
+
+    Returns:
+        A decorator that runs functions on the resolved Databricks cluster.
+    """
     if isinstance(workspace, str):
         workspace = Workspace(host=workspace)
 

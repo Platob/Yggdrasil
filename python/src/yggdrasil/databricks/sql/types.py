@@ -1,3 +1,5 @@
+"""Type utilities for Databricks SQL metadata and Arrow."""
+
 import json
 import re
 from typing import Union
@@ -86,6 +88,14 @@ _struct_re = re.compile(r"^STRUCT\s*<\s*(.+)\s*>$", re.IGNORECASE)
 
 
 def _split_top_level_commas(s: str):
+    """Split a type string by commas, respecting nested angle brackets.
+
+    Args:
+        s: Type string to split.
+
+    Returns:
+        A list of top-level comma-separated parts.
+    """
     parts, cur, depth = [], [], 0
     for ch in s:
         if ch == '<':
@@ -103,6 +113,14 @@ def _split_top_level_commas(s: str):
 
 
 def _safe_bytes(obj):
+    """Convert an object to UTF-8 bytes, with safe handling for None.
+
+    Args:
+        obj: Value to convert.
+
+    Returns:
+        UTF-8 encoded bytes.
+    """
     if not isinstance(obj, bytes):
         if not obj:
             return b""
@@ -120,6 +138,12 @@ def parse_sql_type_to_pa(type_str: str) -> pa.DataType:
       - looks up base types in STRING_TYPE_MAP (expects uppercase keys)
       - supports DECIMAL(p,s), ARRAY<...>, MAP<k,v>, STRUCT<...> recursively
       - raises ValueError if it cannot map the provided type string
+
+    Args:
+        type_str: SQL type string to parse.
+
+    Returns:
+        The corresponding Arrow DataType.
     """
     if not type_str:
         raise ValueError("Empty type string")
@@ -177,6 +201,14 @@ def parse_sql_type_to_pa(type_str: str) -> pa.DataType:
 
 
 def column_info_to_arrow_field(col: Union[SQLColumnInfo, CatalogColumnInfo]):
+    """Convert Databricks SQL/Catalog column info into an Arrow field.
+
+    Args:
+        col: ColumnInfo from SQL or Catalog APIs.
+
+    Returns:
+        An Arrow Field for the column.
+    """
     arrow_type = parse_sql_type_to_pa(col.type_text)
 
     if isinstance(col, CatalogColumnInfo):
