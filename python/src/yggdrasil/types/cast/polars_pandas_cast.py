@@ -1,3 +1,5 @@
+"""Polars <-> pandas conversion helpers via Arrow."""
+
 from typing import Optional
 
 from .arrow_cast import CastOptions
@@ -35,18 +37,45 @@ if polars is not None and pandas is not None:
     PandasDataFrame = pandas.DataFrame
 
     def polars_pandas_converter(*args, **kwargs):
+        """Return a register_converter wrapper when both libs are available.
+
+        Args:
+            *args: Converter registration args.
+            **kwargs: Converter registration kwargs.
+
+        Returns:
+            Converter decorator.
+        """
         return register_converter(*args, **kwargs)
 
 else:
     # Dummy stand-ins so decorators/annotations don't explode if one lib is absent
     class _Dummy:  # pragma: no cover - only used when Polars or pandas not installed
+        """Placeholder type when Polars or pandas are unavailable."""
         pass
 
     PolarsDataFrame = _Dummy
     PandasDataFrame = _Dummy
 
     def polars_pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """Return a no-op decorator when dependencies are missing.
+
+        Args:
+            *_args: Ignored positional args.
+            **_kwargs: Ignored keyword args.
+
+        Returns:
+            No-op decorator.
+        """
         def _decorator(func):
+            """Return the function unchanged.
+
+            Args:
+                func: Callable to return.
+
+            Returns:
+                Unchanged callable.
+            """
             return func
 
         return _decorator

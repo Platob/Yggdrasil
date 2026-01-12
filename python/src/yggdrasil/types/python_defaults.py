@@ -1,3 +1,5 @@
+"""Default value helpers for Python and Arrow types."""
+
 import dataclasses
 import datetime
 import decimal
@@ -96,6 +98,14 @@ except ImportError:
     _POLARS_DEFAULTS = {}
 
 def _is_optional(hint) -> bool:
+    """Return True when the type hint is Optional.
+
+    Args:
+        hint: Type hint to inspect.
+
+    Returns:
+        True if Optional.
+    """
     origin = get_origin(hint)
 
     if origin in (Union, types.UnionType):
@@ -105,6 +115,14 @@ def _is_optional(hint) -> bool:
 
 
 def _default_for_collection(origin):
+    """Return default values for collection-like origins.
+
+    Args:
+        origin: Collection origin type.
+
+    Returns:
+        Default collection instance or None.
+    """
     if origin in (list, MutableSequence):
         return []
 
@@ -124,6 +142,14 @@ def _default_for_collection(origin):
 
 
 def _default_for_tuple_args(args):
+    """Return a default tuple based on element hints.
+
+    Args:
+        args: Tuple element type hints.
+
+    Returns:
+        Default tuple instance.
+    """
     if not args:
         return tuple()
 
@@ -134,6 +160,14 @@ def _default_for_tuple_args(args):
 
 
 def _default_for_dataclass(hint):
+    """Return a default instance for a dataclass type.
+
+    Args:
+        hint: Dataclass type.
+
+    Returns:
+        Dataclass instance with default values.
+    """
     kwargs = {}
 
     for field in dataclasses.fields(hint):
@@ -156,6 +190,15 @@ def default_arrow_scalar(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType, pa.FixedSizeListType],
     nullable: bool
 ):
+    """Return a default scalar for a given Arrow type.
+
+    Args:
+        dtype: Arrow data type.
+        nullable: Whether the scalar should be nullable.
+
+    Returns:
+        Arrow scalar default.
+    """
     if nullable:
         return pa.scalar(None, type=dtype)
 
@@ -208,6 +251,19 @@ def default_arrow_array(
     chunks: Optional[List[int]] = None,
     scalar_default: Optional[pa.Scalar] = None,
 ) -> Union[pa.Array, pa.ChunkedArray]:
+    """Return a default Arrow array or chunked array for a given type.
+
+    Args:
+        dtype: Arrow data type.
+        nullable: Whether values are nullable.
+        size: Number of elements.
+        memory_pool: Optional Arrow memory pool.
+        chunks: Optional chunk sizes.
+        scalar_default: Optional scalar default override.
+
+    Returns:
+        Arrow array or chunked array.
+    """
     if scalar_default is None:
         scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
 
@@ -240,6 +296,14 @@ def default_arrow_array(
 
 
 def default_python_scalar(hint: Any):
+    """Return a default Python value for the given type hint.
+
+    Args:
+        hint: Type hint to generate defaults for.
+
+    Returns:
+        Default Python value.
+    """
     if _is_optional(hint):
         return None
 
@@ -286,6 +350,15 @@ def default_scalar(
     ],
     nullable: Optional[bool] = None
 ):
+    """Return a default scalar value for Python or Arrow type hints.
+
+    Args:
+        hint: Python type or Arrow type/field.
+        nullable: Override nullability for Arrow types.
+
+    Returns:
+        Default scalar value.
+    """
     if isinstance(hint, pa.Field):
         nullable = hint.nullable if nullable is None else nullable
         return default_arrow_scalar(dtype=hint.type, nullable=nullable)

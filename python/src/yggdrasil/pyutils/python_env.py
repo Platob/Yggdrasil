@@ -1,3 +1,5 @@
+"""Manage isolated Python environments with uv/pip helpers."""
+
 # yggdrasil/pyutils/python_env.py
 from __future__ import annotations
 
@@ -24,6 +26,8 @@ log = logging.getLogger(__name__)
 
 
 class PythonEnvError(RuntimeError):
+    """Raised when Python environment operations fail."""
+
     pass
 
 
@@ -93,16 +97,38 @@ def _filter_non_pipable_linux_packages(requirements: Iterable[str]) -> List[str]
 
 
 def _is_windows() -> bool:
+    """Return True when running on Windows.
+
+    Returns:
+        True if the OS is Windows.
+    """
     return os.name == "nt"
 
 
 def _norm_env(base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """Return a normalized environment dict with common defaults.
+
+    Args:
+        base: Optional base environment mapping.
+
+    Returns:
+        Normalized environment mapping.
+    """
     env = dict(base or os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 
 def _split_on_tag(stdout: str, tag: str) -> tuple[list[str], Optional[str]]:
+    """Split stdout into lines before the tag and the tag payload.
+
+    Args:
+        stdout: Captured stdout text.
+        tag: Prefix tag to split on.
+
+    Returns:
+        Tuple of lines before the tag and tag payload.
+    """
     lines = (stdout or "").splitlines()
     before: list[str] = []
     payload: Optional[str] = None
@@ -116,6 +142,14 @@ def _split_on_tag(stdout: str, tag: str) -> tuple[list[str], Optional[str]]:
 
 
 def _dedupe_keep_order(items: Iterable[str]) -> list[str]:
+    """Return a de-duplicated list while preserving order.
+
+    Args:
+        items: Iterable of items to deduplicate.
+
+    Returns:
+        De-duplicated list.
+    """
     seen: set[str] = set()
     out: list[str] = []
     for x in items:
@@ -135,6 +169,18 @@ def _run_cmd(
     native_tls: bool = False,
     extra_index_url: Optional[Union[str, List[str]]] = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run a command and raise a PythonEnvError on failure.
+
+    Args:
+        cmd: Command and arguments to execute.
+        cwd: Optional working directory.
+        env: Optional environment variables.
+        native_tls: Whether to enable native TLS for uv.
+        extra_index_url: Extra index URL(s) for pip/uv.
+
+    Returns:
+        Completed process with stdout/stderr.
+    """
     cmd_s = [str(x) for x in cmd]
 
     if native_tls and "--native-tls" not in cmd_s:
@@ -172,14 +218,32 @@ def _run_cmd(
 # -----------------------
 
 def _user_python_dir() -> Path:
+    """Return the base directory for user Python tooling.
+
+    Returns:
+        Path to the user python directory.
+    """
     return (Path.home() / ".python").expanduser().resolve()
 
 
 def _user_envs_dir() -> Path:
+    """Return the directory where user environments are stored.
+
+    Returns:
+        Path to the envs directory.
+    """
     return (_user_python_dir() / "envs").resolve()
 
 
 def _safe_env_name(name: str) -> str:
+    """Normalize and validate an environment name.
+
+    Args:
+        name: Environment name string.
+
+    Returns:
+        Sanitized environment name.
+    """
     n = (name or "").strip()
     if not n:
         raise PythonEnvError("Env name cannot be empty")
@@ -194,11 +258,24 @@ def _safe_env_name(name: str) -> str:
 # -----------------------
 
 def _uv_exe_on_path() -> Optional[str]:
+    """Return the uv executable path if available.
+
+    Returns:
+        Path to uv executable or None.
+    """
     uv = shutil.which("uv")
     return uv
 
 
 def _current_env_script(name: str) -> Optional[Path]:
+    """Return a script path from the current environment, if present.
+
+    Args:
+        name: Script name to locate.
+
+    Returns:
+        Path to the script or None.
+    """
     exe = Path(sys.executable).resolve()
     bindir = exe.parent
     if _is_windows():
@@ -212,6 +289,14 @@ def _current_env_script(name: str) -> Optional[Path]:
 
 
 def _ensure_pip_available(*, check: bool = True) -> None:
+    """Ensure pip is available, optionally raising on failure.
+
+    Args:
+        check: Raise if ensurepip fails.
+
+    Returns:
+        None.
+    """
     log.debug("checking pip availability")
     p = subprocess.run(
         [sys.executable, "-m", "pip", "--version"],
@@ -245,6 +330,18 @@ def _pip_install_uv_in_current(
     extra_pip_args: Optional[Iterable[str]] = None,
     check: bool = True,
 ) -> None:
+    """Install uv in the current environment using pip.
+
+    Args:
+        upgrade: Whether to upgrade uv.
+        user: Install with --user if True.
+        index_url: Optional pip index URL.
+        extra_pip_args: Additional pip arguments.
+        check: Raise if install fails.
+
+    Returns:
+        None.
+    """
     _ensure_pip_available(check=check)
 
     cmd = [sys.executable, "-m", "pip", "install"]
@@ -267,10 +364,26 @@ def _pip_install_uv_in_current(
 # -----------------------
 
 def _env_lock_key(root: Path) -> str:
+    """Return a normalized lock key for an environment path.
+
+    Args:
+        root: Environment root path.
+
+    Returns:
+        Normalized lock key string.
+    """
     return str(Path(root).expanduser().resolve())
 
 
 def _get_env_lock(root: Path) -> threading.RLock:
+    """Return a re-entrant lock for a specific environment root.
+
+    Args:
+        root: Environment root path.
+
+    Returns:
+        Re-entrant lock instance.
+    """
     key = _env_lock_key(root)
     with _LOCKS_GUARD:
         lk = _ENV_LOCKS.get(key)
@@ -282,6 +395,14 @@ def _get_env_lock(root: Path) -> threading.RLock:
 
 @contextmanager
 def _locked_env(root: Path):
+    """Context manager that guards environment operations with a lock.
+
+    Args:
+        root: Environment root path.
+
+    Yields:
+        None.
+    """
     lk = _get_env_lock(root)
     lk.acquire()
     try:
@@ -296,9 +417,15 @@ def _locked_env(root: Path):
 
 @dataclass(frozen=True)
 class PythonEnv:
+    """Represent a managed Python environment rooted at a filesystem path."""
     root: Path
 
     def __post_init__(self) -> None:
+        """Normalize the root path after dataclass initialization.
+
+        Returns:
+            None.
+        """
         object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
 
     # -----------------------
@@ -307,6 +434,11 @@ class PythonEnv:
 
     @classmethod
     def get_current(cls) -> "PythonEnv":
+        """Return the current active environment inferred from the process.
+
+        Returns:
+            PythonEnv representing the current environment.
+        """
         venv = os.environ.get("VIRTUAL_ENV")
         if venv:
             log.debug("current env from VIRTUAL_ENV=%s", venv)
@@ -325,6 +457,11 @@ class PythonEnv:
     def ensure_uv(
         cls,
     ) -> str:
+        """Ensure uv is installed and return its executable path.
+
+        Returns:
+            Path to uv executable.
+        """
         uv = _uv_exe_on_path()
         if uv:
             return uv
@@ -373,6 +510,17 @@ class PythonEnv:
         require_python: bool = True,
         dedupe: bool = True,
     ) -> Iterator["PythonEnv"]:
+        """Yield PythonEnv instances from the user env directory.
+
+        Args:
+            max_depth: Maximum directory traversal depth.
+            include_hidden: Include hidden directories if True.
+            require_python: Require python executable if True.
+            dedupe: Deduplicate results if True.
+
+        Yields:
+            PythonEnv instances.
+        """
         base = _user_envs_dir()
         if not base.exists() or not base.is_dir():
             return
@@ -380,6 +528,14 @@ class PythonEnv:
         seen: set[str] = set()
 
         def _python_exe(d: Path) -> Path:
+            """Return the python executable path for a candidate env.
+
+            Args:
+                d: Candidate environment directory.
+
+            Returns:
+                Path to python executable.
+            """
             if os.name == "nt":
                 return d / "Scripts" / "python.exe"
             return d / "bin" / "python"
@@ -418,10 +574,27 @@ class PythonEnv:
 
     @classmethod
     def _user_env_root(cls, name: str) -> Path:
+        """Return the root path for a named user environment.
+
+        Args:
+            name: Environment name.
+
+        Returns:
+            Root path for the named environment.
+        """
         return _user_envs_dir() / _safe_env_name(name)
 
     @classmethod
     def get(cls, name: str, *, require_python: bool = False) -> Optional["PythonEnv"]:
+        """Return a PythonEnv by name when it exists.
+
+        Args:
+            name: Environment name.
+            require_python: Require python executable if True.
+
+        Returns:
+            PythonEnv or None if not found.
+        """
         root = cls._user_env_root(name)
         if not root.exists() or not root.is_dir():
             return None
@@ -620,6 +793,15 @@ class PythonEnv:
 
     @classmethod
     def delete(cls, name: str, *, missing_ok: bool = True) -> None:
+        """Delete a user environment by name.
+
+        Args:
+            name: Environment name.
+            missing_ok: If True, missing envs do not raise.
+
+        Returns:
+            None.
+        """
         root = cls._user_env_root(name)
         with _locked_env(root):
             if not root.exists():
@@ -635,6 +817,11 @@ class PythonEnv:
 
     @property
     def bindir(self) -> Path:
+        """Return the scripts/bin directory for this environment.
+
+        Returns:
+            Path to the bin/Scripts directory.
+        """
         if _is_windows():
             scripts = self.root / "Scripts"
             return scripts if scripts.is_dir() else self.root
@@ -642,24 +829,49 @@ class PythonEnv:
 
     @property
     def name(self) -> str:
+        """Return the environment name derived from its root path.
+
+        Returns:
+            Environment name.
+        """
         n = self.root.name
         return n if n else str(self.root)
 
     @property
     def python_executable(self) -> Path:
+        """Return the full path to the environment's Python executable.
+
+        Returns:
+            Path to python executable.
+        """
         exe = "python.exe" if _is_windows() else "python"
         return self.bindir / exe
 
     def exists(self) -> bool:
+        """Return True when the environment's Python executable exists.
+
+        Returns:
+            True if python executable exists.
+        """
         return self.python_executable.exists()
 
     @property
     def version(self) -> str:
+        """Return the Python version string for the environment.
+
+        Returns:
+            Version string.
+        """
         out = self.exec_code("import sys; print(sys.version.split()[0])", check=True)
         return out.strip()
 
     @property
     def version_info(self) -> tuple[int, int, int]:
+        """Return the parsed (major, minor, patch) version tuple.
+
+        Returns:
+            Tuple of (major, minor, patch).
+        """
         v = self.version
         m = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)\s*$", v)
         if not m:
@@ -715,6 +927,14 @@ class PythonEnv:
                 return self
 
         def _slug(s: str) -> str:
+            """Return a filesystem-friendly slug from a string.
+
+            Args:
+                s: Input string.
+
+            Returns:
+                Slugified string.
+            """
             s = (s or "").strip()
             s = re.sub(r"[^A-Za-z0-9._+-]+", "-", s)
             return s.strip("-") or "unknown"
@@ -768,6 +988,18 @@ class PythonEnv:
         include_input: bool = True,
         buffers: Optional[MutableMapping[str, str]] = None,
     ):
+        """Export requirements for the current environment's Python executable.
+
+        Args:
+            out_dir: Optional output directory.
+            base_name: Base filename prefix.
+            include_frozen: Include frozen requirements.
+            include_input: Include input requirements.
+            buffers: Optional mapping for in-memory outputs.
+
+        Returns:
+            Requirements output path or content.
+        """
         return self.export_requirements_matrix(
             python_versions=[self.python_executable],
             out_dir=out_dir, base_name=base_name, include_frozen=include_frozen,
@@ -801,6 +1033,14 @@ class PythonEnv:
           - {base_name}-py<slug>.txt
         """
         def _slug(s: str) -> str:
+            """Return a filesystem-friendly slug for a Python version label.
+
+            Args:
+                s: Input string.
+
+            Returns:
+                Slugified string.
+            """
             s = (s or "").strip()
             if not s:
                 return "unknown"
@@ -923,6 +1163,14 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                 tmp_ctx.cleanup()
 
     def installed_packages(self, parsed: bool = False) -> List[Tuple[str, str]]:
+        """Return installed packages, optionally parsed into (name, version).
+
+        Args:
+            parsed: Return parsed tuples if True.
+
+        Returns:
+            List of package specs or tuples.
+        """
         req = self.requirements()
 
         r = [
@@ -950,6 +1198,18 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         env: Optional[Mapping[str, str]] = None,
         check: bool = True,
     ) -> str:
+        """Execute Python code inside the environment and return stdout.
+
+        Args:
+            code: Python code string to execute.
+            python: Optional python executable override.
+            cwd: Optional working directory.
+            env: Optional environment variables.
+            check: Raise on failure if True.
+
+        Returns:
+            Captured stdout.
+        """
         # pick interpreter (default = env python)
         if python is None:
             if not self.exists():
@@ -979,6 +1239,22 @@ print("RESULT:" + json.dumps(top_level))""".strip()
         print_prefix_lines: bool = True,
         strip_payload: bool = True,
     ) -> Any:
+        """Execute code and parse a tagged payload from stdout.
+
+        Args:
+            code: Python code string to execute.
+            result_tag: Tag prefix for the payload line.
+            python: Optional python executable override.
+            cwd: Optional working directory.
+            env: Optional environment variables.
+            check: Raise on failure if True.
+            parse_json: Parse payload as JSON if True.
+            print_prefix_lines: Print lines before the tag.
+            strip_payload: Strip whitespace from payload.
+
+        Returns:
+            Parsed payload value.
+        """
         stdout = self.exec_code(
             code,
             python=python,
@@ -1003,6 +1279,14 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             payload = payload.strip()
 
         def _try_parse_obj(s: str) -> Optional[Any]:
+            """Try parsing a string as JSON or Python literal.
+
+            Args:
+                s: String to parse.
+
+            Returns:
+                Parsed object or None.
+            """
             s2 = s.strip()
             if not s2:
                 return None
@@ -1016,6 +1300,15 @@ print("RESULT:" + json.dumps(top_level))""".strip()
                 return None
 
         def _decode_value(val: Any, encoding: Optional[str]) -> Any:
+            """Decode a serialized value based on an encoding hint.
+
+            Args:
+                val: Value to decode.
+                encoding: Encoding hint string.
+
+            Returns:
+                Decoded value.
+            """
             enc = (encoding or "").strip().lower()
             if enc in ("", "none", "raw", "plain"):
                 return val
@@ -1088,6 +1381,14 @@ print("RESULT:" + json.dumps(top_level))""".strip()
 
     @classmethod
     def cli(cls, argv: Optional[list[str]] = None) -> int:
+        """Run the PythonEnv CLI command.
+
+        Args:
+            argv: Optional argument list.
+
+        Returns:
+            Exit code.
+        """
         import argparse
 
         parser = argparse.ArgumentParser(prog="python_env", description="User env CRUD + exec (uv everywhere)")

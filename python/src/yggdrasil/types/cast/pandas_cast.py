@@ -1,3 +1,5 @@
+"""Pandas <-> Arrow casting helpers and converters."""
+
 from typing import Optional
 
 import pyarrow as pa
@@ -33,18 +35,45 @@ if pandas is not None:
     PandasDataFrame = pandas.DataFrame
 
     def pandas_converter(*args, **kwargs):
+        """Return a register_converter wrapper when pandas is available.
+
+        Args:
+            *args: Converter registration args.
+            **kwargs: Converter registration kwargs.
+
+        Returns:
+            Converter decorator.
+        """
         return register_converter(*args, **kwargs)
 
 else:
     # Dummy types so annotations/decorators don't explode without pandas
     class _PandasDummy:  # pragma: no cover - only used when pandas not installed
+        """Placeholder type for pandas symbols when pandas is unavailable."""
         pass
 
     PandasSeries = _PandasDummy
     PandasDataFrame = _PandasDummy
 
     def pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """Return a no-op decorator when pandas is unavailable.
+
+        Args:
+            *_args: Ignored positional args.
+            **_kwargs: Ignored keyword args.
+
+        Returns:
+            No-op decorator.
+        """
         def _decorator(func):
+            """Return the function unchanged.
+
+            Args:
+                func: Callable to return.
+
+            Returns:
+                Unchanged callable.
+            """
             return func
 
         return _decorator
