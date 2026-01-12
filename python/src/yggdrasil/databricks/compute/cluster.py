@@ -657,6 +657,7 @@ class Cluster(WorkspaceService):
                 self, update_details
             )
 
+            self.wait_for_status()
             self.details = self.clusters_client().edit_and_wait(**update_details)
 
             logger.info(
