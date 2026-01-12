@@ -37,6 +37,16 @@ ExceptionTypes = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
 
 
 def _ensure_exception_tuple(exc: ExceptionTypes) -> Tuple[Type[BaseException], ...]:
+    """
+    _ensure_exception_tuple documentation.
+    
+    Args:
+        exc: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if isinstance(exc, type) and issubclass(exc, BaseException):
         return (exc,)
     return tuple(exc)
@@ -104,9 +114,30 @@ def retry(
     exc_types = _ensure_exception_tuple(exceptions)
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        """
+        decorator documentation.
+        
+        Args:
+            func: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if inspect.iscoroutinefunction(func):
 
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
+                """
+                async_wrapper documentation.
+                
+                Args:
+                    *args: Parameter.
+                    **kwargs: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 _delay = delay
                 attempt = 1
                 start_time = time.monotonic() if timeout is not None else None
@@ -170,6 +201,17 @@ def retry(
         else:
 
             def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
+                """
+                sync_wrapper documentation.
+                
+                Args:
+                    *args: Parameter.
+                    **kwargs: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 _delay = delay
                 attempt = 1
                 start_time = time.monotonic() if timeout is not None else None
@@ -269,6 +311,16 @@ def random_jitter(scale: float = 0.1) -> Callable[[float], float]:
     """
 
     def _jitter(d: float) -> float:
+        """
+        _jitter documentation.
+        
+        Args:
+            d: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if d <= 0:
             return d
         delta = d * scale
@@ -286,6 +338,16 @@ if __name__ == "__main__":
 
     @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
     def flaky_function() -> str:
+        """
+        flaky_function documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         counter["n"] += 1
         if counter["n"] < 3:
             raise ValueError("boom")
@@ -294,10 +356,30 @@ if __name__ == "__main__":
     print("Result:", flaky_function())
 
     async def main():
+        """
+        main documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         async_counter = {"n": 0}
 
         @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
         async def async_flaky() -> str:
+            """
+            async_flaky documentation.
+            
+            Args:
+                None.
+            
+            Returns:
+                The result.
+            """
+
             async_counter["n"] += 1
             if async_counter["n"] < 3:
                 raise RuntimeError("async boom")

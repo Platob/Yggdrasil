@@ -1,3 +1,5 @@
+"""databricks.workspaces.workspace module documentation."""
+
 import dataclasses
 import logging
 import os
@@ -42,6 +44,16 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 def _get_env_product():
+    """
+    _get_env_product documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     v = os.getenv("DATABRICKS_PRODUCT")
 
     if not v:
@@ -50,6 +62,16 @@ def _get_env_product():
 
 
 def _get_env_product_version():
+    """
+    _get_env_product_version documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     v = os.getenv("DATABRICKS_PRODUCT_VERSION")
 
     if not v:
@@ -58,6 +80,16 @@ def _get_env_product_version():
 
 
 def _get_env_product_tag():
+    """
+    _get_env_product_tag documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     v = os.getenv("DATABRICKS_PRODUCT_TAG")
 
     if not v:
@@ -113,6 +145,16 @@ class Workspace:
     # Pickle support
     # -------------------------
     def __getstate__(self):
+        """
+        __getstate__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         state = self.__dict__.copy()
         state.pop("_sdk", None)
 
@@ -122,6 +164,16 @@ class Workspace:
         return state
 
     def __setstate__(self, state):
+        """
+        __setstate__ documentation.
+        
+        Args:
+            state: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.__dict__.update(state)
         self._sdk = None
 
@@ -132,14 +184,46 @@ class Workspace:
             self.connect(reset=True)
 
     def __enter__(self) -> "Workspace":
+        """
+        __enter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self._was_connected = self._sdk is not None
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        __exit__ documentation.
+        
+        Args:
+            exc_type: Parameter.
+            exc_val: Parameter.
+            exc_tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self._was_connected:
             self.close()
 
     def __del__(self):
+        """
+        __del__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.close()
 
     # -------------------------
@@ -149,6 +233,16 @@ class Workspace:
         self,
         **kwargs
     ) -> "Workspace":
+        """
+        clone_instance documentation.
+        
+        Args:
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         state = self.__getstate__()
         state.update(kwargs)
         return Workspace().__setstate__(state)
@@ -158,9 +252,30 @@ class Workspace:
     # -------------------------
     @property
     def connected(self):
+        """
+        connected documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._sdk is not None
 
     def connect(self, reset: bool = False, clone: bool = False) -> "Workspace":
+        """
+        connect documentation.
+        
+        Args:
+            reset: Parameter.
+            clone: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if reset:
             self._sdk = None
 
@@ -261,6 +376,16 @@ class Workspace:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _local_cache_token_path():
+        """
+        _local_cache_token_path documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         oauth_dir = Path.home() / ".config" / "databricks-sdk-py" / "oauth"
         if not oauth_dir.is_dir():
             return None
@@ -270,6 +395,16 @@ class Workspace:
         return str(files[0]) if files else None
 
     def reset_local_cache(self):
+        """
+        reset_local_cache documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         local_cache = self._local_cache_token_path()
 
         if local_cache:
@@ -277,6 +412,16 @@ class Workspace:
 
     @property
     def current_user(self):
+        """
+        current_user documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         try:
             return self.sdk().current_user.me()
         except:
@@ -285,6 +430,16 @@ class Workspace:
             raise
 
     def current_token(self) -> str:
+        """
+        current_token documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.token:
             return self.token
 
@@ -301,6 +456,16 @@ class Workspace:
         self,
         workspace: Optional["Workspace"] = None,
     ):
+        """
+        filesytem documentation.
+        
+        Args:
+            workspace: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         from .filesytem import DatabricksFileSystem, DatabricksFileSystemHandler
 
         handler = DatabricksFileSystemHandler(
@@ -317,6 +482,18 @@ class Workspace:
         kind: Optional[DatabricksPathKind] = None,
         workspace: Optional["Workspace"] = None
     ):
+        """
+        dbfs_path documentation.
+        
+        Args:
+            parts: Parameter.
+            kind: Parameter.
+            workspace: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         workspace = self if workspace is None else workspace
 
         if kind is None or isinstance(parts, str):
@@ -351,6 +528,16 @@ class Workspace:
     # ------------------------------------------------------------------ #
 
     def sdk(self) -> "WorkspaceClient":
+        """
+        sdk documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.connect()._sdk
 
     # ------------------------------------------------------------------ #
@@ -437,9 +624,29 @@ class Workspace:
 
     @staticmethod
     def is_in_databricks_environment():
+        """
+        is_in_databricks_environment documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
 
     def default_tags(self):
+        """
+        default_tags documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return {
             k: v
             for k, v in (
@@ -451,6 +658,16 @@ class Workspace:
         }
 
     def merge_tags(self, existing: dict | None = None):
+        """
+        merge_tags documentation.
+        
+        Args:
+            existing: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if existing:
             return self.default_tags()
 
@@ -461,6 +678,19 @@ class Workspace:
         schema_name: Optional[str] = None,
         **kwargs
     ):
+        """
+        sql documentation.
+        
+        Args:
+            workspace: Parameter.
+            catalog_name: Parameter.
+            schema_name: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         from ..sql import SQLEngine
 
         return SQLEngine(
@@ -476,6 +706,18 @@ class Workspace:
         cluster_name: Optional[str] = None,
         **kwargs
     ) -> "Cluster":
+        """
+        clusters documentation.
+        
+        Args:
+            cluster_id: Parameter.
+            cluster_name: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         from ..compute.cluster import Cluster
 
         return Cluster(workspace=self, cluster_id=cluster_id, cluster_name=cluster_name, **kwargs)
@@ -492,20 +734,72 @@ class WorkspaceService(ABC):
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
 
     def __post_init__(self):
+        """
+        __post_init__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.workspace is None:
             self.workspace = Workspace()
 
     def __enter__(self):
+        """
+        __enter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.workspace.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        __exit__ documentation.
+        
+        Args:
+            exc_type: Parameter.
+            exc_val: Parameter.
+            exc_tb: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.workspace.__exit__(exc_type=exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
     def is_in_databricks_environment(self):
+        """
+        is_in_databricks_environment documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.is_in_databricks_environment()
 
     def connect(self):
+        """
+        connect documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.workspace = self.workspace.connect()
         return self
 
@@ -515,6 +809,18 @@ class WorkspaceService(ABC):
         kind: Optional[DatabricksPathKind] = None,
         workspace: Optional["Workspace"] = None
     ):
+        """
+        dbfs_path documentation.
+        
+        Args:
+            parts: Parameter.
+            kind: Parameter.
+            workspace: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.dbfs_path(
             kind=kind,
             parts=parts,
@@ -522,8 +828,28 @@ class WorkspaceService(ABC):
         )
 
     def sdk(self):
+        """
+        sdk documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.sdk()
 
     @property
     def current_user(self):
+        """
+        current_user documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.current_user

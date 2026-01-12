@@ -1,3 +1,5 @@
+"""databricks.sql.types module documentation."""
+
 import json
 import re
 from typing import Union
@@ -86,6 +88,16 @@ _struct_re = re.compile(r"^STRUCT\s*<\s*(.+)\s*>$", re.IGNORECASE)
 
 
 def _split_top_level_commas(s: str):
+    """
+    _split_top_level_commas documentation.
+    
+    Args:
+        s: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     parts, cur, depth = [], [], 0
     for ch in s:
         if ch == '<':
@@ -103,6 +115,16 @@ def _split_top_level_commas(s: str):
 
 
 def _safe_bytes(obj):
+    """
+    _safe_bytes documentation.
+    
+    Args:
+        obj: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if not isinstance(obj, bytes):
         if not obj:
             return b""
@@ -177,6 +199,16 @@ def parse_sql_type_to_pa(type_str: str) -> pa.DataType:
 
 
 def column_info_to_arrow_field(col: Union[SQLColumnInfo, CatalogColumnInfo]):
+    """
+    column_info_to_arrow_field documentation.
+    
+    Args:
+        col: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     arrow_type = parse_sql_type_to_pa(col.type_text)
 
     if isinstance(col, CatalogColumnInfo):

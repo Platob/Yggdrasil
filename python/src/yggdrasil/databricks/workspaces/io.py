@@ -1,3 +1,5 @@
+"""databricks.workspaces.io module documentation."""
+
 import base64
 import io
 import time
@@ -43,6 +45,21 @@ class DatabricksIO(ABC, IO):
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ):
+        """
+        __init__ documentation.
+        
+        Args:
+            path: Parameter.
+            mode: Parameter.
+            encoding: Parameter.
+            compression: Parameter.
+            position: Parameter.
+            buffer: Parameter.
+        
+        Returns:
+            None.
+        """
+
         super().__init__()
 
         self.encoding = encoding
@@ -57,24 +74,86 @@ class DatabricksIO(ABC, IO):
         self._write_flag = False
 
     def __enter__(self) -> "DatabricksIO":
+        """
+        __enter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.connect(clone=False)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """
+        __exit__ documentation.
+        
+        Args:
+            exc_type: Parameter.
+            exc_value: Parameter.
+            traceback: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.close()
 
     def __del__(self):
+        """
+        __del__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.close()
 
     def __next__(self):
+        """
+        __next__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         line = self.readline()
         if not line:
             raise StopIteration
         return line
 
     def __iter__(self):
+        """
+        __iter__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self
 
     def __hash__(self):
+        """
+        __hash__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.path.__hash__()
 
     @classmethod
@@ -87,6 +166,21 @@ class DatabricksIO(ABC, IO):
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ) -> "DatabricksIO":
+        """
+        create_instance documentation.
+        
+        Args:
+            path: Parameter.
+            mode: Parameter.
+            encoding: Parameter.
+            compression: Parameter.
+            position: Parameter.
+            buffer: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if path.kind == DatabricksPathKind.VOLUME:
             return DatabricksVolumeIO(
                 path=path,
@@ -119,18 +213,58 @@ class DatabricksIO(ABC, IO):
 
     @property
     def workspace(self):
+        """
+        workspace documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.path.workspace
 
     @property
     def name(self):
+        """
+        name documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.path.name
 
     @property
     def mode(self):
+        """
+        mode documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self._mode
 
     @mode.setter
     def mode(self, value: str):
+        """
+        mode documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._mode = value
 
         # Basic text/binary behavior:
@@ -144,17 +278,57 @@ class DatabricksIO(ABC, IO):
 
     @property
     def content_length(self) -> int:
+        """
+        content_length documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.path.content_length
 
     def size(self):
+        """
+        size documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.content_length
 
     @content_length.setter
     def content_length(self, value: int):
+        """
+        content_length documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.path.content_length = value
 
     @property
     def buffer(self):
+        """
+        buffer documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._buffer is None:
             self._buffer = io.BytesIO()
             self._buffer.seek(self.position, io.SEEK_SET)
@@ -162,14 +336,44 @@ class DatabricksIO(ABC, IO):
 
     @buffer.setter
     def buffer(self, value: Optional[io.BytesIO]):
+        """
+        buffer documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._buffer = value
 
     def clear_buffer(self):
+        """
+        clear_buffer documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._buffer is not None:
             self._buffer.close()
             self._buffer = None
 
     def clone_instance(self, **kwargs):
+        """
+        clone_instance documentation.
+        
+        Args:
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.__class__(
             path=kwargs.get("path", self.path),
             mode=kwargs.get("mode", self.mode),
@@ -181,9 +385,29 @@ class DatabricksIO(ABC, IO):
 
     @property
     def connected(self):
+        """
+        connected documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.path.connected
 
     def connect(self, clone: bool = False) -> "DatabricksIO":
+        """
+        connect documentation.
+        
+        Args:
+            clone: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         path = self.path.connect(clone=clone)
 
         if clone:
@@ -193,23 +417,84 @@ class DatabricksIO(ABC, IO):
         return self
 
     def close(self):
+        """
+        close documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.flush()
         if self._buffer is not None:
             self._buffer.close()
 
     def fileno(self):
+        """
+        fileno documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return hash(self)
 
     def isatty(self):
+        """
+        isatty documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return False
 
     def tell(self):
+        """
+        tell documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.position
 
     def seekable(self):
+        """
+        seekable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return True
 
     def seek(self, offset, whence=0, /):
+        """
+        seek documentation.
+        
+        Args:
+            offset: Parameter.
+            whence: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if whence == io.SEEK_SET:
             new_position = offset
         elif whence == io.SEEK_CUR:
@@ -230,21 +515,74 @@ class DatabricksIO(ABC, IO):
         return self.position
 
     def readable(self):
+        """
+        readable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return True
 
     def getvalue(self):
+        """
+        getvalue documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._buffer is not None:
             return self._buffer.getvalue()
         return self.read_all_bytes()
 
     def getbuffer(self):
+        """
+        getbuffer documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.buffer
 
     @abstractmethod
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
+        """
+        read_byte_range documentation.
+        
+        Args:
+            start: Parameter.
+            length: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         pass
 
     def read_all_bytes(self, use_cache: bool = True, allow_not_found: bool = False) -> bytes:
+        """
+        read_all_bytes documentation.
+        
+        Args:
+            use_cache: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if use_cache and self._buffer is not None:
             buffer_value = self._buffer.getvalue()
 
@@ -266,6 +604,17 @@ class DatabricksIO(ABC, IO):
         return data
 
     def read(self, n=-1, use_cache: bool = True):
+        """
+        read documentation.
+        
+        Args:
+            n: Parameter.
+            use_cache: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.readable():
             raise IOError("File not open for reading")
 
@@ -285,6 +634,17 @@ class DatabricksIO(ABC, IO):
         return data
 
     def readline(self, limit=-1, use_cache: bool = True):
+        """
+        readline documentation.
+        
+        Args:
+            limit: Parameter.
+            use_cache: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.readable():
             raise IOError("File not open for reading")
 
@@ -320,6 +680,17 @@ class DatabricksIO(ABC, IO):
         return bytes(line_bytes)
 
     def readlines(self, hint=-1, use_cache: bool = True):
+        """
+        readlines documentation.
+        
+        Args:
+            hint: Parameter.
+            use_cache: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.readable():
             raise IOError("File not open for reading")
 
@@ -338,16 +709,56 @@ class DatabricksIO(ABC, IO):
         return lines
 
     def appendable(self):
+        """
+        appendable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return "a" in self.mode
 
     def writable(self):
+        """
+        writable documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return True
 
     @abstractmethod
     def write_all_bytes(self, data: bytes):
+        """
+        write_all_bytes documentation.
+        
+        Args:
+            data: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         pass
 
     def truncate(self, size=None, /):
+        """
+        truncate documentation.
+        
+        Args:
+            size: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if size is None:
             size = self.position
 
@@ -362,11 +773,31 @@ class DatabricksIO(ABC, IO):
         return size
 
     def flush(self):
+        """
+        flush documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._write_flag and self._buffer is not None:
             self.write_all_bytes(data=self._buffer.getvalue())
             self._write_flag = False
 
     def write(self, data: AnyStr) -> int:
+        """
+        write documentation.
+        
+        Args:
+            data: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.writable():
             raise IOError("File not open for writing")
 
@@ -382,6 +813,16 @@ class DatabricksIO(ABC, IO):
         return written
 
     def writelines(self, lines) -> None:
+        """
+        writelines documentation.
+        
+        Args:
+            lines: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         for line in lines:
             if isinstance(line, str):
                 line = line.encode(self.encoding or "utf-8")
@@ -394,12 +835,33 @@ class DatabricksIO(ABC, IO):
             self.write(data)
 
     def get_output_stream(self, *args, **kwargs):
+        """
+        get_output_stream documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self
 
     def copy_to(
         self,
         dest: Union["DatabricksIO", "DatabricksPath", str]
     ) -> None:
+        """
+        copy_to documentation.
+        
+        Args:
+            dest: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not isinstance(dest, DatabricksIO):
             from .path import DatabricksPath
 
@@ -413,6 +875,16 @@ class DatabricksIO(ABC, IO):
     # ---- format helpers ----
 
     def _reset_for_write(self):
+        """
+        _reset_for_write documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._buffer is not None:
             self._buffer.seek(0, io.SEEK_SET)
             self._buffer.truncate(0)
@@ -430,6 +902,19 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_table documentation.
+        
+        Args:
+            table: Parameter.
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if isinstance(table, pa.Table):
             return self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
         elif isinstance(table, pa.RecordBatch):
@@ -449,6 +934,18 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ) -> pa.Table:
+        """
+        read_arrow_table documentation.
+        
+        Args:
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         file_format = self.path.file_format if file_format is None else file_format
         self.seek(0)
 
@@ -466,6 +963,18 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_arrow documentation.
+        
+        Args:
+            table: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not isinstance(table, pa.Table):
             table = convert(table, pa.Table)
 
@@ -482,6 +991,19 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_arrow_table documentation.
+        
+        Args:
+            table: Parameter.
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         file_format = self.path.file_format if file_format is None else file_format
         buffer = io.BytesIO()
 
@@ -503,6 +1025,19 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_arrow_batch documentation.
+        
+        Args:
+            batch: Parameter.
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         table = pa.Table.from_batches([batch])
         self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
 
@@ -511,6 +1046,17 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        read_arrow_batches documentation.
+        
+        Args:
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return (
             self
             .read_arrow_table(batch_size=batch_size, **kwargs)
@@ -524,6 +1070,17 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        read_pandas documentation.
+        
+        Args:
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.read_arrow_table(batch_size=batch_size, **kwargs).to_pandas()
 
     def write_pandas(
@@ -532,6 +1089,18 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_pandas documentation.
+        
+        Args:
+            df: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.write_arrow_table(pa.table(df), batch_size=batch_size, **kwargs)
 
     # ---- Polars ----
@@ -542,6 +1111,18 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        read_polars documentation.
+        
+        Args:
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         import polars as pl
 
         file_format = self.path.file_format if file_format is None else file_format
@@ -562,6 +1143,19 @@ class DatabricksIO(ABC, IO):
         batch_size: Optional[int] = None,
         **kwargs
     ):
+        """
+        write_polars documentation.
+        
+        Args:
+            df: Parameter.
+            file_format: Parameter.
+            batch_size: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         file_format = self.path.file_format if file_format is None else FileFormat
         buffer = io.BytesIO()
 
@@ -580,6 +1174,18 @@ class DatabricksIO(ABC, IO):
 class DatabricksWorkspaceIO(DatabricksIO):
 
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
+        """
+        read_byte_range documentation.
+        
+        Args:
+            start: Parameter.
+            length: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if length == 0:
             return b""
 
@@ -601,6 +1207,16 @@ class DatabricksWorkspaceIO(DatabricksIO):
         return data[start:end]
 
     def write_all_bytes(self, data: bytes):
+        """
+        write_all_bytes documentation.
+        
+        Args:
+            data: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         workspace_client = sdk.workspace
         full_path = self.path.workspace_full_path()
@@ -635,6 +1251,18 @@ class DatabricksWorkspaceIO(DatabricksIO):
 class DatabricksVolumeIO(DatabricksIO):
 
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
+        """
+        read_byte_range documentation.
+        
+        Args:
+            start: Parameter.
+            length: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if length == 0:
             return b""
 
@@ -652,6 +1280,16 @@ class DatabricksVolumeIO(DatabricksIO):
         return result
 
     def write_all_bytes(self, data: bytes):
+        """
+        write_all_bytes documentation.
+        
+        Args:
+            data: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         client = sdk.files
         full_path = self.path.files_full_path()
@@ -684,6 +1322,18 @@ class DatabricksVolumeIO(DatabricksIO):
 class DatabricksDBFSIO(DatabricksIO):
 
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
+        """
+        read_byte_range documentation.
+        
+        Args:
+            start: Parameter.
+            length: Parameter.
+            allow_not_found: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if length == 0:
             return b""
 
@@ -718,6 +1368,16 @@ class DatabricksDBFSIO(DatabricksIO):
         return bytes(read_bytes)
 
     def write_all_bytes(self, data: bytes):
+        """
+        write_all_bytes documentation.
+        
+        Args:
+            data: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sdk = self.workspace.sdk()
         client = sdk.dbfs
         full_path = self.path.dbfs_full_path()

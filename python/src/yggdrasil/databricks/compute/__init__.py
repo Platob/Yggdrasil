@@ -1,3 +1,5 @@
+"""databricks.compute package documentation."""
+
 __all__ = [
     "databricks_remote_compute",
     "Cluster",

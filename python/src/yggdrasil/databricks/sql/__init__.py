@@ -1,3 +1,5 @@
+"""databricks.sql package documentation."""
+
 from .engine import SQLEngine, StatementResult
 
 # Backwards compatibility

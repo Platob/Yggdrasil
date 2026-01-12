@@ -1,3 +1,5 @@
+"""types.cast.registry module documentation."""
+
 from __future__ import annotations
 
 import dataclasses as _dataclasses
@@ -31,6 +33,17 @@ __all__ = [
 
 
 def _identity(x, opt):
+    """
+    _identity documentation.
+    
+    Args:
+        x: Parameter.
+        opt: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return x
 
 ReturnType = TypeVar("ReturnType")
@@ -49,6 +62,16 @@ def register_converter(
     """
 
     def decorator(func: Callable[..., ReturnType]) -> Converter:
+        """
+        decorator documentation.
+        
+        Args:
+            func: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         sig = inspect.signature(func)
         params = list(sig.parameters.values())
         if any(
@@ -75,6 +98,16 @@ def register_converter(
 
 
 def _unwrap_optional(hint: Any) -> Tuple[bool, Any]:
+    """
+    _unwrap_optional documentation.
+    
+    Args:
+        hint: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     origin = get_origin(hint)
     if origin in {Union, types.UnionType}:
         args = get_args(hint)
@@ -116,6 +149,17 @@ def find_converter(
 ) -> Optional[Converter]:
 
     # 0) Fast path: exact key
+    """
+    find_converter documentation.
+    
+    Args:
+        from_type: Parameter.
+        to_hint: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     conv = _registry.get((from_type, to_hint))
     if conv is not None:
         return conv
@@ -177,6 +221,19 @@ def find_converter(
 
             # Build composite converter once we find the first viable chain.
             def composed(value, options=None, _c1=conv1, _c2=conv2):
+                """
+                composed documentation.
+                
+                Args:
+                    value: Parameter.
+                    options: Parameter.
+                    _c1: Parameter.
+                    _c2: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 intermediate = _c1(value, options)
                 return _c2(intermediate, options)
 
@@ -190,6 +247,16 @@ def find_converter(
 
 
 def _normalize_fractional_seconds(value: str) -> str:
+    """
+    _normalize_fractional_seconds documentation.
+    
+    Args:
+        value: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     match = re.search(r"(\.)(\d+)(?=(?:[+-]\d{2}:?\d{2})?$)", value)
     if not match:
         return value
@@ -203,6 +270,16 @@ def _normalize_fractional_seconds(value: str) -> str:
 def is_runtime_value(x) -> bool:
     # True for "42", [], MyClass(), etc.
     # False for MyClass, list[int], dict[str, int], etc.
+    """
+    is_runtime_value documentation.
+    
+    Args:
+        x: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if inspect.isclass(x):
         return False
     if get_origin(x) is not None:
@@ -305,6 +382,18 @@ def convert_to_python_enum(
     target_hint: type,
     options: Optional[CastOptions] = None,
 ):
+    """
+    convert_to_python_enum documentation.
+    
+    Args:
+        value: Parameter.
+        target_hint: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if isinstance(value, target_hint):
         return value
 
@@ -343,6 +432,18 @@ def convert_to_python_dataclass(
     target_hint: type,
     options: Optional[CastOptions] = None,
 ):
+    """
+    convert_to_python_dataclass documentation.
+    
+    Args:
+        value: Parameter.
+        target_hint: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     from yggdrasil.types.python_defaults import default_scalar
 
     if isinstance(value, target_hint):
@@ -385,6 +486,20 @@ def convert_to_python_iterable(
     target_args,
     options: Optional[CastOptions] = None,
 ):
+    """
+    convert_to_python_iterable documentation.
+    
+    Args:
+        value: Parameter.
+        target_hint: Parameter.
+        target_origin: Parameter.
+        target_args: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if isinstance(value, (str, bytes)):
         raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
 
@@ -411,6 +526,17 @@ def convert_to_python_iterable(
 
 @register_converter(str, int)
 def _str_to_int(value: str, cast_options: Any) -> int:
+    """
+    _str_to_int documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if value == "":
         return 0
     return int(value)
@@ -418,6 +544,17 @@ def _str_to_int(value: str, cast_options: Any) -> int:
 
 @register_converter(str, float)
 def _str_to_float(value: str, cast_options: Any) -> float:
+    """
+    _str_to_float documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -426,6 +563,17 @@ def _str_to_float(value: str, cast_options: Any) -> float:
 
 @register_converter(str, bool)
 def _str_to_bool(value: str, cast_options: Any) -> bool:
+    """
+    _str_to_bool documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -441,11 +589,33 @@ def _str_to_bool(value: str, cast_options: Any) -> bool:
 
 @register_converter(str, _datetime.date)
 def _str_to_date(value: str, cast_options: Any) -> _datetime.date:
+    """
+    _str_to_date documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return _str_to_datetime(value, cast_options).date()
 
 
 @register_converter(str, _datetime.datetime)
 def _str_to_datetime(value: str, cast_options: Any) -> _datetime.datetime:
+    """
+    _str_to_datetime documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -488,6 +658,17 @@ def _str_to_datetime(value: str, cast_options: Any) -> _datetime.datetime:
 
 @register_converter(str, _datetime.timedelta)
 def _str_to_timedelta(value: str, cast_options: Any) -> _datetime.timedelta:
+    """
+    _str_to_timedelta documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     default_value = getattr(cast_options, "default_value", None)
     stripped = value.strip()
 
@@ -545,6 +726,17 @@ def _str_to_timedelta(value: str, cast_options: Any) -> _datetime.timedelta:
 
 @register_converter(str, _datetime.time)
 def _str_to_time(value: str, cast_options: Any) -> _datetime.time:
+    """
+    _str_to_time documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -553,9 +745,31 @@ def _str_to_time(value: str, cast_options: Any) -> _datetime.time:
 
 @register_converter(_datetime.datetime, _datetime.date)
 def _datetime_to_date(value: _datetime.datetime, cast_options: Any) -> _datetime.date:
+    """
+    _datetime_to_date documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return value.date()
 
 
 @register_converter(int, str)
 def _int_to_str(value: int, cast_options: Any) -> str:
+    """
+    _int_to_str documentation.
+    
+    Args:
+        value: Parameter.
+        cast_options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return str(value)

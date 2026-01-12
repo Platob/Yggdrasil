@@ -1,3 +1,5 @@
+"""libs.polarslib module documentation."""
+
 try:
     import polars  # type: ignore
 
@@ -13,6 +15,16 @@ __all__ = [
 
 
 def require_polars():
+    """
+    require_polars documentation.
+    
+    Args:
+        None.
+    
+    Returns:
+        The result.
+    """
+
     if polars is None:
         raise ImportError(
             "polars is required to use this function. "

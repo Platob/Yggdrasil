@@ -1,3 +1,5 @@
+"""databricks.compute.remote module documentation."""
+
 import datetime as dt
 import logging
 from typing import (
@@ -26,6 +28,22 @@ def databricks_remote_compute(
     env_keys: Optional[List[str]] = None,
     **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
+    """
+    databricks_remote_compute documentation.
+    
+    Args:
+        cluster_id: Parameter.
+        cluster_name: Parameter.
+        workspace: Parameter.
+        cluster: Parameter.
+        timeout: Parameter.
+        env_keys: Parameter.
+        **options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if isinstance(workspace, str):
         workspace = Workspace(host=workspace)
 

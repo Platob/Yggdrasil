@@ -90,17 +90,57 @@ class Cluster(WorkspaceService):
 
     @property
     def id(self):
+        """
+        id documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.cluster_id
 
     @property
     def name(self) -> str:
+        """
+        name documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.cluster_name
 
     def __post_init__(self):
+        """
+        __post_init__ documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._details is not None:
             self.details = self._details
 
     def is_in_databricks_environment(self):
+        """
+        is_in_databricks_environment documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.is_in_databricks_environment()
 
     @classmethod
@@ -114,6 +154,22 @@ class Cluster(WorkspaceService):
         libraries: Optional[list[str]] = None,
         **kwargs
     ) -> "Cluster":
+        """
+        replicated_current_environment documentation.
+        
+        Args:
+            workspace: Parameter.
+            cluster_id: Parameter.
+            cluster_name: Parameter.
+            single_user_name: Parameter.
+            runtime_engine: Parameter.
+            libraries: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if workspace is None:
             workspace = Workspace()  # your default, whatever it is
 
@@ -146,6 +202,22 @@ class Cluster(WorkspaceService):
         libraries: Optional[list[str]] = None,
         **kwargs
     ) -> "Cluster":
+        """
+        push_python_environment documentation.
+        
+        Args:
+            source: Parameter.
+            cluster_id: Parameter.
+            cluster_name: Parameter.
+            single_user_name: Parameter.
+            runtime_engine: Parameter.
+            libraries: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if source is None:
             source = PythonEnv.get_current()
 
@@ -192,6 +264,17 @@ class Cluster(WorkspaceService):
         name: Optional[str] = None,
         target: PythonEnv | str | None = None,
     ):
+        """
+        pull_python_environment documentation.
+        
+        Args:
+            name: Parameter.
+            target: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         with self.context() as c:
             m = c.remote_metadata
             version_info = m.version_info
@@ -220,11 +303,31 @@ class Cluster(WorkspaceService):
     
     @property
     def details(self):
+        """
+        details documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self._details is None and self.cluster_id is not None:
             self.details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
     def fresh_details(self, max_delay: float | None = None):
+        """
+        fresh_details documentation.
+        
+        Args:
+            max_delay: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         max_delay = max_delay or 0
         delay = time.time() - self._details_refresh_time
 
@@ -234,6 +337,16 @@ class Cluster(WorkspaceService):
 
     @details.setter
     def details(self, value: "ClusterDetails"):
+        """
+        details documentation.
+        
+        Args:
+            value: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self._details_refresh_time = time.time()
         self._details = value
 
@@ -242,6 +355,16 @@ class Cluster(WorkspaceService):
 
     @property
     def state(self):
+        """
+        state documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         details = self.fresh_details(max_delay=10)
 
         if details is not None:
@@ -249,6 +372,16 @@ class Cluster(WorkspaceService):
         return State.UNKNOWN
 
     def get_state(self, max_delay: float = None):
+        """
+        get_state documentation.
+        
+        Args:
+            max_delay: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         details = self.fresh_details(max_delay=max_delay)
 
         if details is not None:
@@ -257,17 +390,57 @@ class Cluster(WorkspaceService):
 
     @property
     def is_running(self):
+        """
+        is_running documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.state == State.RUNNING
 
     @property
     def is_pending(self):
+        """
+        is_pending documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.state in  (State.PENDING, State.RESIZING, State.RESTARTING, State.TERMINATING)
 
     @property
     def is_error(self):
+        """
+        is_error documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.state == State.ERROR
 
     def raise_for_status(self):
+        """
+        raise_for_status documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.is_error:
             raise DatabricksError("Error in %s" % self)
 
@@ -280,6 +453,19 @@ class Cluster(WorkspaceService):
         backoff: int = 2,
         max_sleep_time: float = 15
     ):
+        """
+        wait_for_status documentation.
+        
+        Args:
+            tick: Parameter.
+            timeout: Parameter.
+            backoff: Parameter.
+            max_sleep_time: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         start = time.time()
         sleep_time = tick
 
@@ -297,6 +483,16 @@ class Cluster(WorkspaceService):
 
     @property
     def spark_version(self) -> str:
+        """
+        spark_version documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         d = self.details
         if d is None:
             return None
@@ -305,6 +501,16 @@ class Cluster(WorkspaceService):
     @property
     def runtime_version(self):
         # Extract "major.minor" from strings like "17.3.x-scala2.13-ml-gpu"
+        """
+        runtime_version documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         v = self.spark_version
 
         if v is None:
@@ -331,6 +537,16 @@ class Cluster(WorkspaceService):
     # Internal helpers
     # ------------------------------------------------------------------ #
     def clusters_client(self) -> "ClustersAPI":
+        """
+        clusters_client documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.sdk().clusters
 
     def spark_versions(
@@ -338,6 +554,17 @@ class Cluster(WorkspaceService):
         photon: Optional[bool] = None,
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
     ):
+        """
+        spark_versions documentation.
+        
+        Args:
+            photon: Parameter.
+            python_version: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         all_versions = self.clusters_client().spark_versions().versions
 
         if not all_versions:
@@ -363,12 +590,32 @@ class Cluster(WorkspaceService):
 
             def dbr_from_key(key: str) -> Optional[str]:
                 # "17.3.x-gpu-ml-scala2.13" -> "17.3"
+                """
+                dbr_from_key documentation.
+                
+                Args:
+                    key: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 dbr_version_parts = key.split(".")
                 if len(dbr_version_parts) < 2:
                     return None
                 return ".".join(dbr_version_parts[:2])
 
             def py_for_key(key: str) -> Optional[tuple[int, int]]:
+                """
+                py_for_key documentation.
+                
+                Args:
+                    key: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 dbr = dbr_from_key(key)
                 if dbr is None:
                     return None
@@ -387,6 +634,17 @@ class Cluster(WorkspaceService):
         photon: Optional[bool] = None,
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
     ):
+        """
+        latest_spark_version documentation.
+        
+        Args:
+            photon: Parameter.
+            python_version: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         versions = self.spark_versions(photon=photon, python_version=python_version)
 
         max_version: SparkVersion = None
@@ -409,6 +667,18 @@ class Cluster(WorkspaceService):
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
         **kwargs
     ):
+        """
+        _check_details documentation.
+        
+        Args:
+            details: Parameter.
+            python_version: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         pip_settings = PipIndexSettings.default_settings()
 
         if kwargs:
@@ -458,6 +728,19 @@ class Cluster(WorkspaceService):
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ):
+        """
+        create_or_update documentation.
+        
+        Args:
+            cluster_id: Parameter.
+            cluster_name: Parameter.
+            libraries: Parameter.
+            **cluster_spec: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         found = self.find_cluster(
             cluster_id=cluster_id or self.cluster_id,
             cluster_name=cluster_name or self.cluster_name,
@@ -482,6 +765,17 @@ class Cluster(WorkspaceService):
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ) -> str:
+        """
+        create documentation.
+        
+        Args:
+            libraries: Parameter.
+            **cluster_spec: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
         update_details = self._check_details(details=ClusterDetails(), **cluster_spec)
         update_details = {
@@ -512,6 +806,17 @@ class Cluster(WorkspaceService):
         libraries: Optional[List[Union[str, "Library"]]] = None,
         **cluster_spec: Any
     ) -> "Cluster":
+        """
+        update documentation.
+        
+        Args:
+            libraries: Parameter.
+            **cluster_spec: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
 
         existing_details = {
@@ -590,11 +895,31 @@ class Cluster(WorkspaceService):
     def ensure_running(
         self,
     ) -> "Cluster":
+        """
+        ensure_running documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.start()
 
     def start(
         self,
     ) -> "Cluster":
+        """
+        start documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.wait_for_status()
 
         if not self.is_running:
@@ -608,6 +933,16 @@ class Cluster(WorkspaceService):
     def restart(
         self,
     ):
+        """
+        restart documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         self.wait_for_status()
 
         if self.is_running:
@@ -620,6 +955,16 @@ class Cluster(WorkspaceService):
     def delete(
         self
     ):
+        """
+        delete documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         logger.info("Deleting %s", self)
         return self.clusters_client().delete(cluster_id=self.cluster_id)
 
@@ -628,6 +973,17 @@ class Cluster(WorkspaceService):
         language: Optional["Language"] = None,
         context_id: Optional[str] = None
     ) -> ExecutionContext:
+        """
+        context documentation.
+        
+        Args:
+            language: Parameter.
+            context_id: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return ExecutionContext(
             cluster=self,
             language=language,
@@ -645,6 +1001,22 @@ class Cluster(WorkspaceService):
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
     ):
+        """
+        execute documentation.
+        
+        Args:
+            obj: Parameter.
+            language: Parameter.
+            args: Parameter.
+            kwargs: Parameter.
+            env_keys: Parameter.
+            timeout: Parameter.
+            result_tag: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.context(language=language).execute(
             obj=obj,
             args=args,
@@ -685,6 +1057,16 @@ class Cluster(WorkspaceService):
             def h(z): ...
         """
         def decorator(func: Callable):
+            """
+            decorator documentation.
+            
+            Args:
+                func: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
                 return func
 
@@ -693,6 +1075,17 @@ class Cluster(WorkspaceService):
 
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                """
+                wrapper documentation.
+                
+                Args:
+                    *args: Parameter.
+                    **kwargs: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
                     return func(*args, **kwargs)
 
@@ -723,6 +1116,20 @@ class Cluster(WorkspaceService):
         raise_error: bool = True,
         restart: bool = True,
     ) -> "Cluster":
+        """
+        install_libraries documentation.
+        
+        Args:
+            libraries: Parameter.
+            wait_timeout: Parameter.
+            pip_settings: Parameter.
+            raise_error: Parameter.
+            restart: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not libraries:
             return self
 
@@ -752,6 +1159,16 @@ class Cluster(WorkspaceService):
         return self
 
     def installed_library_statuses(self):
+        """
+        installed_library_statuses documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return self.workspace.sdk().libraries.cluster_status(cluster_id=self.cluster_id)
 
     def uninstall_libraries(
@@ -760,6 +1177,18 @@ class Cluster(WorkspaceService):
         libraries: Optional[list["Library"]] = None,
         restart: bool = True
     ):
+        """
+        uninstall_libraries documentation.
+        
+        Args:
+            pypi_packages: Parameter.
+            libraries: Parameter.
+            restart: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if libraries is None:
             to_remove = [
                 lib.library
@@ -790,6 +1219,18 @@ class Cluster(WorkspaceService):
         pypi_packages: Optional[list[str]] = None,
         default_filter: bool = False
     ):
+        """
+        _filter_lib documentation.
+        
+        Args:
+            lib: Parameter.
+            pypi_packages: Parameter.
+            default_filter: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if lib is None:
             return False
 
@@ -805,6 +1246,18 @@ class Cluster(WorkspaceService):
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
     ):
+        """
+        wait_installed_libraries documentation.
+        
+        Args:
+            timeout: Parameter.
+            pip_settings: Parameter.
+            raise_error: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if not self.is_running:
             return self
 
@@ -851,6 +1304,16 @@ class Cluster(WorkspaceService):
         self,
         libraries: str | ModuleType | List[str | ModuleType],
     ):
+        """
+        install_temporary_libraries documentation.
+        
+        Args:
+            libraries: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return self.context().install_temporary_libraries(libraries=libraries)
 
     def _check_library(
@@ -858,6 +1321,17 @@ class Cluster(WorkspaceService):
         value,
         pip_settings: Optional[PipIndexSettings] = None,
     ) -> "Library":
+        """
+        _check_library documentation.
+        
+        Args:
+            value: Parameter.
+            pip_settings: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         if isinstance(value, Library):
             return value
 

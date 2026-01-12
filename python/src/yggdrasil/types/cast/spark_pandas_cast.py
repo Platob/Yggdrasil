@@ -1,3 +1,5 @@
+"""types.cast.spark_pandas_cast module documentation."""
+
 from typing import Optional
 
 from .arrow_cast import CastOptions
@@ -34,6 +36,17 @@ if pyspark is not None and pandas is not None:
     PandasDataFrame = pandas.DataFrame
 
     def spark_pandas_converter(*args, **kwargs):
+        """
+        spark_pandas_converter documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return register_converter(*args, **kwargs)
 
 else:
@@ -45,7 +58,28 @@ else:
     PandasDataFrame = _Dummy
 
     def spark_pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """
+        spark_pandas_converter documentation.
+        
+        Args:
+            *_args: Parameter.
+            **_kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         def _decorator(func):
+            """
+            _decorator documentation.
+            
+            Args:
+                func: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             return func
 
         return _decorator

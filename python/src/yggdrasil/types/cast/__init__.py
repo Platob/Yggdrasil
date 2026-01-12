@@ -1,3 +1,5 @@
+"""types.cast package documentation."""
+
 from .registry import *
 from .arrow_cast import *
 from .polars_cast import *

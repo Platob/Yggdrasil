@@ -1,3 +1,5 @@
+"""types.cast.spark_cast module documentation."""
+
 from typing import Optional, Tuple, List
 
 import pyarrow as pa
@@ -57,6 +59,17 @@ if pyspark is not None:
     SparkStructField = T.StructField
 
     def spark_converter(*args, **kwargs):
+        """
+        spark_converter documentation.
+        
+        Args:
+            *args: Parameter.
+            **kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         return register_converter(*args, **kwargs)
 
 else:  # pyspark missing -> dummies + no-op decorator
@@ -70,7 +83,28 @@ else:  # pyspark missing -> dummies + no-op decorator
     SparkStructField = _SparkDummy
 
     def spark_converter(*_args, **_kwargs):  # pragma: no cover
+        """
+        spark_converter documentation.
+        
+        Args:
+            *_args: Parameter.
+            **_kwargs: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         def _decorator(func):
+            """
+            _decorator documentation.
+            
+            Args:
+                func: Parameter.
+            
+            Returns:
+                The result.
+            """
+
             return func
 
         return _decorator
@@ -227,6 +261,19 @@ def check_column_nullability(
     target_field: "T.StructField",
     mask: "pyspark.sql.Column"
 ) -> "pyspark.sql.Column":
+    """
+    check_column_nullability documentation.
+    
+    Args:
+        column: Parameter.
+        source_field: Parameter.
+        target_field: Parameter.
+        mask: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     source_nullable = True if source_field is None else source_field.nullable
     target_nullable = True if target_field is None else target_field.nullable
 
@@ -532,6 +579,17 @@ def spark_dataframe_to_spark_type(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """
+    spark_dataframe_to_spark_type documentation.
+    
+    Args:
+        df: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return df.schema
 
 
@@ -540,6 +598,17 @@ def spark_dataframe_to_spark_field(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """
+    spark_dataframe_to_spark_field documentation.
+    
+    Args:
+        df: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return SparkStructField(
         df.getAlias() or "root",
         df.schema,
@@ -552,6 +621,17 @@ def spark_dataframe_to_arrow_field(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """
+    spark_dataframe_to_arrow_field documentation.
+    
+    Args:
+        df: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return spark_field_to_arrow_field(
         spark_dataframe_to_spark_field(df, options),
         options
@@ -563,6 +643,17 @@ def spark_dataframe_to_arrow_schema(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """
+    spark_dataframe_to_arrow_schema documentation.
+    
+    Args:
+        df: Parameter.
+        options: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return arrow_field_to_schema(
         spark_field_to_arrow_field(
             spark_dataframe_to_spark_field(df, options),

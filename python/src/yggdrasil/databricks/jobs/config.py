@@ -1,3 +1,5 @@
+"""databricks.jobs.config module documentation."""
+
 import builtins
 import dataclasses
 import datetime as dt
@@ -21,6 +23,17 @@ logger = logging.getLogger(__name__)
 
 
 def type_is_iterable(tpe: type, origin=None):
+    """
+    type_is_iterable documentation.
+    
+    Args:
+        tpe: Parameter.
+        origin: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if (
         tpe is list or tpe is set
     ):
@@ -53,6 +66,16 @@ class NotebookConfig:
     @classmethod
     def get_dbutils(cls):
         # 1) explicit builtin injection (Databricks sometimes does this)
+        """
+        get_dbutils documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if hasattr(builtins, "dbutils"):
             return builtins.dbutils
 
@@ -296,6 +319,16 @@ class NotebookConfig:
 
     @classmethod
     def init_job(cls):
+        """
+        init_job documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         cls.init_widgets()
 
         if SparkSession is not None:

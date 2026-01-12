@@ -1,3 +1,5 @@
+"""databricks package documentation."""
+
 from .workspaces import *
 from .compute import *
 from .sql import *

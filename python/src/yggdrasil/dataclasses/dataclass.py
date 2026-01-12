@@ -1,3 +1,5 @@
+"""dataclasses.dataclass module documentation."""
+
 import dataclasses
 from inspect import isclass
 from typing import Any, Iterable, Mapping, Tuple
@@ -26,6 +28,16 @@ def is_yggdataclass(cls_or_instance: Any) -> bool:
 
 
 def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
+    """
+    get_dataclass_arrow_field documentation.
+    
+    Args:
+        cls_or_instance: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if is_yggdataclass(cls_or_instance):
         return cls_or_instance.__arrow_field__()
 
@@ -73,7 +85,27 @@ def yggdataclass(
     """
 
     def wrap(c):
+        """
+        wrap documentation.
+        
+        Args:
+            c: Parameter.
+        
+        Returns:
+            The result.
+        """
+
         def _init_public_fields(cls):
+            """
+            _init_public_fields documentation.
+            
+            Args:
+                None.
+            
+            Returns:
+                The result.
+            """
+
             return [
                 field
                 for field in dataclasses.fields(cls)
@@ -83,6 +115,16 @@ def yggdataclass(
         if not hasattr(c, "default_instance"):
             @classmethod
             def default_instance(cls):
+                """
+                default_instance documentation.
+                
+                Args:
+                    None.
+                
+                Returns:
+                    The result.
+                """
+
                 from yggdrasil.types import default_scalar
 
                 if not hasattr(cls, "__default_instance__"):
@@ -135,6 +177,16 @@ def yggdataclass(
         if not hasattr(c, "__arrow_field__"):
             @classmethod
             def __arrow_field__(cls, name: str | None = None):
+                """
+                __arrow_field__ documentation.
+                
+                Args:
+                    name: Parameter.
+                
+                Returns:
+                    The result.
+                """
+
                 from yggdrasil.types.python_arrow import arrow_field_from_hint
 
                 return arrow_field_from_hint(cls, name=name)

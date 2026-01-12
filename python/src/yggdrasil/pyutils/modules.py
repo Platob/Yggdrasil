@@ -1,3 +1,5 @@
+"""pyutils.modules module documentation."""
+
 # modules.py
 from __future__ import annotations
 
@@ -43,6 +45,16 @@ MODULE_PROJECT_NAMES_ALIASES = {
 
 
 def module_name_to_project_name(module_name: str) -> str:
+    """
+    module_name_to_project_name documentation.
+    
+    Args:
+        module_name: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     return MODULE_PROJECT_NAMES_ALIASES.get(module_name, module_name)
 
 
@@ -136,6 +148,16 @@ def _req_project_name(req_line: str) -> Optional[str]:
 
 
 def _distribution_for_module(mod: Union[str, ModuleType]):
+    """
+    _distribution_for_module documentation.
+    
+    Args:
+        mod: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     if ilm is None:
         raise RuntimeError("importlib.metadata is not available")
 
@@ -213,6 +235,16 @@ def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]
 
 
 def _run_pip(*args: str) -> Tuple[int, str, str]:
+    """
+    _run_pip documentation.
+    
+    Args:
+        *args: Parameter.
+    
+    Returns:
+        The result.
+    """
+
     p = subprocess.run(
         [sys.executable, "-m", "pip", *args],
         text=True,
@@ -231,15 +263,45 @@ class PipIndexSettings:
 
     @classmethod
     def default_settings(cls):
+        """
+        default_settings documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return DEFAULT_PIP_INDEX_SETTINGS
 
     @property
     def extra_index_url(self):
+        """
+        extra_index_url documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         if self.extra_index_urls:
             return " ".join(self.extra_index_urls)
         return None
 
     def as_dict(self) -> dict:
+        """
+        as_dict documentation.
+        
+        Args:
+            None.
+        
+        Returns:
+            The result.
+        """
+
         return dc.asdict(self)
 
 
