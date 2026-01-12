@@ -1,3 +1,5 @@
+"""Arrow casting helpers for arrays, tables, and schemas."""
+
 import dataclasses
 import enum
 import logging
@@ -453,6 +455,7 @@ def any_to_arrow_scalar(
     scalar: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Scalar:
+    """Convert a Python value to an Arrow scalar."""
     if isinstance(scalar, pa.Scalar):
         return cast_arrow_scalar(scalar, options)
 
@@ -493,6 +496,7 @@ def cast_arrow_scalar(
     scalar: pa.Scalar,
     options: Optional[CastOptions] = None,
 ) -> pa.Scalar:
+    """Cast an Arrow scalar to the target Arrow field."""
     options = CastOptions.check_arg(options)
     target_field = options.target_field
 
@@ -744,6 +748,7 @@ def cast_arrow_tabular(
 
 @register_converter(pds.Dataset, pds.Dataset)
 def cast_arrow_dataset(data: pds.Dataset, options: Optional[CastOptions] = None) -> pds.Dataset:
+    """Cast a dataset to the target schema in options."""
     if options is None:
         return data
 
@@ -771,6 +776,7 @@ def cast_arrow_record_batch_reader(
         return data
 
     def casted_batches():
+        """Yield casted batches from a RecordBatchReader."""
         for batch in data:
             yield cast_arrow_tabular(batch, options)
 
@@ -784,6 +790,7 @@ def any_to_arrow_array(
     obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Array:
+    """Convert array-like input into an Arrow array."""
     options = CastOptions.check_arg(options)
     arrow_array = None
 
@@ -860,6 +867,7 @@ def pylist_to_record_batch(
     data: list,
     options: Optional[CastOptions] = None,
 ) -> pa.RecordBatch:
+    """Convert a list of rows into a RecordBatch."""
     options = CastOptions.check_arg(options)
 
     array: Union[pa.Array, pa.StructArray] = any_to_arrow_array(data, options)
@@ -1115,6 +1123,7 @@ def arrow_dataset_to_table(
     data: pds.Dataset,
     options: Optional[CastOptions] = None,
 ) -> pa.Table:
+    """Convert a dataset to a Table and apply casting."""
     table = data.to_table()
     return cast_arrow_tabular(table, options)
 
@@ -1125,6 +1134,7 @@ def arrow_tabular_to_dataset(
     data: Union[pa.Table, pa.RecordBatch],
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
+    """Convert Arrow tabular data to a dataset after casting."""
     data = cast_arrow_tabular(data, options)
     return pds.dataset([data])
 
@@ -1179,6 +1189,7 @@ def arrow_schema_to_field(
     data: pa.Schema,
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
+    """Wrap an Arrow schema as a struct field."""
     dtype = pa.struct(list(data))
     md = dict(data.metadata or {})
     name = md.setdefault(b"name", b"root")
@@ -1191,6 +1202,7 @@ def arrow_field_to_schema(
     data: pa.Field,
     options: Optional[CastOptions] = None,
 ) -> pa.Schema:
+    """Return a schema view of an Arrow field."""
     md = dict(data.metadata or {})
     md[b"name"] = data.name.encode()
 
@@ -1206,4 +1218,5 @@ def arrow_tabular_to_field(
     data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader],
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
+    """Return a field representing the schema of tabular data."""
     return arrow_schema_to_field(data.schema, options)

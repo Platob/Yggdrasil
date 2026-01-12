@@ -1,3 +1,5 @@
+"""Arrow type inference utilities from Python type hints."""
+
 import dataclasses
 import datetime
 import decimal
@@ -57,6 +59,7 @@ _INT_UNITS_ORDER = {"s": 0, "ms": 1, "us": 2, "ns": 3}
 
 
 def _is_optional(hint) -> bool:
+    """Return True when the hint includes None."""
     origin = get_origin(hint)
 
     if origin is Annotated:
@@ -69,6 +72,7 @@ def _is_optional(hint) -> bool:
 
 
 def _strip_optional(hint):
+    """Return the underlying hint without Optional[...]."""
     origin = get_origin(hint)
 
     if origin is Annotated:
@@ -89,6 +93,7 @@ def _strip_optional(hint):
 
 
 def _field_name(hint, index: int | None) -> str:
+    """Derive a field name from a hint and optional index."""
     name = getattr(hint, "__name__", None)
 
     if name:
@@ -101,6 +106,7 @@ def _field_name(hint, index: int | None) -> str:
 
 
 def _struct_from_dataclass(hint) -> pa.StructType:
+    """Build an Arrow struct type from a dataclass."""
     fields = []
 
     for field in dataclasses.fields(hint):
@@ -113,6 +119,7 @@ def _struct_from_dataclass(hint) -> pa.StructType:
 
 
 def _struct_from_tuple(args, names: list[str] | None = None) -> pa.StructType:
+    """Build an Arrow struct type from tuple hints."""
     if names is not None and len(names) != len(args):
         raise TypeError("Tuple metadata names length must match tuple elements")
 
@@ -125,6 +132,7 @@ def _struct_from_tuple(args, names: list[str] | None = None) -> pa.StructType:
 
 
 def _arrow_type_from_metadata(base_hint, metadata):
+    """Resolve an Arrow type from Annotated metadata when present."""
     merged_metadata: dict[str, Any] = {}
 
     for item in metadata:
@@ -187,6 +195,7 @@ def _arrow_type_from_metadata(base_hint, metadata):
 
 
 def _arrow_type_from_hint(hint):
+    """Infer an Arrow data type from a Python type hint."""
     if get_origin(hint) is Annotated:
         base_hint, *metadata = get_args(hint)
         metadata_type = _arrow_type_from_metadata(base_hint, metadata)
@@ -229,6 +238,7 @@ def _arrow_type_from_hint(hint):
 
 
 def arrow_field_from_hint(hint, name: str | None = None, index: int | None = None) -> pa.Field:
+    """Build an Arrow field from a Python type hint."""
     nullable = _is_optional(hint)
     base_hint = _strip_optional(hint) if nullable else hint
 
@@ -269,6 +279,7 @@ def is_arrow_type_binary_like(arrow_type: pa.DataType) -> bool:
 
 
 def _merge_metadata(left: Optional[Dict[bytes, bytes]], right: Optional[Dict[bytes, bytes]]) -> Optional[Dict[bytes, bytes]]:
+    """Merge Arrow field metadata with right-hand precedence."""
     if not left and not right:
         return None
     out: Dict[bytes, bytes] = {}
@@ -281,31 +292,38 @@ def _merge_metadata(left: Optional[Dict[bytes, bytes]], right: Optional[Dict[byt
 
 
 def _is_null(dt: pa.DataType) -> bool:
+    """Return True when the Arrow type is null."""
     return pa.types.is_null(dt)
 
 
 def _is_integer(dt: pa.DataType) -> bool:
+    """Return True when the Arrow type is integer-like."""
     return pa.types.is_integer(dt)
 
 
 def _is_signed_integer(dt: pa.DataType) -> bool:
+    """Return True when the Arrow type is signed integer."""
     return pa.types.is_signed_integer(dt)
 
 
 def _is_unsigned_integer(dt: pa.DataType) -> bool:
+    """Return True when the Arrow type is unsigned integer."""
     return pa.types.is_unsigned_integer(dt)
 
 
 def _is_floating(dt: pa.DataType) -> bool:
+    """Return True when the Arrow type is floating-point."""
     return pa.types.is_floating(dt)
 
 
 def _int_bit_width(dt: pa.DataType) -> int:
+    """Return the bit width of an integer Arrow type."""
     # int8/int16/int32/int64/uint8/...
     return dt.bit_width
 
 
 def _digits_for_uint_bits(bits: int) -> int:
+    """Return a safe decimal digit count for unsigned integer bits."""
     # max uint bits -> decimal digits upper bound:
     # uint64 max = 18446744073709551615 => 20 digits
     # 2**bits - 1 has ceil(bits*log10(2)) digits, use safe upper bound
@@ -364,10 +382,12 @@ def _promote_int_types(left: pa.DataType, right: pa.DataType) -> pa.DataType:
 
 def _promote_decimal_types(left: pa.Decimal128Type | pa.Decimal256Type,
                            right: pa.Decimal128Type | pa.Decimal256Type) -> pa.DataType:
+    """Return a decimal type that can represent both inputs."""
     # Match scale, then set precision to fit both after scale alignment.
     scale = max(left.scale, right.scale)
 
     def adj_precision(d: pa.DataType) -> int:
+        """Adjust precision to account for scale differences."""
         # Increasing scale can require increasing precision to keep same integer digits.
         # integer_digits = precision - scale
         integer_digits = d.precision - d.scale
@@ -382,6 +402,7 @@ def _promote_decimal_types(left: pa.Decimal128Type | pa.Decimal256Type,
 
 
 def _promote_numeric(left: pa.DataType, right: pa.DataType) -> pa.DataType:
+    """Promote numeric Arrow types to a common compatible type."""
     # decimal dominates ints/floats if present? Depends on your semantics.
     # Here: decimals keep exactness when mixing with ints; floats win when mixing float+anything non-decimal.
     if pa.types.is_decimal(left) and pa.types.is_decimal(right):
@@ -409,6 +430,7 @@ def _promote_numeric(left: pa.DataType, right: pa.DataType) -> pa.DataType:
 
 
 def _merge_time_units(left_unit: str, right_unit: str) -> str:
+    """Return the finer-grained Arrow time unit of two units."""
     # choose finer resolution (higher order index)
     return left_unit if _INT_UNITS_ORDER[left_unit] >= _INT_UNITS_ORDER[right_unit] else right_unit
 
@@ -418,6 +440,7 @@ def merge_arrow_types(
     right: Union[pa.DataType, pa.TimestampType, pa.ListType, pa.MapType, pa.StructType],
     add_missing_columns: bool = True
 ) -> pa.DataType:
+    """Merge two Arrow types into a compatible supertype."""
     # null is identity
     if _is_null(left):
         return right
@@ -563,6 +586,7 @@ def merge_arrow_fields(
     right: pa.Field,
     add_missing_columns: bool = True
 ) -> pa.Field:
+    """Merge two Arrow fields into a compatible field."""
     if left.name != right.name:
         raise TypeError(f"Cannot merge fields with different names: {left.name!r} vs {right.name!r}")
 

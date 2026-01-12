@@ -1,3 +1,5 @@
+"""Type conversion registry and default converters."""
+
 from __future__ import annotations
 
 import dataclasses as _dataclasses
@@ -31,6 +33,7 @@ __all__ = [
 
 
 def _identity(x, opt):
+    """Return the input value unchanged."""
     return x
 
 ReturnType = TypeVar("ReturnType")
@@ -49,6 +52,7 @@ def register_converter(
     """
 
     def decorator(func: Callable[..., ReturnType]) -> Converter:
+        """Validate and register a converter function."""
         sig = inspect.signature(func)
         params = list(sig.parameters.values())
         if any(
@@ -75,6 +79,7 @@ def register_converter(
 
 
 def _unwrap_optional(hint: Any) -> Tuple[bool, Any]:
+    """Return whether a hint is Optional and the underlying hint."""
     origin = get_origin(hint)
     if origin in {Union, types.UnionType}:
         args = get_args(hint)
@@ -114,6 +119,7 @@ def find_converter(
     from_type: Any,
     to_hint: Any
 ) -> Optional[Converter]:
+    """Find a registered converter for the requested type pair."""
 
     # 0) Fast path: exact key
     conv = _registry.get((from_type, to_hint))
@@ -177,6 +183,7 @@ def find_converter(
 
             # Build composite converter once we find the first viable chain.
             def composed(value, options=None, _c1=conv1, _c2=conv2):
+                """Compose two converters into one."""
                 intermediate = _c1(value, options)
                 return _c2(intermediate, options)
 
@@ -190,6 +197,7 @@ def find_converter(
 
 
 def _normalize_fractional_seconds(value: str) -> str:
+    """Normalize fractional seconds to microsecond precision."""
     match = re.search(r"(\.)(\d+)(?=(?:[+-]\d{2}:?\d{2})?$)", value)
     if not match:
         return value
@@ -201,6 +209,7 @@ def _normalize_fractional_seconds(value: str) -> str:
 
 
 def is_runtime_value(x) -> bool:
+    """Return True when x is a runtime value, not a type hint."""
     # True for "42", [], MyClass(), etc.
     # False for MyClass, list[int], dict[str, int], etc.
     if inspect.isclass(x):
@@ -305,6 +314,7 @@ def convert_to_python_enum(
     target_hint: type,
     options: Optional[CastOptions] = None,
 ):
+    """Convert values into a Python Enum member."""
     if isinstance(value, target_hint):
         return value
 
@@ -343,6 +353,7 @@ def convert_to_python_dataclass(
     target_hint: type,
     options: Optional[CastOptions] = None,
 ):
+    """Convert a mapping into a dataclass instance."""
     from yggdrasil.types.python_defaults import default_scalar
 
     if isinstance(value, target_hint):
@@ -385,6 +396,7 @@ def convert_to_python_iterable(
     target_args,
     options: Optional[CastOptions] = None,
 ):
+    """Convert iterable-like values into typed Python collections."""
     if isinstance(value, (str, bytes)):
         raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
 
@@ -411,6 +423,7 @@ def convert_to_python_iterable(
 
 @register_converter(str, int)
 def _str_to_int(value: str, cast_options: Any) -> int:
+    """Convert a string into an integer."""
     if value == "":
         return 0
     return int(value)
@@ -418,6 +431,7 @@ def _str_to_int(value: str, cast_options: Any) -> int:
 
 @register_converter(str, float)
 def _str_to_float(value: str, cast_options: Any) -> float:
+    """Convert a string into a float."""
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -426,6 +440,7 @@ def _str_to_float(value: str, cast_options: Any) -> float:
 
 @register_converter(str, bool)
 def _str_to_bool(value: str, cast_options: Any) -> bool:
+    """Convert a string into a boolean."""
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -441,11 +456,13 @@ def _str_to_bool(value: str, cast_options: Any) -> bool:
 
 @register_converter(str, _datetime.date)
 def _str_to_date(value: str, cast_options: Any) -> _datetime.date:
+    """Convert a string into a date."""
     return _str_to_datetime(value, cast_options).date()
 
 
 @register_converter(str, _datetime.datetime)
 def _str_to_datetime(value: str, cast_options: Any) -> _datetime.datetime:
+    """Convert a string into a datetime."""
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -488,6 +505,7 @@ def _str_to_datetime(value: str, cast_options: Any) -> _datetime.datetime:
 
 @register_converter(str, _datetime.timedelta)
 def _str_to_timedelta(value: str, cast_options: Any) -> _datetime.timedelta:
+    """Convert a string into a timedelta."""
     default_value = getattr(cast_options, "default_value", None)
     stripped = value.strip()
 
@@ -545,6 +563,7 @@ def _str_to_timedelta(value: str, cast_options: Any) -> _datetime.timedelta:
 
 @register_converter(str, _datetime.time)
 def _str_to_time(value: str, cast_options: Any) -> _datetime.time:
+    """Convert a string into a time."""
     default_value = getattr(cast_options, "default_value", None)
     if value == "" and default_value is not None:
         return default_value
@@ -553,9 +572,11 @@ def _str_to_time(value: str, cast_options: Any) -> _datetime.time:
 
 @register_converter(_datetime.datetime, _datetime.date)
 def _datetime_to_date(value: _datetime.datetime, cast_options: Any) -> _datetime.date:
+    """Convert a datetime into a date."""
     return value.date()
 
 
 @register_converter(int, str)
 def _int_to_str(value: int, cast_options: Any) -> str:
+    """Convert an integer into a string."""
     return str(value)

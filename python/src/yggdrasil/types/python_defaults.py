@@ -1,3 +1,5 @@
+"""Default value helpers for Python and Arrow types."""
+
 import dataclasses
 import datetime
 import decimal
@@ -96,6 +98,7 @@ except ImportError:
     _POLARS_DEFAULTS = {}
 
 def _is_optional(hint) -> bool:
+    """Return True when the type hint is Optional."""
     origin = get_origin(hint)
 
     if origin in (Union, types.UnionType):
@@ -105,6 +108,7 @@ def _is_optional(hint) -> bool:
 
 
 def _default_for_collection(origin):
+    """Return default values for collection-like origins."""
     if origin in (list, MutableSequence):
         return []
 
@@ -124,6 +128,7 @@ def _default_for_collection(origin):
 
 
 def _default_for_tuple_args(args):
+    """Return a default tuple based on element hints."""
     if not args:
         return tuple()
 
@@ -134,6 +139,7 @@ def _default_for_tuple_args(args):
 
 
 def _default_for_dataclass(hint):
+    """Return a default instance for a dataclass type."""
     kwargs = {}
 
     for field in dataclasses.fields(hint):
@@ -156,6 +162,7 @@ def default_arrow_scalar(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType, pa.FixedSizeListType],
     nullable: bool
 ):
+    """Return a default scalar for a given Arrow type."""
     if nullable:
         return pa.scalar(None, type=dtype)
 
@@ -208,6 +215,7 @@ def default_arrow_array(
     chunks: Optional[List[int]] = None,
     scalar_default: Optional[pa.Scalar] = None,
 ) -> Union[pa.Array, pa.ChunkedArray]:
+    """Return a default Arrow array or chunked array for a given type."""
     if scalar_default is None:
         scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
 
@@ -240,6 +248,7 @@ def default_arrow_array(
 
 
 def default_python_scalar(hint: Any):
+    """Return a default Python value for the given type hint."""
     if _is_optional(hint):
         return None
 
@@ -286,6 +295,7 @@ def default_scalar(
     ],
     nullable: Optional[bool] = None
 ):
+    """Return a default scalar value for Python or Arrow type hints."""
     if isinstance(hint, pa.Field):
         nullable = hint.nullable if nullable is None else nullable
         return default_arrow_scalar(dtype=hint.type, nullable=nullable)

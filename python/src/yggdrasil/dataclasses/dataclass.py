@@ -1,3 +1,5 @@
+"""Dataclass helpers that integrate with Arrow schemas and safe casting."""
+
 import dataclasses
 from inspect import isclass
 from typing import Any, Iterable, Mapping, Tuple
@@ -26,6 +28,7 @@ def is_yggdataclass(cls_or_instance: Any) -> bool:
 
 
 def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
+    """Return a cached Arrow Field describing the dataclass type."""
     if is_yggdataclass(cls_or_instance):
         return cls_or_instance.__arrow_field__()
 
@@ -58,7 +61,7 @@ def yggdataclass(
     kw_only=False, slots=False,
     weakref_slot=False
 ):
-    """Add dunder methods based on the fields defined in the class.
+    """Decorate a class with dataclass behavior plus Arrow helpers.
 
     Examines PEP 526 __annotations__ to determine fields.
 
@@ -73,7 +76,10 @@ def yggdataclass(
     """
 
     def wrap(c):
+        """Wrap a class with yggdrasil dataclass enhancements."""
+
         def _init_public_fields(cls):
+            """Return init-enabled, public dataclass fields."""
             return [
                 field
                 for field in dataclasses.fields(cls)
@@ -83,6 +89,7 @@ def yggdataclass(
         if not hasattr(c, "default_instance"):
             @classmethod
             def default_instance(cls):
+                """Return a default instance built from type defaults."""
                 from yggdrasil.types import default_scalar
 
                 if not hasattr(cls, "__default_instance__"):
@@ -135,6 +142,7 @@ def yggdataclass(
         if not hasattr(c, "__arrow_field__"):
             @classmethod
             def __arrow_field__(cls, name: str | None = None):
+                """Return an Arrow field representing the dataclass schema."""
                 from yggdrasil.types.python_arrow import arrow_field_from_hint
 
                 return arrow_field_from_hint(cls, name=name)

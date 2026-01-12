@@ -1,3 +1,5 @@
+"""Spark <-> Polars conversion helpers via Arrow."""
+
 from typing import Optional
 
 import pyarrow as pa
@@ -23,10 +25,13 @@ __all__ = [
 # ---------------------------------------------------------------------------
 if pyspark is not None and polars is not None:
     def spark_polars_converter(*args, **kwargs):
+        """Return a register_converter wrapper when deps are available."""
         return register_converter(*args, **kwargs)
 else:
     def spark_polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """Return a no-op decorator when deps are missing."""
         def _decorator(func):
+            """Return the function unchanged."""
             return func
 
         return _decorator

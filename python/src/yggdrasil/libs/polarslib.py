@@ -1,3 +1,5 @@
+"""Optional Polars dependency helpers."""
+
 try:
     import polars  # type: ignore
 
@@ -13,6 +15,7 @@ __all__ = [
 
 
 def require_polars():
+    """Ensure polars is available before using polars helpers."""
     if polars is None:
         raise ImportError(
             "polars is required to use this function. "

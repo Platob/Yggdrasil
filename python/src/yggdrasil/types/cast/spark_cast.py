@@ -1,3 +1,5 @@
+"""Spark <-> Arrow casting helpers and converters."""
+
 from typing import Optional, Tuple, List
 
 import pyarrow as pa
@@ -57,10 +59,12 @@ if pyspark is not None:
     SparkStructField = T.StructField
 
     def spark_converter(*args, **kwargs):
+        """Return a register_converter wrapper when pyspark is available."""
         return register_converter(*args, **kwargs)
 
 else:  # pyspark missing -> dummies + no-op decorator
     class _SparkDummy:  # pragma: no cover
+        """Placeholder type for Spark symbols when pyspark is unavailable."""
         pass
 
     SparkDataFrame = _SparkDummy
@@ -70,7 +74,9 @@ else:  # pyspark missing -> dummies + no-op decorator
     SparkStructField = _SparkDummy
 
     def spark_converter(*_args, **_kwargs):  # pragma: no cover
+        """Return a no-op decorator when pyspark is unavailable."""
         def _decorator(func):
+            """Return the function unchanged."""
             return func
 
         return _decorator
@@ -227,6 +233,7 @@ def check_column_nullability(
     target_field: "T.StructField",
     mask: "pyspark.sql.Column"
 ) -> "pyspark.sql.Column":
+    """Fill nulls when the target field is non-nullable."""
     source_nullable = True if source_field is None else source_field.nullable
     target_nullable = True if target_field is None else target_field.nullable
 
@@ -532,6 +539,7 @@ def spark_dataframe_to_spark_type(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """Return the Spark DataFrame schema as a Spark data type."""
     return df.schema
 
 
@@ -540,6 +548,7 @@ def spark_dataframe_to_spark_field(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """Return a Spark StructField for the DataFrame schema."""
     return SparkStructField(
         df.getAlias() or "root",
         df.schema,
@@ -552,6 +561,7 @@ def spark_dataframe_to_arrow_field(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """Return an Arrow field representation of the DataFrame schema."""
     return spark_field_to_arrow_field(
         spark_dataframe_to_spark_field(df, options),
         options
@@ -563,6 +573,7 @@ def spark_dataframe_to_arrow_schema(
     df: SparkDataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
+    """Return an Arrow schema representation of the DataFrame."""
     return arrow_field_to_schema(
         spark_field_to_arrow_field(
             spark_dataframe_to_spark_field(df, options),

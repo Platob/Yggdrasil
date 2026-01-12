@@ -1,3 +1,5 @@
+"""Parallel execution decorator utilities."""
+
 from __future__ import annotations
 
 import concurrent.futures as cf
@@ -42,8 +44,10 @@ def parallelize(
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, Iterator[R]]:
+        """Wrap a callable to execute over an iterable using an executor."""
         @wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterator[R]:  # type: ignore[misc]
+            """Execute the wrapped function across items in parallel."""
             # Basic sanity checks
             if arg_index < 0 or arg_index >= len(args):
                 raise ValueError(
@@ -79,6 +83,7 @@ def parallelize(
 
             # Generator that will actually submit tasks and yield results
             def gen() -> Iterator[R]:
+                """Yield results from parallel execution in input order."""
                 futures: list[cf.Future[R]] = []
                 processed = 0  # for progress
 
@@ -87,6 +92,7 @@ def parallelize(
                 ctx = executor if owns_executor else nullcontext(executor)
 
                 def _print_progress() -> None:
+                    """Emit progress output when enabled."""
                     if not show_progress:
                         return
 

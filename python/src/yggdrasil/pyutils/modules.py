@@ -1,3 +1,5 @@
+"""Module dependency and pip index inspection utilities."""
+
 # modules.py
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ MODULE_PROJECT_NAMES_ALIASES = {
 
 
 def module_name_to_project_name(module_name: str) -> str:
+    """Map module import names to PyPI project names when they differ."""
     return MODULE_PROJECT_NAMES_ALIASES.get(module_name, module_name)
 
 
@@ -104,6 +107,7 @@ _REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 @dc.dataclass(frozen=True)
 class DependencyMetadata:
+    """Metadata describing an installed or missing dependency."""
     project: str
     requirement: str
     installed: bool
@@ -136,6 +140,7 @@ def _req_project_name(req_line: str) -> Optional[str]:
 
 
 def _distribution_for_module(mod: Union[str, ModuleType]):
+    """Resolve the importlib.metadata distribution that provides a module."""
     if ilm is None:
         raise RuntimeError("importlib.metadata is not available")
 
@@ -213,6 +218,7 @@ def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]
 
 
 def _run_pip(*args: str) -> Tuple[int, str, str]:
+    """Run pip with arguments and return (returncode, stdout, stderr)."""
     p = subprocess.run(
         [sys.executable, "-m", "pip", *args],
         text=True,
@@ -225,21 +231,25 @@ def _run_pip(*args: str) -> Tuple[int, str, str]:
 
 @dc.dataclass(frozen=True)
 class PipIndexSettings:
+    """Resolved pip index configuration from env and config sources."""
     index_url: Optional[str] = None
     extra_index_urls: List[str] = dc.field(default_factory=list)
     sources: Dict[str, Dict[str, Any]] = dc.field(default_factory=dict)  # {"env": {...}, "config": {...}}
 
     @classmethod
     def default_settings(cls):
+        """Return the cached default pip index settings."""
         return DEFAULT_PIP_INDEX_SETTINGS
 
     @property
     def extra_index_url(self):
+        """Return extra index URLs as a space-separated string."""
         if self.extra_index_urls:
             return " ".join(self.extra_index_urls)
         return None
 
     def as_dict(self) -> dict:
+        """Return a dict representation of the settings."""
         return dc.asdict(self)
 
 

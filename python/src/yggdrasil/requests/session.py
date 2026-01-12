@@ -1,3 +1,5 @@
+"""HTTP session helpers with retry-enabled defaults."""
+
 from typing import Optional, Dict
 
 from requests import Session
@@ -10,6 +12,7 @@ __all__ = [
 
 
 class YGGSession(Session):
+    """Requests session with preconfigured retry adapter support."""
     def __init__(
         self,
         num_retry: int = 4,
@@ -17,6 +20,7 @@ class YGGSession(Session):
         *args,
         **kwargs
     ):
+        """Initialize the session with retries and optional default headers."""
         super(YGGSession, self).__init__()
 
         retry = Retry(

@@ -1,3 +1,5 @@
+"""Optional Spark dependency helpers and Arrow/Spark type conversions."""
+
 from typing import Any
 
 import pyarrow as pa
@@ -51,18 +53,23 @@ except ImportError:  # pragma: no cover - Spark not available
     pyspark = None
 
     class SparkSession:
+        """Fallback SparkSession placeholder when pyspark is unavailable."""
 
         @classmethod
         def getActiveSession(cls):
+            """Return None to indicate no active session is available."""
             return None
 
     class SparkDataFrame:
+        """Fallback DataFrame placeholder when pyspark is unavailable."""
         pass
 
     class SparkColumn:
+        """Fallback Column placeholder when pyspark is unavailable."""
         pass
 
     class SparkDataType:
+        """Fallback DataType placeholder when pyspark is unavailable."""
         pass
 
     ARROW_TO_SPARK = {}

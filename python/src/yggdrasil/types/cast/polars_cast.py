@@ -1,3 +1,5 @@
+"""Polars <-> Arrow casting helpers and converters."""
+
 from typing import Optional, Tuple, Union, Dict, Any
 
 import pyarrow as pa
@@ -79,12 +81,14 @@ if polars is not None:
     }
 
     def polars_converter(*args, **kwargs):
+        """Return a register_converter wrapper when polars is available."""
         return register_converter(*args, **kwargs)
 else:
     ARROW_TO_POLARS = {}
 
     # Dummy types so annotations/decorators don't explode without Polars
     class _PolarsDummy:  # pragma: no cover - only used when Polars not installed
+        """Placeholder type for polars symbols when polars is unavailable."""
         pass
 
     PolarsSeries = _PolarsDummy
@@ -95,7 +99,9 @@ else:
     PolarsDataType = _PolarsDummy
 
     def polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
+        """Return a no-op decorator when polars is unavailable."""
         def _decorator(func):
+            """Return the function unchanged."""
             return func
         return _decorator
 
@@ -171,6 +177,7 @@ def cast_to_list_array(
     array: PolarsSeries,
     options: Optional["CastOptions"] = None,
 ) -> PolarsSeries:
+    """Cast a Polars list series to a target list Arrow type."""
     options = CastOptions.check_arg(options)
 
     if not options.need_polars_type_cast(source_obj=array):
@@ -796,6 +803,7 @@ def polars_array_to_arrow_field(
     array: Union[PolarsSeries, PolarsExpr],
     options: Optional[CastOptions] = None
 ) -> pa.Field:
+    """Infer an Arrow field from a Polars Series or Expr."""
     options = CastOptions.check_arg(options)
 
     if options.source_arrow_field:

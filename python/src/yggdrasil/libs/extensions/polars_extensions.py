@@ -1,3 +1,5 @@
+"""Polars DataFrame extension helpers for joins and resampling."""
+
 from __future__ import annotations
 
 import datetime
@@ -39,6 +41,7 @@ def join_coalesced(
 
 
 def _normalize_group_by(group_by: str | Sequence[str] | None) -> list[str] | None:
+    """Normalize group_by inputs into a list or None."""
     if group_by is None:
         return None
     if isinstance(group_by, str):
@@ -57,6 +60,7 @@ def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str,
 
 
 def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
+    """Build a Polars expression from an aggregation spec."""
     base = pl.col(col)
 
     if isinstance(agg, pl.Expr):
@@ -80,6 +84,7 @@ def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
 
 
 def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
+    """Normalize aggregation specs into a list of Polars expressions."""
     if isinstance(agg, Mapping):
         return [_expr_from_agg(col, spec) for col, spec in agg.items()]
 
@@ -91,11 +96,13 @@ def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
 
 
 def _is_datetime(dtype: object) -> bool:
+    """Return True when the dtype is a Polars datetime."""
     # Datetime-only inference (per requirement), version-safe.
     return isinstance(dtype, pl.Datetime)
 
 
 def _infer_time_col(df: "pl.DataFrame") -> str:
+    """Infer the first datetime-like column name from a DataFrame."""
     # Find first Datetime column in schema order; ignore Date columns.
     for name, dtype in df.schema.items():
         if _is_datetime(dtype):
@@ -106,6 +113,7 @@ def _infer_time_col(df: "pl.DataFrame") -> str:
 
 
 def _ensure_datetime_like(df: "pl.DataFrame", time_col: str) -> "pl.DataFrame":
+    """Ensure a time column is cast to datetime for resampling."""
     dtype = df.schema.get(time_col)
     if dtype is None:
         raise KeyError(f"resample: time_col '{time_col}' not found in DataFrame columns.")
@@ -151,6 +159,7 @@ def _timedelta_to_polars_duration(td: datetime.timedelta) -> str:
 
 
 def _normalize_duration(v: str | datetime.timedelta | None) -> str | None:
+    """Normalize duration inputs to a Polars duration string."""
     if v is None:
         return None
     if isinstance(v, str):
@@ -168,6 +177,7 @@ def _upsample_single(
     offset: str | datetime.timedelta | None,
     keep_group_order: bool,
 ) -> "pl.DataFrame":
+    """Upsample a single DataFrame with normalized duration arguments."""
     df = df.sort(time_col)
 
     every_n = _normalize_duration(every)

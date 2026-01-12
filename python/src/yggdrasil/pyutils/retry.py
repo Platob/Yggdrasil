@@ -37,6 +37,7 @@ ExceptionTypes = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
 
 
 def _ensure_exception_tuple(exc: ExceptionTypes) -> Tuple[Type[BaseException], ...]:
+    """Normalize exception inputs into a tuple of exception classes."""
     if isinstance(exc, type) and issubclass(exc, BaseException):
         return (exc,)
     return tuple(exc)
@@ -104,9 +105,11 @@ def retry(
     exc_types = _ensure_exception_tuple(exceptions)
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        """Wrap a callable with retry behavior."""
         if inspect.iscoroutinefunction(func):
 
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
+                """Execute an async callable with retry behavior."""
                 _delay = delay
                 attempt = 1
                 start_time = time.monotonic() if timeout is not None else None
@@ -170,6 +173,7 @@ def retry(
         else:
 
             def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[misc]
+                """Execute a sync callable with retry behavior."""
                 _delay = delay
                 attempt = 1
                 start_time = time.monotonic() if timeout is not None else None
@@ -269,6 +273,7 @@ def random_jitter(scale: float = 0.1) -> Callable[[float], float]:
     """
 
     def _jitter(d: float) -> float:
+        """Apply random jitter to a delay value."""
         if d <= 0:
             return d
         delta = d * scale
@@ -286,6 +291,7 @@ if __name__ == "__main__":
 
     @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
     def flaky_function() -> str:
+        """Demonstrate retry behavior for a flaky sync function."""
         counter["n"] += 1
         if counter["n"] < 3:
             raise ValueError("boom")
@@ -294,10 +300,12 @@ if __name__ == "__main__":
     print("Result:", flaky_function())
 
     async def main():
+        """Run an async retry demonstration."""
         async_counter = {"n": 0}
 
         @retry(tries=4, delay=0.1, backoff=2, logger=log, timeout=5.0)
         async def async_flaky() -> str:
+            """Demonstrate retry behavior for a flaky async function."""
             async_counter["n"] += 1
             if async_counter["n"] < 3:
                 raise RuntimeError("async boom")

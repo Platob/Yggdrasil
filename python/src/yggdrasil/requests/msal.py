@@ -1,3 +1,5 @@
+"""MSAL-backed authentication helpers for requests sessions."""
+
 # auth_session.py
 import os
 import time
@@ -27,6 +29,7 @@ __all__ = [
 
 @dataclass
 class MSALAuth:
+    """Configuration and token cache for MSAL client credential flows."""
     tenant_id: Optional[str] = None
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
@@ -38,12 +41,15 @@ class MSALAuth:
     _access_token: Optional[str] = None
 
     def __setitem__(self, key, value):
+        """Set an attribute via mapping-style assignment."""
         self.__setattr__(key, value)
 
     def __getitem__(self, item):
+        """Return attribute values via mapping-style access."""
         return getattr(self, item)
 
     def __post_init__(self):
+        """Populate defaults from environment variables and validate."""
         self.tenant_id = self.tenant_id or os.environ.get("AZURE_TENANT_ID")
         self.client_id = self.client_id or os.environ.get("AZURE_CLIENT_ID")
         self.client_secret = self.client_secret or os.environ.get("AZURE_CLIENT_SECRET")
@@ -81,6 +87,7 @@ class MSALAuth:
         env: Mapping = None,
         prefix: Optional[str] = None
     ) -> "MSALAuth":
+        """Return an MSALAuth built from environment variables if available."""
         if not env:
             env = os.environ
         prefix = prefix or "AZURE_"
@@ -105,6 +112,7 @@ class MSALAuth:
         return None
 
     def export_to(self, to: dict = os.environ):
+        """Export the auth configuration to the provided mapping."""
         for key, value in (
             ("AZURE_CLIENT_ID", self.client_id),
             ("AZURE_CLIENT_SECRET", self.client_secret),
@@ -116,6 +124,7 @@ class MSALAuth:
 
     @property
     def auth_app(self) -> ConfidentialClientApplication:
+        """Return or initialize the MSAL confidential client."""
         if not self._auth_app:
             self._auth_app = ConfidentialClientApplication(
                 client_id=self.client_id,
@@ -127,19 +136,23 @@ class MSALAuth:
 
     @property
     def expires_in(self) -> float:
+        """Return the number of seconds since the token expiry timestamp."""
         return time.time() - self.expires_at
 
     @property
     def expires_at(self) -> float:
+        """Ensure the token is fresh and return the expiry timestamp."""
         self.refresh()
 
         return self._expires_at
 
     @property
     def expired(self) -> bool:
+        """Return True when the token is missing or past its expiry time."""
         return not self._expires_at or time.time() >= self._expires_at
 
     def refresh(self, force: bool | None = None):
+        """Acquire or refresh the token if needed."""
         if self.expired or force:
             app = self.auth_app
             result = app.acquire_token_for_client(scopes=self.scopes)
@@ -167,6 +180,7 @@ class MSALAuth:
         return f"Bearer {self.access_token}"
 
     def requests_session(self, **kwargs):
+        """Build a requests session that injects the MSAL authorization header."""
         return MSALSession(
             msal_auth=self,
             **kwargs
@@ -174,6 +188,7 @@ class MSALAuth:
 
 
 class MSALSession(YGGSession):
+    """YGGSession subclass that injects MSAL authorization headers."""
     msal_auth: MSALAuth | None = None
 
     def __init__(
@@ -182,11 +197,13 @@ class MSALSession(YGGSession):
         *args,
         **kwargs: dict
     ):
+        """Initialize the session with optional MSAL auth configuration."""
         super().__init__(*args, **kwargs)
         self.msal_auth = msal_auth
 
 
     def prepare_request(self, request):
+        """Prepare the request with an Authorization header when needed."""
         # called before sending; ensure header exists
         if self.msal_auth is not None:
             request.headers["Authorization"] = request.headers.get("Authorization", self.msal_auth.authorization)

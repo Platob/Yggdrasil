@@ -1,3 +1,5 @@
+"""Callable serialization helpers for cross-process execution."""
+
 from __future__ import annotations
 
 import base64
@@ -26,6 +28,7 @@ _FLAG_COMPRESSED = 1
 
 
 def _resolve_attr_chain(mod: Any, qualname: str) -> Any:
+    """Resolve a dotted attribute path from a module."""
     obj = mod
     for part in qualname.split("."):
         obj = getattr(obj, part)
@@ -49,6 +52,7 @@ def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
 
 
 def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional[int]]:
+    """Return the source file path and line number for a callable."""
     file = None
     line = None
     try:
@@ -85,6 +89,7 @@ def _referenced_global_names(fn: Callable[..., Any]) -> Set[str]:
 
 
 def _is_importable_reference(fn: Callable[..., Any]) -> bool:
+    """Return True when a callable can be imported by module and qualname."""
     mod_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
     if not mod_name or not qualname:
@@ -245,6 +250,7 @@ class CallableSerde:
 
     @classmethod
     def from_callable(cls: type[T], x: Union[Callable[..., Any], T]) -> T:
+        """Create a CallableSerde from a callable or existing instance."""
         if isinstance(x, cls):
             return x
 
@@ -256,14 +262,17 @@ class CallableSerde:
 
     @property
     def module(self) -> Optional[str]:
+        """Return the callable's module name if available."""
         return self._module or (getattr(self.fn, "__module__", None) if self.fn else None)
 
     @property
     def qualname(self) -> Optional[str]:
+        """Return the callable's qualified name if available."""
         return self._qualname or (getattr(self.fn, "__qualname__", None) if self.fn else None)
 
     @property
     def file(self) -> Optional[str]:
+        """Return the filesystem path of the callable's source file."""
         if not self.fn:
             return None
         f, _ = _callable_file_line(self.fn)
@@ -271,6 +280,7 @@ class CallableSerde:
 
     @property
     def line(self) -> Optional[int]:
+        """Return the line number where the callable is defined."""
         if not self.fn:
             return None
         _, ln = _callable_file_line(self.fn)
@@ -278,6 +288,7 @@ class CallableSerde:
 
     @property
     def pkg_root(self) -> Optional[str]:
+        """Return the inferred package root for the callable, if known."""
         if self._pkg_root:
             return self._pkg_root
         if not self.file:
@@ -287,6 +298,7 @@ class CallableSerde:
 
     @property
     def relpath_from_pkg_root(self) -> Optional[str]:
+        """Return the callable's path relative to the package root."""
         if not self.file or not self.pkg_root:
             return None
         try:
@@ -296,6 +308,7 @@ class CallableSerde:
 
     @property
     def importable(self) -> bool:
+        """Return True when the callable can be imported by reference."""
         if self.fn is None:
             return bool(self.module and self.qualname and "<locals>" not in (self.qualname or ""))
         return _is_importable_reference(self.fn)
@@ -309,6 +322,7 @@ class CallableSerde:
         dump_env: str = "none",          # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
     ) -> Dict[str, Any]:
+        """Serialize the callable into a dict for transport."""
         kind = prefer
         if kind == "import" and not self.importable:
             kind = "dill"
@@ -352,6 +366,7 @@ class CallableSerde:
 
     @classmethod
     def load(cls: type[T], d: Dict[str, Any], *, add_pkg_root_to_syspath: bool = True) -> T:
+        """Construct a CallableSerde from a serialized dict payload."""
         obj = cls(
             fn=None,
             _kind=d.get("kind", "auto"),
@@ -369,6 +384,7 @@ class CallableSerde:
         return obj  # type: ignore[return-value]
 
     def materialize(self, *, add_pkg_root_to_syspath: bool = True) -> Callable[..., Any]:
+        """Resolve and return the underlying callable."""
         if self.fn is not None:
             return self.fn
 
@@ -402,6 +418,7 @@ class CallableSerde:
         raise ValueError(f"Unknown kind: {kind}")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke the materialized callable with the provided arguments."""
         fn = self.materialize()
         return fn(*args, **kwargs)
 

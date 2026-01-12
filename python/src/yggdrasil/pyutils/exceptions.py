@@ -1,3 +1,5 @@
+"""Utilities for parsing and re-raising exceptions from traceback strings."""
+
 import builtins
 import dataclasses as dc
 import re
@@ -26,6 +28,7 @@ _BARE_EXC_RE = re.compile(r"(?m)^\s*([A-Za-z_]\w*(?:Error|Exception|Warning|Inte
 
 @dc.dataclass(frozen=True)
 class ParsedException:
+    """Structured representation of a parsed exception type and message."""
     exc_type: Type[BaseException]
     message: str
     raw_type_name: str
@@ -34,10 +37,12 @@ class ParsedException:
 class RemoteTraceback(Exception):
     """Holds a traceback *string* and prints it as the chained cause."""
     def __init__(self, traceback_text: str):
+        """Store the traceback text for later display."""
         super().__init__("Remote traceback (text)")
         self.traceback_text = traceback_text
 
     def __str__(self) -> str:
+        """Render the exception with its stored traceback text."""
         return f"{self.args[0]}\n\n{self.traceback_text}"
 
 
