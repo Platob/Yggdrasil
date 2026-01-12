@@ -1,3 +1,5 @@
+"""Result wrapper for Databricks SQL statement execution."""
+
 import dataclasses
 import threading
 import time
@@ -49,6 +51,7 @@ __all__ = [
 
 @dataclasses.dataclass
 class StatementResult:
+    """Container for statement responses, data extraction, and conversions."""
     engine: "SQLEngine"
     statement_id: str
     disposition: "Disposition"
@@ -60,6 +63,11 @@ class StatementResult:
     _arrow_table: Optional[pa.Table] = dataclasses.field(default=None, repr=False)
 
     def __getstate__(self):
+        """Serialize statement results, converting Spark dataframes to Arrow.
+
+        Returns:
+            A pickle-ready state dictionary.
+        """
         state = self.__dict__.copy()
 
         _spark_df = state.pop("_spark_df", None)
@@ -70,29 +78,54 @@ class StatementResult:
         return state
 
     def __setstate__(self, state):
+        """Restore statement result state, rehydrating cached data.
+
+        Args:
+            state: Serialized state dictionary.
+        """
         _spark_df = state.pop("_spark_df")
 
     def __iter__(self):
+        """Iterate over Arrow record batches."""
         return self.to_arrow_batches()
 
     @property
     def is_spark_sql(self):
+        """Return True when this result was produced by Spark SQL."""
         return self._spark_df is not None
 
     @property
     def response(self):
+        """Return the latest statement response, refreshing when needed.
+
+        Returns:
+            The current StatementResponse object.
+        """
         if self._response is None and not self.is_spark_sql:
             self.response = self.workspace.sdk().statement_execution.get_statement(self.statement_id)
         return self._response
 
     @response.setter
     def response(self, value: "StatementResponse"):
+        """Update the cached response and refresh timestamp.
+
+        Args:
+            value: StatementResponse to cache.
+        """
         self._response = value
         self._response_refresh_time = time.time()
 
         self.statement_id = self._response.statement_id
 
     def fresh_response(self, delay: float):
+        """Refresh the response if it is older than ``delay`` seconds.
+
+        Args:
+            delay: Minimum age in seconds before refreshing.
+
+        Returns:
+            The refreshed StatementResponse object.
+        """
         if self.is_spark_sql:
             return self._response
 
@@ -102,6 +135,14 @@ class StatementResult:
         return self._response
 
     def result_data_at(self, chunk_index: int):
+        """Fetch a specific result chunk by index.
+
+        Args:
+            chunk_index: Result chunk index to retrieve.
+
+        Returns:
+            The SDK result chunk response.
+        """
         sdk = self.workspace.sdk()
 
         return sdk.statement_execution.get_statement_result_chunk_n(
@@ -111,10 +152,20 @@ class StatementResult:
 
     @property
     def workspace(self):
+        """Expose the underlying workspace from the engine.
+
+        Returns:
+            The Workspace instance backing this statement.
+        """
         return self.engine.workspace
 
     @property
     def status(self):
+        """Return the statement status, handling persisted data.
+
+        Returns:
+            A StatementStatus object.
+        """
         if self.persisted:
             return StatementStatus(
                 state=StatementState.SUCCEEDED
@@ -129,20 +180,40 @@ class StatementResult:
 
     @property
     def state(self):
+        """Return the statement state.
+
+        Returns:
+            The StatementState enum value.
+        """
         return self.status.state
 
     @property
     def manifest(self):
+        """Return the SQL result manifest, if available.
+
+        Returns:
+            The result manifest or None for Spark SQL results.
+        """
         if self.is_spark_sql:
             return None
         return self.response.manifest
 
     @property
     def result(self):
+        """Return the raw statement result object.
+
+        Returns:
+            The statement result payload from the API.
+        """
         return self.response.result
 
     @property
     def done(self):
+        """Return True when the statement is in a terminal state.
+
+        Returns:
+            True if the statement is done, otherwise False.
+        """
         if self.persisted:
             return True
 
@@ -155,6 +226,11 @@ class StatementResult:
 
     @property
     def failed(self):
+        """Return True when the statement failed or was cancelled.
+
+        Returns:
+            True if the statement failed or was cancelled.
+        """
         if self.persisted:
             return True
 
@@ -165,14 +241,29 @@ class StatementResult:
 
     @property
     def persisted(self):
+        """Return True when data is cached locally.
+
+        Returns:
+            True when cached Arrow or Spark data is present.
+        """
         return self._spark_df is not None or self._arrow_table is not None
 
     def persist(self):
+        """Cache the statement result locally as Arrow data.
+
+        Returns:
+            The current StatementResult instance.
+        """
         if not self.persisted:
             self._arrow_table = self.to_arrow_table()
         return self
 
     def external_links(self):
+        """Yield external result links for EXTERNAL_LINKS dispositions.
+
+        Yields:
+            External link objects in result order.
+        """
         assert self.disposition == Disposition.EXTERNAL_LINKS, "Cannot get from %s, disposition %s != %s" % (
             self, self.disposition, Disposition.EXTERNAL_LINKS
         )
@@ -222,6 +313,11 @@ class StatementResult:
                 )
 
     def raise_for_status(self):
+        """Raise a ValueError if the statement failed.
+
+        Returns:
+            None.
+        """
         if self.failed:
             # grab error info if present
             err = self.status.error
@@ -244,6 +340,15 @@ class StatementResult:
         timeout: Optional[int] = None,
         poll_interval: Optional[float] = None
     ):
+        """Wait for statement completion with optional timeout.
+
+        Args:
+            timeout: Maximum seconds to wait.
+            poll_interval: Initial poll interval in seconds.
+
+        Returns:
+            The current StatementResult instance.
+        """
         if self.done:
             return self
 
@@ -265,6 +370,11 @@ class StatementResult:
         return current
 
     def arrow_schema(self):
+        """Return the Arrow schema for the result.
+
+        Returns:
+            An Arrow Schema instance.
+        """
         if self.persisted:
             if self._arrow_table is not None:
                 return self._arrow_table.schema
@@ -277,6 +387,14 @@ class StatementResult:
         return pa.schema(fields)
 
     def to_arrow_table(self, parallel_pool: Optional[int] = 4) -> pa.Table:
+        """Collect the statement result into a single Arrow table.
+
+        Args:
+            parallel_pool: Maximum parallel fetch workers.
+
+        Returns:
+            An Arrow Table containing all rows.
+        """
         if self.persisted:
             if self._arrow_table:
                 return self._arrow_table
@@ -295,6 +413,14 @@ class StatementResult:
         self,
         parallel_pool: Optional[int] = 4
     ) -> Iterator[pa.RecordBatch]:
+        """Stream the result as Arrow record batches.
+
+        Args:
+            parallel_pool: Maximum parallel fetch workers.
+
+        Yields:
+            Arrow RecordBatch objects.
+        """
         if self.persisted:
             if self._arrow_table is not None:
                 for batch in self._arrow_table.to_batches(max_chunksize=64 * 1024):
@@ -379,15 +505,36 @@ class StatementResult:
         self,
         parallel_pool: Optional[int] = 4
     ) -> "pandas.DataFrame":
+        """Return the result as a pandas DataFrame.
+
+        Args:
+            parallel_pool: Maximum parallel fetch workers.
+
+        Returns:
+            A pandas DataFrame with the result rows.
+        """
         return self.to_arrow_table(parallel_pool=parallel_pool).to_pandas()
 
     def to_polars(
         self,
         parallel_pool: Optional[int] = 4
     ) -> "polars.DataFrame":
+        """Return the result as a polars DataFrame.
+
+        Args:
+            parallel_pool: Maximum parallel fetch workers.
+
+        Returns:
+            A polars DataFrame with the result rows.
+        """
         return polars.from_arrow(self.to_arrow_table(parallel_pool=parallel_pool))
 
     def to_spark(self):
+        """Return the result as a Spark DataFrame, caching it locally.
+
+        Returns:
+            A Spark DataFrame with the result rows.
+        """
         if self._spark_df:
             return self._spark_df
 

@@ -1,3 +1,5 @@
+"""Databricks widget-backed configuration helpers."""
+
 import builtins
 import dataclasses
 import datetime as dt
@@ -21,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 def type_is_iterable(tpe: type, origin=None):
+    """Return True when the type annotation represents a list/set-like container.
+
+    Args:
+        tpe: The type annotation to inspect.
+        origin: Optional origin to reuse when recursing.
+
+    Returns:
+        True when the type is list-like, otherwise False.
+    """
     if (
         tpe is list or tpe is set
     ):
@@ -40,7 +51,7 @@ ALL_VALUES_TAG = "**all**"
 
 
 class WidgetType(Enum):
-    """Enum defining supported widget types in Databricks"""
+    """Enum defining supported Databricks widget types."""
     TEXT = "text"
     DROPDOWN = "dropdown"
     COMBOBOX = "combobox"
@@ -50,8 +61,15 @@ class WidgetType(Enum):
 
 @dataclass
 class NotebookConfig:
+    """Base class for widget-driven notebook configuration dataclasses."""
+
     @classmethod
     def get_dbutils(cls):
+        """Locate a ``dbutils`` instance from known Databricks injection points.
+
+        Returns:
+            The ``dbutils`` instance if found, otherwise None.
+        """
         # 1) explicit builtin injection (Databricks sometimes does this)
         if hasattr(builtins, "dbutils"):
             return builtins.dbutils
@@ -85,8 +103,7 @@ class NotebookConfig:
 
     @classmethod
     def from_environment(cls):
-        """
-        Build data class from environment variables or databricks dbutils if available.
+        """Build a config instance from Databricks widgets or environment variables.
 
         This method looks for values in the following order:
         1. Databricks widgets (if running in Databricks notebook)
@@ -94,7 +111,7 @@ class NotebookConfig:
         3. Environment variables
 
         Returns:
-            An instance of the dataclass populated with values from the environment
+            An instance of the dataclass populated with values from the environment.
         """
         dbutils = cls.get_dbutils()
         key_values: Dict[str, Any] = {}
@@ -229,6 +246,9 @@ class NotebookConfig:
 
         This method creates appropriate widgets for each field in the dataclass,
         with optional default values and customization options.
+
+        Returns:
+            None. Widgets are created in the notebook environment.
         """
         dbutils = cls.get_dbutils()
         if dbutils is None or not hasattr(dbutils, "widgets"):
@@ -296,6 +316,11 @@ class NotebookConfig:
 
     @classmethod
     def init_job(cls):
+        """Initialize widgets, tweak Spark session defaults, and return config.
+
+        Returns:
+            An instance of the dataclass populated from widgets or environment.
+        """
         cls.init_widgets()
 
         if SparkSession is not None:

@@ -1,3 +1,5 @@
+"""Compute helpers for Databricks clusters and remote execution."""
+
 __all__ = [
     "databricks_remote_compute",
     "Cluster",
