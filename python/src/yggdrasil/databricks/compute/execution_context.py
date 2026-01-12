@@ -144,7 +144,7 @@ os_env = meta["os_env"] = {}
 for k, v in os.environ.items():
     os_env[k] = v
     
-meta["requirements"] = current_env.export_requirements_matrix()
+meta["requirements"] = current_env.requirements()
 meta["version_info"] = current_env.version_info
 
 print(json.dumps(meta))"""
