@@ -26,6 +26,7 @@ def databricks_remote_compute(
     cluster: Optional["Cluster"] = None,
     timeout: Optional[dt.timedelta] = None,
     env_keys: Optional[List[str]] = None,
+    force_local: bool = False,
     **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     """Return a decorator that executes functions on a remote cluster.
@@ -37,11 +38,18 @@ def databricks_remote_compute(
         cluster: Pre-configured Cluster instance to reuse.
         timeout: Optional execution timeout for remote calls.
         env_keys: Optional environment variable names to forward.
+        force_local: Force local execution
         **options: Extra options forwarded to the execution decorator.
 
     Returns:
         A decorator that runs functions on the resolved Databricks cluster.
     """
+    if force_local or Workspace.is_in_databricks_environment():
+        def identity(x):
+            return x
+
+        return identity
+
     if isinstance(workspace, str):
         workspace = Workspace(host=workspace)
 

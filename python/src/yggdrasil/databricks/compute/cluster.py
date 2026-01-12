@@ -848,6 +848,7 @@ class Cluster(WorkspaceService):
         env_variables: Optional[Dict[str, str]] = None,
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
+        force_local: bool = False,
         **options
     ):
         """
@@ -873,13 +874,14 @@ class Cluster(WorkspaceService):
             env_variables: Optional environment variables to inject.
             timeout: Optional timeout for remote execution.
             result_tag: Optional tag for parsing remote output.
+            force_local: force local execution
             **options: Additional execution options passed through.
 
         Returns:
             A decorator or wrapped function that executes remotely.
         """
         def decorator(func: Callable):
-            if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
+            if force_local or self.is_in_databricks_environment():
                 return func
 
             context = self.context(language=language or Language.PYTHON)
