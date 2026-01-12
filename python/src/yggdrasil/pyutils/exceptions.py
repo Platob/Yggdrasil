@@ -37,12 +37,23 @@ class ParsedException:
 class RemoteTraceback(Exception):
     """Holds a traceback *string* and prints it as the chained cause."""
     def __init__(self, traceback_text: str):
-        """Store the traceback text for later display."""
+        """Store the traceback text for later display.
+
+        Args:
+            traceback_text: Traceback string to store.
+
+        Returns:
+            None.
+        """
         super().__init__("Remote traceback (text)")
         self.traceback_text = traceback_text
 
     def __str__(self) -> str:
-        """Render the exception with its stored traceback text."""
+        """Render the exception with its stored traceback text.
+
+        Returns:
+            Rendered exception string with traceback text.
+        """
         return f"{self.args[0]}\n\n{self.traceback_text}"
 
 

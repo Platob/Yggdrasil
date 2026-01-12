@@ -45,7 +45,14 @@ MODULE_PROJECT_NAMES_ALIASES = {
 
 
 def module_name_to_project_name(module_name: str) -> str:
-    """Map module import names to PyPI project names when they differ."""
+    """Map module import names to PyPI project names when they differ.
+
+    Args:
+        module_name: Importable module name.
+
+    Returns:
+        PyPI project name.
+    """
     return MODULE_PROJECT_NAMES_ALIASES.get(module_name, module_name)
 
 
@@ -140,7 +147,14 @@ def _req_project_name(req_line: str) -> Optional[str]:
 
 
 def _distribution_for_module(mod: Union[str, ModuleType]):
-    """Resolve the importlib.metadata distribution that provides a module."""
+    """Resolve the importlib.metadata distribution that provides a module.
+
+    Args:
+        mod: Module name or module object.
+
+    Returns:
+        importlib.metadata.Distribution instance.
+    """
     if ilm is None:
         raise RuntimeError("importlib.metadata is not available")
 
@@ -218,7 +232,14 @@ def module_dependencies(lib: Union[str, ModuleType]) -> List[DependencyMetadata]
 
 
 def _run_pip(*args: str) -> Tuple[int, str, str]:
-    """Run pip with arguments and return (returncode, stdout, stderr)."""
+    """Run pip with arguments and return (returncode, stdout, stderr).
+
+    Args:
+        *args: Pip arguments.
+
+    Returns:
+        Tuple of (returncode, stdout, stderr).
+    """
     p = subprocess.run(
         [sys.executable, "-m", "pip", *args],
         text=True,
@@ -238,18 +259,30 @@ class PipIndexSettings:
 
     @classmethod
     def default_settings(cls):
-        """Return the cached default pip index settings."""
+        """Return the cached default pip index settings.
+
+        Returns:
+            Default PipIndexSettings instance.
+        """
         return DEFAULT_PIP_INDEX_SETTINGS
 
     @property
     def extra_index_url(self):
-        """Return extra index URLs as a space-separated string."""
+        """Return extra index URLs as a space-separated string.
+
+        Returns:
+            Space-separated extra index URLs or None.
+        """
         if self.extra_index_urls:
             return " ".join(self.extra_index_urls)
         return None
 
     def as_dict(self) -> dict:
-        """Return a dict representation of the settings."""
+        """Return a dict representation of the settings.
+
+        Returns:
+            Dict representation of settings.
+        """
         return dc.asdict(self)
 
 

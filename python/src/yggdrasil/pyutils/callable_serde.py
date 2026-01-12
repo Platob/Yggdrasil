@@ -28,7 +28,15 @@ _FLAG_COMPRESSED = 1
 
 
 def _resolve_attr_chain(mod: Any, qualname: str) -> Any:
-    """Resolve a dotted attribute path from a module."""
+    """Resolve a dotted attribute path from a module.
+
+    Args:
+        mod: Module to traverse.
+        qualname: Dotted qualified name.
+
+    Returns:
+        Resolved attribute.
+    """
     obj = mod
     for part in qualname.split("."):
         obj = getattr(obj, part)
@@ -52,7 +60,14 @@ def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
 
 
 def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional[int]]:
-    """Return the source file path and line number for a callable."""
+    """Return the source file path and line number for a callable.
+
+    Args:
+        fn: Callable to inspect.
+
+    Returns:
+        Tuple of (file path, line number).
+    """
     file = None
     line = None
     try:
@@ -89,7 +104,14 @@ def _referenced_global_names(fn: Callable[..., Any]) -> Set[str]:
 
 
 def _is_importable_reference(fn: Callable[..., Any]) -> bool:
-    """Return True when a callable can be imported by module and qualname."""
+    """Return True when a callable can be imported by module and qualname.
+
+    Args:
+        fn: Callable to inspect.
+
+    Returns:
+        True if importable by module/qualname.
+    """
     mod_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
     if not mod_name or not qualname:
@@ -250,7 +272,14 @@ class CallableSerde:
 
     @classmethod
     def from_callable(cls: type[T], x: Union[Callable[..., Any], T]) -> T:
-        """Create a CallableSerde from a callable or existing instance."""
+        """Create a CallableSerde from a callable or existing instance.
+
+        Args:
+            x: Callable or CallableSerde instance.
+
+        Returns:
+            CallableSerde instance.
+        """
         if isinstance(x, cls):
             return x
 
@@ -262,17 +291,29 @@ class CallableSerde:
 
     @property
     def module(self) -> Optional[str]:
-        """Return the callable's module name if available."""
+        """Return the callable's module name if available.
+
+        Returns:
+            Module name or None.
+        """
         return self._module or (getattr(self.fn, "__module__", None) if self.fn else None)
 
     @property
     def qualname(self) -> Optional[str]:
-        """Return the callable's qualified name if available."""
+        """Return the callable's qualified name if available.
+
+        Returns:
+            Qualified name or None.
+        """
         return self._qualname or (getattr(self.fn, "__qualname__", None) if self.fn else None)
 
     @property
     def file(self) -> Optional[str]:
-        """Return the filesystem path of the callable's source file."""
+        """Return the filesystem path of the callable's source file.
+
+        Returns:
+            File path or None.
+        """
         if not self.fn:
             return None
         f, _ = _callable_file_line(self.fn)
@@ -280,7 +321,11 @@ class CallableSerde:
 
     @property
     def line(self) -> Optional[int]:
-        """Return the line number where the callable is defined."""
+        """Return the line number where the callable is defined.
+
+        Returns:
+            Line number or None.
+        """
         if not self.fn:
             return None
         _, ln = _callable_file_line(self.fn)
@@ -288,7 +333,11 @@ class CallableSerde:
 
     @property
     def pkg_root(self) -> Optional[str]:
-        """Return the inferred package root for the callable, if known."""
+        """Return the inferred package root for the callable, if known.
+
+        Returns:
+            Package root path or None.
+        """
         if self._pkg_root:
             return self._pkg_root
         if not self.file:
@@ -298,7 +347,11 @@ class CallableSerde:
 
     @property
     def relpath_from_pkg_root(self) -> Optional[str]:
-        """Return the callable's path relative to the package root."""
+        """Return the callable's path relative to the package root.
+
+        Returns:
+            Relative path or None.
+        """
         if not self.file or not self.pkg_root:
             return None
         try:
@@ -308,7 +361,11 @@ class CallableSerde:
 
     @property
     def importable(self) -> bool:
-        """Return True when the callable can be imported by reference."""
+        """Return True when the callable can be imported by reference.
+
+        Returns:
+            True if importable by module/qualname.
+        """
         if self.fn is None:
             return bool(self.module and self.qualname and "<locals>" not in (self.qualname or ""))
         return _is_importable_reference(self.fn)
@@ -322,7 +379,16 @@ class CallableSerde:
         dump_env: str = "none",          # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
     ) -> Dict[str, Any]:
-        """Serialize the callable into a dict for transport."""
+        """Serialize the callable into a dict for transport.
+
+        Args:
+            prefer: Preferred serialization kind.
+            dump_env: Environment payload selection.
+            filter_used_globals: Filter globals to referenced names.
+
+        Returns:
+            Serialized payload dict.
+        """
         kind = prefer
         if kind == "import" and not self.importable:
             kind = "dill"
@@ -366,7 +432,15 @@ class CallableSerde:
 
     @classmethod
     def load(cls: type[T], d: Dict[str, Any], *, add_pkg_root_to_syspath: bool = True) -> T:
-        """Construct a CallableSerde from a serialized dict payload."""
+        """Construct a CallableSerde from a serialized dict payload.
+
+        Args:
+            d: Serialized payload dict.
+            add_pkg_root_to_syspath: Add package root to sys.path if True.
+
+        Returns:
+            CallableSerde instance.
+        """
         obj = cls(
             fn=None,
             _kind=d.get("kind", "auto"),
@@ -384,7 +458,14 @@ class CallableSerde:
         return obj  # type: ignore[return-value]
 
     def materialize(self, *, add_pkg_root_to_syspath: bool = True) -> Callable[..., Any]:
-        """Resolve and return the underlying callable."""
+        """Resolve and return the underlying callable.
+
+        Args:
+            add_pkg_root_to_syspath: Add package root to sys.path if True.
+
+        Returns:
+            Resolved callable.
+        """
         if self.fn is not None:
             return self.fn
 
@@ -418,7 +499,15 @@ class CallableSerde:
         raise ValueError(f"Unknown kind: {kind}")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke the materialized callable with the provided arguments."""
+        """Invoke the materialized callable with the provided arguments.
+
+        Args:
+            *args: Positional args for the callable.
+            **kwargs: Keyword args for the callable.
+
+        Returns:
+            Callable return value.
+        """
         fn = self.materialize()
         return fn(*args, **kwargs)
 

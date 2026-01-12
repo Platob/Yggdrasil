@@ -98,6 +98,12 @@ __all__ = [
 def require_pyspark(active_session: bool = False):
     """
     Optionally enforce that pyspark (and an active SparkSession) exists.
+
+    Args:
+        active_session: Require an active SparkSession if True.
+
+    Returns:
+        None.
     """
     if pyspark is None:
         raise ImportError(
@@ -123,6 +129,13 @@ def arrow_type_to_spark_type(
 ) -> "T.DataType":
     """
     Convert a pyarrow.DataType to a pyspark.sql.types.DataType.
+
+    Args:
+        arrow_type: Arrow data type to convert.
+        cast_options: Optional casting options.
+
+    Returns:
+        Spark SQL data type.
     """
     require_pyspark()
 
@@ -198,6 +211,13 @@ def arrow_field_to_spark_field(
 ) -> "T.StructField":
     """
     Convert a pyarrow.Field to a pyspark StructField.
+
+    Args:
+        field: Arrow field to convert.
+        cast_options: Optional casting options.
+
+    Returns:
+        Spark StructField representation.
     """
     spark_type = arrow_type_to_spark_type(field.type, cast_options)
 
@@ -215,6 +235,13 @@ def spark_type_to_arrow_type(
 ) -> pa.DataType:
     """
     Convert a pyspark.sql.types.DataType to a pyarrow.DataType.
+
+    Args:
+        spark_type: Spark SQL data type to convert.
+        cast_options: Optional casting options.
+
+    Returns:
+        Arrow data type.
     """
     require_pyspark()
     from pyspark.sql.types import (
@@ -294,6 +321,13 @@ def spark_field_to_arrow_field(
 ) -> pa.Field:
     """
     Convert a pyspark StructField to a pyarrow.Field.
+
+    Args:
+        field: Spark StructField to convert.
+        cast_options: Optional casting options.
+
+    Returns:
+        Arrow field.
     """
     arrow_type = spark_type_to_arrow_type(field.dataType, cast_options)
 

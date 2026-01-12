@@ -15,7 +15,11 @@ __all__ = [
 
 
 def require_polars():
-    """Ensure polars is available before using polars helpers."""
+    """Ensure polars is available before using polars helpers.
+
+    Returns:
+        None.
+    """
     if polars is None:
         raise ImportError(
             "polars is required to use this function. "

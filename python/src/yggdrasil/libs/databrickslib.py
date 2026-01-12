@@ -18,7 +18,11 @@ except ImportError:
 
 
 def require_databricks_sdk():
-    """Ensure the Databricks SDK is available before use."""
+    """Ensure the Databricks SDK is available before use.
+
+    Returns:
+        None.
+    """
     if databricks_sdk is None:
         raise ImportError(
             "databricks_sdk is required to use this function. "

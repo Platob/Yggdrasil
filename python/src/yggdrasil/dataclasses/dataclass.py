@@ -20,6 +20,7 @@ def is_yggdataclass(cls_or_instance: Any) -> bool:
 
     Args:
         cls_or_instance: The class or instance to check.
+
     Returns:
         True if the class or instance
         is a yggdrasil dataclass, False otherwise.
@@ -28,7 +29,14 @@ def is_yggdataclass(cls_or_instance: Any) -> bool:
 
 
 def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
-    """Return a cached Arrow Field describing the dataclass type."""
+    """Return a cached Arrow Field describing the dataclass type.
+
+    Args:
+        cls_or_instance: Dataclass class or instance.
+
+    Returns:
+        Arrow field describing the dataclass schema.
+    """
     if is_yggdataclass(cls_or_instance):
         return cls_or_instance.__arrow_field__()
 
@@ -76,10 +84,24 @@ def yggdataclass(
     """
 
     def wrap(c):
-        """Wrap a class with yggdrasil dataclass enhancements."""
+        """Wrap a class with yggdrasil dataclass enhancements.
+
+        Args:
+            c: Class to decorate.
+
+        Returns:
+            Decorated dataclass type.
+        """
 
         def _init_public_fields(cls):
-            """Return init-enabled, public dataclass fields."""
+            """Return init-enabled, public dataclass fields.
+
+            Args:
+                cls: Dataclass type.
+
+            Returns:
+                List of dataclasses.Field objects.
+            """
             return [
                 field
                 for field in dataclasses.fields(cls)
@@ -89,7 +111,11 @@ def yggdataclass(
         if not hasattr(c, "default_instance"):
             @classmethod
             def default_instance(cls):
-                """Return a default instance built from type defaults."""
+                """Return a default instance built from type defaults.
+
+                Returns:
+                    Default instance of the dataclass.
+                """
                 from yggdrasil.types import default_scalar
 
                 if not hasattr(cls, "__default_instance__"):
@@ -142,7 +168,14 @@ def yggdataclass(
         if not hasattr(c, "__arrow_field__"):
             @classmethod
             def __arrow_field__(cls, name: str | None = None):
-                """Return an Arrow field representing the dataclass schema."""
+                """Return an Arrow field representing the dataclass schema.
+
+                Args:
+                    name: Optional override for the field name.
+
+                Returns:
+                    Arrow field describing the dataclass schema.
+                """
                 from yggdrasil.types.python_arrow import arrow_field_from_hint
 
                 return arrow_field_from_hint(cls, name=name)

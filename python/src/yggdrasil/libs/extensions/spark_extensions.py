@@ -33,6 +33,14 @@ _COL_RE = re.compile(r"Column<\s*['\"]?`?(.+?)`?['\"]?\s*>")
 
 def _require_pyspark(fn_name: str) -> None:
     """Raise when PySpark is unavailable for a requested helper."""
+    """Raise when PySpark is unavailable for a requested helper.
+
+    Args:
+        fn_name: Name of the calling function.
+
+    Returns:
+        None.
+    """
     if pyspark is None or F is None or T is None:
         raise RuntimeError(
             f"{fn_name} requires PySpark to be available. "
@@ -44,7 +52,15 @@ def getAliases(
     obj: Union[SparkDataFrame, SparkColumn, str, Iterable[Union[SparkDataFrame, SparkColumn, str]]],
     full: bool = True,
 ) -> list[str]:
-    """Return aliases for Spark columns/dataframes or collections."""
+    """Return aliases for Spark columns/dataframes or collections.
+
+    Args:
+        obj: Spark DataFrame/Column, string, or iterable of these.
+        full: Whether to return full qualified names.
+
+    Returns:
+        List of alias strings.
+    """
     if obj is None:
         return []
 
@@ -96,7 +112,16 @@ def latest(
     partitionBy: List[Union[str, SparkColumn]],
     orderBy: List[Union[str, SparkColumn]],
 ) -> SparkDataFrame:
-    """Return the latest rows per partition based on ordering."""
+    """Return the latest rows per partition based on ordering.
+
+    Args:
+        df: Spark DataFrame.
+        partitionBy: Columns to partition by.
+        orderBy: Columns to order by.
+
+    Returns:
+        Spark DataFrame with latest rows per partition.
+    """
     _require_pyspark("latest")
 
     partition_col_names = getAliases(partitionBy)
@@ -128,14 +153,30 @@ def _infer_time_col_spark(df: "pyspark.sql.DataFrame") -> str:
 
 
 def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Filter kwargs to only those accepted by the callable."""
+    """Filter kwargs to only those accepted by the callable.
+
+    Args:
+        fn: Callable to inspect.
+        kwargs: Candidate keyword arguments.
+
+    Returns:
+        Filtered keyword arguments.
+    """
     sig = inspect.signature(fn)  # type: ignore[arg-type]
     allowed = set(sig.parameters.keys())
     return {k: v for k, v in kwargs.items() if (k in allowed and v is not None)}
 
 
 def _append_drop_col_to_spark_schema(schema: "T.StructType", drop_col: str) -> "T.StructType":
-    """Ensure the drop column exists in the Spark schema."""
+    """Ensure the drop column exists in the Spark schema.
+
+    Args:
+        schema: Spark schema to augment.
+        drop_col: Column name to add if missing.
+
+    Returns:
+        Updated Spark schema.
+    """
     _require_pyspark("_append_drop_col_to_spark_schema")
     if drop_col in schema.fieldNames():
         return schema
@@ -176,7 +217,14 @@ def upsample(
     spark_schema = arrow_field_to_spark_field(options.target_field)
 
     def within_group(tb: pa.Table) -> pa.Table:
-        """Apply upsample logic to a grouped Arrow table."""
+        """Apply upsample logic to a grouped Arrow table.
+
+        Args:
+            tb: Arrow table for a grouped partition.
+
+        Returns:
+            Arrow table with upsampled data.
+        """
         res = (
             arrow_table_to_polars_dataframe(tb, options)
             .sort(time_col_name)
@@ -285,7 +333,14 @@ def resample(
         out_options = CastOptions.check_arg(out_arrow_field)
 
     def within_group(tb: pa.Table) -> pa.Table:
-        """Apply resample logic to a grouped Arrow table."""
+        """Apply resample logic to a grouped Arrow table.
+
+        Args:
+            tb: Arrow table for a grouped partition.
+
+        Returns:
+            Arrow table with resampled data.
+        """
         from .polars_extensions import resample
 
         pdf = arrow_table_to_polars_dataframe(tb, in_options)
@@ -338,7 +393,18 @@ def checkJoin(
     *args,
     **kwargs,
 ):
-    """Join two DataFrames with schema-aware column casting."""
+    """Join two DataFrames with schema-aware column casting.
+
+    Args:
+        df: Left Spark DataFrame.
+        other: Right Spark DataFrame.
+        on: Join keys or mapping.
+        *args: Positional args passed to join.
+        **kwargs: Keyword args passed to join.
+
+    Returns:
+        Joined Spark DataFrame.
+    """
     _require_pyspark("checkJoin")
 
     other = convert(other, SparkDataFrame)
@@ -381,14 +447,32 @@ def checkMapInArrow(
     *args,
     **kwargs,
 ):
-    """Wrap mapInArrow to enforce output schema conversion."""
+    """Wrap mapInArrow to enforce output schema conversion.
+
+    Args:
+        df: Spark DataFrame.
+        func: Generator function yielding RecordBatches.
+        schema: Output schema (Spark StructType or DDL string).
+        *args: Positional args passed to mapInArrow.
+        **kwargs: Keyword args passed to mapInArrow.
+
+    Returns:
+        Spark DataFrame with enforced schema.
+    """
     _require_pyspark("mapInArrow")
 
     spark_schema = convert(schema, T.StructType)
     arrow_schema = convert(schema, pa.Field)
 
     def patched(batches: Iterable[pa.RecordBatch]):
-        """Convert batches yielded by user function to the target schema."""
+        """Convert batches yielded by user function to the target schema.
+
+        Args:
+            batches: Input RecordBatch iterable.
+
+        Yields:
+            RecordBatch instances conforming to the output schema.
+        """
         for src in func(batches):
             yield convert(src, pa.RecordBatch, arrow_schema)
 
@@ -407,7 +491,18 @@ def checkMapInPandas(
     *args,
     **kwargs,
 ):
-    """Wrap mapInPandas to enforce output schema conversion."""
+    """Wrap mapInPandas to enforce output schema conversion.
+
+    Args:
+        df: Spark DataFrame.
+        func: Generator function yielding pandas DataFrames.
+        schema: Output schema (Spark StructType or DDL string).
+        *args: Positional args passed to mapInPandas.
+        **kwargs: Keyword args passed to mapInPandas.
+
+    Returns:
+        Spark DataFrame with enforced schema.
+    """
     _require_pyspark("mapInPandas")
 
     import pandas as _pd  # local import so we don't shadow the ..pandas module
@@ -416,7 +511,14 @@ def checkMapInPandas(
     arrow_schema = convert(schema, pa.Field)
 
     def patched(batches: Iterable[_pd.DataFrame]):
-        """Convert pandas batches yielded by user function to the target schema."""
+        """Convert pandas batches yielded by user function to the target schema.
+
+        Args:
+            batches: Input pandas DataFrame iterable.
+
+        Yields:
+            pandas DataFrames conforming to the output schema.
+        """
         for src in func(batches):
             yield convert(src, _pd.DataFrame, arrow_schema)
 

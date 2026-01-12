@@ -41,7 +41,14 @@ def join_coalesced(
 
 
 def _normalize_group_by(group_by: str | Sequence[str] | None) -> list[str] | None:
-    """Normalize group_by inputs into a list or None."""
+    """Normalize group_by inputs into a list or None.
+
+    Args:
+        group_by: Grouping column or columns.
+
+    Returns:
+        List of column names or None.
+    """
     if group_by is None:
         return None
     if isinstance(group_by, str):
@@ -60,7 +67,15 @@ def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str,
 
 
 def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
-    """Build a Polars expression from an aggregation spec."""
+    """Build a Polars expression from an aggregation spec.
+
+    Args:
+        col: Column name to aggregate.
+        agg: Aggregation spec (expr, callable, or string).
+
+    Returns:
+        Polars expression.
+    """
     base = pl.col(col)
 
     if isinstance(agg, pl.Expr):
@@ -84,7 +99,14 @@ def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
 
 
 def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
-    """Normalize aggregation specs into a list of Polars expressions."""
+    """Normalize aggregation specs into a list of Polars expressions.
+
+    Args:
+        agg: Mapping or sequence of aggregation specs.
+
+    Returns:
+        List of Polars expressions.
+    """
     if isinstance(agg, Mapping):
         return [_expr_from_agg(col, spec) for col, spec in agg.items()]
 
@@ -96,13 +118,27 @@ def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
 
 
 def _is_datetime(dtype: object) -> bool:
-    """Return True when the dtype is a Polars datetime."""
+    """Return True when the dtype is a Polars datetime.
+
+    Args:
+        dtype: Polars dtype to inspect.
+
+    Returns:
+        True if dtype is Polars Datetime.
+    """
     # Datetime-only inference (per requirement), version-safe.
     return isinstance(dtype, pl.Datetime)
 
 
 def _infer_time_col(df: "pl.DataFrame") -> str:
-    """Infer the first datetime-like column name from a DataFrame."""
+    """Infer the first datetime-like column name from a DataFrame.
+
+    Args:
+        df: Polars DataFrame to inspect.
+
+    Returns:
+        Column name of the first datetime field.
+    """
     # Find first Datetime column in schema order; ignore Date columns.
     for name, dtype in df.schema.items():
         if _is_datetime(dtype):
@@ -113,7 +149,15 @@ def _infer_time_col(df: "pl.DataFrame") -> str:
 
 
 def _ensure_datetime_like(df: "pl.DataFrame", time_col: str) -> "pl.DataFrame":
-    """Ensure a time column is cast to datetime for resampling."""
+    """Ensure a time column is cast to datetime for resampling.
+
+    Args:
+        df: Polars DataFrame.
+        time_col: Column name to validate.
+
+    Returns:
+        DataFrame with time column cast to datetime if needed.
+    """
     dtype = df.schema.get(time_col)
     if dtype is None:
         raise KeyError(f"resample: time_col '{time_col}' not found in DataFrame columns.")
@@ -159,7 +203,14 @@ def _timedelta_to_polars_duration(td: datetime.timedelta) -> str:
 
 
 def _normalize_duration(v: str | datetime.timedelta | None) -> str | None:
-    """Normalize duration inputs to a Polars duration string."""
+    """Normalize duration inputs to a Polars duration string.
+
+    Args:
+        v: Duration string, timedelta, or None.
+
+    Returns:
+        Normalized duration string or None.
+    """
     if v is None:
         return None
     if isinstance(v, str):
@@ -177,7 +228,18 @@ def _upsample_single(
     offset: str | datetime.timedelta | None,
     keep_group_order: bool,
 ) -> "pl.DataFrame":
-    """Upsample a single DataFrame with normalized duration arguments."""
+    """Upsample a single DataFrame with normalized duration arguments.
+
+    Args:
+        df: Polars DataFrame to upsample.
+        time_col: Name of the time column.
+        every: Sampling interval.
+        offset: Optional offset interval.
+        keep_group_order: Preserve input order when grouping.
+
+    Returns:
+        Upsampled Polars DataFrame.
+    """
     df = df.sort(time_col)
 
     every_n = _normalize_duration(every)

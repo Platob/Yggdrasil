@@ -71,7 +71,22 @@ class CastOptions:
         target_field: pa.Field | pa.Schema | pa.DataType | None = None,
         **kwargs
     ):
-        """Build a CastOptions instance with optional source/target fields."""
+        """Build a CastOptions instance with optional source/target fields.
+
+        Args:
+            safe: Enable safe casting if True.
+            add_missing_columns: Add missing columns if True.
+            strict_match_names: Require exact field name matches if True.
+            allow_add_columns: Allow extra columns if True.
+            eager: Enable eager casting behavior if True.
+            datetime_patterns: Optional datetime parsing patterns.
+            source_field: Optional source Arrow field/schema/type.
+            target_field: Optional target Arrow field/schema/type.
+            **kwargs: Additional CastOptions fields.
+
+        Returns:
+            CastOptions instance.
+        """
         built = CastOptions(
             safe=safe,
             add_missing_columns=add_missing_columns,
@@ -172,7 +187,14 @@ class CastOptions:
         return result
 
     def check_source(self, obj: Any):
-        """Set the source field if not already configured."""
+        """Set the source field if not already configured.
+
+        Args:
+            obj: Source object to infer from.
+
+        Returns:
+            Self.
+        """
         if self.source_field is not None or obj is None:
             return self
 
@@ -181,7 +203,14 @@ class CastOptions:
         return self
 
     def need_arrow_type_cast(self, source_obj: Any):
-        """Return True when Arrow type casting is required."""
+        """Return True when Arrow type casting is required.
+
+        Args:
+            source_obj: Source object to compare types against.
+
+        Returns:
+            True if Arrow type cast needed.
+        """
         if self.target_field is None:
             return False
 
@@ -190,7 +219,14 @@ class CastOptions:
         return self.source_field.type != self.target_field.type
 
     def need_polars_type_cast(self, source_obj: Any):
-        """Return True when Polars dtype casting is required."""
+        """Return True when Polars dtype casting is required.
+
+        Args:
+            source_obj: Source object to compare types against.
+
+        Returns:
+            True if Polars type cast needed.
+        """
         if self.target_polars_field is None:
             return False
 
@@ -199,7 +235,14 @@ class CastOptions:
         return self.source_polars_field.dtype != self.target_polars_field.dtype
 
     def need_spark_type_cast(self, source_obj: Any):
-        """Return True when Spark datatype casting is required."""
+        """Return True when Spark datatype casting is required.
+
+        Args:
+            source_obj: Source object to compare types against.
+
+        Returns:
+            True if Spark type cast needed.
+        """
         if self.target_spark_field is None:
             return False
 
@@ -208,7 +251,14 @@ class CastOptions:
         return self.source_spark_field.dataType != self.target_spark_field.dataType
 
     def need_nullability_check(self, source_obj: Any):
-        """Return True when nullability checks are required."""
+        """Return True when nullability checks are required.
+
+        Args:
+            source_obj: Source object to compare nullability against.
+
+        Returns:
+            True if nullability check needed.
+        """
         if self.target_field is None:
             return False
 
@@ -221,7 +271,15 @@ class CastOptions:
         arrow_field: pa.Field,
         index: int
     ):
-        """Return a child Arrow field by index for nested types."""
+        """Return a child Arrow field by index for nested types.
+
+        Args:
+            arrow_field: Parent Arrow field.
+            index: Child index.
+
+        Returns:
+            Child Arrow field.
+        """
         source_type: Union[
             pa.DataType, pa.ListType, pa.StructType, pa.MapType
         ] = arrow_field.type
@@ -244,7 +302,11 @@ class CastOptions:
 
     @property
     def source_field(self):
-        """Return the configured source Arrow field."""
+        """Return the configured source Arrow field.
+
+        Returns:
+            Source Arrow field.
+        """
         return self.source_arrow_field
 
     @source_field.setter
@@ -258,12 +320,23 @@ class CastOptions:
         object.__setattr__(self, "source_arrow_field", value)
 
     def source_child_arrow_field(self, index: int):
-        """Return a child source Arrow field by index."""
+        """Return a child source Arrow field by index.
+
+        Args:
+            index: Child index.
+
+        Returns:
+            Child Arrow field.
+        """
         return self._child_arrow_field(self.source_arrow_field, index=index)
 
     @property
     def source_polars_field(self):
-        """Return or compute the cached Polars field for the source."""
+        """Return or compute the cached Polars field for the source.
+
+        Returns:
+            Polars field or None.
+        """
         if self.source_arrow_field is not None and self._source_polars_field is None:
             from ...types.cast.polars_cast import arrow_field_to_polars_field
 
@@ -272,7 +345,11 @@ class CastOptions:
 
     @property
     def source_spark_field(self):
-        """Return or compute the cached Spark field for the source."""
+        """Return or compute the cached Spark field for the source.
+
+        Returns:
+            Spark field or None.
+        """
         if self.source_arrow_field is not None and self._source_spark_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
@@ -288,7 +365,11 @@ class CastOptions:
 
     @property
     def target_field_name(self):
-        """Return the effective target field name."""
+        """Return the effective target field name.
+
+        Returns:
+            Target field name or None.
+        """
         if self.target_field is None:
             if self.source_field is not None:
                 return self.source_field.name
@@ -309,12 +390,23 @@ class CastOptions:
         object.__setattr__(self, "target_arrow_field", value)
 
     def target_child_arrow_field(self, index: int):
-        """Return a child target Arrow field by index."""
+        """Return a child target Arrow field by index.
+
+        Args:
+            index: Child index.
+
+        Returns:
+            Child Arrow field.
+        """
         return self._child_arrow_field(self.target_arrow_field, index=index)
 
     @property
     def target_polars_field(self):
-        """Return or compute the cached Polars field for the target."""
+        """Return or compute the cached Polars field for the target.
+
+        Returns:
+            Polars field or None.
+        """
         if self.target_arrow_field is not None and self._target_polars_field is None:
             from ...types.cast.polars_cast import arrow_field_to_polars_field
 
@@ -323,7 +415,11 @@ class CastOptions:
 
     @property
     def target_spark_field(self):
-        """Return or compute the cached Spark field for the target."""
+        """Return or compute the cached Spark field for the target.
+
+        Returns:
+            Spark field or None.
+        """
         if self.target_arrow_field is not None and self._target_spark_field is None:
             from ...types.cast.spark_cast import arrow_field_to_spark_field
 
@@ -346,7 +442,11 @@ class CastOptions:
 
     @property
     def target_spark_schema(self) -> Optional["pyspark.sql.types.StructType"]:
-        """Return a Spark schema view of the target Arrow schema."""
+        """Return a Spark schema view of the target Arrow schema.
+
+        Returns:
+            Spark StructType schema or None.
+        """
         arrow_schema = self.target_arrow_schema
 
         if arrow_schema is not None:

@@ -36,7 +36,15 @@ if pyspark is not None and pandas is not None:
     PandasDataFrame = pandas.DataFrame
 
     def spark_pandas_converter(*args, **kwargs):
-        """Return a register_converter wrapper when dependencies are available."""
+        """Return a register_converter wrapper when dependencies are available.
+
+        Args:
+            *args: Converter registration args.
+            **kwargs: Converter registration kwargs.
+
+        Returns:
+            Converter decorator.
+        """
         return register_converter(*args, **kwargs)
 
 else:
@@ -49,9 +57,24 @@ else:
     PandasDataFrame = _Dummy
 
     def spark_pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
-        """Return a no-op decorator when dependencies are missing."""
+        """Return a no-op decorator when dependencies are missing.
+
+        Args:
+            *_args: Ignored positional args.
+            **_kwargs: Ignored keyword args.
+
+        Returns:
+            No-op decorator.
+        """
         def _decorator(func):
-            """Return the function unchanged."""
+            """Return the function unchanged.
+
+            Args:
+                func: Callable to return.
+
+            Returns:
+                Unchanged callable.
+            """
             return func
 
         return _decorator

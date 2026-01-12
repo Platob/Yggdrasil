@@ -8,7 +8,11 @@ except ImportError:
 
 
 def require_pandas():
-    """Ensure pandas is available before using pandas helpers."""
+    """Ensure pandas is available before using pandas helpers.
+
+    Returns:
+        None.
+    """
     if pandas is None:
         raise ImportError(
             "pandas is required to use this function. "

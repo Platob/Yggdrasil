@@ -12,7 +12,11 @@ __all__ = [
 
 
 class YGGSession(Session):
-    """Requests session with preconfigured retry adapter support."""
+    """Requests session with preconfigured retry adapter support.
+
+    Args:
+        Session: Base requests session type.
+    """
     def __init__(
         self,
         num_retry: int = 4,
@@ -20,7 +24,17 @@ class YGGSession(Session):
         *args,
         **kwargs
     ):
-        """Initialize the session with retries and optional default headers."""
+        """Initialize the session with retries and optional default headers.
+
+        Args:
+            num_retry: Number of retries for connection and read errors.
+            headers: Optional default headers to merge into the session.
+            *args: Additional positional arguments passed to Session.
+            **kwargs: Additional keyword arguments passed to Session.
+
+        Returns:
+            None.
+        """
         super(YGGSession, self).__init__()
 
         retry = Retry(
