@@ -309,7 +309,6 @@ class SQLEngine(WorkspaceService):
             engine=self,
             statement_id=response.statement_id,
             _response=response,
-            _response_refresh_time=time.time(),
             disposition=disposition,
         )
 

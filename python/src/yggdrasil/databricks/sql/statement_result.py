@@ -44,6 +44,15 @@ if TYPE_CHECKING:
     from .engine import SQLEngine
 
 
+DONE_STATES = {
+    StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED,
+    StatementState.SUCCEEDED
+}
+
+FAILED_STATES = {
+    StatementState.FAILED, StatementState.CANCELED
+}
+
 __all__ = [
     "StatementResult"
 ]
@@ -57,7 +66,6 @@ class StatementResult:
     disposition: "Disposition"
 
     _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False)
-    _response_refresh_time: float = dataclasses.field(default=0, repr=False)
 
     _spark_df: Optional[SparkDataFrame] = dataclasses.field(default=None, repr=False)
     _arrow_table: Optional[pa.Table] = dataclasses.field(default=None, repr=False)
@@ -101,8 +109,30 @@ class StatementResult:
         Returns:
             The current StatementResponse object.
         """
-        if self._response is None and not self.is_spark_sql:
-            self.response = self.workspace.sdk().statement_execution.get_statement(self.statement_id)
+        if self.is_spark_sql:
+            return StatementResponse(
+                statement_id=self.statement_id or "sparksql",
+                status=StatementStatus(
+                    state=StatementState.SUCCEEDED
+                )
+            )
+        elif not self.statement_id:
+            return StatementResponse(
+                statement_id="unknown",
+                status=StatementStatus(
+                    state=StatementState.PENDING
+                )
+            )
+
+        statement_execution = self.workspace.sdk().statement_execution
+
+        if self._response is None:
+            # Initialize
+            self._response = statement_execution.get_statement(self.statement_id)
+        elif self._response.status.state not in DONE_STATES:
+            # Refresh
+            self._response = statement_execution.get_statement(self.statement_id)
+
         return self._response
 
     @response.setter
@@ -113,26 +143,7 @@ class StatementResult:
             value: StatementResponse to cache.
         """
         self._response = value
-        self._response_refresh_time = time.time()
-
         self.statement_id = self._response.statement_id
-
-    def fresh_response(self, delay: float):
-        """Refresh the response if it is older than ``delay`` seconds.
-
-        Args:
-            delay: Minimum age in seconds before refreshing.
-
-        Returns:
-            The refreshed StatementResponse object.
-        """
-        if self.is_spark_sql:
-            return self._response
-
-        if self.statement_id and not self.done and time.time() - self._response_refresh_time > delay:
-            self.response = self.workspace.sdk().statement_execution.get_statement(self.statement_id)
-
-        return self._response
 
     def result_data_at(self, chunk_index: int):
         """Fetch a specific result chunk by index.
@@ -166,17 +177,7 @@ class StatementResult:
         Returns:
             A StatementStatus object.
         """
-        if self.persisted:
-            return StatementStatus(
-                state=StatementState.SUCCEEDED
-            )
-
-        if not self.statement_id:
-            return StatementStatus(
-                state=StatementState.PENDING
-            )
-
-        return self.fresh_response(delay=1).status
+        return self.response.status
 
     @property
     def state(self):
@@ -194,8 +195,7 @@ class StatementResult:
         Returns:
             The result manifest or None for Spark SQL results.
         """
-        if self.is_spark_sql:
-            return None
+        self.wait()
         return self.response.manifest
 
     @property
@@ -205,6 +205,7 @@ class StatementResult:
         Returns:
             The statement result payload from the API.
         """
+        self.wait()
         return self.response.result
 
     @property
@@ -214,15 +215,7 @@ class StatementResult:
         Returns:
             True if the statement is done, otherwise False.
         """
-        if self.persisted:
-            return True
-
-        if self._response is None:
-            return False
-
-        return self._response.status.state in [
-            StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED, StatementState.SUCCEEDED
-        ]
+        return self.state in DONE_STATES
 
     @property
     def failed(self):
@@ -231,13 +224,7 @@ class StatementResult:
         Returns:
             True if the statement failed or was cancelled.
         """
-        if self.persisted:
-            return True
-
-        if self._response is None:
-            return False
-
-        return self._response.status.state in [StatementState.CANCELED, StatementState.FAILED]
+        return self.state in FAILED_STATES
 
     @property
     def persisted(self):
@@ -268,7 +255,6 @@ class StatementResult:
             self, self.disposition, Disposition.EXTERNAL_LINKS
         )
 
-        self.wait()
         result_data = self.result
         wsdk = self.workspace.sdk()
 
@@ -335,6 +321,8 @@ class StatementResult:
                 f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
             )
 
+        return self
+
     def wait(
         self,
         timeout: Optional[int] = None,
@@ -354,20 +342,21 @@ class StatementResult:
 
         start = time.time()
         poll_interval = poll_interval or 1
-        current = self
 
         while not self.done:
             # still running / queued / pending
             if timeout is not None and (time.time() - start) > timeout:
                 raise TimeoutError(
-                    f"Statement {current.statement_id} did not finish within {timeout} seconds "
-                    f"(last state={current})"
+                    f"Statement {self.statement_id} did not finish within {timeout} seconds "
+                    f"(last state={self.state})"
                 )
 
             poll_interval = max(10, poll_interval * 1.2)
             time.sleep(poll_interval)
 
-        return current
+        self.raise_for_status()
+
+        return self
 
     def arrow_schema(self):
         """Return the Arrow schema for the result.

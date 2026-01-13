@@ -310,6 +310,11 @@ class Cluster(WorkspaceService):
             self.details = self.clusters_client().get(cluster_id=self.cluster_id)
         return self._details
 
+    def refresh(self, max_delay: float | None = None):
+        self.details = self.fresh_details(max_delay=max_delay)
+
+        return self
+
     @details.setter
     def details(self, value: "ClusterDetails"):
         """Cache cluster details and update identifiers."""
@@ -322,10 +327,10 @@ class Cluster(WorkspaceService):
     @property
     def state(self):
         """Return the current cluster state."""
-        details = self.fresh_details(max_delay=10)
+        self.refresh()
 
-        if details is not None:
-            return details.state
+        if self._details is not None:
+            return self._details.state
         return State.UNKNOWN
 
     @property
@@ -356,7 +361,7 @@ class Cluster(WorkspaceService):
     def wait_for_status(
         self,
         tick: float = 0.5,
-        timeout: float = 600,
+        timeout: Union[float, dt.timedelta] = 600,
         backoff: int = 2,
         max_sleep_time: float = 15
     ):
@@ -373,6 +378,9 @@ class Cluster(WorkspaceService):
         """
         start = time.time()
         sleep_time = tick
+
+        if isinstance(timeout, dt.timedelta):
+            timeout = timeout.total_seconds()
 
         while self.is_pending:
             time.sleep(sleep_time)
@@ -691,7 +699,8 @@ class Cluster(WorkspaceService):
             )
 
             self.wait_for_status()
-            self.details = self.clusters_client().edit_and_wait(**update_details)
+            self.details = self.clusters_client().edit(**update_details)
+            self.wait_for_status()
 
             logger.info(
                 "Updated %s",
@@ -754,7 +763,10 @@ class Cluster(WorkspaceService):
                 return None
 
             return Cluster(
-                workspace=self.workspace, cluster_id=details.cluster_id, _details=details
+                workspace=self.workspace,
+                cluster_id=details.cluster_id,
+                cluster_name=details.cluster_name,
+                _details=details
             )
 
         for cluster in self.list_clusters():
@@ -796,10 +808,8 @@ class Cluster(WorkspaceService):
             logger.info("Starting %s", self)
 
             if wait_timeout:
-                self.details = (
-                    self.clusters_client()
-                    .start_and_wait(cluster_id=self.cluster_id, timeout=wait_timeout)
-                )
+                self.clusters_client().start(cluster_id=self.cluster_id)
+                self.wait_for_status(timeout=wait_timeout.total_seconds())
                 self.wait_installed_libraries(timeout=wait_timeout)
             else:
                 self.clusters_client().start(cluster_id=self.cluster_id)
