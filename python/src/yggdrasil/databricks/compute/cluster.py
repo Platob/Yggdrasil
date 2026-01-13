@@ -818,7 +818,6 @@ class Cluster(WorkspaceService):
             if wait_timeout:
                 self.clusters_client().start(cluster_id=self.cluster_id)
                 self.wait_for_status(timeout=wait_timeout.total_seconds())
-                self.wait_installed_libraries(timeout=wait_timeout)
             else:
                 self.clusters_client().start(cluster_id=self.cluster_id)
 
@@ -837,7 +836,7 @@ class Cluster(WorkspaceService):
         if self.is_running:
             logger.info("Restarting %s", self)
             self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
-            return self.wait_installed_libraries()
+            return self.wait_for_status()
 
         return self.start()
 

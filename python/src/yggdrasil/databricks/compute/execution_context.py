@@ -156,7 +156,8 @@ print(json.dumps(meta))"""
                         print_stdout=False,
                     )
                 except ImportError:
-                    self.cluster.wait_installed_libraries()
+                    self.cluster.ensure_running()
+
                     content = self.execute_command(
                         command=cmd,
                         result_tag="<<RESULT>>",
