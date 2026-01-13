@@ -331,6 +331,12 @@ class Workspace:
             os.remove(local_cache)
 
     @property
+    def safe_host(self):
+        if not self.host:
+            return self.connect().host
+        return self.host
+
+    @property
     def current_user(self):
         """Return the current Databricks user.
 
@@ -625,7 +631,12 @@ class Workspace:
         """
         from ..compute.cluster import Cluster
 
-        return Cluster(workspace=self, cluster_id=cluster_id, cluster_name=cluster_name, **kwargs)
+        return Cluster(
+            workspace=self,
+            cluster_id=cluster_id,
+            cluster_name=cluster_name,
+            **kwargs
+        )
 
 # ---------------------------------------------------------------------------
 # Workspace-bound base class

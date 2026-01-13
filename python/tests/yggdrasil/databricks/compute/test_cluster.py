@@ -6,7 +6,7 @@ import unittest
 import pytest
 from databricks.sdk.service.compute import Language
 
-from yggdrasil.databricks import Workspace
+from yggdrasil.databricks import Workspace, databricks_remote_compute
 
 # ---- logging to stdout ----
 logger = logging.getLogger("test")
@@ -22,7 +22,9 @@ logger.propagate = False
 class TestCluster(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace().connect()
+        self.workspace = Workspace(
+            host="dbc-e646c5f9-8a44.cloud.databricks.com",
+        ).connect()
         self.cluster = self.workspace.clusters().push_python_environment()
         # self.cluster.restart()
         self.venv = self.cluster.pull_python_environment()
@@ -52,11 +54,28 @@ class TestCluster(unittest.TestCase):
             raise ValueError("error")
 
         with pytest.raises(ValueError):
+            with self.cluster.system_context as context:
+                _ = context.execute(f)
+
+        with pytest.raises(ValueError):
             with self.cluster.context() as context:
                 _ = context.execute(f)
 
     def test_decorator(self):
         @self.cluster.execution_decorator
+        def decorated(a: int):
+            return {
+                "os": os.environ,
+                "value": a
+            }
+
+        result = decorated(1)
+
+        assert result["os"]
+        assert result["value"] == 1
+
+    def test_static_decorator(self):
+        @databricks_remote_compute(workspace=self.workspace)
         def decorated(a: int):
             return {
                 "os": os.environ,

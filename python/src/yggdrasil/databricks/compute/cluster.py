@@ -24,6 +24,8 @@ from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
 from ... import retry, CallableSerde
 from ...libs.databrickslib import databricks_sdk
+from ...pyutils.equality import dicts_equal, dict_diff
+from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import PipIndexSettings
 from ...pyutils.python_env import PythonEnv
 
@@ -43,6 +45,31 @@ else:  # pragma: no cover - runtime fallback when SDK is missing
 
 
 __all__ = ["Cluster"]
+
+
+NAME_ID_CACHE: dict[str, ExpiringDict] = {}
+
+
+def set_cached_cluster_name(
+    host: str,
+    cluster_name: str,
+    cluster_id: str
+) -> None:
+    existing = NAME_ID_CACHE.get(host)
+
+    if not existing:
+        existing = NAME_ID_CACHE[host] = ExpiringDict(default_ttl=60)
+
+    existing[cluster_name] = cluster_id
+
+
+def get_cached_cluster_id(
+    host: str,
+    cluster_name: str,
+) -> str:
+    existing = NAME_ID_CACHE.get(host)
+
+    return existing.get(cluster_name) if existing else None
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +111,7 @@ class Cluster(WorkspaceService):
     
     _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False)
     _details_refresh_time: float = dataclasses.field(default=0, repr=False)
+    _system_context: Optional[ExecutionContext] = dataclasses.field(default=None, repr=False)
 
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
@@ -98,10 +126,11 @@ class Cluster(WorkspaceService):
         """Return the current cluster name."""
         return self.cluster_name
 
-    def __post_init__(self):
-        """Initialize cached details after dataclass construction."""
-        if self._details is not None:
-            self.details = self._details
+    @property
+    def system_context(self):
+        if self._system_context is None:
+            self._system_context = self.context(language=Language.PYTHON)
+        return self._system_context
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
@@ -233,9 +262,8 @@ class Cluster(WorkspaceService):
         Returns:
             The updated PythonEnv instance.
         """
-        with self.context() as c:
-            m = c.remote_metadata
-            version_info = m.version_info
+        m = self.system_context.remote_metadata
+        version_info = m.version_info
 
         python_version = ".".join(str(_) for _ in version_info)
 
@@ -258,7 +286,7 @@ class Cluster(WorkspaceService):
         )
 
         return target
-    
+
     @property
     def details(self):
         """Return cached cluster details, refreshing when needed."""
@@ -300,21 +328,6 @@ class Cluster(WorkspaceService):
             return details.state
         return State.UNKNOWN
 
-    def get_state(self, max_delay: float = None):
-        """Return the cluster state with a custom refresh delay.
-
-        Args:
-            max_delay: Maximum age in seconds before refresh.
-
-        Returns:
-            The current cluster state.
-        """
-        details = self.fresh_details(max_delay=max_delay)
-
-        if details is not None:
-            return details.state
-        return State.UNKNOWN
-
     @property
     def is_running(self):
         """Return True when the cluster is running."""
@@ -323,7 +336,10 @@ class Cluster(WorkspaceService):
     @property
     def is_pending(self):
         """Return True when the cluster is starting, resizing, or terminating."""
-        return self.state in  (State.PENDING, State.RESIZING, State.RESTARTING, State.TERMINATING)
+        return self.state in (
+            State.PENDING, State.RESIZING, State.RESTARTING,
+            State.TERMINATING
+        )
 
     @property
     def is_error(self):
@@ -507,45 +523,51 @@ class Cluster(WorkspaceService):
     ):
         pip_settings = PipIndexSettings.default_settings()
 
-        if kwargs:
-            details = ClusterDetails(**{
-                **details.as_shallow_dict(),
-                **kwargs
-            })
+        new_details = ClusterDetails(**{
+            **details.as_shallow_dict(),
+            **kwargs
+        })
 
-        if details.custom_tags is None:
-            details.custom_tags = self.workspace.default_tags()
+        default_tags = self.workspace.default_tags()
 
-        if details.cluster_name is None:
-            details.cluster_name = self.workspace.current_user.user_name
+        if new_details.custom_tags is None:
+            new_details.custom_tags = default_tags
+        elif default_tags:
+            new_tags = new_details.custom_tags.copy()
+            new_tags.update(default_tags)
 
-        if details.spark_version is None or python_version:
-            details.spark_version = self.latest_spark_version(
+            new_details.custom_tags = new_tags
+
+        if new_details.cluster_name is None:
+            new_details.cluster_name = self.workspace.current_user.user_name
+
+        if new_details.spark_version is None or python_version:
+            new_details.spark_version = self.latest_spark_version(
                 photon=False, python_version=python_version
             ).key
 
-        if details.single_user_name:
-            if not details.data_security_mode:
-                details.data_security_mode = DataSecurityMode.DATA_SECURITY_MODE_DEDICATED
+        if new_details.single_user_name:
+            if not new_details.data_security_mode:
+                new_details.data_security_mode = DataSecurityMode.DATA_SECURITY_MODE_DEDICATED
 
-        if not details.node_type_id:
-            details.node_type_id = "rd-fleet.xlarge"
+        if not new_details.node_type_id:
+            new_details.node_type_id = "rd-fleet.xlarge"
 
-        if getattr(details, "virtual_cluster_size", None) is None and details.num_workers is None and details.autoscale is None:
-            if details.is_single_node is None:
-                details.is_single_node = True
+        if getattr(new_details, "virtual_cluster_size", None) is None and new_details.num_workers is None and new_details.autoscale is None:
+            if new_details.is_single_node is None:
+                new_details.is_single_node = True
 
-        if details.is_single_node is not None and details.kind is None:
-            details.kind = Kind.CLASSIC_PREVIEW
+        if new_details.is_single_node is not None and new_details.kind is None:
+            new_details.kind = Kind.CLASSIC_PREVIEW
 
         if pip_settings.extra_index_urls:
-            if details.spark_env_vars is None:
-                details.spark_env_vars = {}
+            if new_details.spark_env_vars is None:
+                new_details.spark_env_vars = {}
             str_urls = " ".join(pip_settings.extra_index_urls)
-            details.spark_env_vars["UV_EXTRA_INDEX_URL"] = details.spark_env_vars.get("UV_INDEX", str_urls)
-            details.spark_env_vars["PIP_EXTRA_INDEX_URL"] = details.spark_env_vars.get("PIP_EXTRA_INDEX_URL", str_urls)
+            new_details.spark_env_vars["UV_EXTRA_INDEX_URL"] = new_details.spark_env_vars.get("UV_INDEX", str_urls)
+            new_details.spark_env_vars["PIP_EXTRA_INDEX_URL"] = new_details.spark_env_vars.get("PIP_EXTRA_INDEX_URL", str_urls)
 
-        return details
+        return new_details
 
     def create_or_update(
         self,
@@ -637,8 +659,6 @@ class Cluster(WorkspaceService):
         Returns:
             The updated Cluster instance.
         """
-        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
-
         existing_details = {
             k: v
             for k, v in self.details.as_shallow_dict().items()
@@ -651,10 +671,23 @@ class Cluster(WorkspaceService):
             if k in _EDIT_ARG_NAMES
         }
 
-        if update_details != existing_details:
+        same = dicts_equal(
+            existing_details,
+            update_details,
+            keys=_EDIT_ARG_NAMES,
+            treat_missing_as_none=True,
+            float_tol=0.0,  # set e.g. 1e-6 if you have float-y stuff
+        )
+
+        if not same:
+            diff = {
+                k: v[1]
+                for k, v in dict_diff(existing_details, update_details, keys=_EDIT_ARG_NAMES).items()
+            }
+
             logger.debug(
                 "Updating %s with %s",
-                self, update_details
+                self, diff
             )
 
             self.wait_for_status()
@@ -664,6 +697,8 @@ class Cluster(WorkspaceService):
                 "Updated %s",
                 self
             )
+
+        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
 
         return self
 
@@ -704,6 +739,12 @@ class Cluster(WorkspaceService):
         if not cluster_name and not cluster_id:
             raise ValueError("Either name or cluster_id must be provided")
 
+        if not cluster_id:
+            cluster_id = get_cached_cluster_id(
+                host=self.workspace.safe_host,
+                cluster_name=cluster_name
+            )
+
         if cluster_id:
             try:
                 details = self.clusters_client().get(cluster_id=cluster_id)
@@ -716,10 +757,13 @@ class Cluster(WorkspaceService):
                 workspace=self.workspace, cluster_id=details.cluster_id, _details=details
             )
 
-        cluster_name_cf = cluster_name.casefold()
-
         for cluster in self.list_clusters():
-            if cluster_name_cf == cluster.details.cluster_name.casefold():
+            if cluster_name == cluster.details.cluster_name:
+                set_cached_cluster_name(
+                    host=self.workspace.safe_host,
+                    cluster_name=cluster.cluster_name,
+                    cluster_id=cluster.cluster_id
+                )
                 return cluster
 
         if raise_error:
@@ -728,16 +772,18 @@ class Cluster(WorkspaceService):
 
     def ensure_running(
         self,
+        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ) -> "Cluster":
         """Ensure the cluster is running.
 
         Returns:
             The current Cluster instance.
         """
-        return self.start()
+        return self.start(wait_timeout=wait_timeout)
 
     def start(
         self,
+        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
     ) -> "Cluster":
         """Start the cluster if it is not already running.
 
@@ -748,8 +794,15 @@ class Cluster(WorkspaceService):
 
         if not self.is_running:
             logger.info("Starting %s", self)
-            self.details = self.clusters_client().start_and_wait(cluster_id=self.cluster_id)
-            return self.wait_installed_libraries()
+
+            if wait_timeout:
+                self.details = (
+                    self.clusters_client()
+                    .start_and_wait(cluster_id=self.cluster_id, timeout=wait_timeout)
+                )
+                self.wait_installed_libraries(timeout=wait_timeout)
+            else:
+                self.clusters_client().start(cluster_id=self.cluster_id)
 
         return self
 
@@ -812,6 +865,7 @@ class Cluster(WorkspaceService):
         env_keys: Optional[List[str]] = None,
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
+        context: Optional[ExecutionContext] = None,
     ):
         """Execute a command or callable on the cluster.
 
@@ -823,11 +877,14 @@ class Cluster(WorkspaceService):
             env_keys: Optional environment variable names to pass.
             timeout: Optional timeout for execution.
             result_tag: Optional result tag for parsing output.
+            context: ExecutionContext to run or create new one
 
         Returns:
             The decoded result from the execution context.
         """
-        return self.context(language=language).execute(
+        context = self.system_context if context is None else context
+
+        return context.execute(
             obj=obj,
             args=args,
             kwargs=kwargs,
@@ -849,6 +906,7 @@ class Cluster(WorkspaceService):
         timeout: Optional[dt.timedelta] = None,
         result_tag: Optional[str] = None,
         force_local: bool = False,
+        context: Optional[ExecutionContext] = None,
         **options
     ):
         """
@@ -875,16 +933,28 @@ class Cluster(WorkspaceService):
             timeout: Optional timeout for remote execution.
             result_tag: Optional tag for parsing remote output.
             force_local: force local execution
+            context: ExecutionContext to run or create new one
             **options: Additional execution options passed through.
 
         Returns:
             A decorator or wrapped function that executes remotely.
         """
+        if force_local or self.is_in_databricks_environment():
+            # Support both @ws.remote and @ws.remote(...)
+            if _func is not None and callable(_func):
+                return _func
+
+            def identity(x):
+                return x
+
+            return identity
+
+        context = self.system_context if context is None else context
+
         def decorator(func: Callable):
             if force_local or self.is_in_databricks_environment():
                 return func
 
-            context = self.context(language=language or Language.PYTHON)
             serialized = CallableSerde.from_callable(func)
 
             @functools.wraps(func)
@@ -1075,7 +1145,7 @@ class Cluster(WorkspaceService):
                     "Waiting %s to install libraries timed out" % self
                 )
 
-            time.sleep(10)
+            time.sleep(5)
             statuses = list(self.installed_library_statuses())
 
         return self
@@ -1111,7 +1181,7 @@ class Cluster(WorkspaceService):
                 )
 
                 with open(value, mode="rb") as f:
-                    target_path.write_bytes(f.read())
+                    target_path.open().write_all_bytes(f.read())
 
                 value = str(target_path)
             elif "." in value and not "/" in value:

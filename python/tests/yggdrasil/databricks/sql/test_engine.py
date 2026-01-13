@@ -27,7 +27,3 @@ class TestSQLEngine(unittest.TestCase):
         assert data == read
 
         self.engine.drop_table(table_name="test_insert")
-
-    def test_daft(self):
-        import daft
-

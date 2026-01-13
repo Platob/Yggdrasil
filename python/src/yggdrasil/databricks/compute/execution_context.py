@@ -78,8 +78,8 @@ class ExecutionContext:
     language: Optional["Language"] = None
     context_id: Optional[str] = None
 
-    _was_connected: Optional[bool] = None
-    _remote_metadata: Optional[RemoteMetadata] = None
+    _was_connected: Optional[bool] = dc.field(default=None, repr=False)
+    _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False)
 
     _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -367,6 +367,8 @@ print(json.dumps(meta))"""
             args=args,
             kwargs=kwargs,
             result_tag=result_tag,
+            env_keys=env_keys,
+            env_variables=env_variables
         ) if not command else command
 
         raw_result = self.execute_command(
@@ -382,8 +384,9 @@ print(json.dumps(meta))"""
             module_name = module_name.group(1) if module_name else None
             module_name = module_name.split(".")[0]
 
-            if module_name:
+            if module_name and "yggdrasil" not in module_name:
                 self.close()
+
                 self.cluster.install_libraries(
                     libraries=[module_name],
                     raise_error=True,
@@ -442,7 +445,7 @@ print(json.dumps(meta))"""
             module_name = module_name.group(1) if module_name else None
             module_name = module_name.split(".")[0]
 
-            if module_name:
+            if module_name and "yggdrasil" not in module_name:
                 self.close()
                 self.cluster.install_libraries(
                     libraries=[module_name],

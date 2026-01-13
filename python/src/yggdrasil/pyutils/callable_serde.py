@@ -7,12 +7,13 @@ import dis
 import importlib
 import inspect
 import json
+import os
 import struct
 import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, Set, Tuple, TypeVar, Union, Iterable
 
 import dill
 
@@ -378,6 +379,8 @@ class CallableSerde:
         prefer: str = "import",          # "import" | "dill"
         dump_env: str = "none",          # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
+        env_keys: Optional[Iterable[str]] = None,
+        env_variables: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Serialize the callable into a dict for transport.
 
@@ -385,6 +388,8 @@ class CallableSerde:
             prefer: Preferred serialization kind.
             dump_env: Environment payload selection.
             filter_used_globals: Filter globals to referenced names.
+            env_keys: environment keys
+            env_variables: environment key values
 
         Returns:
             Serialized payload dict.
@@ -410,6 +415,17 @@ class CallableSerde:
                 payload = dill.dumps(self.fn, recurse=True)
                 self._dill_b64 = base64.b64encode(payload).decode("ascii")
             out["dill_b64"] = self._dill_b64
+
+        env_variables = env_variables or {}
+        if env_keys:
+            for env_key in env_keys:
+                existing = os.getenv(env_key)
+
+                if existing:
+                    env_variables[env_key] = existing
+
+        if env_variables:
+            out["osenv"] = env_variables
 
         if dump_env != "none":
             if self.fn is None:
@@ -523,6 +539,8 @@ class CallableSerde:
         byte_limit: int = 256_000,
         dump_env: str = "none",  # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
+        env_keys: Optional[Iterable[str]] = None,
+        env_variables: Optional[Dict[str, str]] = None,
     ) -> str:
         """
         Returns Python code string to execute in another interpreter.
@@ -536,6 +554,8 @@ class CallableSerde:
             prefer=prefer,
             dump_env=dump_env,
             filter_used_globals=filter_used_globals,
+            env_keys=env_keys,
+            env_variables=env_variables
         )
         serde_json = json.dumps(serde_dict, ensure_ascii=False)
 
@@ -545,7 +565,7 @@ class CallableSerde:
 
         # NOTE: plain string template + replace. No f-string. No brace escaping.
         template = r"""
-import base64, json, sys, struct, zlib, importlib, dis
+import base64, json, sys, struct, zlib, importlib, dis, os
 import dill
 
 RESULT_TAG = __RESULT_TAG__
@@ -625,6 +645,11 @@ else:
         fn = _resolve_attr_chain(mod, serde["qualname"])
     else:
         fn = dill.loads(base64.b64decode(serde["dill_b64"]))
+
+osenv = serde.get("osenv")
+if osenv:
+    for k, v in osenv.items():
+        os.environ[k] = v
 
 env_b64 = serde.get("env_b64")
 if env_b64:
