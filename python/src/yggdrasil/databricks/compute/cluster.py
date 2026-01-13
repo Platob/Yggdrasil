@@ -658,12 +658,14 @@ class Cluster(WorkspaceService):
     def update(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        wait_timeout: Union[float, dt.timedelta] = dt.timedelta(minutes=20),
         **cluster_spec: Any
     ) -> "Cluster":
         """Update cluster configuration and optionally install libraries.
 
         Args:
             libraries: Optional libraries to install.
+            wait_timeout: waiting timeout until done, if None it does not wait
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -703,19 +705,15 @@ class Cluster(WorkspaceService):
             )
 
             self.wait_for_status()
-            try:
-                self.details = self.clusters_client().edit_and_wait(**update_details)
-            except Exception as e:
-                if self.state == State.TERMINATED:
-                    self.start()
-                    self.details = self.clusters_client().edit_and_wait(**update_details)
-                else:
-                    raise e
+            self.clusters_client().edit(**update_details)
 
             logger.info(
                 "Updated %s",
                 self
             )
+
+        if wait_timeout:
+            self.wait_for_status(timeout=wait_timeout)
 
         return self
 
@@ -1026,6 +1024,17 @@ class Cluster(WorkspaceService):
             self._check_library(_, pip_settings=pip_settings)
             for _ in libraries if _
         ]
+
+        if libraries:
+            existing = [
+                _.library for _ in self.installed_library_statuses()
+            ]
+
+            libraries = [
+                _
+                for _ in libraries
+                if _ not in existing
+            ]
 
         if libraries:
             wsdk.libraries.install(
