@@ -390,6 +390,8 @@ class Cluster(WorkspaceService):
 
             sleep_time = min(max_sleep_time, sleep_time * backoff)
 
+        self.wait_installed_libraries()
+
         self.raise_for_status()
 
         return self
@@ -667,6 +669,8 @@ class Cluster(WorkspaceService):
         Returns:
             The updated Cluster instance.
         """
+        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
+
         existing_details = {
             k: v
             for k, v in self.details.as_shallow_dict().items()
@@ -699,15 +703,19 @@ class Cluster(WorkspaceService):
             )
 
             self.wait_for_status()
-            self.details = self.clusters_client().edit(**update_details)
-            self.wait_for_status()
+            try:
+                self.details = self.clusters_client().edit_and_wait(**update_details)
+            except Exception as e:
+                if self.state == State.TERMINATED:
+                    self.start()
+                    self.details = self.clusters_client().edit_and_wait(**update_details)
+                else:
+                    raise e
 
             logger.info(
                 "Updated %s",
                 self
             )
-
-        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
 
         return self
 
@@ -816,7 +824,6 @@ class Cluster(WorkspaceService):
 
         return self
 
-    @retry(tries=4)
     def restart(
         self,
     ):

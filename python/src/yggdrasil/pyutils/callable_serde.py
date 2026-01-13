@@ -546,7 +546,15 @@ class CallableSerde:
         Returns Python code string to execute in another interpreter.
         Prints one line: "{result_tag}:{base64(blob)}"
         where blob is raw dill bytes or framed+zlib.
+
+        Also compresses the input call payload (args/kwargs) using the same framing
+        scheme when it exceeds byte_limit.
         """
+        import base64
+        import json
+        import struct
+        import zlib
+
         args = args or ()
         kwargs = kwargs or {}
 
@@ -555,13 +563,32 @@ class CallableSerde:
             dump_env=dump_env,
             filter_used_globals=filter_used_globals,
             env_keys=env_keys,
-            env_variables=env_variables
+            env_variables=env_variables,
         )
         serde_json = json.dumps(serde_dict, ensure_ascii=False)
 
-        call_payload_b64 = base64.b64encode(
-            dill.dumps((args, kwargs), recurse=True)
-        ).decode("ascii")
+        # --- input payload compression (args/kwargs) ---
+        MAGIC = b"CS1"
+        FLAG_COMPRESSED = 1
+
+        def _pick_level(n: int, limit: int) -> int:
+            ratio = n / max(1, limit)
+            x = min(1.0, max(0.0, (ratio - 1.0) / 3.0))
+            return max(1, min(9, int(round(1 + 8 * x))))
+
+        def _encode_blob(raw: bytes, limit: int) -> bytes:
+            if len(raw) <= limit:
+                return raw
+            level = _pick_level(len(raw), limit)
+            compressed = zlib.compress(raw, level)
+            if len(compressed) >= len(raw):
+                return raw
+            header = MAGIC + struct.pack(">BIB", FLAG_COMPRESSED, len(raw), level)
+            return header + compressed
+
+        call_raw = dill.dumps((args, kwargs), recurse=True)
+        call_blob = _encode_blob(call_raw, int(byte_limit))
+        call_payload_b64 = base64.b64encode(call_blob).decode("ascii")
 
         # NOTE: plain string template + replace. No f-string. No brace escaping.
         template = r"""
@@ -594,6 +621,19 @@ def _encode_result(raw: bytes, byte_limit: int) -> bytes:
         return raw
     header = MAGIC + struct.pack(">BIB", FLAG_COMPRESSED, len(raw), level)
     return header + compressed
+
+def _decode_blob(blob: bytes) -> bytes:
+    # If it's framed (MAGIC + header), decompress; else return as-is.
+    if isinstance(blob, (bytes, bytearray)) and len(blob) >= 3 and blob[:3] == MAGIC:
+        if len(blob) >= 3 + 6:
+            flag, orig_len, level = struct.unpack(">BIB", blob[3:3+6])
+            if flag & FLAG_COMPRESSED:
+                raw = zlib.decompress(blob[3+6:])
+                # best-effort sanity check; don't hard-fail on mismatch
+                if isinstance(orig_len, int) and orig_len > 0 and len(raw) != orig_len:
+                    return raw
+                return raw
+    return blob
 
 def _needed_globals(fn) -> set[str]:
     names = set()
@@ -657,7 +697,9 @@ if env_b64:
     meta = serde.get("env_meta") or {}
     _apply_env(fn, env, bool(meta.get("filter_used_globals", True)))
 
-args, kwargs = dill.loads(base64.b64decode(__CALL_PAYLOAD_B64__))
+call_blob = base64.b64decode(__CALL_PAYLOAD_B64__)
+call_raw = _decode_blob(call_blob)
+args, kwargs = dill.loads(call_raw)
 
 res = fn(*args, **kwargs)
 raw = dill.dumps(res, recurse=True)

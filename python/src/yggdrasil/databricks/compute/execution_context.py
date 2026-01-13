@@ -149,11 +149,19 @@ meta["version_info"] = current_env.version_info
 
 print(json.dumps(meta))"""
 
-                content = self.execute_command(
-                    command=cmd,
-                    result_tag="<<RESULT>>",
-                    print_stdout=False,
-                )
+                try:
+                    content = self.execute_command(
+                        command=cmd,
+                        result_tag="<<RESULT>>",
+                        print_stdout=False,
+                    )
+                except ImportError:
+                    self.cluster.wait_installed_libraries()
+                    content = self.execute_command(
+                        command=cmd,
+                        result_tag="<<RESULT>>",
+                        print_stdout=False,
+                    )
 
                 self._remote_metadata = RemoteMetadata(**json.loads(content))
 
