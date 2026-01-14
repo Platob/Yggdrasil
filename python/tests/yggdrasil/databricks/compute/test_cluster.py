@@ -22,12 +22,8 @@ logger.propagate = False
 class TestCluster(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace(
-            host="dbc-e646c5f9-8a44.cloud.databricks.com",
-        ).connect()
+        self.workspace = Workspace().connect()
         self.cluster = self.workspace.clusters().push_python_environment()
-        # self.cluster.restart()
-        self.venv = self.cluster.pull_python_environment()
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
