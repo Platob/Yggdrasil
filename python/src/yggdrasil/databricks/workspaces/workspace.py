@@ -72,7 +72,7 @@ class Workspace:
     """Configuration wrapper for connecting to a Databricks workspace."""
     # Databricks / generic
     host: Optional[str] = None
-    account_id: Optional[str] = None
+    account_id: Optional[str] = dataclasses.field(default=None, repr=False)
     token: Optional[str] = dataclasses.field(default=None, repr=False)
     client_id: Optional[str] = dataclasses.field(default=None, repr=False)
     client_secret: Optional[str] = dataclasses.field(default=None, repr=False)
@@ -220,7 +220,6 @@ class Workspace:
         instance = self.clone_instance() if clone else self
 
         require_databricks_sdk()
-        logger.debug("Connecting %s", self)
 
         # Build Config from config_dict if available, else from fields.
         kwargs = {
@@ -290,8 +289,6 @@ class Workspace:
                 v = getattr(instance._sdk.config, key, None)
                 if v is not None:
                     setattr(instance, key, v)
-
-        logger.info("Connected %s", instance)
 
         return instance
 
@@ -570,6 +567,7 @@ class Workspace:
                 ("Product", self.product),
                 ("ProductVersion", self.product_version),
                 ("ProductTag", self.product_tag),
+                ("ProductUser", self.current_user.user_name)
             )
             if v
         }
@@ -589,17 +587,17 @@ class Workspace:
     def sql(
         self,
         workspace: Optional["Workspace"] = None,
+        warehouse_id: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        **kwargs
     ):
         """Return a SQLEngine configured for this workspace.
 
         Args:
             workspace: Optional workspace override.
+            warehouse_id: Optional SQL warehouse id.
             catalog_name: Optional catalog name.
             schema_name: Optional schema name.
-            **kwargs: Additional SQLEngine parameters.
 
         Returns:
             A SQLEngine instance.
@@ -608,16 +606,29 @@ class Workspace:
 
         return SQLEngine(
             workspace=self if workspace is None else workspace,
+            warehouse_id=warehouse_id,
             catalog_name=catalog_name,
             schema_name=schema_name,
-            **kwargs
+        )
+
+    def warehouses(
+        self,
+        workspace: Optional["Workspace"] = None,
+        warehouse_id: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+    ):
+        from ..sql.warehouse import SQLWarehouse
+
+        return SQLWarehouse(
+            workspace=self if workspace is None else workspace,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name
         )
 
     def clusters(
         self,
         cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
-        **kwargs
     ) -> "Cluster":
         """Return a Cluster helper bound to this workspace.
 
@@ -635,7 +646,6 @@ class Workspace:
             workspace=self,
             cluster_id=cluster_id,
             cluster_name=cluster_name,
-            **kwargs
         )
 
 # ---------------------------------------------------------------------------

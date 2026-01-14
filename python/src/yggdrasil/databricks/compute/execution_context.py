@@ -12,11 +12,13 @@ import re
 import sys
 import threading
 import zipfile
+from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.exceptions import raise_parsed_traceback
+from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
 from ...pyutils.callable_serde import CallableSerde
 
@@ -30,7 +32,7 @@ __all__ = [
     "ExecutionContext"
 ]
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 @dc.dataclass
@@ -38,7 +40,6 @@ class RemoteMetadata:
     """Metadata describing the remote cluster execution environment."""
     site_packages_path: Optional[str] = dc.field(default=None)
     os_env: Dict[str, str] = dc.field(default_factory=dict)
-    requirements: Optional[str] = dc.field(default=None)
     version_info: Tuple[int, int, int] = dc.field(default=(0, 0, 0))
 
     def os_env_diff(
@@ -80,6 +81,7 @@ class ExecutionContext:
 
     _was_connected: Optional[bool] = dc.field(default=None, repr=False)
     _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False)
+    _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False)
 
     _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -113,7 +115,11 @@ class ExecutionContext:
 
     def __del__(self):
         """Best-effort cleanup for the remote execution context."""
-        self.close()
+        if self.context_id:
+            try:
+                Thread(target=self.close).start()
+            except BaseException:
+                pass
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
@@ -127,9 +133,7 @@ class ExecutionContext:
         with self._lock:
             # double-check after acquiring lock
             if self._remote_metadata is None:
-                cmd = r"""import glob
-import json
-import os
+                cmd = r"""import glob, json, os
 from yggdrasil.pyutils.python_env import PythonEnv
 
 current_env = PythonEnv.get_current()
@@ -144,7 +148,6 @@ os_env = meta["os_env"] = {}
 for k, v in os.environ.items():
     os_env[k] = v
     
-meta["requirements"] = current_env.requirements()
 meta["version_info"] = current_env.version_info
 
 print(json.dumps(meta))"""
@@ -191,7 +194,7 @@ print(json.dumps(meta))"""
         """
         self.cluster.ensure_running()
 
-        logger.debug(
+        LOGGER.debug(
             "Creating Databricks command execution context for %s",
             self.cluster
         )
@@ -217,7 +220,7 @@ print(json.dumps(meta))"""
             The connected ExecutionContext instance.
         """
         if self.context_id is not None:
-            logger.debug(
+            LOGGER.debug(
                 "Execution context already open for %s",
                 self
             )
@@ -235,7 +238,7 @@ print(json.dumps(meta))"""
             raise RuntimeError("Failed to create command execution context")
 
         self.context_id = context_id
-        logger.info(
+        LOGGER.info(
             "Opened execution context for %s",
             self
         )
@@ -247,13 +250,9 @@ print(json.dumps(meta))"""
         Returns:
             None.
         """
-        if self.context_id is None:
+        if not self.context_id:
             return
 
-        logger.debug(
-            "Closing execution context for %s",
-            self
-        )
         try:
             self._workspace_client().command_execution.destroy(
                 cluster_id=self.cluster.cluster_id,
@@ -349,7 +348,7 @@ print(json.dumps(meta))"""
 
         self.connect(language=Language.PYTHON)
 
-        logger.debug(
+        LOGGER.debug(
             "Executing callable %s with %s",
             getattr(func, "__name__", type(func)),
             self,
@@ -386,7 +385,11 @@ print(json.dumps(meta))"""
         )
 
         try:
-            result = serialized.parse_command_result(raw_result, result_tag=result_tag)
+            result = serialized.parse_command_result(
+                raw_result,
+                result_tag=result_tag,
+                workspace=self.cluster.workspace
+            )
         except ModuleNotFoundError as remote_module_error:
             _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
             module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
@@ -394,12 +397,18 @@ print(json.dumps(meta))"""
             module_name = module_name.split(".")[0]
 
             if module_name and "yggdrasil" not in module_name:
-                self.close()
+                LOGGER.debug(
+                    "Installing missing module %s from local environment",
+                    module_name,
+                )
 
-                self.cluster.install_libraries(
+                self.install_temporary_libraries(
                     libraries=[module_name],
-                    raise_error=True,
-                    restart=True
+                )
+
+                LOGGER.warning(
+                    "Installed missing module %s from local environment",
+                    module_name,
                 )
 
                 return self.execute_callable(
@@ -412,6 +421,7 @@ print(json.dumps(meta))"""
                     timeout=timeout,
                     command=command,
                 )
+
             raise remote_module_error
 
         return result
@@ -455,11 +465,18 @@ print(json.dumps(meta))"""
             module_name = module_name.split(".")[0]
 
             if module_name and "yggdrasil" not in module_name:
-                self.close()
-                self.cluster.install_libraries(
+                LOGGER.debug(
+                    "Installing missing module %s from local environment",
+                    module_name,
+                )
+
+                self.install_temporary_libraries(
                     libraries=[module_name],
-                    raise_error=True,
-                    restart=True
+                )
+
+                LOGGER.warning(
+                    "Installed missing module %s from local environment",
+                    module_name,
                 )
 
                 return self.execute_command(
@@ -468,6 +485,7 @@ print(json.dumps(meta))"""
                     result_tag=result_tag,
                     print_stdout=print_stdout
                 )
+
             raise remote_module_error
 
     # ------------------------------------------------------------------
@@ -589,16 +607,22 @@ with zipfile.ZipFile(buf, "r") as zf:
             ]
 
         resolved = resolve_local_lib_path(libraries)
+        str_resolved = str(resolved)
+        existing = self._uploaded_package_roots.get(str_resolved)
 
-        remote_site_packages_path = self.remote_metadata.site_packages_path
-        if resolved.is_dir():
-            # site-packages/<package_name>/
-            remote_target = posixpath.join(remote_site_packages_path, resolved.name)
-        else:
-            # site-packages/<module_file>
-            remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+        if not existing:
+            remote_site_packages_path = self.remote_metadata.site_packages_path
 
-        self.upload_local_path(resolved, remote_target)
+            if resolved.is_dir():
+                # site-packages/<package_name>/
+                remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+            else:
+                # site-packages/<module_file>
+                remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+
+            self.upload_local_path(resolved, remote_target)
+
+            self._uploaded_package_roots[str_resolved] = remote_target
 
         return libraries
 
@@ -648,17 +672,5 @@ with zipfile.ZipFile(buf, "r") as zf:
             output = str(res.data)
         else:
             output = ""
-
-        # result_tag slicing
-        if result_tag:
-            start = output.find(result_tag)
-            if start != -1:
-                content_start = start + len(result_tag)
-                end = output.find(result_tag, content_start)
-                if end != -1:
-                    before = output[:start].strip()
-                    if before and print_stdout:
-                        print(before)
-                    return output[content_start:end]
 
         return output

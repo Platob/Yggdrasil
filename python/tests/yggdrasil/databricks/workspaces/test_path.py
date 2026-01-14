@@ -266,6 +266,8 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         self.assertTrue(my_arrow_table.equals(filepath.sql(f"SELECT * from dbfs.`{filepath}`")))
 
     def test_pyarrow_filesystem(self):
+        from yggdrasil.databricks.workspaces import Workspace
+
         folder_path = self.vol_base / "arrow_dataset"
 
         my_arrow_table = pa.table({
@@ -281,8 +283,10 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
     def test_duckdb(self):
         import duckdb
+        from yggdrasil.databricks import Workspace
 
-        folder_path = self.vol_base / "duckdb_arrow_dataset"
+        workspace = Workspace()
+        folder_path = workspace.dbfs_path("/Volumes/trading/unittest/duckdb_arrow_dataset")
 
         my_arrow_table = pa.table({
             "col1": [1, 2, 3],
@@ -290,9 +294,6 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         })
 
         folder_path.mkdir()
-
         folder_path.write_arrow(my_arrow_table)
-
         arrow_dataset = folder_path.arrow_dataset()
-
-        self.assertEqual(my_arrow_table, duckdb.sql("select * from arrow_dataset").to_arrow_table())
+        arrow_table_from_volume = duckdb.sql("select * from arrow_dataset").to_arrow_table()

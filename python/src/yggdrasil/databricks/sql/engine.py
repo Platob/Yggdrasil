@@ -130,7 +130,10 @@ class SQLEngine(WorkspaceService):
         schema_name = schema_name or self.schema_name
         return catalog_name, schema_name, table_name
 
-    def _default_warehouse(self, cluster_size: str = "Small"):
+    def _default_warehouse(
+        self,
+        cluster_size: str = "Small"
+    ):
         """Pick a default SQL warehouse (best-effort) matching the desired size.
 
         Args:
@@ -951,7 +954,7 @@ FROM parquet.`{temp_volume_path}`"""
         """Convert an Arrow Field to a Databricks SQL column DDL fragment."""
         name = field.name
         nullable_str = " NOT NULL" if put_not_null and not field.nullable else ""
-        name_str = f"{name} " if put_name else ""
+        name_str = f"`{name}` " if put_name else ""
 
         comment_str = ""
         if put_comment and field.metadata and b"comment" in field.metadata:

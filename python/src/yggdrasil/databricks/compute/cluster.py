@@ -22,7 +22,7 @@ from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVa
 
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
-from ... import retry, CallableSerde
+from ... import CallableSerde
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.equality import dicts_equal, dict_diff
 from ...pyutils.expiring_dict import ExpiringDict
@@ -47,6 +47,7 @@ else:  # pragma: no cover - runtime fallback when SDK is missing
 __all__ = ["Cluster"]
 
 
+LOGGER = logging.getLogger(__name__)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
 
 
@@ -70,9 +71,6 @@ def get_cached_cluster_id(
     existing = NAME_ID_CACHE.get(host)
 
     return existing.get(cluster_name) if existing else None
-
-
-logger = logging.getLogger(__name__)
 
 
 # module-level mapping Databricks Runtime -> (major, minor) Python version
@@ -363,7 +361,8 @@ class Cluster(WorkspaceService):
         tick: float = 0.5,
         timeout: Union[float, dt.timedelta] = 600,
         backoff: int = 2,
-        max_sleep_time: float = 15
+        max_sleep_time: float = 15,
+        wait_libraries: bool = True
     ):
         """Wait for the cluster to exit pending states.
 
@@ -372,6 +371,7 @@ class Cluster(WorkspaceService):
             timeout: Max seconds to wait before timing out.
             backoff: Backoff multiplier for the sleep interval.
             max_sleep_time: Maximum sleep interval in seconds.
+            wait_libraries: Wait libraries to install fully
 
         Returns:
             The current Cluster instance.
@@ -390,7 +390,8 @@ class Cluster(WorkspaceService):
 
             sleep_time = min(max_sleep_time, sleep_time * backoff)
 
-        self.wait_installed_libraries()
+        if wait_libraries:
+            self.wait_installed_libraries()
 
         self.raise_for_status()
 
@@ -638,7 +639,7 @@ class Cluster(WorkspaceService):
             if k in _CREATE_ARG_NAMES
         }
 
-        logger.debug(
+        LOGGER.debug(
             "Creating Databricks cluster %s with %s",
             update_details["cluster_name"],
             update_details,
@@ -646,7 +647,7 @@ class Cluster(WorkspaceService):
 
         self.details = self.clusters_client().create_and_wait(**update_details)
 
-        logger.info(
+        LOGGER.info(
             "Created %s",
             self
         )
@@ -699,7 +700,7 @@ class Cluster(WorkspaceService):
                 for k, v in dict_diff(existing_details, update_details, keys=_EDIT_ARG_NAMES).items()
             }
 
-            logger.debug(
+            LOGGER.debug(
                 "Updating %s with %s",
                 self, diff
             )
@@ -707,7 +708,7 @@ class Cluster(WorkspaceService):
             self.wait_for_status()
             self.clusters_client().edit(**update_details)
 
-            logger.info(
+            LOGGER.info(
                 "Updated %s",
                 self
             )
@@ -811,13 +812,15 @@ class Cluster(WorkspaceService):
         self.wait_for_status()
 
         if not self.is_running:
-            logger.info("Starting %s", self)
+            LOGGER.debug("Starting %s", self)
 
             if wait_timeout:
                 self.clusters_client().start(cluster_id=self.cluster_id)
                 self.wait_for_status(timeout=wait_timeout.total_seconds())
             else:
                 self.clusters_client().start(cluster_id=self.cluster_id)
+
+            LOGGER.info("Started %s", self)
 
         return self
 
@@ -832,7 +835,6 @@ class Cluster(WorkspaceService):
         self.wait_for_status()
 
         if self.is_running:
-            logger.info("Restarting %s", self)
             self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
             return self.wait_for_status()
 
@@ -846,8 +848,10 @@ class Cluster(WorkspaceService):
         Returns:
             The SDK delete response.
         """
-        logger.info("Deleting %s", self)
-        return self.clusters_client().delete(cluster_id=self.cluster_id)
+        if self.cluster_id:
+            LOGGER.debug("Deleting %s", self)
+            self.clusters_client().delete(cluster_id=self.cluster_id)
+            LOGGER.info("Deleted %s", self)
 
     def context(
         self,
@@ -1150,7 +1154,7 @@ class Cluster(WorkspaceService):
                 if raise_error:
                     raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
 
-                logger.warning(
+                LOGGER.exception(
                     "Libraries %s in %s failed to install",
                     failed, self
                 )
@@ -1187,7 +1191,7 @@ class Cluster(WorkspaceService):
         Returns:
             The uploaded library argument(s).
         """
-        return self.context().install_temporary_libraries(libraries=libraries)
+        return self.system_context.install_temporary_libraries(libraries=libraries)
 
     def _check_library(
         self,

@@ -1,43 +1,168 @@
-"""Callable serialization helpers for cross-process execution."""
+"""Callable serialization helpers for cross-process execution.
+
+Design goals:
+- Prefer import-by-reference when possible (module + qualname), fallback to dill.
+- Optional environment payload: selected globals and/or closure values.
+- Cross-process bridge: generate a self-contained Python command string that:
+    1) materializes the callable
+    2) decodes args/kwargs payload
+    3) executes
+    4) emits a single tagged base64 line with a compressed result blob
+
+Compression/framing:
+- CS2 framing only (no CS1 logic).
+- Frame header: MAGIC(3) + codec(u8) + orig_len(u32) + param(u8) + data
+- Codecs:
+    0 raw (rarely used; mostly means "no frame")
+    1 zlib
+    2 lzma
+    3 zstd (optional dependency)
+"""
 
 from __future__ import annotations
 
 import base64
+import binascii
 import dis
 import importlib
 import inspect
-import json
+import io
+import lzma
 import os
+import secrets
 import struct
 import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set, Tuple, TypeVar, Union, Iterable
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple, TypeVar, Union, TYPE_CHECKING
 
 import dill
+
+if TYPE_CHECKING:
+    from ..databricks.workspaces import Workspace
 
 __all__ = ["CallableSerde"]
 
 T = TypeVar("T", bound="CallableSerde")
 
+# ---------------------------
+# Framing / compression (CS2)
+# ---------------------------
 
-# ---------- internal helpers ----------
+_MAGIC = b"CS2"
 
-_MAGIC = b"CS1"  # CallableSerde framing v1
-_FLAG_COMPRESSED = 1
+_CODEC_RAW = 0
+_CODEC_ZLIB = 1
+_CODEC_LZMA = 2
+_CODEC_ZSTD = 3
 
+
+def _try_import_zstd():
+    try:
+        import zstandard as zstd  # type: ignore
+        return zstd
+    except Exception:
+        return None
+
+
+def _pick_zlib_level(n: int, limit: int) -> int:
+    """Ramp compression level 1..9 based on how far we exceed the byte_limit."""
+    ratio = n / max(1, limit)
+    x = min(1.0, max(0.0, (ratio - 1.0) / 3.0))
+    return max(1, min(9, int(round(1 + 8 * x))))
+
+
+def _frame(codec: int, orig_len: int, param: int, payload: bytes) -> bytes:
+    return _MAGIC + struct.pack(">BIB", int(codec) & 0xFF, int(orig_len), int(param) & 0xFF) + payload
+
+
+def _encode_with_candidates(raw: bytes, *, byte_limit: int, allow_zstd: bool) -> bytes:
+    """Choose the smallest among available codecs; fall back to raw if not beneficial."""
+    if len(raw) <= byte_limit:
+        return raw
+
+    candidates: list[bytes] = []
+
+    if allow_zstd:
+        zstd = _try_import_zstd()
+        if zstd is not None:
+            for lvl in (6, 10, 15):
+                try:
+                    c = zstd.ZstdCompressor(level=lvl).compress(raw)
+                    candidates.append(_frame(_CODEC_ZSTD, len(raw), lvl, c))
+                except Exception:
+                    pass
+
+    for preset in (6, 9):
+        try:
+            c = lzma.compress(raw, preset=preset)
+            candidates.append(_frame(_CODEC_LZMA, len(raw), preset, c))
+        except Exception:
+            pass
+
+    lvl = _pick_zlib_level(len(raw), byte_limit)
+    try:
+        c = zlib.compress(raw, lvl)
+        candidates.append(_frame(_CODEC_ZLIB, len(raw), lvl, c))
+    except Exception:
+        pass
+
+    if not candidates:
+        return raw
+
+    best = min(candidates, key=len)
+    return best if len(best) < len(raw) else raw
+
+
+def _encode_result_blob(raw: bytes, byte_limit: int) -> bytes:
+    """Result payload: zstd (if available) -> lzma -> zlib."""
+    return _encode_with_candidates(raw, byte_limit=byte_limit, allow_zstd=True)
+
+
+def _encode_wire_blob_stdlib(raw: bytes, byte_limit: int) -> bytes:
+    """Wire payload (args/kwargs): stdlib-only (lzma -> zlib)."""
+    return _encode_with_candidates(raw, byte_limit=byte_limit, allow_zstd=False)
+
+
+def _decode_result_blob(blob: bytes) -> bytes:
+    """Decode raw or CS2 framed data (no CS1 support)."""
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 3:
+        return blob  # type: ignore[return-value]
+
+    if not blob.startswith(_MAGIC):
+        return blob
+
+    if len(blob) < 3 + 6:
+        raise ValueError("CS2 framed blob too short / truncated.")
+
+    codec, orig_len, _param = struct.unpack(">BIB", blob[3 : 3 + 6])
+    data = blob[3 + 6 :]
+
+    if codec == _CODEC_RAW:
+        raw = data
+    elif codec == _CODEC_ZLIB:
+        raw = zlib.decompress(data)
+    elif codec == _CODEC_LZMA:
+        raw = lzma.decompress(data)
+    elif codec == _CODEC_ZSTD:
+        zstd = _try_import_zstd()
+        if zstd is None:
+            raise RuntimeError("CS2 uses zstd but 'zstandard' is not installed.")
+        raw = zstd.ZstdDecompressor().decompress(data, max_output_size=int(orig_len) if orig_len else 0)
+    else:
+        raise ValueError(f"Unknown CS2 codec: {codec}")
+
+    if orig_len and len(raw) != orig_len:
+        raise ValueError(f"Decoded length mismatch: got {len(raw)}, expected {orig_len}")
+    return raw
+
+
+# ---------------------------
+# Callable reference helpers
+# ---------------------------
 
 def _resolve_attr_chain(mod: Any, qualname: str) -> Any:
-    """Resolve a dotted attribute path from a module.
-
-    Args:
-        mod: Module to traverse.
-        qualname: Dotted qualified name.
-
-    Returns:
-        Resolved attribute.
-    """
     obj = mod
     for part in qualname.split("."):
         obj = getattr(obj, part)
@@ -45,10 +170,6 @@ def _resolve_attr_chain(mod: Any, qualname: str) -> Any:
 
 
 def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
-    """
-    Walk up parents while __init__.py exists.
-    Return the directory that should be on sys.path (parent of top package dir).
-    """
     file_path = file_path.resolve()
     d = file_path.parent
 
@@ -61,14 +182,6 @@ def _find_pkg_root_from_file(file_path: Path) -> Optional[Path]:
 
 
 def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional[int]]:
-    """Return the source file path and line number for a callable.
-
-    Args:
-        fn: Callable to inspect.
-
-    Returns:
-        Tuple of (file path, line number).
-    """
     file = None
     line = None
     try:
@@ -84,17 +197,12 @@ def _callable_file_line(fn: Callable[..., Any]) -> Tuple[Optional[str], Optional
 
 
 def _referenced_global_names(fn: Callable[..., Any]) -> Set[str]:
-    """
-    Names that the function *actually* resolves from globals/namespaces at runtime.
-    Uses bytecode to avoid shipping random junk.
-    """
     names: Set[str] = set()
     try:
         for ins in dis.get_instructions(fn):
             if ins.opname in ("LOAD_GLOBAL", "LOAD_NAME") and isinstance(ins.argval, str):
                 names.add(ins.argval)
     except Exception:
-        # fallback: less precise
         try:
             names.update(getattr(fn.__code__, "co_names", ()) or ())
         except Exception:
@@ -105,14 +213,6 @@ def _referenced_global_names(fn: Callable[..., Any]) -> Set[str]:
 
 
 def _is_importable_reference(fn: Callable[..., Any]) -> bool:
-    """Return True when a callable can be imported by module and qualname.
-
-    Args:
-        fn: Callable to inspect.
-
-    Returns:
-        True if importable by module/qualname.
-    """
     mod_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
     if not mod_name or not qualname:
@@ -127,61 +227,9 @@ def _is_importable_reference(fn: Callable[..., Any]) -> bool:
         return False
 
 
-def _pick_zlib_level(n: int, limit: int) -> int:
-    """
-    Ramp compression level 1..9 based on how much payload exceeds byte_limit.
-    ratio=1 -> level=1
-    ratio=4 -> level=9
-    clamp beyond.
-    """
-    ratio = n / max(1, limit)
-    x = min(1.0, max(0.0, (ratio - 1.0) / 3.0))
-    return max(1, min(9, int(round(1 + 8 * x))))
-
-
-def _encode_result_blob(raw: bytes, byte_limit: int) -> bytes:
-    """
-    For small payloads: return raw dill bytes (backwards compat).
-    For large payloads: wrap in framed header + zlib-compressed bytes (if beneficial).
-    """
-    if len(raw) <= byte_limit:
-        return raw
-
-    level = _pick_zlib_level(len(raw), byte_limit)
-    compressed = zlib.compress(raw, level)
-
-    # If compression doesn't help, keep raw
-    if len(compressed) >= len(raw):
-        return raw
-
-    # Frame:
-    # MAGIC(3) + flags(u8) + orig_len(u32) + level(u8) + data
-    header = _MAGIC + struct.pack(">BIB", _FLAG_COMPRESSED, len(raw), level)
-    return header + compressed
-
-
-def _decode_result_blob(blob: bytes) -> bytes:
-    """
-    If framed, decompress if flagged, return raw dill bytes.
-    Else treat as raw dill bytes.
-    """
-    if not blob.startswith(_MAGIC):
-        return blob
-
-    if len(blob) < 3 + 1 + 4 + 1:
-        raise ValueError("Framed result too short / corrupted.")
-
-    flags, orig_len, _level = struct.unpack(">BIB", blob[3 : 3 + 1 + 4 + 1])
-    data = blob[3 + 1 + 4 + 1 :]
-
-    if flags & _FLAG_COMPRESSED:
-        raw = zlib.decompress(data)
-        if orig_len and len(raw) != orig_len:
-            raise ValueError(f"Decompressed length mismatch: got {len(raw)}, expected {orig_len}")
-        return raw
-
-    return data
-
+# ---------------------------
+# Environment snapshot
+# ---------------------------
 
 def _dump_env(
     fn: Callable[..., Any],
@@ -190,12 +238,6 @@ def _dump_env(
     include_closure: bool,
     filter_used_globals: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Returns (env, meta).
-    env is dill-able and contains:
-      - "globals": {name: value}  (filtered to used names if enabled)
-      - "closure": {freevar: value} (capture only; injection not generally safe)
-    """
     env: Dict[str, Any] = {}
     meta: Dict[str, Any] = {
         "missing_globals": [],
@@ -242,13 +284,14 @@ def _dump_env(
     return env, meta
 
 
-# ---------- main class ----------
+# ----------
+# Main class
+# ----------
 
 @dataclass
 class CallableSerde:
     """
     Core field: `fn`
-    Serialized/backing fields used when fn isn't present yet.
 
     kind:
       - "auto": resolve import if possible else dill
@@ -258,6 +301,7 @@ class CallableSerde:
     Optional env payload:
       - env_b64: dill(base64) of {"globals": {...}, "closure": {...}}
     """
+
     fn: Optional[Callable[..., Any]] = None
 
     _kind: str = "auto"  # "auto" | "import" | "dill"
@@ -273,48 +317,22 @@ class CallableSerde:
 
     @classmethod
     def from_callable(cls: type[T], x: Union[Callable[..., Any], T]) -> T:
-        """Create a CallableSerde from a callable or existing instance.
-
-        Args:
-            x: Callable or CallableSerde instance.
-
-        Returns:
-            CallableSerde instance.
-        """
         if isinstance(x, cls):
             return x
+        return cls(fn=x)  # type: ignore[return-value]
 
-        obj = cls(fn=x)  # type: ignore[return-value]
-
-        return obj
-
-    # ----- lazy-ish properties (computed on access) -----
+    # ----- properties -----
 
     @property
     def module(self) -> Optional[str]:
-        """Return the callable's module name if available.
-
-        Returns:
-            Module name or None.
-        """
         return self._module or (getattr(self.fn, "__module__", None) if self.fn else None)
 
     @property
     def qualname(self) -> Optional[str]:
-        """Return the callable's qualified name if available.
-
-        Returns:
-            Qualified name or None.
-        """
         return self._qualname or (getattr(self.fn, "__qualname__", None) if self.fn else None)
 
     @property
     def file(self) -> Optional[str]:
-        """Return the filesystem path of the callable's source file.
-
-        Returns:
-            File path or None.
-        """
         if not self.fn:
             return None
         f, _ = _callable_file_line(self.fn)
@@ -322,11 +340,6 @@ class CallableSerde:
 
     @property
     def line(self) -> Optional[int]:
-        """Return the line number where the callable is defined.
-
-        Returns:
-            Line number or None.
-        """
         if not self.fn:
             return None
         _, ln = _callable_file_line(self.fn)
@@ -334,11 +347,6 @@ class CallableSerde:
 
     @property
     def pkg_root(self) -> Optional[str]:
-        """Return the inferred package root for the callable, if known.
-
-        Returns:
-            Package root path or None.
-        """
         if self._pkg_root:
             return self._pkg_root
         if not self.file:
@@ -348,11 +356,6 @@ class CallableSerde:
 
     @property
     def relpath_from_pkg_root(self) -> Optional[str]:
-        """Return the callable's path relative to the package root.
-
-        Returns:
-            Relative path or None.
-        """
         if not self.file or not self.pkg_root:
             return None
         try:
@@ -362,11 +365,6 @@ class CallableSerde:
 
     @property
     def importable(self) -> bool:
-        """Return True when the callable can be imported by reference.
-
-        Returns:
-            True if importable by module/qualname.
-        """
         if self.fn is None:
             return bool(self.module and self.qualname and "<locals>" not in (self.qualname or ""))
         return _is_importable_reference(self.fn)
@@ -376,24 +374,12 @@ class CallableSerde:
     def dump(
         self,
         *,
-        prefer: str = "import",          # "import" | "dill"
-        dump_env: str = "none",          # "none" | "globals" | "closure" | "both"
+        prefer: str = "import",           # "import" | "dill"
+        dump_env: str = "none",           # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
         env_keys: Optional[Iterable[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Serialize the callable into a dict for transport.
-
-        Args:
-            prefer: Preferred serialization kind.
-            dump_env: Environment payload selection.
-            filter_used_globals: Filter globals to referenced names.
-            env_keys: environment keys
-            env_variables: environment key values
-
-        Returns:
-            Serialized payload dict.
-        """
         kind = prefer
         if kind == "import" and not self.importable:
             kind = "dill"
@@ -420,7 +406,6 @@ class CallableSerde:
         if env_keys:
             for env_key in env_keys:
                 existing = os.getenv(env_key)
-
                 if existing:
                     env_variables[env_key] = existing
 
@@ -432,6 +417,7 @@ class CallableSerde:
                 raise ValueError("dump_env requested but fn is not present.")
             include_globals = dump_env in ("globals", "both")
             include_closure = dump_env in ("closure", "both")
+
             env, meta = _dump_env(
                 self.fn,
                 include_globals=include_globals,
@@ -448,15 +434,6 @@ class CallableSerde:
 
     @classmethod
     def load(cls: type[T], d: Dict[str, Any], *, add_pkg_root_to_syspath: bool = True) -> T:
-        """Construct a CallableSerde from a serialized dict payload.
-
-        Args:
-            d: Serialized payload dict.
-            add_pkg_root_to_syspath: Add package root to sys.path if True.
-
-        Returns:
-            CallableSerde instance.
-        """
         obj = cls(
             fn=None,
             _kind=d.get("kind", "auto"),
@@ -474,14 +451,6 @@ class CallableSerde:
         return obj  # type: ignore[return-value]
 
     def materialize(self, *, add_pkg_root_to_syspath: bool = True) -> Callable[..., Any]:
-        """Resolve and return the underlying callable.
-
-        Args:
-            add_pkg_root_to_syspath: Add package root to sys.path if True.
-
-        Returns:
-            Resolved callable.
-        """
         if self.fn is not None:
             return self.fn
 
@@ -515,19 +484,12 @@ class CallableSerde:
         raise ValueError(f"Unknown kind: {kind}")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke the materialized callable with the provided arguments.
-
-        Args:
-            *args: Positional args for the callable.
-            **kwargs: Keyword args for the callable.
-
-        Returns:
-            Callable return value.
-        """
         fn = self.materialize()
         return fn(*args, **kwargs)
 
-    # ----- command execution bridge -----
+    # -------------------------
+    # Command execution bridge
+    # -------------------------
 
     def to_command(
         self,
@@ -536,24 +498,21 @@ class CallableSerde:
         *,
         result_tag: str = "__CALLABLE_SERDE_RESULT__",
         prefer: str = "dill",
-        byte_limit: int = 256_000,
-        dump_env: str = "none",  # "none" | "globals" | "closure" | "both"
+        byte_limit: int = 64 * 1024,
+        dump_env: str = "none",           # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
         env_keys: Optional[Iterable[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
+        file_dump_limit: int = 512 * 1024,
+        transaction_id: Optional[str] = None
     ) -> str:
         """
         Returns Python code string to execute in another interpreter.
-        Prints one line: "{result_tag}:{base64(blob)}"
-        where blob is raw dill bytes or framed+zlib.
-
-        Also compresses the input call payload (args/kwargs) using the same framing
-        scheme when it exceeds byte_limit.
+        Emits exactly one line to stdout:
+            "{result_tag}:{base64(blob)}\\n"
+        where blob is raw dill bytes or CS2 framed.
         """
-        import base64
         import json
-        import struct
-        import zlib
 
         args = args or ()
         kwargs = kwargs or {}
@@ -567,75 +526,31 @@ class CallableSerde:
         )
         serde_json = json.dumps(serde_dict, ensure_ascii=False)
 
-        # --- input payload compression (args/kwargs) ---
-        MAGIC = b"CS1"
-        FLAG_COMPRESSED = 1
-
-        def _pick_level(n: int, limit: int) -> int:
-            ratio = n / max(1, limit)
-            x = min(1.0, max(0.0, (ratio - 1.0) / 3.0))
-            return max(1, min(9, int(round(1 + 8 * x))))
-
-        def _encode_blob(raw: bytes, limit: int) -> bytes:
-            if len(raw) <= limit:
-                return raw
-            level = _pick_level(len(raw), limit)
-            compressed = zlib.compress(raw, level)
-            if len(compressed) >= len(raw):
-                return raw
-            header = MAGIC + struct.pack(">BIB", FLAG_COMPRESSED, len(raw), level)
-            return header + compressed
-
+        # args/kwargs payload: stdlib-only compression (lzma/zlib)
         call_raw = dill.dumps((args, kwargs), recurse=True)
-        call_blob = _encode_blob(call_raw, int(byte_limit))
+        call_blob = _encode_wire_blob_stdlib(call_raw, int(byte_limit))
         call_payload_b64 = base64.b64encode(call_blob).decode("ascii")
+        transaction_id = transaction_id or secrets.token_urlsafe(16)
 
-        # NOTE: plain string template + replace. No f-string. No brace escaping.
         template = r"""
-import base64, json, sys, struct, zlib, importlib, dis, os
+import base64, json, os, sys
 import dill
+import pandas
+
+from yggdrasil.databricks import Workspace
+from yggdrasil.pyutils.callable_serde import (
+    CallableSerde,
+    _decode_result_blob,
+    _encode_result_blob,
+)
 
 RESULT_TAG = __RESULT_TAG__
 BYTE_LIMIT = __BYTE_LIMIT__
-
-MAGIC = b"CS1"
-FLAG_COMPRESSED = 1
-
-def _resolve_attr_chain(mod, qualname: str):
-    obj = mod
-    for part in qualname.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-def _pick_level(n: int, limit: int) -> int:
-    ratio = n / max(1, limit)
-    x = min(1.0, max(0.0, (ratio - 1.0) / 3.0))
-    return max(1, min(9, int(round(1 + 8 * x))))
-
-def _encode_result(raw: bytes, byte_limit: int) -> bytes:
-    if len(raw) <= byte_limit:
-        return raw
-    level = _pick_level(len(raw), byte_limit)
-    compressed = zlib.compress(raw, level)
-    if len(compressed) >= len(raw):
-        return raw
-    header = MAGIC + struct.pack(">BIB", FLAG_COMPRESSED, len(raw), level)
-    return header + compressed
-
-def _decode_blob(blob: bytes) -> bytes:
-    # If it's framed (MAGIC + header), decompress; else return as-is.
-    if isinstance(blob, (bytes, bytearray)) and len(blob) >= 3 and blob[:3] == MAGIC:
-        if len(blob) >= 3 + 6:
-            flag, orig_len, level = struct.unpack(">BIB", blob[3:3+6])
-            if flag & FLAG_COMPRESSED:
-                raw = zlib.decompress(blob[3+6:])
-                # best-effort sanity check; don't hard-fail on mismatch
-                if isinstance(orig_len, int) and orig_len > 0 and len(raw) != orig_len:
-                    return raw
-                return raw
-    return blob
+FILE_DUMP_LIMIT = __FILE_DUMP_LIMIT__
+TRANSACTION_ID = __TRANSACTION_ID__
 
 def _needed_globals(fn) -> set[str]:
+    import dis
     names = set()
     try:
         for ins in dis.get_instructions(fn):
@@ -657,34 +572,22 @@ def _apply_env(fn, env: dict, filter_used: bool):
         return
 
     env_g = env.get("globals") or {}
-    if env_g:
-        if filter_used:
-            needed = _needed_globals(fn)
-            for name in needed:
-                if name in env_g:
-                    g.setdefault(name, env_g[name])
-        else:
-            for name, val in env_g.items():
-                g.setdefault(name, val)
+    if not env_g:
+        return
+
+    if filter_used:
+        needed = _needed_globals(fn)
+        for name in needed:
+            if name in env_g:
+                g.setdefault(name, env_g[name])
+    else:
+        for name, val in env_g.items():
+            g.setdefault(name, val)
 
 serde = json.loads(__SERDE_JSON__)
 
-pkg_root = serde.get("pkg_root")
-if pkg_root and pkg_root not in sys.path:
-    sys.path.insert(0, pkg_root)
-
-kind = serde.get("kind")
-if kind == "import":
-    mod = importlib.import_module(serde["module"])
-    fn = _resolve_attr_chain(mod, serde["qualname"])
-elif kind == "dill":
-    fn = dill.loads(base64.b64decode(serde["dill_b64"]))
-else:
-    if serde.get("module") and serde.get("qualname") and "<locals>" not in serde.get("qualname", ""):
-        mod = importlib.import_module(serde["module"])
-        fn = _resolve_attr_chain(mod, serde["qualname"])
-    else:
-        fn = dill.loads(base64.b64decode(serde["dill_b64"]))
+cs = CallableSerde.load(serde, add_pkg_root_to_syspath=True)
+fn = cs.materialize(add_pkg_root_to_syspath=True)
 
 osenv = serde.get("osenv")
 if osenv:
@@ -698,42 +601,127 @@ if env_b64:
     _apply_env(fn, env, bool(meta.get("filter_used_globals", True)))
 
 call_blob = base64.b64decode(__CALL_PAYLOAD_B64__)
-call_raw = _decode_blob(call_blob)
+call_raw = _decode_result_blob(call_blob)
 args, kwargs = dill.loads(call_raw)
 
 res = fn(*args, **kwargs)
-raw = dill.dumps(res, recurse=True)
-blob = _encode_result(raw, BYTE_LIMIT)
 
-# No f-string. No braces. No drama.
-sys.stdout.write(str(RESULT_TAG) + ":" + base64.b64encode(blob).decode("ascii") + "\n")
-""".strip()
+if isinstance(res, pandas.DataFrame):
+    dump_path = Workspace().shared_cache_path("/cmd/" + TRANSACTION_ID + ".parquet")
+    
+    with dump_path.open(mode="wb") as f:
+        res.to_parquet(f)
+        
+    blob = "DBXPATH:" + str(dump_path)
+else:
+    raw = dill.dumps(res)
+    blob = _encode_result_blob(raw, BYTE_LIMIT)
+    
+    if len(blob) > FILE_DUMP_LIMIT:
+        dump_path = Workspace().shared_cache_path("/cmd/" + TRANSACTION_ID)
+        
+        with dump_path.open(mode="wb") as f:
+            f.write_all_bytes(data=blob)
+            
+        blob = "DBXPATH:" + str(dump_path)
+    else:
+        blob = base64.b64encode(blob).decode('ascii')
 
-        code = (
+sys.stdout.write(f"{RESULT_TAG}:{len(blob)}:{blob}\n")
+sys.stdout.flush()
+"""
+
+        return (
             template
             .replace("__RESULT_TAG__", repr(result_tag))
             .replace("__BYTE_LIMIT__", str(int(byte_limit)))
             .replace("__SERDE_JSON__", repr(serde_json))
             .replace("__CALL_PAYLOAD_B64__", repr(call_payload_b64))
+            .replace("__FILE_DUMP_LIMIT__", str(int(file_dump_limit)))
+            .replace("__TRANSACTION_ID__", repr(str(transaction_id)))
         )
 
-        return code
-
     @staticmethod
-    def parse_command_result(output: str, *, result_tag: str = "__CALLABLE_SERDE_RESULT__") -> Any:
+    def parse_command_result(
+        output: str,
+        *,
+        result_tag: str = "__CALLABLE_SERDE_RESULT__",
+        workspace: Optional["Workspace"] = None
+    ) -> Any:
         """
-        Parse stdout/stderr combined text, find last "{result_tag}:{b64}" line.
-        Supports raw dill or framed+zlib compressed payloads.
+        Expect last tagged line:
+            "{result_tag}:{blob_nbytes}:{b64}"
+
+        We use blob_nbytes to compute expected base64 char length and detect truncation
+        before decoding/decompressing.
         """
         prefix = f"{result_tag}:"
-        b64 = None
-        for line in reversed(output.splitlines()):
-            if line.startswith(prefix):
-                b64 = line[len(prefix):].strip()
-                break
-        if not b64:
-            raise ValueError(f"Result tag not found in output: {result_tag!r}")
+        if prefix not in output:
+            raise ValueError(f"Result tag not found in output: {result_tag}")
 
-        blob = base64.b64decode(b64.encode("ascii"))
+        # Grab everything after the LAST occurrence of the tag
+        _, tail = output.rsplit(prefix, 1)
+
+        # Parse "{nbytes}:{b64}"
+        try:
+            nbytes_str, string_result = tail.split(":", 1)
+        except ValueError as e:
+            raise ValueError(
+                f"Malformed result line after tag {result_tag}. "
+                "Expected '{tag}:{nbytes}:{b64}'."
+            ) from e
+
+        try:
+            content_length = int(nbytes_str)
+        except ValueError as e:
+            raise ValueError(f"Malformed byte count '{nbytes_str}' after tag {result_tag}") from e
+
+        if content_length < 0:
+            raise ValueError(f"Negative byte count {content_length} after tag {result_tag}")
+
+        string_result = string_result[:content_length]
+
+        if len(string_result) != content_length:
+            raise ValueError(
+                "Got truncated result content from command, got %s bytes and expected %s bytes" % (
+                    len(string_result),
+                    content_length
+                )
+            )
+
+        if string_result.startswith("DBXPATH:"):
+            from ..databricks.workspaces import Workspace
+
+            workspace = Workspace() if workspace is None else workspace
+            path = workspace.dbfs_path(
+                string_result.replace("DBXPATH:", "")
+            )
+
+            if path.name.endswith(".parquet"):
+                import pandas
+
+                with path.open(mode="rb") as f:
+                    buf = io.BytesIO(f.read_all_bytes())
+
+                path.rmfile()
+                buf.seek(0)
+                return pandas.read_parquet(buf)
+
+            with path.open(mode="rb") as f:
+                blob = f.read_all_bytes()
+
+            path.rmfile()
+        else:
+            # Strict base64 decode (rejects junk chars)
+            try:
+                blob = base64.b64decode(string_result.encode("ascii"), validate=True)
+            except (UnicodeEncodeError, binascii.Error) as e:
+                raise ValueError("Invalid base64 payload after result tag (corrupted/contaminated).") from e
+
         raw = _decode_result_blob(blob)
-        return dill.loads(raw)
+        try:
+            result = dill.loads(raw)
+        except Exception as e:
+            raise ValueError("Failed to dill.loads decoded payload") from e
+
+        return result
