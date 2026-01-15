@@ -1,14 +1,15 @@
 # yggdrasil.pyutils
 
-Utility decorators for concurrency and retry workflows.
+Utility helpers for retries, parallel execution, environment management, and callable serialization.
 
 ## When to use
-- Parallelize work over an iterable without writing executor boilerplate.
+- Parallelize workloads with minimal executor boilerplate.
 - Add retry/backoff behavior to fragile operations.
-- Apply the same helpers to both sync and async functions.
+- Manage isolated Python environments (uv/pip) or serialize callables for remote execution.
 
-## `parallelize`
-`parallelize(executor_cls=ThreadPoolExecutor, max_workers=None, arg_index=0, timeout=None, return_exceptions=False, show_progress=False)` turns a function into a generator producing results from concurrent execution over one iterable argument.
+## Core exports
+### `parallelize`
+Decorator that turns a function into a generator producing results from concurrent execution over one iterable argument.
 
 ```python
 from yggdrasil.pyutils import parallelize
@@ -21,11 +22,8 @@ for body in fetch(urls):
     handle(body)
 ```
 
-- Accepts a custom executor class (thread or process) and supports passing an existing executor via `executor` kwarg.
-- Preserves input order and can optionally return exceptions instead of raising.
-
-## `retry`
-`retry(exceptions=Exception, tries=3, delay=0.5, backoff=2.0, max_delay=None, jitter=None, logger=None, reraise=True, timeout=None)` adds retry semantics to sync and async callables.
+### `retry`
+Retry decorator that works for both sync and async functions.
 
 ```python
 from yggdrasil.pyutils import retry
@@ -35,10 +33,18 @@ def unstable():
     ...
 ```
 
-- Supports coroutine functions transparently.
-- Optional logger hooks emit warnings/errors on retries and failures.
-- `timeout` stops scheduling new retries once the total elapsed time exceeds the limit.
+### `PythonEnv`
+Helper for managing isolated Python environments (create, install requirements, run commands) with uv/pip.
+The `yggenv` CLI entry point is backed by `PythonEnv.cli`.
+
+### `CallableSerde`
+Serialize callables for cross-process or remote execution, with optional compression and import-by-reference behavior.
+
+## Additional helpers
+- `expiring_dict.ExpiringDict` – TTL-backed caching.
+- `modules.PipIndexSettings` – helper for pip/uv index configuration.
+- `equality` utilities for diffing dictionaries.
 
 ## Related modules
-- [yggdrasil.requests](../requests/README.md) for session-level retries.
-- [yggdrasil.libs](../libs/README.md) for dependency guards that pair well with retries.
+- [yggdrasil.requests](../requests/README.md) for request sessions that pair well with retries.
+- [yggdrasil.databricks](../databricks/README.md) for remote execution workflows using `CallableSerde`.

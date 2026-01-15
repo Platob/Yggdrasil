@@ -1,46 +1,43 @@
 # yggdrasil.dataclasses
 
-Decorator and helpers to build dataclasses that understand defaults, safe construction, and Arrow schemas.
+Arrow-aware dataclass helpers that add safe construction and schema inspection on top of `dataclasses.dataclass`.
 
 ## When to use
-- You need dataclasses that coerce inbound data (strings, numbers, booleans) to annotated types.
-- You want Arrow schema generation directly from Python type hints.
-- You prefer built-in helpers for dict/tuple round-tripping and default instances.
+- You want to coerce inbound values into annotated types without hand-writing parsing logic.
+- You need a `pyarrow.Field` representation of a dataclass for schemas or table casting.
+- You want consistent default-instance behavior for dataclasses with nested type hints.
 
 ## Key exports
 ### `yggdataclass`
-Wraps `dataclasses.dataclass` to add convenience methods:
-- `__safe_init__(*args, **kwargs)` — constructs instances with type conversion and default fallbacks using the casting registry.
-- `from_dict(mapping, safe=True)` / `from_tuple(iterable, safe=True)` — build instances from structured inputs with optional type-safe casting.
-- `to_dict()` / `to_tuple()` — serialize instances.
-- `default_instance()` — lazily builds a default instance using type defaults.
-- `__arrow_field__(name: str | None = None)` — derive a `pyarrow.Field` from annotations.
+Decorator that wraps `dataclasses.dataclass` and injects helper methods:
+- `__safe_init__(*args, **kwargs)` – builds an instance while casting values via `yggdrasil.types.convert` and falling back to defaults.
+- `default_instance()` – builds a cached default instance using `yggdrasil.types.default_scalar`.
+- `__arrow_field__(name: str | None = None)` – returns a `pyarrow.Field` derived from the dataclass annotations.
 
-Usage:
 ```python
 from yggdrasil.dataclasses import yggdataclass
-from yggdrasil.types import convert
 
 @yggdataclass
 class Item:
     id: int
-    quantity: int = 0
+    count: int = 0
 
 item = Item.__safe_init__("42")
-assert item.id == 42 and item.quantity == 0
+assert item.id == 42
 ```
 
 ### `is_yggdataclass(obj)`
-Returns `True` when the class or instance was decorated with `@yggdataclass`.
+Returns `True` when a class or instance has been wrapped by `@yggdataclass`.
 
 ### `get_dataclass_arrow_field(obj)`
-Returns the cached `pyarrow.Field` for a Yggdrasil dataclass or native dataclass by inspecting annotations.
+Returns a cached Arrow field for a dataclass by inspecting type annotations.
 
-## Tips and edge cases
-- Arrow generation requires the `pyarrow` dependency.
-- Casting behavior is governed by the global `convert` registry; extend it via `register_converter` when supporting custom types.
-- `safe=False` on `from_dict`/`from_tuple` skips casting and assumes the input already matches the type hints.
+> Note: `is_yggdataclass` and `get_dataclass_arrow_field` live in
+> `yggdrasil.dataclasses.dataclass` (they are not re-exported from the package root).
+
+## Notes
+- Arrow schema helpers require `pyarrow` (installed by default for this package).
+- Casting relies on the global `convert` registry; register custom converters if you need non-standard types.
 
 ## Related modules
-- [yggdrasil.types](../types/README.md) for casting and Arrow inference.
-- [yggdrasil.libs](../libs/README.md) for engine-specific dtype conversions.
+- [yggdrasil.types](../types/README.md) for casting logic and Arrow inference.

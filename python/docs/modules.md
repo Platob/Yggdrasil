@@ -7,25 +7,21 @@ Enhanced dataclasses with safe initialization, default handling, and Arrow schem
 - [Detailed doc](modules/dataclasses/README.md)
 
 ## `yggdrasil.types`
-Central casting registry, Arrow inference from type hints, and sensible defaults. Use when normalizing data across Python/Arrow/Polars/pandas/Spark.
+Central casting registry, Arrow inference from type hints, and sensible defaults. Use when normalizing data across Python/Arrow/Polars/Pandas/Spark.
 - [Detailed doc](modules/types/README.md)
 
 ## `yggdrasil.libs`
-Optional bridges to external dataframe libraries plus dependency guards. Helpful for converting Arrow schemas to Polars/pandas/Spark dtypes or gating optional imports.
+Optional dependency guards plus Spark/Polars helper functions. Helpful for environment checks and Arrow/Spark type conversions.
 - [Detailed doc](modules/libs/README.md)
 
 ## `yggdrasil.requests`
-HTTP utilities with retries and Azure MSAL authentication. Use for resilient API calls and service-to-service auth.
+MSAL-backed request sessions and retry-enabled request utilities.
 - [Detailed doc](modules/requests/README.md)
 
 ## `yggdrasil.databricks`
-Wrappers around the Databricks SDK for workspaces, SQL, jobs, and compute management. Use for table ingestion, query execution, and cluster automation.
+Wrappers around the Databricks SDK for workspace, SQL, jobs, and compute management.
 - [Detailed doc](modules/databricks/README.md)
 
 ## `yggdrasil.pyutils`
-Concurrency and retry decorators that underpin the package utilities. Use to parallelize work or add backoff to unreliable operations.
+Concurrency, retry, environment, and serialization utilities.
 - [Detailed doc](modules/pyutils/README.md)
-
-## `yggdrasil.ser`
-Serialization helpers and dependency inspection utilities. Use when you need to extract function source or validate optional dependencies.
-- [Detailed doc](modules/ser/README.md)
