@@ -47,6 +47,8 @@ Available under `yggdrasil.types.cast`:
 
 These helpers rely on optional dependencies (PySpark, Polars, Pandas) when relevant.
 
+For details, see [yggdrasil.types.cast](cast/README.md).
+
 ## Related modules
 - [yggdrasil.dataclasses](../dataclasses/README.md) for Arrow-aware dataclass helpers.
 - [yggdrasil.libs](../libs/README.md) for dependency guards and Spark type mappings.
