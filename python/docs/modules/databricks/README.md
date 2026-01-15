@@ -1,164 +1,57 @@
 # yggdrasil.databricks
 
-Helpers built on the Databricks SDK for workspaces, SQL execution, jobs, and compute.
+Databricks integrations built on the Databricks SDK plus Spark-aware helpers.
 
 ## When to use
-- You need a lightweight wrapper around Databricks SDK clients with sane defaults.
-- You want typed SQL execution that returns Arrow tables or Spark DataFrames.
-- You manage clusters, jobs, or workspace files programmatically.
+- You need workspace-aware file/path utilities across DBFS, workspace files, and Unity Catalog volumes.
+- You want a thin SQL execution layer that can use the Databricks SQL API or Spark when available.
+- You want helper utilities for cluster management or notebook widget configuration.
 
-## Workspaces (`yggdrasil.databricks.workspaces`)
-- `Workspace` dataclass wraps `databricks.sdk.WorkspaceClient` configuration (host/token, Azure/GCP settings) and provides helpers to upload/download, list, and delete files across DBFS, Unity Catalog Volumes, and Workspace paths.
-- `WorkspaceObject` tracks remote file metadata and provides convenience methods for reading/writing.
-- `AuthType` enumerates supported auth flows (e.g., external-browser).
+## Workspace and paths
+Modules under `yggdrasil.databricks.workspaces` provide:
+- `Workspace` – configuration wrapper around `databricks.sdk.WorkspaceClient` with caching and context-manager support.
+- `DatabricksPath` / `DatabricksPathKind` – unified path abstraction for DBFS, workspace, and volumes.
+- `DatabricksIO` – file-like read/write interfaces that operate on Databricks paths.
 
 ```python
-from yggdrasil.databricks.workspaces import Workspace
+from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
 
-ws = Workspace(host="https://...", token="...")
-with ws.client() as sdk:
-    print(sdk.current_user.me())
+workspace = Workspace(host="https://...")
+path = DatabricksPath.parse("dbfs:/tmp/demo.txt", workspace=workspace)
 ```
 
-### Tips
-- Requires the `databricks-sdk` extra. For Azure-hosted workspaces, ensure the `host` points to the correct region-specific URL.
-- File helpers support DBFS and Unity Catalog volume prefixes; choose the storage type that matches your workspace permissions.
+## SQL execution
+`yggdrasil.databricks.sql` includes `SQLEngine` and `StatementResult` to execute SQL via the SQL Statement Execution API or Spark.
 
-## SQL (`yggdrasil.databricks.sql`)
-- `SQLEngine(workspace, **kwargs)` issues SQL statements via the Databricks SQL API.
-- `StatementResult` encapsulates statement status, waiting/polling, and fetching results as Arrow tables/record batches with casting helpers (`cast_spark_dataframe`, `convert`).
-- `column_info_to_arrow_field` maps SQL metadata to Arrow fields.
+Key capabilities:
+- Build fully qualified table names and issue SQL statements.
+- Insert Arrow tables or Spark dataframes into Delta tables.
+- Convert SQL metadata into Arrow fields.
 
 ```python
 from yggdrasil.databricks.sql import SQLEngine
-from yggdrasil.databricks.workspaces import Workspace
 
-engine = SQLEngine(Workspace(host="https://...", token="..."))
-result = engine.execute("SELECT 1 AS v").wait()
-print(result.arrow_table().to_pandas())
+engine = SQLEngine(catalog_name="main", schema_name="demo")
+engine.execute("SELECT 1 AS value")
 ```
 
-### Inserting data
-- Use `SQLEngine.insert_into(data, ...)` to load Arrow tables/record batches or Spark DataFrames into Delta tables.
-- Arrow inputs land in a temporary Unity Catalog volume as Parquet before `INSERT INTO`/`MERGE` statements run; Spark inputs call DataFrame writes directly.
-- Set `match_by` to perform an upsert/merge on key columns; omit it for plain appends or specify `mode="overwrite"` for replace semantics.
-- Optional optimization hooks: `zorder_by` (Z-ORDER), `optimize_after_merge` (OPTIMIZE), and `vacuum_hours` (VACUUM) are issued after inserts.
-
-```python
-import pyarrow as pa
-from yggdrasil.databricks.sql import SQLEngine
-from yggdrasil.databricks.workspaces import Workspace
-
-engine = SQLEngine(Workspace(host="https://...", token="..."))
-
-data = pa.table({"id": [1, 2], "name": ["alice", "bob"]})
-engine.insert_into(
-    data,
-    catalog_name="main",
-    schema_name="demo",
-    table_name="users",
-)
-```
-
-### Common pitfalls
-- Ensure the workspace has permission to create the temporary volume used for Arrow ingestion.
-- When using `match_by`, the key columns must exist in the incoming data and target table.
-- Casting options control how timestamps/timezones are handled—pass `CastOptions` if you need strict enforcement.
-
-## Jobs (`yggdrasil.databricks.jobs`)
-- `DBXJobSettings` and `TaskConfig` dataclasses (via `config.py`) to compose job/task payloads.
-- Utilities for building `Task` structures with defaults and type-safe casting.
-
-## Compute (`yggdrasil.databricks.compute`)
-Use `Cluster` to provision and manage clusters, track metadata via custom tags, install libraries, and execute commands directly on the driver node.
+## Compute helpers
+`yggdrasil.databricks.compute` provides:
+- `Cluster` – create/update clusters, install libraries, and execute commands remotely.
+- `ExecutionContext` – helper for remote execution contexts.
 
 ```python
 from yggdrasil.databricks.compute import Cluster
-from yggdrasil.databricks.workspaces import Workspace
 
-cluster = Cluster(
-    workspace=Workspace(host="https://...", token="..."),
-    metadata={"owner": "platform-team", "env": "dev"},
-)
-
-cluster_id = cluster.create(
-    cluster_name="demo-cluster",
-    spark_version="14.3.x-scala2.12",
-    num_workers=1,
-    node_type_id="i3.xlarge",
-)
-
-cluster.check_started(cluster_id=cluster_id)
-print(
-    cluster.execute_command(
-        "import platform; print(platform.python_version())",
-        cluster_id=cluster_id,
-    )
-)
+cluster = Cluster()
+cluster.ensure_running()
 ```
 
-### Common operations
-- **Create or update a cluster with sensible defaults**
+## Jobs and widgets
+`yggdrasil.databricks.jobs` focuses on notebook configuration helpers:
+- `NotebookConfig` – dataclass base that reads Databricks widgets or job parameters.
+- `WidgetType` – enum of supported widget types.
 
-```python
-from yggdrasil.databricks.compute import Cluster
-from yggdrasil.databricks.workspaces import Workspace
-import datetime as dt
-
-cluster = Cluster(Workspace(host="https://...", token="..."))
-
-cluster.create_or_update(
-    cluster_name="ci-dev",
-    spark_version="17.3.x-scala2.13",
-    num_workers=1,
-    node_type_id="i3.xlarge",
-    autotermination_minutes=30,
-)
-
-cluster.ensure_running()  # starts the cluster if needed
-```
-
-- **Install local or PyPI libraries onto the cluster**
-
-```python
-# Install a local package from the current environment
-cluster.install_libraries(libraries=["my_package"], upload_local_lib=True)
-
-# Install directly from PyPI without building a wheel locally
-cluster.install_libraries(libraries=["pydantic==2.8.0"])
-```
-
-- **Execute code remotely on the driver node**
-
-```python
-# Run a one-off Python statement
-output = cluster.execute_command(
-    "import platform; print(platform.python_version())",
-    cluster_id=cluster.cluster_id,
-)
-print(output)
-
-
-# Send a function to run remotely with automatic serialization
-@cluster.execution_decorator(timeout=dt.timedelta(seconds=10))
-def remote_sum(x, y):
-    return x + y
-
-
-print(remote_sum(2, 3))
-```
-
-- **Restart or delete clusters when finished**
-
-```python
-cluster.restart()
-cluster.delete()
-```
-
-### Notes
-- Functions guard imports with `require_databricks_sdk()` and `require_pyspark()` to give clear errors when dependencies are missing.
-- Many methods accept `CastOptions` to control Arrow/Pandas/Spark casting of SQL results.
-
-## Related modules
-- [yggdrasil.libs](../libs/README.md) for Spark dependency guards.
-- [yggdrasil.types](../types/README.md) for casting Arrow/Spark data.
+## Notes
+- These helpers rely on the Databricks SDK and PySpark when running inside a Spark-enabled environment.
+- Arrow-based insert and cast helpers use `yggdrasil.types.cast` for schema enforcement.
