@@ -21,6 +21,8 @@ Located in `yggdrasil.libs.sparklib`:
 - **Polars**: `join_coalesced`, `resample` for dataframe joins and time-based aggregation.
 - **Spark**: helpers for alias discovery, `latest` row selection, and Arrow/Polars-backed resampling routines.
 
+For details, see [yggdrasil.libs.extensions](extensions/README.md).
+
 ## Related modules
 - [yggdrasil.types](../types/README.md) for casting helpers built on these dependencies.
 - [yggdrasil.databricks](../databricks/README.md) for Databricks-specific integrations.
