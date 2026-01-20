@@ -4,15 +4,16 @@ import base64
 import io
 import time
 from abc import ABC, abstractmethod
+from threading import Thread
 from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union
 
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
-from Lib.threading import Thread
 from pyarrow.dataset import (
     FileFormat,
-    ParquetFileFormat, CsvFileFormat,
+    ParquetFileFormat,
+    CsvFileFormat,
 )
 
 from .path_kind import DatabricksPathKind
@@ -71,10 +72,11 @@ class DatabricksIO(ABC, IO):
         self.close()
 
     def __del__(self):
-        try:
-            Thread(target=self.close).start()
-        except BaseException:
-            pass
+        if self._need_flush():
+            try:
+                Thread(target=self.close).start()
+            except BaseException:
+                pass
 
     def __next__(self):
         """Iterate over lines in the file."""
@@ -533,13 +535,16 @@ class DatabricksIO(ABC, IO):
 
         return size
 
+    def _need_flush(self):
+        return self._write_flag and self._buffer is not None
+
     def flush(self):
         """Flush buffered data to the remote path.
 
         Returns:
             None.
         """
-        if self._write_flag and self._buffer is not None:
+        if self._need_flush():
             self.write_all_bytes(data=self._buffer.getvalue())
             self._write_flag = False
 
