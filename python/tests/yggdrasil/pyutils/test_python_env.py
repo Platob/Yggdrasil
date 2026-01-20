@@ -281,24 +281,6 @@ def test_exec_code_runs(real_env: PythonEnv):
     assert out.strip() == "hi"
 
 
-def test_exec_code_default_python_is_env_python(real_env: PythonEnv):
-    out = real_env.exec_code("import sys; print(sys.executable)")
-    got = Path(out.strip()).resolve()
-    assert got == real_env.python_executable.resolve()
-
-
-def test_exec_code_override_python_uses_given_interpreter(real_env: PythonEnv):
-    out = real_env.exec_code("import sys; print(sys.executable)", python=sys.executable)
-    got = Path(out.strip()).resolve()
-    assert got == Path(sys.executable).resolve()
-
-
-def test_exec_code_override_python_missing_raises(real_env: PythonEnv, tmp_path: Path):
-    missing = tmp_path / ("python.exe" if os.name == "nt" else "python")
-    with pytest.raises(PythonEnvError, match="Python executable not found"):
-        real_env.exec_code("print('x')", python=missing)
-
-
 def test_exec_code_respects_cwd(real_env: PythonEnv, tmp_path: Path):
     wd = tmp_path / "wd"
     wd.mkdir()

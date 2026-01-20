@@ -14,6 +14,8 @@ def _get_retry_module():
 def test_retry_success_after_failures_sync():
     calls = {"n": 0}
 
+    from yggdrasil.pyutils.retry import retry
+
     @retry(tries=4, delay=0, backoff=1)  # no sleeping in tests
     def flaky():
         calls["n"] += 1

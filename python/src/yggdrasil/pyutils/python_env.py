@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Optional, Union, List, Tuple
 
@@ -415,10 +415,12 @@ def _locked_env(root: Path):
 # PythonEnv
 # -----------------------
 
-@dataclass(frozen=True)
+@dataclass
 class PythonEnv:
     """Represent a managed Python environment rooted at a filesystem path."""
     root: Path
+
+    _version: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Normalize the root path after dataclass initialization.
@@ -862,8 +864,9 @@ class PythonEnv:
         Returns:
             Version string.
         """
-        out = self.exec_code("import sys; print(sys.version.split()[0])", check=True)
-        return out.strip()
+        if self._version is None:
+            self._version = self.exec_code("import sys; print(sys.version.split()[0])", check=True).strip()
+        return self._version
 
     @property
     def version_info(self) -> tuple[int, int, int]:

@@ -216,10 +216,7 @@ def test_default_arrow_scalar_decimal():
 
 
 def test_default_arrow_scalar_fixed_size_binary():
-    if not hasattr(pa, "fixed_size_binary"):
-        pytest.skip("pyarrow missing fixed_size_binary")
-
-    dt = pa.fixed_size_binary(4)
+    dt = pa.binary(4)
     s = default_arrow_scalar(dt, nullable=False)
     assert s.type == dt
     assert s.as_py() == b"\x00" * 4

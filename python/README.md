@@ -31,34 +31,6 @@ Extras are grouped by engine:
 - `.[polars]`, `.[pandas]`, `.[spark]`, `.[databricks]` – install only the integrations you need.
 - `.[dev]` – adds testing, linting, and typing tools (`pytest`, `ruff`, `black`, `mypy`).
 
-## Quickstart
-Define an Arrow-aware dataclass, coerce inputs, and cast across containers:
-
-```python
-from yggdrasil import yggdataclass
-from yggdrasil.types.cast import convert
-from yggdrasil.types import arrow_field_from_hint
-
-@yggdataclass
-class User:
-    id: int
-    email: str
-    active: bool = True
-
-user = User.__safe_init__("123", email="alice@example.com")
-assert user.id == 123 and user.active is True
-
-payload = {"id": "45", "email": "bob@example.com", "active": "false"}
-clean = User.from_dict(payload)
-print(clean.to_dict())
-
-field = arrow_field_from_hint(User, name="user")
-print(field)  # user: struct<id: int64, email: string, active: bool>
-
-numbers = convert(["1", "2", "3"], list[int])
-print(numbers)
-```
-
 ### Databricks example
 Install the `databricks` extra and run SQL with typed results:
 

@@ -39,6 +39,7 @@ def databricks_remote_compute(
     timeout: Optional[dt.timedelta] = None,
     env_keys: Optional[List[str]] = None,
     force_local: bool = False,
+    update_timeout: Optional[Union[float, dt.timedelta]] = None,
     **options
 ) -> Callable[[Callable[..., ReturnType]], Callable[..., ReturnType]]:
     """Return a decorator that executes functions on a remote cluster.
@@ -52,6 +53,7 @@ def databricks_remote_compute(
         timeout: Optional execution timeout for remote calls.
         env_keys: Optional environment variable names to forward.
         force_local: Force local execution
+        update_timeout: creation or update wait timeout
         **options: Extra options forwarded to the execution decorator.
 
     Returns:
@@ -82,7 +84,8 @@ def databricks_remote_compute(
             cluster = workspace.clusters().replicated_current_environment(
                 workspace=workspace,
                 cluster_name=cluster_name,
-                single_user_name=workspace.current_user.user_name
+                single_user_name=workspace.current_user.user_name,
+                update_timeout=update_timeout
             )
 
     cluster.ensure_running(wait_timeout=None)

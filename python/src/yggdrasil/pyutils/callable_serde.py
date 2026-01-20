@@ -27,7 +27,6 @@ import dis
 import importlib
 import inspect
 import io
-import lzma
 import os
 import secrets
 import struct
@@ -66,6 +65,14 @@ def _try_import_zstd():
         return None
 
 
+def _try_import_lzma():
+    try:
+        import lzma  # type: ignore
+        return lzma
+    except Exception:
+        return None
+
+
 def _pick_zlib_level(n: int, limit: int) -> int:
     """Ramp compression level 1..9 based on how far we exceed the byte_limit."""
     ratio = n / max(1, limit)
@@ -93,13 +100,6 @@ def _encode_with_candidates(raw: bytes, *, byte_limit: int, allow_zstd: bool) ->
                     candidates.append(_frame(_CODEC_ZSTD, len(raw), lvl, c))
                 except Exception:
                     pass
-
-    for preset in (6, 9):
-        try:
-            c = lzma.compress(raw, preset=preset)
-            candidates.append(_frame(_CODEC_LZMA, len(raw), preset, c))
-        except Exception:
-            pass
 
     lvl = _pick_zlib_level(len(raw), byte_limit)
     try:
@@ -143,8 +143,8 @@ def _decode_result_blob(blob: bytes) -> bytes:
         raw = data
     elif codec == _CODEC_ZLIB:
         raw = zlib.decompress(data)
-    elif codec == _CODEC_LZMA:
-        raw = lzma.decompress(data)
+    # elif codec == _CODEC_LZMA:
+    #     raw = lzma.decompress(data)
     elif codec == _CODEC_ZSTD:
         zstd = _try_import_zstd()
         if zstd is None:

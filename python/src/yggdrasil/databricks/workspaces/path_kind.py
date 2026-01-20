@@ -8,6 +8,6 @@ __all__ = ["DatabricksPathKind"]
 
 class DatabricksPathKind(str, Enum):
     """Supported Databricks path kinds for workspace, volumes, and DBFS."""
-    WORKSPACE = "workspace"
-    VOLUME = "volume"
-    DBFS = "dbfs"
+    WORKSPACE = 1
+    VOLUME = 2
+    DBFS = 3

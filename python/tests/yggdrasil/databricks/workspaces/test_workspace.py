@@ -7,7 +7,7 @@ from yggdrasil.databricks import Workspace
 class TestCluster(unittest.TestCase):
 
     def setUp(self):
-        self.workspace = Workspace(host=os.environ["DATABRICKS_HOST"]).connect()
+        self.workspace = Workspace().connect()
 
     def test_get_current_token(self):
         assert Workspace(

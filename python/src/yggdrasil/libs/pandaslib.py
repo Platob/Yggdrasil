@@ -3,8 +3,13 @@
 try:
     import pandas  # type: ignore
     pandas = pandas
+
+    PandasDataFrame = pandas.DataFrame
 except ImportError:
     pandas = None
+
+    class PandasDataFrame:
+        pass
 
 
 def require_pandas():
@@ -23,4 +28,5 @@ def require_pandas():
 __all__ = [
     "pandas",
     "require_pandas",
+    "PandasDataFrame"
 ]

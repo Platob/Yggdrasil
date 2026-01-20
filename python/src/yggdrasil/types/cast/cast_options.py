@@ -7,16 +7,15 @@ import pyarrow as pa
 
 from .registry import convert
 from ..python_arrow import is_arrow_type_list_like
-from ...dataclasses import yggdataclass
+from ...libs.polarslib import polars
+from ...libs.sparklib import pyspark
 
 __all__ = [
     "CastOptions",
 ]
 
-from ...libs import pyspark, polars
 
-
-@yggdataclass
+@dataclasses.dataclass
 class CastOptions:
     """
     Options controlling Arrow casting behavior.

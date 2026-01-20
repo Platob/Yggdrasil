@@ -8,7 +8,6 @@ from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
-    Any,
     BinaryIO,
     Iterator,
     Optional,
@@ -55,7 +54,9 @@ def _get_env_product_version():
     v = os.getenv("DATABRICKS_PRODUCT_VERSION")
 
     if not v:
-        return YGGDRASIL_VERSION
+        if _get_env_product() == "yggdrasil":
+            return YGGDRASIL_VERSION
+        return None
     return v.strip().lower()
 
 
@@ -106,11 +107,12 @@ class Workspace:
     product: Optional[str] = dataclasses.field(default_factory=_get_env_product, repr=False)
     product_version: Optional[str] = dataclasses.field(default_factory=_get_env_product_version, repr=False)
     product_tag: Optional[str] = dataclasses.field(default_factory=_get_env_product_tag, repr=False)
+    custom_tags: Optional[dict] = dataclasses.field(default=None, repr=False)
 
     # Runtime cache (never serialized)
-    _sdk: Any = dataclasses.field(init=False, default=None, repr=False, compare=False, hash=False)
-    _was_connected: bool = dataclasses.field(init=False, default=False, repr=False, compare=False)
-    _cached_token: Optional[str] = dataclasses.field(init=False, default=None, repr=False, compare=False)
+    _sdk: Optional["WorkspaceClient"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _was_connected: bool = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
     # -------------------------
     # Pickle support
@@ -175,19 +177,43 @@ class Workspace:
     # -------------------------
     def clone_instance(
         self,
-        **kwargs
     ) -> "Workspace":
         """Clone the workspace config with overrides.
-
-        Args:
-            **kwargs: Field overrides for the clone.
 
         Returns:
             A new Workspace instance with updated fields.
         """
-        state = self.__getstate__()
-        state.update(kwargs)
-        return Workspace().__setstate__(state)
+        return Workspace(
+            host = self.host,
+            account_id = self.account_id,
+            token = self.token,
+            client_id = self.client_id,
+            client_secret = self.client_secret,
+            token_audience = self.token_audience,
+            azure_workspace_resource_id = self.azure_workspace_resource_id,
+            azure_use_msi = self.azure_use_msi,
+            azure_client_secret = self.azure_client_secret,
+            azure_client_id = self.azure_client_id,
+            azure_tenant_id = self.azure_tenant_id,
+            azure_environment = self.azure_environment,
+            google_credentials = self.google_credentials,
+            google_service_account = self.google_service_account,
+            profile = self.profile,
+            config_file = self.config_file,
+            auth_type = self.auth_type,
+            http_timeout_seconds = self.http_timeout_seconds,
+            retry_timeout_seconds = self.retry_timeout_seconds,
+            debug_truncate_bytes = self.debug_truncate_bytes,
+            debug_headers = self.debug_headers,
+            rate_limit = self.rate_limit,
+            product = self.product,
+            product_version = self.product_version,
+            product_tag = self.product_tag,
+            custom_tags = self.custom_tags,
+            _sdk = self._sdk,
+            _was_connected = self._was_connected,
+            _cached_token = self._cached_token,
+        )
 
     # -------------------------
     # SDK connection
@@ -300,8 +326,9 @@ class Workspace:
         Drop the cached WorkspaceClient (no actual close needed, but this
         avoids reusing stale config).
         """
-        self._sdk = None
-        self._was_connected = False
+        if self._sdk is not None:
+            self._sdk = None
+            self._was_connected = False
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -561,28 +588,19 @@ class Workspace:
         Returns:
             A dict of default tags.
         """
-        return {
+        base = {
             k: v
             for k, v in (
                 ("Product", self.product),
-                ("ProductVersion", self.product_version),
                 ("ProductTag", self.product_tag),
-                ("ProductUser", self.current_user.user_name)
             )
             if v
         }
 
-    def merge_tags(self, existing: dict | None = None):
-        """Merge default tags with an existing set.
+        if self.custom_tags:
+            base.update(self.custom_tags)
 
-        Args:
-            existing: Optional existing tags.
-
-        Returns:
-            A dict of merged tags.
-        """
-        if existing:
-            return self.default_tags()
+        return base
 
     def sql(
         self,

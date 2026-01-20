@@ -15,6 +15,7 @@ from ..python_defaults import default_arrow_scalar
 from ...libs.polarslib import polars
 
 __all__ = [
+    "polars_converter",
     "cast_polars_array",
     "cast_polars_dataframe",
     "arrow_type_to_polars_type",

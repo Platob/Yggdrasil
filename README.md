@@ -68,7 +68,7 @@ print(result.arrow_table().to_pandas())
 - [`python/docs/modules/`](python/docs/modules/README.md) – per-module documentation for dataclasses, types, libs, requests, Databricks, and more.
 
 ## Publishing
-The GitHub Actions workflow at [`.github/workflows/publish.yml`](.github/workflows/publish.yml) builds and publishes the Python package when pushing to `main`. To authorize uploads:
+The GitHub Actions workflow at [`.github/workflows/publish.yml`](.github/workflows/publish-pypi.yml) builds and publishes the Python package when pushing to `main`. To authorize uploads:
 1. Create a PyPI API token (Account settings → **API tokens** → **Add API token**).
 2. Add a repository Actions secret named `PYPI_API_TOKEN` containing the token. The username is preset to `__token__` in the workflow.
 3. Push to `main` or trigger the workflow manually; the package is built from `python/` and uploaded using the stored secret.

@@ -22,8 +22,8 @@ from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVa
 
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
-from ... import CallableSerde
 from ...libs.databrickslib import databricks_sdk
+from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.equality import dicts_equal, dict_diff
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import PipIndexSettings
@@ -36,7 +36,8 @@ else:  # pragma: no cover - runtime fallback when SDK is missing
     from databricks.sdk.errors import DatabricksError
     from databricks.sdk.errors.platform import ResourceDoesNotExist
     from databricks.sdk.service.compute import (
-        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus
+        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus,
+        ClusterAccessControlRequest, ClusterPermissionLevel
     )
     from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
 
@@ -143,6 +144,7 @@ class Cluster(WorkspaceService):
         single_user_name: Optional[str] = None,
         runtime_engine: Optional["RuntimeEngine"] = None,
         libraries: Optional[list[str]] = None,
+        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
         **kwargs
     ) -> "Cluster":
         """Create or reuse a cluster that mirrors the current Python environment.
@@ -151,9 +153,10 @@ class Cluster(WorkspaceService):
             workspace: Workspace to use for the cluster.
             cluster_id: Optional cluster id to reuse.
             cluster_name: Optional cluster name to reuse.
-            single_user_name: Optional user name for single-user clusters.
+            single_user_name: Optional username for single-user clusters.
             runtime_engine: Optional Databricks runtime engine.
             libraries: Optional list of libraries to install.
+            update_timeout: wait timeout, if None it will not wait completion
             **kwargs: Additional cluster specification overrides.
 
         Returns:
@@ -175,6 +178,7 @@ class Cluster(WorkspaceService):
                 single_user_name=single_user_name,
                 runtime_engine=runtime_engine,
                 libraries=libraries,
+                update_timeout=update_timeout,
                 **kwargs
             )
         )
@@ -189,6 +193,7 @@ class Cluster(WorkspaceService):
         single_user_name: Optional[str] = "current",
         runtime_engine: Optional["RuntimeEngine"] = None,
         libraries: Optional[list[str]] = None,
+        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
         **kwargs
     ) -> "Cluster":
         """Create/update a cluster to match the local Python environment.
@@ -197,9 +202,10 @@ class Cluster(WorkspaceService):
             source: Optional PythonEnv to mirror (defaults to current).
             cluster_id: Optional cluster id to update.
             cluster_name: Optional cluster name to update.
-            single_user_name: Optional single user name for the cluster.
+            single_user_name: Optional single username for the cluster.
             runtime_engine: Optional runtime engine selection.
             libraries: Optional list of libraries to install.
+            update_timeout: wait timeout, if None it will not wait completion
             **kwargs: Additional cluster specification overrides.
 
         Returns:
@@ -241,6 +247,7 @@ class Cluster(WorkspaceService):
             single_user_name=single_user_name,
             runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
             libraries=libraries,
+            update_timeout=update_timeout,
             **kwargs
         )
 
@@ -379,7 +386,9 @@ class Cluster(WorkspaceService):
         start = time.time()
         sleep_time = tick
 
-        if isinstance(timeout, dt.timedelta):
+        if not timeout:
+            timeout = 20 * 60.0
+        elif isinstance(timeout, dt.timedelta):
             timeout = timeout.total_seconds()
 
         while self.is_pending:
@@ -411,12 +420,14 @@ class Cluster(WorkspaceService):
         # Extract "major.minor" from strings like "17.3.x-scala2.13-ml-gpu"
         v = self.spark_version
 
-        if v is None:
+        if not v:
             return None
 
         parts = v.split(".")
+
         if len(parts) < 2:
             return None
+
         return ".".join(parts[:2])  # e.g. "17.3"
 
     @property
@@ -427,8 +438,10 @@ class Cluster(WorkspaceService):
         When the runtime can't be mapped, returns ``None``.
         """
         v = self.runtime_version
-        if v is None:
+
+        if not v:
             return None
+
         return _PYTHON_BY_DBR.get(v)
 
     # ------------------------------------------------------------------ #
@@ -585,6 +598,7 @@ class Cluster(WorkspaceService):
         cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
         **cluster_spec: Any
     ):
         """Create a new cluster or update an existing one.
@@ -593,6 +607,7 @@ class Cluster(WorkspaceService):
             cluster_id: Optional cluster id to update.
             cluster_name: Optional cluster name to update or create.
             libraries: Optional libraries to install.
+            update_timeout: wait timeout, if None it will not wait completion
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -608,24 +623,28 @@ class Cluster(WorkspaceService):
             return found.update(
                 cluster_name=cluster_name,
                 libraries=libraries,
+                wait_timeout=update_timeout,
                 **cluster_spec
             )
 
         return self.create(
             cluster_name=cluster_name,
             libraries=libraries,
+            wait_timeout=update_timeout,
             **cluster_spec
         )
 
     def create(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
+        wait_timeout: Union[float, dt.timedelta] = dt.timedelta(minutes=20),
         **cluster_spec: Any
     ) -> str:
         """Create a new cluster and optionally install libraries.
 
         Args:
             libraries: Optional list of libraries to install after creation.
+            wait_timeout: wait timeout, if None it will not wait completion
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -645,27 +664,32 @@ class Cluster(WorkspaceService):
             update_details,
         )
 
-        self.details = self.clusters_client().create_and_wait(**update_details)
+        self.details = self.clusters_client().create(**update_details)
 
         LOGGER.info(
             "Created %s",
             self
         )
 
-        self.install_libraries(libraries=libraries, raise_error=False)
+        self.install_libraries(libraries=libraries, raise_error=False, wait_timeout=None)
+
+        if wait_timeout:
+            self.wait_for_status(timeout=wait_timeout)
 
         return self
 
     def update(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        wait_timeout: Union[float, dt.timedelta] = dt.timedelta(minutes=20),
+        access_control_list: Optional[List["ClusterAccessControlRequest"]] = None,
+        wait_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
         **cluster_spec: Any
     ) -> "Cluster":
         """Update cluster configuration and optionally install libraries.
 
         Args:
             libraries: Optional libraries to install.
+            access_control_list: List of permissions
             wait_timeout: waiting timeout until done, if None it does not wait
             **cluster_spec: Cluster specification overrides.
 
@@ -705,8 +729,9 @@ class Cluster(WorkspaceService):
                 self, diff
             )
 
-            self.wait_for_status()
+            self.wait_for_status(timeout=wait_timeout)
             self.clusters_client().edit(**update_details)
+            self.update_permissions(access_control_list=access_control_list)
 
             LOGGER.info(
                 "Updated %s",
@@ -717,6 +742,56 @@ class Cluster(WorkspaceService):
             self.wait_for_status(timeout=wait_timeout)
 
         return self
+
+    def update_permissions(
+        self,
+        access_control_list: Optional[List["ClusterAccessControlRequest"]] = None,
+    ):
+        if not access_control_list:
+            return self
+
+        access_control_list = self._check_permission(access_control_list)
+
+        self.clusters_client().update_permissions(
+            cluster_id=self.cluster_id,
+            access_control_list=access_control_list
+        )
+
+    def default_permissions(self):
+        current_groups = self.current_user.groups or []
+
+        return [
+            ClusterAccessControlRequest(
+                group_name=name,
+                permission_level=ClusterPermissionLevel.CAN_MANAGE
+            )
+            for name in current_groups
+            if name not in {"users"}
+        ]
+
+    def _check_permission(
+        self,
+        permission: Union[str, "ClusterAccessControlRequest", List[Union[str, "ClusterAccessControlRequest"]]],
+    ):
+        if isinstance(permission, ClusterAccessControlRequest):
+            return permission
+
+        if isinstance(permission, str):
+            if "@" in permission:
+                group_name, user_name = None, permission
+            else:
+                group_name, user_name = permission, None
+
+            return ClusterAccessControlRequest(
+                group_name=group_name,
+                user_name=user_name,
+                permission_level=ClusterPermissionLevel.CAN_MANAGE
+            )
+
+        return [
+            self._check_permission(_)
+            for _ in permission
+        ]
 
     def list_clusters(self) -> Iterator["Cluster"]:
         """Iterate clusters, yielding helpers annotated with metadata.
@@ -809,18 +884,22 @@ class Cluster(WorkspaceService):
         Returns:
             The current Cluster instance.
         """
+        if self.is_running:
+            return self
+
         self.wait_for_status()
 
-        if not self.is_running:
-            LOGGER.debug("Starting %s", self)
+        if self.is_running:
+            return self
 
-            if wait_timeout:
-                self.clusters_client().start(cluster_id=self.cluster_id)
-                self.wait_for_status(timeout=wait_timeout.total_seconds())
-            else:
-                self.clusters_client().start(cluster_id=self.cluster_id)
+        LOGGER.debug("Starting %s", self)
 
-            LOGGER.info("Started %s", self)
+        self.clusters_client().start(cluster_id=self.cluster_id)
+
+        LOGGER.info("Started %s", self)
+
+        if wait_timeout:
+            self.wait_for_status(timeout=wait_timeout.total_seconds())
 
         return self
 
@@ -836,7 +915,7 @@ class Cluster(WorkspaceService):
 
         if self.is_running:
             self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
-            return self.wait_for_status()
+            return self
 
         return self.start()
 

@@ -82,14 +82,14 @@ def retry(
     logger:
         Optional logger for debug/info messages.
     reraise:
-        If True, re-raise the last exception after exhausting retries or timeout.
+        If True, reraise the last exception after exhausting retries or timeout.
         If False, returns None after all retries fail or timeout is hit.
     timeout:
         Optional max total time in seconds across all attempts. The timeout is
         checked after each failed attempt. In-flight attempts are not forcibly
         cancelled; we just stop scheduling new retries when the timeout is hit.
 
-    Usage
+    Example
     -----
     @retry(exceptions=(ValueError,), tries=5, delay=0.1, backoff=2)
     def flaky():

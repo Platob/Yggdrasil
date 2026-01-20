@@ -9,24 +9,28 @@ import random
 import string
 import time
 from pathlib import PurePosixPath
-from typing import Optional, Tuple, Union, TYPE_CHECKING, List, Iterable
+from typing import Optional, Tuple, Union, TYPE_CHECKING, List
 
 import pyarrow as pa
+import pyarrow.dataset as ds
+from pyarrow import ArrowInvalid
 from pyarrow.dataset import FileFormat, ParquetFileFormat, CsvFileFormat, JsonFileFormat
 from pyarrow.fs import FileInfo, FileType, FileSystem
-import pyarrow.dataset as ds
 
 from .io import DatabricksIO
 from .path_kind import DatabricksPathKind
+from .volumes_path import get_volume_status, get_volume_metadata
 from ...libs.databrickslib import databricks
-from ...types import cast_arrow_tabular, cast_polars_dataframe
+from ...libs.pandaslib import PandasDataFrame
+from ...libs.polarslib import polars, PolarsDataFrame
+from ...types.cast.arrow_cast import cast_arrow_tabular
 from ...types.cast.cast_options import CastOptions
-from ...types.cast.polars_cast import polars_converter
-from ...types.cast.polars_pandas_cast import PolarsDataFrame
+from ...types.cast.polars_cast import polars_converter, cast_polars_dataframe
 from ...types.cast.registry import convert, register_converter
+from ...types.file_format import ExcelFileFormat
 
 if databricks is not None:
-    from databricks.sdk.service.catalog import VolumeType
+    from databricks.sdk.service.catalog import VolumeType, PathOperation, VolumeInfo
     from databricks.sdk.service.workspace import ObjectType
     from databricks.sdk.errors.platform import (
         NotFound,
@@ -50,7 +54,9 @@ __all__ = [
 ]
 
 
-def _flatten_parts(parts: Union[list[str], str]) -> list[str]:
+def _flatten_parts(
+    parts: Union["DatabricksPath", List[str], str],
+) -> List[str]:
     """Normalize path parts by splitting on '/' and removing empties.
 
     Args:
@@ -59,8 +65,13 @@ def _flatten_parts(parts: Union[list[str], str]) -> list[str]:
     Returns:
         A flattened list of path components.
     """
-    if isinstance(parts, str):
-        parts = [parts]
+    if not isinstance(parts, list):
+        if isinstance(parts, DatabricksPath):
+            return parts.parts
+        elif isinstance(parts, (set, tuple)):
+            parts = list(parts)
+        else:
+            parts = [str(parts).replace("\\", "/")]
 
     if any("/" in part for part in parts):
         new_parts: list[str] = []
@@ -91,13 +102,16 @@ class DatabricksPath:
     """Path wrapper for Databricks workspace, volumes, and DBFS objects."""
     kind: DatabricksPathKind
     parts: List[str]
+    temporary: bool = False
 
-    _workspace: Optional["Workspace"] = None
+    _is_file: Optional[bool] = dataclasses.field(repr=False, hash=False, default=None)
+    _is_dir: Optional[bool] = dataclasses.field(repr=False, hash=False, default=None)
+    _size: Optional[int] = dataclasses.field(repr=False, hash=False, default=None)
+    _mtime: Optional[float] = dataclasses.field(repr=False, hash=False, default=None)
 
-    _is_file: Optional[bool] = None
-    _is_dir: Optional[bool] = None
-    _size: Optional[int] = None
-    _mtime: Optional[float] = None
+    _workspace: Optional["Workspace"] = dataclasses.field(repr=False, hash=False, default=None)
+
+    _volume_info: Optional["VolumeInfo"] = dataclasses.field(repr=False, hash=False, default=None)
 
     def clone_instance(
         self,
@@ -109,6 +123,7 @@ class DatabricksPath:
         is_dir: Optional[bool] = dataclasses.MISSING,
         size: Optional[int] = dataclasses.MISSING,
         mtime: Optional[float] = dataclasses.MISSING,
+        volume_info: Optional["VolumeInfo"] = dataclasses.MISSING,
     ) -> "DatabricksPath":
         """
         Return a copy of this DatabricksPath, optionally overriding fields.
@@ -124,6 +139,21 @@ class DatabricksPath:
             _is_dir=self._is_dir if is_dir is dataclasses.MISSING else is_dir,
             _size=self._size if size is dataclasses.MISSING else size,
             _mtime=self._mtime if mtime is dataclasses.MISSING else mtime,
+            _volume_info=self._volume_info if volume_info is dataclasses.MISSING else volume_info,
+        )
+
+    @classmethod
+    def empty_instance(cls, workspace: Optional["Workspace"] = None):
+        return DatabricksPath(
+            kind=DatabricksPathKind.DBFS,
+            parts=[],
+            temporary=False,
+            _workspace=workspace,
+            _is_file=False,
+            _is_dir=False,
+            _size=0,
+            _mtime=0.0,
+            _volume_info=None,
         )
 
     @classmethod
@@ -131,18 +161,20 @@ class DatabricksPath:
         cls,
         obj: Union["DatabricksPath", str, List[str]],
         workspace: Optional["Workspace"] = None,
+        temporary: bool = False
     ) -> "DatabricksPath":
         """Parse input into a DatabricksPath instance.
 
         Args:
             obj: Input path, DatabricksPath, or path parts list.
             workspace: Optional Workspace to bind to the path.
+            temporary: Temporary location
 
         Returns:
             A DatabricksPath instance.
         """
         if not obj:
-            return DatabricksPath(kind=DatabricksPathKind.DBFS, parts=[], _workspace=workspace)
+            return cls.empty_instance(workspace=workspace)
 
         if not isinstance(obj, (str, list)):
             if isinstance(obj, DatabricksPath):
@@ -155,8 +187,9 @@ class DatabricksPath:
             if isinstance(obj, DatabricksIO):
                 return obj.path
 
-            if not isinstance(obj, Iterable):
+            else:
                 obj = str(obj)
+
 
         obj = _flatten_parts(obj)
 
@@ -164,21 +197,25 @@ class DatabricksPath:
             obj = obj[1:]
 
         if not obj:
-            return DatabricksPath(kind=DatabricksPathKind.DBFS, parts=[], _workspace=workspace)
+            return cls.empty_instance(workspace=workspace)
 
         head, *tail = obj
-        head = head.casefold()
 
         if head == "dbfs":
             kind = DatabricksPathKind.DBFS
-        elif head == "workspace":
+        elif head in {"Workspace", "workspace"}:
             kind = DatabricksPathKind.WORKSPACE
-        elif head == "volumes":
+        elif head in {"Volumes", "volumes"}:
             kind = DatabricksPathKind.VOLUME
         else:
             raise ValueError(f"Invalid DatabricksPath head {head!r} from {obj!r}, must be in ['dbfs', 'workspace', 'volumes']")
 
-        return DatabricksPath(kind=kind, parts=tail, _workspace=workspace)
+        return DatabricksPath(
+            kind=kind,
+            parts=tail,
+            temporary=temporary,
+            _workspace=workspace,
+        )
 
     def __hash__(self):
         return hash(self.full_path())
@@ -258,16 +295,19 @@ class DatabricksPath:
             return self
 
         if self._is_file is not None or self._is_dir is not None:
-            _is_file, _is_dir = False, True
+            _is_file, _is_dir, _size = False, True, 0
         else:
-            _is_file, _is_dir = None, None
+            _is_file, _is_dir, _size = None, None, None
 
         return DatabricksPath(
             kind=self.kind,
             parts=self.parts[:-1],
+            temporary=False,
             _workspace=self._workspace,
             _is_file=_is_file,
             _is_dir=_is_dir,
+            _size=_size,
+            _volume_info=self._volume_info
         )
 
     @property
@@ -280,7 +320,7 @@ class DatabricksPath:
         if self._workspace is None:
             from .workspace import Workspace
 
-            return Workspace()
+            self._workspace = Workspace()
         return self._workspace
 
     @workspace.setter
@@ -329,13 +369,15 @@ class DatabricksPath:
             return CsvFileFormat()
         elif ext == "json":
             return JsonFileFormat()
+        elif ext in {"xlsx", "xlsm", "xls"}:
+            return ExcelFileFormat()
         else:
             raise ValueError(
                 "Cannot get file format from extension %s" % ext
             )
 
     @property
-    def content_length(self):
+    def content_length(self) -> int:
         """Return the size of the path in bytes if known.
 
         Returns:
@@ -343,10 +385,10 @@ class DatabricksPath:
         """
         if self._size is None:
             self.refresh_status()
-        return self._size
+        return self._size or 0
 
     @content_length.setter
-    def content_length(self, value: int):
+    def content_length(self, value: Optional[int]):
         self._size = value
 
     @property
@@ -389,6 +431,10 @@ class DatabricksPath:
             size=self.content_length,
         )
 
+    @property
+    def is_local(self):
+        return False
+
     def is_file(self):
         """Return True when the path is a file.
 
@@ -415,7 +461,16 @@ class DatabricksPath:
         Returns:
             True if the path represents a directory sink.
         """
-        return self.is_dir() or (self.parts and self.parts[-1] == "")
+        if self.is_dir():
+            return True
+
+        if self.is_file():
+            return False
+
+        if self.parts and self.parts[-1] == "":
+            return True
+
+        return not "." in self.name
 
     @property
     def connected(self) -> bool:
@@ -442,7 +497,33 @@ class DatabricksPath:
         return self
 
     def close(self):
-        pass
+        if self.temporary:
+            self.remove(recursive=True)
+
+    def storage_location(self) -> str:
+        info = self.volume_info()
+
+        if info is None:
+            raise NotFound(
+                "Volume %s not found" % repr(self)
+            )
+
+        _, _, _, parts = self.volume_parts()
+
+        base = info.storage_location.rstrip("/")  # avoid trailing slash
+        return f"{base}/{'/'.join(parts)}" if parts else base
+
+
+    def volume_info(self) -> Optional["VolumeInfo"]:
+        if self._volume_info is None and self.kind == DatabricksPathKind.VOLUME:
+            catalog, schema, volume, _ = self.volume_parts()
+
+            if catalog and schema and volume:
+                self._volume_info = get_volume_metadata(
+                    sdk=self.workspace.sdk(),
+                    full_name="%s.%s.%s" % (catalog, schema, volume)
+                )
+        return self._volume_info
 
     def volume_parts(self) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[PurePosixPath]]:
         """Return (catalog, schema, volume, rel_path) for volume paths.
@@ -457,8 +538,6 @@ class DatabricksPath:
         schema = self.parts[1] if len(self.parts) > 1 and self.parts[1] else None
         volume = self.parts[2] if len(self.parts) > 2 and self.parts[2] else None
 
-        # NOTE: rel is used as a true/false “has relative path” indicator in this file.
-        # The runtime value is a list[str] (not PurePosixPath). Keeping it that way to avoid behavior changes.
         return catalog, schema, volume, self.parts[3:]  # type: ignore[return-value]
 
     def refresh_status(self) -> "DatabricksPath":
@@ -479,30 +558,20 @@ class DatabricksPath:
         full_path = self.files_full_path()
         sdk = self.workspace.sdk()
 
-        try:
-            info = sdk.files.get_metadata(full_path)
+        is_file, is_dir, size, mtime = get_volume_status(
+            sdk=sdk,
+            full_path=full_path,
+            check_file_first="." in self.name,
+            raise_error=False
+        )
 
-            mtime = (
-                dt.datetime.strptime(info.last_modified, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=dt.timezone.utc)
-                if info.last_modified
-                else None
-            )
-
-            return self.reset_metadata(is_file=True, is_dir=False, size=info.content_length, mtime=mtime)
-        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
-
-        try:
-            info = sdk.files.get_directory_metadata(full_path)
-            mtime = (
-                dt.datetime.strptime(info.last_modified, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=dt.timezone.utc)
-                if info.last_modified
-                else None
-            )
-
-            return self.reset_metadata(is_file=False, is_dir=True, size=info, mtime=mtime)
-        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
+        self.reset_metadata(
+            is_file=is_file,
+            is_dir=is_dir,
+            size=size,
+            mtime=mtime,
+            volume_info=self._volume_info
+        )
 
         return self
 
@@ -515,15 +584,18 @@ class DatabricksPath:
             is_file = not is_dir
             size = info.size
             mtime = float(info.modified_at) / 1000.0 if info.modified_at is not None else None
-        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            found = next(self.ls(fetch_size=1, recursive=False, allow_not_found=True), None)
-            size = 0
-            mtime = found.mtime if found is not None else None
 
-            if found is None:
-                is_file, is_dir = None, None
-            else:
-                is_file, is_dir = False, True
+            return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
+        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
+            pass
+
+        found = next(self.ls(fetch_size=1, recursive=False, allow_not_found=True), None)
+        size = None
+
+        if found is None:
+            is_file, is_dir, mtime = None, None, None
+        else:
+            is_file, is_dir, mtime = False, True, found.mtime
 
         return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
 
@@ -535,17 +607,23 @@ class DatabricksPath:
             is_file, is_dir = not info.is_dir, info.is_dir
             size = info.file_size
             mtime = info.modification_time / 1000.0 if info.modification_time else None
+
+            return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            found = next(self.ls(fetch_size=1, recursive=False, allow_not_found=True), None)
-            size = 0
-            mtime = found.mtime if found is not None else None
+            pass
 
-            if found is None:
-                is_file, is_dir = None, None
-            else:
-                is_file, is_dir = False, True
+        found = next(self.ls(fetch_size=1, recursive=False, allow_not_found=True), None)
+        size = None
+        mtime = found.mtime if found is not None else None
 
-        return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
+        if found is None:
+            is_file, is_dir = None, None
+        else:
+            is_file, is_dir = False, True
+
+        return self.reset_metadata(
+            is_file=is_file, is_dir=is_dir, size=size, mtime=mtime
+        )
 
     def reset_metadata(
         self,
@@ -553,6 +631,7 @@ class DatabricksPath:
         is_dir: Optional[bool] = None,
         size: Optional[int] = None,
         mtime: Optional[float] = None,
+        volume_info: Optional["VolumeInfo"] = None
     ):
         """Update cached metadata fields.
 
@@ -561,6 +640,7 @@ class DatabricksPath:
             is_dir: Optional directory flag.
             size: Optional size in bytes.
             mtime: Optional modification time in seconds.
+            volume_info: volume metadata
 
         Returns:
             The DatabricksPath instance.
@@ -569,10 +649,13 @@ class DatabricksPath:
         self._is_dir = is_dir
         self._size = size
         self._mtime = mtime
+        self._volume_info = volume_info
 
         return self
 
     # ---- API path normalization helpers ----
+    def full_parts(self):
+        return self.parts if self.parts[-1] else self.parts[:-1]
 
     def workspace_full_path(self) -> str:
         """Return the full workspace path string.
@@ -580,12 +663,7 @@ class DatabricksPath:
         Returns:
             Workspace path string.
         """
-        if not self.parts:
-            return "/Workspace"
-
-        parts = self.parts if self.parts[-1] else self.parts[:-1]
-
-        return "/Workspace/%s" % "/".join(parts)
+        return "/Workspace/%s" % "/".join(self.full_parts())
 
     def dbfs_full_path(self) -> str:
         """Return the full DBFS path string.
@@ -593,12 +671,7 @@ class DatabricksPath:
         Returns:
             DBFS path string.
         """
-        if not self.parts:
-            return "/dbfs"
-
-        parts = self.parts if self.parts[-1] else self.parts[:-1]
-
-        return "/dbfs/%s" % "/".join(parts)
+        return "/dbfs/%s" % "/".join(self.full_parts())
 
     def files_full_path(self) -> str:
         """Return the full files (volume) path string.
@@ -606,12 +679,7 @@ class DatabricksPath:
         Returns:
             Volume path string.
         """
-        if not self.parts:
-            return "/Volumes"
-
-        parts = self.parts if self.parts[-1] else self.parts[:-1]
-
-        return "/Volumes/%s" % "/".join(parts)
+        return "/Volumes/%s" % "/".join(self.full_parts())
 
     def exists(self, *, follow_symlinks=True) -> bool:
         """Return True if the path exists.
@@ -622,7 +690,13 @@ class DatabricksPath:
         Returns:
             True if the path exists.
         """
-        return bool(self.is_file() or self.is_dir())
+        if self.is_file():
+            return True
+
+        elif self.is_dir():
+            return True
+
+        return False
 
     def mkdir(self, mode=None, parents=True, exist_ok=True):
         """Create a directory for the path.
@@ -635,54 +709,57 @@ class DatabricksPath:
         Returns:
             The DatabricksPath instance.
         """
-        try:
-            if self.kind == DatabricksPathKind.WORKSPACE:
-                self.make_workspace_dir(parents=parents, exist_ok=exist_ok)
-            elif self.kind == DatabricksPathKind.VOLUME:
-                self.make_volume_dir(parents=parents, exist_ok=exist_ok)
-            elif self.kind == DatabricksPathKind.DBFS:
-                self.make_dbfs_dir(parents=parents, exist_ok=exist_ok)
-        except (NotFound, ResourceDoesNotExist):
-            if not parents or self.parent == self:
-                raise
-
-            self.parent.mkdir(parents=True, exist_ok=True)
-            self.mkdir(parents=False, exist_ok=exist_ok)
-        except (AlreadyExists, ResourceAlreadyExists):
-            if not exist_ok:
-                raise
+        if self.kind == DatabricksPathKind.WORKSPACE:
+            self.make_workspace_dir(parents=parents, exist_ok=exist_ok)
+        elif self.kind == DatabricksPathKind.VOLUME:
+            self.make_volume_dir(parents=parents, exist_ok=exist_ok)
+        elif self.kind == DatabricksPathKind.DBFS:
+            self.make_dbfs_dir(parents=parents, exist_ok=exist_ok)
 
         return self
 
     def _ensure_volume(self, exist_ok: bool = True, sdk=None):
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
         sdk = self.workspace.sdk() if sdk is None else sdk
+        default_tags = self.workspace.default_tags()
 
         if catalog_name:
             try:
-                sdk.catalogs.create(name=catalog_name)
+                sdk.catalogs.create(
+                    name=catalog_name,
+                    properties=default_tags,
+                    comment="Catalog auto generated by yggdrasil"
+                )
             except (AlreadyExists, ResourceAlreadyExists, PermissionDenied, BadRequest):
                 if not exist_ok:
                     raise
 
         if schema_name:
             try:
-                sdk.schemas.create(catalog_name=catalog_name, name=schema_name)
+                sdk.schemas.create(
+                    catalog_name=catalog_name,
+                    name=schema_name,
+                    properties=default_tags,
+                    comment="Schema auto generated by yggdrasil"
+                )
             except (AlreadyExists, ResourceAlreadyExists, PermissionDenied, BadRequest):
                 if not exist_ok:
                     raise
 
         if volume_name:
             try:
-                sdk.volumes.create(
+                self._volume_info = sdk.volumes.create(
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     name=volume_name,
                     volume_type=VolumeType.MANAGED,
+                    comment="Volume auto generated by yggdrasil"
                 )
             except (AlreadyExists, ResourceAlreadyExists, BadRequest):
                 if not exist_ok:
                     raise
+
+        return self._volume_info
 
     def make_volume_dir(self, parents=True, exist_ok=True):
         path = self.files_full_path()
@@ -729,7 +806,10 @@ class DatabricksPath:
 
         return self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
 
-    def remove(self, recursive: bool = True):
+    def remove(
+        self,
+        recursive: bool = True
+    ):
         """Remove the path as a file or directory.
 
         Args:
@@ -760,111 +840,182 @@ class DatabricksPath:
             return self._remove_dbfs_file()
         return self._remove_dbfs_dir(recursive=recursive)
 
-    def rmfile(self):
+    def rmfile(self, allow_not_found: bool = True):
         """Remove the path as a file.
 
         Returns:
             The DatabricksPath instance.
         """
-        try:
-            if self.kind == DatabricksPathKind.VOLUME:
-                return self._remove_volume_file()
-            elif self.kind == DatabricksPathKind.WORKSPACE:
-                return self._remove_workspace_file()
-            elif self.kind == DatabricksPathKind.DBFS:
-                return self._remove_dbfs_file()
-        finally:
-            self.reset_metadata()
+        if self.kind == DatabricksPathKind.VOLUME:
+            self._remove_volume_file(allow_not_found=allow_not_found)
+        elif self.kind == DatabricksPathKind.WORKSPACE:
+            self._remove_workspace_file(allow_not_found=allow_not_found)
+        elif self.kind == DatabricksPathKind.DBFS:
+            self._remove_dbfs_file(allow_not_found=allow_not_found)
+
         return self
 
-    def _remove_volume_file(self):
+    def _remove_volume_file(self, allow_not_found: bool = True):
         sdk = self.workspace.sdk()
         try:
             sdk.files.delete(self.files_full_path())
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
+            if not allow_not_found:
+                raise
+        finally:
+            self.reset_metadata()
+
         return self
 
-    def _remove_workspace_file(self):
+    def _remove_workspace_file(self, allow_not_found: bool = True):
         sdk = self.workspace.sdk()
         try:
             sdk.workspace.delete(self.workspace_full_path(), recursive=True)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
+            if not allow_not_found:
+                raise
+        finally:
+            self.reset_metadata()
+
         return self
 
-    def _remove_dbfs_file(self):
+    def _remove_dbfs_file(self, allow_not_found: bool = True):
         sdk = self.workspace.sdk()
         try:
             sdk.dbfs.delete(self.dbfs_full_path(), recursive=True)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
+            if not allow_not_found:
+                raise
+        finally:
+            self.reset_metadata()
+
         return self
 
-    def rmdir(self, recursive: bool = True):
+    def rmdir(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True
+    ):
         """Remove the path as a directory.
 
         Args:
             recursive: Whether to delete directories recursively.
+            allow_not_found: Allow not found location
+            with_root: Delete also dir object
 
         Returns:
             The DatabricksPath instance.
         """
         if self.kind == DatabricksPathKind.VOLUME:
-            return self._remove_volume_dir(recursive=recursive)
+            return self._remove_volume_dir(
+                recursive=recursive,
+                allow_not_found=allow_not_found,
+                with_root=with_root
+            )
         elif self.kind == DatabricksPathKind.WORKSPACE:
-            return self._remove_workspace_dir(recursive=recursive)
+            return self._remove_workspace_dir(
+                recursive=recursive,
+                allow_not_found=allow_not_found,
+                with_root=with_root
+            )
         elif self.kind == DatabricksPathKind.DBFS:
-            return self._remove_dbfs_dir(recursive=recursive)
+            return self._remove_dbfs_dir(
+                recursive=recursive,
+                allow_not_found=allow_not_found,
+                with_root=with_root
+            )
 
-    def _remove_workspace_dir(self, recursive: bool = True):
+    def _remove_workspace_dir(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True
+    ):
         sdk = self.workspace.sdk()
+        full_path =self.workspace_full_path()
+
         try:
-            sdk.workspace.delete(self.workspace_full_path(), recursive=recursive)
+            sdk.workspace.delete(full_path, recursive=recursive)
+
+            if not with_root:
+                sdk.workspace.mkdirs(full_path)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
-        self.reset_metadata()
+            if not allow_not_found:
+                raise
+        finally:
+            self.reset_metadata()
+
         return self
 
-    def _remove_dbfs_dir(self, recursive: bool = True):
+    def _remove_dbfs_dir(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True
+    ):
         sdk = self.workspace.sdk()
+        full_path = self.dbfs_full_path()
+
         try:
-            sdk.dbfs.delete(self.dbfs_full_path(), recursive=recursive)
+            sdk.dbfs.delete(full_path, recursive=recursive)
+
+            if not with_root:
+                sdk.dbfs.mkdirs(full_path)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-            pass
-        self.reset_metadata()
+            if not allow_not_found:
+                raise
+        finally:
+            self.reset_metadata()
+
         return self
 
-    def _remove_volume_dir(self, recursive: bool = True):
-        root_path = self.files_full_path()
+    def _remove_volume_dir(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True
+    ):
+        full_path = self.files_full_path()
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
         sdk = self.workspace.sdk()
 
         if rel:
             try:
-                sdk.files.delete_directory(root_path)
+                sdk.files.delete_directory(full_path)
             except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied) as e:
                 message = str(e)
+
                 if recursive and "directory is not empty" in message:
                     for child_path in self.ls():
                         child_path._remove_volume_obj(recursive=True)
-                    sdk.files.delete_directory(root_path)
-                else:
-                    pass
+
+                    if with_root:
+                        sdk.files.delete_directory(full_path)
+
+                elif not allow_not_found:
+                    raise
         elif volume_name:
             try:
                 sdk.volumes.delete(f"{catalog_name}.{schema_name}.{volume_name}")
             except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-                pass
+                if not allow_not_found:
+                    raise
         elif schema_name:
             try:
                 sdk.schemas.delete(f"{catalog_name}.{schema_name}", force=True)
             except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
-                pass
+                if not allow_not_found:
+                    raise
 
         return self.reset_metadata()
 
-    def ls(self, recursive: bool = False, fetch_size: int = None, allow_not_found: bool = True):
+    def ls(
+        self,
+        recursive: bool = False,
+        fetch_size: int = None,
+        allow_not_found: bool = True
+    ):
         """List directory contents for the path.
 
         Args:
@@ -876,11 +1027,21 @@ class DatabricksPath:
             DatabricksPath entries.
         """
         if self.kind == DatabricksPathKind.VOLUME:
-            yield from self._ls_volume(recursive=recursive, fetch_size=fetch_size, allow_not_found=allow_not_found)
+            yield from self._ls_volume(
+                recursive=recursive,
+                fetch_size=fetch_size,
+                allow_not_found=allow_not_found
+            )
         elif self.kind == DatabricksPathKind.WORKSPACE:
-            yield from self._ls_workspace(recursive=recursive, allow_not_found=allow_not_found)
+            yield from self._ls_workspace(
+                recursive=recursive,
+                allow_not_found=allow_not_found
+            )
         elif self.kind == DatabricksPathKind.DBFS:
-            yield from self._ls_dbfs(recursive=recursive, allow_not_found=allow_not_found)
+            yield from self._ls_dbfs(
+                recursive=recursive,
+                allow_not_found=allow_not_found
+            )
 
     def _ls_volume(self, recursive: bool = False, fetch_size: int = None, allow_not_found: bool = True):
         catalog_name, schema_name, volume_name, rel = self.volume_parts()
@@ -898,6 +1059,7 @@ class DatabricksPath:
                             _is_dir=True,
                             _size=0,
                         )
+
                         if recursive:
                             yield from base._ls_volume(recursive=recursive)
                         else:
@@ -1038,7 +1200,7 @@ class DatabricksPath:
         Returns:
             None.
         """
-        if self.is_file() and dest.is_file():
+        if self.is_file():
             with self.open(mode="rb") as src:
                 src.copy_to(dest=dest)
 
@@ -1062,6 +1224,29 @@ class DatabricksPath:
 
         else:
             raise FileNotFoundError(f"Path {self} does not exist, or dest is not same file or folder type")
+
+    def write_bytes(self, data: bytes):
+        if hasattr(data, "read"):
+            data = data.read()
+
+        with self.open("wb") as f:
+            f.write_all_bytes(data=data)
+
+    def temporary_credentials(
+        self,
+        operation: Optional["PathOperation"] = None
+    ):
+        if self.kind != DatabricksPathKind.VOLUME:
+            raise ValueError(f"Cannot generate temporary credentials for {repr(self)}")
+
+        sdk = self.workspace.sdk()
+        client = sdk.temporary_path_credentials
+        url = self.storage_location()
+
+        return client.generate_temporary_path_credentials(
+            url=url,
+            operation=operation or PathOperation.PATH_READ,
+        )
 
     # -------------------------
     # Data ops (Arrow / Pandas / Polars)
@@ -1108,9 +1293,10 @@ class DatabricksPath:
         """
         if self.is_file():
             with self.open("rb") as f:
-                return f.read_arrow_table(batch_size=batch_size, **kwargs)
+                data = f.read_arrow_table(batch_size=batch_size, **kwargs)
+            return data
 
-        if self.is_dir():
+        elif self.is_dir():
             tables: list[pa.Table] = []
             for child in self.ls(recursive=True):
                 if child.is_file():
@@ -1126,7 +1312,7 @@ class DatabricksPath:
 
             try:
                 return pa.concat_tables(tables)
-            except Exception:
+            except ArrowInvalid:
                 # Fallback: concat via polars (diagonal relaxed) then back to Arrow
                 from polars import CompatLevel
 
@@ -1195,17 +1381,20 @@ class DatabricksPath:
 
                 return connected
 
-            connected.open(mode="wb", clone=False).write_arrow_table(
-                table,
-                file_format=file_format,
-                batch_size=batch_size,
-                **kwargs
-            )
+            else:
+                with connected.open(mode="wb", clone=False) as f:
+                    f.write_arrow_table(
+                        table,
+                        file_format=file_format,
+                        batch_size=batch_size,
+                        **kwargs
+                    )
 
         return self
 
     def read_pandas(
         self,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         concat: bool = True,
         **kwargs
@@ -1213,6 +1402,7 @@ class DatabricksPath:
         """Read the path into a pandas DataFrame.
 
         Args:
+            file_format: Optional file format override.
             batch_size: Optional batch size for reads.
             concat: Whether to concatenate results for directories.
             **kwargs: Format-specific options.
@@ -1221,14 +1411,26 @@ class DatabricksPath:
             A pandas DataFrame or list of DataFrames if concat=False.
         """
         if concat:
-            return self.read_arrow_table(batch_size=batch_size, concat=True, **kwargs).to_pandas()
+            return self.read_arrow_table(
+                file_format=file_format,
+                batch_size=batch_size,
+                concat=True,
+                **kwargs
+            ).to_pandas()
 
-        tables = self.read_arrow_table(batch_size=batch_size, concat=False, **kwargs)
+        tables = self.read_arrow_table(
+            batch_size=batch_size,
+            file_format=file_format,
+            concat=False,
+            **kwargs
+        )
+
         return [t.to_pandas() for t in tables]  # type: ignore[arg-type]
 
     def write_pandas(
         self,
-        df,
+        df: PandasDataFrame,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         **kwargs
     ):
@@ -1236,13 +1438,41 @@ class DatabricksPath:
 
         Args:
             df: pandas DataFrame to write.
+            file_format: Optional file format override.
             batch_size: Optional batch size for writes.
             **kwargs: Format-specific options.
 
         Returns:
             The DatabricksPath instance.
         """
-        return self.write_arrow_table(pa.table(df), batch_size=batch_size, **kwargs)
+        with self.connect(clone=False) as connected:
+            if connected.is_dir_sink():
+                seed = int(time.time() * 1000)
+
+                def df_batches(pdf, bs: int):
+                    for start in range(0, len(pdf), batch_size):
+                        yield pdf.iloc[start:start + batch_size]
+
+                for i, batch in enumerate(df_batches(df, batch_size)):
+                    part_path = connected / f"{seed}-{i:05d}-{_rand_str(4)}.parquet"
+
+                    with part_path.open(mode="wb", clone=False) as f:
+                        f.write_pandas(
+                            batch,
+                            file_format=file_format,
+                            batch_size=batch_size,
+                            **kwargs
+                        )
+            else:
+                with connected.open(mode="wb", clone=False) as f:
+                    f.write_pandas(
+                        df,
+                        file_format=file_format,
+                        batch_size=batch_size,
+                        **kwargs
+                    )
+
+        return self
 
     def read_polars(
         self,
@@ -1264,13 +1494,12 @@ class DatabricksPath:
         Returns:
             A polars DataFrame or list of DataFrames if concat=False.
         """
-        import polars as pl
-
         if self.is_file():
             with self.open("rb") as f:
-                return f.read_polars(batch_size=batch_size, **kwargs)
+                df = f.read_polars(batch_size=batch_size, **kwargs)
+            return df
 
-        if self.is_dir():
+        elif self.is_dir():
             dfs = []
             for child in self.ls(recursive=True):
                 if child.is_file():
@@ -1278,17 +1507,19 @@ class DatabricksPath:
                         dfs.append(f.read_polars(batch_size=batch_size, **kwargs))
 
             if not dfs:
-                return pl.DataFrame()
+                return polars.DataFrame()
 
             if concat:
-                return pl.concat(dfs, how=how, rechunk=rechunk)
+                return polars.concat(dfs, how=how, rechunk=rechunk)
             return dfs  # type: ignore[return-value]
 
-        raise FileNotFoundError(f"Path does not exist: {self}")
+        else:
+            raise FileNotFoundError(f"Path does not exist: {self}")
 
     def write_polars(
         self,
         df,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         **kwargs
     ):
@@ -1303,6 +1534,7 @@ class DatabricksPath:
 
         Args:
             df: polars DataFrame or LazyFrame to write.
+            file_format: Optional file format override.
             batch_size: Optional rows per part for directory sinks.
             **kwargs: Format-specific options.
 
@@ -1312,13 +1544,8 @@ class DatabricksPath:
         Notes:
         - If `df` is a LazyFrame, we collect it first (optionally streaming).
         """
-        import polars as pl
-
-        if isinstance(df, pl.LazyFrame):
+        if isinstance(df, polars.LazyFrame):
             df = df.collect()
-
-        if not isinstance(df, pl.DataFrame):
-            raise TypeError(f"write_polars expects pl.DataFrame or pl.LazyFrame, got {type(df)!r}")
 
         with self.connect() as connected:
             if connected.is_dir_sink():
@@ -1329,14 +1556,23 @@ class DatabricksPath:
                 for i, chunk in enumerate(df.iter_slices(n_rows=rows_per_part)):
                     part_path = connected / f"part-{i:05d}-{seed}-{_rand_str(4)}.parquet"
 
-                    part_path.write_polars(chunk, **kwargs)
+                    with part_path.open(mode="wb", clone=False) as f:
+                        f.write_polars(
+                            df,
+                            file_format=file_format,
+                            batch_size=batch_size,
+                            **kwargs
+                        )
+            else:
+                with connected.open(mode="wb", clone=False) as f:
+                    f.write_polars(
+                        df,
+                        file_format=file_format,
+                        batch_size=batch_size,
+                        **kwargs
+                    )
 
-                return connected
-
-            # Single file write: format/extension is handled in DatabricksIO.write_polars
-            connected.write_polars(df, **kwargs)
-
-            return connected
+        return self
 
     def sql(
         self,
@@ -1364,7 +1600,7 @@ class DatabricksPath:
         if from_table not in query:
             raise ValueError(
                 "SQL query must contain %s to execute query:\n%s" % (
-                    from_table,
+                    repr(from_table),
                     query
                 )
             )
@@ -1372,19 +1608,26 @@ class DatabricksPath:
         if engine == "duckdb":
             import duckdb
 
-            __arrow_table__ = self.read_arrow_table()
+            __arrow_dataset__ = self.arrow_dataset()
 
             return (
                 duckdb.connect()
-                .execute(query=query.replace(from_table, "__arrow_table__"))
+                .execute(
+                    query=query.replace(from_table, "__arrow_dataset__")
+                )
                 .fetch_arrow_table()
             )
         elif engine == "polars":
             from polars import CompatLevel
 
+            table_name = "__dbpath__"
+
             return (
                 self.read_polars()
-                .sql(query=query.replace(from_table, "self"))
+                .sql(
+                    query=query.replace(from_table, table_name),
+                    table_name=table_name
+                )
                 .to_arrow(compat_level=CompatLevel.newest())
             )
         else:
@@ -1393,23 +1636,32 @@ class DatabricksPath:
             )
 
 
-@register_converter(DatabricksPath, pa.Table)
-def databricks_path_to_arrow_table(
-    data: DatabricksPath,
-    options: Optional[CastOptions] = None,
-) -> pa.Table:
-    return cast_arrow_tabular(
-        data.read_arrow_table(),
-        options
-    )
+if databricks is not None:
+    @register_converter(DatabricksPath, pa.Table)
+    def databricks_path_to_arrow_table(
+        data: DatabricksPath,
+        options: Optional[CastOptions] = None,
+    ) -> pa.Table:
+        return cast_arrow_tabular(
+            data.read_arrow_table(),
+            options
+        )
 
 
-@polars_converter(DatabricksPath, PolarsDataFrame)
-def databricks_path_to_polars(
-    data: DatabricksPath,
-    options: Optional[CastOptions] = None,
-) -> PolarsDataFrame:
-    return cast_polars_dataframe(
-        data.read_polars(),
-        options
-    )
+    @register_converter(DatabricksPath, ds.Dataset)
+    def databricks_path_to_arrow_table(
+        data: DatabricksPath,
+        options: Optional[CastOptions] = None,
+    ) -> ds.Dataset:
+        return data.arrow_dataset()
+
+
+    @polars_converter(DatabricksPath, PolarsDataFrame)
+    def databricks_path_to_polars(
+        data: DatabricksPath,
+        options: Optional[CastOptions] = None,
+    ) -> PolarsDataFrame:
+        return cast_polars_dataframe(
+            data.read_polars(),
+            options
+        )

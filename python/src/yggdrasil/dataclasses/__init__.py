@@ -1,5 +1,3 @@
 """Enhanced dataclass helpers with Arrow awareness."""
 
-from .dataclass import yggdataclass
-
-__all__ = ["yggdataclass"]
+from .dataclass import get_dataclass_arrow_field

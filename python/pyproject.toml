@@ -1,17 +1,16 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+# bump setuptools so type-info files are handled sanely
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.1.47"
+version = "0.1.52"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors = [
-  { name = "Yggdrasil contributors" },
-]
+authors = [{ name = "Yggdrasil contributors" }]
 keywords = ["arrow", "polars", "pandas", "spark", "databricks", "typing", "dataclass", "serialization"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -42,6 +41,8 @@ dev = [
   "black",
   "ruff",
   "mypy",
+  "build",
+  "twine",
 ]
 
 [project.scripts]
@@ -55,9 +56,15 @@ Documentation = "https://github.com/Platob/Yggdrasil/tree/main/python/docs"
 [tool.setuptools]
 package-dir = { "" = "src" }
 license-files = ["LICENSE"]
-
-[tool.uv]
-native-tls = true
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# If your import package is yggdrasil (seems likely from yggenv entrypoint),
+# ship the PEP 561 marker file. Put `py.typed` inside src/yggdrasil/
+[tool.setuptools.package-data]
+yggdrasil = ["py.typed"]
+
+[tool.uv]
+native-tls = true

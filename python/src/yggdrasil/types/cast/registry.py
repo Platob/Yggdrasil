@@ -68,20 +68,6 @@ def register_converter(
         Returns:
             Registered converter.
         """
-        sig = inspect.signature(func)
-        params = list(sig.parameters.values())
-        if any(
-            param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
-            for param in params
-        ):
-            raise TypeError(
-                "Converters must accept exactly two positional arguments: (value, options)"
-            )
-
-        if len(params) < 2:
-            raise TypeError(
-                "Converters must accept at least two positional arguments: (value, options)"
-            )
 
         if from_hint in (Any, object):
             _any_registry[to_hint] = func

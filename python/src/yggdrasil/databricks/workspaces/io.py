@@ -9,13 +9,18 @@ from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
-from pyarrow.dataset import FileFormat, ParquetFileFormat, CsvFileFormat
+from Lib.threading import Thread
+from pyarrow.dataset import (
+    FileFormat,
+    ParquetFileFormat, CsvFileFormat,
+)
 
 from .path_kind import DatabricksPathKind
 from ...libs.databrickslib import databricks
-from ...types.cast.pandas_cast import PandasDataFrame
-from ...types.cast.polars_pandas_cast import PolarsDataFrame
+from ...libs.pandaslib import PandasDataFrame
+from ...libs.polarslib import polars, PolarsDataFrame
 from ...types.cast.registry import convert
+from ...types.file_format import ExcelFileFormat
 
 if databricks is not None:
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat
@@ -42,7 +47,6 @@ class DatabricksIO(ABC, IO):
         path: "DatabricksPath",
         mode: str,
         encoding: Optional[str] = None,
-        compression: Optional[str] = "detect",
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ):
@@ -50,7 +54,6 @@ class DatabricksIO(ABC, IO):
 
         self.encoding = encoding
         self.mode = mode
-        self.compression = compression
 
         self.path = path
 
@@ -68,7 +71,10 @@ class DatabricksIO(ABC, IO):
         self.close()
 
     def __del__(self):
-        self.close()
+        try:
+            Thread(target=self.close).start()
+        except BaseException:
+            pass
 
     def __next__(self):
         """Iterate over lines in the file."""
@@ -77,8 +83,11 @@ class DatabricksIO(ABC, IO):
             raise StopIteration
         return line
 
+    def __len__(self):
+        return self.content_length or 0
+
     def __iter__(self):
-        return self
+        return self.read_all_bytes().__iter__()
 
     def __hash__(self):
         return self.path.__hash__()
@@ -89,7 +98,6 @@ class DatabricksIO(ABC, IO):
         path: "DatabricksPath",
         mode: str,
         encoding: Optional[str] = None,
-        compression: Optional[str] = "detect",
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ) -> "DatabricksIO":
@@ -99,7 +107,6 @@ class DatabricksIO(ABC, IO):
             path: DatabricksPath to open.
             mode: File mode string.
             encoding: Optional text encoding for text mode.
-            compression: Optional compression mode.
             position: Initial file cursor position.
             buffer: Optional pre-seeded buffer.
 
@@ -111,7 +118,6 @@ class DatabricksIO(ABC, IO):
                 path=path,
                 mode=mode,
                 encoding=encoding,
-                compression=compression,
                 position=position,
                 buffer=buffer,
             )
@@ -120,7 +126,6 @@ class DatabricksIO(ABC, IO):
                 path=path,
                 mode=mode,
                 encoding=encoding,
-                compression=compression,
                 position=position,
                 buffer=buffer,
             )
@@ -129,7 +134,6 @@ class DatabricksIO(ABC, IO):
                 path=path,
                 mode=mode,
                 encoding=encoding,
-                compression=compression,
                 position=position,
                 buffer=buffer,
             )
@@ -175,6 +179,10 @@ class DatabricksIO(ABC, IO):
     def content_length(self) -> int:
         return self.path.content_length
 
+    @content_length.setter
+    def content_length(self, value: int):
+        self.path.content_length = value
+
     def size(self):
         """Return the size of the file in bytes.
 
@@ -182,10 +190,6 @@ class DatabricksIO(ABC, IO):
             The file size in bytes.
         """
         return self.content_length
-
-    @content_length.setter
-    def content_length(self, value: int):
-        self.path.content_length = value
 
     @property
     def buffer(self):
@@ -209,9 +213,7 @@ class DatabricksIO(ABC, IO):
         Returns:
             None.
         """
-        if self._buffer is not None:
-            self._buffer.close()
-            self._buffer = None
+        self._buffer = None
 
     def clone_instance(self, **kwargs):
         """Clone this IO instance with optional overrides.
@@ -226,7 +228,6 @@ class DatabricksIO(ABC, IO):
             path=kwargs.get("path", self.path),
             mode=kwargs.get("mode", self.mode),
             encoding=kwargs.get("encoding", self.encoding),
-            compression=kwargs.get("compression", self.compression),
             position=kwargs.get("position", self.position),
             buffer=kwargs.get("buffer", self._buffer),
         )
@@ -257,15 +258,22 @@ class DatabricksIO(ABC, IO):
         self.path = path
         return self
 
-    def close(self):
+    def close(self, flush: bool = True):
         """Flush pending writes and close the buffer.
+
+        Args:
+            flush: Checks flush data to commit to remote location
 
         Returns:
             None.
         """
-        self.flush()
-        if self._buffer is not None:
-            self._buffer.close()
+        if flush:
+            self.flush()
+        self.clear_buffer()
+
+    @property
+    def closed(self):
+        return False
 
     def fileno(self):
         """Return a pseudo file descriptor based on object hash.
@@ -403,9 +411,6 @@ class DatabricksIO(ABC, IO):
         Returns:
             The read bytes or string depending on mode.
         """
-        if not self.readable():
-            raise IOError("File not open for reading")
-
         current_position = self.position
         all_data = self.read_all_bytes(use_cache=use_cache)
 
@@ -431,9 +436,6 @@ class DatabricksIO(ABC, IO):
         Returns:
             The next line as bytes or string.
         """
-        if not self.readable():
-            raise IOError("File not open for reading")
-
         if self.encoding:
             # Text-mode: accumulate characters
             out_chars = []
@@ -475,9 +477,6 @@ class DatabricksIO(ABC, IO):
         Returns:
             A list of lines.
         """
-        if not self.readable():
-            raise IOError("File not open for reading")
-
         lines = []
         total = 0
 
@@ -491,14 +490,6 @@ class DatabricksIO(ABC, IO):
                 break
 
         return lines
-
-    def appendable(self):
-        """Return True when the file is open in append mode.
-
-        Returns:
-            True if in append mode.
-        """
-        return "a" in self.mode
 
     def writable(self):
         """Return True to indicate write support.
@@ -532,14 +523,14 @@ class DatabricksIO(ABC, IO):
         if size is None:
             size = self.position
 
-        if self._buffer is not None:
-            self._buffer.truncate(size)
-        else:
-            data = b"\x00" * size
-            self.write_all_bytes(data=data)
+        if self._buffer is None:
+            return self.write_all_bytes(data=b"\x00" * size)
+
+        self._buffer.truncate(size)
 
         self.content_length = size
         self._write_flag = True
+
         return size
 
     def flush(self):
@@ -561,9 +552,6 @@ class DatabricksIO(ABC, IO):
         Returns:
             The number of bytes written.
         """
-        if not self.writable():
-            raise IOError("File not open for writing")
-
         if isinstance(data, str):
             data = data.encode(self.encoding or "utf-8")
 
@@ -615,15 +603,19 @@ class DatabricksIO(ABC, IO):
         Returns:
             None.
         """
-        if not isinstance(dest, DatabricksIO):
+        data = self.read_all_bytes(use_cache=False)
+
+        if isinstance(dest, DatabricksIO):
+            dest.write_all_bytes(data=data)
+        elif hasattr(dest, "write"):
+            dest.write(data)
+        else:
             from .path import DatabricksPath
 
             dest_path = DatabricksPath.parse(dest, workspace=self.workspace)
 
             with dest_path.open(mode="wb") as d:
                 return self.copy_to(dest=d)
-
-        dest.write_all_bytes(data=self.read_all_bytes(use_cache=False))
 
     # ---- format helpers ----
 
@@ -643,7 +635,6 @@ class DatabricksIO(ABC, IO):
         table: Union[pa.Table, pa.RecordBatch, PolarsDataFrame, PandasDataFrame],
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write a table-like object to the path using an inferred format.
 
@@ -651,21 +642,24 @@ class DatabricksIO(ABC, IO):
             table: Table-like object to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             The result of the specific write implementation.
         """
         if isinstance(table, pa.Table):
-            return self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
+            return self.write_arrow_table(table, file_format=file_format, batch_size=batch_size)
         elif isinstance(table, pa.RecordBatch):
-            return self.write_arrow_batch(table, file_format=file_format, batch_size=batch_size, **kwargs)
+            return self.write_arrow_batch(table, file_format=file_format, batch_size=batch_size)
         elif isinstance(table, PolarsDataFrame):
-            return self.write_polars(table, file_format=file_format, batch_size=batch_size, **kwargs)
+            return self.write_polars(table, file_format=file_format, batch_size=batch_size)
         elif isinstance(table, PandasDataFrame):
-            return self.write_pandas(table, file_format=file_format, batch_size=batch_size, **kwargs)
-        else:
-            raise ValueError(f"Cannot write {type(table)} to {self.path}")
+            return self.write_pandas(table, file_format=file_format, batch_size=batch_size)
+
+        return self.write_arrow(
+            table=table,
+            file_format=file_format,
+            batch_size=batch_size
+        )
 
     # ---- Arrow ----
 
@@ -691,23 +685,24 @@ class DatabricksIO(ABC, IO):
         if isinstance(file_format, ParquetFileFormat):
             return pq.read_table(self, **kwargs)
 
-        if isinstance(file_format, CsvFileFormat):
+        elif isinstance(file_format, CsvFileFormat):
             return pcsv.read_csv(self, parse_options=file_format.parse_options)
 
-        raise ValueError(f"Unsupported file format for Arrow table: {file_format}")
+        else:
+            ValueError(f"Unsupported file format for Arrow table: {file_format}")
 
     def write_arrow(
         self,
         table: Union[pa.Table, pa.RecordBatch],
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write an Arrow table or record batch to the path.
 
         Args:
             table: Arrow table or batch to write.
+            file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             None.
@@ -717,8 +712,8 @@ class DatabricksIO(ABC, IO):
 
         return self.write_arrow_table(
             table=table,
+            file_format=file_format,
             batch_size=batch_size,
-            **kwargs
         )
 
     def write_arrow_table(
@@ -726,7 +721,6 @@ class DatabricksIO(ABC, IO):
         table: pa.Table,
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write an Arrow table using the selected file format.
 
@@ -734,7 +728,6 @@ class DatabricksIO(ABC, IO):
             table: Arrow table to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             None.
@@ -743,13 +736,20 @@ class DatabricksIO(ABC, IO):
         buffer = io.BytesIO()
 
         if isinstance(file_format, ParquetFileFormat):
-            pq.write_table(table, buffer, write_batch_size=batch_size, **kwargs)
+            pq.write_table(
+                table, buffer,
+                write_batch_size=batch_size
+            )
 
         elif isinstance(file_format, CsvFileFormat):
-            pcsv.write_csv(table, buffer, **kwargs)
+            pcsv.write_csv(table, buffer)
 
         else:
-            raise ValueError(f"Unsupported file format for Arrow table: {file_format}")
+            return self.write_polars(
+                df=polars.from_arrow(table),
+                file_format=file_format,
+                batch_size=batch_size
+            )
 
         self.write_all_bytes(data=buffer.getvalue())
 
@@ -758,7 +758,6 @@ class DatabricksIO(ABC, IO):
         batch: pa.RecordBatch,
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write a single Arrow record batch.
 
@@ -766,31 +765,33 @@ class DatabricksIO(ABC, IO):
             batch: RecordBatch to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             None.
         """
         table = pa.Table.from_batches([batch])
-        self.write_arrow_table(table, file_format=file_format, batch_size=batch_size, **kwargs)
+        self.write_arrow_table(table, file_format=file_format, batch_size=batch_size)
 
     def read_arrow_batches(
         self,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Yield Arrow record batches from the file.
 
         Args:
+            file_format: Optional file format override.
             batch_size: Optional batch size for reads.
-            **kwargs: Format-specific options.
 
         Returns:
             An iterator over Arrow RecordBatch objects.
         """
         return (
             self
-            .read_arrow_table(batch_size=batch_size, **kwargs)
+            .read_arrow_table(
+                file_format=file_format,
+                batch_size=batch_size,
+            )
             .to_batches(max_chunksize=batch_size)
         )
 
@@ -798,83 +799,35 @@ class DatabricksIO(ABC, IO):
 
     def read_pandas(
         self,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Read the file into a pandas DataFrame.
 
         Args:
+            file_format: Optional file format override.
             batch_size: Optional batch size for reads.
-            **kwargs: Format-specific options.
 
         Returns:
             A pandas DataFrame with the file contents.
         """
-        return self.read_arrow_table(batch_size=batch_size, **kwargs).to_pandas()
+        return self.read_arrow_table(
+            file_format=file_format,
+            batch_size=batch_size
+        ).to_pandas()
 
     def write_pandas(
         self,
-        df,
+        df: PandasDataFrame,
+        file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write a pandas DataFrame to the file.
 
         Args:
             df: pandas DataFrame to write.
-            batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
-
-        Returns:
-            None.
-        """
-        self.write_arrow_table(pa.table(df), batch_size=batch_size, **kwargs)
-
-    # ---- Polars ----
-
-    def read_polars(
-        self,
-        file_format: Optional[FileFormat] = None,
-        batch_size: Optional[int] = None,
-        **kwargs
-    ):
-        """Read the file into a polars DataFrame.
-
-        Args:
-            file_format: Optional file format override.
-            batch_size: Optional batch size for reads.
-            **kwargs: Format-specific options.
-
-        Returns:
-            A polars DataFrame with the file contents.
-        """
-        import polars as pl
-
-        file_format = self.path.file_format if file_format is None else file_format
-        self.seek(0)
-
-        if isinstance(file_format, ParquetFileFormat):
-            return pl.read_parquet(self, **kwargs)
-
-        if isinstance(file_format, CsvFileFormat):
-            return pl.read_csv(self, **kwargs)
-
-        raise ValueError(f"Unsupported file format for Polars DataFrame: {file_format}")
-
-    def write_polars(
-        self,
-        df,
-        file_format: Optional[FileFormat] = None,
-        batch_size: Optional[int] = None,
-        **kwargs
-    ):
-        """Write a polars DataFrame to the file.
-
-        Args:
-            df: polars DataFrame to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             None.
@@ -883,10 +836,78 @@ class DatabricksIO(ABC, IO):
         buffer = io.BytesIO()
 
         if isinstance(file_format, ParquetFileFormat):
-            df.write_parquet(buffer, **kwargs)
+            df.to_parquet(buffer)
 
         elif isinstance(file_format, CsvFileFormat):
-            df.write_csv(buffer, **kwargs)
+            df.to_csv(buffer)
+
+        else:
+            return self.write_polars(
+                df=polars.from_pandas(df),
+                file_format=file_format,
+                batch_size=batch_size,
+            )
+
+        self.write_all_bytes(data=buffer.getvalue())
+
+    # ---- Polars ----
+
+    def read_polars(
+        self,
+        file_format: Optional[FileFormat] = None,
+        batch_size: Optional[int] = None,
+    ):
+        """Read the file into a polars DataFrame.
+
+        Args:
+            file_format: Optional file format override.
+            batch_size: Optional batch size for reads.
+
+        Returns:
+            A polars DataFrame with the file contents.
+        """
+        file_format = self.path.file_format if file_format is None else file_format
+        self.seek(0)
+
+        if isinstance(file_format, ParquetFileFormat):
+            return polars.read_parquet(self)
+
+        elif isinstance(file_format, CsvFileFormat):
+            return polars.read_csv(self)
+
+        elif isinstance(file_format, ExcelFileFormat):
+            return polars.read_excel(self)
+
+        else:
+            raise ValueError(f"Unsupported file format for Polars DataFrame: {file_format}")
+
+    def write_polars(
+        self,
+        df: PolarsDataFrame,
+        file_format: Optional[FileFormat] = None,
+        batch_size: Optional[int] = None,
+    ):
+        """Write a polars DataFrame to the file.
+
+        Args:
+            df: polars DataFrame to write.
+            file_format: Optional file format override.
+            batch_size: Optional batch size for writes.
+
+        Returns:
+            None.
+        """
+        file_format = self.path.file_format if file_format is None else FileFormat
+        buffer = io.BytesIO()
+
+        if isinstance(file_format, ParquetFileFormat):
+            df.write_parquet(buffer)
+
+        elif isinstance(file_format, CsvFileFormat):
+            df.write_csv(buffer)
+
+        elif isinstance(file_format, ExcelFileFormat):
+            df.write_excel(buffer)
 
         else:
             raise ValueError(f"Unsupported file format for Polars DataFrame: {file_format}")
@@ -975,28 +996,40 @@ class DatabricksVolumeIO(DatabricksIO):
         """Read bytes from a volume file.
 
         Args:
-            start: Starting byte offset.
+            start: Starting byte offset (0-based).
             length: Number of bytes to read.
             allow_not_found: Whether to suppress missing-path errors.
 
         Returns:
             Bytes read from the file.
         """
-        if length == 0:
+        if length <= 0:
             return b""
+        if start < 0:
+            raise ValueError(f"start must be >= 0, got {start}")
+        if length < 0:
+            raise ValueError(f"length must be >= 0, got {length}")
 
         sdk = self.workspace.sdk()
         client = sdk.files
         full_path = self.path.files_full_path()
 
-        resp = client.download(full_path)
-        result = (
-            resp.contents
-            .seek(start, io.SEEK_SET)
-            .read(length)
-        )
+        try:
+            resp = client.download(full_path)
+        except Exception as e:
+            # Databricks SDK exceptions vary a bit by version; keep it pragmatic.
+            if allow_not_found and any(s in str(e).lower() for s in ("not found", "not exist", "404")):
+                return b""
+            raise
 
-        return result
+        data = resp.contents.read()
+
+        # If start is past EOF, return empty (common file-like behavior).
+        if start >= len(data):
+            return b""
+
+        end = start + length
+        return data[start:end]
 
     def write_all_bytes(self, data: bytes):
         """Write bytes to a volume file.

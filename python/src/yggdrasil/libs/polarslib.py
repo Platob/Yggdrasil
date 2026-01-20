@@ -4,13 +4,18 @@ try:
     import polars  # type: ignore
 
     polars = polars
+
+    PolarsDataFrame = polars.DataFrame
 except ImportError:
     polars = None
 
+    class PolarsDataFrame:
+        pass
 
 __all__ = [
     "polars",
     "require_polars",
+    "PolarsDataFrame"
 ]
 
 

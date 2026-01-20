@@ -9,6 +9,7 @@ from typing import Optional, Iterator, TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.ipc as pipc
 
+from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
 from ...libs.databrickslib import databricks_sdk
 from ...libs.pandaslib import pandas
@@ -32,9 +33,7 @@ except ImportError:
 if databricks_sdk is not None:
     from databricks.sdk.service.sql import (
         StatementState, StatementResponse, Disposition, StatementStatus
-)
-
-    StatementResponse = StatementResponse
+    )
 else:
     class StatementResponse:
         pass
@@ -299,28 +298,8 @@ class StatementResult:
                 )
 
     def raise_for_status(self):
-        """Raise a ValueError if the statement failed.
-
-        Returns:
-            None.
-        """
         if self.failed:
-            # grab error info if present
-            err = self.status.error
-            message = err.message or "Unknown SQL error"
-            error_code = err.error_code
-            sql_state = getattr(err, "sql_state", None)
-
-            parts = [message]
-            if error_code:
-                parts.append(f"error_code={error_code}")
-            if sql_state:
-                parts.append(f"sql_state={sql_state}")
-
-            raise ValueError(
-                f"Statement {self.statement_id} {self.state}: " + " | ".join(parts)
-            )
-
+            raise SqlStatementError.from_statement(self)
         return self
 
     def wait(
@@ -337,22 +316,20 @@ class StatementResult:
         Returns:
             The current StatementResult instance.
         """
-        if self.done:
-            return self
+        if not self.done:
+            start = time.time()
+            poll_interval = poll_interval or 1
 
-        start = time.time()
-        poll_interval = poll_interval or 1
+            while not self.done:
+                # still running / queued / pending
+                if timeout is not None and (time.time() - start) > timeout:
+                    raise TimeoutError(
+                        f"Statement {self.statement_id} did not finish within {timeout} seconds "
+                        f"(last state={self.state})"
+                    )
 
-        while not self.done:
-            # still running / queued / pending
-            if timeout is not None and (time.time() - start) > timeout:
-                raise TimeoutError(
-                    f"Statement {self.statement_id} did not finish within {timeout} seconds "
-                    f"(last state={self.state})"
-                )
-
-            poll_interval = max(10, poll_interval * 1.2)
-            time.sleep(poll_interval)
+                poll_interval = max(10, poll_interval * 1.2)
+                time.sleep(poll_interval)
 
         self.raise_for_status()
 
@@ -367,10 +344,17 @@ class StatementResult:
         if self.persisted:
             if self._arrow_table is not None:
                 return self._arrow_table.schema
-            return spark_schema_to_arrow_schema(self._spark_df.schema)
+            elif self._spark_df is not None:
+                return spark_schema_to_arrow_schema(self._spark_df.schema)
+            raise NotImplementedError("")
+
+        manifest = self.manifest
+
+        if manifest is None:
+            return pa.schema([])
 
         fields = [
-            column_info_to_arrow_field(_) for _ in self.manifest.schema.columns
+            column_info_to_arrow_field(_) for _ in manifest.schema.columns
         ]
 
         return pa.schema(fields)
@@ -385,7 +369,7 @@ class StatementResult:
             An Arrow Table containing all rows.
         """
         if self.persisted:
-            if self._arrow_table:
+            if self._arrow_table is not None:
                 return self._arrow_table
             else:
                 return self._spark_df.toArrow()
@@ -393,7 +377,6 @@ class StatementResult:
         batches = list(self.to_arrow_batches(parallel_pool=parallel_pool))
 
         if not batches:
-            # empty table with no columns
             return pa.Table.from_batches([], schema=self.arrow_schema())
 
         return pa.Table.from_batches(batches)
@@ -524,8 +507,9 @@ class StatementResult:
         Returns:
             A Spark DataFrame with the result rows.
         """
-        if self._spark_df:
+        if self._spark_df is not None:
             return self._spark_df
 
         self._spark_df = arrow_table_to_spark_dataframe(self.to_arrow_table())
+
         return self._spark_df

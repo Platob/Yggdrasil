@@ -60,8 +60,29 @@ if pyspark is not None:
 __all__ = ["SQLEngine", "StatementResult"]
 
 
-class SqlExecutionError(RuntimeError):
-    """Raised when a SQL statement execution fails."""
+@dataclasses.dataclass
+class CreateTablePlan:
+    sql: str
+    properties: dict[str, Any]
+    warnings: list[str]
+    result: Any = None  # StatementResult when executed
+
+
+_INVALID_COL_CHARS = set(" ,;{}()\n\t=")
+
+
+def _escape_sql_string(s: str) -> str:
+    return s.replace("'", "''")
+
+
+def _quote_ident(ident: str) -> str:
+    # Always quote to be safe; also allows reserved keywords
+    escaped = ident.replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _needs_column_mapping(col_name: str) -> bool:
+    return any(ch in _INVALID_COL_CHARS for ch in col_name)
 
 
 @dataclasses.dataclass
@@ -268,7 +289,10 @@ class SQLEngine(WorkspaceService):
             if row_limit:
                 df = df.limit(row_limit)
 
-            logger.info("Spark SQL executed: %s", self._sql_preview(statement))
+            logger.debug(
+                "SPARK SQL executed query:\n%s",
+                statement
+            )
 
             # Avoid Disposition dependency if SDK imports are absent
             spark_disp = disposition if disposition is not None else getattr(globals().get("Disposition", object), "EXTERNAL_LINKS", None)
@@ -316,8 +340,12 @@ class SQLEngine(WorkspaceService):
         )
 
         logger.info(
-            "API SQL executed: %s",
-            self._sql_preview(statement)
+            "API SQL executed statement '%s'",
+            execution.statement_id
+        )
+        logger.debug(
+            "API SQL executed query:\n%s",
+            statement
         )
 
         return execution.wait() if wait_result else execution
@@ -816,111 +844,287 @@ FROM parquet.`{temp_volume_path}`"""
 
     def create_table(
         self,
-        field: pa.Field,
-        location: Optional[str] = None,
-        table_name: Optional[str] = None,
+        field: Union[pa.Field, pa.Schema],
+        table_fqn: Optional[str] = None,            # e.g. catalog.schema.table
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+        storage_location: Optional[str] = None,     # external location path
         partition_by: Optional[list[str]] = None,
         cluster_by: Optional[bool | list[str]] = True,
         comment: Optional[str] = None,
-        options: Optional[dict] = None,
+        tblproperties: Optional[dict[str, Any]] = None,
         if_not_exists: bool = True,
+        or_replace: bool = False,
+        using: str = "DELTA",
         optimize_write: bool = True,
         auto_compact: bool = True,
+        # perf-ish optional knobs (don’t hard-force)
+        enable_cdf: Optional[bool] = None,
+        enable_deletion_vectors: Optional[bool] = None,
+        target_file_size: Optional[int] = None,     # bytes
+        # column mapping: None=auto, "none"/"name"/"id" explicit
+        column_mapping_mode: Optional[str] = None,
         execute: bool = True,
-        wait_result: bool = True
-    ) -> Union[str, "StatementResult"]:
-        """Generate (and optionally execute) CREATE TABLE DDL from an Arrow schema/field.
-
-        Args:
-            field: Arrow Field or Schema describing the table. If `field` is a schema, it's converted.
-            location: Fully qualified table name override.
-            table_name: Table name override (used if location not provided).
-            catalog_name: Catalog override.
-            schema_name: Schema override.
-            partition_by: Optional partition columns.
-            cluster_by: If True -> CLUSTER BY AUTO. If list[str] -> CLUSTER BY (..). If False -> no clustering.
-            comment: Optional table comment (falls back to field metadata b"comment" when present).
-            options: Extra table properties.
-            if_not_exists: Add IF NOT EXISTS clause.
-            optimize_write: Sets delta.autoOptimize.optimizeWrite table property.
-            auto_compact: Sets delta.autoOptimize.autoCompact table property.
-            execute: If True, executes DDL and returns StatementResult; otherwise returns SQL string.
-            wait_result: Waits execution to complete
-
-        Returns:
-            StatementResult if execute=True, else the DDL SQL string.
+        wait_result: bool = True,
+        return_plan: bool = False,
+    ) -> Union[str, CreateTablePlan, "StatementResult"]:
         """
-        if not isinstance(field, pa.Field):
-            field = convert(field, pa.Field)
+        Generate (and optionally execute) a Databricks/Delta `CREATE TABLE` statement from an Apache Arrow
+        schema/field, with integration-friendly safety checks and performance-oriented defaults.
 
-        location, catalog_name, schema_name, table_name = self._check_location_params(
-            location=location,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=True,
-        )
+        This helper is meant to be "team-safe":
+          - Quotes identifiers (catalog/schema/table/columns) to avoid SQL keyword/name edge cases.
+          - Validates `partition_by` / `cluster_by` columns exist in the Arrow schema before generating SQL.
+          - Supports managed or external tables via `storage_location`.
+          - Optionally enables Delta Column Mapping (name/id) and applies the required protocol upgrades.
 
-        if pa.types.is_struct(field.type):
-            children = list(field.type)
+        Parameters
+        ----------
+        field:
+            Arrow schema or field describing the table.
+            - If `pa.Schema`, all schema fields are used as columns.
+            - If `pa.Field` with struct type, its children become columns.
+            - If `pa.Field` non-struct, it becomes a single-column table.
+        table_fqn:
+            Fully-qualified table name, e.g. `"catalog.schema.table"`.
+            If provided, it takes precedence over `catalog_name`/`schema_name`/`table_name`.
+            Parts are quoted as needed.
+        catalog_name, schema_name, table_name:
+            Used to build the table identifier when `table_fqn` is not provided.
+            All three must be provided together.
+        storage_location:
+            If set, emits `LOCATION '<path>'` to create an external Delta table at the given path.
+            (Path string is SQL-escaped.)
+        partition_by:
+            List of partition column names. Must exist in the schema.
+            Note: Partitioning is a physical layout choice; only use for low-cardinality columns.
+        cluster_by:
+            Controls clustering / liquid clustering:
+            - True  -> emits `CLUSTER BY AUTO`
+            - False -> emits no clustering clause
+            - list[str] -> emits `CLUSTER BY (<cols...>)` (all cols must exist in schema)
+        comment:
+            Optional table comment. If not provided and Arrow metadata contains `b"comment"`, that is used.
+        tblproperties:
+            Additional/override Delta table properties (final say).
+            Example: `{"delta.enableChangeDataFeed": "true"}` or `{"delta.logRetentionDuration": "30 days"}`
+        if_not_exists:
+            If True, generates `CREATE TABLE IF NOT EXISTS ...`.
+            Mutually exclusive with `or_replace`.
+        or_replace:
+            If True, generates `CREATE OR REPLACE TABLE ...`.
+            Mutually exclusive with `if_not_exists`.
+        using:
+            Storage format keyword. Defaults to `"DELTA"`.
+        optimize_write:
+            Sets `delta.autoOptimize.optimizeWrite` table property.
+        auto_compact:
+            Sets `delta.autoOptimize.autoCompact` table property.
+        enable_cdf:
+            If set, adds `delta.enableChangeDataFeed` property.
+            Useful for CDC pipelines; avoid enabling by default if you don't need it.
+        enable_deletion_vectors:
+            If set, adds `delta.enableDeletionVectors` property.
+            Can improve performance for updates/deletes in some workloads (subject to platform support).
+        target_file_size:
+            If set, adds `delta.targetFileSize` (bytes). Helps guide file sizing and reduce small files.
+        column_mapping_mode:
+            Delta column mapping mode:
+            - None  -> auto-detect: enables `"name"` only if invalid column names are present, else `"none"`
+            - "none" -> do not enable column mapping (max compatibility)
+            - "name" -> enable name-based column mapping
+            - "id"   -> enable id-based column mapping
+
+            When enabled (name/id), this method also sets the required protocol properties:
+            `delta.minReaderVersion=2` and `delta.minWriterVersion=5`.
+        execute:
+            If True, executes the generated SQL via `self.execute(...)`.
+            If False, returns the SQL (or plan) without executing.
+        wait_result:
+            Passed to `self.execute(...)`. If True, blocks until the statement finishes.
+        return_plan:
+            If True, returns a `CreateTablePlan` containing SQL + applied properties + warnings (+ result if executed).
+            If False:
+              - returns SQL string when `execute=False`
+              - returns `StatementResult` when `execute=True`
+
+        Returns
+        -------
+        Union[str, CreateTablePlan, StatementResult]
+            - If `execute=False` and `return_plan=False`: the SQL string.
+            - If `execute=False` and `return_plan=True`: `CreateTablePlan(sql=..., properties=..., warnings=...)`.
+            - If `execute=True` and `return_plan=False`: `StatementResult`.
+            - If `execute=True` and `return_plan=True`: `CreateTablePlan` with `result` populated.
+
+        Raises
+        ------
+        ValueError
+            If required naming params are missing, if `or_replace` and `if_not_exists` conflict,
+            if `column_mapping_mode` is invalid, or if partition/cluster columns are not present.
+
+        Notes
+        -----
+        - Column mapping is primarily a metadata feature; performance impact is usually negligible vs IO,
+          but enabling it affects compatibility with older readers.
+        - Partitioning and clustering are workload-dependent: partition for selective pruning on low-cardinality
+          columns; cluster for speeding up common filter/join patterns.
+
+        Examples
+        --------
+        Create a managed Delta table with auto clustering and auto column mapping:
+            >>> plan = client.create_table(schema, table_fqn="main.analytics.events", execute=False, return_plan=True)
+            >>> print(plan.sql)
+
+        External table with explicit partitioning and CDF:
+            >>> client.create_table(
+            ...     schema,
+            ...     table_fqn="main.analytics.events",
+            ...     storage_location="abfss://.../events",
+            ...     partition_by=["event_date"],
+            ...     enable_cdf=True,
+            ... )
+        """
+
+        # ---- Normalize Arrow input ----
+        if isinstance(field, pa.Schema):
+            arrow_fields = list(field)
+            schema_metadata = field.metadata or {}
         else:
-            children = [field]
+            # pa.Field
+            schema_metadata = field.metadata or {}
+            if pa.types.is_struct(field.type):
+                arrow_fields = list(field.type)
+            else:
+                arrow_fields = [field]
 
-        column_definitions = [self._field_to_ddl(child) for child in children]
+        # ---- Resolve table FQN ----
+        # Prefer explicit table_fqn. Else build from catalog/schema/table_name.
+        if table_fqn is None:
+            if not (catalog_name and schema_name and table_name):
+                raise ValueError("Provide table_fqn or (catalog_name, schema_name, table_name).")
+            table_fqn = ".".join(map(_quote_ident, [catalog_name, schema_name, table_name]))
+        else:
+            # If caller passes raw "cat.schema.table", quote each part safely
+            parts = table_fqn.split(".")
+            table_fqn = ".".join(_quote_ident(p) for p in parts)
 
-        sql = [
-            f"CREATE TABLE {'IF NOT EXISTS ' if if_not_exists else ''}{location} (",
-            ",\n  ".join(column_definitions),
+        # ---- Comments ----
+        if comment is None and schema_metadata:
+            c = schema_metadata.get(b"comment")
+            if isinstance(c, bytes):
+                comment = c.decode("utf-8")
+
+        # ---- Detect invalid column names -> column mapping auto ----
+        any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
+        warnings: list[str] = []
+        if column_mapping_mode is None:
+            column_mapping_mode = "name" if any_invalid else "none"
+
+        if column_mapping_mode not in ("none", "name", "id"):
+            raise ValueError("column_mapping_mode must be one of: None, 'none', 'name', 'id'.")
+
+        # ---- Validate partition/cluster columns exist ----
+        col_names = {f.name for f in arrow_fields}
+        for cols, label in ((partition_by, "partition_by"),):
+            if cols:
+                missing = [c for c in cols if c not in col_names]
+                if missing:
+                    raise ValueError(f"{label} contains unknown columns: {missing}")
+
+        if isinstance(cluster_by, list):
+            missing = [c for c in cluster_by if c not in col_names]
+            if missing:
+                raise ValueError(f"cluster_by contains unknown columns: {missing}")
+
+        # ---- Column DDL ----
+        # IMPORTANT: your _field_to_ddl should quote names with backticks if needed.
+        # I’d recommend it ALWAYS quotes via _quote_ident internally.
+        column_definitions = [self._field_to_ddl(child) for child in arrow_fields]
+
+        # ---- Build CREATE TABLE ----
+        if or_replace and if_not_exists:
+            raise ValueError("Use either or_replace or if_not_exists, not both.")
+
+        create_kw = "CREATE OR REPLACE TABLE" if or_replace else "CREATE TABLE"
+        if if_not_exists and not or_replace:
+            create_kw = "CREATE TABLE IF NOT EXISTS"
+
+        sql_parts: list[str] = [
+            f"{create_kw} {table_fqn} (",
+            "  " + ",\n  ".join(column_definitions),
             ")",
+            f"USING {using}",
         ]
 
         if partition_by:
-            sql.append(f"\nPARTITIONED BY ({', '.join(partition_by)})")
+            sql_parts.append("PARTITIONED BY (" + ", ".join(_quote_ident(c) for c in partition_by) + ")")
         elif cluster_by:
             if isinstance(cluster_by, bool):
-                sql.append("\nCLUSTER BY AUTO")
+                sql_parts.append("CLUSTER BY AUTO")
             else:
-                sql.append(f"\nCLUSTER BY ({', '.join(cluster_by)})")
-
-        if not comment and field.metadata:
-            comment = field.metadata.get(b"comment")
-
-        if isinstance(comment, bytes):
-            comment = comment.decode("utf-8")
+                sql_parts.append("CLUSTER BY (" + ", ".join(_quote_ident(c) for c in cluster_by) + ")")
 
         if comment:
-            sql.append(f"\nCOMMENT '{comment}'")
+            sql_parts.append(f"COMMENT '{_escape_sql_string(comment)}'")
 
-        options = {} if options is None else options
-        options.update({
-            "delta.autoOptimize.optimizeWrite": optimize_write,
-            "delta.autoOptimize.autoCompact": auto_compact,
-        })
+        if storage_location:
+            sql_parts.append(f"LOCATION '{_escape_sql_string(storage_location)}'")
 
-        option_strs = []
-        for key, value in (options or {}).items():
-            if isinstance(value, str):
-                option_strs.append(f"'{key}' = '{value}'")
-            elif isinstance(value, bool):
-                option_strs.append(f"'{key}' = '{'true' if value else 'false'}'")
-            else:
-                option_strs.append(f"'{key}' = {value}")
+        # ---- Table properties (defaults + overrides) ----
+        props: dict[str, Any] = {
+            "delta.autoOptimize.optimizeWrite": bool(optimize_write),
+            "delta.autoOptimize.autoCompact": bool(auto_compact)
+        }
 
-        if option_strs:
-            sql.append(f"\nTBLPROPERTIES ({', '.join(option_strs)})")
+        if enable_cdf is not None:
+            props["delta.enableChangeDataFeed"] = bool(enable_cdf)
 
-        statement = "\n".join(sql)
+        if enable_deletion_vectors is not None:
+            props["delta.enableDeletionVectors"] = bool(enable_deletion_vectors)
 
-        logger.debug(
-            "Generated CREATE TABLE DDL for %s:\n%s",
-            location, statement
-        )
+        if target_file_size is not None:
+            props["delta.targetFileSize"] = int(target_file_size)
 
-        if execute:
-            return self.execute(statement, wait_result=wait_result)
-        return statement
+        # Column mapping + required protocol bumps
+        if column_mapping_mode != "none":
+            props["delta.columnMapping.mode"] = column_mapping_mode
+            props["delta.minReaderVersion"] = 2
+            props["delta.minWriterVersion"] = 5
+        else:
+            # only set explicitly if user wants; otherwise leave unset for max compatibility
+            pass
+
+        # Let caller override anything (final say)
+        if tblproperties:
+            props.update(tblproperties)
+
+        if any_invalid and column_mapping_mode == "none":
+            warnings.append(
+                "Schema has invalid column names but column_mapping_mode='none'. "
+                "This will fail unless you rename/escape columns."
+            )
+
+        if props:
+            def fmt(k: str, v: Any) -> str:
+                if isinstance(v, str):
+                    return f"'{k}' = '{_escape_sql_string(v)}'"
+                if isinstance(v, bool):
+                    return f"'{k}' = '{'true' if v else 'false'}'"
+                return f"'{k}' = {v}"
+
+            sql_parts.append("TBLPROPERTIES (" + ", ".join(fmt(k, v) for k, v in props.items()) + ")")
+
+        statement = "\n".join(sql_parts)
+
+        plan = CreateTablePlan(sql=statement, properties=props, warnings=warnings)
+
+        if not execute:
+            return plan if return_plan else statement
+
+        res = self.execute(statement, wait_result=wait_result)
+        plan.result = res
+        return plan if return_plan else res
 
     def _check_location_params(
         self,

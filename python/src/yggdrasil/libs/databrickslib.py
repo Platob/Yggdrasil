@@ -4,6 +4,8 @@ try:
     import databricks
     import databricks.sdk  # type: ignore
 
+    from databricks.sdk import WorkspaceClient
+
     databricks = databricks
     databricks_sdk = databricks.sdk
 except ImportError:
@@ -15,6 +17,8 @@ except ImportError:
 
     databricks = _DatabricksDummy
     databricks_sdk = _DatabricksDummy
+
+    WorkspaceClient = _DatabricksDummy
 
 
 def require_databricks_sdk():
@@ -34,4 +38,5 @@ __all__ = [
     "databricks",
     "databricks_sdk",
     "require_databricks_sdk",
+    "WorkspaceClient"
 ]

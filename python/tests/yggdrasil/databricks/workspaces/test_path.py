@@ -1,7 +1,6 @@
 # tests/integration/test_databricks_path_integration.py
 from __future__ import annotations
 
-import os
 import unittest
 
 import pyarrow as pa
@@ -35,22 +34,12 @@ class DatabricksIntegrationBase(unittest.TestCase):
         except Exception as e:
             raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
 
-        cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/dbfs/tmp/unittest")
-        cls.workspace_root = os.getenv(
-            "DATABRICKS_TEST_WORKSPACE_BASE",
-            f"/Workspace/Users/{cls.workspace.current_user.user_name}/unittest",
-        )
-        cls.schema_root = os.getenv(
-            "DATABRICKS_TEST_VOLUME_BASE",
-            "/Volumes/trading/unittest"
-        )  # may be None
-
         # Unique per test so parallel runs don’t punch each other
         cls.test_id = "unittest"
 
-        cls.dbfs_base = DatabricksPath.parse(f"{cls.dbfs_root}/{cls.test_id}", workspace=cls.workspace)
-        cls.ws_base = DatabricksPath.parse(f"{cls.workspace_root}/{cls.test_id}", workspace=cls.workspace)
-        cls.vol_base = DatabricksPath.parse(f"{cls.schema_root}/{cls.test_id}", workspace=cls.workspace)
+        cls.dbfs_base = DatabricksPath.parse(f"/dbfs/tmp/unittest/{cls.test_id}", workspace=cls.workspace)
+        cls.ws_base = DatabricksPath.parse(f"/Workspace/Users/{cls.workspace.current_user.user_name}/unittest/{cls.test_id}", workspace=cls.workspace)
+        cls.vol_base = DatabricksPath.parse(f"/Volumes/trading/unittest/{cls.test_id}", workspace=cls.workspace)
 
     @classmethod
     def tearDownClass(cls):
@@ -260,14 +249,19 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         folder_path.write_arrow(my_arrow_table)
         arrow_dataset = folder_path.arrow_dataset()
 
-        self.assertTrue(my_arrow_table.equals(filepath.read_arrow_table()))
-        self.assertTrue(my_arrow_table.equals(folder_path.read_arrow_table()))
-        self.assertTrue(my_arrow_table.equals(arrow_dataset.to_table()))
-        self.assertTrue(my_arrow_table.equals(filepath.sql(f"SELECT * from dbfs.`{filepath}`")))
+        data = filepath.read_arrow_table()
+        self.assertTrue(my_arrow_table.equals(data))
+
+        data = folder_path.read_arrow_table()
+        self.assertTrue(my_arrow_table.equals(data))
+
+        data = arrow_dataset.to_table()
+        self.assertTrue(my_arrow_table.equals(data))
+
+        data = filepath.sql(f"SELECT * from dbfs.`{filepath}`")
+        self.assertTrue(my_arrow_table.equals(data))
 
     def test_pyarrow_filesystem(self):
-        from yggdrasil.databricks.workspaces import Workspace
-
         folder_path = self.vol_base / "arrow_dataset"
 
         my_arrow_table = pa.table({
@@ -281,19 +275,11 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
         self.assertEqual(my_arrow_table, folder_path.read_arrow_table())
 
-    def test_duckdb(self):
-        import duckdb
-        from yggdrasil.databricks import Workspace
-
-        workspace = Workspace()
-        folder_path = workspace.dbfs_path("/Volumes/trading/unittest/duckdb_arrow_dataset")
-
-        my_arrow_table = pa.table({
-            "col1": [1, 2, 3],
-            "col2": ["a", "b", "c"]
-        })
+    def test_temporary_credentials(self):
+        folder_path = self.vol_base / "tmp_path"
 
         folder_path.mkdir()
-        folder_path.write_arrow(my_arrow_table)
-        arrow_dataset = folder_path.arrow_dataset()
-        arrow_table_from_volume = duckdb.sql("select * from arrow_dataset").to_arrow_table()
+
+        credentials = folder_path.temporary_credentials()
+
+        self.assertTrue(credentials)

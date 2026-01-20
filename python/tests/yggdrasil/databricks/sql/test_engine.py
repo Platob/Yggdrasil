@@ -1,7 +1,11 @@
+import os
 import unittest
 import pyarrow as pa
 import datetime as dt
 
+import pytest
+
+from yggdrasil.databricks.sql.exceptions import SqlStatementError
 from yggdrasil.databricks.workspaces import Workspace
 
 
@@ -20,8 +24,9 @@ class TestSQLEngine(unittest.TestCase):
             pa.array(["a", None, "c"]),
             pa.array([1, 2, 4]),
             pa.array([{"q": dt.datetime.now()}, None, None]),
-            pa.array([[{"list_nest": dt.datetime.now()}], None, None])
-        ], names=["c0", "c1", "c2", "c3"])
+            pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
+            pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
+        ], names=["c0", "c1", "c2", "c3", "map column"])
 
         self.engine.insert_into(data, table_name="test_insert", mode="overwrite")
 
@@ -31,6 +36,9 @@ class TestSQLEngine(unittest.TestCase):
             f"SELECT * from {n}"
         ).to_arrow_table()
 
-        assert data == read
+        self.assertEqual(data, read)
+
+        with pytest.raises(SqlStatementError):
+            self.engine.execute(f"SELECT t from {n}")
 
         self.engine.drop_table(table_name="test_insert")

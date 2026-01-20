@@ -180,7 +180,7 @@ print(json.dumps(meta))"""
         """
         return self.cluster.workspace.sdk()
 
-    def _create_command(
+    def create_command(
         self,
         language: "Language",
     ) -> any:
@@ -192,17 +192,29 @@ print(json.dumps(meta))"""
         Returns:
             The created command execution context response.
         """
-        self.cluster.ensure_running()
-
         LOGGER.debug(
             "Creating Databricks command execution context for %s",
             self.cluster
         )
 
-        created = self._workspace_client().command_execution.create_and_wait(
-            cluster_id=self.cluster.cluster_id,
-            language=language,
+        try:
+            created = self._workspace_client().command_execution.create_and_wait(
+                cluster_id=self.cluster.cluster_id,
+                language=language,
+            )
+        except:
+            self.cluster.ensure_running()
+
+            created = self._workspace_client().command_execution.create_and_wait(
+                cluster_id=self.cluster.cluster_id,
+                language=language,
+            )
+
+        LOGGER.info(
+            "Created Databricks command execution context %s",
+            self
         )
+
         created = getattr(created, "response", created)
 
         return created
@@ -220,10 +232,6 @@ print(json.dumps(meta))"""
             The connected ExecutionContext instance.
         """
         if self.context_id is not None:
-            LOGGER.debug(
-                "Execution context already open for %s",
-                self
-            )
             return self
 
         self.language = language or self.language
@@ -231,7 +239,7 @@ print(json.dumps(meta))"""
         if self.language is None:
             self.language = Language.PYTHON
 
-        ctx = self._create_command(language=self.language)
+        ctx = self.create_command(language=self.language)
 
         context_id = ctx.id
         if not context_id:
