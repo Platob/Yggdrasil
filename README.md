@@ -1,21 +1,21 @@
 # Yggdrasil
 
-Utilities for schema-aware data interchange, conversions, and platform integrations. The repository currently focuses on the Python package in [`python/`](python/), which ships dataclass helpers, casting utilities, Databricks wrappers, and resilient HTTP sessions so you can move data between engines without re-learning their type systems.
+Yggdrasil is a collection of schema-aware utilities for data interchange across Python types, Apache Arrow, pandas, Polars, Spark, and Databricks. The main deliverable today is the Python package in [`python/`](python/), published to PyPI as **`ygg`** with the import namespace **`yggdrasil`**.
 
-## Why Yggdrasil?
-- **Type-first conversions** between Python objects, Arrow, Polars, pandas, PySpark, and Databricks SQL results.
-- **Safer dataclasses** with automatic defaults, Arrow schema generation, and coercion on construction.
-- **Platform helpers** for Databricks workspaces, jobs, compute, and SQL execution.
-- **Operational utilities** including retries, concurrency decorators, and dependency guards for optional libraries.
+## What you can do with it
+- **Type-safe casting** between primitives, containers, enums, and dataclasses via a registry of converters.
+- **Arrow schema inference** from Python type hints (including dataclasses and `typing.Annotated`).
+- **Databricks helpers** for workspace config, SQL execution, and Arrow/Spark conversions.
+- **Operational utilities** such as retry-enabled HTTP sessions and simple parallelization helpers.
 
-## Quickstart
-Install directly from PyPI for the quickest trial:
+## Install
+Quick install from PyPI:
 
 ```bash
 pip install ygg
 ```
 
-Or clone the repo, create a virtual environment with [uv](https://docs.astral.sh/uv/), and install the Python package in editable mode:
+For development, create a local environment and install the package in editable mode:
 
 ```bash
 cd python
@@ -24,62 +24,82 @@ source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
-Run a minimal example that defines a dataclass, converts values, and generates an Arrow schema:
+## Code examples
+
+### 1) Convert values and dataclasses
 
 ```python
-from yggdrasil import yggdataclass
-from yggdrasil.types.cast import convert
-from yggdrasil.types import arrow_field_from_hint
+from dataclasses import dataclass
 
-@yggdataclass
+from yggdrasil.types import convert
+
+@dataclass
 class User:
     id: int
     email: str
     active: bool = True
 
-user = User.__safe_init__("1", email="ada@example.com")
-print(user)  # User(id=1, email='ada@example.com', active=True)
-
-payload = {"id": "2", "email": "bob@example.com", "active": "false"}
-print(User.from_dict(payload))
-
-arrow_field = arrow_field_from_hint(User, name="user")
-print(arrow_field)
-
-values = convert(["1", "2", "3"], list[int])
-print(values)
+raw = {"id": "42", "email": "ada@example.com", "active": "false"}
+user = convert(raw, User)
+print(user)
 ```
 
-### Databricks hello world
-With the Databricks extras installed, execute SQL and fetch results as Arrow:
+### 2) Build Arrow schema fields from type hints
+
+```python
+from dataclasses import dataclass
+
+from yggdrasil.dataclasses import get_dataclass_arrow_field
+from yggdrasil.types import arrow_field_from_hint
+
+@dataclass
+class Event:
+    ts: str
+    value: float
+
+print(arrow_field_from_hint(list[int], name="counts"))
+print(get_dataclass_arrow_field(Event))
+```
+
+### 3) Run Databricks SQL and retrieve Arrow results
 
 ```python
 from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.workspaces import Workspace
 
 engine = SQLEngine(Workspace(host="https://<workspace>", token="<token>"))
-result = engine.execute("SELECT 1 AS value").wait()
-print(result.arrow_table().to_pandas())
+result = engine.execute("SELECT 1 AS value")
+print(result.to_arrow_table().to_pandas())
 ```
 
-## Documentation map
-- [`python/README.md`](python/README.md) – installation, quickstart, and feature overview for the Python package.
-- [`python/docs/`](python/docs/README.md) – structured guides, module reference, and developer templates.
-- [`python/docs/modules/`](python/docs/modules/README.md) – per-module documentation for dataclasses, types, libs, requests, Databricks, and more.
+### 4) Retryable HTTP sessions and simple parallel work
 
-## Publishing
-The GitHub Actions workflow at [`.github/workflows/publish.yml`](.github/workflows/publish-pypi.yml) builds and publishes the Python package when pushing to `main`. To authorize uploads:
-1. Create a PyPI API token (Account settings → **API tokens** → **Add API token**).
-2. Add a repository Actions secret named `PYPI_API_TOKEN` containing the token. The username is preset to `__token__` in the workflow.
-3. Push to `main` or trigger the workflow manually; the package is built from `python/` and uploaded using the stored secret.
+```python
+from yggdrasil.requests import YGGSession
+from yggdrasil.pyutils import parallelize, retry
 
-## Support matrix and extras
-Many conversions rely on optional dependencies. Install only what you need:
-- `.[dev]` – development, linting, and testing tools.
-- `.[databricks]` – Databricks SDK and PySpark dependencies.
-- `.[pandas]`, `.[polars]`, `.[spark]` – engine-specific extras for conversions.
+session = YGGSession(num_retry=3)
 
-## Contributing
-1. Create a branch and install with `uv pip install -e .[dev]` inside `python/`.
-2. Run the pytest suite (and optionally `ruff`, `black`, `mypy`) before opening a pull request.
-3. Keep examples copy-pasteable and prefer type-hinted signatures in new utilities.
+@parallelize(max_workers=4)
+def square(x: int) -> int:
+    return x * x
+
+@retry(tries=3, delay=0.1, backoff=2)
+def flaky(value: int) -> int:
+    return value
+
+print(list(square(range(4))))
+```
+
+## Repository map
+- [`python/`](python/) — Python package source, docs, and tests.
+- [`python/README.md`](python/README.md) — Package-specific setup and usage.
+- [`python/docs/`](python/docs/README.md) — Detailed documentation and module references.
+
+## Development notes
+- The package requires Python **3.10+**.
+- Entry point `yggenv` is available after installation for environment helpers.
+- Run tests from the `python/` directory with `pytest`.
+
+## License
+Licensed under the terms in [LICENSE](LICENSE).
