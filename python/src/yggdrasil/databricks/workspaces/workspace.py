@@ -645,6 +645,7 @@ class Workspace:
 
     def clusters(
         self,
+        workspace: Optional["Workspace"] = None,
         cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
     ) -> "Cluster":
@@ -664,6 +665,16 @@ class Workspace:
             workspace=self,
             cluster_id=cluster_id,
             cluster_name=cluster_name,
+        )
+
+    def loki(
+        self,
+        workspace: Optional["Workspace"] = None,
+    ):
+        from ..ai.loki import Loki
+
+        return Loki(
+            workspace=self,
         )
 
 # ---------------------------------------------------------------------------
@@ -717,13 +728,13 @@ class WorkspaceService(ABC):
         """
         return self.workspace.is_in_databricks_environment()
 
-    def connect(self):
+    def connect(self, clone: bool = False):
         """Connect the underlying workspace.
 
         Returns:
             The current WorkspaceService instance.
         """
-        self.workspace = self.workspace.connect()
+        self.workspace = self.workspace.connect(clone=clone)
         return self
 
     def dbfs_path(
