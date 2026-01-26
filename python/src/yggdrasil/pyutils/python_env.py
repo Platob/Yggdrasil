@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Optional, Union, List, Tuple
 
-from yggdrasil.pyutils.modules import PipIndexSettings
+from .modules import PipIndexSettings
 
 log = logging.getLogger(__name__)
 
@@ -441,19 +441,21 @@ class PythonEnv:
         Returns:
             PythonEnv representing the current environment.
         """
-        venv = os.environ.get("VIRTUAL_ENV")
-        if venv:
-            log.debug("current env from VIRTUAL_ENV=%s", venv)
-            return cls(Path(venv))
+        global CURRENT_PYTHON_ENV
 
-        exe = Path(sys.executable).expanduser().resolve()
-        parent = exe.parent
-        if parent.name in ("bin", "Scripts"):
-            log.debug("current env inferred from sys.executable=%s", str(exe))
-            return cls(parent.parent)
+        if CURRENT_PYTHON_ENV is None:
+            exe = Path(sys.executable).expanduser().resolve()
+            parent = exe.parent
 
-        log.debug("current env fallback to sys.prefix=%s", sys.prefix)
-        return cls(Path(sys.prefix))
+            if parent.name in ("bin", "Scripts"):
+                log.debug("current env inferred from sys.executable=%s", str(exe))
+                return cls(parent.parent)
+
+            log.debug("current env fallback to sys.prefix=%s", sys.prefix)
+
+            CURRENT_PYTHON_ENV = cls(Path(sys.prefix))
+
+        return CURRENT_PYTHON_ENV
 
     @classmethod
     def ensure_uv(
@@ -1510,7 +1512,7 @@ print("RESULT:" + json.dumps(top_level))""".strip()
 
 
 # Snapshot singleton (import-time)
-CURRENT_PYTHON_ENV: PythonEnv = PythonEnv.get_current()
+CURRENT_PYTHON_ENV: PythonEnv = None
 
 
 if __name__ == "__main__":

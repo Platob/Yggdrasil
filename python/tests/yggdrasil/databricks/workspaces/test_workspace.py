@@ -1,4 +1,3 @@
-import os
 import unittest
 
 from yggdrasil.databricks import Workspace

@@ -30,7 +30,7 @@ from ...types.cast.registry import convert, register_converter
 from ...types.file_format import ExcelFileFormat
 
 if databricks is not None:
-    from databricks.sdk.service.catalog import VolumeType, PathOperation, VolumeInfo
+    from databricks.sdk.service.catalog import VolumeType, VolumeInfo, PathOperation
     from databricks.sdk.service.workspace import ObjectType
     from databricks.sdk.errors.platform import (
         NotFound,
@@ -282,7 +282,7 @@ class DatabricksPath:
         Returns:
             A PyArrow FileSystem instance.
         """
-        return self.workspace.filesytem(workspace=workspace)
+        return self.workspace.filesystem(workspace=workspace)
 
     @property
     def parent(self):

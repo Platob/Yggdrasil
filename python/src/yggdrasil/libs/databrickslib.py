@@ -1,24 +1,14 @@
 """Optional Databricks SDK dependency helpers."""
 
-try:
-    import databricks
-    import databricks.sdk  # type: ignore
+class DatabricksDummyClass:
+    """Placeholder object that raises if Databricks SDK is required."""
+    def __getattr__(self, item):
+        """Raise an error when accessing missing Databricks SDK attributes."""
+        require_databricks_sdk()
 
-    from databricks.sdk import WorkspaceClient
-
-    databricks = databricks
-    databricks_sdk = databricks.sdk
-except ImportError:
-    class _DatabricksDummy:
-        """Placeholder object that raises if Databricks SDK is required."""
-        def __getattr__(self, item):
-            """Raise an error when accessing missing Databricks SDK attributes."""
-            require_databricks_sdk()
-
-    databricks = _DatabricksDummy
-    databricks_sdk = _DatabricksDummy
-
-    WorkspaceClient = _DatabricksDummy
+    def __setattr__(self, key, value):
+        """Raise an error when accessing missing Databricks SDK attributes."""
+        require_databricks_sdk()
 
 
 def require_databricks_sdk():
@@ -34,9 +24,25 @@ def require_databricks_sdk():
         )
 
 
+try:
+    import databricks
+    import databricks.sdk  # type: ignore
+
+    from databricks.sdk import WorkspaceClient
+
+    databricks = databricks
+    databricks_sdk = databricks.sdk
+except ImportError:
+    databricks = DatabricksDummyClass
+    databricks_sdk = DatabricksDummyClass
+
+    WorkspaceClient = DatabricksDummyClass
+
+
 __all__ = [
     "databricks",
     "databricks_sdk",
     "require_databricks_sdk",
-    "WorkspaceClient"
+    "WorkspaceClient",
+    "DatabricksDummyClass"
 ]

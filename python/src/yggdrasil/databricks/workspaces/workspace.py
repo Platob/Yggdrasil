@@ -14,19 +14,26 @@ from typing import (
     Union, TYPE_CHECKING, List
 )
 
-if TYPE_CHECKING:
-    from ..compute.cluster import Cluster
-
 from .path import DatabricksPath, DatabricksPathKind
 from ...version import __version__ as YGGDRASIL_VERSION
-from ...libs.databrickslib import require_databricks_sdk, databricks_sdk
+from ...libs.databrickslib import require_databricks_sdk, databricks_sdk, WorkspaceClient, DatabricksDummyClass
 
 if databricks_sdk is not None:
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import ResourceDoesNotExist
     from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
     from databricks.sdk.dbutils import FileInfo
     from databricks.sdk.service.files import DirectoryEntry
+else:
+    ResourceDoesNotExist = DatabricksDummyClass
+    ExportFormat = DatabricksDummyClass
+    ObjectInfo = DatabricksDummyClass
+    FileInfo = DatabricksDummyClass
+    DirectoryEntry = DatabricksDummyClass
+
+
+if TYPE_CHECKING:
+    from ..sql.warehouse import SQLWarehouse
+    from ..compute.cluster import Cluster
 
 
 __all__ = [
@@ -36,7 +43,7 @@ __all__ = [
 ]
 
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +54,7 @@ def _get_env_product():
 
     if not v:
         return "yggdrasil"
-    return v.strip().lower()
+    return v
 
 
 def _get_env_product_version():
@@ -57,7 +64,7 @@ def _get_env_product_version():
         if _get_env_product() == "yggdrasil":
             return YGGDRASIL_VERSION
         return None
-    return v.strip().lower()
+    return v
 
 
 def _get_env_product_tag():
@@ -65,7 +72,7 @@ def _get_env_product_tag():
 
     if not v:
         return None
-    return v.strip().lower()
+    return v
 
 
 @dataclass
@@ -115,8 +122,12 @@ class Workspace:
     _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
     # -------------------------
-    # Pickle support
+    # Python methods
     # -------------------------
+    def __post_init__(self):
+        self.product = self.product.strip().lower() if self.product else "yggdrasil"
+        self.product_tag = self.product_tag.strip().lower() if self.product_tag else "main"
+
     def __getstate__(self):
         """Serialize the workspace state for pickling.
 
@@ -357,7 +368,7 @@ class Workspace:
     @property
     def safe_host(self):
         if not self.host:
-            return self.connect().host
+            self.host = self.sdk().config.host
         return self.host
 
     @property
@@ -392,7 +403,7 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Path helpers
     # ------------------------------------------------------------------ #
-    def filesytem(
+    def filesystem(
         self,
         workspace: Optional["Workspace"] = None,
     ):
@@ -605,7 +616,7 @@ class Workspace:
     def sql(
         self,
         workspace: Optional["Workspace"] = None,
-        warehouse_id: Optional[str] = None,
+        warehouse: Optional["SQLWarehouse"] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
     ):
@@ -613,7 +624,7 @@ class Workspace:
 
         Args:
             workspace: Optional workspace override.
-            warehouse_id: Optional SQL warehouse id.
+            warehouse: Optional SQL warehouse.
             catalog_name: Optional catalog name.
             schema_name: Optional schema name.
 
@@ -622,11 +633,13 @@ class Workspace:
         """
         from ..sql import SQLEngine
 
+        workspace = self if workspace is None else workspace
+
         return SQLEngine(
-            workspace=self if workspace is None else workspace,
-            warehouse_id=warehouse_id,
+            workspace=workspace,
             catalog_name=catalog_name,
             schema_name=schema_name,
+            _warehouse=warehouse,
         )
 
     def warehouses(
@@ -652,9 +665,9 @@ class Workspace:
         """Return a Cluster helper bound to this workspace.
 
         Args:
+            workspace: Optional workspace override.
             cluster_id: Optional cluster id.
             cluster_name: Optional cluster name.
-            **kwargs: Additional Cluster parameters.
 
         Returns:
             A Cluster instance.
@@ -662,19 +675,9 @@ class Workspace:
         from ..compute.cluster import Cluster
 
         return Cluster(
-            workspace=self,
+            workspace=self if workspace is None else workspace,
             cluster_id=cluster_id,
             cluster_name=cluster_name,
-        )
-
-    def loki(
-        self,
-        workspace: Optional["Workspace"] = None,
-    ):
-        from ..ai.loki import Loki
-
-        return Loki(
-            workspace=self,
         )
 
 # ---------------------------------------------------------------------------
@@ -688,15 +691,6 @@ DBXWorkspace = Workspace
 class WorkspaceService(ABC):
     """Base class for helpers that depend on a Workspace."""
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
-
-    def __post_init__(self):
-        """Ensure a Workspace instance is available.
-
-        Returns:
-            None.
-        """
-        if self.workspace is None:
-            self.workspace = Workspace()
 
     def __enter__(self):
         """Enter a context manager and connect the workspace.

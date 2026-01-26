@@ -1,38 +1,41 @@
 import dataclasses as dc
 import inspect
 import logging
-from typing import Optional, Sequence
+import time
+from typing import Optional, Sequence, Any, Type, TypeVar, Union, List
 
-from ..workspaces import WorkspaceService, Workspace
-from ...pyutils.equality import dicts_equal, dict_diff
+from .statement_result import StatementResult
+from ..workspaces import WorkspaceService
+from ...libs.databrickslib import DatabricksDummyClass
+from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 try:
     from databricks.sdk import WarehousesAPI
     from databricks.sdk.service.sql import (
-        State, EndpointInfo, EndpointTags, EndpointTagPair, EndpointInfoWarehouseType
-)
+        State, EndpointInfo,
+        EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
+        GetWarehouseResponse, GetWarehouseResponseWarehouseType,
+        Disposition, Format,
+        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
+    )
 
     _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
     _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
 except ImportError:
-    class WarehousesAPI:
-        pass
-
-    class State:
-        pass
-
-    class EndpointInfo:
-        pass
-
-    class EndpointTags:
-        pass
-
-    class EndpointTagPair:
-        pass
-
-    class EndpointInfoWarehouseType:
-        pass
+    WarehousesAPI = DatabricksDummyClass
+    State = DatabricksDummyClass
+    EndpointInfo = DatabricksDummyClass
+    EndpointTags = DatabricksDummyClass
+    EndpointTagPair = DatabricksDummyClass
+    EndpointInfoWarehouseType = DatabricksDummyClass
+    GetWarehouseResponse = DatabricksDummyClass
+    GetWarehouseResponseWarehouseType = DatabricksDummyClass
+    Disposition = DatabricksDummyClass
+    Format = DatabricksDummyClass
+    ExecuteStatementRequestOnWaitTimeout = DatabricksDummyClass
+    StatementParameterListItem = DatabricksDummyClass
 
 
 __all__ = [
@@ -42,6 +45,35 @@ __all__ = [
 
 LOGGER = logging.getLogger(__name__)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
+T = TypeVar("T")
+
+
+def safeGetWarehouseResponse(src: Union[GetWarehouseResponse, EndpointInfo]) -> GetWarehouseResponse:
+    if isinstance(src, GetWarehouseResponse):
+        return src
+
+    payload = _copy_common_fields(src, GetWarehouseResponse, skip={"warehouse_type"})
+
+    payload["warehouse_type"] = _safe_map_enum(
+        GetWarehouseResponseWarehouseType,
+        getattr(src, "warehouse_type", None),
+    )
+
+    return GetWarehouseResponse(**payload)
+
+
+def safeEndpointInfo(src: Union[GetWarehouseResponse, EndpointInfo]) -> EndpointInfo:
+    if isinstance(src, EndpointInfo):
+        return src
+
+    payload = _copy_common_fields(src, EndpointInfo, skip={"warehouse_type"})
+
+    payload["warehouse_type"] = _safe_map_enum(
+        EndpointInfoWarehouseType,
+        getattr(src, "warehouse_type", None),
+    )
+
+    return EndpointInfo(**payload)
 
 
 def set_cached_warehouse_name(
@@ -66,25 +98,68 @@ def get_cached_warehouse_id(
     return existing.get(warehouse_name) if existing else None
 
 
+
+def _safe_map_enum(dst_enum: Type[T], src_val: Any) -> Optional[T]:
+    """
+    Best-effort mapping:
+      - if src_val is already a dst_enum member -> return it
+      - try dst_enum(src_val) for value-based enums
+      - try dst_enum(src_val.value) if src is enum-like
+      - try dst_enum[src_val.name] if src is enum-like
+      - try dst_enum[str(src_val)] as a last resort
+    If nothing works -> None
+    """
+    if src_val is None:
+        return None
+
+    # already the right type
+    if isinstance(src_val, dst_enum):
+        return src_val
+
+    # direct constructor (works if src_val is value-compatible)
+    try:
+        return dst_enum(src_val)  # type: ignore[misc]
+    except Exception:
+        pass
+
+    # enum-like: .value
+    try:
+        return dst_enum(src_val.value)  # type: ignore[misc]
+    except Exception:
+        pass
+
+    # enum-like: .name
+    try:
+        return dst_enum[src_val.name]  # type: ignore[index]
+    except Exception:
+        pass
+
+    # string fallback
+    try:
+        return dst_enum(str(src_val))  # type: ignore[misc]
+    except Exception:
+        return None
+
+
+def _copy_common_fields(src: Any, dst_cls: Type[T], *, skip: set[str] = frozenset()) -> dict:
+    dst_field_names = {f.name for f in dc.fields(dst_cls)}
+    payload = {}
+    for name in dst_field_names:
+        if name in skip:
+            continue
+        payload[name] = getattr(src, name, None)
+    return payload
+
+
 @dc.dataclass
 class SQLWarehouse(WorkspaceService):
     warehouse_id: Optional[str] = None
     warehouse_name: Optional[str] = None
 
-    _details: Optional[EndpointInfo] = dc.field(default=None, repr=False)
+    _details: Optional[EndpointInfo] = dc.field(default=None, repr=False, hash=False, compare=False)
 
     def warehouse_client(self):
         return self.workspace.sdk().warehouses
-
-    def default(
-        self,
-        name: str = "YGG-DEFAULT",
-        **kwargs
-    ):
-        return self.create_or_update(
-            name=name,
-            **kwargs
-        )
 
     @property
     def details(self) -> EndpointInfo:
@@ -100,31 +175,65 @@ class SQLWarehouse(WorkspaceService):
         return self
 
     @details.setter
-    def details(self, value: EndpointInfo):
-        self._details = value
+    def details(self, value: Union[GetWarehouseResponse, EndpointInfo]):
+        self._details = safeEndpointInfo(value)
 
-        self.warehouse_id = value.id
-        self.warehouse_name = value.name
+        if self._details is not None:
+            self.warehouse_id = self._details.id
+            self.warehouse_name = self._details.name
 
     @property
     def state(self):
         return self.latest_details().state
 
     @property
-    def running(self):
-        return self.state in {State.RUNNING}
+    def is_serverless(self):
+        return self.details.enable_serverless_compute
 
     @property
-    def pending(self):
-        return self.state in {State.DELETING, State.STARTING, State.STOPPING}
+    def is_running(self):
+        return self.state == State.RUNNING
+
+    @property
+    def is_pending(self):
+        return self.state in {
+            State.DELETING, State.STARTING, State.STOPPING
+        }
+
+    def wait_for_status(
+        self,
+        wait: Optional[WaitingConfigArg] = None
+    ):
+        """
+        Polls until not pending, using wait.sleep(iteration, start).
+
+        WaitingConfig:
+          - timeout: total wall-clock seconds (0 => no timeout)
+          - interval: base sleep seconds (0 => busy/no-sleep)
+          - backoff: exponential factor (>= 1)
+          - max_interval: cap for sleep seconds (0 => no cap)
+
+        Returns self.
+        """
+        wait = WaitingConfig.default() if wait is None else WaitingConfig.check_arg(wait)
+
+        start = time.time()
+        iteration = 0
+
+        while self.is_pending:
+            # sleep() enforces timeout when start is provided (raises TimeoutError)
+            wait.sleep(iteration=iteration, start=start)
+            iteration += 1
+
+        return self
 
     def start(self):
-        if not self.running:
+        if not self.is_running:
             self.warehouse_client().start(id=self.warehouse_id)
         return self
 
     def stop(self):
-        if self.running:
+        if self.is_running:
             return self.warehouse_client().stop(id=self.warehouse_id)
         return self
 
@@ -132,38 +241,58 @@ class SQLWarehouse(WorkspaceService):
         self,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
-        raise_error: bool = True
+        raise_error: bool = True,
     ):
         if warehouse_id:
+            if warehouse_id == self.warehouse_id:
+                return self
+
             return SQLWarehouse(
                 workspace=self.workspace,
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name
             )
 
-        if self.warehouse_id:
+        elif self.warehouse_id:
             return self
 
-        warehouse_name = warehouse_name or self.warehouse_name
+        warehouse_name = warehouse_name or self.warehouse_name or
 
-        warehouse_id = get_cached_warehouse_id(host=self.workspace.host, warehouse_name=warehouse_name)
+        if warehouse_name:
+            if warehouse_name == self.warehouse_name:
+                return self
 
-        if warehouse_id:
-            return SQLWarehouse(
-                workspace=self.workspace,
-                warehouse_id=warehouse_id,
+            warehouse_id = get_cached_warehouse_id(
+                host=self.workspace.safe_host,
                 warehouse_name=warehouse_name
             )
 
-        for warehouse in self.list_warehouses():
-            if warehouse.warehouse_name == warehouse_name:
-                set_cached_warehouse_name(host=self.workspace.host, warehouse_name=warehouse_name, warehouse_id=warehouse.warehouse_id)
-                return warehouse
+            if warehouse_id:
+                if warehouse_id == self.warehouse_id:
+                    return self
+
+                return SQLWarehouse(
+                    workspace=self.workspace,
+                    warehouse_id=warehouse_id,
+                    warehouse_name=warehouse_name
+                )
+
+            for warehouse in self.list_warehouses():
+                if warehouse.warehouse_name == warehouse_name:
+                    set_cached_warehouse_name(
+                        host=self.workspace.safe_host,
+                        warehouse_name=warehouse_name,
+                        warehouse_id=warehouse.warehouse_id
+                    )
+                    return warehouse
 
         if raise_error:
+            v = warehouse_name or warehouse_id
+
             raise ValueError(
-                f"SQL Warehouse {warehouse_name!r} not found"
+                f"SQL Warehouse {v!r} not found"
             )
+
         return None
 
     def list_warehouses(self):
@@ -176,6 +305,13 @@ class SQLWarehouse(WorkspaceService):
             )
 
             yield warehouse
+
+    def _make_default_name(self, enable_serverless_compute: bool = True):
+        return "%s%s%s" % (
+            self.workspace.product or "yggdrasil",
+            " %s" % self.workspace.product_tag if self.workspace.product_tag else "",
+            " serverless" if enable_serverless_compute else ""
+        )
 
     def _check_details(
         self,
@@ -204,10 +340,20 @@ class SQLWarehouse(WorkspaceService):
             )
 
         if details.cluster_size is None:
-            details.cluster_size = "Small"
+            details.cluster_size = "2X-Small"
 
-        if details.name is None:
-            details.name = "YGG-%s" % details.cluster_size.upper()
+        if details.warehouse_type is None:
+            details.warehouse_type = EndpointInfoWarehouseType.PRO
+
+        if details.enable_serverless_compute is None:
+            details.enable_serverless_compute = details.warehouse_type.value == EndpointInfoWarehouseType.PRO.value
+        elif details.enable_serverless_compute:
+            details.warehouse_type = EndpointInfoWarehouseType.PRO
+
+        if not details.name:
+            details.name = self._make_default_name(
+                enable_serverless_compute=details.enable_serverless_compute
+            )
 
         default_tags = self.workspace.default_tags()
 
@@ -233,30 +379,36 @@ class SQLWarehouse(WorkspaceService):
         if not details.max_num_clusters:
             details.max_num_clusters = 4
 
-        if details.warehouse_type is None:
-            details.warehouse_type = EndpointInfoWarehouseType.CLASSIC
-
         return details
 
     def create_or_update(
         self,
         warehouse_id: Optional[str] = None,
         name: Optional[str] = None,
+        wait: Optional[WaitingConfig] = None,
         **warehouse_specs
     ):
         name = name or self.warehouse_name
-        found = self.find_warehouse(warehouse_id=warehouse_id, warehouse_name=name, raise_error=False)
+        found = self.find_warehouse(
+            warehouse_id=warehouse_id,
+            warehouse_name=name,
+            raise_error=False,
+        )
 
         if found is not None:
-            return found.update(name=name, **warehouse_specs)
-        return self.create(name=name, **warehouse_specs)
+            return found.update(name=name, wait=wait, **warehouse_specs)
+
+        return self.create(name=name, wait=wait, **warehouse_specs)
 
     def create(
         self,
         name: Optional[str] = None,
+        wait: Optional[WaitingConfigArg] = None,
         **warehouse_specs
     ):
         name = name or self.warehouse_name
+
+        checked_wait = WaitingConfig.check_arg(wait)
 
         details = self._check_details(
             keys=_CREATE_ARG_NAMES,
@@ -264,11 +416,23 @@ class SQLWarehouse(WorkspaceService):
             **warehouse_specs
         )
 
-        info = self.warehouse_client().create_and_wait(**{
+        update_details = {
             k: v
             for k, v in details.as_shallow_dict().items()
             if k in _CREATE_ARG_NAMES
-        })
+        }
+
+        if checked_wait.timeout:
+            info = self.warehouse_client().create_and_wait(
+                timeout=checked_wait.timeout_timedelta,
+                **update_details
+            )
+        else:
+            info = self.warehouse_client().create(**update_details)
+
+            update_details["id"] = info.response.id
+
+            info = EndpointInfo(**update_details)
 
         return SQLWarehouse(
             workspace=self.workspace,
@@ -279,10 +443,13 @@ class SQLWarehouse(WorkspaceService):
 
     def update(
         self,
+        wait: Optional[WaitingConfigArg] = None,
         **warehouse_specs
     ):
         if not warehouse_specs:
             return self
+
+        wait = WaitingConfig.check_arg(wait)
 
         existing_details = {
             k: v
@@ -304,22 +471,23 @@ class SQLWarehouse(WorkspaceService):
             existing_details,
             update_details,
             keys=_EDIT_ARG_NAMES,
-            treat_missing_as_none=True,
-            float_tol=0.0,  # set e.g. 1e-6 if you have float-y stuff
         )
 
         if not same:
-            diff = {
-                k: v[1]
-                for k, v in dict_diff(existing_details, update_details, keys=_EDIT_ARG_NAMES).items()
-            }
-
             LOGGER.debug(
                 "Updating %s with %s",
-                self, diff
+                self, update_details
             )
 
-            self.warehouse_client().edit_and_wait(**update_details)
+            if wait.timeout:
+                self.details = self.warehouse_client().edit_and_wait(
+                    timeout=wait.timeout_timedelta,
+                    **update_details
+                )
+            else:
+                _ = self.warehouse_client().edit(**update_details)
+
+                self.details = EndpointInfo(**update_details)
 
             LOGGER.info(
                 "Updated %s",
@@ -328,28 +496,93 @@ class SQLWarehouse(WorkspaceService):
 
         return self
 
-    def sql(
+    def execute(
         self,
-        workspace: Optional[Workspace] = None,
+        statement: Optional[str] = None,
+        *,
         warehouse_id: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+        byte_limit: Optional[int] = None,
+        disposition: Optional[Disposition] = None,
+        format: Optional[Format] = None,
+        on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
+        parameters: Optional[List[StatementParameterListItem]] = None,
+        row_limit: Optional[int] = None,
+        wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-    ):
-        """Return a SQLEngine configured for this workspace.
+        wait: Optional[WaitingConfigArg] = True
+    ) -> StatementResult:
+        """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
+
+        Engine resolution:
+        - If `engine` is not provided and a Spark session is active -> uses Spark.
+        - Otherwise uses Databricks SQL API (warehouse).
+
+        Waiting behavior (`wait_result`):
+        - If True (default): returns a StatementResult in terminal state (SUCCEEDED/FAILED/CANCELED).
+        - If False: returns immediately with the initial handle (caller can `.wait()` later).
 
         Args:
-            workspace: Optional workspace override.
-            warehouse_id: Optional SQL warehouse id.
-            catalog_name: Optional catalog name.
-            schema_name: Optional schema name.
+            statement: SQL statement to execute. If None, a `SELECT *` is generated from the table params.
+            warehouse_id: Warehouse override (for API engine).
+            warehouse_name: Warehouse name override (for API engine).
+            byte_limit: Optional byte limit for results.
+            disposition: Result disposition mode (API engine).
+            format: Result format (API engine).
+            on_wait_timeout: Timeout behavior for waiting (API engine).
+            parameters: Optional statement parameters (API engine).
+            row_limit: Optional row limit for results (API engine).
+            wait_timeout: API wait timeout value.
+            catalog_name: Optional catalog override for API engine.
+            schema_name: Optional schema override for API engine.
+            wait: Whether to block until completion (API engine).
 
         Returns:
-            A SQLEngine instance.
+            StatementResult
         """
+        if format is None:
+            format = Format.ARROW_STREAM
 
-        return self.workspace.sql(
-            workspace=workspace,
-            warehouse_id=warehouse_id or self.warehouse_id,
-            catalog_name=catalog_name,
-            schema_name=schema_name
+        if disposition is None:
+            disposition = Disposition.EXTERNAL_LINKS
+        elif format in (Format.CSV, Format.ARROW_STREAM):
+            disposition = Disposition.EXTERNAL_LINKS
+
+        instance = self.find_warehouse(warehouse_id=warehouse_id, warehouse_name=warehouse_name)
+        warehouse_id = warehouse_id or instance.warehouse_id
+        workspace_client = instance.workspace.sdk()
+
+        LOGGER.debug(
+            "API SQL executing query:\n%s",
+            statement
         )
+
+        response = workspace_client.statement_execution.execute_statement(
+            statement=statement,
+            warehouse_id=warehouse_id,
+            byte_limit=byte_limit,
+            disposition=disposition,
+            format=format,
+            on_wait_timeout=on_wait_timeout,
+            parameters=parameters,
+            row_limit=row_limit,
+            wait_timeout=wait_timeout,
+            catalog=catalog_name,
+            schema=schema_name,
+        )
+
+        execution = StatementResult(
+            workspace_client=workspace_client,
+            warehouse_id=warehouse_id,
+            statement_id=response.statement_id,
+            disposition=disposition,
+            _response=response,
+        )
+
+        LOGGER.info(
+            "API SQL executed statement '%s'",
+            execution.statement_id
+        )
+
+        return execution.wait() if wait is not None else execution

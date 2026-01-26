@@ -22,10 +22,12 @@ import pyarrow as pa
 
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
-from .. import DatabricksPathKind, DatabricksPath
-from ..workspaces import WorkspaceService
-from ...libs.databrickslib import databricks_sdk
+from .warehouse import SQLWarehouse
+from ..workspaces import WorkspaceService, DatabricksPathKind, DatabricksPath
+from ...ai.sql_session import SQLAISession, SQLFlavor
+from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -43,13 +45,14 @@ except ImportError:
 
 if databricks_sdk is not None:
     from databricks.sdk.service.sql import (
-        StatementResponse, Disposition, Format,
+        Disposition, Format,
         ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
     )
-    StatementResponse = StatementResponse
 else:
-    class StatementResponse:  # pragma: no cover
-        pass
+    Disposition = DatabricksDummyClass
+    Format = DatabricksDummyClass
+    ExecuteStatementRequestOnWaitTimeout = DatabricksDummyClass
+    StatementParameterListItem = DatabricksDummyClass
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +60,11 @@ logger = logging.getLogger(__name__)
 if pyspark is not None:
     import pyspark.sql.functions as F
 
-__all__ = ["SQLEngine", "StatementResult"]
+
+__all__ = [
+    "SQLEngine",
+    "StatementResult"
+]
 
 
 @dataclasses.dataclass
@@ -88,9 +95,11 @@ def _needs_column_mapping(col_name: str) -> bool:
 @dataclasses.dataclass
 class SQLEngine(WorkspaceService):
     """Execute SQL statements and manage tables via Databricks SQL / Spark."""
-    warehouse_id: Optional[str] = None
     catalog_name: Optional[str] = None
     schema_name: Optional[str] = None
+
+    _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _ai_session: Optional[SQLAISession] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
 
     def table_full_name(
         self,
@@ -147,68 +156,8 @@ class SQLEngine(WorkspaceService):
             return self.catalog_name, parts[0], parts[1]
 
         catalog_name, schema_name, table_name = parts[-3], parts[-2], parts[-1]
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
-        return catalog_name, schema_name, table_name
 
-    def _default_warehouse(
-        self,
-        cluster_size: str = "Small"
-    ):
-        """Pick a default SQL warehouse (best-effort) matching the desired size.
-
-        Args:
-            cluster_size: Desired warehouse size (Databricks "cluster_size"), e.g. "Small".
-                If empty/None, returns the first warehouse encountered.
-
-        Returns:
-            Warehouse object.
-
-        Raises:
-            ValueError: If no warehouses exist in the workspace.
-        """
-        wk = self.workspace.sdk()
-        existing = list(wk.warehouses.list())
-        first = None
-
-        for warehouse in existing:
-            if first is None:
-                first = warehouse
-
-            if cluster_size:
-                if getattr(warehouse, "cluster_size", None) == cluster_size:
-                    logger.debug("Default warehouse match found: id=%s cluster_size=%s", warehouse.id, warehouse.cluster_size)
-                    return warehouse
-            else:
-                logger.debug("Default warehouse selected (first): id=%s", warehouse.id)
-                return warehouse
-
-        if first is not None:
-            logger.info(
-                "No warehouse matched cluster_size=%s; falling back to first warehouse id=%s cluster_size=%s",
-                cluster_size,
-                getattr(first, "id", None),
-                getattr(first, "cluster_size", None),
-            )
-            return first
-
-        raise ValueError(f"No default warehouse found in {wk.config.host}")
-
-    def _get_or_default_warehouse_id(self, cluster_size: str = "Small") -> str:
-        """Return configured warehouse_id or resolve a default one.
-
-        Args:
-            cluster_size: Desired warehouse size filter used when resolving defaults.
-
-        Returns:
-            Warehouse id string.
-        """
-        if not self.warehouse_id:
-            dft = self._default_warehouse(cluster_size=cluster_size)
-            self.warehouse_id = dft.id
-            logger.info("Resolved default warehouse_id=%s (cluster_size=%s)", self.warehouse_id, cluster_size)
-
-        return self.warehouse_id
+        return catalog_name or self.catalog_name, schema_name or self.schema_name, table_name
 
     @staticmethod
     def _random_suffix(prefix: str = "") -> str:
@@ -217,12 +166,44 @@ class SQLEngine(WorkspaceService):
         timestamp = int(time.time() * 1000)
         return f"{prefix}{timestamp}_{unique}"
 
-    @staticmethod
-    def _sql_preview(sql: str, limit: int = 220) -> str:
-        """Short, single-line preview for logs (avoids spewing giant SQL)."""
-        if not sql:
-            return ""
-        return sql[:limit] + ("…" if len(sql) > limit else "")
+    def warehouse(
+        self,
+        warehouse_id: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
+    ) -> SQLWarehouse:
+        if self._warehouse is None:
+            wh = SQLWarehouse(
+                workspace=self.workspace,
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name
+            )
+
+            self._warehouse = wh.find_warehouse(
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name,
+                raise_error=False
+            )
+
+            if self._warehouse is None:
+                self._warehouse = wh.create_or_update()
+
+        return self._warehouse.find_warehouse(
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
+            raise_error=True
+        )
+
+    def ai_session(
+        self,
+        model: str = "databricks-gemini-2-5-pro",
+        flavor: SQLFlavor = SQLFlavor.DATABRICKS
+    ):
+        return SQLAISession(
+            model=model,
+            api_key=self.workspace.current_token(),
+            base_url="%s/serving-endpoints" % self.workspace.safe_host,
+            flavor=flavor
+        )
 
     def execute(
         self,
@@ -230,17 +211,17 @@ class SQLEngine(WorkspaceService):
         *,
         engine: Optional[Literal["spark", "api"]] = None,
         warehouse_id: Optional[str] = None,
+        warehouse_name: Optional[str] = None,
         byte_limit: Optional[int] = None,
-        disposition: Optional["Disposition"] = None,
-        format: Optional["Format"] = None,
+        disposition: Optional[Disposition] = None,
+        format: Optional[Format] = None,
         on_wait_timeout: Optional["ExecuteStatementRequestOnWaitTimeout"] = None,
         parameters: Optional[List["StatementParameterListItem"]] = None,
         row_limit: Optional[int] = None,
         wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        wait_result: bool = True,
+        wait: Optional[WaitingConfigArg] = True
     ) -> "StatementResult":
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 
@@ -256,6 +237,7 @@ class SQLEngine(WorkspaceService):
             statement: SQL statement to execute. If None, a `SELECT *` is generated from the table params.
             engine: "spark" or "api".
             warehouse_id: Warehouse override (for API engine).
+            warehouse_name: Warehouse name override (for API engine).
             byte_limit: Optional byte limit for results.
             disposition: Result disposition mode (API engine).
             format: Result format (API engine).
@@ -265,8 +247,7 @@ class SQLEngine(WorkspaceService):
             wait_timeout: API wait timeout value.
             catalog_name: Optional catalog override for API engine.
             schema_name: Optional schema override for API engine.
-            table_name: Optional table override used when `statement` is None.
-            wait_result: Whether to block until completion (API engine).
+            wait: Whether to block until completion (API engine).
 
         Returns:
             StatementResult.
@@ -284,71 +265,43 @@ class SQLEngine(WorkspaceService):
             if spark_session is None:
                 raise ValueError("No spark session found to run sql query")
 
+            logger.debug(
+                "SPARK SQL executing query:\n%s",
+                statement
+            )
+
             df: SparkDataFrame = spark_session.sql(statement)
 
             if row_limit:
                 df = df.limit(row_limit)
 
-            logger.debug(
-                "SPARK SQL executed query:\n%s",
-                statement
-            )
-
-            # Avoid Disposition dependency if SDK imports are absent
-            spark_disp = disposition if disposition is not None else getattr(globals().get("Disposition", object), "EXTERNAL_LINKS", None)
-
             return StatementResult(
-                engine=self,
-                statement_id="sparksql",
-                disposition=spark_disp,
+                workspace_client=self.workspace.sdk(),
+                warehouse_id="SparkSQL",
+                statement_id="SparkSQL",
+                disposition=Disposition.EXTERNAL_LINKS,
                 _spark_df=df,
             )
 
-        # --- API path defaults ---
-        if format is None:
-            format = Format.ARROW_STREAM
+        wh = self.warehouse(
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
+        )
 
-        if (disposition is None or disposition == Disposition.INLINE) and format in [Format.CSV, Format.ARROW_STREAM]:
-            disposition = Disposition.EXTERNAL_LINKS
-
-        if not statement:
-            full_name = self.table_full_name(catalog_name=catalog_name, schema_name=schema_name, table_name=table_name)
-            statement = f"SELECT * FROM {full_name}"
-
-        if not warehouse_id:
-            warehouse_id = self._get_or_default_warehouse_id()
-
-        response = self.workspace.sdk().statement_execution.execute_statement(
+        return wh.execute(
             statement=statement,
             warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
             byte_limit=byte_limit,
             disposition=disposition,
             format=format,
             on_wait_timeout=on_wait_timeout,
             parameters=parameters,
-            row_limit=row_limit,
             wait_timeout=wait_timeout,
-            catalog=catalog_name or self.catalog_name,
-            schema=schema_name or self.schema_name,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            wait=wait
         )
-
-        execution = StatementResult(
-            engine=self,
-            statement_id=response.statement_id,
-            _response=response,
-            disposition=disposition,
-        )
-
-        logger.info(
-            "API SQL executed statement '%s'",
-            execution.statement_id
-        )
-        logger.debug(
-            "API SQL executed query:\n%s",
-            statement
-        )
-
-        return execution.wait() if wait_result else execution
 
     def spark_table(
         self,
@@ -412,7 +365,7 @@ class SQLEngine(WorkspaceService):
             None (mutates the destination table).
         """
 
-        if pyspark is not None:
+        if pyspark is not None or spark_session is not None:
             spark_session = SparkSession.getActiveSession() if spark_session is None else spark_session
 
             if spark_session is not None or isinstance(data, SparkDataFrame):
@@ -502,6 +455,7 @@ class SQLEngine(WorkspaceService):
             if existing_schema is None:
                 try:
                     existing_schema = connected.get_table_schema(
+                        location=location,
                         catalog_name=catalog_name,
                         schema_name=schema_name,
                         table_name=table_name,
@@ -788,6 +742,7 @@ FROM parquet.`{temp_volume_path}`"""
 
     def get_table_schema(
         self,
+        location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
@@ -796,6 +751,7 @@ FROM parquet.`{temp_volume_path}`"""
         """Fetch a table schema from Unity Catalog and convert it to Arrow types.
 
         Args:
+            location: Optional Fully qualified location name
             catalog_name: Optional catalog override.
             schema_name: Optional schema override.
             table_name: Optional table name override.
@@ -804,25 +760,44 @@ FROM parquet.`{temp_volume_path}`"""
         Returns:
             Arrow Schema or a STRUCT Field representing the table.
         """
-        full_name = self.table_full_name(
+        location, catalog_name, schema_name, table_name = self._check_location_params(
+            location=location,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
             safe_chars=False,
         )
 
-        wk = self.workspace.sdk()
+        client = self.workspace.sdk().tables
 
         try:
-            table = wk.tables.get(full_name)
+            table = client.get(location)
         except Exception as e:
-            raise ValueError(f"Table %s not found, {type(e)} {e}" % full_name)
+            raise ValueError(f"Table %s not found, {type(e)} {e}" % location)
 
-        fields = [column_info_to_arrow_field(_) for _ in table.columns]
+        fields = [
+            column_info_to_arrow_field(_) for _ in table.columns
+        ]
+
+        metadata = {
+            b"engine": b"databricks",
+            b"full_name": location,
+            b"catalog_name": catalog_name,
+            b"schema_name": schema_name,
+            b"table_name": table_name,
+        }
 
         if to_arrow_schema:
-            return pa.schema(fields, metadata={b"name": table_name})
-        return pa.field(table.name, pa.struct(fields))
+            return pa.schema(
+                fields,
+                metadata=metadata
+            )
+
+        return pa.field(
+            location,
+            pa.struct(fields),
+            metadata=metadata
+        )
 
     def drop_table(
         self,
@@ -830,6 +805,7 @@ FROM parquet.`{temp_volume_path}`"""
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
+        wait: Optional[WaitingConfigArg] = True
     ):
         """Drop a table if it exists."""
         location, _, _, _ = self._check_location_params(
@@ -839,13 +815,17 @@ FROM parquet.`{temp_volume_path}`"""
             table_name=table_name,
             safe_chars=True,
         )
-        logger.info("Dropping table if exists: %s", location)
-        return self.execute(f"DROP TABLE IF EXISTS {location}")
+
+        logger.debug("Dropping table if exists: %s", location)
+
+        self.execute(f"DROP TABLE IF EXISTS {location}", wait=wait)
+
+        logger.info("Dropped table if exists: %s", location)
 
     def create_table(
         self,
         field: Union[pa.Field, pa.Schema],
-        table_fqn: Optional[str] = None,            # e.g. catalog.schema.table
+        full_name: Optional[str] = None,            # e.g. catalog.schema.table
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
@@ -853,7 +833,7 @@ FROM parquet.`{temp_volume_path}`"""
         partition_by: Optional[list[str]] = None,
         cluster_by: Optional[bool | list[str]] = True,
         comment: Optional[str] = None,
-        tblproperties: Optional[dict[str, Any]] = None,
+        properties: Optional[dict[str, Any]] = None,
         if_not_exists: bool = True,
         or_replace: bool = False,
         using: str = "DELTA",
@@ -886,7 +866,7 @@ FROM parquet.`{temp_volume_path}`"""
             - If `pa.Schema`, all schema fields are used as columns.
             - If `pa.Field` with struct type, its children become columns.
             - If `pa.Field` non-struct, it becomes a single-column table.
-        table_fqn:
+        full_name:
             Fully-qualified table name, e.g. `"catalog.schema.table"`.
             If provided, it takes precedence over `catalog_name`/`schema_name`/`table_name`.
             Parts are quoted as needed.
@@ -906,7 +886,7 @@ FROM parquet.`{temp_volume_path}`"""
             - list[str] -> emits `CLUSTER BY (<cols...>)` (all cols must exist in schema)
         comment:
             Optional table comment. If not provided and Arrow metadata contains `b"comment"`, that is used.
-        tblproperties:
+        properties:
             Additional/override Delta table properties (final say).
             Example: `{"delta.enableChangeDataFeed": "true"}` or `{"delta.logRetentionDuration": "30 days"}`
         if_not_exists:
@@ -973,18 +953,21 @@ FROM parquet.`{temp_volume_path}`"""
         Examples
         --------
         Create a managed Delta table with auto clustering and auto column mapping:
-            >>> plan = client.create_table(schema, table_fqn="main.analytics.events", execute=False, return_plan=True)
+            >>> plan = client.create_table(schema, full_name="main.analytics.events", execute=False, return_plan=True)
             >>> print(plan.sql)
 
         External table with explicit partitioning and CDF:
             >>> client.create_table(
             ...     schema,
-            ...     table_fqn="main.analytics.events",
+            ...     full_name="main.analytics.events",
             ...     storage_location="abfss://.../events",
             ...     partition_by=["event_date"],
             ...     enable_cdf=True,
             ... )
         """
+
+        if not isinstance(field, (pa.Field, pa.Schema)):
+            field = convert(field, pa.Field)
 
         # ---- Normalize Arrow input ----
         if isinstance(field, pa.Schema):
@@ -998,16 +981,13 @@ FROM parquet.`{temp_volume_path}`"""
             else:
                 arrow_fields = [field]
 
-        # ---- Resolve table FQN ----
-        # Prefer explicit table_fqn. Else build from catalog/schema/table_name.
-        if table_fqn is None:
-            if not (catalog_name and schema_name and table_name):
-                raise ValueError("Provide table_fqn or (catalog_name, schema_name, table_name).")
-            table_fqn = ".".join(map(_quote_ident, [catalog_name, schema_name, table_name]))
-        else:
-            # If caller passes raw "cat.schema.table", quote each part safely
-            parts = table_fqn.split(".")
-            table_fqn = ".".join(_quote_ident(p) for p in parts)
+        full_name, catalog_name, schema_name, table_name = self._check_location_params(
+            location=full_name,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            safe_chars=True
+        )
 
         # ---- Comments ----
         if comment is None and schema_metadata:
@@ -1051,7 +1031,7 @@ FROM parquet.`{temp_volume_path}`"""
             create_kw = "CREATE TABLE IF NOT EXISTS"
 
         sql_parts: list[str] = [
-            f"{create_kw} {table_fqn} (",
+            f"{create_kw} {full_name} (",
             "  " + ",\n  ".join(column_definitions),
             ")",
             f"USING {using}",
@@ -1096,14 +1076,19 @@ FROM parquet.`{temp_volume_path}`"""
             pass
 
         # Let caller override anything (final say)
-        if tblproperties:
-            props.update(tblproperties)
+        if properties:
+            props.update(properties)
 
         if any_invalid and column_mapping_mode == "none":
             warnings.append(
                 "Schema has invalid column names but column_mapping_mode='none'. "
                 "This will fail unless you rename/escape columns."
             )
+
+        default_tags = self.workspace.default_tags()
+
+        for k, v in default_tags.items():
+            props[f"tags.{k}"] = v
 
         if props:
             def fmt(k: str, v: Any) -> str:
@@ -1122,7 +1107,7 @@ FROM parquet.`{temp_volume_path}`"""
         if not execute:
             return plan if return_plan else statement
 
-        res = self.execute(statement, wait_result=wait_result)
+        res = self.execute(statement, wait=wait_result)
         plan.result = res
         return plan if return_plan else res
 

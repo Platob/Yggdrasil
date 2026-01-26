@@ -24,7 +24,7 @@ from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.callable_serde import CallableSerde
-from ...pyutils.equality import dicts_equal, dict_diff
+from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import PipIndexSettings
 from ...pyutils.python_env import PythonEnv
@@ -714,19 +714,12 @@ class Cluster(WorkspaceService):
             existing_details,
             update_details,
             keys=_EDIT_ARG_NAMES,
-            treat_missing_as_none=True,
-            float_tol=0.0,  # set e.g. 1e-6 if you have float-y stuff
         )
 
         if not same:
-            diff = {
-                k: v[1]
-                for k, v in dict_diff(existing_details, update_details, keys=_EDIT_ARG_NAMES).items()
-            }
-
             LOGGER.debug(
                 "Updating %s with %s",
-                self, diff
+                self, update_details
             )
 
             self.wait_for_status(timeout=wait_timeout)

@@ -16,23 +16,30 @@ from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
-from ...libs.databrickslib import databricks_sdk
+from .exceptions import CommandAborted
+from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
+from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
-from ...pyutils.callable_serde import CallableSerde
 
 if TYPE_CHECKING:
     from .cluster import Cluster
 
 if databricks_sdk is not None:
-    from databricks.sdk.service.compute import Language, ResultType
+    from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
+else:
+    Language = DatabricksDummyClass
+    ResultType = DatabricksDummyClass
+    CommandStatusResponse = DatabricksDummyClass
+
 
 __all__ = [
     "ExecutionContext"
 ]
 
 LOGGER = logging.getLogger(__name__)
+UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
 
 
 @dc.dataclass
@@ -110,16 +117,8 @@ class ExecutionContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context manager and close the remote context if created."""
         if not self._was_connected:
-            self.close()
+            self.close(wait=False)
         self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
-
-    def __del__(self):
-        """Best-effort cleanup for the remote execution context."""
-        if self.context_id:
-            try:
-                Thread(target=self.close).start()
-            except BaseException:
-                pass
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
@@ -152,20 +151,7 @@ meta["version_info"] = current_env.version_info
 
 print(json.dumps(meta))"""
 
-                try:
-                    content = self.execute_command(
-                        command=cmd,
-                        result_tag="<<RESULT>>",
-                        print_stdout=False,
-                    )
-                except ImportError:
-                    self.cluster.ensure_running()
-
-                    content = self.execute_command(
-                        command=cmd,
-                        result_tag="<<RESULT>>",
-                        print_stdout=False,
-                    )
+                content = self.execute_command(command=cmd)
 
                 self._remote_metadata = RemoteMetadata(**json.loads(content))
 
@@ -180,7 +166,7 @@ print(json.dumps(meta))"""
         """
         return self.cluster.workspace.sdk()
 
-    def create_command(
+    def create(
         self,
         language: "Language",
     ) -> any:
@@ -197,15 +183,17 @@ print(json.dumps(meta))"""
             self.cluster
         )
 
+        client = self._workspace_client().command_execution
+
         try:
-            created = self._workspace_client().command_execution.create_and_wait(
+            created = client.create_and_wait(
                 cluster_id=self.cluster.cluster_id,
                 language=language,
             )
         except:
             self.cluster.ensure_running()
 
-            created = self._workspace_client().command_execution.create_and_wait(
+            created = client.create_and_wait(
                 cluster_id=self.cluster.cluster_id,
                 language=language,
             )
@@ -217,42 +205,38 @@ print(json.dumps(meta))"""
 
         created = getattr(created, "response", created)
 
-        return created
+        self.context_id = created.id
+
+        return self
 
     def connect(
         self,
-        language: Optional["Language"] = None
+        language: Optional[Language] = None,
+        reset: bool = False
     ) -> "ExecutionContext":
         """Create a remote command execution context if not already open.
 
         Args:
             language: Optional language override for the context.
+            reset: Reset existing if connected
 
         Returns:
             The connected ExecutionContext instance.
         """
         if self.context_id is not None:
-            return self
+            if not reset:
+                return self
 
-        self.language = language or self.language
+            self.close(wait=False)
 
-        if self.language is None:
-            self.language = Language.PYTHON
+        language = language or self.language
 
-        ctx = self.create_command(language=self.language)
+        if language is None:
+            language = Language.PYTHON
 
-        context_id = ctx.id
-        if not context_id:
-            raise RuntimeError("Failed to create command execution context")
+        return self.create(language=language)
 
-        self.context_id = context_id
-        LOGGER.info(
-            "Opened execution context for %s",
-            self
-        )
-        return self
-
-    def close(self) -> None:
+    def close(self, wait: bool = True) -> None:
         """Destroy the remote command execution context if it exists.
 
         Returns:
@@ -261,12 +245,23 @@ print(json.dumps(meta))"""
         if not self.context_id:
             return
 
+        client = self._workspace_client()
+
         try:
-            self._workspace_client().command_execution.destroy(
-                cluster_id=self.cluster.cluster_id,
-                context_id=self.context_id,
-            )
-        except Exception:
+            if wait:
+                client.command_execution.destroy(
+                    cluster_id=self.cluster.cluster_id,
+                    context_id=self.context_id,
+                )
+            else:
+                Thread(
+                    target=client.command_execution.destroy,
+                    kwargs={
+                        "cluster_id": self.cluster.cluster_id,
+                        "context_id": self.context_id,
+                    }
+                ).start()
+        except BaseException:
             # non-fatal: context cleanup best-effort
             pass
         finally:
@@ -282,7 +277,6 @@ print(json.dumps(meta))"""
         env_keys: Optional[List[str]] = None,
         env_variables: Optional[dict[str, str]] = None,
         timeout: Optional[dt.timedelta] = None,
-        result_tag: Optional[str] = None,
         **options
     ):
         """Execute a string command or a callable in the remote context.
@@ -294,7 +288,6 @@ print(json.dumps(meta))"""
             env_keys: Environment variable names to forward.
             env_variables: Environment variables to inject remotely.
             timeout: Optional timeout for execution.
-            result_tag: Optional result tag for parsing output.
             **options: Additional execution options.
 
         Returns:
@@ -304,8 +297,6 @@ print(json.dumps(meta))"""
             return self.execute_command(
                 command=obj,
                 timeout=timeout,
-                result_tag=result_tag,
-                **options
             )
         elif callable(obj):
             return self.execute_callable(
@@ -317,7 +308,8 @@ print(json.dumps(meta))"""
                 timeout=timeout,
                 **options
             )
-        raise ValueError(f"Cannot execute {type(obj)}")
+        else:
+            raise ValueError(f"Cannot execute {type(obj)}")
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
@@ -389,48 +381,14 @@ print(json.dumps(meta))"""
 
         raw_result = self.execute_command(
             command,
-            timeout=timeout, result_tag=result_tag, print_stdout=print_stdout
+            timeout=timeout
         )
 
-        try:
-            result = serialized.parse_command_result(
-                raw_result,
-                result_tag=result_tag,
-                workspace=self.cluster.workspace
-            )
-        except ModuleNotFoundError as remote_module_error:
-            _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
-            module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
-            module_name = module_name.group(1) if module_name else None
-            module_name = module_name.split(".")[0]
-
-            if module_name and "yggdrasil" not in module_name:
-                LOGGER.debug(
-                    "Installing missing module %s from local environment",
-                    module_name,
-                )
-
-                self.install_temporary_libraries(
-                    libraries=[module_name],
-                )
-
-                LOGGER.warning(
-                    "Installed missing module %s from local environment",
-                    module_name,
-                )
-
-                return self.execute_callable(
-                    func=func,
-                    args=args,
-                    kwargs=kwargs,
-                    env_keys=env_keys,
-                    env_variables=env_variables,
-                    print_stdout=print_stdout,
-                    timeout=timeout,
-                    command=command,
-                )
-
-            raise remote_module_error
+        result = serialized.parse_command_result(
+            raw_result,
+            result_tag=result_tag,
+            workspace=self.cluster.workspace
+        )
 
         return result
 
@@ -438,17 +396,15 @@ print(json.dumps(meta))"""
         self,
         command: str,
         *,
+        language: Optional[Language] = None,
         timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
-        result_tag: Optional[str] = None,
-        print_stdout: Optional[bool] = True,
     ) -> str:
         """Execute a command in this context and return decoded output.
 
         Args:
             command: The command string to execute.
+            language: Language to execute
             timeout: Optional timeout for execution.
-            result_tag: Optional tag to extract a specific result segment.
-            print_stdout: Whether to print stdout for tagged output.
 
         Returns:
             The decoded command output string.
@@ -456,16 +412,31 @@ print(json.dumps(meta))"""
         self.connect()
 
         client = self._workspace_client()
+
+        language = self.language if language is None else Language.PYTHON
+        language = Language.PYTHON if language is None else language
+
         result = client.command_execution.execute_and_wait(
             cluster_id=self.cluster.cluster_id,
             context_id=self.context_id,
-            language=self.language,
+            language=language,
             command=command,
             timeout=timeout or dt.timedelta(minutes=20)
         )
 
         try:
-            return self._decode_result(result, result_tag=result_tag, print_stdout=print_stdout)
+            return _decode_result(
+                result=result,
+                language=language
+            )
+        except CommandAborted:
+            return self.connect(
+                language=self.language,
+                reset=True
+            ).execute_command(
+                command=command,
+                timeout=timeout,
+            )
         except ModuleNotFoundError as remote_module_error:
             _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
             module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
@@ -490,8 +461,6 @@ print(json.dumps(meta))"""
                 return self.execute_command(
                     command=command,
                     timeout=timeout,
-                    result_tag=result_tag,
-                    print_stdout=print_stdout
                 )
 
             raise remote_module_error
@@ -537,7 +506,7 @@ with open(remote_file, "wb") as f:
     f.write(base64.b64decode(data_b64))
 """
 
-            self.execute_command(command=cmd, print_stdout=False)
+            self.execute_command(command=cmd)
             return
 
         # ---------- directory ----------
@@ -583,7 +552,7 @@ with zipfile.ZipFile(buf, "r") as zf:
                 dst.write(src.read())
 """
 
-        self.execute_command(command=cmd, print_stdout=False)
+        self.execute_command(command=cmd)
 
     # ------------------------------------------------------------------
     # upload local lib into remote site-packages
@@ -591,7 +560,6 @@ with zipfile.ZipFile(buf, "r") as zf:
     def install_temporary_libraries(
         self,
         libraries: str | ModuleType | List[str | ModuleType],
-        with_dependencies: bool = True
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
         """
         Upload a local Python lib/module into the remote cluster's
@@ -604,7 +572,6 @@ with zipfile.ZipFile(buf, "r") as zf:
         - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
         Args:
             libraries: Library path, name, module, or iterable of these.
-            with_dependencies: Whether to include dependencies (unused).
 
         Returns:
             The resolved library or list of libraries uploaded.
@@ -634,51 +601,39 @@ with zipfile.ZipFile(buf, "r") as zf:
 
         return libraries
 
-    def _decode_result(
-        self,
-        result: Any,
-        *,
-        result_tag: Optional[str],
-        print_stdout: Optional[bool] = True
-    ) -> str:
-        """Mirror the old Cluster.execute_command result handling.
 
-        Args:
-            result: Raw command execution response.
-            result_tag: Optional tag to extract a segment from output.
-            print_stdout: Whether to print stdout when using tags.
+def _decode_result(
+    result: CommandStatusResponse,
+    language: Language
+) -> str:
+    """Mirror the old Cluster.execute_command result handling.
 
-        Returns:
-            The decoded output string.
-        """
-        if not getattr(result, "results", None):
-            raise RuntimeError("Command execution returned no results")
+    Args:
+        result: Raw command execution response.
 
-        res = result.results
+    Returns:
+        The decoded output string.
+    """
+    res = result.results
 
-        # error handling
-        if res.result_type == ResultType.ERROR:
-            message = res.cause or "Command execution failed"
+    # error handling
+    if res.result_type == ResultType.ERROR:
+        message = res.cause or "Command execution failed"
 
-            if self.language == Language.PYTHON:
-                raise_parsed_traceback(message)
+        if "client terminated the session" in message:
+            raise CommandAborted(message)
 
-            remote_tb = (
-                getattr(res, "data", None)
-                or getattr(res, "stack_trace", None)
-                or getattr(res, "traceback", None)
-            )
-            if remote_tb:
-                message = f"{message}\n{remote_tb}"
+        if language == Language.PYTHON:
+            raise_parsed_traceback(message)
 
-            raise RuntimeError(message)
+        raise RuntimeError(message)
 
-        # normal output
-        if res.result_type == ResultType.TEXT:
-            output = getattr(res, "data", "") or ""
-        elif getattr(res, "data", None) is not None:
-            output = str(res.data)
-        else:
-            output = ""
+    # normal output
+    if res.result_type == ResultType.TEXT:
+        output = res.data or ""
+    elif res.data is not None:
+        output = str(res.data)
+    else:
+        output = ""
 
-        return output
+    return output
