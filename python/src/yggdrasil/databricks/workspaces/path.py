@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import io
 import random
 import string
 import time
 from pathlib import PurePosixPath
-from typing import Optional, Tuple, Union, TYPE_CHECKING, List
+from typing import Optional, Tuple, Union, TYPE_CHECKING, List, Any
 
+import dill
 import pyarrow as pa
 import pyarrow.dataset as ds
 from pyarrow import ArrowInvalid
@@ -23,8 +25,8 @@ from .volumes_path import get_volume_status, get_volume_metadata
 from ...libs.databrickslib import databricks
 from ...libs.pandaslib import PandasDataFrame
 from ...libs.polarslib import polars, PolarsDataFrame
-from ...types.cast.arrow_cast import cast_arrow_tabular
 from ...types.cast.cast_options import CastOptions
+from ...types.cast.pandas_cast import pandas_converter, cast_pandas_dataframe
 from ...types.cast.polars_cast import polars_converter, cast_polars_dataframe
 from ...types.cast.registry import convert, register_converter
 from ...types.file_format import ExcelFileFormat
@@ -176,6 +178,8 @@ class DatabricksPath:
         if not obj:
             return cls.empty_instance(workspace=workspace)
 
+        if isinstance(obj, str):
+            obj = [obj]
         if not isinstance(obj, (str, list)):
             if isinstance(obj, DatabricksPath):
                 if workspace is not None and obj._workspace is None:
@@ -189,6 +193,7 @@ class DatabricksPath:
 
             else:
                 obj = str(obj)
+
 
 
         obj = _flatten_parts(obj)
@@ -256,6 +261,8 @@ class DatabricksPath:
         return self.full_path()
 
     def url(self):
+        if self._workspace is not None:
+            return self._workspace.safe_host + self.full_path()
         return "dbfs://%s" % self.full_path()
 
     def full_path(self) -> str:
@@ -1225,13 +1232,6 @@ class DatabricksPath:
         else:
             raise FileNotFoundError(f"Path {self} does not exist, or dest is not same file or folder type")
 
-    def write_bytes(self, data: bytes):
-        if hasattr(data, "read"):
-            data = data.read()
-
-        with self.open("wb") as f:
-            f.write_all_bytes(data=data)
-
     def temporary_credentials(
         self,
         operation: Optional["PathOperation"] = None
@@ -1247,6 +1247,32 @@ class DatabricksPath:
             url=url,
             operation=operation or PathOperation.PATH_READ,
         )
+
+    def read_bytes(self):
+        with self.open("rb") as f:
+            return f.read_all_bytes(use_cache=False)
+
+    def read_object(self):
+        with self.open("rb") as f:
+            return f.read_object()
+
+    def write_bytes(self, data: bytes):
+        if hasattr(data, "read"):
+            data = data.read()
+
+        with self.open("wb") as f:
+            f.write_all_bytes(data=data)
+
+    def write_object(
+        self,
+        obj: Any,
+        file_format: Optional[FileFormat] = None,
+    ):
+        with self.open("wb") as f:
+            return f.write_object(
+                obj=obj,
+                file_format=file_format
+            )
 
     # -------------------------
     # Data ops (Arrow / Pandas / Polars)
@@ -1356,7 +1382,6 @@ class DatabricksPath:
         table: pa.Table,
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write an Arrow table to the path, sharding if needed.
 
@@ -1364,7 +1389,6 @@ class DatabricksPath:
             table: Arrow table to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             The DatabricksPath instance.
@@ -1377,7 +1401,11 @@ class DatabricksPath:
                     part_path = connected / f"{seed}-{i:05d}-{_rand_str(4)}.parquet"
 
                     with part_path.open(mode="wb") as f:
-                        f.write_arrow_batch(batch, file_format=file_format)
+                        f.write_arrow_batch(
+                            batch,
+                            file_format=file_format,
+                            batch_size=batch_size,
+                        )
 
                 return connected
 
@@ -1387,7 +1415,6 @@ class DatabricksPath:
                         table,
                         file_format=file_format,
                         batch_size=batch_size,
-                        **kwargs
                     )
 
         return self
@@ -1397,7 +1424,6 @@ class DatabricksPath:
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
         concat: bool = True,
-        **kwargs
     ):
         """Read the path into a pandas DataFrame.
 
@@ -1405,7 +1431,6 @@ class DatabricksPath:
             file_format: Optional file format override.
             batch_size: Optional batch size for reads.
             concat: Whether to concatenate results for directories.
-            **kwargs: Format-specific options.
 
         Returns:
             A pandas DataFrame or list of DataFrames if concat=False.
@@ -1415,14 +1440,12 @@ class DatabricksPath:
                 file_format=file_format,
                 batch_size=batch_size,
                 concat=True,
-                **kwargs
             ).to_pandas()
 
         tables = self.read_arrow_table(
             batch_size=batch_size,
             file_format=file_format,
             concat=False,
-            **kwargs
         )
 
         return [t.to_pandas() for t in tables]  # type: ignore[arg-type]
@@ -1432,7 +1455,6 @@ class DatabricksPath:
         df: PandasDataFrame,
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """Write a pandas DataFrame to the path.
 
@@ -1440,7 +1462,6 @@ class DatabricksPath:
             df: pandas DataFrame to write.
             file_format: Optional file format override.
             batch_size: Optional batch size for writes.
-            **kwargs: Format-specific options.
 
         Returns:
             The DatabricksPath instance.
@@ -1461,7 +1482,6 @@ class DatabricksPath:
                             batch,
                             file_format=file_format,
                             batch_size=batch_size,
-                            **kwargs
                         )
             else:
                 with connected.open(mode="wb", clone=False) as f:
@@ -1469,7 +1489,6 @@ class DatabricksPath:
                         df,
                         file_format=file_format,
                         batch_size=batch_size,
-                        **kwargs
                     )
 
         return self
@@ -1521,7 +1540,6 @@ class DatabricksPath:
         df,
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
-        **kwargs
     ):
         """
         Write Polars to a DatabricksPath.
@@ -1536,7 +1554,6 @@ class DatabricksPath:
             df: polars DataFrame or LazyFrame to write.
             file_format: Optional file format override.
             batch_size: Optional rows per part for directory sinks.
-            **kwargs: Format-specific options.
 
         Returns:
             The DatabricksPath instance.
@@ -1550,7 +1567,7 @@ class DatabricksPath:
         with self.connect() as connected:
             if connected.is_dir_sink():
                 seed = int(time.time() * 1000)
-                rows_per_part = batch_size or 1_000_000
+                rows_per_part = batch_size or 1024 * 1024
 
                 # Always parquet for directory sinks (lake layout standard)
                 for i, chunk in enumerate(df.iter_slices(n_rows=rows_per_part)):
@@ -1561,7 +1578,6 @@ class DatabricksPath:
                             df,
                             file_format=file_format,
                             batch_size=batch_size,
-                            **kwargs
                         )
             else:
                 with connected.open(mode="wb", clone=False) as f:
@@ -1569,10 +1585,32 @@ class DatabricksPath:
                         df,
                         file_format=file_format,
                         batch_size=batch_size,
-                        **kwargs
                     )
 
         return self
+
+    def read_pickle(
+        self,
+    ) -> Any:
+        content = self.read_bytes()
+        obj = dill.loads(content)
+
+        return obj
+
+    def write_pickle(
+        self,
+        obj: Any,
+        file_format: Optional[FileFormat] = None,
+    ):
+        buffer = io.BytesIO()
+
+        if isinstance(obj, PandasDataFrame):
+            obj.to_pickle(buffer)
+        else:
+            buffer.write(dill.dumps(obj))
+
+        self.write_bytes(data=buffer.getvalue())
+
 
     def sql(
         self,
@@ -1635,19 +1673,7 @@ class DatabricksPath:
                 "Invalid engine %s, must be in duckdb, polars" % engine
             )
 
-
 if databricks is not None:
-    @register_converter(DatabricksPath, pa.Table)
-    def databricks_path_to_arrow_table(
-        data: DatabricksPath,
-        options: Optional[CastOptions] = None,
-    ) -> pa.Table:
-        return cast_arrow_tabular(
-            data.read_arrow_table(),
-            options
-        )
-
-
     @register_converter(DatabricksPath, ds.Dataset)
     def databricks_path_to_arrow_table(
         data: DatabricksPath,
@@ -1655,6 +1681,16 @@ if databricks is not None:
     ) -> ds.Dataset:
         return data.arrow_dataset()
 
+
+    @pandas_converter(DatabricksPath, PandasDataFrame)
+    def databricks_path_to_pandas(
+        data: DatabricksPath,
+        options: Optional[CastOptions] = None,
+    ) -> PolarsDataFrame:
+        return cast_pandas_dataframe(
+            data.read_pandas(),
+            options
+        )
 
     @polars_converter(DatabricksPath, PolarsDataFrame)
     def databricks_path_to_polars(

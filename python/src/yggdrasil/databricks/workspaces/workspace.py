@@ -480,13 +480,13 @@ class Workspace:
     # SDK access / connection
     # ------------------------------------------------------------------ #
 
-    def sdk(self) -> "WorkspaceClient":
+    def sdk(self) -> WorkspaceClient:
         """Return the connected WorkspaceClient.
 
         Returns:
             The WorkspaceClient instance.
         """
-        return self.connect()._sdk
+        return self.connect(clone=False)._sdk
 
     # ------------------------------------------------------------------ #
     # List / open / delete / SQL
@@ -593,20 +593,29 @@ class Workspace:
         """
         return os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
 
-    def default_tags(self):
+    def default_tags(self, update: bool = True):
         """Return default resource tags for Databricks assets.
 
         Returns:
             A dict of default tags.
         """
-        base = {
-            k: v
-            for k, v in (
-                ("Product", self.product),
-                ("ProductTag", self.product_tag),
-            )
-            if v
-        }
+        if update:
+            base = {
+                k: v
+                for k, v in (
+                    ("Product", self.product),
+                )
+                if v
+            }
+        else:
+            base = {
+                k: v
+                for k, v in (
+                    ("Product", self.product),
+                    ("ProductTag", self.product_tag),
+                )
+                if v
+            }
 
         if self.custom_tags:
             base.update(self.custom_tags)
@@ -736,7 +745,7 @@ class WorkspaceService(ABC):
         parts: Union[List[str], str],
         kind: Optional[DatabricksPathKind] = None,
         workspace: Optional["Workspace"] = None
-    ):
+    ) -> "DatabricksPath":
         """Create a DatabricksPath in the underlying workspace.
 
         Args:

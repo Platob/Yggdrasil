@@ -7,7 +7,6 @@ from typing import List, Union, Optional, Iterable, Callable, TYPE_CHECKING, Map
 
 import pyarrow as pa
 
-from ..pandaslib import pandas
 from ..sparklib import (
     pyspark,
     SparkDataFrame,
@@ -18,6 +17,7 @@ from ..sparklib import (
 from ...types.cast.registry import convert
 
 if TYPE_CHECKING:  # pragma: no cover
+    from ..pandaslib import pandas
     from ...types.cast.cast_options import CastOptions
 
 if pyspark is not None:

@@ -215,8 +215,8 @@ class SQLEngine(WorkspaceService):
         byte_limit: Optional[int] = None,
         disposition: Optional[Disposition] = None,
         format: Optional[Format] = None,
-        on_wait_timeout: Optional["ExecuteStatementRequestOnWaitTimeout"] = None,
-        parameters: Optional[List["StatementParameterListItem"]] = None,
+        on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
+        parameters: Optional[List[StatementParameterListItem]] = None,
         row_limit: Optional[int] = None,
         wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
@@ -685,8 +685,6 @@ FROM parquet.`{temp_volume_path}`"""
         else:
             cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
             data = cast_spark_dataframe(data, options=cast_options)
-
-        logger.debug("Incoming Spark columns: %s", data.columns)
 
         if match_by:
             notnull = None

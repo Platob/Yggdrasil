@@ -2,11 +2,14 @@ import logging
 import os
 import sys
 import unittest
+import datetime as dt
 
 import pytest
 from databricks.sdk.service.compute import Language
 
-from yggdrasil.databricks import Workspace, databricks_remote_compute
+from yggdrasil.databricks import Workspace
+from yggdrasil.databricks.compute import databricks_remote_compute
+
 
 # ---- logging to stdout ----
 logger = logging.getLogger("test")
@@ -35,6 +38,22 @@ class TestCluster(unittest.TestCase):
 
         assert result
         assert latest
+
+    def test_command(self):
+        def test(a: str, date: dt.date):
+            return {
+                "value": a,
+                "date": date
+            }
+
+        cmd = self.cluster.context().command(func=test)
+        today = dt.date.today()
+
+        result = cmd(a="test", date=today)
+
+        assert result
+        assert result["value"] == "test"
+        assert result["date"] == today
 
     def test_execute(self):
         def test():

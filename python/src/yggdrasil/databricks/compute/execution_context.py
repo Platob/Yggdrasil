@@ -2,7 +2,6 @@
 
 import base64
 import dataclasses as dc
-import datetime as dt
 import io
 import json
 import logging
@@ -16,12 +15,14 @@ from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
-from .exceptions import CommandAborted
+from .command_execution import CommandExecution
+from .exceptions import CommandExecutionAborted
 from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
 from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -83,7 +84,7 @@ class ExecutionContext:
             ctx.execute("print(x + 1)")
     """
     cluster: "Cluster"
-    language: Optional["Language"] = None
+    language: Optional[Language] = None
     context_id: Optional[str] = None
 
     _was_connected: Optional[bool] = dc.field(default=None, repr=False)
@@ -119,6 +120,14 @@ class ExecutionContext:
         if not self._was_connected:
             self.close(wait=False)
         self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
+
+    @property
+    def workspace(self):
+        return self.cluster.workspace
+
+    @property
+    def cluster_id(self):
+        return self.cluster.cluster_id
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
@@ -158,13 +167,21 @@ print(json.dumps(meta))"""
             return self._remote_metadata
 
     # ------------ internal helpers ------------
-    def _workspace_client(self):
+    def workspace_client(self):
         """Return the Databricks SDK client for command execution.
 
         Returns:
             The underlying WorkspaceClient instance.
         """
         return self.cluster.workspace.sdk()
+
+    def shared_cache_path(
+        self,
+        suffix: str
+    ):
+        return self.cluster.shared_cache_path(
+            suffix="/context/%s/%s" % (self.context_id, suffix.lstrip("/"))
+        )
 
     def create(
         self,
@@ -183,18 +200,18 @@ print(json.dumps(meta))"""
             self.cluster
         )
 
-        client = self._workspace_client().command_execution
+        client = self.workspace_client().command_execution
 
         try:
             created = client.create_and_wait(
-                cluster_id=self.cluster.cluster_id,
+                cluster_id=self.cluster_id,
                 language=language,
             )
         except:
             self.cluster.ensure_running()
 
             created = client.create_and_wait(
-                cluster_id=self.cluster.cluster_id,
+                cluster_id=self.cluster_id,
                 language=language,
             )
 
@@ -227,6 +244,11 @@ print(json.dumps(meta))"""
             if not reset:
                 return self
 
+            LOGGER.info(
+                "%s reset connection",
+                self
+            )
+
             self.close(wait=False)
 
         language = language or self.language
@@ -245,7 +267,7 @@ print(json.dumps(meta))"""
         if not self.context_id:
             return
 
-        client = self._workspace_client()
+        client = self.workspace_client()
 
         try:
             if wait:
@@ -268,6 +290,28 @@ print(json.dumps(meta))"""
             self.context_id = None
 
     # ------------ public API ------------
+    def command(
+        self,
+        context: Optional["ExecutionContext"] = None,
+        func: Optional[Callable] = None,
+        command_id: Optional[str] = None,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+    ):
+        context = self if context is None else context
+
+        return CommandExecution(
+            context=context,
+            command_id=command_id,
+            language=language,
+            command=command,
+        ).create(
+            context=context,
+            language=language,
+            command=command,
+            func=func,
+        )
+
     def execute(
         self,
         obj: Union[str, Callable],
@@ -276,8 +320,7 @@ print(json.dumps(meta))"""
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[List[str]] = None,
         env_variables: Optional[dict[str, str]] = None,
-        timeout: Optional[dt.timedelta] = None,
-        **options
+        timeout: Optional[WaitingConfigArg] = True,
     ):
         """Execute a string command or a callable in the remote context.
 
@@ -288,7 +331,6 @@ print(json.dumps(meta))"""
             env_keys: Environment variable names to forward.
             env_variables: Environment variables to inject remotely.
             timeout: Optional timeout for execution.
-            **options: Additional execution options.
 
         Returns:
             The decoded execution result.
@@ -306,7 +348,6 @@ print(json.dumps(meta))"""
                 env_keys=env_keys,
                 env_variables=env_variables,
                 timeout=timeout,
-                **options
             )
         else:
             raise ValueError(f"Cannot execute {type(obj)}")
@@ -322,8 +363,7 @@ print(json.dumps(meta))"""
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[Iterable[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
-        print_stdout: Optional[bool] = True,
-        timeout: Optional[dt.timedelta] = None,
+        timeout: Optional[WaitingConfigArg] = True,
         command: Optional[str] = None,
     ) -> Any:
         """Execute a Python callable remotely and return the decoded result.
@@ -334,7 +374,6 @@ print(json.dumps(meta))"""
             kwargs: Keyword arguments for the callable.
             env_keys: Environment variable names to forward.
             env_variables: Environment variables to inject remotely.
-            print_stdout: Whether to print stdout from the command output.
             timeout: Optional timeout for execution.
             command: Optional prebuilt command string override.
 
@@ -397,7 +436,7 @@ print(json.dumps(meta))"""
         command: str,
         *,
         language: Optional[Language] = None,
-        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
+        timeout: Optional[WaitingConfigArg] = True,
     ) -> str:
         """Execute a command in this context and return decoded output.
 
@@ -411,25 +450,34 @@ print(json.dumps(meta))"""
         """
         self.connect()
 
-        client = self._workspace_client()
+        client = self.workspace_client()
 
+        timeout = WaitingConfig.default() if timeout is None else WaitingConfig.check_arg(timeout)
         language = self.language if language is None else Language.PYTHON
         language = Language.PYTHON if language is None else language
 
-        result = client.command_execution.execute_and_wait(
-            cluster_id=self.cluster.cluster_id,
-            context_id=self.context_id,
-            language=language,
-            command=command,
-            timeout=timeout or dt.timedelta(minutes=20)
-        )
+        if timeout.timeout:
+            result = client.command_execution.execute_and_wait(
+                cluster_id=self.cluster.cluster_id,
+                context_id=self.context_id,
+                language=language,
+                command=command,
+                timeout=timeout.timeout_timedelta
+            )
+        else:
+            result = client.command_execution.execute(
+                cluster_id=self.cluster.cluster_id,
+                context_id=self.context_id,
+                language=language,
+                command=command,
+            )
 
         try:
             return _decode_result(
                 result=result,
                 language=language
             )
-        except CommandAborted:
+        except CommandExecutionAborted:
             return self.connect(
                 language=self.language,
                 reset=True
@@ -621,7 +669,7 @@ def _decode_result(
         message = res.cause or "Command execution failed"
 
         if "client terminated the session" in message:
-            raise CommandAborted(message)
+            raise CommandExecutionAborted(message)
 
         if language == Language.PYTHON:
             raise_parsed_traceback(message)

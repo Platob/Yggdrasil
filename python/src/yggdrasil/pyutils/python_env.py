@@ -449,11 +449,10 @@ class PythonEnv:
 
             if parent.name in ("bin", "Scripts"):
                 log.debug("current env inferred from sys.executable=%s", str(exe))
-                return cls(parent.parent)
-
-            log.debug("current env fallback to sys.prefix=%s", sys.prefix)
-
-            CURRENT_PYTHON_ENV = cls(Path(sys.prefix))
+                CURRENT_PYTHON_ENV = cls(parent.parent)
+            else:
+                log.debug("current env fallback to sys.prefix=%s", sys.prefix)
+                CURRENT_PYTHON_ENV = cls(Path(sys.prefix))
 
         return CURRENT_PYTHON_ENV
 

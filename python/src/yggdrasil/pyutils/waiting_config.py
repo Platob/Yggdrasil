@@ -12,12 +12,13 @@ def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
     return ticks
 
 
+DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
 WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 
 
 @dataclass(frozen=True)
 class WaitingConfig:
-    timeout: float = 300.0
+    timeout: float = DEFAULT_TIMEOUT_TICKS
     interval: float = 2.0
     backoff: float = 1.0
     max_interval: float = 15.0
@@ -63,6 +64,9 @@ class WaitingConfig:
 
         if arg is not None:
             if isinstance(arg, cls):
+                if timeout is None and interval is None and backoff is None and max_interval is None:
+                    return arg
+
                 base_timeout = arg.timeout
                 base_interval = arg.interval
                 base_backoff = arg.backoff
@@ -88,7 +92,7 @@ class WaitingConfig:
                 base_timeout = cls._to_seconds(arg)
 
             elif isinstance(arg, bool):
-                base_timeout = 300.0 if arg else 0.0
+                base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
                 base_interval = 2.0
                 base_backoff = 1.0
                 base_max_interval = 15.0
@@ -105,16 +109,17 @@ class WaitingConfig:
         # defaults to match non-Optional signature
         if final_timeout is None:
             final_timeout = 0.0
+        elif final_timeout < 0:
+            final_timeout = 0.0
+
         if final_interval is None:
             final_interval = 2.0
+
         if final_backoff is None:
             final_backoff = 1.0
+
         if final_max_interval is None:
             final_max_interval = 15.0
-
-        # normalize/clamp
-        if final_timeout < 0:
-            final_timeout = 0.0
 
         return cls(
             timeout=float(final_timeout),

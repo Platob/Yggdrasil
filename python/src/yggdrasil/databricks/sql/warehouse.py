@@ -256,7 +256,7 @@ class SQLWarehouse(WorkspaceService):
         elif self.warehouse_id:
             return self
 
-        warehouse_name = warehouse_name or self.warehouse_name or
+        warehouse_name = warehouse_name or self.warehouse_name or self._make_default_name(enable_serverless_compute=True)
 
         if warehouse_name:
             if warehouse_name == self.warehouse_name:
@@ -307,15 +307,15 @@ class SQLWarehouse(WorkspaceService):
             yield warehouse
 
     def _make_default_name(self, enable_serverless_compute: bool = True):
-        return "%s%s%s" % (
+        return "%s%s" % (
             self.workspace.product or "yggdrasil",
-            " %s" % self.workspace.product_tag if self.workspace.product_tag else "",
             " serverless" if enable_serverless_compute else ""
         )
 
     def _check_details(
         self,
         keys: Sequence[str],
+        update: bool,
         details: Optional[EndpointInfo] = None,
         **warehouse_specs
     ):
@@ -340,7 +340,7 @@ class SQLWarehouse(WorkspaceService):
             )
 
         if details.cluster_size is None:
-            details.cluster_size = "2X-Small"
+            details.cluster_size = "Small"
 
         if details.warehouse_type is None:
             details.warehouse_type = EndpointInfoWarehouseType.PRO
@@ -355,7 +355,7 @@ class SQLWarehouse(WorkspaceService):
                 enable_serverless_compute=details.enable_serverless_compute
             )
 
-        default_tags = self.workspace.default_tags()
+        default_tags = self.workspace.default_tags(update=update)
 
         if details.tags is None:
             details.tags = EndpointTags(custom_tags=[
@@ -412,6 +412,7 @@ class SQLWarehouse(WorkspaceService):
 
         details = self._check_details(
             keys=_CREATE_ARG_NAMES,
+            update=False,
             name=name,
             **warehouse_specs
         )
@@ -460,7 +461,12 @@ class SQLWarehouse(WorkspaceService):
         update_details = {
             k: v
             for k, v in (
-                self._check_details(details=self.details, keys=_EDIT_ARG_NAMES, **warehouse_specs)
+                self._check_details(
+                    details=self.details,
+                    update=True,
+                    keys=_EDIT_ARG_NAMES,
+                    **warehouse_specs
+                )
                 .as_shallow_dict()
                 .items()
             )
@@ -581,8 +587,8 @@ class SQLWarehouse(WorkspaceService):
         )
 
         LOGGER.info(
-            "API SQL executed statement '%s'",
-            execution.statement_id
+            "API SQL executed %s",
+            execution
         )
 
         return execution.wait() if wait is not None else execution

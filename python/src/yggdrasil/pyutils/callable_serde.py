@@ -497,9 +497,8 @@ class CallableSerde:
         kwargs: Optional[Dict[str, Any]] = None,
         *,
         result_tag: str = "__CALLABLE_SERDE_RESULT__",
-        prefer: str = "dill",
         byte_limit: int = 64 * 1024,
-        dump_env: str = "none",           # "none" | "globals" | "closure" | "both"
+        dump_env: str = "none", # "none" | "globals" | "closure" | "both"
         filter_used_globals: bool = True,
         env_keys: Optional[Iterable[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
@@ -697,26 +696,18 @@ sys.stdout.flush()
                 string_result.replace("DBXPATH:", "")
             )
 
-            if path.name.endswith(".parquet"):
-                import pandas
-
-                with path.open(mode="rb") as f:
-                    buf = io.BytesIO(f.read_all_bytes())
-
-                path.rmfile()
-                buf.seek(0)
-                return pandas.read_parquet(buf)
-
-            with path.open(mode="rb") as f:
-                blob = f.read_all_bytes()
-
-            path.rmfile()
-        else:
-            # Strict base64 decode (rejects junk chars)
             try:
-                blob = base64.b64decode(string_result.encode("ascii"), validate=True)
-            except (UnicodeEncodeError, binascii.Error) as e:
-                raise ValueError("Invalid base64 payload after result tag (corrupted/contaminated).") from e
+                df = path.read_pandas()
+            finally:
+                path.rmfile()
+
+            return df
+
+        # Strict base64 decode (rejects junk chars)
+        try:
+            blob = base64.b64decode(string_result.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error) as e:
+            raise ValueError("Invalid base64 payload after result tag (corrupted/contaminated).") from e
 
         raw = _decode_result_blob(blob)
         try:
@@ -725,3 +716,5 @@ sys.stdout.flush()
             raise ValueError("Failed to dill.loads decoded payload") from e
 
         return result
+
+

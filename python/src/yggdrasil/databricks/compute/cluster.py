@@ -215,12 +215,6 @@ class Cluster(WorkspaceService):
             source = PythonEnv.get_current()
 
         libraries = list(libraries) if libraries is not None else []
-        libraries.extend([
-            _ for _ in [
-                "ygg",
-                "uv",
-            ] if _ not in libraries
-        ])
 
         python_version = source.version_info
 
@@ -252,45 +246,6 @@ class Cluster(WorkspaceService):
         )
 
         return inst
-
-    def pull_python_environment(
-        self,
-        name: Optional[str] = None,
-        target: PythonEnv | str | None = None,
-    ):
-        """Update or create a local PythonEnv based on remote metadata.
-
-        Args:
-            name: Optional name for the local PythonEnv.
-            target: Existing PythonEnv or name to update.
-
-        Returns:
-            The updated PythonEnv instance.
-        """
-        m = self.system_context.remote_metadata
-        version_info = m.version_info
-
-        python_version = ".".join(str(_) for _ in version_info)
-
-        if target is None:
-            target = PythonEnv.create(
-                name=name or self.name,
-                python=python_version
-            )
-        elif isinstance(target, str):
-            if target.casefold() == "current":
-                target = PythonEnv.get_current()
-            else:
-                target = PythonEnv.create(
-                    name=target,
-                    python=python_version
-                )
-
-        target.update(
-            python=python_version,
-        )
-
-        return target
 
     @property
     def details(self):
@@ -450,6 +405,16 @@ class Cluster(WorkspaceService):
     def clusters_client(self) -> "ClustersAPI":
         """Return the Databricks clusters API client."""
         return self.workspace.sdk().clusters
+
+    def shared_cache_path(
+        self,
+        suffix: str
+    ):
+        base = "/cluster/%s/%s" % (self.cluster_id, suffix.lstrip("/"))
+
+        return self.workspace.shared_cache_path(
+            suffix=base
+        )
 
     def spark_versions(
         self,
@@ -954,7 +919,6 @@ class Cluster(WorkspaceService):
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[List[str]] = None,
         timeout: Optional[dt.timedelta] = None,
-        result_tag: Optional[str] = None,
         context: Optional[ExecutionContext] = None,
     ):
         """Execute a command or callable on the cluster.
@@ -966,7 +930,6 @@ class Cluster(WorkspaceService):
             kwargs: Optional keyword arguments for the callable.
             env_keys: Optional environment variable names to pass.
             timeout: Optional timeout for execution.
-            result_tag: Optional result tag for parsing output.
             context: ExecutionContext to run or create new one
 
         Returns:
@@ -980,7 +943,6 @@ class Cluster(WorkspaceService):
             kwargs=kwargs,
             env_keys=env_keys,
             timeout=timeout,
-            result_tag=result_tag
         )
 
     # ------------------------------------------------------------------
@@ -1059,8 +1021,6 @@ class Cluster(WorkspaceService):
                     env_keys=env_keys,
                     env_variables=env_variables,
                     timeout=timeout,
-                    result_tag=result_tag,
-                    **options
                 )
 
             return wrapper
@@ -1077,7 +1037,6 @@ class Cluster(WorkspaceService):
         wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
-        restart: bool = True,
     ) -> "Cluster":
         """Install libraries on the cluster and optionally wait for completion.
 

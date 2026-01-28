@@ -1,18 +1,21 @@
 """Polars <-> Arrow casting helpers and converters."""
 
-from typing import Optional, Tuple, Union, Dict, Any
+from typing import Optional, Tuple, Union, Dict
 
 import pyarrow as pa
 
 from .arrow_cast import (
     cast_arrow_array,
     cast_arrow_tabular,
-    cast_arrow_record_batch_reader, is_arrow_type_binary_like, is_arrow_type_string_like, is_arrow_type_list_like,
+    cast_arrow_record_batch_reader,
+    is_arrow_type_binary_like,
+    is_arrow_type_string_like,
+    is_arrow_type_list_like,
 )
 from .cast_options import CastOptions
 from .registry import register_converter
 from ..python_defaults import default_arrow_scalar
-from ...libs.polarslib import polars
+from ...libs.polarslib import *
 
 __all__ = [
     "polars_converter",
@@ -41,14 +44,8 @@ __all__ = [
 # Polars type aliases + decorator wrapper (safe when Polars is missing)
 # ---------------------------------------------------------------------------
 
-if polars is not None:
-    PolarsSeries = polars.Series
-    PolarsExpr = polars.Expr
-    PolarsDataFrame = polars.DataFrame
-    PolarsField = polars.Field
-    PolarsSchema = polars.Schema
-    PolarsDataType = polars.DataType
 
+if polars is not None:
     # Primitive Arrow -> Polars dtype mapping (base, non-nested types).
     # These are Polars *dtype classes* (not instances), so they can be used
     # directly in schemas (e.g. pl.Struct({"a": pl.Int64})).
@@ -94,18 +91,6 @@ if polars is not None:
         return register_converter(*args, **kwargs)
 else:
     ARROW_TO_POLARS = {}
-
-    # Dummy types so annotations/decorators don't explode without Polars
-    class _PolarsDummy:  # pragma: no cover - only used when Polars not installed
-        """Placeholder type for polars symbols when polars is unavailable."""
-        pass
-
-    PolarsSeries = _PolarsDummy
-    PolarsExpr = _PolarsDummy
-    PolarsDataFrame = _PolarsDummy
-    PolarsField = _PolarsDummy
-    PolarsSchema = _PolarsDummy
-    PolarsDataType = _PolarsDummy
 
     def polars_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
         """Return a no-op decorator when polars is unavailable.
@@ -737,26 +722,6 @@ def arrow_field_to_polars_field(
     return built
 
 
-def _polars_base_type(pl_dtype: Any) -> Any:
-    """
-    Normalize a Polars dtype or dtype class to its base_type class,
-    so we can key into POLARS_BASE_TO_ARROW.
-    """
-    # dtype is an instance
-    base_method = getattr(pl_dtype, "base_type", None)
-    if callable(base_method):
-        return base_method()
-    # dtype is a class (e.g. pl.Int64)
-    try:
-        instance = pl_dtype()
-    except Exception:
-        return pl_dtype
-    base_method = getattr(instance, "base_type", None)
-    if callable(base_method):
-        return base_method()
-    return pl_dtype
-
-
 @polars_converter(PolarsDataType, pa.DataType)
 def polars_type_to_arrow_type(
     pl_type: PolarsDataType,
@@ -767,7 +732,10 @@ def polars_type_to_arrow_type(
 
     Handles primitives via POLARS_BASE_TO_ARROW and common nested/temporal types.
     """
-    base = _polars_base_type(pl_type)
+    try:
+        base =  pl_type()
+    except Exception:
+        base = pl_type
 
     # Primitive base mapping
     existing = POLARS_BASE_TO_ARROW.get(base) or POLARS_BASE_TO_ARROW.get(type(pl_type))
