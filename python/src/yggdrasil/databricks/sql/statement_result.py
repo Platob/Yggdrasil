@@ -3,7 +3,7 @@
 import dataclasses
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as concurrent_wait
 from typing import Optional, Iterator, TYPE_CHECKING
 
 import pyarrow as pa
@@ -309,6 +309,7 @@ class StatementResult:
 
         if not self.done:
             wait.sleep(iteration=iteration, start=start)
+            iteration += 1
 
         if raise_error:
             self.raise_for_status()
@@ -434,7 +435,7 @@ class StatementResult:
                 submit_more(ex)
 
                 while pending:
-                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    done, _ = concurrent_wait(pending, return_when=FIRST_COMPLETED)
 
                     # collect completed downloads
                     for fut in done:

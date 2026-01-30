@@ -21,7 +21,7 @@ class WaitingConfig:
     timeout: float = DEFAULT_TIMEOUT_TICKS
     interval: float = 2.0
     backoff: float = 1.0
-    max_interval: float = 15.0
+    max_interval: float = 10.0
 
     @property
     def timeout_timedelta(self) -> dt.timedelta:
@@ -72,6 +72,18 @@ class WaitingConfig:
                 base_backoff = arg.backoff
                 base_max_interval = arg.max_interval
 
+            elif isinstance(arg, bool):
+                base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
+                base_interval = 2.0
+                base_backoff = 2.0
+                base_max_interval = 15.0
+
+            elif isinstance(arg, (int, float, dt.timedelta)):
+                base_timeout = cls._to_seconds(arg)
+
+            elif isinstance(arg, dt.datetime):
+                base_timeout = float(cls._deadline_to_timeout(arg))
+
             elif isinstance(arg, dict):
                 if "deadline" in arg and "timeout" in arg:
                     raise ValueError("Provide only one of 'deadline' or 'timeout' in WaitingOptions dict.")
@@ -84,18 +96,6 @@ class WaitingConfig:
                 base_interval = cls._to_seconds(arg.get("interval"))
                 base_backoff = cls._to_seconds(arg.get("backoff"))
                 base_max_interval = cls._to_seconds(arg.get("max_interval"))
-
-            elif isinstance(arg, dt.datetime):
-                base_timeout = float(cls._deadline_to_timeout(arg))
-
-            elif isinstance(arg, (int, float, dt.timedelta)):
-                base_timeout = cls._to_seconds(arg)
-
-            elif isinstance(arg, bool):
-                base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
-                base_interval = 2.0
-                base_backoff = 1.0
-                base_max_interval = 15.0
 
             else:
                 raise TypeError(f"Unsupported WaitingOptions arg type: {type(arg)!r}")
@@ -116,10 +116,12 @@ class WaitingConfig:
             final_interval = 2.0
 
         if final_backoff is None:
-            final_backoff = 1.0
+            final_backoff = 2.0
+        elif final_backoff < 1:
+            final_backoff = 2.0
 
         if final_max_interval is None:
-            final_max_interval = 15.0
+            final_max_interval = 10.0
 
         return cls(
             timeout=float(final_timeout),
@@ -145,17 +147,17 @@ class WaitingConfig:
         if self.interval == 0:
             return
 
-        sleep_s = float(self.interval) * (float(self.backoff) ** int(iteration))
+        sleep_s = self.interval * (self.backoff ** int(iteration))
 
         if self.max_interval > 0:
-            sleep_s = min(sleep_s, float(self.max_interval))
+            sleep_s = min(sleep_s, self.max_interval)
 
         if sleep_s <= 0:
             return
 
         if start is not None and self.timeout > 0:
             elapsed = time.time() - float(start)
-            remaining = float(self.timeout) - elapsed
+            remaining = self.timeout - elapsed
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
             sleep_s = min(sleep_s, remaining)

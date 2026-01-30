@@ -2,7 +2,7 @@ from ...exceptions import YGGException
 
 __all__ = [
     "ComputeException",
-    "CommandExecutionAborted",
+    "ClientTerminatedSession",
     "CommandExecutionException"
 ]
 
@@ -15,5 +15,5 @@ class CommandExecutionException(ComputeException):
     pass
 
 
-class CommandExecutionAborted(CommandExecutionException):
+class ClientTerminatedSession(CommandExecutionException):
     pass

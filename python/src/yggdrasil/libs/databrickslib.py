@@ -1,14 +1,13 @@
 """Optional Databricks SDK dependency helpers."""
+from yggdrasil.types.dummy_class import DummyModuleClass
 
-class DatabricksDummyClass:
+
+class DatabricksDummyClass(DummyModuleClass):
     """Placeholder object that raises if Databricks SDK is required."""
-    def __getattr__(self, item):
-        """Raise an error when accessing missing Databricks SDK attributes."""
-        require_databricks_sdk()
 
-    def __setattr__(self, key, value):
-        """Raise an error when accessing missing Databricks SDK attributes."""
-        require_databricks_sdk()
+    @classmethod
+    def module_name(cls) -> str:
+        return "databricks"
 
 
 def require_databricks_sdk():

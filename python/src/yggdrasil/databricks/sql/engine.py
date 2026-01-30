@@ -16,18 +16,20 @@ import logging
 import random
 import string
 import time
+from threading import Thread
 from typing import Optional, Union, Any, Dict, List, Literal
 
 import pyarrow as pa
+import pyarrow.dataset as pds
 
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
 from .warehouse import SQLWarehouse
-from ..workspaces import WorkspaceService, DatabricksPathKind, DatabricksPath
+from ..workspaces import WorkspaceService, DatabricksPath
 from ...ai.sql_session import SQLAISession, SQLFlavor
 from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from ...pyutils.waiting_config import WaitingConfigArg
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -465,8 +467,7 @@ class SQLEngine(WorkspaceService):
                     data_tbl = convert(data, pa.Table)
                     existing_schema = data_tbl.schema
                     logger.warning(
-                        "Table %s not found (%s). Creating it from input schema (columns=%s)",
-                        location,
+                        "%s, creating it from input schema (columns=%s)",
                         exc,
                         existing_schema.names,
                     )
@@ -498,12 +499,10 @@ class SQLEngine(WorkspaceService):
                     except Exception:
                         logger.exception("Arrow insert failed after auto-creating %s; attempting cleanup (DROP TABLE)", location)
                         try:
-                            connected.drop_table(location=location)
+                            connected.drop_table(location=location, wait=True)
                         except Exception:
                             logger.exception("Failed to drop table %s after auto creation error", location)
                         raise
-
-            transaction_id = self._random_suffix()
 
             data_tbl = convert(
                 data, pa.Table,
@@ -521,14 +520,15 @@ class SQLEngine(WorkspaceService):
             )
 
             # Write in temp volume
-            temp_volume_path = connected.dbfs_path(
-                kind=DatabricksPathKind.VOLUME,
-                parts=[catalog_name, schema_name, "tmp", "sql", transaction_id],
+            temp_volume_path = self.workspace.tmp_path(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                volume_name="tmp",
+                extension="parquet"
             ) if temp_volume_path is None else DatabricksPath.parse(obj=temp_volume_path, workspace=connected.workspace)
 
             logger.debug("Staging Parquet to temp volume: %s", temp_volume_path)
-            temp_volume_path.mkdir()
-            temp_volume_path.write_arrow_table(data_tbl)
+            temp_volume_path.write_arrow_table(data_tbl, file_format=pds.ParquetFileFormat())
 
             columns = list(existing_schema.names)
             cols_quoted = ", ".join([f"`{c}`" for c in columns])
@@ -574,7 +574,12 @@ FROM parquet.`{temp_volume_path}`"""
                     connected.execute(stmt.strip())
             finally:
                 try:
-                    temp_volume_path.rmdir(recursive=True)
+                    Thread(
+                        target=temp_volume_path.rmdir,
+                        kwargs={
+                            "recursive": True
+                        }
+                    ).start()
                 except Exception:
                     logger.exception("Failed cleaning temp volume: %s", temp_volume_path)
 

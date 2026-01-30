@@ -101,6 +101,15 @@ class DatabricksIO(ABC, IO):
     def __hash__(self):
         return self.path.__hash__()
 
+    def __str__(self):
+        return self.path.__str__()
+
+    def __repr__(self):
+        return "%s(path=%s)" % (
+            self.__class__.__name__,
+            self.path.__repr__()
+        )
+
     @classmethod
     def create_instance(
         cls,
@@ -509,7 +518,7 @@ class DatabricksIO(ABC, IO):
         return True
 
     @abstractmethod
-    def write_all_bytes(self, data: bytes):
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write raw bytes to the remote path.
 
         Args:
@@ -984,11 +993,11 @@ class DatabricksWorkspaceIO(DatabricksIO):
         return data[start:end]
 
     @retry(exceptions=(InternalError,))
-    def write_all_bytes(self, data: bytes):
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a Workspace file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksWorkspaceIO instance.
@@ -997,8 +1006,17 @@ class DatabricksWorkspaceIO(DatabricksIO):
         workspace_client = sdk.workspace
         full_path = self.path.workspace_full_path()
 
+        if isinstance(data, bytes):
+            bsize = len(data)
+        elif isinstance(data, io.BytesIO):
+            bsize = len(data.getvalue())
+        else:
+            bsize = None
+
         LOGGER.debug(
-            "Writing all bytes in %s",
+            "Writing %s(size=%s) in %s",
+            type(data),
+            bsize,
             self
         )
 
@@ -1019,16 +1037,17 @@ class DatabricksWorkspaceIO(DatabricksIO):
                 overwrite=True
             )
 
-        LOGGER.info(
-            "Written all bytes in %s",
-            self
-        )
-
         self.path.reset_metadata(
             is_file=True,
             is_dir=False,
-            size=len(data),
+            size=bsize,
             mtime=time.time()
+        )
+
+        LOGGER.info(
+            "Written %s bytes in %s",
+            bsize,
+            self
         )
 
         return self
@@ -1078,11 +1097,11 @@ class DatabricksVolumeIO(DatabricksIO):
         return data[start:end]
 
     @retry(exceptions=(InternalError,))
-    def write_all_bytes(self, data: bytes):
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a volume file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksVolumeIO instance.
@@ -1175,11 +1194,11 @@ class DatabricksDBFSIO(DatabricksIO):
         return bytes(read_bytes)
 
     @retry(exceptions=(InternalError,))
-    def write_all_bytes(self, data: bytes):
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a DBFS file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksDBFSIO instance.

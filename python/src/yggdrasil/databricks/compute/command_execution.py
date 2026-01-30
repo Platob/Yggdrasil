@@ -1,20 +1,26 @@
+import base64
+import gzip
 import io
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Any, AnyStr, Callable
+from json import JSONDecodeError
+from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Iterable, Union, Generator, Iterator
 
 import dill
-from databricks.sdk.errors import InternalError
+import pyarrow
 
-from .exceptions import CommandExecutionAborted
+from .exceptions import ClientTerminatedSession
 from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
 from ...libs.pandaslib import PandasDataFrame
+from ...libs.polarslib import PolarsDataFrame
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 if databricks_sdk is not None:
+    from databricks.sdk.errors import InternalError
     from databricks.sdk.service.compute import (
         Language, CommandExecutionAPI, CommandStatusResponse, CommandStatus, ResultType
     )
@@ -31,6 +37,7 @@ if databricks_sdk is not None:
         CommandStatus.ERROR, CommandStatus.CANCELLED
     }
 else:
+    InternalError = DatabricksDummyClass
     Language = DatabricksDummyClass
     CommandExecutionAPI = DatabricksDummyClass
     ResultType = DatabricksDummyClass
@@ -57,34 +64,71 @@ class CommandExecution:
 
     language: Optional[Language] = field(default=None, repr=False, compare=False, hash=False)
     command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
+    environ: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False, hash=False)
 
     _details: Optional[CommandStatusResponse] = field(default=None, repr=False, compare=False, hash=False)
+
+    def __post_init__(self):
+        if self.environ:
+            if isinstance(self.environ, (list, tuple, set)):
+                self.environ = {
+                    k: os.getenv(k)
+                    for k in self.environ
+                }
 
     def __call__(self, *args, **kwargs):
         assert self.command, "Cannot call %s, missing command" % self
 
-        args = dill.dumps([self.encode_object(_) for _ in args])
-        kwargs = dill.dumps({
-            k: self.encode_object(v)
-            for k, v in kwargs.items()
-        })
+        args_blob = dill.dumps([self.encode_object(_) for _ in args])
+        kwargs_blob = dill.dumps({k: self.encode_object(v) for k, v in kwargs.items()})
+
+        if self.environ:
+            env_blob = {
+                k: os.getenv(k) or v
+                for k, v in self.environ.items()
+                if os.getenv(k) or v
+            }
+        else:
+            env_blob = {}
+
+        args_b64 = base64.b64encode(args_blob).decode("ascii")
+        kwargs_b64 = base64.b64encode(kwargs_blob).decode("ascii")
 
         command = (
             self.command
-            .replace("__ARGS__", args.decode("latin-1"))
-            .replace("__KWARGS__", kwargs.decode("latin-1"))
+            .replace("__ARGS__", repr(args_b64))
+            .replace("__KWARGS__", repr(kwargs_b64))
+            .replace("__ENVIRON__", repr(env_blob))
         )
 
-        run = self.create(
-            context=self.context,
-            command=command,
-            language=Language.PYTHON
-        ).start()
+        run = (
+            self.create(
+                context=self.context,
+                command=command,
+                language=self.language
+            )
+            .start()
+        )
 
-        return run.wait(raise_error=True)
+        return run.wait(raise_error=True).result(raise_error=True)
 
     def __bool__(self):
         return self.done
+
+    def __repr__(self):
+        return "%s(url=%s)" % (
+            self.__class__.__name__,
+            self.url()
+        )
+
+    def __str__(self):
+        return self.url()
+
+    def url(self) -> str:
+        return "%s/command/%s" % (
+            self.context.url(),
+            self.command_id or "unknown"
+        )
 
     def create(
         self,
@@ -92,10 +136,24 @@ class CommandExecution:
         func: Optional[Callable] = None,
         command: Optional[str] = None,
         language: Optional[Language] = None,
-        command_id: Optional[str] = None
+        command_id: Optional[str] = None,
+        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
     ):
         context = self.context if context is None else context
         command = self.command if command is None else command
+        environ = self.environ if environ is None else environ
+
+        if environ is not None:
+            if not isinstance(environ, dict):
+                environ = {
+                    str(k): os.getenv(str(k))
+                    for k in environ
+                }
+            else:
+                environ = {
+                    str(k): str(v)
+                    for k, v in environ.items()
+                }
 
         if not command:
             if callable(func):
@@ -112,39 +170,34 @@ class CommandExecution:
             context=context,
             language=language,
             command=command,
-            command_id=command_id
+            command_id=command_id,
+            environ=environ
         )
 
-    def start(self):
+    def start(self, reset: bool = False):
         if self.command_id:
-            return self
+            if not reset:
+                return self
+
+            self._details = None
+            self.command_id = None
 
         client = self.context.workspace_client().command_execution
 
-        LOGGER.debug(
-            "%s executing command:\m%s",
-            self.context,
-            self.command
-        )
+        assert self.command, "Missing command arg in %s" % self
 
         try:
-            details: CommandStatusResponse = client.execute(
-                cluster_id=self.context.cluster_id,
-                context_id=self.context.context_id,
+            details = client.execute(
+                cluster_id=self.cluster_id,
+                context_id=self.context_id,
                 language=self.language,
                 command=self.command,
             ).response
-        except InternalError as e:
+        except Exception as e:
             if "ontext" in str(e):  # context related
                 self.context = self.context.connect(reset=True)
 
-                LOGGER.debug(
-                    "%s executing command:\m%s",
-                    self.context,
-                    self.command
-                )
-
-                details: CommandStatusResponse = client.execute(
+                details = client.execute(
                     cluster_id=self.cluster_id,
                     context_id=self.context_id,
                     language=self.language,
@@ -153,12 +206,10 @@ class CommandExecution:
             else:
                 raise e
 
-        LOGGER.info(
-            "Started %s",
-            self
-        )
+        self.command_id = details.id
+        self._details = None
 
-        self.details = details
+        LOGGER.info("Started %s", self)
 
         return self
 
@@ -172,6 +223,8 @@ class CommandExecution:
 
     @property
     def context_id(self):
+        if not self.context.context_id:
+            self.context = self.context.connect()
         return self.context.context_id
 
     @property
@@ -207,6 +260,10 @@ class CommandExecution:
         self._details = value
 
         if value is not None:
+            assert isinstance(value, CommandStatusResponse), "%s.details must be CommandStatusResponse, got %s" %(
+                self,
+                type(value)
+            )
             self.command_id = value.id
 
     @property
@@ -218,10 +275,6 @@ class CommandExecution:
 
     def connect(self, reset: bool = False):
         self.context = self.context.connect(language=self.language)
-
-        if self.command_id:
-            if not reset:
-                return self
 
         return self
 
@@ -253,52 +306,53 @@ class CommandExecution:
         raise_error: bool = True
     ):
         if not self.command_id:
-            return self
+            return self.start().wait(
+                wait=wait,
+                raise_error=raise_error
+            )
 
         wait = WaitingConfig.check_arg(wait)
         iteration, start = 0, time.time()
 
-        while self.running:
-            wait.sleep(
-                iteration=iteration,
-                start=start
-            )
-            iteration += 1
+        if wait.timeout:
+            while self.running:
+                wait.sleep(iteration=iteration, start=start)
+                iteration += 1
 
         if raise_error:
             try:
                 self.raise_for_status()
-            except CommandExecutionAborted as e:
+            except ModuleNotFoundError as e:
+                module_name = e.name
+
+                if module_name and not module_name.startswith("ygg"):
+                    self.context.cluster.install_temporary_libraries(
+                        libraries=[module_name]
+                    )
+
+                    return (
+                        self
+                        .start(reset=True)
+                        .wait(wait=wait, raise_error=raise_error)
+                    )
+                else:
+                    raise e
+            except ClientTerminatedSession as e:
                 LOGGER.error(
                     "%s aborted: %s",
                     self,
                     e
                 )
 
-                if self.command:
-                    # Retry with new context
-                    new_execution = self.create(
-                        context=self.context.connect(reset=True),
-                        command=self.command,
-                        language=self.language
-                    )
+                self.context = self.context.connect(reset=True)
 
-                    self.context = new_execution.context
-                    self.command_id = new_execution.command_id
-
-                    self._details = new_execution._details
-                else:
-                    raise
+                return (
+                    self
+                    .start(reset=True)
+                    .wait(wait=wait, raise_error=raise_error)
+                )
 
         return self
-
-    def shared_cache_path(
-        self,
-        suffix: str
-    ):
-        return self.context.shared_cache_path(
-            suffix="/command/%s/%s" % (self.command_id, suffix.lstrip("/"))
-        )
 
     def encode_object(
         self,
@@ -306,73 +360,159 @@ class CommandExecution:
         byte_limit: int = 32 * 1024,
         byref: Any = None,
         recurse: Any = None,
+        compression: Optional[str] = None
     ) -> str:
-        prefix = Prefixes.DILL
-        compression: str = ""
-
         buffer = io.BytesIO()
-        if isinstance(obj, PandasDataFrame):
-            obj.to_pickle(path=buffer)
-        else:
-            dill.dump(
-                obj,
-                buffer,
-                byref=byref,
-                recurse=recurse
-            )
+
+        if isinstance(obj, pyarrow.Table):
+            import pyarrow.parquet as pq
+
+            func = "pyarrow.parquet.read_table"
+            extension = "parquet"
+            pq.write_table(obj, buffer)
+
+            buffer.seek(0)
+            dbx_path = self.workspace.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json.dumps({
+                "func": func,
+                "file": dbx_path.full_path()
+            })
+        elif isinstance(obj, PolarsDataFrame):
+            func = "polars.read_parquet"
+            extension = "parquet"
+            obj.write_parquet(buffer)
+
+            buffer.seek(0)
+            dbx_path = self.workspace.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json.dumps({
+                "func": func,
+                "file": dbx_path.full_path()
+            })
+        elif isinstance(obj, PandasDataFrame):
+            try:
+                func = "pandas.read_parquet"
+                extension = "parquet"
+                obj.to_parquet(path=buffer)
+            except Exception as e:
+                LOGGER.warning(e)
+
+                compression = "gzip"
+                extension = "pkl.gz"
+                func = "pandas.read_pickle"
+                obj.to_pickle(path=buffer, compression=compression)
+
+            buffer.seek(0)
+            dbx_path = self.workspace.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json.dumps({
+                "func": func,
+                "cpr": compression,
+                "file": dbx_path.full_path()
+            })
+        elif isinstance(obj, (Generator, Iterator)):
+            return json.dumps({
+                "func": "generator",
+                "items": [
+                    self.encode_object(_, byte_limit=byte_limit, byref=byref, recurse=recurse, compression=compression)
+                    for _ in obj
+                ]
+            })
+
+        dill.dump(obj, buffer, byref=byref, recurse=recurse)
 
         raw = buffer.getvalue()
 
-        if len(raw) > byte_limit:
-            import zlib
-            compression = "zlib"
-            raw = zlib.compress(raw)
+        if compression or len(raw) > byte_limit:
+            compression = compression or "gzip"
+            raw = gzip.compress(raw)
 
         if len(raw) > byte_limit:
-            dbx_path = self.shared_cache_path(suffix=f"{hash(obj)}.pkl")
-            dbx_path.write_object(obj)
-            prefix = Prefixes.DATABRICKS_PATH
-            payload = dbx_path.full_path()
-        else:
-            payload = raw.decode("latin-1")
+            buffer.seek(0)
+            dbx_path = self.workspace.tmp_path(extension="bin")
+            dbx_path.write_bytes(buffer)
 
-        return f"{prefix}:{compression}:{payload}"
+            return json.dumps({
+                "func": "dill.load",
+                "cpr": compression,
+                "file": dbx_path.full_path()
+            })
 
-    def decode_object(
+        return json.dumps({
+            "func": "dill.load",
+            "cpr": compression,
+            "b64": base64.b64encode(raw).decode("ascii")
+        })
+
+    def decode_payload(
         self,
-        payload: str,
+        payload: Union[str, bytes, dict, list]
     ):
-        try:
-            prefix, compression, payload = payload.split(":", 2)
-        except ValueError as e:
-            raise ValueError(f"Malformed encoded object: {payload[:80]}...") from e
-
-        def _maybe_decompress(blob: bytes) -> bytes:
-            if not compression:
-                return blob
-            if compression == "zlib":
-                import zlib
-                return zlib.decompress(blob)
-            raise ValueError(f"Unknown compression '{compression}'")
-
-        if prefix == Prefixes.DILL:
-            blob = payload.encode("latin-1")
-            blob = _maybe_decompress(blob)
-            return dill.loads(blob)
-
-        if prefix == Prefixes.DATABRICKS_PATH:
-            # payload is a full path string
-            dbx_path = self.workspace.dbfs_path(payload)
-
+        if isinstance(payload, (str, bytes)):
             try:
-                raw = dbx_path.read_bytes()
-            finally:
-                dbx_path.rmfile(allow_not_found=True)
+                payload = json.loads(payload)
+            except JSONDecodeError:
+                return payload
 
-            raw = _maybe_decompress(raw)
-            return dill.loads(raw)
+        if isinstance(payload, dict):
+            func, compression, b64, databricks_path = (
+                payload.get("func"), payload.get("cpr"),
+                payload.get("b64"), payload.get("file")
+            )
 
-        raise ValueError(f"Unknown prefix '{prefix}'")
+            if isinstance(func, str) and func:
+                if b64:
+                    blob = base64.b64decode(b64.encode("ascii"))
+                elif databricks_path:
+                    blob = self.workspace.dbfs_path(databricks_path, temporary=True).read_bytes()
+                else:
+                    blob = None
+
+                if func == "dill.load":
+                    if compression == "gzip":
+                        import gzip
+                        blob = gzip.decompress(blob)
+
+                    return dill.loads(blob)
+                elif func.startswith("pyarrow."):
+                    import pyarrow.parquet as pq
+
+                    buff = io.BytesIO(blob)
+
+                    return pq.read_table(buff)
+                elif func.startswith("pandas."):
+                    import pandas
+
+                    buff = io.BytesIO(blob)
+
+                    if func == "pandas.read_parquet":
+                        return pandas.read_parquet(buff)
+                    elif func == "pandas.read_pickle":
+                        return pandas.read_pickle(buff, compression=compression)
+                    else:
+                        raise NotImplementedError
+                elif func == "generator":
+                    items = payload.get("items")
+
+                    def gen(it: Iterator = items):
+                        if it:
+                            for item in it:
+                                yield self.decode_payload(item)
+
+                    return gen()
+                elif func.startswith("polars."):
+                    import polars
+
+                    buff = io.BytesIO(blob)
+                    return polars.read_parquet(buff)
+                else:
+                    raise NotImplementedError
+
+        return payload
 
     def make_python_function_command(
         self,
@@ -381,30 +521,36 @@ class CommandExecution:
         byref: Any = None,
         recurse: Any = None,
     ):
+        # Serialize the command object (self) as ASCII-safe base64
         command_bytes = dill.dumps(self)
-        serialized_func = self.encode_object(func)
+        command_b64 = base64.b64encode(command_bytes).decode("ascii")
 
-        cmd = (
-            """import dill
-from yggdrasil.databricks.compute.command_execution import encode_object, decode_object
+        # Func serialized by strict encoder: DILL:<compression>:b64:<...> or DATABRICKS_PATH:<compression>:path:<...>
+        serialized_func = self.encode_object(func, byref=byref, recurse=recurse)
 
-args, kwargs, func, tag, command = "__ARGS__", "__KWARGS__", "__FUNCTION__", "__TAG__", "__COMMAND__"
+        cmd = f"""
+import base64, dill, os
+args_b64 = __ARGS__
+kwargs_b64 = __KWARGS__
+environ = __ENVIRON__
 
-command = dill.loads(command.decode("latin-1"))
+if environ:
+    for k, v in environ.items():
+        if k and v:
+            os.environ[k] = v
 
-args = [command.decode_object(_) for _ in command.decode_object(args)]
-kwargs = {k: command.decode_object(v) for k, v in command.decode_object(kwargs).items()}
-func = command.decode_object(func)
+func_payload = {serialized_func!r}
+tag = {tag!r}
+command_b64 = {command_b64!r}
 
-result = func(*args, **kwargs)
-encoded = command.encode_object(result)
+command = dill.loads(base64.b64decode(command_b64.encode("ascii")))
+args = dill.loads(base64.b64decode(args_b64.encode("ascii")))
+kwargs = dill.loads(base64.b64decode(kwargs_b64.encode("ascii")))
 
-print(tag + encoded)
-"""
-            .replace("__TAG__", tag)
-            .replace("__FUNCTION__", serialized_func)
-            .replace("__COMMAND__", command_bytes.decode("latin-1"))
-        )
+print(tag + command.encode_object(command.decode_payload(func_payload)(
+    *[command.decode_payload(x) for x in args],
+    **{{k: command.decode_payload(v) for k, v in kwargs.items()}}
+)))"""
 
         return cmd
 
@@ -414,7 +560,8 @@ print(tag + encoded)
         language: Language,
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
-        logger: bool = True
+        logger: bool = True,
+        unpickle: bool = True
     ) -> Any:
         """Mirror the old Cluster.execute_command result handling.
 
@@ -424,6 +571,7 @@ print(tag + encoded)
             raise_error: Raise error if response is failed
             tag: Result tag
             logger: Print logs
+            unpickle: Unpickle
 
         Returns:
             The decoded output string.
@@ -449,28 +597,59 @@ print(tag + encoded)
         if tag in raw_result:
             logs_text, raw_result = raw_result.split(tag, 1)
 
-            if logger:
-                for line in logs_text.splitlines():
-                    stripped_log = line.strip()
+            try:
+                if logger:
+                    for line in logs_text.splitlines():
+                        stripped_log = line.strip()
 
-                    if stripped_log:
-                        print(stripped_log)
+                        if stripped_log:
+                            print(stripped_log)
+            except Exception as e:
+                LOGGER.warning(
+                    "Cannot print logs from %s: %s",
+                    logs_text,
+                    e
+                )
 
-            return self.decode_object(payload=raw_result)
-
+        if unpickle:
+            return self.decode_payload(payload=raw_result)
         return raw_result
 
     def result(
         self,
-        raise_error: bool = True
+        raise_error: bool = True,
+        unpickle: bool = True
     ) -> Any:
-        self.wait(raise_error=raise_error)
+        try:
+            self.wait(raise_error=raise_error)
 
-        obj = self.decode_response(
-            response=self.details,
-            language=self.language,
-            raise_error=raise_error
-        )
+            obj = self.decode_response(
+                response=self.details,
+                language=self.language,
+                raise_error=raise_error,
+                unpickle=unpickle
+            )
+        except (InternalError, ClientTerminatedSession):
+            self.context = self.context.connect(reset=True)
+
+            return (
+                self
+                .start(reset=True)
+                .result(raise_error=raise_error, unpickle=unpickle)
+            )
+        except ModuleNotFoundError as e:
+            module_name = e.name
+
+            if module_name and not module_name.startswith("ygg"):
+                self.context.cluster.install_temporary_libraries(libraries=[module_name])
+
+                return (
+                    self
+                    .start(reset=True)
+                    .result(raise_error=raise_error, unpickle=unpickle)
+                )
+            else:
+                raise e
 
         return obj
 
@@ -487,18 +666,9 @@ def raise_error_from_response(
             message = results.cause or "Command execution failed"
 
             if "client terminated the session" in message:
-                raise CommandExecutionAborted(message)
+                raise ClientTerminatedSession(message)
 
             if language == Language.PYTHON:
                 raise_parsed_traceback(message)
-        else:
-            message = str(response)
 
-        raise RuntimeError(message)
-
-
-class Prefixes:
-    DILL = "EP000"
-    DATABRICKS_PATH = "EP001"
-
-
+            raise RuntimeError(str(response))

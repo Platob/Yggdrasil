@@ -220,10 +220,10 @@ class SQLWarehouse(WorkspaceService):
         start = time.time()
         iteration = 0
 
-        while self.is_pending:
-            # sleep() enforces timeout when start is provided (raises TimeoutError)
-            wait.sleep(iteration=iteration, start=start)
-            iteration += 1
+        if wait.timeout:
+            while self.is_pending:
+                wait.sleep(iteration=iteration, start=start)
+                iteration += 1
 
         return self
 

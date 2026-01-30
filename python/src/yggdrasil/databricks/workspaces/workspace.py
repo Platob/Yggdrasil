@@ -4,19 +4,23 @@ import dataclasses
 import logging
 import os
 import posixpath
+import time
 from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 from typing import (
     BinaryIO,
     Iterator,
     Optional,
-    Union, TYPE_CHECKING, List
+    Union, TYPE_CHECKING, List, Set
 )
 
 from .path import DatabricksPath, DatabricksPathKind
+from ...libs.databrickslib import databricks_sdk, WorkspaceClient, DatabricksDummyClass
+from ...pyutils.expiring_dict import ExpiringDict
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 from ...version import __version__ as YGGDRASIL_VERSION
-from ...libs.databrickslib import require_databricks_sdk, databricks_sdk, WorkspaceClient, DatabricksDummyClass
 
 if databricks_sdk is not None:
     from databricks.sdk.errors import ResourceDoesNotExist
@@ -44,6 +48,25 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
+CHECKED_TMP_WORKSPACES: ExpiringDict[str, Set[str]] = ExpiringDict()
+
+def is_checked_tmp_path(
+    host: str,
+    base_path: str
+):
+    existing = CHECKED_TMP_WORKSPACES.get(host)
+
+    if existing is None:
+        CHECKED_TMP_WORKSPACES[host] = set(base_path)
+
+        return False
+
+    if base_path in existing:
+        return True
+
+    existing.add(base_path)
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +279,6 @@ class Workspace:
 
         instance = self.clone_instance() if clone else self
 
-        require_databricks_sdk()
-
         # Build Config from config_dict if available, else from fields.
         kwargs = {
             "host": instance.host,
@@ -429,7 +450,8 @@ class Workspace:
         self,
         parts: Union[List[str], str],
         kind: Optional[DatabricksPathKind] = None,
-        workspace: Optional["Workspace"] = None
+        workspace: Optional["Workspace"] = None,
+        temporary: bool = False
     ):
         """Create a DatabricksPath in this workspace.
 
@@ -437,6 +459,7 @@ class Workspace:
             parts: Path parts or string to parse.
             kind: Optional path kind override.
             workspace: Optional workspace override.
+            temporary: Temporary path
 
         Returns:
             A DatabricksPath instance.
@@ -446,14 +469,140 @@ class Workspace:
         if kind is None or isinstance(parts, str):
             return DatabricksPath.parse(
                 obj=parts,
-                workspace=workspace
+                workspace=workspace,
+                temporary=temporary
             )
 
         return DatabricksPath(
             kind=kind,
             parts=parts,
+            temporary=temporary,
             _workspace=workspace
         )
+
+    @staticmethod
+    def _base_tmp_path(
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        volume_name: Optional[str] = None,
+    ) -> str:
+        if catalog_name and schema_name:
+            base_path = "/Volumes/%s/%s/%s" % (
+                catalog_name, schema_name, volume_name or "tmp"
+            )
+        else:
+            base_path = "/Workspace/Shared/.ygg/tmp"
+
+        return base_path
+
+    def tmp_path(
+        self,
+        suffix: Optional[str] = None,
+        extension: Optional[str] = None,
+        max_lifetime: Optional[float] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        volume_name: Optional[str] = None,
+        base_path: Optional[str] = None,
+    ) -> DatabricksPath:
+        """
+        Shared cache base under Volumes for the current user.
+
+        Args:
+            suffix: Optional suffix
+            extension: Optional extension suffix to append.
+            max_lifetime: Max lifetime of temporary path
+            catalog_name: Unity catalog name for volume path
+            schema_name: Unity schema name for volume path
+            volume_name: Unity volume name for volume path
+            base_path: Base temporary path
+
+        Returns:
+            A DatabricksPath pointing at the shared cache location.
+        """
+        start = int(time.time() * 1000)
+        max_lifetime = max_lifetime or 48.0 * 3600.0
+        end = int(start + max_lifetime)
+
+        base_path = base_path or self._base_tmp_path(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            volume_name=volume_name
+        )
+
+        rnd = os.urandom(4).hex()
+        temp_path = f"tmp-{start}-{end}-{rnd}"
+
+        if suffix:
+            temp_path += suffix
+
+        if extension:
+            temp_path += ".%s" % extension
+
+        self.clean_tmp_folder(
+            raise_error=False,
+            wait=False,
+            base_path=base_path
+        )
+
+        return self.dbfs_path(f"{base_path}/{temp_path}")
+
+    def clean_tmp_folder(
+        self,
+        raise_error: bool = True,
+        wait: Optional[WaitingConfigArg] = True,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        volume_name: Optional[str] = None,
+        base_path: Optional[str] = None,
+    ):
+        wait = WaitingConfig.check_arg(wait)
+
+        base_path = base_path or self._base_tmp_path(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            volume_name=volume_name
+        )
+
+        if is_checked_tmp_path(host=self.safe_host, base_path=base_path):
+            return self
+
+        if wait.timeout:
+            base_path = self.dbfs_path(base_path)
+
+            LOGGER.debug(
+                "Cleaning temp path %s",
+                base_path
+            )
+
+            try:
+                for path in base_path.ls(recursive=False, allow_not_found=True):
+                    parts = path.name.split("-")
+
+                    if len(parts) > 2 and parts[0] == "tmp" and parts[1].isdigit() and parts[2].isdigit():
+                        end = int(parts[2]) / 1000.0
+
+                        if end and time.time() > end:
+                            path.remove(recursive=True)
+            except Exception as e:
+                if raise_error:
+                    raise e
+                LOGGER.warning(e)
+
+            LOGGER.info(
+                "Cleaned temp path %s",
+                base_path
+            )
+        else:
+            Thread(
+                target=self.clean_tmp_folder,
+                kwargs={
+                    "raise_error": raise_error,
+                    "base_path": base_path
+                }
+            ).start()
+
+        return self
 
     def shared_cache_path(
         self,
@@ -540,14 +689,15 @@ class Workspace:
                     yield from self.list_path(child_path, recursive=True)
             return
 
-        # Workspace files / notebooks
-        try:
-            entries = list(sdk.workspace.list(path, recursive=recursive))
-        except ResourceDoesNotExist:
-            return
+        else:
+            # Workspace files / notebooks
+            try:
+                entries = list(sdk.workspace.list(path, recursive=recursive))
+            except ResourceDoesNotExist:
+                return
 
-        for obj in entries:
-            yield obj
+            for obj in entries:
+                yield obj
 
     def open_path(
         self,

@@ -28,14 +28,12 @@ class TestSQLEngine(unittest.TestCase):
 
         n = self.engine.table_full_name(table_name="test_insert")
 
-        read = self.engine.execute(
-            f"SELECT * from {n}"
-        ).to_arrow_table()
+        read = self.engine.execute(f"SELECT * from {n}").to_arrow_table()
 
         self.assertEqual(data, read)
 
         with pytest.raises(SqlStatementError):
-            self.engine.execute(f"SELECT t from {n}")
+            self.engine.execute(f"SELECT * from unknown_table")
 
         self.engine.drop_table(table_name="test_insert")
 
