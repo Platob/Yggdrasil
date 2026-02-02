@@ -1,15 +1,22 @@
 """Optional pandas dependency helpers."""
 
+from ..types.dummy_class import DummyModuleClass
+
+class DummyPandasClass(DummyModuleClass):
+
+    @classmethod
+    def module_name(cls) -> str:
+        return "pandas"
+
+
 try:
     import pandas  # type: ignore
-    pandas = pandas
-
     PandasDataFrame = pandas.DataFrame
+    PandasSeries = pandas.Series
 except ImportError:
     pandas = None
-
-    class PandasDataFrame:
-        pass
+    PandasDataFrame = DummyPandasClass
+    PandasSeries = DummyPandasClass
 
 
 def require_pandas():
@@ -28,5 +35,7 @@ def require_pandas():
 __all__ = [
     "pandas",
     "require_pandas",
-    "PandasDataFrame"
+    "PandasDataFrame",
+    "PandasSeries",
+    "DummyPandasClass",
 ]

@@ -2,7 +2,3 @@
 
 from .engine import SQLEngine, StatementResult
 from .exceptions import SqlStatementError
-
-# Backwards compatibility
-DBXSQL = SQLEngine
-DBXStatementResult = StatementResult

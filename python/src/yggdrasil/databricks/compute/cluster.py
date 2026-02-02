@@ -24,10 +24,11 @@ from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
 from ...libs.databrickslib import databricks_sdk
 from ...pyutils.callable_serde import CallableSerde
-from ...pyutils.equality import dicts_equal, dict_diff
+from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import PipIndexSettings
 from ...pyutils.python_env import PythonEnv
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 if databricks_sdk is None:  # pragma: no cover - import guard
     ResourceDoesNotExist = Exception  # type: ignore
@@ -115,6 +116,21 @@ class Cluster(WorkspaceService):
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
 
+    def __repr__(self):
+        return "%s(url=%s)" % (
+            self.__class__.__name__,
+            self.url()
+        )
+
+    def __str__(self):
+        return self.url()
+
+    def url(self) -> str:
+        return "%s/compute/clusters/%s" % (
+            self.workspace.safe_host,
+            self.cluster_id or "unknown"
+        )
+
     @property
     def id(self):
         """Return the current cluster id."""
@@ -144,7 +160,7 @@ class Cluster(WorkspaceService):
         single_user_name: Optional[str] = None,
         runtime_engine: Optional["RuntimeEngine"] = None,
         libraries: Optional[list[str]] = None,
-        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
+        wait_update: Optional[WaitingConfigArg] = True,
         **kwargs
     ) -> "Cluster":
         """Create or reuse a cluster that mirrors the current Python environment.
@@ -156,7 +172,7 @@ class Cluster(WorkspaceService):
             single_user_name: Optional username for single-user clusters.
             runtime_engine: Optional Databricks runtime engine.
             libraries: Optional list of libraries to install.
-            update_timeout: wait timeout, if None it will not wait completion
+            wait_update: wait timeout, if None it will not wait completion
             **kwargs: Additional cluster specification overrides.
 
         Returns:
@@ -178,7 +194,7 @@ class Cluster(WorkspaceService):
                 single_user_name=single_user_name,
                 runtime_engine=runtime_engine,
                 libraries=libraries,
-                update_timeout=update_timeout,
+                wait_update=wait_update,
                 **kwargs
             )
         )
@@ -193,7 +209,7 @@ class Cluster(WorkspaceService):
         single_user_name: Optional[str] = "current",
         runtime_engine: Optional["RuntimeEngine"] = None,
         libraries: Optional[list[str]] = None,
-        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
+        wait_update: Optional[WaitingConfigArg] = True,
         **kwargs
     ) -> "Cluster":
         """Create/update a cluster to match the local Python environment.
@@ -205,7 +221,7 @@ class Cluster(WorkspaceService):
             single_user_name: Optional single username for the cluster.
             runtime_engine: Optional runtime engine selection.
             libraries: Optional list of libraries to install.
-            update_timeout: wait timeout, if None it will not wait completion
+            wait_update: wait timeout, if None it will not wait completion
             **kwargs: Additional cluster specification overrides.
 
         Returns:
@@ -215,12 +231,6 @@ class Cluster(WorkspaceService):
             source = PythonEnv.get_current()
 
         libraries = list(libraries) if libraries is not None else []
-        libraries.extend([
-            _ for _ in [
-                "ygg",
-                "uv",
-            ] if _ not in libraries
-        ])
 
         python_version = source.version_info
 
@@ -247,50 +257,11 @@ class Cluster(WorkspaceService):
             single_user_name=single_user_name,
             runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
             libraries=libraries,
-            update_timeout=update_timeout,
+            wait_update=wait_update,
             **kwargs
         )
 
         return inst
-
-    def pull_python_environment(
-        self,
-        name: Optional[str] = None,
-        target: PythonEnv | str | None = None,
-    ):
-        """Update or create a local PythonEnv based on remote metadata.
-
-        Args:
-            name: Optional name for the local PythonEnv.
-            target: Existing PythonEnv or name to update.
-
-        Returns:
-            The updated PythonEnv instance.
-        """
-        m = self.system_context.remote_metadata
-        version_info = m.version_info
-
-        python_version = ".".join(str(_) for _ in version_info)
-
-        if target is None:
-            target = PythonEnv.create(
-                name=name or self.name,
-                python=python_version
-            )
-        elif isinstance(target, str):
-            if target.casefold() == "current":
-                target = PythonEnv.get_current()
-            else:
-                target = PythonEnv.create(
-                    name=target,
-                    python=python_version
-                )
-
-        target.update(
-            python=python_version,
-        )
-
-        return target
 
     @property
     def details(self):
@@ -365,44 +336,32 @@ class Cluster(WorkspaceService):
 
     def wait_for_status(
         self,
-        tick: float = 0.5,
-        timeout: Union[float, dt.timedelta] = 600,
-        backoff: int = 2,
-        max_sleep_time: float = 15,
-        wait_libraries: bool = True
+        wait: Optional[WaitingConfigArg] = True,
+        raise_error: bool = True
     ):
         """Wait for the cluster to exit pending states.
 
         Args:
-            tick: Initial sleep interval in seconds.
-            timeout: Max seconds to wait before timing out.
-            backoff: Backoff multiplier for the sleep interval.
-            max_sleep_time: Maximum sleep interval in seconds.
-            wait_libraries: Wait libraries to install fully
+            wait: Waiting config
+            raise_error: Raise error if failed
 
         Returns:
             The current Cluster instance.
         """
-        start = time.time()
-        sleep_time = tick
+        wait = WaitingConfig.check_arg(wait)
+        iteration, start = 0, time.time()
 
-        if not timeout:
-            timeout = 20 * 60.0
-        elif isinstance(timeout, dt.timedelta):
-            timeout = timeout.total_seconds()
+        if wait.timeout:
+            while self.is_pending:
+                wait.sleep(iteration=iteration, start=start)
+                iteration += 1
 
-        while self.is_pending:
-            time.sleep(sleep_time)
+            self.wait_installed_libraries(
+                raise_error=raise_error
+            )
 
-            if time.time() - start > timeout:
-                raise TimeoutError("Waiting state for %s timed out")
-
-            sleep_time = min(max_sleep_time, sleep_time * backoff)
-
-        if wait_libraries:
-            self.wait_installed_libraries()
-
-        self.raise_for_status()
+        if raise_error:
+            self.raise_for_status()
 
         return self
 
@@ -450,6 +409,16 @@ class Cluster(WorkspaceService):
     def clusters_client(self) -> "ClustersAPI":
         """Return the Databricks clusters API client."""
         return self.workspace.sdk().clusters
+
+    def shared_cache_path(
+        self,
+        suffix: str
+    ):
+        assert suffix, "Missing suffix arg"
+
+        return self.workspace.shared_cache_path(
+            suffix="/cluster/%s" % suffix.lstrip("/")
+        )
 
     def spark_versions(
         self,
@@ -598,7 +567,7 @@ class Cluster(WorkspaceService):
         cluster_id: Optional[str] = None,
         cluster_name: Optional[str] = None,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        update_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
+        wait_update: Optional[WaitingConfigArg] = True,
         **cluster_spec: Any
     ):
         """Create a new cluster or update an existing one.
@@ -607,7 +576,7 @@ class Cluster(WorkspaceService):
             cluster_id: Optional cluster id to update.
             cluster_name: Optional cluster name to update or create.
             libraries: Optional libraries to install.
-            update_timeout: wait timeout, if None it will not wait completion
+            wait_update: wait timeout, if None it will not wait completion
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -623,28 +592,28 @@ class Cluster(WorkspaceService):
             return found.update(
                 cluster_name=cluster_name,
                 libraries=libraries,
-                wait_timeout=update_timeout,
+                wait=wait_update,
                 **cluster_spec
             )
 
         return self.create(
             cluster_name=cluster_name,
             libraries=libraries,
-            wait_timeout=update_timeout,
+            wait=wait_update,
             **cluster_spec
         )
 
     def create(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        wait_timeout: Union[float, dt.timedelta] = dt.timedelta(minutes=20),
+        wait: Union[WaitingConfigArg] = True,
         **cluster_spec: Any
     ) -> str:
         """Create a new cluster and optionally install libraries.
 
         Args:
             libraries: Optional list of libraries to install after creation.
-            wait_timeout: wait timeout, if None it will not wait completion
+            wait: wait timeout, if None it will not wait completion
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -673,8 +642,7 @@ class Cluster(WorkspaceService):
 
         self.install_libraries(libraries=libraries, raise_error=False, wait_timeout=None)
 
-        if wait_timeout:
-            self.wait_for_status(timeout=wait_timeout)
+        self.wait_for_status(wait=wait)
 
         return self
 
@@ -682,7 +650,7 @@ class Cluster(WorkspaceService):
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
         access_control_list: Optional[List["ClusterAccessControlRequest"]] = None,
-        wait_timeout: Optional[Union[float, dt.timedelta]] = dt.timedelta(minutes=20),
+        wait: Optional[WaitingConfigArg] = True,
         **cluster_spec: Any
     ) -> "Cluster":
         """Update cluster configuration and optionally install libraries.
@@ -690,7 +658,7 @@ class Cluster(WorkspaceService):
         Args:
             libraries: Optional libraries to install.
             access_control_list: List of permissions
-            wait_timeout: waiting timeout until done, if None it does not wait
+            wait: waiting timeout until done, if None it does not wait
             **cluster_spec: Cluster specification overrides.
 
         Returns:
@@ -714,22 +682,15 @@ class Cluster(WorkspaceService):
             existing_details,
             update_details,
             keys=_EDIT_ARG_NAMES,
-            treat_missing_as_none=True,
-            float_tol=0.0,  # set e.g. 1e-6 if you have float-y stuff
         )
 
         if not same:
-            diff = {
-                k: v[1]
-                for k, v in dict_diff(existing_details, update_details, keys=_EDIT_ARG_NAMES).items()
-            }
-
             LOGGER.debug(
                 "Updating %s with %s",
-                self, diff
+                self, update_details
             )
 
-            self.wait_for_status(timeout=wait_timeout)
+            self.wait_for_status(wait=wait)
             self.clusters_client().edit(**update_details)
             self.update_permissions(access_control_list=access_control_list)
 
@@ -738,8 +699,7 @@ class Cluster(WorkspaceService):
                 self
             )
 
-        if wait_timeout:
-            self.wait_for_status(timeout=wait_timeout)
+            self.wait_for_status(wait=wait)
 
         return self
 
@@ -866,18 +826,18 @@ class Cluster(WorkspaceService):
 
     def ensure_running(
         self,
-        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
+        wait: Optional[WaitingConfigArg] = True
     ) -> "Cluster":
         """Ensure the cluster is running.
 
         Returns:
             The current Cluster instance.
         """
-        return self.start(wait_timeout=wait_timeout)
+        return self.start(wait=wait)
 
     def start(
         self,
-        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20)
+        wait: Optional[WaitingConfigArg] = True
     ) -> "Cluster":
         """Start the cluster if it is not already running.
 
@@ -887,7 +847,9 @@ class Cluster(WorkspaceService):
         if self.is_running:
             return self
 
-        self.wait_for_status()
+        wait = WaitingConfig.check_arg(wait)
+
+        self.wait_for_status(wait=wait)
 
         if self.is_running:
             return self
@@ -898,8 +860,7 @@ class Cluster(WorkspaceService):
 
         LOGGER.info("Started %s", self)
 
-        if wait_timeout:
-            self.wait_for_status(timeout=wait_timeout.total_seconds())
+        self.wait_for_status(wait=wait)
 
         return self
 
@@ -961,7 +922,6 @@ class Cluster(WorkspaceService):
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[List[str]] = None,
         timeout: Optional[dt.timedelta] = None,
-        result_tag: Optional[str] = None,
         context: Optional[ExecutionContext] = None,
     ):
         """Execute a command or callable on the cluster.
@@ -973,7 +933,6 @@ class Cluster(WorkspaceService):
             kwargs: Optional keyword arguments for the callable.
             env_keys: Optional environment variable names to pass.
             timeout: Optional timeout for execution.
-            result_tag: Optional result tag for parsing output.
             context: ExecutionContext to run or create new one
 
         Returns:
@@ -987,7 +946,6 @@ class Cluster(WorkspaceService):
             kwargs=kwargs,
             env_keys=env_keys,
             timeout=timeout,
-            result_tag=result_tag
         )
 
     # ------------------------------------------------------------------
@@ -1066,8 +1024,6 @@ class Cluster(WorkspaceService):
                     env_keys=env_keys,
                     env_variables=env_variables,
                     timeout=timeout,
-                    result_tag=result_tag,
-                    **options
                 )
 
             return wrapper
@@ -1084,7 +1040,6 @@ class Cluster(WorkspaceService):
         wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
-        restart: bool = True,
     ) -> "Cluster":
         """Install libraries on the cluster and optionally wait for completion.
 
@@ -1093,7 +1048,6 @@ class Cluster(WorkspaceService):
             wait_timeout: Optional timeout for installation.
             pip_settings: Optional pip index settings.
             raise_error: Whether to raise on install failure.
-            restart: Whether to restart the cluster after installation.
 
         Returns:
             The current Cluster instance.
@@ -1309,6 +1263,7 @@ class Cluster(WorkspaceService):
                 value.startswith("datamanagement")
                 or value.startswith("TSSecrets")
                 or value.startswith("tgp_")
+                or value.startswith("wma-data")
             ):
                 repo = pip_settings.extra_index_url
 

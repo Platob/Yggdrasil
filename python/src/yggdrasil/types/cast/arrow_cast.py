@@ -26,6 +26,9 @@ __all__ = [
     "to_spark_arrow_type",
     "to_polars_arrow_type",
     "arrow_field_to_schema",
+    "is_arrow_type_binary_like",
+    "is_arrow_type_string_like",
+    "is_arrow_type_list_like",
 ]
 
 logger = logging.getLogger(__name__)

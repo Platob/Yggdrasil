@@ -2,7 +2,6 @@
 
 import base64
 import dataclasses as dc
-import datetime as dt
 import io
 import json
 import logging
@@ -12,28 +11,57 @@ import re
 import sys
 import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
-from ...libs.databrickslib import databricks_sdk
+from .command_execution import CommandExecution
+from .exceptions import ClientTerminatedSession
+from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
+from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
-from ...pyutils.callable_serde import CallableSerde
+from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 if TYPE_CHECKING:
     from .cluster import Cluster
 
 if databricks_sdk is not None:
-    from databricks.sdk.service.compute import Language, ResultType
+    from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
+else:
+    Language = DatabricksDummyClass
+    ResultType = DatabricksDummyClass
+    CommandStatusResponse = DatabricksDummyClass
+
 
 __all__ = [
     "ExecutionContext"
 ]
 
 LOGGER = logging.getLogger(__name__)
+UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
+BytesLike = Union[bytes, bytearray, memoryview]
 
+@dc.dataclass(frozen=True)
+class BytesSource:
+    """
+    Hashable wrapper for in-memory content so it can be used as a dict key.
+
+    name: only used for debugging / metadata (not required to match remote basename)
+    data: bytes-like payload
+    """
+    name: str
+    data: bytes
+
+LocalSpec = Union[
+    str,
+    os.PathLike,
+    bytes,                       # raw bytes as key (works, but no name)
+    BytesSource,                 # recommended for buffers
+    Tuple[str, BytesLike],       # (name, data) helper
+]
 
 @dc.dataclass
 class RemoteMetadata:
@@ -41,6 +69,7 @@ class RemoteMetadata:
     site_packages_path: Optional[str] = dc.field(default=None)
     os_env: Dict[str, str] = dc.field(default_factory=dict)
     version_info: Tuple[int, int, int] = dc.field(default=(0, 0, 0))
+    temp_path: str = ""
 
     def os_env_diff(
         self,
@@ -76,14 +105,14 @@ class ExecutionContext:
             ctx.execute("print(x + 1)")
     """
     cluster: "Cluster"
-    language: Optional["Language"] = None
     context_id: Optional[str] = None
 
-    _was_connected: Optional[bool] = dc.field(default=None, repr=False)
-    _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False)
-    _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False)
+    language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
 
-    _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False)
+    _was_connected: Optional[bool] = dc.field(default=None, repr=False, compare=False, hash=False)
+    _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False, compare=False, hash=False)
+    _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False, compare=False, hash=False)
+    _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False, compare=False, hash=False)
 
     # --- Pickle / cloudpickle support (don’t serialize locks or cached remote metadata) ---
     def __getstate__(self):
@@ -110,16 +139,31 @@ class ExecutionContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context manager and close the remote context if created."""
         if not self._was_connected:
-            self.close()
+            self.close(wait=False)
         self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
 
-    def __del__(self):
-        """Best-effort cleanup for the remote execution context."""
-        if self.context_id:
-            try:
-                Thread(target=self.close).start()
-            except BaseException:
-                pass
+    def __repr__(self):
+        return "%s(url=%s)" % (
+            self.__class__.__name__,
+            self.url()
+        )
+
+    def __str__(self):
+        return self.url()
+
+    def url(self) -> str:
+        return "%s/context/%s" % (
+            self.cluster.url(),
+            self.context_id or "unknown"
+        )
+
+    @property
+    def workspace(self):
+        return self.cluster.workspace
+
+    @property
+    def cluster_id(self):
+        return self.cluster.cluster_id
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
@@ -133,46 +177,43 @@ class ExecutionContext:
         with self._lock:
             # double-check after acquiring lock
             if self._remote_metadata is None:
-                cmd = r"""import glob, json, os
+                cmd = r"""import glob, json, os, tempfile
 from yggdrasil.pyutils.python_env import PythonEnv
 
 current_env = PythonEnv.get_current()
 meta = {}
 
+# temp dir (explicit + stable for downstream code)
+tmp_dir = tempfile.mkdtemp(prefix="tmp_")
+meta["temp_path"] = tmp_dir
+os.environ["TMPDIR"] = tmp_dir  # many libs respect this
+
+# find site-packages
 for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/python*/site-*', recursive=False):
     if path.endswith('site-packages'):
         meta["site_packages_path"] = path
         break
 
+# env vars snapshot
 os_env = meta["os_env"] = {}
 for k, v in os.environ.items():
     os_env[k] = v
-    
+
 meta["version_info"] = current_env.version_info
 
 print(json.dumps(meta))"""
 
-                try:
-                    content = self.execute_command(
-                        command=cmd,
-                        result_tag="<<RESULT>>",
-                        print_stdout=False,
-                    )
-                except ImportError:
-                    self.cluster.ensure_running()
+                content = self.command(
+                    command=cmd,
+                    language=Language.PYTHON,
+                ).start().wait().result(unpickle=True)
 
-                    content = self.execute_command(
-                        command=cmd,
-                        result_tag="<<RESULT>>",
-                        print_stdout=False,
-                    )
-
-                self._remote_metadata = RemoteMetadata(**json.loads(content))
+                self._remote_metadata = RemoteMetadata(**content)
 
             return self._remote_metadata
 
     # ------------ internal helpers ------------
-    def _workspace_client(self):
+    def workspace_client(self):
         """Return the Databricks SDK client for command execution.
 
         Returns:
@@ -180,14 +221,26 @@ print(json.dumps(meta))"""
         """
         return self.cluster.workspace.sdk()
 
-    def create_command(
+    def shared_cache_path(
+        self,
+        suffix: str
+    ):
+        assert suffix, "Missing suffix arg"
+
+        return self.cluster.shared_cache_path(
+            suffix="/context/%s" % suffix.lstrip("/")
+        )
+
+    def create(
         self,
         language: "Language",
-    ) -> any:
+        wait: Optional[WaitingConfigArg] = True,
+    ) -> "ExecutionContext":
         """Create a command execution context, retrying if needed.
 
         Args:
             language: The Databricks command language to use.
+            wait: Waiting config to update
 
         Returns:
             The created command execution context response.
@@ -197,62 +250,82 @@ print(json.dumps(meta))"""
             self.cluster
         )
 
-        try:
-            created = self._workspace_client().command_execution.create_and_wait(
-                cluster_id=self.cluster.cluster_id,
-                language=language,
-            )
-        except:
-            self.cluster.ensure_running()
+        client = self.workspace_client().command_execution
 
-            created = self._workspace_client().command_execution.create_and_wait(
-                cluster_id=self.cluster.cluster_id,
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(
+                    client.create,
+                    cluster_id=self.cluster_id,
+                    language=language,
+                )
+
+                try:
+                    created = fut.result(timeout=10).response
+                except TimeoutError:
+                    self.cluster.ensure_running(wait=True)
+
+                    created = client.create(
+                        cluster_id=self.cluster_id,
+                        language=language,
+                    ).response
+        except Exception as e:
+            LOGGER.warning(e)
+
+            self.cluster.ensure_running(wait=True)
+
+            created = client.create(
+                cluster_id=self.cluster_id,
                 language=language,
-            )
+            ).response
 
         LOGGER.info(
-            "Created Databricks command execution context %s",
+            "Created %s",
             self
         )
 
-        created = getattr(created, "response", created)
+        self.context_id = created.id
 
-        return created
+        return self
 
     def connect(
         self,
-        language: Optional["Language"] = None
+        language: Optional[Language] = None,
+        wait: Optional[WaitingConfigArg] = True,
+        reset: bool = False,
     ) -> "ExecutionContext":
         """Create a remote command execution context if not already open.
 
         Args:
             language: Optional language override for the context.
+            wait: Wait config
+            reset: Reset existing if connected
 
         Returns:
             The connected ExecutionContext instance.
         """
         if self.context_id is not None:
-            return self
+            if not reset:
+                return self
 
-        self.language = language or self.language
+            LOGGER.info(
+                "%s reset connection",
+                self
+            )
 
-        if self.language is None:
-            self.language = Language.PYTHON
+            self.close(wait=False)
 
-        ctx = self.create_command(language=self.language)
+        language = language or self.language
 
-        context_id = ctx.id
-        if not context_id:
-            raise RuntimeError("Failed to create command execution context")
+        if language is None:
+            language = Language.PYTHON
 
-        self.context_id = context_id
-        LOGGER.info(
-            "Opened execution context for %s",
-            self
+        return self.create(
+            language=language,
+            wait=wait
         )
-        return self
 
-    def close(self) -> None:
+    def close(self, wait: bool = True) -> None:
         """Destroy the remote command execution context if it exists.
 
         Returns:
@@ -261,18 +334,91 @@ print(json.dumps(meta))"""
         if not self.context_id:
             return
 
+        client = self.workspace_client()
+
         try:
-            self._workspace_client().command_execution.destroy(
-                cluster_id=self.cluster.cluster_id,
-                context_id=self.context_id,
-            )
-        except Exception:
+            if wait:
+                client.command_execution.destroy(
+                    cluster_id=self.cluster.cluster_id,
+                    context_id=self.context_id,
+                )
+            else:
+                Thread(
+                    target=client.command_execution.destroy,
+                    kwargs={
+                        "cluster_id": self.cluster.cluster_id,
+                        "context_id": self.context_id,
+                    }
+                ).start()
+        except BaseException:
             # non-fatal: context cleanup best-effort
             pass
         finally:
             self.context_id = None
 
     # ------------ public API ------------
+    def command(
+        self,
+        context: Optional["ExecutionContext"] = None,
+        func: Optional[Callable] = None,
+        command_id: Optional[str] = None,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+        environ: Optional[Dict[str, str]] = None,
+    ):
+        context = self if context is None else context
+
+        return CommandExecution(
+            context=context,
+            command_id=command_id,
+            language=language,
+            command=command,
+        ).create(
+            context=context,
+            language=language,
+            command=command,
+            func=func,
+            environ=environ
+        )
+
+    def decorate(
+        self,
+        func: Optional[Callable] = None,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+        command_id: Optional[str] = None,
+        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+    ) -> Callable:
+        language = Language.PYTHON if language is None else language
+
+        def decorator(
+            f: Callable,
+            c: ExecutionContext = self,
+            cmd: Optional[str] = command,
+            l: Optional[Language] = language,
+            cid: Optional[str] = command_id,
+            env: Optional[Union[Iterable[str], Dict[str, str]]] = environ,
+        ):
+            if c.is_in_databricks_environment():
+                return func
+
+            c.cluster.ensure_running(
+                wait=False
+            )
+
+            return c.command(
+                context=c,
+                func=f,
+                command_id=cid,
+                command=cmd,
+                language=l,
+                environ=env
+            )
+
+        if func is not None and callable(func):
+            return decorator(f=func)
+        return decorator
+
     def execute(
         self,
         obj: Union[str, Callable],
@@ -281,9 +427,7 @@ print(json.dumps(meta))"""
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[List[str]] = None,
         env_variables: Optional[dict[str, str]] = None,
-        timeout: Optional[dt.timedelta] = None,
-        result_tag: Optional[str] = None,
-        **options
+        timeout: Optional[WaitingConfigArg] = True,
     ):
         """Execute a string command or a callable in the remote context.
 
@@ -294,8 +438,6 @@ print(json.dumps(meta))"""
             env_keys: Environment variable names to forward.
             env_variables: Environment variables to inject remotely.
             timeout: Optional timeout for execution.
-            result_tag: Optional result tag for parsing output.
-            **options: Additional execution options.
 
         Returns:
             The decoded execution result.
@@ -303,9 +445,7 @@ print(json.dumps(meta))"""
         if isinstance(obj, str):
             return self.execute_command(
                 command=obj,
-                timeout=timeout,
-                result_tag=result_tag,
-                **options
+                wait=timeout,
             )
         elif callable(obj):
             return self.execute_callable(
@@ -315,9 +455,9 @@ print(json.dumps(meta))"""
                 env_keys=env_keys,
                 env_variables=env_variables,
                 timeout=timeout,
-                **options
             )
-        raise ValueError(f"Cannot execute {type(obj)}")
+        else:
+            raise ValueError(f"Cannot execute {type(obj)}")
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
@@ -330,8 +470,7 @@ print(json.dumps(meta))"""
         kwargs: Dict[str, Any] = None,
         env_keys: Optional[Iterable[str]] = None,
         env_variables: Optional[Dict[str, str]] = None,
-        print_stdout: Optional[bool] = True,
-        timeout: Optional[dt.timedelta] = None,
+        timeout: Optional[WaitingConfigArg] = True,
         command: Optional[str] = None,
     ) -> Any:
         """Execute a Python callable remotely and return the decoded result.
@@ -342,7 +481,6 @@ print(json.dumps(meta))"""
             kwargs: Keyword arguments for the callable.
             env_keys: Environment variable names to forward.
             env_variables: Environment variables to inject remotely.
-            print_stdout: Whether to print stdout from the command output.
             timeout: Optional timeout for execution.
             command: Optional prebuilt command string override.
 
@@ -389,48 +527,14 @@ print(json.dumps(meta))"""
 
         raw_result = self.execute_command(
             command,
-            timeout=timeout, result_tag=result_tag, print_stdout=print_stdout
+            wait=timeout
         )
 
-        try:
-            result = serialized.parse_command_result(
-                raw_result,
-                result_tag=result_tag,
-                workspace=self.cluster.workspace
-            )
-        except ModuleNotFoundError as remote_module_error:
-            _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
-            module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
-            module_name = module_name.group(1) if module_name else None
-            module_name = module_name.split(".")[0]
-
-            if module_name and "yggdrasil" not in module_name:
-                LOGGER.debug(
-                    "Installing missing module %s from local environment",
-                    module_name,
-                )
-
-                self.install_temporary_libraries(
-                    libraries=[module_name],
-                )
-
-                LOGGER.warning(
-                    "Installed missing module %s from local environment",
-                    module_name,
-                )
-
-                return self.execute_callable(
-                    func=func,
-                    args=args,
-                    kwargs=kwargs,
-                    env_keys=env_keys,
-                    env_variables=env_variables,
-                    print_stdout=print_stdout,
-                    timeout=timeout,
-                    command=command,
-                )
-
-            raise remote_module_error
+        result = serialized.parse_command_result(
+            raw_result,
+            result_tag=result_tag,
+            workspace=self.cluster.workspace
+        )
 
         return result
 
@@ -438,152 +542,256 @@ print(json.dumps(meta))"""
         self,
         command: str,
         *,
-        timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
-        result_tag: Optional[str] = None,
-        print_stdout: Optional[bool] = True,
+        language: Optional[Language] = None,
+        wait: Optional[WaitingConfigArg] = True,
+        raise_error: bool = True
     ) -> str:
         """Execute a command in this context and return decoded output.
 
         Args:
             command: The command string to execute.
-            timeout: Optional timeout for execution.
-            result_tag: Optional tag to extract a specific result segment.
-            print_stdout: Whether to print stdout for tagged output.
+            language: Language to execute
+            wait: Optional timeout for execution.
+            raise_error: Raises error if failed
 
         Returns:
             The decoded command output string.
         """
-        self.connect()
-
-        client = self._workspace_client()
-        result = client.command_execution.execute_and_wait(
-            cluster_id=self.cluster.cluster_id,
-            context_id=self.context_id,
-            language=self.language,
+        return self.command(
             command=command,
-            timeout=timeout or dt.timedelta(minutes=20)
-        )
-
-        try:
-            return self._decode_result(result, result_tag=result_tag, print_stdout=print_stdout)
-        except ModuleNotFoundError as remote_module_error:
-            _MOD_NOT_FOUND_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
-            module_name = _MOD_NOT_FOUND_RE.search(str(remote_module_error))
-            module_name = module_name.group(1) if module_name else None
-            module_name = module_name.split(".")[0]
-
-            if module_name and "yggdrasil" not in module_name:
-                LOGGER.debug(
-                    "Installing missing module %s from local environment",
-                    module_name,
-                )
-
-                self.install_temporary_libraries(
-                    libraries=[module_name],
-                )
-
-                LOGGER.warning(
-                    "Installed missing module %s from local environment",
-                    module_name,
-                )
-
-                return self.execute_command(
-                    command=command,
-                    timeout=timeout,
-                    result_tag=result_tag,
-                    print_stdout=print_stdout
-                )
-
-            raise remote_module_error
+            language=language,
+        ).wait(wait=wait, raise_error=raise_error)
 
     # ------------------------------------------------------------------
     # generic local → remote uploader, via remote python
     # ------------------------------------------------------------------
-    def upload_local_path(self, local_path: str, remote_path: str) -> None:
+    def upload_local_path(
+        self,
+        paths: Union[Iterable[Tuple[LocalSpec, str]], Dict[LocalSpec, str]],
+        byte_limit: int = 64 * 1024
+    ) -> None:
         """
-        Generic uploader.
+        One-shot uploader. Sends exactly ONE remote command.
 
-        - If local_path is a file:
-              remote_path is the *file* path on remote.
-        - If local_path is a directory:
-              remote_path is the *directory root* on remote; the directory
-              contents are mirrored under it.
-        Args:
-            local_path: Local file or directory to upload.
-            remote_path: Target path on the remote cluster.
+        paths: dict[local_spec -> remote_target]
 
-        Returns:
-            None.
+        local_spec can be:
+          - str | PathLike: local file or directory
+          - bytes/bytearray/memoryview: raw content (remote_target must be a file path)
+          - BytesSource(name, data): raw content with a name
+          - (name, bytes-like): raw content with a name
+
+        remote_target:
+          - if local_spec is file: full remote file path
+          - if local_spec is dir:  remote directory root
+          - if local_spec is bytes: full remote file path
         """
-        local_path = os.path.abspath(local_path)
-        if not os.path.exists(local_path):
-            raise FileNotFoundError(f"Local path not found: {local_path}")
+        if isinstance(paths, dict):
+            paths = paths.items()
 
-        # normalize to POSIX for remote (Linux)
-        remote_path = remote_path.replace("\\", "/")
+        def _to_bytes(x: BytesLike) -> bytes:
+            if isinstance(x, bytes):
+                return x
+            if isinstance(x, bytearray):
+                return bytes(x)
+            if isinstance(x, memoryview):
+                return x.tobytes()
+            elif isinstance(x, io.BytesIO):
+                return x.getvalue()
+            raise TypeError(f"Unsupported bytes-like: {type(x)!r}")
 
-        if os.path.isfile(local_path):
-            # ---------- single file ----------
-            with open(local_path, "rb") as f:
-                data_b64 = base64.b64encode(f.read()).decode("ascii")
+        # normalize + validate + build a unified "work list"
+        work: list[dict[str, Any]] = []
+        for local_spec, remote in paths:
+            if not isinstance(remote, str) or not remote:
+                raise TypeError("remote_target must be a non-empty string")
 
-            cmd = f"""import base64, os
+            remote_posix = remote.replace("\\", "/")
 
-remote_file = {remote_path!r}
-data_b64 = {data_b64!r}
+            # --- bytes payloads ---
+            if isinstance(local_spec, BytesSource):
+                work.append({
+                    "kind": "bytes",
+                    "name": local_spec.name,
+                    "data": local_spec.data,
+                    "remote": remote_posix,
+                })
+                continue
 
-os.makedirs(os.path.dirname(remote_file), exist_ok=True)
-with open(remote_file, "wb") as f:
-    f.write(base64.b64decode(data_b64))
-"""
+            if isinstance(local_spec, tuple) and len(local_spec) == 2 and isinstance(local_spec[0], str):
+                name, data = local_spec
+                work.append({
+                    "kind": "bytes",
+                    "name": name,
+                    "data": _to_bytes(data),
+                    "remote": remote_posix,
+                })
+                continue
 
-            self.execute_command(command=cmd, print_stdout=False)
-            return
+            if isinstance(local_spec, (bytes, bytearray, memoryview, io.BytesIO)):
+                work.append({
+                    "kind": "bytes",
+                    "name": "blob",
+                    "data": _to_bytes(local_spec),
+                    "remote": remote_posix,
+                })
+                continue
 
-        # ---------- directory ----------
+            # --- filesystem payloads ---
+            if isinstance(local_spec, os.PathLike):
+                local_spec = os.fspath(local_spec)
+
+            if isinstance(local_spec, str):
+                local_abs = os.path.abspath(local_spec)
+                if not os.path.exists(local_abs):
+                    raise FileNotFoundError(f"Local path not found: {local_spec}")
+
+                if os.path.isfile(local_abs):
+                    work.append({
+                        "kind": "file",
+                        "local": local_abs,
+                        "remote": remote_posix,
+                    })
+                else:
+                    work.append({
+                        "kind": "dir",
+                        "local": local_abs,
+                        "remote_root": remote_posix.rstrip("/"),
+                        "top": os.path.basename(local_abs.rstrip(os.sep)) or "dir",
+                    })
+                continue
+
+            raise TypeError(f"Unsupported local_spec type: {type(local_spec)!r}")
+
+        # build one zip containing all content
+        manifest: list[dict[str, Any]] = []
         buf = io.BytesIO()
-        local_root = local_path
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, item in enumerate(work):
+                kind = item["kind"]
 
-        # zip local folder into memory
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, dirs, files in os.walk(local_root):
-                # skip __pycache__
-                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                if kind == "bytes":
+                    zip_name = f"BYTES/{idx}"
+                    zf.writestr(zip_name, item["data"])
+                    manifest.append({
+                        "kind": "bytes",
+                        "zip": zip_name,
+                        "remote": item["remote"],
+                    })
 
-                rel_root = os.path.relpath(root, local_root)
-                if rel_root == ".":
-                    rel_root = ""
-                for name in files:
-                    if name.endswith((".pyc", ".pyo")):
-                        continue
-                    full = os.path.join(root, name)
-                    arcname = os.path.join(rel_root, name) if rel_root else name
-                    zf.write(full, arcname=arcname)
+                elif kind == "file":
+                    zip_name = f"FILE/{idx}"
+                    zf.write(item["local"], arcname=zip_name)
+                    manifest.append({
+                        "kind": "file",
+                        "zip": zip_name,
+                        "remote": item["remote"],
+                    })
 
-        data_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                elif kind == "dir":
+                    local_root = item["local"]
+                    top = item["top"]
+                    prefix = f"DIR/{idx}/{top}"
 
-        cmd = f"""import base64, io, os, zipfile
+                    for root, dirs, files in os.walk(local_root):
+                        dirs[:] = [d for d in dirs if d != "__pycache__"]
 
-remote_root = {remote_path!r}
-data_b64 = {data_b64!r}
+                        rel_root = os.path.relpath(root, local_root)
+                        rel_root = "" if rel_root == "." else rel_root
 
-os.makedirs(remote_root, exist_ok=True)
+                        for name in files:
+                            if name.endswith((".pyc", ".pyo")):
+                                continue
+                            full = os.path.join(root, name)
+                            rel_path = os.path.join(rel_root, name) if rel_root else name
+                            zip_name = f"{prefix}/{rel_path}".replace("\\", "/")
+                            zf.write(full, arcname=zip_name)
 
-buf = io.BytesIO(base64.b64decode(data_b64))
+                    manifest.append({
+                        "kind": "dir",
+                        "zip_prefix": f"{prefix}/",
+                        "remote_root": item["remote_root"],
+                    })
+
+                else:
+                    raise ValueError(f"Unknown kind in work list: {kind}")
+
+        raw = buf.getvalue()
+
+        # optional zlib on top of zip
+        algo = "none"
+        payload = raw
+        if len(raw) > byte_limit:
+            import zlib
+            compressed = zlib.compress(raw, level=9)
+            if len(compressed) < int(len(raw) * 0.95):
+                algo = "zlib"
+                payload = compressed
+
+        packed = b"ALG:" + algo.encode("ascii") + b"\n" + payload
+        data_b64 = base64.b64encode(packed).decode("ascii")
+
+        cmd = f"""import base64, io, os, zipfile, zlib
+
+packed_b64 = {data_b64!r}
+manifest = {manifest!r}
+
+packed = base64.b64decode(packed_b64)
+nl = packed.find(b"\\n")
+if nl == -1 or not packed.startswith(b"ALG:"):
+    raise ValueError("Bad payload header")
+
+algo = packed[4:nl].decode("ascii")
+payload = packed[nl+1:]
+
+if algo == "none":
+    raw = payload
+elif algo == "zlib":
+    raw = zlib.decompress(payload)
+else:
+    raise ValueError(f"Unknown compression algo: {{algo}}")
+
+buf = io.BytesIO(raw)
 with zipfile.ZipFile(buf, "r") as zf:
-    for member in zf.infolist():
-        rel_name = member.filename
-        target_path = os.path.join(remote_root, rel_name)
+    names = set(zf.namelist())
 
-        if member.is_dir() or rel_name.endswith("/"):
-            os.makedirs(target_path, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with zf.open(member, "r") as src, open(target_path, "wb") as dst:
+    for item in manifest:
+        kind = item["kind"]
+
+        if kind in ("file", "bytes"):
+            zip_name = item["zip"]
+            remote_file = item["remote"]
+            if zip_name not in names:
+                raise FileNotFoundError(f"Missing in zip: {{zip_name}}")
+
+            parent = os.path.dirname(remote_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+            with zf.open(zip_name, "r") as src, open(remote_file, "wb") as dst:
                 dst.write(src.read())
-"""
 
-        self.execute_command(command=cmd, print_stdout=False)
+        elif kind == "dir":
+            prefix = item["zip_prefix"]
+            remote_root = item["remote_root"]
+            os.makedirs(remote_root, exist_ok=True)
+
+            for n in names:
+                if not n.startswith(prefix):
+                    continue
+                rel = n[len(prefix):]
+                if not rel or rel.endswith("/"):
+                    continue
+
+                target = os.path.join(remote_root, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(n, "r") as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+
+        else:
+            raise ValueError(f"Unknown manifest kind: {{kind}}")
+"""
+        self.execute_command(command=cmd)
 
     # ------------------------------------------------------------------
     # upload local lib into remote site-packages
@@ -591,7 +799,6 @@ with zipfile.ZipFile(buf, "r") as zf:
     def install_temporary_libraries(
         self,
         libraries: str | ModuleType | List[str | ModuleType],
-        with_dependencies: bool = True
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
         """
         Upload a local Python lib/module into the remote cluster's
@@ -604,7 +811,6 @@ with zipfile.ZipFile(buf, "r") as zf:
         - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
         Args:
             libraries: Library path, name, module, or iterable of these.
-            with_dependencies: Whether to include dependencies (unused).
 
         Returns:
             The resolved library or list of libraries uploaded.
@@ -615,6 +821,13 @@ with zipfile.ZipFile(buf, "r") as zf:
             ]
 
         resolved = resolve_local_lib_path(libraries)
+
+        LOGGER.debug(
+            "Installing temporary lib '%s' in %s",
+            resolved,
+            self
+        )
+
         str_resolved = str(resolved)
         existing = self._uploaded_package_roots.get(str_resolved)
 
@@ -628,57 +841,53 @@ with zipfile.ZipFile(buf, "r") as zf:
                 # site-packages/<module_file>
                 remote_target = posixpath.join(remote_site_packages_path, resolved.name)
 
-            self.upload_local_path(resolved, remote_target)
+            self.upload_local_path({
+                str_resolved: remote_target
+            })
 
             self._uploaded_package_roots[str_resolved] = remote_target
 
+            LOGGER.info(
+                "Installed temporary lib '%s' in %s",
+                resolved,
+                self
+            )
+
         return libraries
 
-    def _decode_result(
-        self,
-        result: Any,
-        *,
-        result_tag: Optional[str],
-        print_stdout: Optional[bool] = True
-    ) -> str:
-        """Mirror the old Cluster.execute_command result handling.
 
-        Args:
-            result: Raw command execution response.
-            result_tag: Optional tag to extract a segment from output.
-            print_stdout: Whether to print stdout when using tags.
+def _decode_result(
+    result: CommandStatusResponse,
+    language: Language
+) -> str:
+    """Mirror the old Cluster.execute_command result handling.
 
-        Returns:
-            The decoded output string.
-        """
-        if not getattr(result, "results", None):
-            raise RuntimeError("Command execution returned no results")
+    Args:
+        result: Raw command execution response.
 
-        res = result.results
+    Returns:
+        The decoded output string.
+    """
+    res = result.results
 
-        # error handling
-        if res.result_type == ResultType.ERROR:
-            message = res.cause or "Command execution failed"
+    # error handling
+    if res.result_type == ResultType.ERROR:
+        message = res.cause or "Command execution failed"
 
-            if self.language == Language.PYTHON:
-                raise_parsed_traceback(message)
+        if "client terminated the session" in message:
+            raise ClientTerminatedSession(message)
 
-            remote_tb = (
-                getattr(res, "data", None)
-                or getattr(res, "stack_trace", None)
-                or getattr(res, "traceback", None)
-            )
-            if remote_tb:
-                message = f"{message}\n{remote_tb}"
+        if language == Language.PYTHON:
+            raise_parsed_traceback(message)
 
-            raise RuntimeError(message)
+        raise RuntimeError(message)
 
-        # normal output
-        if res.result_type == ResultType.TEXT:
-            output = getattr(res, "data", "") or ""
-        elif getattr(res, "data", None) is not None:
-            output = str(res.data)
-        else:
-            output = ""
+    # normal output
+    if res.result_type == ResultType.TEXT:
+        output = res.data or ""
+    elif res.data is not None:
+        output = str(res.data)
+    else:
+        output = ""
 
-        return output
+    return output

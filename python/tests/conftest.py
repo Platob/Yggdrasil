@@ -34,4 +34,6 @@ def setup_logging(level: int = logging.INFO) -> None:
 # --- usage ---
 setup_logging(logging.DEBUG)
 
+
+# Environment variables
 os.environ["DATABRICKS_HOST"] = "xxx.cloud.databricks.com"

@@ -2,11 +2,13 @@
 
 import base64
 import io
+import logging
 import time
 from abc import ABC, abstractmethod
 from threading import Thread
-from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union
+from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union, Any
 
+import dill
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
@@ -20,6 +22,7 @@ from .path_kind import DatabricksPathKind
 from ...libs.databrickslib import databricks
 from ...libs.pandaslib import PandasDataFrame
 from ...libs.polarslib import polars, PolarsDataFrame
+from ...pyutils import retry
 from ...types.cast.registry import convert
 from ...types.file_format import ExcelFileFormat
 
@@ -30,6 +33,7 @@ if databricks is not None:
         ResourceDoesNotExist,
         BadRequest,
     )
+    from databricks.sdk.errors import InternalError
 
 if TYPE_CHECKING:
     from .path import DatabricksPath
@@ -38,6 +42,9 @@ if TYPE_CHECKING:
 __all__ = [
     "DatabricksIO"
 ]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DatabricksIO(ABC, IO):
@@ -93,6 +100,15 @@ class DatabricksIO(ABC, IO):
 
     def __hash__(self):
         return self.path.__hash__()
+
+    def __str__(self):
+        return self.path.__str__()
+
+    def __repr__(self):
+        return "%s(path=%s)" % (
+            self.__class__.__name__,
+            self.path.__repr__()
+        )
 
     @classmethod
     def create_instance(
@@ -502,7 +518,7 @@ class DatabricksIO(ABC, IO):
         return True
 
     @abstractmethod
-    def write_all_bytes(self, data: bytes):
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write raw bytes to the remote path.
 
         Args:
@@ -919,10 +935,32 @@ class DatabricksIO(ABC, IO):
 
         self.write_all_bytes(data=buffer.getvalue())
 
+    def read_object(
+        self,
+    ):
+        content = self.read_all_bytes()
+        obj = dill.loads(content)
+
+        return obj
+
+    def write_object(
+        self,
+        obj: Any,
+        file_format: Optional[FileFormat] = None,
+    ):
+        buffer = io.BytesIO()
+
+        if isinstance(obj, PandasDataFrame):
+            obj.to_pickle(buffer)
+        else:
+            buffer.write(dill.dumps(obj))
+
+        self.write_all_bytes(data=buffer.getvalue())
 
 class DatabricksWorkspaceIO(DatabricksIO):
     """IO adapter for Workspace files."""
 
+    @retry(exceptions=(InternalError,))
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
         """Read bytes from a Workspace file.
 
@@ -954,11 +992,12 @@ class DatabricksWorkspaceIO(DatabricksIO):
         end = start + length
         return data[start:end]
 
-    def write_all_bytes(self, data: bytes):
+    @retry(exceptions=(InternalError,))
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a Workspace file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksWorkspaceIO instance.
@@ -966,6 +1005,20 @@ class DatabricksWorkspaceIO(DatabricksIO):
         sdk = self.workspace.sdk()
         workspace_client = sdk.workspace
         full_path = self.path.workspace_full_path()
+
+        if isinstance(data, bytes):
+            bsize = len(data)
+        elif isinstance(data, io.BytesIO):
+            bsize = len(data.getvalue())
+        else:
+            bsize = None
+
+        LOGGER.debug(
+            "Writing %s(size=%s) in %s",
+            type(data),
+            bsize,
+            self
+        )
 
         try:
             workspace_client.upload(
@@ -987,8 +1040,14 @@ class DatabricksWorkspaceIO(DatabricksIO):
         self.path.reset_metadata(
             is_file=True,
             is_dir=False,
-            size=len(data),
+            size=bsize,
             mtime=time.time()
+        )
+
+        LOGGER.info(
+            "Written %s bytes in %s",
+            bsize,
+            self
         )
 
         return self
@@ -997,6 +1056,7 @@ class DatabricksWorkspaceIO(DatabricksIO):
 class DatabricksVolumeIO(DatabricksIO):
     """IO adapter for Unity Catalog volume files."""
 
+    @retry(exceptions=(InternalError,))
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
         """Read bytes from a volume file.
 
@@ -1036,11 +1096,12 @@ class DatabricksVolumeIO(DatabricksIO):
         end = start + length
         return data[start:end]
 
-    def write_all_bytes(self, data: bytes):
+    @retry(exceptions=(InternalError,))
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a volume file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksVolumeIO instance.
@@ -1048,6 +1109,11 @@ class DatabricksVolumeIO(DatabricksIO):
         sdk = self.workspace.sdk()
         client = sdk.files
         full_path = self.path.files_full_path()
+
+        LOGGER.debug(
+            "Writing all bytes in %s",
+            self
+        )
 
         try:
             client.upload(
@@ -1064,6 +1130,11 @@ class DatabricksVolumeIO(DatabricksIO):
                 overwrite=True
             )
 
+        LOGGER.info(
+            "Written all bytes in %s",
+            self
+        )
+
         self.path.reset_metadata(
             is_file=True,
             is_dir=False,
@@ -1077,6 +1148,7 @@ class DatabricksVolumeIO(DatabricksIO):
 class DatabricksDBFSIO(DatabricksIO):
     """IO adapter for DBFS files."""
 
+    @retry(exceptions=(InternalError,))
     def read_byte_range(self, start: int, length: int, allow_not_found: bool = False) -> bytes:
         """Read bytes from a DBFS file.
 
@@ -1121,11 +1193,12 @@ class DatabricksDBFSIO(DatabricksIO):
 
         return bytes(read_bytes)
 
-    def write_all_bytes(self, data: bytes):
+    @retry(exceptions=(InternalError,))
+    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
         """Write bytes to a DBFS file.
 
         Args:
-            data: Bytes to write.
+            data: Union[bytes, IO[bytes]] to write.
 
         Returns:
             The DatabricksDBFSIO instance.
@@ -1133,6 +1206,11 @@ class DatabricksDBFSIO(DatabricksIO):
         sdk = self.workspace.sdk()
         client = sdk.dbfs
         full_path = self.path.dbfs_full_path()
+
+        LOGGER.debug(
+            "Writing all bytes in %s",
+            self
+        )
 
         try:
             with client.open(
@@ -1152,6 +1230,11 @@ class DatabricksDBFSIO(DatabricksIO):
                 overwrite=True
             ) as f:
                 f.write(data)
+
+        LOGGER.info(
+            "Written all bytes in %s",
+            self
+        )
 
         self.path.reset_metadata(
             is_file=True,

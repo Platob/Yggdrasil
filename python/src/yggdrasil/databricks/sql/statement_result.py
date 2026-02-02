@@ -3,7 +3,7 @@
 import dataclasses
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as concurrent_wait
 from typing import Optional, Iterator, TYPE_CHECKING
 
 import pyarrow as pa
@@ -11,36 +11,28 @@ import pyarrow.ipc as pipc
 
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
-from ...libs.databrickslib import databricks_sdk
-from ...libs.pandaslib import pandas
+from ...libs.databrickslib import databricks_sdk, WorkspaceClient, DatabricksDummyClass
+from ...libs.pandaslib import PandasDataFrame
 from ...libs.polarslib import polars
 from ...libs.sparklib import SparkDataFrame
+from ...pyutils.waiting_config import WaitingConfigArg, WaitingConfig
 from ...requests.session import YGGSession
 from ...types import spark_dataframe_to_arrow_table, \
     spark_schema_to_arrow_schema, arrow_table_to_spark_dataframe
-
-try:
-    from delta.tables import DeltaTable as SparkDeltaTable
-except ImportError:
-    class SparkDeltaTable:
-        @classmethod
-        def forName(cls, *args, **kwargs):
-            from delta.tables import DeltaTable
-
-            return DeltaTable.forName(*args, **kwargs)
-
 
 if databricks_sdk is not None:
     from databricks.sdk.service.sql import (
         StatementState, StatementResponse, Disposition, StatementStatus
     )
 else:
-    class StatementResponse:
-        pass
+    StatementState = DatabricksDummyClass
+    StatementResponse = DatabricksDummyClass
+    Disposition = DatabricksDummyClass
+    StatementStatus = DatabricksDummyClass
 
 
 if TYPE_CHECKING:
-    from .engine import SQLEngine
+    pass
 
 
 DONE_STATES = {
@@ -60,9 +52,10 @@ __all__ = [
 @dataclasses.dataclass
 class StatementResult:
     """Container for statement responses, data extraction, and conversions."""
-    engine: "SQLEngine"
+    workspace_client: WorkspaceClient
+    warehouse_id: str
     statement_id: str
-    disposition: "Disposition"
+    disposition: Disposition
 
     _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False)
 
@@ -96,6 +89,20 @@ class StatementResult:
         """Iterate over Arrow record batches."""
         return self.to_arrow_batches()
 
+    def __repr__(self):
+        return "StatementResult(url='%s')" % self.monitoring_url
+
+    def __str__(self):
+        return self.monitoring_url
+
+    @property
+    def monitoring_url(self):
+        return "%s/sql/warehouses/%s/monitoring?queryId=%s" % (
+            self.workspace_client.config.host,
+            self.warehouse_id,
+            self.statement_id
+        )
+
     @property
     def is_spark_sql(self):
         """Return True when this result was produced by Spark SQL."""
@@ -123,7 +130,7 @@ class StatementResult:
                 )
             )
 
-        statement_execution = self.workspace.sdk().statement_execution
+        statement_execution = self.workspace_client.statement_execution
 
         if self._response is None:
             # Initialize
@@ -134,17 +141,7 @@ class StatementResult:
 
         return self._response
 
-    @response.setter
-    def response(self, value: "StatementResponse"):
-        """Update the cached response and refresh timestamp.
-
-        Args:
-            value: StatementResponse to cache.
-        """
-        self._response = value
-        self.statement_id = self._response.statement_id
-
-    def result_data_at(self, chunk_index: int):
+    def api_result_data_at_index(self, chunk_index: int):
         """Fetch a specific result chunk by index.
 
         Args:
@@ -153,21 +150,12 @@ class StatementResult:
         Returns:
             The SDK result chunk response.
         """
-        sdk = self.workspace.sdk()
+        sdk = self.workspace_client
 
         return sdk.statement_execution.get_statement_result_chunk_n(
             statement_id=self.statement_id,
             chunk_index=chunk_index,
         )
-
-    @property
-    def workspace(self):
-        """Expose the underlying workspace from the engine.
-
-        Returns:
-            The Workspace instance backing this statement.
-        """
-        return self.engine.workspace
 
     @property
     def status(self):
@@ -255,7 +243,7 @@ class StatementResult:
         )
 
         result_data = self.result
-        wsdk = self.workspace.sdk()
+        wsdk = self.workspace_client
 
         seen_chunk_indexes = set()
 
@@ -304,34 +292,27 @@ class StatementResult:
 
     def wait(
         self,
-        timeout: Optional[int] = None,
-        poll_interval: Optional[float] = None
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True
     ):
         """Wait for statement completion with optional timeout.
 
         Args:
-            timeout: Maximum seconds to wait.
-            poll_interval: Initial poll interval in seconds.
+            wait: Waiting config
+            raise_error: Raise error if failed
 
         Returns:
             The current StatementResult instance.
         """
+        wait = WaitingConfig.check_arg(wait)
+        iteration, start = 0, time.time()
+
         if not self.done:
-            start = time.time()
-            poll_interval = poll_interval or 1
+            wait.sleep(iteration=iteration, start=start)
+            iteration += 1
 
-            while not self.done:
-                # still running / queued / pending
-                if timeout is not None and (time.time() - start) > timeout:
-                    raise TimeoutError(
-                        f"Statement {self.statement_id} did not finish within {timeout} seconds "
-                        f"(last state={self.state})"
-                    )
-
-                poll_interval = max(10, poll_interval * 1.2)
-                time.sleep(poll_interval)
-
-        self.raise_for_status()
+        if raise_error:
+            self.raise_for_status()
 
         return self
 
@@ -346,20 +327,32 @@ class StatementResult:
                 return self._arrow_table.schema
             elif self._spark_df is not None:
                 return spark_schema_to_arrow_schema(self._spark_df.schema)
-            raise NotImplementedError("")
+            else:
+                raise NotImplementedError("")
 
         manifest = self.manifest
 
+        metadata = {
+            "source": "databricks-sql",
+            "sid": self.statement_id or ""
+        }
+
         if manifest is None:
-            return pa.schema([])
+            return pa.schema([], metadata=metadata)
 
         fields = [
             column_info_to_arrow_field(_) for _ in manifest.schema.columns
         ]
 
-        return pa.schema(fields)
+        return pa.schema(
+            fields,
+            metadata=metadata
+        )
 
-    def to_arrow_table(self, parallel_pool: Optional[int] = 4) -> pa.Table:
+    def to_arrow_table(
+        self,
+        parallel_pool: int = 4
+    ) -> pa.Table:
         """Collect the statement result into a single Arrow table.
 
         Args:
@@ -383,23 +376,27 @@ class StatementResult:
 
     def to_arrow_batches(
         self,
-        parallel_pool: Optional[int] = 4
+        parallel_pool: int = 4,
+        batch_size: Optional[int] = None
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result as Arrow record batches.
 
         Args:
             parallel_pool: Maximum parallel fetch workers.
+            batch_size: Fetch batch size
 
         Yields:
             Arrow RecordBatch objects.
         """
         if self.persisted:
             if self._arrow_table is not None:
-                for batch in self._arrow_table.to_batches(max_chunksize=64 * 1024):
+                for batch in self._arrow_table.to_batches(max_chunksize=batch_size):
                     yield batch
             elif self._spark_df is not None:
-                for batch in self._spark_df.toArrow().to_batches(max_chunksize=64 * 1024):
+                for batch in self._spark_df.toArrow().to_batches(max_chunksize=batch_size):
                     yield batch
+            else:
+                raise NotImplementedError("")
         else:
             _tls = threading.local()
 
@@ -417,66 +414,57 @@ class StatementResult:
                 resp.raise_for_status()
                 return resp.content
 
-            # ---- in your generator ----
-            if self.persisted:
-                if self._arrow_table is not None:
-                    for batch in self._arrow_table.to_batches(max_chunksize=64 * 1024):
-                        yield batch
-                elif self._spark_df is not None:
-                    for batch in self._spark_df.toArrow().to_batches(max_chunksize=64 * 1024):
-                        yield batch
-            else:
-                max_workers = max(1, int(parallel_pool) if parallel_pool else 4)
-                max_in_flight = max_workers * 2  # keeps pipeline full without exploding memory
+            max_workers = max(1, int(parallel_pool) if parallel_pool else 4)
+            max_in_flight = max_workers * 2  # keeps pipeline full without exploding memory
 
-                links_iter = enumerate(self.external_links())
-                pending = {}  # future -> idx
-                ready = {}  # idx -> bytes
-                next_idx = 0
+            links_iter = enumerate(self.external_links())
+            pending = {}  # future -> idx
+            ready = {}  # idx -> bytes
+            next_idx = 0
 
-                def submit_more(ex):
-                    while len(pending) < max_in_flight:
-                        try:
-                            idx, link = next(links_iter)
-                        except StopIteration:
-                            break
-                        fut = ex.submit(_fetch_bytes, link)
-                        pending[fut] = idx
+            def submit_more(ex):
+                while len(pending) < max_in_flight:
+                    try:
+                        idx, link = next(links_iter)
+                    except StopIteration:
+                        break
+                    fut = ex.submit(_fetch_bytes, link)
+                    pending[fut] = idx
 
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                submit_more(ex)
+
+                while pending:
+                    done, _ = concurrent_wait(pending, return_when=FIRST_COMPLETED)
+
+                    # collect completed downloads
+                    for fut in done:
+                        idx = pending.pop(fut)
+                        ready[idx] = fut.result()  # raises here if the GET failed
+
+                    # yield strictly in-order
+                    while next_idx in ready:
+                        content = ready.pop(next_idx)
+
+                        buf = pa.BufferReader(content)
+
+                        # IPC stream (your current format)
+                        reader = pipc.open_stream(buf)
+
+                        # if it’s IPC file instead:
+                        # reader = pipc.open_file(buf)
+
+                        for batch in reader:
+                            yield batch
+
+                        next_idx += 1
+
                     submit_more(ex)
-
-                    while pending:
-                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
-
-                        # collect completed downloads
-                        for fut in done:
-                            idx = pending.pop(fut)
-                            ready[idx] = fut.result()  # raises here if the GET failed
-
-                        # yield strictly in-order
-                        while next_idx in ready:
-                            content = ready.pop(next_idx)
-
-                            buf = pa.BufferReader(content)
-
-                            # IPC stream (your current format)
-                            reader = pipc.open_stream(buf)
-
-                            # if it’s IPC file instead:
-                            # reader = pipc.open_file(buf)
-
-                            for batch in reader:
-                                yield batch
-
-                            next_idx += 1
-
-                        submit_more(ex)
 
     def to_pandas(
         self,
         parallel_pool: Optional[int] = 4
-    ) -> "pandas.DataFrame":
+    ) -> PandasDataFrame:
         """Return the result as a pandas DataFrame.
 
         Args:
@@ -489,7 +477,7 @@ class StatementResult:
 
     def to_polars(
         self,
-        parallel_pool: Optional[int] = 4
+        parallel_pool: int = 4
     ) -> "polars.DataFrame":
         """Return the result as a polars DataFrame.
 
@@ -499,9 +487,11 @@ class StatementResult:
         Returns:
             A polars DataFrame with the result rows.
         """
-        return polars.from_arrow(self.to_arrow_table(parallel_pool=parallel_pool))
+        arrow_table = self.to_arrow_table(parallel_pool=parallel_pool)
 
-    def to_spark(self):
+        return polars.from_arrow(arrow_table)
+
+    def to_spark(self) -> SparkDataFrame:
         """Return the result as a Spark DataFrame, caching it locally.
 
         Returns:
@@ -510,6 +500,4 @@ class StatementResult:
         if self._spark_df is not None:
             return self._spark_df
 
-        self._spark_df = arrow_table_to_spark_dataframe(self.to_arrow_table())
-
-        return self._spark_df
+        return arrow_table_to_spark_dataframe(self.to_arrow_table())

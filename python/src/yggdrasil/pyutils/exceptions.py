@@ -86,6 +86,19 @@ def parse_exception_from_traceback(tb_text: str) -> ParsedException:
     return ParsedException(RuntimeError, clean, "RuntimeError")
 
 
+def missing_module_name(exc: BaseException) -> str | None:
+    if isinstance(exc, ModuleNotFoundError):
+        if getattr(exc, "name", None):
+            return exc.name
+
+        # fallback: parse from message/args
+        msg = exc.args[0] if exc.args else str(exc)
+        m = re.search(r"No module named ['\"]([^'\"]+)['\"]", msg)
+        return m.group(1) if m else None
+
+    return None
+
+
 def raise_parsed_traceback(tb_text: str, *, attach_as_cause: bool = True) -> None:
     """
     Infer exception from traceback text and raise it.
@@ -93,6 +106,9 @@ def raise_parsed_traceback(tb_text: str, *, attach_as_cause: bool = True) -> Non
     """
     parsed = parse_exception_from_traceback(tb_text)
     exc = parsed.exc_type(parsed.message) if parsed.message else parsed.exc_type()
+
+    if isinstance(exc, ModuleNotFoundError):
+        exc.name = missing_module_name(exc)
 
     if attach_as_cause:
         raise exc from RemoteTraceback(tb_text)
