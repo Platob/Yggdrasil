@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+/csharp/Yggdrasil/.vs/
+/csharp/Yggdrasil/*/bin/
+/csharp/Yggdrasil/*/obj/
+/csharp/Yggdrasil/YGGXLAddin/.vs/
+/csharp/Yggdrasil/packages/
