@@ -238,7 +238,9 @@
       <DependentUpon>Settings.settings</DependentUpon>
     </Compile>
     <Compile Include="PyEnv\PyEnv.cs" />
+    <Compile Include="PyEnv\PyEnvManagerForm.cs" />
     <Compile Include="PyEnv\PyEnvManager.cs" />
+    <Compile Include="PyEnv\PyEnvUdf.cs" />
     <Compile Include="PyEnv\PyVersion.cs" />
     <Compile Include="ThisAddIn.cs">
       <SubType>Code</SubType>

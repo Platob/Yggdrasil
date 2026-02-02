@@ -37,6 +37,8 @@
             this.YGGAddin = this.Factory.CreateRibbonTab();
             this.group1 = this.Factory.CreateRibbonGroup();
             this.YGGPythonTab = this.Factory.CreateRibbonTab();
+            this.groupEnvironment = this.Factory.CreateRibbonGroup();
+            this.buttonManageEnvironments = this.Factory.CreateRibbonButton();
             this.YGGAddin.SuspendLayout();
             this.YGGPythonTab.SuspendLayout();
             this.SuspendLayout();
@@ -55,8 +57,21 @@
             // 
             // YGGPythonTab
             // 
+            this.YGGPythonTab.Groups.Add(this.groupEnvironment);
             this.YGGPythonTab.Label = "YGG Python";
             this.YGGPythonTab.Name = "YGGPythonTab";
+            // 
+            // groupEnvironment
+            // 
+            this.groupEnvironment.Items.Add(this.buttonManageEnvironments);
+            this.groupEnvironment.Label = "Environment";
+            this.groupEnvironment.Name = "groupEnvironment";
+            // 
+            // buttonManageEnvironments
+            // 
+            this.buttonManageEnvironments.Label = "Manage Envs";
+            this.buttonManageEnvironments.Name = "buttonManageEnvironments";
+            this.buttonManageEnvironments.Click += new Microsoft.Office.Tools.Ribbon.RibbonControlEventHandler(this.buttonManageEnvironments_Click);
             // 
             // YGGRibbon
             // 
@@ -78,6 +93,8 @@
         internal Microsoft.Office.Tools.Ribbon.RibbonTab YGGAddin;
         internal Microsoft.Office.Tools.Ribbon.RibbonGroup group1;
         internal Microsoft.Office.Tools.Ribbon.RibbonTab YGGPythonTab;
+        internal Microsoft.Office.Tools.Ribbon.RibbonGroup groupEnvironment;
+        internal Microsoft.Office.Tools.Ribbon.RibbonButton buttonManageEnvironments;
     }
 
     partial class ThisRibbonCollection
