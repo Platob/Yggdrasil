@@ -5,7 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
-namespace YGGXLAddin.PyEnv
+namespace YGGXLAddin.Python
 {
     /// <summary>
     /// Manages Python virtual environments under:
@@ -25,10 +25,10 @@ namespace YGGXLAddin.PyEnv
             new Dictionary<string, PyEnv>(StringComparer.OrdinalIgnoreCase);
 
         // -----------------------------
-        // System default singleton
+        // Manager default (optional)
         // -----------------------------
-        private static readonly object _systemLock = new object();
-        private static PyEnv _systemDefault;
+        private readonly object _defaultLock = new object();
+        private PyEnv _default;
 
         /// <summary>
         /// Returns a singleton representing the "system default" Python on PATH.
@@ -37,25 +37,50 @@ namespace YGGXLAddin.PyEnv
         /// </summary>
         public static PyEnv SystemDefault(TimeSpan? timeout = null)
         {
-            // Classic double-check lock for .NET Framework
-            if (_systemDefault != null) return _systemDefault;
+            var exePath = ResolveSystemPythonExe(timeout ?? TimeSpan.FromSeconds(10));
+            return PyEnv.Create("system", exePath, timeout);
+        }
 
-            lock (_systemLock)
+        /// <summary>
+        /// Returns manager default if set, otherwise system default.
+        /// </summary>
+        public PyEnv Default(TimeSpan? timeout = null)
+        {
+            lock (_defaultLock)
             {
-                if (_systemDefault != null) return _systemDefault;
-
-                var exePath = ResolveSystemPythonExe(timeout ?? TimeSpan.FromSeconds(10));
-                _systemDefault = PyEnv.Create("system", exePath, timeout);
-                return _systemDefault;
+                return _default ?? SystemDefault(timeout);
             }
         }
 
         /// <summary>
-        /// Clear cached singleton (useful for tests or if PATH changes at runtime).
+        /// Clear manager default (falls back to system default).
         /// </summary>
-        public static void ResetSystemDefault()
+        public void ResetDefault()
         {
-            lock (_systemLock) { _systemDefault = null; }
+            lock (_defaultLock) { _default = null; }
+        }
+
+        /// <summary>
+        /// Set manager default by cached env name or python exe file.
+        /// </summary>
+        public void SetDefault(string nameOrFile)
+        {
+            if (string.IsNullOrWhiteSpace(nameOrFile))
+                throw new ArgumentException("name is required.", nameof(nameOrFile));
+
+            nameOrFile = nameOrFile.Trim();
+
+            if (!_envs.TryGetValue(nameOrFile, out var env))
+            {
+                if (!File.Exists(nameOrFile))
+                    throw new KeyNotFoundException($"Env '{nameOrFile}' not found in cache.");
+
+                env = PyEnv.Create(name: null, exePath: nameOrFile);
+
+                _envs[env.Name] = env;
+            }
+
+            lock (_defaultLock) { _default = env; }
         }
 
         private static string ResolveSystemPythonExe(TimeSpan timeout)
@@ -154,6 +179,10 @@ namespace YGGXLAddin.PyEnv
         {
             _envs.Clear();
 
+            var dftEnv = SystemDefault();
+
+            _envs[$"system-{dftEnv.Version}"] = dftEnv;
+
             if (!Directory.Exists(BaseDir))
                 return;
 
@@ -180,27 +209,73 @@ namespace YGGXLAddin.PyEnv
         /// Create a new environment (or recreate if overwrite=true) with the given Python version.
         /// Uses uv to create the venv in BaseDir/name.
         /// </summary>
-        public PyEnv Create(string name, PyVersion pythonVersion, bool overwrite = false, TimeSpan? timeout = null)
+        public PyEnv Create(
+            string name,
+            string pythonVersion,
+            bool overwrite = false,
+            TimeSpan? timeout = null)
         {
-            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("name is required.", nameof(name));
-            name = name.Trim();
+            name = NormalizeName(name);
 
             var envDir = GetEnvDir(name);
+            EnsureEnvDirReady(name, envDir, overwrite);
 
+            var t = timeout ?? TimeSpan.FromMinutes(5);
+
+            CreateVenvWithSystemUv(envDir, pythonVersion.ToString(), t);
+
+            var pyExe = RequireVenvPython(envDir);
+
+            // Register env first (so callers can see it even if bootstrap fails)
+            var env = PyEnv.Create(name, pyExe, t);
+            _envs[name] = env;
+
+            BootstrapPipAndUv(envDir, pyExe, t);
+
+            return env;
+        }
+
+        private static string NormalizeName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("name is required.", nameof(name));
+            return name.Trim();
+        }
+
+        private void EnsureEnvDirReady(string name, string envDir, bool overwrite)
+        {
             if (Directory.Exists(envDir))
             {
                 if (!overwrite)
                     throw new InvalidOperationException($"Env '{name}' already exists at: {envDir}");
                 Delete(name);
             }
+        }
 
-            Directory.CreateDirectory(envDir);
-
-            // Create via system uv (must be on PATH)
-            var uv = FindUvOnPath();
+        private void CreateVenvWithSystemUv(string envDir, string pythonVersion, TimeSpan timeout)
+        {
+            var uv = SystemDefault().FindUVPath();
             var args = $"venv --python {pythonVersion} {QuoteArg(envDir)}";
 
-            var res = RunProcess(uv, args, workingDirectory: BaseDir, timeout: timeout ?? TimeSpan.FromMinutes(5));
+            var env = new System.Collections.Generic.Dictionary<string, string>
+            {
+                ["RUST_TLS_ALLOW_INVALID_CERTS"] = "1",
+                ["UV_INSECURE_HOSTS"] = "github.com",
+            };
+
+            var res = RunProcess(uv, args, workingDirectory: BaseDir, timeout: timeout, env: env);
+
+            if (res.ExitCode != 0)
+            {
+                if (IsWindows() && PyVersion.TryParse(pythonVersion, out var v))
+                {
+                    var localPython = $"C:\\Program Files\\Python{v.Major}{v.Minor}\\python.exe";
+                    args = $"venv --python {QuoteArg(localPython)} {QuoteArg(envDir)}";
+
+                    res = RunProcess(uv, args, workingDirectory: BaseDir, timeout: timeout, env: env);
+                }
+            }
+
             if (res.ExitCode != 0)
             {
                 throw new InvalidOperationException(
@@ -208,14 +283,51 @@ namespace YGGXLAddin.PyEnv
                     $"Cmd: {uv} {args}\n" +
                     res.ToString());
             }
+        }
 
+        private static string RequireVenvPython(string envDir)
+        {
             var pyExe = ResolvePythonExePath(envDir);
-            if (pyExe == null || !File.Exists(pyExe))
+            if (string.IsNullOrWhiteSpace(pyExe) || !File.Exists(pyExe))
                 throw new FileNotFoundException("Created env but python executable not found.", pyExe ?? envDir);
 
-            var envCreated = PyEnv.Create(name, pyExe);
-            _envs[name] = envCreated;
-            return envCreated;
+            return pyExe;
+        }
+
+        private void BootstrapPipAndUv(string envDir, string pyExe, TimeSpan timeout)
+        {
+            // 1) Best-effort ensurepip (some distros disable it; don’t brick the env if it's missing)
+            var ensurePip = RunProcess(pyExe, "-m ensurepip --upgrade", workingDirectory: envDir, timeout: timeout);
+
+            // 2) Upgrade pip tooling (this should generally work if pip exists)
+            var pipUp = RunProcess(
+                pyExe,
+                "-m pip install --upgrade pip setuptools wheel --disable-pip-version-check --no-input",
+                workingDirectory: envDir,
+                timeout: timeout);
+
+            if (pipUp.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Upgrading pip tooling failed.\n" +
+                    $"Cmd: {pyExe} -m pip install --upgrade pip setuptools wheel\n" +
+                    pipUp.ToString());
+            }
+
+            // 3) Install uv into the venv so future updates can use uv pip
+            var uvInVenv = RunProcess(
+                pyExe,
+                "-m pip install --upgrade uv --disable-pip-version-check --no-input",
+                workingDirectory: envDir,
+                timeout: timeout);
+
+            if (uvInVenv.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Installing uv into venv failed.\n" +
+                    $"Cmd: {pyExe} -m pip install --upgrade uv\n" +
+                    uvInVenv.ToString());
+            }
         }
 
         /// <summary>
@@ -297,6 +409,28 @@ namespace YGGXLAddin.PyEnv
                 timeout: timeout);
         }
 
+        public PyProcessResult RunPythonCode(
+            string code,
+            string pyVariable = null,
+            string environment = null,
+            string workingDirectory = null,
+            TimeSpan? timeout = null)
+        {
+            PyEnv pyenv;
+
+            if (string.IsNullOrEmpty(environment))
+                pyenv = SystemDefault();
+            else if (File.Exists(environment))
+                pyenv = PyEnv.Create(name: null, exePath: environment);
+            else
+                pyenv = _envs[environment];
+
+            
+            var result = pyenv.RunCode(code, workingDirectory: workingDirectory, timeout: timeout);
+
+            return result;
+        }
+
         /// <summary>
         /// Resolve python executable path for a venv dir (Windows + Unix).
         /// </summary>
@@ -317,39 +451,9 @@ namespace YGGXLAddin.PyEnv
             return null;
         }
 
-        /// <summary>
-        /// Find uv executable on PATH (system uv).
-        /// Create() needs this.
-        /// </summary>
-        private static string FindUvOnPath()
-        {
-            // Windows: uv.exe, uv.cmd; Unix: uv
-            var candidates = Environment.OSVersion.Platform.ToString().StartsWith("Win", StringComparison.OrdinalIgnoreCase)
-                ? new[] { "uv.exe", "uv.cmd", "uv.bat", "uv" }
-                : new[] { "uv" };
-
-            var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-            foreach (var dir in path.Split(Path.PathSeparator))
-            {
-                if (string.IsNullOrWhiteSpace(dir)) continue;
-                string d;
-                try { d = dir.Trim(); } catch { continue; }
-
-                foreach (var c in candidates)
-                {
-                    var p = Path.Combine(d, c);
-                    if (File.Exists(p))
-                        return p;
-                }
-            }
-
-            // Last resort: let ProcessStartInfo resolve it (might work depending on shell/PATHEXT),
-            // but we prefer explicit path for reliability.
-            throw new FileNotFoundException(
-                "uv executable not found on PATH. Install uv (Astral) so 'uv' is available, then retry.");
-        }
-
-        private static PyProcessResult RunProcess(string fileName, string arguments, string workingDirectory, TimeSpan timeout)
+        private static PyProcessResult RunProcess(
+            string fileName, string arguments, string workingDirectory, TimeSpan timeout,
+            IDictionary<string, string> env = null)
         {
             var psi = new ProcessStartInfo
             {
@@ -365,6 +469,27 @@ namespace YGGXLAddin.PyEnv
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8
             };
+
+            // .NET Framework 4.8: use EnvironmentVariables (not psi.Environment)
+            if (env != null)
+            {
+                foreach (var kv in env)
+                {
+                    if (string.IsNullOrWhiteSpace(kv.Key))
+                        continue;
+
+                    // If value is null -> remove the var (optional behavior)
+                    if (kv.Value == null)
+                    {
+                        if (psi.EnvironmentVariables.ContainsKey(kv.Key))
+                            psi.EnvironmentVariables.Remove(kv.Key);
+                    }
+                    else
+                    {
+                        psi.EnvironmentVariables[kv.Key] = kv.Value;
+                    }
+                }
+            }
 
             using (var p = new Process { StartInfo = psi })
             {

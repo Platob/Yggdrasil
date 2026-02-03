@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 
-namespace YGGXLAddin.PyEnv
+namespace YGGXLAddin.Python
 {
     public readonly struct PyEnvMetadata
     {
@@ -13,8 +13,10 @@ namespace YGGXLAddin.PyEnv
 
         public PyEnvMetadata(string name, string exePath, PyVersion version)
         {
-            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required.", nameof(name));
             if (string.IsNullOrWhiteSpace(exePath)) throw new ArgumentException("ExePath is required.", nameof(exePath));
+
+            if (string.IsNullOrWhiteSpace(name))
+                name = InferNameFromExePath(exePath, version);
 
             Name = name.Trim();
             ExePath = exePath.Trim();
@@ -22,6 +24,25 @@ namespace YGGXLAddin.PyEnv
         }
 
         public override string ToString() => $"{Name} ({Version}) @ {ExePath}";
+
+
+        private static string InferNameFromExePath(string exePath, PyVersion ver)
+        {
+            // If it's a full path, use basename; if it's a command like "python3.12", still works.
+            var baseName = Path.GetFileNameWithoutExtension(exePath)?.Trim();
+
+            // Fall back to something stable if basename is empty somehow
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "python";
+
+            // Normalize common generic names to include version so they're unique-ish
+            var lower = baseName.ToLowerInvariant();
+            if (lower == "python" || lower == "python3" || lower == "py")
+                return $"python {ver.Major}.{ver.Minor}.{ver.Patch}";
+
+            // If the basename already contains digits (like python3.12), keep it as-is (nice)
+            return baseName;
+        }
     }
 
     public sealed class PyEnv
@@ -55,6 +76,7 @@ namespace YGGXLAddin.PyEnv
             }
 
             var ver = DetectVersion(exePath, timeout ?? TimeSpan.FromSeconds(10));
+
             return new PyEnv(new PyEnvMetadata(name, exePath, ver));
         }
 
@@ -73,10 +95,33 @@ namespace YGGXLAddin.PyEnv
         /// <summary>
         /// Run python -c "..."
         /// </summary>
-        public PyProcessResult RunCode(string pythonCode, string workingDirectory = null, TimeSpan? timeout = null)
+        public PyProcessResult RunCode(
+            string pythonCode,
+            string pyVariable = null,
+            string workingDirectory = null,
+            TimeSpan? timeout = null,
+            bool smartCheckCode = false)
         {
-            if (pythonCode == null) throw new ArgumentNullException(nameof(pythonCode));
+            if (pythonCode == null) 
+                throw new ArgumentNullException(nameof(pythonCode));
+
+            if (File.Exists(pythonCode))
+            {
+                try
+                {
+                    pythonCode = File.ReadAllText(pythonCode, Encoding.UTF8);
+                }
+                catch (Exception ex)
+                {
+                    return new PyProcessResult(
+                        exitCode: -1,
+                        stdOut: "",
+                        stdErr: $"Failed to read python file: {pythonCode}{Environment.NewLine}{ex}");
+                }
+            }
+
             var args = "-c " + QuoteArg(pythonCode);
+
             return Run(args, workingDirectory, timeout);
         }
 
@@ -311,9 +356,9 @@ namespace YGGXLAddin.PyEnv
             if (!string.IsNullOrEmpty(direct))
                 return direct;
 
-            var which = TryWhichUvViaPython(timeout.Value);
-            if (!string.IsNullOrEmpty(which))
-                return which;
+            //var which = TryWhichUvViaPython(timeout.Value);
+            //if (!string.IsNullOrEmpty(which))
+            //    return which;
 
             if (!installIfMissing)
                 return null;
@@ -334,7 +379,7 @@ namespace YGGXLAddin.PyEnv
             if (!string.IsNullOrEmpty(direct))
                 return direct;
 
-            which = TryWhichUvViaPython(timeout.Value);
+            var which = TryWhichUvViaPython(timeout.Value);
             if (!string.IsNullOrEmpty(which))
                 return which;
 
@@ -399,6 +444,30 @@ namespace YGGXLAddin.PyEnv
             StdOut = stdOut ?? "";
             StdErr = stdErr ?? "";
         }
+
+        /// <summary>
+        /// Throws InvalidOperationException if ExitCode != 0.
+        /// Optional context is prepended to the error.
+        /// </summary>
+        public PyProcessResult ThrowIfFailed(string context = null)
+        {
+            if (ExitCode != 0)
+            {
+                var msg = string.IsNullOrWhiteSpace(context)
+                    ? "Process failed."
+                    : context.Trim();
+
+                throw new InvalidOperationException(
+                    msg + Environment.NewLine + ToString());
+            }
+
+            return this; // fluent chaining
+        }
+
+        /// <summary>
+        /// True when ExitCode == 0.
+        /// </summary>
+        public bool Success => ExitCode == 0;
 
         public override string ToString()
             => $"Exit={ExitCode}\n--- stdout ---\n{StdOut}\n--- stderr ---\n{StdErr}";

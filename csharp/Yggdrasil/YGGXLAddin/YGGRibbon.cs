@@ -1,6 +1,4 @@
 ﻿using Microsoft.Office.Tools.Ribbon;
-using System;
-using YGGXLAddin.PyEnv;
 
 namespace YGGXLAddin
 {

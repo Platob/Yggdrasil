@@ -41,6 +41,7 @@
             this.buttonManageEnvironments = this.Factory.CreateRibbonButton();
             this.YGGAddin.SuspendLayout();
             this.YGGPythonTab.SuspendLayout();
+            this.groupEnvironment.SuspendLayout();
             this.SuspendLayout();
             // 
             // YGGAddin
@@ -84,6 +85,8 @@
             this.YGGAddin.PerformLayout();
             this.YGGPythonTab.ResumeLayout(false);
             this.YGGPythonTab.PerformLayout();
+            this.groupEnvironment.ResumeLayout(false);
+            this.groupEnvironment.PerformLayout();
             this.ResumeLayout(false);
 
         }

@@ -5,7 +5,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from openai import OpenAI
+from yggdrasil.types.dummy_class import DummyModuleClass
+
+try:
+    from openai import OpenAI
+except:
+    OpenAI = DummyModuleClass
 
 __all__ = ["AISession"]
 
