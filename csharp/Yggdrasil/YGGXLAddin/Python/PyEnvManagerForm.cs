@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Windows.Forms;
 using YGGXLAddin.Python;
 
@@ -14,9 +15,12 @@ namespace YGGXLAddin
         private readonly TextBox _versionInput;
         private readonly TextBox _packageInput;
         private readonly Label _baseDirLabel;
+        private readonly Label _defaultEnvLabel;
         private readonly Button _refreshButton;
         private readonly Button _createButton;
         private readonly Button _deleteButton;
+        private readonly Button _setDefaultButton;
+        private readonly Button _resetDefaultButton;
         private readonly Button _refreshPackagesButton;
         private readonly Button _installPackageButton;
         private readonly Button _upgradePackageButton;
@@ -34,10 +38,11 @@ namespace YGGXLAddin
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 6,
+                RowCount = 7,
                 Padding = new Padding(12)
             };
 
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -51,6 +56,12 @@ namespace YGGXLAddin
                 Text = $"Base directory: {_manager.BaseDir}"
             };
 
+            _defaultEnvLabel = new Label
+            {
+                AutoSize = true,
+                Text = "Default environment: (loading...)"
+            };
+
             _envList = new ListView
             {
                 Dock = DockStyle.Fill,
@@ -60,7 +71,8 @@ namespace YGGXLAddin
             };
             _envList.Columns.Add("Name", 140);
             _envList.Columns.Add("Version", 100);
-            _envList.Columns.Add("Executable", 380);
+            _envList.Columns.Add("Default", 80);
+            _envList.Columns.Add("Executable", 360);
             _envList.SelectedIndexChanged += (_, __) => RefreshPackages();
 
             var createPanel = new TableLayoutPanel
@@ -167,12 +179,21 @@ namespace YGGXLAddin
             _deleteButton.Click += (_, __) => DeleteSelected();
             actionPanel.Controls.Add(_deleteButton);
 
+            _setDefaultButton = new Button { Text = "Set Default", AutoSize = true };
+            _setDefaultButton.Click += (_, __) => SetDefault();
+            actionPanel.Controls.Add(_setDefaultButton);
+
+            _resetDefaultButton = new Button { Text = "Reset Default", AutoSize = true };
+            _resetDefaultButton.Click += (_, __) => ResetDefault();
+            actionPanel.Controls.Add(_resetDefaultButton);
+
             layout.Controls.Add(_baseDirLabel, 0, 0);
-            layout.Controls.Add(_envList, 0, 1);
-            layout.Controls.Add(createPanel, 0, 2);
-            layout.Controls.Add(_packageList, 0, 3);
-            layout.Controls.Add(packageActionPanel, 0, 4);
-            layout.Controls.Add(actionPanel, 0, 5);
+            layout.Controls.Add(_defaultEnvLabel, 0, 1);
+            layout.Controls.Add(_envList, 0, 2);
+            layout.Controls.Add(createPanel, 0, 3);
+            layout.Controls.Add(_packageList, 0, 4);
+            layout.Controls.Add(packageActionPanel, 0, 5);
+            layout.Controls.Add(actionPanel, 0, 6);
 
             Controls.Add(layout);
 
@@ -185,12 +206,15 @@ namespace YGGXLAddin
             {
                 _manager.Reload();
                 _envList.Items.Clear();
+                var defaultEnv = _manager.Default();
+                _defaultEnvLabel.Text = $"Default environment: {defaultEnv.Name} ({defaultEnv.Version})";
 
                 foreach (var pair in _manager.Envs)
                 {
                     var env = pair.Value;
                     var item = new ListViewItem(env.Name);
                     item.SubItems.Add(env.Version.ToString());
+                    item.SubItems.Add(IsDefaultEnv(env, defaultEnv) ? "Yes" : "");
                     item.SubItems.Add(env.ExePath);
                     _envList.Items.Add(item);
                 }
@@ -201,6 +225,42 @@ namespace YGGXLAddin
             {
                 MessageBox.Show(this, ex.Message, "Failed to refresh", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private static bool IsDefaultEnv(PyEnv env, PyEnv defaultEnv)
+        {
+            if (defaultEnv == null || env == null)
+                return false;
+
+            if (string.Equals(env.Name, defaultEnv.Name, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return AreSamePath(env.ExePath, defaultEnv.ExePath);
+        }
+
+        private static bool AreSamePath(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+                return false;
+
+            var comparison = Environment.OSVersion.Platform == PlatformID.Win32NT
+                || Environment.OSVersion.Platform == PlatformID.Win32S
+                || Environment.OSVersion.Platform == PlatformID.Win32Windows
+                || Environment.OSVersion.Platform == PlatformID.WinCE
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+
+            try
+            {
+                left = Path.GetFullPath(left);
+                right = Path.GetFullPath(right);
+            }
+            catch
+            {
+                return string.Equals(left, right, comparison);
+            }
+
+            return string.Equals(left, right, comparison);
         }
 
         private void CreateEnvironment()
@@ -252,6 +312,39 @@ namespace YGGXLAddin
             catch (Exception ex)
             {
                 MessageBox.Show(this, ex.Message, "Delete failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void SetDefault()
+        {
+            var env = GetSelectedEnv();
+            if (env == null)
+            {
+                MessageBox.Show(this, "Select an environment to set as default.", "No selection", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                _manager.SetDefault(env.Name);
+                RefreshEnvs();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Set default failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ResetDefault()
+        {
+            try
+            {
+                _manager.ResetDefault();
+                RefreshEnvs();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Reset default failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
