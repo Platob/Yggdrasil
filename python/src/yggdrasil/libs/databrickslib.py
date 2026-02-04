@@ -1,5 +1,5 @@
 """Optional Databricks SDK dependency helpers."""
-from yggdrasil.types.dummy_class import DummyModuleClass
+from ..types.dummy_class import DummyModuleClass
 
 
 class DatabricksDummyClass(DummyModuleClass):
@@ -25,7 +25,7 @@ def require_databricks_sdk():
 
 try:
     import databricks
-    import databricks.sdk  # type: ignore
+    import databricks.sdk
 
     from databricks.sdk import WorkspaceClient
 
@@ -34,7 +34,6 @@ try:
 except ImportError:
     databricks = DatabricksDummyClass
     databricks_sdk = DatabricksDummyClass
-
     WorkspaceClient = DatabricksDummyClass
 
 

@@ -12,8 +12,9 @@ namespace YGGXLAddin
             Description = "Python execute code")]
         public static object PyExe(
             object code,
-            string pyVariable = null,
             string environment = null,
+            object input = null,
+            object output = null,
             string workingDirectory = null)
         {
             if (string.IsNullOrEmpty(workingDirectory))
@@ -39,7 +40,7 @@ namespace YGGXLAddin
             }
             catch (Exception ex)
             {
-                // Don’t throw into Excel; return a clean error.
+                // Donï¿½t throw into Excel; return a clean error.
                 return $"#PYEXE! {ex.GetType().Name}: {ex.Message}";
             }
         }

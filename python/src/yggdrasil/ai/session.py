@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from yggdrasil.types.dummy_class import DummyModuleClass
+from ..types.dummy_class import DummyModuleClass
 
 try:
     from openai import OpenAI
@@ -19,8 +19,6 @@ __all__ = ["AISession"]
 class AISession(ABC):
     api_key: str
     base_url: str
-
-    # Gemini default (via OpenAI-compatible gateway)
     model: str = "gemini-2.5-flash"
 
     client: OpenAI = field(init=False)

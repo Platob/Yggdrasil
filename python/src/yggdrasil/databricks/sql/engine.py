@@ -17,7 +17,7 @@ import random
 import string
 import time
 from threading import Thread
-from typing import Optional, Union, Any, Dict, List, Literal
+from typing import Optional, Union, Any, Dict, List, Literal, TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.dataset as pds
@@ -26,11 +26,10 @@ from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
 from .warehouse import SQLWarehouse
 from ..workspaces import WorkspaceService, DatabricksPath
-from ...ai.sql_session import SQLAISession, SQLFlavor
 from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
 from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
 from ...pyutils.waiting_config import WaitingConfigArg
-from ...types import is_arrow_type_string_like, is_arrow_type_binary_like
+from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, cast_arrow_tabular
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
 from ...types.cast.spark_cast import cast_spark_dataframe
@@ -61,6 +60,10 @@ logger = logging.getLogger(__name__)
 
 if pyspark is not None:
     import pyspark.sql.functions as F
+
+
+if TYPE_CHECKING:
+    from ...ai.sql_session import SQLAISession, SQLFlavor
 
 
 __all__ = [
@@ -101,7 +104,7 @@ class SQLEngine(WorkspaceService):
     schema_name: Optional[str] = None
 
     _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
-    _ai_session: Optional[SQLAISession] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _ai_session: Optional["SQLAISession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
 
     def table_full_name(
         self,
@@ -198,8 +201,13 @@ class SQLEngine(WorkspaceService):
     def ai_session(
         self,
         model: str = "databricks-gemini-2-5-pro",
-        flavor: SQLFlavor = SQLFlavor.DATABRICKS
+        flavor: Optional["SQLFlavor"] = None
     ):
+        from ...ai.sql_session import SQLAISession, SQLFlavor
+
+        if flavor is None:
+            flavor = SQLFlavor.DATABRICKS
+
         return SQLAISession(
             model=model,
             api_key=self.workspace.current_token(),
@@ -224,7 +232,7 @@ class SQLEngine(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         wait: Optional[WaitingConfigArg] = True
-    ) -> "StatementResult":
+    ) -> StatementResult:
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 
         Engine resolution:
@@ -504,10 +512,13 @@ class SQLEngine(WorkspaceService):
                             logger.exception("Failed to drop table %s after auto creation error", location)
                         raise
 
-            data_tbl = convert(
-                data, pa.Table,
-                options=cast_options, target_field=existing_schema
-            )
+            cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
+
+            if isinstance(data, (pa.Table, pa.RecordBatch)):
+                data_tbl = cast_arrow_tabular(data, options=cast_options)
+            else:
+                data_tbl = convert(data, pa.Table, options=cast_options)
+
             num_rows = data_tbl.num_rows
 
             logger.debug(
@@ -524,7 +535,8 @@ class SQLEngine(WorkspaceService):
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 volume_name="tmp",
-                extension="parquet"
+                extension="parquet",
+                max_lifetime=3600,
             ) if temp_volume_path is None else DatabricksPath.parse(obj=temp_volume_path, workspace=connected.workspace)
 
             logger.debug("Staging Parquet to temp volume: %s", temp_volume_path)
@@ -575,7 +587,7 @@ FROM parquet.`{temp_volume_path}`"""
             finally:
                 try:
                     Thread(
-                        target=temp_volume_path.rmdir,
+                        target=temp_volume_path.remove,
                         kwargs={
                             "recursive": True
                         }

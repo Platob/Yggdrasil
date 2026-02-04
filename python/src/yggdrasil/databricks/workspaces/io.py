@@ -3,28 +3,25 @@
 import base64
 import io
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
+from tempfile import SpooledTemporaryFile
 from threading import Thread
-from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union, Any
+from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union, Any, BinaryIO
 
 import dill
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
-from pyarrow.dataset import (
-    FileFormat,
-    ParquetFileFormat,
-    CsvFileFormat,
-)
 
 from .path_kind import DatabricksPathKind
 from ...libs.databrickslib import databricks
 from ...libs.pandaslib import PandasDataFrame
 from ...libs.polarslib import polars, PolarsDataFrame
-from ...pyutils import retry
+from ...pyutils.retry import retry
 from ...types.cast.registry import convert
-from ...types.file_format import ExcelFileFormat
+from ...types.file_format import FileFormat, ParquetFileFormat, CsvFileFormat, ExcelFileFormat
 
 if databricks is not None:
     from databricks.sdk.service.workspace import ImportFormat, ExportFormat
@@ -45,7 +42,64 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
+_SPOOL_MAX = 64 * 1024 * 1024   # 64MB in RAM then spill to disk
+_COPY_CHUNK = 8 * 1024 * 1024   # 8MB chunks
 
+def _prepare_binaryio_and_size(
+    data: Union[bytes, bytearray, memoryview, BinaryIO]
+) -> tuple[int, BinaryIO, bool]:
+    """
+    Returns (size, bio, should_close).
+
+    - bytes-like -> wrap in BytesIO (closeable by us).
+    - seekable file -> compute size via fstat or seek/tell.
+    - non-seekable stream -> spool into SpooledTemporaryFile, count bytes.
+    """
+    # bytes-like
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        b = bytes(data)
+        return len(b), io.BytesIO(b), True
+
+    f: BinaryIO = data
+
+    # 1) try OS-level size for real files
+    try:
+        fileno = f.fileno()  # type: ignore[attr-defined]
+    except Exception:
+        fileno = None
+
+    if fileno is not None:
+        try:
+            st = os.fstat(fileno)
+            # rewind if possible
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+            return int(st.st_size), f, False
+        except Exception:
+            pass
+
+    # 2) try seek/tell (seekable streams)
+    try:
+        f.seek(0, io.SEEK_END)
+        end = f.tell()
+        f.seek(0)
+        return int(end), f, False
+    except Exception:
+        pass
+
+    # 3) non-seekable stream: spool + count
+    spooled = SpooledTemporaryFile(max_size=_SPOOL_MAX, mode="w+b")
+    size = 0
+    while True:
+        chunk = f.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        spooled.write(chunk)
+        size += len(chunk)
+    spooled.seek(0)
+    return size, spooled, True
 
 class DatabricksIO(ABC, IO):
     """File-like interface for Databricks workspace, volume, or DBFS paths."""
@@ -102,7 +156,10 @@ class DatabricksIO(ABC, IO):
         return self.path.__hash__()
 
     def __str__(self):
-        return self.path.__str__()
+        return "%s(path=%s)" % (
+            self.__class__.__name__,
+            self.path.__repr__()
+        )
 
     def __repr__(self):
         return "%s(path=%s)" % (
@@ -1081,9 +1138,9 @@ class DatabricksVolumeIO(DatabricksIO):
 
         try:
             resp = client.download(full_path)
-        except Exception as e:
+        except (NotFound, ResourceDoesNotExist, BadRequest, InternalError) as e:
             # Databricks SDK exceptions vary a bit by version; keep it pragmatic.
-            if allow_not_found and any(s in str(e).lower() for s in ("not found", "not exist", "404")):
+            if allow_not_found:
                 return b""
             raise
 
@@ -1096,53 +1153,61 @@ class DatabricksVolumeIO(DatabricksIO):
         end = start + length
         return data[start:end]
 
-    @retry(exceptions=(InternalError,))
-    def write_all_bytes(self, data: Union[bytes, IO[bytes]]):
-        """Write bytes to a volume file.
-
-        Args:
-            data: Union[bytes, IO[bytes]] to write.
-
-        Returns:
-            The DatabricksVolumeIO instance.
-        """
+    def write_all_bytes(
+        self,
+        data: Union[bytes, bytearray, memoryview, BinaryIO],
+        *,
+        overwrite: bool = True,
+        part_size: Optional[int] = None,
+        use_parallel: bool = True,
+        parallelism: Optional[int] = None,
+    ):
+        """Write bytes/stream to a volume file safely (BinaryIO upload)."""
         sdk = self.workspace.sdk()
         client = sdk.files
         full_path = self.path.files_full_path()
 
-        LOGGER.debug(
-            "Writing all bytes in %s",
-            self
-        )
+        LOGGER.debug("Writing all bytes in %s", self)
+
+        size, bio, should_close = _prepare_binaryio_and_size(data)
+
+        def _upload():
+            return client.upload(
+                full_path,
+                bio,
+                overwrite=overwrite,
+                part_size=part_size,
+                use_parallel=use_parallel,
+                parallelism=parallelism,
+            )
 
         try:
-            client.upload(
-                full_path,
-                io.BytesIO(data),
-                overwrite=True
-            )
-        except (NotFound, ResourceDoesNotExist, BadRequest):
+            _ = _upload()
+        except (NotFound, ResourceDoesNotExist, BadRequest, InternalError):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-
-            client.upload(
-                full_path,
-                io.BytesIO(data),
-                overwrite=True
-            )
-
-        LOGGER.info(
-            "Written all bytes in %s",
-            self
-        )
+            # Important: rewind if possible before retry
+            try:
+                bio.seek(0)
+            except Exception:
+                pass
+            _ = _upload()
+        finally:
+            if should_close:
+                try:
+                    bio.close()
+                except Exception:
+                    pass
 
         self.path.reset_metadata(
             is_file=True,
             is_dir=False,
-            size=len(data),
-            mtime=time.time()
+            size=size,
+            mtime=time.time(),
         )
 
-        return self
+        LOGGER.info("Written %s bytes in %s", size or "all", self.path)
+
+        return self  # or return result if your API prefers that
 
 
 class DatabricksDBFSIO(DatabricksIO):

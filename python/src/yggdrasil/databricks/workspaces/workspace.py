@@ -520,9 +520,9 @@ class Workspace:
         Returns:
             A DatabricksPath pointing at the shared cache location.
         """
-        start = int(time.time() * 1000)
-        max_lifetime = max_lifetime or 48.0 * 3600.0
-        end = int(start + max_lifetime)
+        start = int(time.time())
+        max_lifetime = int(max_lifetime or 48 * 3600)
+        end = max(0, int(start + max_lifetime))
 
         base_path = base_path or self._base_tmp_path(
             catalog_name=catalog_name,
@@ -575,19 +575,15 @@ class Workspace:
                 base_path
             )
 
-            try:
-                for path in base_path.ls(recursive=False, allow_not_found=True):
+            for path in base_path.ls(recursive=False, allow_not_found=True):
+                if path.name.startswith("tmp"):
                     parts = path.name.split("-")
 
                     if len(parts) > 2 and parts[0] == "tmp" and parts[1].isdigit() and parts[2].isdigit():
-                        end = int(parts[2]) / 1000.0
+                        end = int(parts[2])
 
                         if end and time.time() > end:
                             path.remove(recursive=True)
-            except Exception as e:
-                if raise_error:
-                    raise e
-                LOGGER.warning(e)
 
             LOGGER.info(
                 "Cleaned temp path %s",

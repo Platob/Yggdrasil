@@ -1,8 +1,6 @@
 """Databricks path abstraction spanning DBFS, workspace, and volumes."""
 
 # src/yggdrasil/databricks/workspaces/databricks_path.py
-from __future__ import annotations
-
 import dataclasses
 import datetime as dt
 import io
@@ -15,9 +13,7 @@ from typing import Optional, Tuple, Union, TYPE_CHECKING, List, Any, IO
 
 import dill
 import pyarrow as pa
-import pyarrow.dataset as ds
 from pyarrow import ArrowInvalid
-from pyarrow.dataset import FileFormat, ParquetFileFormat, CsvFileFormat, JsonFileFormat
 from pyarrow.fs import FileInfo, FileType, FileSystem
 
 from .io import DatabricksIO
@@ -25,12 +21,9 @@ from .path_kind import DatabricksPathKind
 from .volumes_path import get_volume_status, get_volume_metadata
 from ...libs.databrickslib import databricks
 from ...libs.pandaslib import PandasDataFrame
-from ...libs.polarslib import polars, PolarsDataFrame
-from ...types.cast.cast_options import CastOptions
-from ...types.cast.pandas_cast import pandas_converter, cast_pandas_dataframe
-from ...types.cast.polars_cast import polars_converter, cast_polars_dataframe
-from ...types.cast.registry import convert, register_converter
-from ...types.file_format import ExcelFileFormat
+from ...libs.polarslib import polars
+from ...types.cast.registry import convert
+from ...types.file_format import FileFormat, ExcelFileFormat, ParquetFileFormat, JsonFileFormat, CsvFileFormat
 
 if databricks is not None:
     from databricks.sdk.errors import InternalError
@@ -1305,6 +1298,8 @@ class DatabricksPath:
         Returns:
             A PyArrow Dataset instance.
         """
+        import pyarrow.dataset as ds
+
         filesystem = self.filesystem(workspace=workspace) if filesystem is None else filesystem
 
         return ds.dataset(
@@ -1684,32 +1679,3 @@ class DatabricksPath:
             raise ValueError(
                 "Invalid engine %s, must be in duckdb, polars" % engine
             )
-
-if databricks is not None:
-    @register_converter(DatabricksPath, ds.Dataset)
-    def databricks_path_to_arrow_table(
-        data: DatabricksPath,
-        options: Optional[CastOptions] = None,
-    ) -> ds.Dataset:
-        return data.arrow_dataset()
-
-
-    @pandas_converter(DatabricksPath, PandasDataFrame)
-    def databricks_path_to_pandas(
-        data: DatabricksPath,
-        options: Optional[CastOptions] = None,
-    ) -> PolarsDataFrame:
-        return cast_pandas_dataframe(
-            data.read_pandas(),
-            options
-        )
-
-    @polars_converter(DatabricksPath, PolarsDataFrame)
-    def databricks_path_to_polars(
-        data: DatabricksPath,
-        options: Optional[CastOptions] = None,
-    ) -> PolarsDataFrame:
-        return cast_polars_dataframe(
-            data.read_polars(),
-            options
-        )

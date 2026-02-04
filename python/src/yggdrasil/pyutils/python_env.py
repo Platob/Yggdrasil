@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 
 class PythonEnvError(RuntimeError):
     """Raised when Python environment operations fail."""
-
     pass
 
 
@@ -71,6 +70,9 @@ _NON_PIPABLE_RE = re.compile(
     + r")(?=\s*(?:$|==|~=|!=|<=|>=|<|>|\[|;))",
     re.IGNORECASE,
 )
+
+# Snapshot singleton (import-time)
+CURRENT_PYTHON_ENV: "PythonEnv" = None
 
 
 
@@ -1508,11 +1510,3 @@ print("RESULT:" + json.dumps(top_level))""".strip()
             log.error("python_env CLI error: %s", e)
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-
-
-# Snapshot singleton (import-time)
-CURRENT_PYTHON_ENV: PythonEnv = None
-
-
-if __name__ == "__main__":
-    raise SystemExit(PythonEnv.cli())

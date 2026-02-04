@@ -18,84 +18,96 @@ __all__ = [
     "default_arrow_array"
 ]
 
+DEFAULT_MAPS_INITIALIZED = False
 
 _NONE_TYPE = type(None)
-_PRIMITIVE_DEFAULTS = {
-    str: "",
-    int: 0,
-    float: 0.0,
-    bool: False,
-    bytes: b"",
-}
-
-_SPECIAL_DEFAULTS = {
-    datetime.datetime: lambda: datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
-    datetime.date: lambda: datetime.date(1970, 1, 1),
-    datetime.time: lambda: datetime.time(0, 0, 0, tzinfo=datetime.timezone.utc),
-    datetime.timedelta: lambda: datetime.timedelta(0),
-    uuid.UUID: lambda: uuid.UUID(int=0),
-    decimal.Decimal: lambda: decimal.Decimal(0),
-}
-
-_ARROW_DEFAULTS = {
-    pa.null(): pa.scalar(None, type=pa.null()),
-
-    pa.bool_(): pa.scalar(False, type=pa.bool_()),
-
-    pa.int8(): pa.scalar(0, type=pa.int8()),
-    pa.int16(): pa.scalar(0, type=pa.int16()),
-    pa.int32(): pa.scalar(0, type=pa.int32()),
-    pa.int64(): pa.scalar(0, type=pa.int64()),
-
-    pa.uint8(): pa.scalar(0, type=pa.uint8()),
-    pa.uint16(): pa.scalar(0, type=pa.uint16()),
-    pa.uint32(): pa.scalar(0, type=pa.uint32()),
-    pa.uint64(): pa.scalar(0, type=pa.uint64()),
-
-    # pa.float16(): pa.scalar(0.0, type=pa.float16()),
-    pa.float32(): pa.scalar(0.0, type=pa.float32()),
-    pa.float64(): pa.scalar(0.0, type=pa.float64()),
-
-    pa.string(): pa.scalar("", type=pa.string()),
-    pa.string_view(): pa.scalar("", type=pa.string_view()),
-    pa.large_string(): pa.scalar("", type=pa.large_string()),
-
-    pa.binary(): pa.scalar(b"", type=pa.binary()),
-    pa.binary_view(): pa.scalar(b"", type=pa.binary_view()),
-    pa.large_binary(): pa.scalar(b"", type=pa.large_binary()),
-}
+_ARROW_DEFAULTS = {}
+_POLARS_DEFAULTS = {}
+_PRIMITIVE_DEFAULTS = {}
+_SPECIAL_DEFAULTS = {}
 
 
-try:
-    import polars
+def ensure_default_maps_initialized():
+    global DEFAULT_MAPS_INITIALIZED
+    global _PRIMITIVE_DEFAULTS
+    global _SPECIAL_DEFAULTS
+    global _ARROW_DEFAULTS
+    global _POLARS_DEFAULTS
 
-    polars = polars
+    if not DEFAULT_MAPS_INITIALIZED:
+        _PRIMITIVE_DEFAULTS = {
+            str: "",
+            int: 0,
+            float: 0.0,
+            bool: False,
+            bytes: b"",
+        }
 
-    _POLARS_DEFAULTS = {
-        polars.Null(): None,
-        polars.Boolean(): False,
+        _SPECIAL_DEFAULTS = {
+            datetime.datetime: lambda: datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+            datetime.date: lambda: datetime.date(1970, 1, 1),
+            datetime.time: lambda: datetime.time(0, 0, 0, tzinfo=datetime.timezone.utc),
+            datetime.timedelta: lambda: datetime.timedelta(0),
+            uuid.UUID: lambda: uuid.UUID(int=0),
+            decimal.Decimal: lambda: decimal.Decimal(0),
+        }
 
-        polars.Binary(): b"",
+        _ARROW_DEFAULTS = {
+            pa.null(): pa.scalar(None, type=pa.null()),
 
-        polars.Utf8(): "",
+            pa.bool_(): pa.scalar(False, type=pa.bool_()),
 
-        polars.Int8(): 0,
-        polars.Int16(): 0,
-        polars.Int32(): 0,
-        polars.Int64(): 0,
+            pa.int8(): pa.scalar(0, type=pa.int8()),
+            pa.int16(): pa.scalar(0, type=pa.int16()),
+            pa.int32(): pa.scalar(0, type=pa.int32()),
+            pa.int64(): pa.scalar(0, type=pa.int64()),
 
-        polars.UInt8(): 0,
-        polars.UInt16(): 0,
-        polars.UInt32(): 0,
-        polars.UInt64(): 0,
+            pa.uint8(): pa.scalar(0, type=pa.uint8()),
+            pa.uint16(): pa.scalar(0, type=pa.uint16()),
+            pa.uint32(): pa.scalar(0, type=pa.uint32()),
+            pa.uint64(): pa.scalar(0, type=pa.uint64()),
 
-        polars.Float32(): 0.0,
-        polars.Float64(): 0.0,
-    }
-except ImportError:
-    polars = None
+            # pa.float16(): pa.scalar(0.0, type=pa.float16()),
+            pa.float32(): pa.scalar(0.0, type=pa.float32()),
+            pa.float64(): pa.scalar(0.0, type=pa.float64()),
 
-    _POLARS_DEFAULTS = {}
+            pa.string(): pa.scalar("", type=pa.string()),
+            pa.string_view(): pa.scalar("", type=pa.string_view()),
+            pa.large_string(): pa.scalar("", type=pa.large_string()),
+
+            pa.binary(): pa.scalar(b"", type=pa.binary()),
+            pa.binary_view(): pa.scalar(b"", type=pa.binary_view()),
+            pa.large_binary(): pa.scalar(b"", type=pa.large_binary()),
+        }
+
+        try:
+            import polars
+
+            _POLARS_DEFAULTS = {
+                polars.Null(): None,
+                polars.Boolean(): False,
+
+                polars.Binary(): b"",
+
+                polars.Utf8(): "",
+
+                polars.Int8(): 0,
+                polars.Int16(): 0,
+                polars.Int32(): 0,
+                polars.Int64(): 0,
+
+                polars.UInt8(): 0,
+                polars.UInt16(): 0,
+                polars.UInt32(): 0,
+                polars.UInt64(): 0,
+
+                polars.Float32(): 0.0,
+                polars.Float64(): 0.0,
+            }
+        except ImportError:
+            pass
+
+        DEFAULT_MAPS_INITIALIZED = True
 
 def _is_optional(hint) -> bool:
     """Return True when the type hint is Optional.
@@ -199,6 +211,8 @@ def default_arrow_scalar(
     Returns:
         Arrow scalar default.
     """
+    ensure_default_maps_initialized()
+
     if nullable:
         return pa.scalar(None, type=dtype)
 
@@ -306,6 +320,8 @@ def default_python_scalar(hint: Any):
     """
     if _is_optional(hint):
         return None
+
+    ensure_default_maps_initialized()
 
     if hint in _PRIMITIVE_DEFAULTS:
         return _PRIMITIVE_DEFAULTS[hint]

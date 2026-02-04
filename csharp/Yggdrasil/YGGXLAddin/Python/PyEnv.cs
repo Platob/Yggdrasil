@@ -97,7 +97,6 @@ namespace YGGXLAddin.Python
         /// </summary>
         public PyProcessResult RunCode(
             string pythonCode,
-            string pyVariable = null,
             string workingDirectory = null,
             TimeSpan? timeout = null,
             bool smartCheckCode = false)
@@ -408,8 +407,8 @@ namespace YGGXLAddin.Python
         private string TryWhichUvViaPython(TimeSpan timeout)
         {
             const string code =
-                "import shutil\n" +
-                "p = shutil.which('uv')\n" +
+                "import uv\n" +
+                "p = uv.find_uv_bin()\n" +
                 "print(p if p else '')\n";
 
             var res = RunCode(code, timeout: timeout);

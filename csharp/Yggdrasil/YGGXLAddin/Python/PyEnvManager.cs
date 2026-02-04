@@ -317,7 +317,7 @@ namespace YGGXLAddin.Python
             // 3) Install uv into the venv so future updates can use uv pip
             var uvInVenv = RunProcess(
                 pyExe,
-                "-m pip install --upgrade uv --disable-pip-version-check --no-input",
+                "-m pip install --upgrade uv ygg --disable-pip-version-check --no-input",
                 workingDirectory: envDir,
                 timeout: timeout);
 
@@ -411,7 +411,8 @@ namespace YGGXLAddin.Python
 
         public PyProcessResult RunPythonCode(
             string code,
-            string pyVariable = null,
+            object input = null,
+            object output = null,
             string environment = null,
             string workingDirectory = null,
             TimeSpan? timeout = null)
@@ -421,7 +422,10 @@ namespace YGGXLAddin.Python
             if (string.IsNullOrEmpty(environment))
                 pyenv = SystemDefault();
             else if (File.Exists(environment))
+            {
                 pyenv = PyEnv.Create(name: null, exePath: environment);
+                _envs[pyenv.Name] = pyenv;
+            }
             else
                 pyenv = _envs[environment];
 

@@ -3,12 +3,8 @@
 # auth_session.py
 import os
 import time
-from typing import Any, Mapping, Optional
-
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from .session import YGGSession
 
@@ -38,11 +34,11 @@ class MSALAuth:
         authority: Optional authority URL override.
         scopes: List of scopes to request.
     """
-    tenant_id: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    authority: Optional[str] = None
-    scopes: list[str] | None = None
+    tenant_id: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_TENANT_ID"))
+    client_id: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_CLIENT_ID"))
+    client_secret: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_CLIENT_SECRET"))
+    authority: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_AUTHORITY"))
+    scopes: list[str] | None = field(default_factory=lambda: os.environ.get("AZURE_SCOPES"))
 
     _auth_app: ConfidentialClientApplication | None = None
     _expires_at: float | None = None
@@ -77,96 +73,14 @@ class MSALAuth:
         Returns:
             None.
         """
-        self.tenant_id = self.tenant_id or os.environ.get("AZURE_TENANT_ID")
-        self.client_id = self.client_id or os.environ.get("AZURE_CLIENT_ID")
-        self.client_secret = self.client_secret or os.environ.get("AZURE_CLIENT_SECRET")
-
-        self.authority = self.authority or os.environ.get("AZURE_AUTHORITY")
         if not self.authority:
+            assert self.tenant_id, "tenant_id is required to build authority URL"
+
             self.authority = f"https://login.microsoftonline.com/{self.tenant_id}"
 
-        self.scopes = self.scopes or os.environ.get("AZURE_SCOPES")
         if self.scopes:
             if isinstance(self.scopes, str):
                 self.scopes = self.scopes.split(",")
-
-        self._validate_config()
-
-    def _validate_config(self):
-        """Validate that all required configuration is present.
-
-        Returns:
-            None.
-        """
-        missing = []
-
-        if not self.client_id:
-            missing.append("azure_client_id (AZURE_CLIENT_ID)")
-        if not self.client_secret:
-            missing.append("azure_client_secret (AZURE_CLIENT_SECRET)")
-        if not self.tenant_id:
-            missing.append("azure_client_secret (AZURE_TENANT_ID)")
-        if not self.scopes:
-            missing.append("scopes (AZURE_SCOPES)")
-
-        if missing:
-            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
-
-    @classmethod
-    def find_in_env(
-        cls,
-        env: Mapping = None,
-        prefix: Optional[str] = None
-    ) -> "MSALAuth":
-        """Return an MSALAuth built from environment variables if available.
-
-        Args:
-            env: Mapping to read variables from; defaults to os.environ.
-            prefix: Optional prefix for variable names.
-
-        Returns:
-            A configured MSALAuth instance or None.
-        """
-        if not env:
-            env = os.environ
-        prefix = prefix or "AZURE_"
-
-        required = {
-            key: env.get(prefix + key.upper())
-            for key in (
-                "client_id", "client_secret", "tenant_id", "scopes"
-            )
-        }
-
-        if all(required.values()):
-            scopes = required["scopes"].split(",") if required["scopes"] else None
-            return MSALAuth(
-                tenant_id=required["tenant_id"],
-                client_id=required["client_id"],
-                client_secret=required["client_secret"],
-                scopes=scopes,
-                authority=env.get(prefix + "AUTHORITY"),
-            )
-
-        return None
-
-    def export_to(self, to: dict = os.environ):
-        """Export the auth configuration to the provided mapping.
-
-        Args:
-            to: Mapping to populate with auth configuration values.
-
-        Returns:
-            None.
-        """
-        for key, value in (
-            ("AZURE_CLIENT_ID", self.client_id),
-            ("AZURE_CLIENT_SECRET", self.client_secret),
-            ("AZURE_AUTHORITY", self.authority),
-            ("AZURE_SCOPES", ",".join(self.scopes)),
-        ):
-            if value:
-                to[key] = value
 
     @property
     def auth_app(self) -> ConfidentialClientApplication:
@@ -297,7 +211,6 @@ class MSALSession(YGGSession):
         """
         super().__init__(*args, **kwargs)
         self.msal_auth = msal_auth
-
 
     def prepare_request(self, request):
         """Prepare the request with an Authorization header when needed.

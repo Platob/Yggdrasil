@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.1.58"
+version = "0.1.63"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -51,7 +51,7 @@ yggenv = "yggdrasil.pyutils.python_env:PythonEnv.cli"
 [project.urls]
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
-Documentation = "https://github.com/Platob/Yggdrasil/tree/main/python/docs"
+Documentation = "https://github.com/Platob/Yggdrasil"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

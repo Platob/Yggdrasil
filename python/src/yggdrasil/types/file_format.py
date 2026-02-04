@@ -1,8 +1,12 @@
-from pyarrow.dataset import FileFormat
+from pyarrow.dataset import FileFormat, ParquetFileFormat, CsvFileFormat, JsonFileFormat
 
 
 __all__ = [
-    "ExcelFileFormat"
+    "FileFormat",
+    "ExcelFileFormat",
+    "ParquetFileFormat",
+    "CsvFileFormat",
+    "JsonFileFormat"
 ]
 
 

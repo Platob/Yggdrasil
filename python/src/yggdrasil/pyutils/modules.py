@@ -42,7 +42,7 @@ MODULE_PROJECT_NAMES_ALIASES = {
     "yggdrasil": "ygg",
     "jwt": "PyJWT",
 }
-
+DEFAULT_PIP_INDEX_SETTINGS = None
 
 def module_name_to_project_name(module_name: str) -> str:
     """Map module import names to PyPI project names when they differ.
@@ -264,6 +264,11 @@ class PipIndexSettings:
         Returns:
             Default PipIndexSettings instance.
         """
+        global DEFAULT_PIP_INDEX_SETTINGS
+
+        if DEFAULT_PIP_INDEX_SETTINGS is None:
+            DEFAULT_PIP_INDEX_SETTINGS = get_pip_index_settings()
+
         return DEFAULT_PIP_INDEX_SETTINGS
 
     @property
@@ -363,9 +368,3 @@ def get_pip_index_settings() -> PipIndexSettings:
             extra_index_urls.append(u)
 
     return PipIndexSettings(index_url=index_url, extra_index_urls=extra_index_urls, sources=sources)
-
-
-try:
-    DEFAULT_PIP_INDEX_SETTINGS = get_pip_index_settings()
-except:
-    DEFAULT_PIP_INDEX_SETTINGS = PipIndexSettings()
