@@ -36,10 +36,15 @@
         {
             this.YGGAddin = this.Factory.CreateRibbonTab();
             this.group1 = this.Factory.CreateRibbonGroup();
+            this.YGGDatabricksTab = this.Factory.CreateRibbonTab();
+            this.groupDatabricksSql = this.Factory.CreateRibbonGroup();
+            this.buttonDatabricksSql = this.Factory.CreateRibbonButton();
             this.YGGPythonTab = this.Factory.CreateRibbonTab();
             this.groupEnvironment = this.Factory.CreateRibbonGroup();
             this.buttonManageEnvironments = this.Factory.CreateRibbonButton();
             this.YGGAddin.SuspendLayout();
+            this.YGGDatabricksTab.SuspendLayout();
+            this.groupDatabricksSql.SuspendLayout();
             this.YGGPythonTab.SuspendLayout();
             this.groupEnvironment.SuspendLayout();
             this.SuspendLayout();
@@ -55,6 +60,26 @@
             // 
             this.group1.Label = "group1";
             this.group1.Name = "group1";
+            // 
+            // YGGDatabricksTab
+            // 
+            this.YGGDatabricksTab.Groups.Add(this.groupDatabricksSql);
+            this.YGGDatabricksTab.Label = "YGG Databricks";
+            this.YGGDatabricksTab.Name = "YGGDatabricksTab";
+            // 
+            // groupDatabricksSql
+            // 
+            this.groupDatabricksSql.Items.Add(this.buttonDatabricksSql);
+            this.groupDatabricksSql.Label = "SQL";
+            this.groupDatabricksSql.Name = "groupDatabricksSql";
+            // 
+            // buttonDatabricksSql
+            // 
+            this.buttonDatabricksSql.Label = "SQL";
+            this.buttonDatabricksSql.Name = "buttonDatabricksSql";
+            this.buttonDatabricksSql.OfficeImageId = "Database";
+            this.buttonDatabricksSql.ShowImage = true;
+            this.buttonDatabricksSql.Click += new Microsoft.Office.Tools.Ribbon.RibbonControlEventHandler(this.buttonDatabricksSql_Click);
             // 
             // YGGPythonTab
             // 
@@ -79,10 +104,15 @@
             this.Name = "YGGRibbon";
             this.RibbonType = "Microsoft.Excel.Workbook";
             this.Tabs.Add(this.YGGAddin);
+            this.Tabs.Add(this.YGGDatabricksTab);
             this.Tabs.Add(this.YGGPythonTab);
             this.Load += new Microsoft.Office.Tools.Ribbon.RibbonUIEventHandler(this.YGGRibbon_Load);
             this.YGGAddin.ResumeLayout(false);
             this.YGGAddin.PerformLayout();
+            this.YGGDatabricksTab.ResumeLayout(false);
+            this.YGGDatabricksTab.PerformLayout();
+            this.groupDatabricksSql.ResumeLayout(false);
+            this.groupDatabricksSql.PerformLayout();
             this.YGGPythonTab.ResumeLayout(false);
             this.YGGPythonTab.PerformLayout();
             this.groupEnvironment.ResumeLayout(false);
@@ -95,6 +125,9 @@
 
         internal Microsoft.Office.Tools.Ribbon.RibbonTab YGGAddin;
         internal Microsoft.Office.Tools.Ribbon.RibbonGroup group1;
+        internal Microsoft.Office.Tools.Ribbon.RibbonTab YGGDatabricksTab;
+        internal Microsoft.Office.Tools.Ribbon.RibbonGroup groupDatabricksSql;
+        internal Microsoft.Office.Tools.Ribbon.RibbonButton buttonDatabricksSql;
         internal Microsoft.Office.Tools.Ribbon.RibbonTab YGGPythonTab;
         internal Microsoft.Office.Tools.Ribbon.RibbonGroup groupEnvironment;
         internal Microsoft.Office.Tools.Ribbon.RibbonButton buttonManageEnvironments;
