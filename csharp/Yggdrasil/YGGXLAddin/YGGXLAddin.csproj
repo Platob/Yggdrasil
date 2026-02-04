@@ -278,6 +278,10 @@
     <Compile Include="Properties\AssemblyInfo.cs">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="ExcelParquetIO.cs" />
+    <Compile Include="DatabricksSqlForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="YGGRibbon.cs">
       <SubType>Component</SubType>
     </Compile>
