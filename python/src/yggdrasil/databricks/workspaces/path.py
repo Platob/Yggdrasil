@@ -3,15 +3,13 @@
 # src/yggdrasil/databricks/workspaces/databricks_path.py
 import dataclasses
 import datetime as dt
-import io
 import random
 import string
 import time
 from pathlib import PurePosixPath
 from threading import Thread
-from typing import Optional, Tuple, Union, TYPE_CHECKING, List, Any, IO
+from typing import Optional, Tuple, Union, TYPE_CHECKING, List, IO
 
-import dill
 import pyarrow as pa
 from pyarrow import ArrowInvalid
 from pyarrow.fs import FileInfo, FileType, FileSystem
@@ -20,8 +18,6 @@ from .io import DatabricksIO
 from .path_kind import DatabricksPathKind
 from .volumes_path import get_volume_status, get_volume_metadata
 from ...libs.databrickslib import databricks
-from ...libs.pandaslib import PandasDataFrame
-from ...libs.polarslib import polars
 from ...types.cast.registry import convert
 from ...types.file_format import FileFormat, ExcelFileFormat, ParquetFileFormat, JsonFileFormat, CsvFileFormat
 
@@ -1459,7 +1455,7 @@ class DatabricksPath:
 
     def write_pandas(
         self,
-        df: PandasDataFrame,
+        df: "pandas.DataFrame",
         file_format: Optional[FileFormat] = None,
         batch_size: Optional[int] = None,
     ):
@@ -1520,6 +1516,8 @@ class DatabricksPath:
         Returns:
             A polars DataFrame or list of DataFrames if concat=False.
         """
+        import polars
+
         if self.is_file():
             with self.open("rb") as f:
                 df = f.read_polars(batch_size=batch_size, **kwargs)
@@ -1568,6 +1566,8 @@ class DatabricksPath:
         Notes:
         - If `df` is a LazyFrame, we collect it first (optionally streaming).
         """
+        import polars
+
         if isinstance(df, polars.LazyFrame):
             df = df.collect()
 
@@ -1595,29 +1595,6 @@ class DatabricksPath:
                     )
 
         return self
-
-    def read_pickle(
-        self,
-    ) -> Any:
-        content = self.read_bytes()
-        obj = dill.loads(content)
-
-        return obj
-
-    def write_pickle(
-        self,
-        obj: Any,
-        file_format: Optional[FileFormat] = None,
-    ):
-        buffer = io.BytesIO()
-
-        if isinstance(obj, PandasDataFrame):
-            obj.to_pickle(buffer)
-        else:
-            buffer.write(dill.dumps(obj))
-
-        self.write_bytes(data=buffer.getvalue())
-
 
     def sql(
         self,

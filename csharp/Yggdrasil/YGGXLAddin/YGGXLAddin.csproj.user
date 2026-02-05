@@ -9,6 +9,6 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|AnyCPU'">
     <StartAction>Program</StartAction>
     <StartProgram>C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE</StartProgram>
-    <StartArguments>/x "YGGXLAddin-AddIn64.xll"</StartArguments>
+    <StartArguments>"YGGXLAddin-AddIn64.xll"</StartArguments>
   </PropertyGroup>
 </Project>

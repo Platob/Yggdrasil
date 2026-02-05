@@ -186,7 +186,8 @@ class SQLEngine(WorkspaceService):
             self._warehouse = wh.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
-                raise_error=False
+                raise_error=False,
+                find_starter=True
             )
 
             if self._warehouse is None:

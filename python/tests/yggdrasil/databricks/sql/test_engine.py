@@ -55,3 +55,11 @@ class TestSQLEngine(unittest.TestCase):
         self.engine.execute(query)
 
         self.engine.drop_table(table_name="test_warehouse_api")
+
+    def test_warehouse_crud(self):
+        warehouses = self.workspace.warehouses()
+        warehouse = warehouses.create(name="tmp warehouse")
+
+        self.assertEqual(warehouse.warehouse_name, "tmp warehouse")
+
+        warehouse.delete()

@@ -1,10 +1,10 @@
 using System;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
-using ExcelDna.Integration;
-using Microsoft.Office.Interop.Excel;
 using YGGXLAddin.Python;
+using Excel = Microsoft.Office.Interop.Excel;
 
 namespace YGGXLAddin
 {
@@ -112,7 +112,30 @@ namespace YGGXLAddin
 
                 result?.ThrowIfFailed("Databricks SQL query failed.");
 
-                var rows = WriteParquetToWorksheet(tempFile);
+                Excel.Application excelApp;
+
+                try
+                {
+                    // Attach to already-running Excel
+                    excelApp = (Excel.Application)Marshal.GetActiveObject("Excel.Application");
+                }
+                catch (COMException)
+                {
+                    // Excel not running ? start a new one
+                    excelApp = new Excel.Application();
+                    excelApp.Visible = true;
+                }
+
+                if (excelApp == null)
+                    throw new InvalidOperationException("Excel application is not available.");
+
+                var worksheet = excelApp.ActiveSheet as Microsoft.Office.Interop.Excel.Worksheet;
+                if (worksheet == null)
+                    throw new InvalidOperationException("No active worksheet found.");
+
+                var startCell = excelApp.ActiveCell ?? worksheet.Cells[1, 1];
+
+                var rows = ExcelParquetIO.WriteParquetToWorksheet(tempFile, startCell);
 
                 _statusLabel.Text = $"Completed. Loaded {rows} rows.";
             }
@@ -140,14 +163,16 @@ namespace YGGXLAddin
             }
         }
 
+
+
         private static string BuildPythonCode(string statement, string tempFile)
         {
             var statementLiteral = ToPythonStringLiteral(statement);
             var tempFileLiteral = ToPythonStringLiteral(tempFile);
 
-            return $@"from yggdrasil.databricks.workspace import Workspace
+            return $@"from yggdrasil.databricks.workspaces import Workspace
 
-workspace = Workspace()
+workspace = Workspace(host=""dbc-e646c5f9-8a44.cloud.databricks.com"")
 engine = workspace.sql()
 __tempfile__ = {tempFileLiteral}
 statement = {statementLiteral}
@@ -168,20 +193,6 @@ result.to_polars().write_parquet(__tempfile__)
                 .Replace("\n", "\\n");
 
             return $"\"{escaped}\"";
-        }
-
-        private static int WriteParquetToWorksheet(string parquetFile)
-        {
-            var excelApp = (Application)ExcelDnaUtil.Application;
-            if (excelApp == null)
-                throw new InvalidOperationException("Excel application is not available.");
-
-            var worksheet = excelApp.ActiveSheet as Worksheet;
-            if (worksheet == null)
-                throw new InvalidOperationException("No active worksheet found.");
-
-            var startCell = excelApp.ActiveCell as Range ?? worksheet.Cells[1, 1];
-            return ExcelParquetIO.WriteParquetToWorksheet(parquetFile, startCell);
         }
     }
 }

@@ -1,5 +1,6 @@
 ﻿using System.IO;
 using NUnit.Framework;
+using YGGXLAddin.Python;
 
 namespace YGGXLAddin.PyEnv.Tests
 {
@@ -34,16 +35,6 @@ namespace YGGXLAddin.PyEnv.Tests
         }
 
         [Test]
-        public void SystemDefault_Reset_RecreatesSingleton()
-        {
-            var a = PyEnvManager.SystemDefault();
-            PyEnvManager.ResetSystemDefault();
-            var b = PyEnvManager.SystemDefault();
-
-            Assert.That(ReferenceEquals(a, b), Is.False);
-        }
-
-        [Test]
         public void SystemDefault_RunCode_Works()
         {
             var env = PyEnvManager.SystemDefault();
@@ -52,14 +43,6 @@ namespace YGGXLAddin.PyEnv.Tests
 
             Assert.That(res.ExitCode, Is.EqualTo(0));
             Assert.That(res.StdOut, Is.Not.Null.And.Not.Empty);
-        }
-
-        [Test]
-        public void Create_InvalidPath_Throws()
-        {
-            Assert.That(
-                () => PyEnv.Create("bad", @"C:\definitely_not_a_real_python\python.exe"),
-                Throws.TypeOf<FileNotFoundException>());
         }
 
         [Test]

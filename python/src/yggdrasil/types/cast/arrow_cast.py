@@ -4,12 +4,10 @@ import dataclasses
 import enum
 import logging
 from dataclasses import is_dataclass
-from functools import partial
 from typing import Optional, Union, List, Tuple, Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.dataset as pds
 
 from .cast_options import CastOptions
 from .registry import register_converter
@@ -158,13 +156,10 @@ def arrow_struct_to_struct_array(
             )
             child_source_field = child_target_field
         else:
-            logger.error(
-                "Missing struct field %s while casting; available fields: %s",
-                child_target_field.name,
-                list(name_to_index.keys()),
-            )
             raise pa.ArrowInvalid(
-                f"Missing field {child_target_field.name} while casting struct"
+                "Missing struct field %s while casting; available fields: %s" % (
+                    child_target_field.name, list(name_to_index.keys())
+                )
             )
 
         children.append(
@@ -206,6 +201,34 @@ def cast_to_list_arrow_array(
         return pa.chunked_array(casted_chunks, type=target_field.type)
 
     target_type: Union[pa.ListType, pa.FixedSizeListType] = target_field.type
+
+    if is_arrow_type_string_like(source_field.type):
+        import polars
+
+        try:
+            array = (
+                polars.from_arrow(array)
+                .replace("", None)
+                .str.json_decode()
+                .to_arrow()
+            )
+        except Exception as e:
+            raise pa.ArrowInvalid(
+                "Failed to parse JSON strings in list cast from %s to %s: %s" % (
+                    source_field,
+                    target_field,
+                    e
+                )
+            )
+
+        if source_field:
+            source_field = pa.field(
+                name=source_field.name,
+                type=array.type,
+                nullable=source_field.nullable,
+                metadata=source_field.metadata
+            )
+
     mask = array.is_null() if source_field.nullable and target_field.nullable else None
 
     if is_arrow_type_list_like(source_field.type):
@@ -220,12 +243,7 @@ def cast_to_list_arrow_array(
             )
         )
     else:
-        logger.error(
-            "Unsupported list cast from %s to %s",
-            source_field,
-            target_field,
-        )
-        raise pa.ArrowInvalid(f"Unsupported list casting for type {array.type}")
+        raise pa.ArrowInvalid("Unsupported list cast from %s to %s" % (source_field, target_field))
 
     if pa.types.is_list(target_type):
         return pa.ListArray.from_arrays(
@@ -249,8 +267,7 @@ def cast_to_list_arrow_array(
             mask=mask
         )
     else:
-        logger.error("Cannot build arrow array for target list type %s", target_type)
-        raise ValueError(f"Cannot build arrow array {target_type}")
+        raise pa.ArrowInvalid(f"Cannot build arrow array for target list type {target_type}")
 
 
 def cast_to_map_array(
@@ -279,12 +296,7 @@ def cast_to_map_array(
     elif pa.types.is_struct(source_field.type):
         return arrow_struct_to_map_array(array, options)
     else:
-        logger.error(
-            "Unsupported map cast from %s to %s",
-            source_field,
-            target_field,
-        )
-        raise ValueError(f"Cannot cast {source_field} to {target_field}")
+        raise pa.ArrowInvalid("Unsupported map cast from %s to %s" % (source_field, target_field))
 
 
 @register_converter(pa.MapArray, pa.MapArray)
@@ -765,28 +777,6 @@ def cast_arrow_tabular(
     return data.__class__.from_arrays(all_arrays, schema=target_arrow_schema)
 
 
-@register_converter(pds.Dataset, pds.Dataset)
-def cast_arrow_dataset(data: pds.Dataset, options: Optional[CastOptions] = None) -> pds.Dataset:
-    """Cast a dataset to the target schema in options.
-
-    Args:
-        data: Arrow dataset to cast.
-        options: Optional cast options.
-
-    Returns:
-        Casted dataset.
-    """
-    if options is None:
-        return data
-
-    caster = partial(cast_arrow_tabular, options=options)
-
-    return pds.dataset(map(caster, data.to_batches(
-        batch_size=256 * 1024,
-        memory_pool=options.arrow_memory_pool
-    )))
-
-
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)
 def cast_arrow_record_batch_reader(
     data: pa.RecordBatchReader,
@@ -1163,43 +1153,6 @@ def record_batch_reader_to_record_batch(
     """
     table = record_batch_reader_to_table(data, options)
     return table_to_record_batch(table, options)
-
-
-@register_converter(pds.Dataset, pa.Table)
-def arrow_dataset_to_table(
-    data: pds.Dataset,
-    options: Optional[CastOptions] = None,
-) -> pa.Table:
-    """Convert a dataset to a Table and apply casting.
-
-    Args:
-        data: Arrow dataset.
-        options: Optional cast options.
-
-    Returns:
-        Arrow table.
-    """
-    table = data.to_table()
-    return cast_arrow_tabular(table, options)
-
-
-@register_converter(pa.Table, pds.Dataset)
-@register_converter(pa.RecordBatch, pds.Dataset)
-def arrow_tabular_to_dataset(
-    data: Union[pa.Table, pa.RecordBatch],
-    options: Optional[CastOptions] = None,
-) -> pa.Field:
-    """Convert Arrow tabular data to a dataset after casting.
-
-    Args:
-        data: Table or RecordBatch.
-        options: Optional cast options.
-
-    Returns:
-        Arrow dataset.
-    """
-    data = cast_arrow_tabular(data, options)
-    return pds.dataset([data])
 
 
 # ---------------------------------------------------------------------------

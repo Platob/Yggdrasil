@@ -305,14 +305,16 @@ class StatementResult:
             The current StatementResult instance.
         """
         wait = WaitingConfig.check_arg(wait)
-        iteration, start = 0, time.time()
 
-        if not self.done:
-            wait.sleep(iteration=iteration, start=start)
-            iteration += 1
+        if wait.timeout:
+            iteration, start = 0, time.time()
 
-        if raise_error:
-            self.raise_for_status()
+            if not self.done:
+                wait.sleep(iteration=iteration, start=start)
+                iteration += 1
+
+            if raise_error:
+                self.raise_for_status()
 
         return self
 

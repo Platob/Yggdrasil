@@ -5,6 +5,7 @@ using System.Linq;
 using Microsoft.Office.Interop.Excel;
 using Parquet;
 using Parquet.Data;
+using Parquet.Schema;
 
 namespace YGGXLAddin
 {
@@ -14,13 +15,13 @@ namespace YGGXLAddin
         {
             if (topLeftCell == null)
                 throw new ArgumentNullException(nameof(topLeftCell));
-
+            
             var worksheet = topLeftCell.Worksheet;
             if (worksheet == null)
                 throw new InvalidOperationException("Top-left cell is not associated with a worksheet.");
 
             using (var stream = File.OpenRead(parquetFile))
-            using (var reader = new ParquetReader(stream))
+            using (var reader = ParquetReader.CreateAsync(stream).Result)
             {
                 var fields = reader.Schema.GetDataFields();
                 if (fields.Length == 0)
@@ -46,7 +47,7 @@ namespace YGGXLAddin
                 {
                     using (var group = reader.OpenRowGroupReader(g))
                     {
-                        var dataColumns = fields.Select(field => group.ReadColumn(field)).ToArray();
+                        var dataColumns = fields.Select(field => group.ReadColumnAsync(field).Result).ToArray();
                         var rows = dataColumns.Length == 0 ? 0 : dataColumns[0].Data.Length;
 
                         if (rows == 0)
@@ -126,16 +127,16 @@ namespace YGGXLAddin
                 fields[c] = CreateField(inferredType, header);
             }
 
-            var schema = new Schema(fields);
+            var schema = new ParquetSchema(fields);
             using (var fileStream = File.Create(parquetFile))
-            using (var writer = new ParquetWriter(schema, fileStream))
+            using (var writer = ParquetWriter.CreateAsync(schema, fileStream).Result)
             {
                 using (var rowGroupWriter = writer.CreateRowGroup())
                 {
                     for (var c = 0; c < columnCount; c++)
                     {
                         var column = BuildColumn(fields[c], columnSpecs[c]);
-                        rowGroupWriter.WriteColumn(column);
+                        rowGroupWriter.WriteColumnAsync(column).RunSynchronously();
                     }
                 }
             }

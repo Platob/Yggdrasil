@@ -25,7 +25,6 @@ namespace YGGXLAddin.Python
 
         public override string ToString() => $"{Name} ({Version}) @ {ExePath}";
 
-
         private static string InferNameFromExePath(string exePath, PyVersion ver)
         {
             // If it's a full path, use basename; if it's a command like "python3.12", still works.

@@ -3,11 +3,9 @@
 import base64
 import dataclasses as dc
 import io
-import json
 import logging
 import os
 import posixpath
-import re
 import sys
 import threading
 import zipfile
@@ -23,7 +21,7 @@ from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from ...pyutils.waiting_config import WaitingConfigArg
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -401,10 +399,6 @@ print(json.dumps(meta))"""
         ):
             if c.is_in_databricks_environment():
                 return func
-
-            c.cluster.ensure_running(
-                wait=False
-            )
 
             return c.command(
                 context=c,

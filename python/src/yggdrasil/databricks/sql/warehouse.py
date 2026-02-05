@@ -18,8 +18,9 @@ try:
         EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
         GetWarehouseResponse, GetWarehouseResponseWarehouseType,
         Disposition, Format,
-        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
-    )
+        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem,
+        WarehouseAccessControlRequest, WarehousePermissionLevel
+)
 
     _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
     _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
@@ -36,6 +37,7 @@ except ImportError:
     Format = DatabricksDummyClass
     ExecuteStatementRequestOnWaitTimeout = DatabricksDummyClass
     StatementParameterListItem = DatabricksDummyClass
+    WarehouseAccessControlRequest = DatabricksDummyClass
 
 
 __all__ = [
@@ -242,6 +244,7 @@ class SQLWarehouse(WorkspaceService):
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         raise_error: bool = True,
+        find_starter: bool = False
     ):
         if warehouse_id:
             if warehouse_id == self.warehouse_id:
@@ -256,6 +259,7 @@ class SQLWarehouse(WorkspaceService):
         elif self.warehouse_id:
             return self
 
+        starter_warehouse, starter_name = None, "Serverless Starter Warehouse"
         warehouse_name = warehouse_name or self.warehouse_name or self._make_default_name(enable_serverless_compute=True)
 
         if warehouse_name:
@@ -284,7 +288,14 @@ class SQLWarehouse(WorkspaceService):
                         warehouse_name=warehouse_name,
                         warehouse_id=warehouse.warehouse_id
                     )
+
                     return warehouse
+
+                elif warehouse.warehouse_name == starter_name:
+                    starter_warehouse = warehouse
+
+        if find_starter and starter_warehouse is not None:
+            return starter_warehouse
 
         if raise_error:
             v = warehouse_name or warehouse_id
@@ -393,6 +404,7 @@ class SQLWarehouse(WorkspaceService):
             warehouse_id=warehouse_id,
             warehouse_name=name,
             raise_error=False,
+            find_starter=False
         )
 
         if found is not None:
@@ -435,12 +447,16 @@ class SQLWarehouse(WorkspaceService):
 
             info = EndpointInfo(**update_details)
 
-        return SQLWarehouse(
+        created = SQLWarehouse(
             workspace=self.workspace,
             warehouse_id=info.id,
             warehouse_name=info.name,
             _details=info
         )
+
+        created.update_permissions()
+
+        return created
 
     def update(
         self,
@@ -501,6 +517,76 @@ class SQLWarehouse(WorkspaceService):
             )
 
         return self
+
+    def update_permissions(
+        self,
+        access_control_list: Optional[List[WarehouseAccessControlRequest]] = None,
+        wait: Optional[WaitingConfigArg] = None
+    ):
+        if self.warehouse_id:
+            client = self.warehouse_client()
+
+            access_control_list = self._check_access_control_list(
+                access_control_list=access_control_list
+            )
+
+            if access_control_list:
+                client.update_permissions(
+                    warehouse_id=self.warehouse_id,
+                    access_control_list=access_control_list
+                )
+
+    def default_access_control_list(self, for_all: bool):
+        if for_all:
+            base = [
+                WarehouseAccessControlRequest(
+                    group_name="users",
+                    permission_level=WarehousePermissionLevel.CAN_USE
+                )
+            ]
+        else:
+            base = []
+
+        groups = self.workspace.current_user.groups
+
+        if groups:
+            base.extend(
+                WarehouseAccessControlRequest(
+                    group_name=group.display,
+                    permission_level=WarehousePermissionLevel.CAN_MANAGE
+                )
+                for group in groups
+                if group.display != "users"
+            )
+
+        return base
+
+    def _check_access_control_list(
+        self,
+        access_control_list: Optional[List[WarehouseAccessControlRequest]] = None
+    ):
+        if access_control_list is None:
+            access_control_list = []
+
+        access_control_list.extend(self.default_access_control_list(
+            for_all=self.warehouse_name.startswith("yggdrasil") if self.warehouse_name else False
+        ))
+
+        return access_control_list
+
+    def delete(self):
+        if self.warehouse_id:
+            LOGGER.debug(
+                "Deleting %s",
+                self
+            )
+
+            self.warehouse_client().delete(id=self.warehouse_id)
+
+            LOGGER.info(
+                "Deleted %s",
+                self
+            )
 
     def execute(
         self,
@@ -591,4 +677,4 @@ class SQLWarehouse(WorkspaceService):
             execution
         )
 
-        return execution.wait() if wait is not None else execution
+        return execution.wait(wait=wait)

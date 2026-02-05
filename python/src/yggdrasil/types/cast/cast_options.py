@@ -1,14 +1,16 @@
 """Casting options for Arrow- and engine-aware conversions."""
 
 import dataclasses
-from typing import Optional, Union, List, Any
+from typing import Optional, Union, List, Any, TYPE_CHECKING
 
 import pyarrow as pa
 
 from .registry import convert
 from ..python_arrow import is_arrow_type_list_like
-from ...libs.polarslib import polars
-from ...libs.sparklib import pyspark
+
+if TYPE_CHECKING:
+    from ...libs.polarslib import polars
+    from ...libs.sparklib import pyspark
 
 __all__ = [
     "CastOptions",

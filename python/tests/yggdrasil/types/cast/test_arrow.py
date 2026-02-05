@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Union
 
@@ -249,6 +250,18 @@ def test_cast_arrow_tabular_record_batch_matches_table_behavior():
     casted_batch = cast_arrow_tabular(batch, opts)
 
     assert pa.Table.from_batches([casted_batch]).equals(casted_table)
+
+
+def test_cast_arrow_table_string_to_list():
+    table = pa.table({"ls": [json.dumps(["1", "2"]), "", None]})
+
+    target_schema = pa.schema([pa.field("ls", pa.list_(pa.int32()), nullable=False)])
+    opts = CastOptions.check_arg(target_field=target_schema)
+
+    casted = cast_arrow_tabular(table, opts)
+
+    assert casted.schema.names == ["ls"]
+    assert casted.column("ls").to_pylist() == [[1, 2], [], []]
 
 
 # ---------------------------------------------------------------------------

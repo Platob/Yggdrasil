@@ -24,10 +24,9 @@ def require_databricks_sdk():
 
 
 try:
+    from databricks.sdk import WorkspaceClient
     import databricks
     import databricks.sdk
-
-    from databricks.sdk import WorkspaceClient
 
     databricks = databricks
     databricks_sdk = databricks.sdk

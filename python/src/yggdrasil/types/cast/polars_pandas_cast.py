@@ -2,23 +2,20 @@
 
 from typing import Optional
 
-from .arrow_cast import CastOptions
-from .registry import register_converter
-
-# Reuse existing Polars <-> Arrow helpers
-from .polars_cast import (
-    polars_dataframe_to_arrow_table,
-    arrow_table_to_polars_dataframe,
-)
-
+from .cast_options import CastOptions
 # Reuse existing pandas <-> Arrow helpers
 from .pandas_cast import (
     pandas_dataframe_to_arrow_table,
     arrow_table_to_pandas_dataframe,
 )
-
-from ...libs.polarslib import polars, require_polars
-from ...libs.pandaslib import pandas, require_pandas
+# Reuse existing Polars <-> Arrow helpers
+from .polars_cast import (
+    polars_dataframe_to_arrow_table,
+    arrow_table_to_polars_dataframe,
+)
+from .registry import register_converter
+from ...libs.pandaslib import pandas, PandasDataFrame
+from ...libs.polarslib import polars, PolarsDataFrame
 
 __all__ = [
     "polars_dataframe_to_pandas_dataframe",
@@ -30,12 +27,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 if polars is not None and pandas is not None:
-    require_polars()
-    require_pandas()
-
-    PolarsDataFrame = polars.DataFrame
-    PandasDataFrame = pandas.DataFrame
-
     def polars_pandas_converter(*args, **kwargs):
         """Return a register_converter wrapper when both libs are available.
 
@@ -49,14 +40,6 @@ if polars is not None and pandas is not None:
         return register_converter(*args, **kwargs)
 
 else:
-    # Dummy stand-ins so decorators/annotations don't explode if one lib is absent
-    class _Dummy:  # pragma: no cover - only used when Polars or pandas not installed
-        """Placeholder type when Polars or pandas are unavailable."""
-        pass
-
-    PolarsDataFrame = _Dummy
-    PandasDataFrame = _Dummy
-
     def polars_pandas_converter(*_args, **_kwargs):  # pragma: no cover - no-op decorator
         """Return a no-op decorator when dependencies are missing.
 

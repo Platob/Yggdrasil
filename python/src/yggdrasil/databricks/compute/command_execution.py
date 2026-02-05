@@ -209,7 +209,7 @@ class CommandExecution:
         self.command_id = details.id
         self._details = None
 
-        LOGGER.info("Started %s", self)
+        LOGGER.debug("Started %s", self)
 
         return self
 
@@ -393,17 +393,9 @@ class CommandExecution:
                 "file": dbx_path.full_path()
             })
         elif isinstance(obj, PandasDataFrame):
-            try:
-                func = "pandas.read_parquet"
-                extension = "parquet"
-                obj.to_parquet(path=buffer)
-            except Exception as e:
-                LOGGER.warning(e)
-
-                compression = "gzip"
-                extension = "pkl.gz"
-                func = "pandas.read_pickle"
-                obj.to_pickle(path=buffer, compression=compression)
+            func = "pandas.read_parquet"
+            extension = "parquet"
+            obj.to_parquet(path=buffer)
 
             buffer.seek(0)
             dbx_path = self.workspace.tmp_path(extension=extension)
@@ -429,23 +421,23 @@ class CommandExecution:
 
         if compression or len(raw) > byte_limit:
             compression = compression or "gzip"
+            if compression != "gzip":
+                raise ValueError(f"Unsupported compression: {compression}")
             raw = gzip.compress(raw)
 
         if len(raw) > byte_limit:
-            buffer.seek(0)
             dbx_path = self.workspace.tmp_path(extension="bin")
-            dbx_path.write_bytes(buffer)
-
+            dbx_path.write_bytes(raw)
             return json.dumps({
                 "func": "dill.load",
                 "cpr": compression,
-                "file": dbx_path.full_path()
+                "file": dbx_path.full_path(),
             })
 
         return json.dumps({
             "func": "dill.load",
             "cpr": compression,
-            "b64": base64.b64encode(raw).decode("ascii")
+            "b64": base64.b64encode(raw).decode("ascii"),
         })
 
     def decode_payload(
@@ -530,27 +522,20 @@ class CommandExecution:
 
         cmd = f"""
 import base64, dill, os
-args_b64 = __ARGS__
-kwargs_b64 = __KWARGS__
-environ = __ENVIRON__
 
-if environ:
-    for k, v in environ.items():
+if __ENVIRON__:
+    for k, v in __ENVIRON__.items():
         if k and v:
             os.environ[k] = v
 
-func_payload = {serialized_func!r}
-tag = {tag!r}
-command_b64 = {command_b64!r}
-
-command = dill.loads(base64.b64decode(command_b64.encode("ascii")))
-args = dill.loads(base64.b64decode(args_b64.encode("ascii")))
-kwargs = dill.loads(base64.b64decode(kwargs_b64.encode("ascii")))
-
-print(tag + command.encode_object(command.decode_payload(func_payload)(
-    *[command.decode_payload(x) for x in args],
-    **{{k: command.decode_payload(v) for k, v in kwargs.items()}}
-)))"""
+command = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
+args = dill.loads(base64.b64decode(__ARGS__.encode("ascii")))
+kwargs = dill.loads(base64.b64decode(__KWARGS__.encode("ascii")))
+f = command.decode_payload({serialized_func!r})
+a = [command.decode_payload(x) for x in args]
+kw = {{k: command.decode_payload(v) for k, v in kwargs.items()}}
+r = f(*a, **kw)
+print({tag!r} + command.encode_object(r))"""
 
         return cmd
 

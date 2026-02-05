@@ -8,7 +8,7 @@ namespace YGGXLAddin
 {
     public sealed class PyEnvManagerForm : Form
     {
-        public readonly PyEnvManager _manager;
+        public readonly PyEnvManager Manager;
         private readonly ListView _envList;
         private readonly ListView _packageList;
         private readonly TextBox _nameInput;
@@ -28,7 +28,7 @@ namespace YGGXLAddin
 
         public PyEnvManagerForm()
         {
-            _manager = PyEnvManager.Instance;
+            Manager = PyEnvManager.Instance;
 
             Text = "Python Environments";
             MinimumSize = new Size(720, 420);
@@ -53,7 +53,7 @@ namespace YGGXLAddin
             _baseDirLabel = new Label
             {
                 AutoSize = true,
-                Text = $"Base directory: {_manager.BaseDir}"
+                Text = $"Base directory: {Manager.BaseDir}"
             };
 
             _defaultEnvLabel = new Label
@@ -204,12 +204,12 @@ namespace YGGXLAddin
         {
             try
             {
-                _manager.Reload();
+                Manager.Reload();
                 _envList.Items.Clear();
-                var defaultEnv = _manager.Default();
+                var defaultEnv = Manager.Default();
                 _defaultEnvLabel.Text = $"Default environment: {defaultEnv.Name} ({defaultEnv.Version})";
 
-                foreach (var pair in _manager.Envs)
+                foreach (var pair in Manager.Envs)
                 {
                     var env = pair.Value;
                     var item = new ListViewItem(env.Name);
@@ -276,7 +276,7 @@ namespace YGGXLAddin
 
             try
             {
-                _manager.Create(name, versionText);
+                Manager.Create(name, versionText);
                 RefreshEnvs();
             }
             catch (Exception ex)
@@ -306,7 +306,7 @@ namespace YGGXLAddin
 
             try
             {
-                _manager.Delete(name);
+                Manager.Delete(name);
                 RefreshEnvs();
             }
             catch (Exception ex)
@@ -326,7 +326,7 @@ namespace YGGXLAddin
 
             try
             {
-                _manager.SetDefault(env.Name);
+                Manager.SetDefault(env);
                 RefreshEnvs();
             }
             catch (Exception ex)
@@ -339,7 +339,7 @@ namespace YGGXLAddin
         {
             try
             {
-                _manager.ResetDefault();
+                Manager.ResetDefault();
                 RefreshEnvs();
             }
             catch (Exception ex)
@@ -354,7 +354,7 @@ namespace YGGXLAddin
                 return null;
 
             var name = _envList.SelectedItems[0].Text;
-            return _manager.TryGet(name, out var env) ? env : null;
+            return Manager.TryGet(name, out var env) ? env : null;
         }
 
         private void RefreshPackages()

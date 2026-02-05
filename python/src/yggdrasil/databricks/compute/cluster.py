@@ -181,11 +181,13 @@ class Cluster(WorkspaceService):
         if workspace is None:
             workspace = Workspace()  # your default, whatever it is
 
-        host = workspace.host
+        host = workspace.safe_host
 
         # 🔥 return existing singleton for this host
-        if host in cls._env_clusters:
-            return cls._env_clusters[host]
+        existing = cls._env_clusters.get(host)
+
+        if existing is not None:
+            return existing
 
         # 🔥 first time for this host → create
         inst = cls._env_clusters[host] = (
@@ -847,16 +849,20 @@ class Cluster(WorkspaceService):
         if self.is_running:
             return self
 
+        client = self.clusters_client()
         wait = WaitingConfig.check_arg(wait)
-
-        self.wait_for_status(wait=wait)
-
-        if self.is_running:
-            return self
 
         LOGGER.debug("Starting %s", self)
 
-        self.clusters_client().start(cluster_id=self.cluster_id)
+        try:
+            client.start(cluster_id=self.cluster_id)
+        except:
+            self.wait_for_status(wait=wait)
+
+            if self.is_running:
+                return self
+
+            client.start(cluster_id=self.cluster_id)
 
         LOGGER.info("Started %s", self)
 
@@ -866,6 +872,7 @@ class Cluster(WorkspaceService):
 
     def restart(
         self,
+        wait: Optional[WaitingConfigArg] = True
     ):
         """Restart the cluster, waiting for libraries to install.
 
@@ -878,7 +885,7 @@ class Cluster(WorkspaceService):
             self.details = self.clusters_client().restart_and_wait(cluster_id=self.cluster_id)
             return self
 
-        return self.start()
+        return self.start(wait=wait)
 
     def delete(
         self

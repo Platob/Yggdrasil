@@ -1,6 +1,5 @@
 """Convenience decorator for running functions on Databricks clusters."""
 
-import datetime as dt
 import logging
 import os
 from typing import (

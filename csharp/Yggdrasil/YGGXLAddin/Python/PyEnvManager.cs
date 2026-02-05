@@ -80,7 +80,17 @@ namespace YGGXLAddin.Python
                 _envs[env.Name] = env;
             }
 
-            lock (_defaultLock) { _default = env; }
+            SetDefault(env);
+        }
+
+        public void SetDefault(PyEnv env)
+        {
+            _envs[env.Name] = env;
+
+            lock (_defaultLock)
+            {
+                _default = env;
+            }
         }
 
         private static string ResolveSystemPythonExe(TimeSpan timeout)
@@ -181,7 +191,7 @@ namespace YGGXLAddin.Python
 
             var dftEnv = SystemDefault();
 
-            _envs[$"system-{dftEnv.Version}"] = dftEnv;
+            _envs[dftEnv.Name] = dftEnv;
 
             if (!Directory.Exists(BaseDir))
                 return;
@@ -190,6 +200,7 @@ namespace YGGXLAddin.Python
             {
                 var name = Path.GetFileName(dir);
                 var pyExe = ResolvePythonExePath(dir);
+
                 if (pyExe == null || !File.Exists(pyExe))
                     continue;
 
@@ -254,7 +265,7 @@ namespace YGGXLAddin.Python
 
         private void CreateVenvWithSystemUv(string envDir, string pythonVersion, TimeSpan timeout)
         {
-            var uv = SystemDefault().FindUVPath();
+            var uv = Default().FindUVPath();
             var args = $"venv --python {pythonVersion} {QuoteArg(envDir)}";
 
             var env = new System.Collections.Generic.Dictionary<string, string>
@@ -420,7 +431,7 @@ namespace YGGXLAddin.Python
             PyEnv pyenv;
 
             if (string.IsNullOrEmpty(environment))
-                pyenv = SystemDefault();
+                pyenv = Default();
             else if (File.Exists(environment))
             {
                 pyenv = PyEnv.Create(name: null, exePath: environment);
