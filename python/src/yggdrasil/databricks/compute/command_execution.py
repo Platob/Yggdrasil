@@ -442,7 +442,8 @@ class CommandExecution:
 
     def decode_payload(
         self,
-        payload: Union[str, bytes, dict, list]
+        payload: Union[str, bytes, dict, list],
+        temporary: bool = True
     ):
         if isinstance(payload, (str, bytes)):
             try:
@@ -460,7 +461,7 @@ class CommandExecution:
                 if b64:
                     blob = base64.b64decode(b64.encode("ascii"))
                 elif databricks_path:
-                    blob = self.workspace.dbfs_path(databricks_path, temporary=True).read_bytes()
+                    blob = self.workspace.dbfs_path(databricks_path, temporary=temporary).read_bytes()
                 else:
                     blob = None
 
@@ -518,7 +519,11 @@ class CommandExecution:
         command_b64 = base64.b64encode(command_bytes).decode("ascii")
 
         # Func serialized by strict encoder: DILL:<compression>:b64:<...> or DATABRICKS_PATH:<compression>:path:<...>
-        serialized_func = self.encode_object(func, byref=byref, recurse=recurse)
+        serialized_func = self.encode_object(
+            func,
+            byte_limit=64 * 1024,
+            byref=byref, recurse=recurse
+        )
 
         cmd = f"""
 import base64, dill, os
@@ -531,7 +536,7 @@ if __ENVIRON__:
 command = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
 args = dill.loads(base64.b64decode(__ARGS__.encode("ascii")))
 kwargs = dill.loads(base64.b64decode(__KWARGS__.encode("ascii")))
-f = command.decode_payload({serialized_func!r})
+f = command.decode_payload({serialized_func!r}, temporary=False)
 a = [command.decode_payload(x) for x in args]
 kw = {{k: command.decode_payload(v) for k, v in kwargs.items()}}
 r = f(*a, **kw)
