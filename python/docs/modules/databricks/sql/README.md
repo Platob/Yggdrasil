@@ -1,41 +1,99 @@
 # yggdrasil.databricks.sql
 
-Databricks SQL execution helpers for statement execution and Spark-backed workflows.
+`yggdrasil.databricks.sql` offers a unified SQL execution surface for Databricks automation.
 
-## When to use
-- You need to execute SQL against Databricks SQL warehouses or clusters.
-- You want structured results that preserve schema metadata.
+It can execute through:
+- **Spark SQL** (inside Databricks runtime with active Spark session)
+- **Databricks SQL statement API** (external or warehouse-oriented execution)
+
+---
 
 ## Core APIs
-- `SQLEngine` wraps statement execution and provides convenience helpers for fully qualified table names.
-- `StatementResult` captures rows plus metadata for Arrow conversion.
+
+- `SQLEngine`: query execution, table targeting, and insert helpers.
+- `StatementResult`: structured results + conversion helpers.
+- `SqlStatementError`: typed error for statement failures.
+
+---
+
+## Bootstrap: initialize engine
 
 ```python
 from yggdrasil.databricks.sql import SQLEngine
 
-engine = SQLEngine(catalog_name="main", schema_name="demo")
-engine.execute("SELECT 1 AS value")
+engine = SQLEngine(
+    catalog_name="main",
+    schema_name="analytics",
+)
 ```
 
-## Use cases
-### Execute a statement and fetch Arrow data
+---
+
+## Bootstrap: execute SQL and inspect results
+
 ```python
 from yggdrasil.databricks.sql import SQLEngine
 
-engine = SQLEngine(catalog_name="main", schema_name="demo")
-result = engine.execute("SELECT 1 AS value")
-table = result.to_arrow_table()
+engine = SQLEngine(catalog_name="main", schema_name="analytics")
+result = engine.execute("SELECT 1 AS healthcheck")
+
+# Useful access patterns
+print(result.status)
+print(result.statement_id)
+print(result.rows)
 ```
 
-### Insert an Arrow table into Delta
+---
+
+## Bootstrap: convert to Arrow for downstream processing
+
+```python
+from yggdrasil.databricks.sql import SQLEngine
+
+engine = SQLEngine(catalog_name="main", schema_name="analytics")
+result = engine.execute("SELECT id, amount FROM main.analytics.transactions LIMIT 100")
+arrow_table = result.to_arrow_table()
+```
+
+---
+
+## Bootstrap: load Arrow table to Delta
+
 ```python
 import pyarrow as pa
 from yggdrasil.databricks.sql import SQLEngine
 
-engine = SQLEngine(catalog_name="main", schema_name="demo")
-table = pa.table({"id": [1, 2], "value": ["a", "b"]})
-engine.insert_into(table, table_name="demo_table", mode="append")
+engine = SQLEngine(catalog_name="main", schema_name="analytics")
+
+data = pa.table({
+    "id": [1, 2, 3],
+    "country": ["US", "FR", "IN"],
+})
+
+engine.insert_into(data, table_name="country_dim", mode="append")
 ```
 
-## Related modules
-- [yggdrasil.databricks.workspaces](../workspaces/README.md) for workspace configuration.
+---
+
+## Bootstrap: external orchestration mode (API-first)
+
+```python
+from yggdrasil.databricks.sql import SQLEngine
+
+engine = SQLEngine(catalog_name="main", schema_name="analytics")
+
+result = engine.execute(
+    statement="SELECT current_timestamp() AS ts",
+    engine="api",  # force SQL statement API
+    warehouse_name="analytics_wh",
+    wait=True,
+)
+```
+
+---
+
+## Best practices
+
+- Keep `catalog_name` and `schema_name` explicit in pipelines.
+- Use `engine="api"` when running from external orchestrators without Spark.
+- Use `row_limit` for lightweight checks and validation probes.

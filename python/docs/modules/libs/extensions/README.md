@@ -1,26 +1,42 @@
 # yggdrasil.libs.extensions
 
-Optional dataframe extensions for Polars and Spark.
+Extension helpers for dataframe workflows that benefit from concise utility operations.
 
-## When to use
-- You want convenience helpers for joining or resampling Polars dataframes.
-- You need Spark dataframe helpers such as latest-row selection or alias discovery.
+This area is useful when you want shared reusable logic for joins, sampling/resampling, and dataframe convenience operations.
 
-## Polars helpers
-Provided by `polars_extensions`:
-- `join_coalesced` joins two dataframes and coalesces overlapping columns.
-- `resample` groups by a datetime column and aggregates at a regular cadence.
+---
+
+## Typical usage
+
+- Repeated join-with-merge-column patterns
+- Time-window resampling tasks
+- Small helper APIs for dataframe interoperability
+
+---
+
+## Bootstrap: extension-style helper call
 
 ```python
-from yggdrasil.libs.extensions import join_coalesced
-
-result = join_coalesced(left_df, right_df, on="id")
+# Example shape for extension helper usage
+# from yggdrasil.libs.extensions import join_coalesced
+# output = join_coalesced(left_df, right_df, on="id")
 ```
 
-## Spark helpers
-Provided by `spark_extensions`:
-- Utilities for working with Spark columns and aliases.
-- Convenience resampling helpers backed by Spark + Arrow/Polars integration.
+---
 
-## Related modules
-- [yggdrasil.libs](../README.md) for dependency guards and Spark/Arrow conversions.
+## Bootstrap: compose with a pipeline stage
+
+```python
+def transform_features(df):
+    # apply extension helpers in deterministic order
+    # df = join_coalesced(df, ref_df, on="entity_id")
+    return df
+```
+
+---
+
+## Recommendations
+
+- Keep extension operations deterministic and side-effect free.
+- Document key assumptions (sort order, null semantics, dedup strategy).
+- Add tests for overlapping-column and missing-key edge cases.

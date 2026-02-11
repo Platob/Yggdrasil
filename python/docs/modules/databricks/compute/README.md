@@ -1,45 +1,79 @@
 # yggdrasil.databricks.compute
 
-Helpers for managing Databricks clusters and running remote compute workloads.
+This module focuses on remote compute operations for Databricks clusters.
 
-## When to use
-- You need to create/update clusters with shared configuration defaults.
-- You want to execute code in remote Databricks execution contexts.
+Use it when your code runs outside notebooks (CI/CD, services, local scripts) and still needs to:
+- Resolve or manage target clusters
+- Execute commands in cluster contexts
+- Reuse cluster connection patterns across pipelines
+
+---
 
 ## Core APIs
-- `Cluster` wraps cluster lifecycle operations (ensure running, install libraries, submit commands).
-- `ExecutionContext` models a remote execution context for running commands on a cluster.
-- `databricks_remote_compute` builds a Spark-aware remote execution helper.
 
-## Submodules
-- [remote](remote/README.md) for the decorator that runs local functions on a Databricks cluster.
+- `Cluster`: cluster selection, lifecycle control, command execution.
+- `ExecutionContext`: scoped remote execution context.
+- `databricks_remote_compute`: decorator for function-level remote execution.
+
+---
+
+## Bootstrap: basic cluster command execution
 
 ```python
 from yggdrasil.databricks.compute import Cluster
 
-cluster = Cluster(cluster_name="demo")
+cluster = Cluster(cluster_name="shared-etl-cluster")
 cluster.ensure_running()
+
+result = cluster.execute("print('hello from databricks cluster')")
+print(result)
 ```
 
-## Use cases
-### Run a Python snippet on a cluster
-```python
-from yggdrasil.databricks.compute import Cluster
+---
 
-cluster = Cluster(cluster_name="demo")
-cluster.ensure_running()
-cluster.execute("print('hello from cluster')")
-```
+## Bootstrap: context-managed remote session
 
-### Execute with a shared execution context
 ```python
 from yggdrasil.databricks.compute import Cluster, ExecutionContext
 
-cluster = Cluster(cluster_name="demo")
+cluster = Cluster(cluster_name="analytics-jobs")
+cluster.ensure_running()
+
 with ExecutionContext(cluster=cluster) as context:
-    context.execute("spark.range(5).count()")
+    output = context.execute("spark.range(10).count()")
+    print(output)
 ```
 
-## Related modules
-- [yggdrasil.databricks.workspaces](../workspaces/README.md) for workspace configuration helpers.
-- [yggdrasil.databricks.sql](../sql/README.md) for SQL execution against Databricks warehouses.
+---
+
+## Bootstrap: cluster bootstrap in automation script
+
+```python
+from yggdrasil.databricks.compute import Cluster
+
+cluster = Cluster(cluster_name="nightly-maintenance")
+
+# Ensure availability before running batch logic
+cluster.ensure_running()
+
+# Run remote administrative script
+cluster.execute(
+    """
+from pyspark.sql import SparkSession
+spark = SparkSession.getActiveSession()
+print(spark.sql('SELECT current_date()').collect())
+"""
+)
+```
+
+---
+
+## Related submodule
+
+- [compute.remote](remote/README.md): function decorators for remote dispatch.
+
+## Recommendations
+
+- Keep cluster naming conventions deterministic (`env-purpose-size`).
+- Prefer context managers for multi-step command execution workflows.
+- Add retry and timeout controls in surrounding orchestration logic.
