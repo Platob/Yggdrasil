@@ -1,44 +1,85 @@
 # yggdrasil.databricks.workspaces
 
-Workspace, filesystem, and path abstractions for Databricks assets (DBFS, workspace files, Unity Catalog volumes).
+This module standardizes Databricks filesystem interactions across different storage domains:
+- DBFS (`dbfs:/...`)
+- Workspace files (`/Workspace/...`)
+- Unity Catalog volumes (`/Volumes/...`)
 
-## When to use
-- You want a unified path abstraction that works across DBFS, workspace, and volumes.
-- You need file-like IO for Databricks paths with Arrow/Pandas/Polars helpers.
+It provides a single API surface for parsing, opening, and transferring files across those domains.
 
-## Core APIs
-- `Workspace` wraps `databricks.sdk.WorkspaceClient` setup and caching.
-- `DatabricksPath` is a unified path abstraction with filesystem-style helpers.
-- `DatabricksIO` provides file-like read/write utilities for Databricks paths.
+---
+
+## Core components
+
+- `Workspace`: wraps workspace client configuration and access.
+- `DatabricksPath`: path abstraction with parse + operation helpers.
+- `DatabricksIO`: file-like operations on Databricks paths.
+
+---
+
+## Bootstrap: connect once, reuse everywhere
 
 ```python
-from yggdrasil.databricks.workspaces import DatabricksPath, Workspace
+from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
 
-workspace = Workspace()
-path = DatabricksPath.parse("dbfs:/tmp/demo.txt", workspace=workspace)
+workspace = Workspace(host="https://<workspace-host>").connect()
 
-with path.open("w") as handle:
-    handle.write("hello")
+path = DatabricksPath.parse("dbfs:/tmp/demo.csv", workspace=workspace)
+print(path)
 ```
 
-## Use cases
-### Copy data between DBFS and workspace files
+---
+
+## Bootstrap: write and read text
+
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
 
-src = DatabricksPath.parse("dbfs:/tmp/input.csv")
-dest = DatabricksPath.parse("/Workspace/Users/me/output.csv")
+path = DatabricksPath.parse("dbfs:/tmp/bootstrap/hello.txt")
+
+with path.open("w") as handle:
+    handle.write("hello from yggdrasil")
+
+with path.open("r") as handle:
+    text = handle.read()
+
+print(text)
+```
+
+---
+
+## Bootstrap: transfer data between domains
+
+```python
+from yggdrasil.databricks.workspaces import DatabricksPath
+
+src = DatabricksPath.parse("dbfs:/tmp/raw/events.parquet")
+dest = DatabricksPath.parse("/Volumes/main/analytics/bronze/events.parquet")
+
 src.copy_to(dest)
 ```
 
-### Read a DBFS file as a pandas dataframe
+---
+
+## Bootstrap: DataFrame-friendly usage
+
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
 
-path = DatabricksPath.parse("dbfs:/tmp/data.parquet")
-df = path.read_pandas()
+# Read parquet into pandas
+pdf = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_pandas()
+
+# Read parquet into polars
+pl_df = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_polars()
+
+# Read parquet into pyarrow
+arrow_tbl = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_arrow()
 ```
 
-## Related modules
-- [yggdrasil.databricks.sql](../sql/README.md) for SQL execution helpers.
-- [yggdrasil.databricks.compute](../compute/README.md) for cluster execution helpers.
+---
+
+## Operational recommendations
+
+- Prefer explicit `DatabricksPath.parse(...)` over string concatenation.
+- Centralize workspace initialization and inject it where possible.
+- Keep file movement operations (`copy_to`, `move_to`) idempotent in jobs.

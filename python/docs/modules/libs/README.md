@@ -1,28 +1,46 @@
 # yggdrasil.libs
 
-Optional dependency helpers and small extensions for Spark and Polars workflows.
+`yggdrasil.libs` documents optional dependency and extension patterns used across Yggdrasil data modules.
 
-## When to use
-- Guard code paths that require optional dependencies like PySpark, Polars, or pandas.
-- Convert Arrow types to Spark SQL types and back.
-- Use helper extensions for Polars/Spark dataframes when those libraries are installed.
+Use it when your code may run in environments where some engines are optional (Spark, Polars, Pandas).
 
-## Dependency guards
-- `require_pandas()`, `require_polars()`, `require_pyspark()` raise informative errors when a dependency is missing.
-- `databrickslib.require_databricks_sdk()` checks for the Databricks SDK.
+---
 
-## Spark/Arrow type mappings
-Located in `yggdrasil.libs.sparklib`:
-- `arrow_type_to_spark_type` / `spark_type_to_arrow_type` for single types.
-- `arrow_field_to_spark_field` / `spark_field_to_arrow_field` for schema fields.
+## What this module area covers
 
-## Extensions
-`yggdrasil.libs.extensions` exposes helper functions when the corresponding engine is installed:
-- **Polars**: `join_coalesced`, `resample` for dataframe joins and time-based aggregation.
-- **Spark**: helpers for alias discovery, `latest` row selection, and Arrow/Polars-backed resampling routines.
+- Dependency guard functions for optional libraries.
+- Conversion helpers tied to dataframe/type interoperability.
+- Integration support for Spark/Polars-heavy projects.
 
-For details, see [yggdrasil.libs.extensions](extensions/README.md).
+---
 
-## Related modules
-- [yggdrasil.types](../types/README.md) for casting helpers built on these dependencies.
-- [yggdrasil.databricks](../databricks/README.md) for Databricks-specific integrations.
+## Bootstrap: dependency guard pattern
+
+```python
+# Example pattern when optional dependencies are expected
+# from yggdrasil.libs import require_polars
+# require_polars()
+```
+
+The idea is to fail fast with informative errors when a runtime lacks required libraries.
+
+---
+
+## Bootstrap: optional engine branching
+
+```python
+def process_frame(frame, engine: str):
+    if engine == "spark":
+        # spark-specific path
+        return frame
+    if engine == "polars":
+        # polars-specific path
+        return frame
+    raise ValueError(f"Unsupported engine: {engine}")
+```
+
+---
+
+## Related submodule
+
+- [libs.extensions](extensions/README.md): dataframe extension helpers.

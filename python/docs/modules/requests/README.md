@@ -1,38 +1,66 @@
 # yggdrasil.requests
 
-HTTP session helpers focused on Azure AD client-credential authentication.
+This module wraps HTTP request workflows with Yggdrasil-friendly defaults, including authentication support modules.
 
-## When to use
-- You need a requests `Session` that automatically attaches MSAL access tokens.
-- You want a small wrapper around `requests.Session` with retry defaults.
+Use it to standardize service-to-service communication in ETL jobs, orchestration scripts, and backend services.
 
-## `MSALAuth`
-Dataclass that holds tenant/client credentials and scopes. It automatically populates missing values from the environment and validates required fields.
+---
 
-Key helpers:
-- `find_in_env(env=None, prefix=None)` – build an auth config from environment mappings.
-- `export_to(mapping)` – write populated auth values back to a mapping.
+## Core ideas
 
-## `MSALSession`
-Session wrapper that acquires tokens via `msal.ConfidentialClientApplication` and injects `Authorization` headers on each request.
+- Session-style request handling
+- Integration points for token-based authentication (including MSAL-oriented flows)
+- Reusable request setup for enterprise APIs
+
+---
+
+## Bootstrap: create a reusable session
 
 ```python
-from yggdrasil.requests import MSALAuth, MSALSession
+from yggdrasil.requests import requests
 
-auth = MSALAuth(
-    tenant_id="...",
-    client_id="...",
-    client_secret="...",
-    scopes=[".default"],
-)
-
-session = MSALSession(auth)
-response = session.get("https://resource")
+session = requests.Session()
+response = session.get("https://httpbin.org/get", timeout=30)
+print(response.status_code)
 ```
 
-## `YGGSession`
-Located in `yggdrasil.requests.session`, this is a retry-configured `requests.Session` for standard HTTP usage.
+---
 
-## Notes
-- `MSALSession` requires the optional `msal` dependency.
-- Tokens are cached in memory per session instance.
+## Bootstrap: shared headers + retries pattern
+
+```python
+from yggdrasil.requests import requests
+
+session = requests.Session()
+session.headers.update({
+    "Accept": "application/json",
+    "User-Agent": "yggdrasil-client/1.0",
+})
+
+response = session.get("https://httpbin.org/headers", timeout=30)
+print(response.json())
+```
+
+---
+
+## Bootstrap: authenticated API pattern
+
+```python
+import os
+from yggdrasil.requests import requests
+
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {os.environ['ACCESS_TOKEN']}",
+})
+
+response = session.get("https://api.example.com/v1/me", timeout=30)
+```
+
+---
+
+## Best practices
+
+- Reuse one session per service endpoint group.
+- Put auth/token acquisition in a single bootstrap layer.
+- Pair with `yggdrasil.pyutils.retry` for transient failures.

@@ -1,35 +1,86 @@
 # yggdrasil.databricks.compute.remote
 
-Decorator utilities for running Python callables on a Databricks cluster.
+`databricks_remote_compute` enables decorator-based remote execution, so you can keep local Python functions and run them on Databricks when configured.
 
-## When to use
-- You want to run a local function on a remote Databricks cluster without rewriting it.
-- You need a simple guard that executes locally when no Databricks host is configured.
+This is especially useful for teams that want:
+- local development ergonomics
+- remote execution in CI/prod
+- minimal branching in business logic
+
+---
 
 ## Core API
-- `databricks_remote_compute` returns a decorator that dispatches a function to a cluster via the Databricks command execution API.
 
-## Use cases
-### Decorate a function for remote execution
+- `databricks_remote_compute(...)`: decorator factory with cluster/workspace controls.
+
+Key options include:
+- `cluster_id` / `cluster_name`
+- `workspace` (host string or workspace object)
+- `env_keys` (forward selected environment variables)
+- `force_local` (always execute locally)
+
+---
+
+## Bootstrap: basic remote decoration
+
 ```python
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
-@databricks_remote_compute(cluster_name="demo")
-def remote_sum(x, y):
+@databricks_remote_compute(cluster_name="shared-etl-cluster")
+def add(x: int, y: int) -> int:
     return x + y
 
-result = remote_sum(2, 3)
+print(add(2, 3))
 ```
 
-### Provide an explicit Workspace host
+---
+
+## Bootstrap: explicit workspace host
+
 ```python
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
-@databricks_remote_compute(workspace="https://my-workspace.cloud.databricks.com")
-def remote_upper(value: str) -> str:
-    return value.upper()
+@databricks_remote_compute(
+    workspace="https://<workspace-host>",
+    cluster_name="analytics-jobs",
+)
+def normalize(name: str) -> str:
+    return name.strip().lower()
 ```
 
-## Notes
-- If `DATABRICKS_HOST` is unset (and no workspace is provided), the decorator becomes a no-op and executes locally.
-- Use `force_local=True` to always run locally (useful for tests).
+---
+
+## Bootstrap: local-safe fallback for tests
+
+```python
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
+
+@databricks_remote_compute(force_local=True)
+def deterministic_logic(value: str) -> str:
+    return value.upper()
+
+assert deterministic_logic("ok") == "OK"
+```
+
+---
+
+## Bootstrap: environment key forwarding
+
+```python
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
+
+@databricks_remote_compute(
+    cluster_name="shared-etl-cluster",
+    env_keys=["ENV", "LOG_LEVEL", "FEATURE_FLAG_X"],
+)
+def run_with_runtime_flags() -> str:
+    return "done"
+```
+
+---
+
+## Behavior notes
+
+- If Databricks host information is unavailable, decorator behavior may remain local.
+- In Databricks runtime environments, local execution can be preferred automatically.
+- For deterministic CI tests, use `force_local=True`.

@@ -1,45 +1,95 @@
 # yggdrasil.databricks.jobs
 
-Notebook/job configuration helpers for Databricks workflows.
+This module helps you build **typed notebook/job configuration contracts**.
 
-## When to use
-- You want to map widget/job parameters into dataclasses.
-- You need a consistent, typed way to parse notebook inputs.
+Instead of manually reading strings from widgets and converting them in ad hoc code, you define dataclasses once and load values consistently.
+
+---
 
 ## Core APIs
-- `NotebookConfig` is a dataclass base that reads values from Databricks widgets or job parameters.
-- `WidgetType` enumerates supported widget types for Databricks widgets.
+
+- `NotebookConfig`: base dataclass for widget and environment-driven config.
+- `WidgetType`: enum describing widget rendering semantics.
+
+---
+
+## Bootstrap: strongly-typed job arguments
 
 ```python
+from dataclasses import dataclass
 from yggdrasil.databricks.jobs import NotebookConfig
 
-class DemoConfig(NotebookConfig):
-    run_id: str
+@dataclass
+class IngestConfig(NotebookConfig):
+    catalog: str
+    schema: str
+    source_path: str
+    dry_run: bool = False
 
-config = DemoConfig.from_environment()
+cfg = IngestConfig.from_environment()
+print(cfg)
 ```
 
-## Use cases
-### Parse widget inputs into a typed config
+---
+
+## Bootstrap: list and datetime values
+
 ```python
+from dataclasses import dataclass
+import datetime as dt
 from yggdrasil.databricks.jobs import NotebookConfig
 
-class IngestConfig(NotebookConfig):
-    source: str
+@dataclass
+class ReportConfig(NotebookConfig):
+    markets: list[str]
+    run_date: dt.date
+
+cfg = ReportConfig.from_environment()
+```
+
+---
+
+## Bootstrap: enums for controlled inputs
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+from yggdrasil.databricks.jobs import NotebookConfig
+
+class Mode(Enum):
+    FULL = "full"
+    INCREMENTAL = "incremental"
+
+@dataclass
+class PipelineConfig(NotebookConfig):
+    mode: Mode
     target_table: str
 
-config = IngestConfig.from_environment()
+cfg = PipelineConfig.from_environment()
 ```
 
-### Access job parameter defaults
+---
+
+## Bootstrap: generate widgets from dataclass schema
+
 ```python
+from dataclasses import dataclass
 from yggdrasil.databricks.jobs import NotebookConfig
 
-class JobConfig(NotebookConfig):
-    run_id: str = "manual"
+@dataclass
+class FeatureConfig(NotebookConfig):
+    lookback_days: int = 7
+    include_debug: bool = False
 
-config = JobConfig.from_environment()
+# In notebook setup cell (where dbutils is available)
+FeatureConfig.init_widgets()
 ```
 
-## Related modules
-- [yggdrasil.databricks.workspaces](../workspaces/README.md) for workspace helpers that supply SDK clients.
+---
+
+## Best practices
+
+- Keep one config dataclass per notebook entrypoint.
+- Use defaults for safe reruns and local notebook testing.
+- Prefer enums for finite-mode choices.
+- Validate config once, then pass object through all business functions.

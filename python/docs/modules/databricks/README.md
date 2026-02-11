@@ -1,112 +1,105 @@
 # yggdrasil.databricks
 
-Databricks integrations built on the Databricks SDK plus Spark-aware helpers.
+`yggdrasil.databricks` is the integration surface for Databricks-first workflows in Yggdrasil.
 
-## When to use
-- You need workspace-aware file/path utilities across DBFS, workspace files, and Unity Catalog volumes.
-- You want a thin SQL execution layer that can use the Databricks SQL API or Spark when available.
-- You want helper utilities for cluster management or notebook widget configuration.
+It is designed for teams who want one Python toolkit that works for:
+- Notebook development
+- Databricks Jobs orchestration
+- CI/CD automation scripts
+- Service-style data platform tooling
 
-## Common use cases
-- **Path-aware file access**: read/write data across DBFS, workspace, or Unity Catalog volumes with a single API.
-- **SQL automation**: execute SQL statements with structured results and Arrow-friendly metadata.
-- **Cluster orchestration**: create clusters and run commands from CI or automation scripts.
-- **Notebook configuration**: parse widgets/job parameters into typed dataclasses.
+---
+
+## What this module family solves
+
+### 1) Workspace-aware file operations
+Read/write/copy files across DBFS, Workspace files, and Unity Catalog Volumes with one path model.
+
+### 2) SQL execution with environment-aware behavior
+Run SQL through Spark when inside a Databricks runtime, or through statement APIs for external orchestration.
+
+### 3) Cluster orchestration and remote execution
+Create/resolve clusters, run commands, and execute local functions remotely without rewriting business logic.
+
+### 4) Typed job configuration
+Parse widgets/job parameters into strongly typed dataclasses for reproducible notebook contracts.
+
+---
 
 ## Submodules
-- [workspaces](workspaces/README.md) for workspace, path, and IO abstractions.
-- [sql](sql/README.md) for statement execution helpers.
-- [compute](compute/README.md) for cluster lifecycle and remote execution utilities.
-- [jobs](jobs/README.md) for notebook configuration helpers.
 
-## Workspace and paths
-Modules under `yggdrasil.databricks.workspaces` provide:
-- `Workspace` – configuration wrapper around `databricks.sdk.WorkspaceClient` with caching and context-manager support.
-- `DatabricksPath` / `DatabricksPathKind` – unified path abstraction for DBFS, workspace, and volumes.
-- `DatabricksIO` – file-like read/write interfaces that operate on Databricks paths.
+- [workspaces](workspaces/README.md): workspace client, paths, and Databricks IO.
+- [sql](sql/README.md): SQL engine + statement results.
+- [compute](compute/README.md): cluster lifecycle + execution context.
+- [compute.remote](compute/remote/README.md): decorator-based remote function execution.
+- [jobs](jobs/README.md): `NotebookConfig` and widget typing.
+
+---
+
+## Bootstrap: minimal setup for Databricks integrations
 
 ```python
-from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
+import os
+from yggdrasil.databricks.workspaces import Workspace
 
-workspace = Workspace(host="https://...")
-path = DatabricksPath.parse("dbfs:/tmp/demo.txt", workspace=workspace)
+# Recommended: set credentials from secrets manager or CI env
+os.environ["DATABRICKS_HOST"] = "https://<workspace-host>"
+os.environ["DATABRICKS_TOKEN"] = "<token>"
+
+workspace = Workspace().connect()
+print(workspace.safe_host)
 ```
 
-Use case: copy files between DBFS and workspace paths.
+---
+
+## Bootstrap: end-to-end ingestion pattern
 
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
-
-src = DatabricksPath.parse("dbfs:/tmp/input.csv")
-dest = DatabricksPath.parse("/Workspace/Users/me/output.csv")
-src.copy_to(dest)
-```
-
-## SQL execution
-`yggdrasil.databricks.sql` includes `SQLEngine` and `StatementResult` to execute SQL via the SQL Statement Execution API or Spark.
-
-Key capabilities:
-- Build fully qualified table names and issue SQL statements.
-- Insert Arrow tables or Spark dataframes into Delta tables.
-- Convert SQL metadata into Arrow fields.
-
-```python
 from yggdrasil.databricks.sql import SQLEngine
 
-engine = SQLEngine(catalog_name="main", schema_name="demo")
-engine.execute("SELECT 1 AS value")
+# 1) Read raw source from DBFS
+source = DatabricksPath.parse("dbfs:/pipelines/raw/orders.parquet")
+orders = source.read_arrow()
+
+# 2) Apply your transformation layer (pseudo-step)
+orders = orders.append_column("source", orders.column("order_id"))
+
+# 3) Write using SQL engine into Unity Catalog table
+engine = SQLEngine(catalog_name="main", schema_name="analytics")
+engine.insert_into(orders, table_name="orders_curated", mode="append")
 ```
 
-Use case: insert a small Arrow table into a Delta table.
+---
+
+## Bootstrap: production notebook pattern
 
 ```python
-import pyarrow as pa
-from yggdrasil.databricks.sql import SQLEngine
-
-engine = SQLEngine(catalog_name="main", schema_name="demo")
-table = pa.table({"id": [1, 2], "value": ["a", "b"]})
-engine.insert_into(table, table_name="demo_table", mode="append")
-```
-
-## Compute helpers
-`yggdrasil.databricks.compute` provides:
-- `Cluster` – create/update clusters, install libraries, and execute commands remotely.
-- `ExecutionContext` – helper for remote execution contexts.
-
-```python
-from yggdrasil.databricks.compute import Cluster
-
-cluster = Cluster()
-cluster.ensure_running()
-```
-
-Use case: run a small Python snippet on a cluster.
-
-```python
-from yggdrasil.databricks.compute import Cluster
-
-cluster = Cluster(cluster_name="demo")
-cluster.ensure_running()
-cluster.execute("print('hello from cluster')")
-```
-
-## Jobs and widgets
-`yggdrasil.databricks.jobs` focuses on notebook configuration helpers:
-- `NotebookConfig` – dataclass base that reads Databricks widgets or job parameters.
-- `WidgetType` – enum of supported widget types.
-
-Use case: parse widget inputs into a typed config.
-
-```python
+from dataclasses import dataclass
 from yggdrasil.databricks.jobs import NotebookConfig
+from yggdrasil.databricks.sql import SQLEngine
 
-class IngestConfig(NotebookConfig):
-    source: str
-    target_table: str
+@dataclass
+class JobArgs(NotebookConfig):
+    catalog: str
+    schema: str
+    table: str
+    days_back: int = 1
 
-config = IngestConfig.from_environment()
+cfg = JobArgs.from_environment()
+
+engine = SQLEngine(catalog_name=cfg.catalog, schema_name=cfg.schema)
+engine.execute(f"""
+DELETE FROM {cfg.catalog}.{cfg.schema}.{cfg.table}
+WHERE event_date >= date_sub(current_date(), {cfg.days_back})
+""")
 ```
 
-## Notes
-- These helpers rely on the Databricks SDK and PySpark when running inside a Spark-enabled environment.
-- Arrow-based insert and cast helpers use `yggdrasil.types.cast` for schema enforcement.
+---
+
+## Design guidance
+
+- Use `workspaces` for all path manipulation and file handling.
+- Use `sql` for DDL/DML and controlled result retrieval.
+- Use `jobs` for parameter contracts and type casting.
+- Use `compute` / `compute.remote` only when external execution contexts are required.
