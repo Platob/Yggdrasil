@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 from contextlib import nullcontext
 from functools import wraps
+from multiprocessing.reduction import ForkingPickler
 from typing import (
     Callable,
     Iterator,
@@ -15,8 +16,6 @@ from typing import (
 )
 
 import dill
-
-from multiprocessing.reduction import ForkingPickler
 
 ForkingPickler.loads = dill.loads
 ForkingPickler.dumps = dill.dumps

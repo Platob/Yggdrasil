@@ -31,6 +31,8 @@ from typing import (
 
 import pyarrow as pa
 
+from ...pyutils.serde import ObjectSerde
+
 if TYPE_CHECKING:
     from .cast_options import CastOptions
 
@@ -39,7 +41,7 @@ __all__ = ["register_converter", "convert"]
 T = TypeVar("T")
 R = TypeVar("R")
 
-Converter = Callable[[Any, "CastOptions"], Any]
+Converter = Callable[[Any, Optional["CastOptions"]], Any]
 RegistryKey = tuple[Any, Any]
 
 
@@ -104,8 +106,8 @@ def _type_matches(actual: Any, registered: Any) -> bool:
     return False
 
 
-def find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
-    """Find best converter for (from_type -> to_hint)."""
+def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -> Optional[Converter]:
+    """Find the best converter for (from_type -> to_hint)."""
 
     # exact
     conv = _registry.get((from_type, to_hint))
@@ -115,6 +117,24 @@ def find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
     # cheap identities
     if from_type == to_hint or to_hint in (object, Any):
         return _identity
+
+    any_converter = _any_registry.get(to_hint)
+    if any_converter is not None:
+        return any_converter
+
+    if check_namespace:
+        namespace = ObjectSerde.full_namespace(from_type)
+
+        if namespace.startswith("polars"):
+            from ...polars.cast import cast_polars_dataframe  # type: ignore
+
+        elif namespace.startswith("pandas"):
+            from ...pandas.cast import cast_pandas_dataframe  # type: ignore
+
+        elif namespace.startswith("pyspark"):
+            from ...spark.cast import cast_spark_dataframe  # type: ignore
+
+        return find_converter(from_type, to_hint, check_namespace=False)
 
     # mro cross-product lookup (fast and deterministic)
     for f in _iter_mro(from_type):
@@ -153,7 +173,7 @@ def find_converter(from_type: Any, to_hint: Any) -> Optional[Converter]:
 
             return composed
 
-    return _any_registry.get(to_hint)
+    return None
 
 
 def _normalize_fractional_seconds(value: str) -> str:
@@ -177,7 +197,6 @@ def is_runtime_value(x: Any) -> bool:
 # ----------------------------
 # Public API
 # ----------------------------
-
 
 def convert(
     value: Any,
@@ -418,15 +437,15 @@ def _str_to_datetime(value: str, opts: Any) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(s)
     except ValueError:
-        formats = (
+        last: Optional[ValueError] = None
+
+        for fmt in (
             "%Y-%m-%d %H:%M:%S%z",
             "%Y-%m-%d %H:%M:%S.%f%z",
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M:%S.%f",
             "%Y-%m-%d",
-        )
-        last: Optional[ValueError] = None
-        for fmt in formats:
+        ):
             try:
                 parsed = dt.datetime.strptime(s, fmt)
                 break

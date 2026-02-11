@@ -4,41 +4,24 @@ import logging
 import time
 from typing import Optional, Sequence, Any, Type, TypeVar, Union, List
 
+from databricks.sdk import WarehousesAPI
+from databricks.sdk.service.sql import (
+    State, EndpointInfo,
+    EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
+    GetWarehouseResponse, GetWarehouseResponseWarehouseType,
+    Disposition, Format,
+    ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem,
+    WarehouseAccessControlRequest, WarehousePermissionLevel
+)
+
 from .statement_result import StatementResult
 from ..workspaces import WorkspaceService
-from ...libs.databrickslib import DatabricksDummyClass
 from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
-try:
-    from databricks.sdk import WarehousesAPI
-    from databricks.sdk.service.sql import (
-        State, EndpointInfo,
-        EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
-        GetWarehouseResponse, GetWarehouseResponseWarehouseType,
-        Disposition, Format,
-        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem,
-        WarehouseAccessControlRequest, WarehousePermissionLevel
-)
-
-    _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
-    _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
-except ImportError:
-    WarehousesAPI = DatabricksDummyClass
-    State = DatabricksDummyClass
-    EndpointInfo = DatabricksDummyClass
-    EndpointTags = DatabricksDummyClass
-    EndpointTagPair = DatabricksDummyClass
-    EndpointInfoWarehouseType = DatabricksDummyClass
-    GetWarehouseResponse = DatabricksDummyClass
-    GetWarehouseResponseWarehouseType = DatabricksDummyClass
-    Disposition = DatabricksDummyClass
-    Format = DatabricksDummyClass
-    ExecuteStatementRequestOnWaitTimeout = DatabricksDummyClass
-    StatementParameterListItem = DatabricksDummyClass
-    WarehouseAccessControlRequest = DatabricksDummyClass
-
+_CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
+_EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
 
 __all__ = [
     "SQLWarehouse"

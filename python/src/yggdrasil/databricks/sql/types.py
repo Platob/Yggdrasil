@@ -5,14 +5,8 @@ import re
 from typing import Union
 
 import pyarrow as pa
-
-from yggdrasil.libs.databrickslib import databricks_sdk
-
-if databricks_sdk is not None:
-    from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
-    from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
-
-
+from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
+from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
 
 STRING_TYPE_MAP = {
     # boolean

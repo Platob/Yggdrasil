@@ -163,8 +163,6 @@ namespace YGGXLAddin
             }
         }
 
-
-
         private static string BuildPythonCode(string statement, string tempFile)
         {
             var statementLiteral = ToPythonStringLiteral(statement);

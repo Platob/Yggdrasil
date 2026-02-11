@@ -11,39 +11,26 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Iterable, Union
 
 import dill
 import pyarrow
+from databricks.sdk.errors import InternalError
+from databricks.sdk.service.compute import (
+    Language, CommandExecutionAPI, CommandStatusResponse, CommandStatus, ResultType
+)
 
 from .exceptions import ClientTerminatedSession
-from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
-from ...libs.pandaslib import PandasDataFrame
-from ...libs.polarslib import PolarsDataFrame
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
-if databricks_sdk is not None:
-    from databricks.sdk.errors import InternalError
-    from databricks.sdk.service.compute import (
-        Language, CommandExecutionAPI, CommandStatusResponse, CommandStatus, ResultType
-    )
+DONE_STATES = {
+    CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
+}
 
-    DONE_STATES = {
-        CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
-    }
+PENDING_STATES = {
+    CommandStatus.RUNNING, CommandStatus.QUEUED, CommandStatus.RUNNING
+}
 
-    PENDING_STATES = {
-        CommandStatus.RUNNING, CommandStatus.QUEUED, CommandStatus.RUNNING
-    }
-
-    FAILED_STATES = {
-        CommandStatus.ERROR, CommandStatus.CANCELLED
-    }
-else:
-    InternalError = DatabricksDummyClass
-    Language = DatabricksDummyClass
-    CommandExecutionAPI = DatabricksDummyClass
-    ResultType = DatabricksDummyClass
-
-    DONE_STATES, PENDING_STATES, FAILED_STATES = set(), set(), set()
-
+FAILED_STATES = {
+    CommandStatus.ERROR, CommandStatus.CANCELLED
+}
 
 if TYPE_CHECKING:
     from .execution_context import ExecutionContext
@@ -364,6 +351,9 @@ class CommandExecution:
     ) -> str:
         buffer = io.BytesIO()
 
+        from ...polars.lib import polars
+        from ...pandas.lib import pandas
+
         if isinstance(obj, pyarrow.Table):
             import pyarrow.parquet as pq
 
@@ -379,7 +369,8 @@ class CommandExecution:
                 "func": func,
                 "file": dbx_path.full_path()
             })
-        elif isinstance(obj, PolarsDataFrame):
+
+        if isinstance(obj, polars.DataFrame):
             func = "polars.read_parquet"
             extension = "parquet"
             obj.write_parquet(buffer)
@@ -392,7 +383,7 @@ class CommandExecution:
                 "func": func,
                 "file": dbx_path.full_path()
             })
-        elif isinstance(obj, PandasDataFrame):
+        elif isinstance(obj, pandas.DataFrame):
             func = "pandas.read_parquet"
             extension = "parquet"
             obj.to_parquet(path=buffer)

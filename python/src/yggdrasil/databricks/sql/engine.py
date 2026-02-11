@@ -20,49 +20,25 @@ from threading import Thread
 from typing import Optional, Union, Any, Dict, List, Literal, TYPE_CHECKING
 
 import pyarrow as pa
-import pyarrow.dataset as pds
+from databricks.sdk.service.sql import (
+    Disposition, Format,
+    ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
+)
 
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
 from .warehouse import SQLWarehouse
 from ..workspaces import WorkspaceService, DatabricksPath
-from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
-from ...libs.sparklib import SparkSession, SparkDataFrame, pyspark
+from ...enums import FileFormat
 from ...pyutils.waiting_config import WaitingConfigArg
-from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, cast_arrow_tabular
+from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
-from ...types.cast.spark_cast import cast_spark_dataframe
-
-try:
-    from delta.tables import DeltaTable as SparkDeltaTable
-except ImportError:
-    class SparkDeltaTable:
-        @classmethod
-        def forName(cls, *args, **kwargs):
-            from delta.tables import DeltaTable
-            return DeltaTable.forName(*args, **kwargs)
-
-
-if databricks_sdk is not None:
-    from databricks.sdk.service.sql import (
-        Disposition, Format,
-        ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
-    )
-else:
-    Disposition = DatabricksDummyClass
-    Format = DatabricksDummyClass
-    ExecuteStatementRequestOnWaitTimeout = DatabricksDummyClass
-    StatementParameterListItem = DatabricksDummyClass
-
 
 logger = logging.getLogger(__name__)
 
-if pyspark is not None:
-    import pyspark.sql.functions as F
-
-
 if TYPE_CHECKING:
+    from ...spark.lib import pyspark
     from ...ai.sql_session import SQLAISession, SQLFlavor
 
 
@@ -77,7 +53,12 @@ class CreateTablePlan:
     sql: str
     properties: dict[str, Any]
     warnings: list[str]
+    arrow_field: pa.Field
     result: Any = None  # StatementResult when executed
+
+    @property
+    def arrow_schema(self) -> pa.Schema:
+        return arrow_field_to_schema(self.arrow_field, None)
 
 
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
@@ -265,14 +246,14 @@ class SQLEngine(WorkspaceService):
         """
         # --- Engine auto-detection ---
         if not engine:
-            if pyspark is not None:
-                spark_session = SparkSession.getActiveSession()
-                if spark_session is not None:
-                    engine = "spark"
+            if self.workspace.is_in_databricks_environment():
+                engine = "spark"
 
         # --- Spark path ---
         if engine == "spark":
-            spark_session = SparkSession.getActiveSession()
+            from ...spark.lib import pyspark_sql
+
+            spark_session = pyspark_sql.SparkSession.getActiveSession()
             if spark_session is None:
                 raise ValueError("No spark session found to run sql query")
 
@@ -281,7 +262,7 @@ class SQLEngine(WorkspaceService):
                 statement
             )
 
-            df: SparkDataFrame = spark_session.sql(statement)
+            df: pyspark_sql.DataFrame = spark_session.sql(statement)
 
             if row_limit:
                 df = df.limit(row_limit)
@@ -320,22 +301,26 @@ class SQLEngine(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-    ):
+    ) -> "delta.tables.DeltaTable":
         """Return a DeltaTable handle for a given table name (Spark context required)."""
+        from ...spark.lib import pyspark_sql
+        from delta.tables import DeltaTable
+
         if not full_name:
             full_name = self.table_full_name(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name,
             )
-        return SparkDeltaTable.forName(
-            sparkSession=SparkSession.getActiveSession(),
+
+        return DeltaTable.forName(
+            sparkSession=pyspark_sql.SparkSession.getActiveSession(),
             tableOrViewName=full_name,
         )
 
     def insert_into(
         self,
-        data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader, SparkDataFrame],
+        data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader, "pyspark.sql.DataFrame"],
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
@@ -347,13 +332,13 @@ class SQLEngine(WorkspaceService):
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
-        spark_session: Optional[SparkSession] = None,
+        spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
     ):
         """Insert data into a Delta table using Spark when available; otherwise stage Arrow.
 
         Strategy:
-        - If Spark is available and we have an active session (or Spark DF input) -> use `spark_insert_into`.
+        - If Spark is available, and we have an active session (or Spark DF input) -> use `spark_insert_into`.
         - Otherwise -> use `arrow_insert_into` (stages Parquet to a temp volume + runs SQL INSERT/MERGE).
 
         Args:
@@ -375,26 +360,33 @@ class SQLEngine(WorkspaceService):
         Returns:
             None (mutates the destination table).
         """
+        if spark_session is None:
+            try:
+                import pyspark.sql as psql
 
-        if pyspark is not None or spark_session is not None:
-            spark_session = SparkSession.getActiveSession() if spark_session is None else spark_session
+                if isinstance(data, psql.DataFrame):
+                    spark_session = data.sparkSession
+                else:
+                    spark_session = psql.SparkSession.getActiveSession()
+            except ImportError:
+                pass
 
-            if spark_session is not None or isinstance(data, SparkDataFrame):
-                return self.spark_insert_into(
-                    data=data,
-                    location=location,
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    mode=mode,
-                    cast_options=cast_options,
-                    overwrite_schema=overwrite_schema,
-                    match_by=match_by,
-                    zorder_by=zorder_by,
-                    optimize_after_merge=optimize_after_merge,
-                    vacuum_hours=vacuum_hours,
-                    spark_options=spark_options,
-                )
+        if spark_session is not None:
+            return self.spark_insert_into(
+                data=data,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                mode=mode,
+                cast_options=cast_options,
+                overwrite_schema=overwrite_schema,
+                match_by=match_by,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                spark_options=spark_options,
+            )
 
         return self.arrow_insert_into(
             data=data,
@@ -473,25 +465,24 @@ class SQLEngine(WorkspaceService):
                         to_arrow_schema=True,
                     )
                 except ValueError as exc:
-                    data_tbl = convert(data, pa.Table)
-                    existing_schema = data_tbl.schema
                     logger.warning(
-                        "%s, creating it from input schema (columns=%s)",
+                        "%s, creating it from input schema %s",
                         exc,
-                        existing_schema.names,
+                        repr(data),
                     )
 
-                    connected.create_table(
-                        field=existing_schema,
+                    plan = connected.create_table(
+                        field=data,
                         catalog_name=catalog_name,
                         schema_name=schema_name,
                         table_name=table_name,
                         if_not_exists=True,
+                        execute=True
                     )
 
                     try:
                         return connected.arrow_insert_into(
-                            data=data_tbl,
+                            data=data,
                             location=location,
                             catalog_name=catalog_name,
                             schema_name=schema_name,
@@ -503,32 +494,27 @@ class SQLEngine(WorkspaceService):
                             zorder_by=zorder_by,
                             optimize_after_merge=optimize_after_merge,
                             vacuum_hours=vacuum_hours,
-                            existing_schema=existing_schema,
+                            existing_schema=plan.arrow_schema,
                         )
                     except Exception:
                         logger.exception("Arrow insert failed after auto-creating %s; attempting cleanup (DROP TABLE)", location)
+
                         try:
                             connected.drop_table(location=location, wait=True)
-                        except Exception:
-                            logger.exception("Failed to drop table %s after auto creation error", location)
+                        except Exception as e:
+                            logger.exception("Failed to drop table %s after auto creation error: %s", location, e)
+
                         raise
 
-            cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
-
-            if isinstance(data, (pa.Table, pa.RecordBatch)):
-                data_tbl = cast_arrow_tabular(data, options=cast_options)
-            else:
-                data_tbl = convert(data, pa.Table, options=cast_options)
-
-            num_rows = data_tbl.num_rows
+            cast_options = CastOptions.check_arg(
+                options=cast_options,
+                target_field=existing_schema
+            )
 
             logger.debug(
-                "Arrow inserting %s rows into %s (mode=%s, match_by=%s, zorder_by=%s)",
-                num_rows,
-                location,
-                mode,
-                match_by,
-                zorder_by,
+                "Arrow inserting %s into %s",
+                data,
+                location
             )
 
             # Write in temp volume
@@ -540,8 +526,11 @@ class SQLEngine(WorkspaceService):
                 max_lifetime=3600,
             ) if temp_volume_path is None else DatabricksPath.parse(obj=temp_volume_path, workspace=connected.workspace)
 
-            logger.debug("Staging Parquet to temp volume: %s", temp_volume_path)
-            temp_volume_path.write_arrow_table(data_tbl, file_format=pds.ParquetFileFormat())
+            temp_volume_path.write_table(
+                data,
+                file_format=FileFormat.PARQUET,
+                cast_options=cast_options
+            )
 
             columns = list(existing_schema.names)
             cols_quoted = ", ".join([f"`{c}`" for c in columns])
@@ -597,33 +586,26 @@ FROM parquet.`{temp_volume_path}`"""
                     logger.exception("Failed cleaning temp volume: %s", temp_volume_path)
 
             logger.info(
-                "Arrow inserted %s rows into %s (mode=%s, match_by=%s, zorder_by=%s)",
-                num_rows,
+                "Arrow inserted into %s",
                 location,
-                mode,
-                match_by,
-                zorder_by,
             )
 
             if zorder_by:
-                zcols = ", ".join([f"`{c}`" for c in zorder_by])
-                optimize_sql = f"OPTIMIZE {location} ZORDER BY ({zcols})"
-                logger.info("Running OPTIMIZE ZORDER BY: %s", zorder_by)
+                zorder_cols = ", ".join([f"`{c}`" for c in zorder_by])
+                optimize_sql = f"OPTIMIZE {location} ZORDER BY ({zorder_cols})"
                 connected.execute(optimize_sql)
 
             if optimize_after_merge and match_by:
-                logger.info("Running OPTIMIZE after MERGE")
                 connected.execute(f"OPTIMIZE {location}")
 
             if vacuum_hours is not None:
-                logger.info("Running VACUUM retain=%s hours", vacuum_hours)
                 connected.execute(f"VACUUM {location} RETAIN {vacuum_hours} HOURS")
 
         return None
 
     def spark_insert_into(
         self,
-        data: SparkDataFrame,
+        data: "pyspark.sql.DataFrame",
         *,
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
@@ -665,6 +647,10 @@ FROM parquet.`{temp_volume_path}`"""
         Returns:
             None.
         """
+        from ...spark.cast import any_to_spark_dataframe
+        from pyspark.sql import DataFrame
+        import pyspark.sql.functions as F
+
         location, catalog_name, schema_name, table_name = self._check_location_params(
             location=location,
             catalog_name=catalog_name,
@@ -694,15 +680,12 @@ FROM parquet.`{temp_volume_path}`"""
             )
         except ValueError:
             logger.warning("Destination table missing; creating table %s via overwrite write", location)
-            data = convert(data, pyspark.sql.DataFrame)
+            data = convert(data, DataFrame)
             data.write.mode("overwrite").options(**spark_options).saveAsTable(location)
             return
 
-        if not isinstance(data, pyspark.sql.DataFrame):
-            data = convert(data, pyspark.sql.DataFrame, target_field=existing_schema)
-        else:
-            cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
-            data = cast_spark_dataframe(data, options=cast_options)
+        cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
+        data = any_to_spark_dataframe(data, cast_options)
 
         if match_by:
             notnull = None
@@ -863,8 +846,7 @@ FROM parquet.`{temp_volume_path}`"""
         column_mapping_mode: Optional[str] = None,
         execute: bool = True,
         wait_result: bool = True,
-        return_plan: bool = False,
-    ) -> Union[str, CreateTablePlan, "StatementResult"]:
+    ) -> CreateTablePlan:
         """
         Generate (and optionally execute) a Databricks/Delta `CREATE TABLE` statement from an Apache Arrow
         schema/field, with integration-friendly safety checks and performance-oriented defaults.
@@ -939,11 +921,6 @@ FROM parquet.`{temp_volume_path}`"""
             If False, returns the SQL (or plan) without executing.
         wait_result:
             Passed to `self.execute(...)`. If True, blocks until the statement finishes.
-        return_plan:
-            If True, returns a `CreateTablePlan` containing SQL + applied properties + warnings (+ result if executed).
-            If False:
-              - returns SQL string when `execute=False`
-              - returns `StatementResult` when `execute=True`
 
         Returns
         -------
@@ -969,11 +946,11 @@ FROM parquet.`{temp_volume_path}`"""
         Examples
         --------
         Create a managed Delta table with auto clustering and auto column mapping:
-            >>> plan = client.create_table(schema, full_name="main.analytics.events", execute=False, return_plan=True)
+            >>> plan = self.create_table(schema, full_name="main.analytics.events", execute=False, return_plan=True)
             >>> print(plan.sql)
 
         External table with explicit partitioning and CDF:
-            >>> client.create_table(
+            >>> self.create_table(
             ...     schema,
             ...     full_name="main.analytics.events",
             ...     storage_location="abfss://.../events",
@@ -982,20 +959,15 @@ FROM parquet.`{temp_volume_path}`"""
             ... )
         """
 
-        if not isinstance(field, (pa.Field, pa.Schema)):
+        if not isinstance(field, pa.Field):
             field = convert(field, pa.Field)
 
         # ---- Normalize Arrow input ----
-        if isinstance(field, pa.Schema):
-            arrow_fields = list(field)
-            schema_metadata = field.metadata or {}
+        schema_metadata = field.metadata or {}
+        if pa.types.is_struct(field.type):
+            arrow_fields = list(field.type)
         else:
-            # pa.Field
-            schema_metadata = field.metadata or {}
-            if pa.types.is_struct(field.type):
-                arrow_fields = list(field.type)
-            else:
-                arrow_fields = [field]
+            arrow_fields = [field]
 
         full_name, catalog_name, schema_name, table_name = self._check_location_params(
             location=full_name,
@@ -1107,25 +1079,25 @@ FROM parquet.`{temp_volume_path}`"""
             props[f"tags.{k}"] = v
 
         if props:
-            def fmt(k: str, v: Any) -> str:
-                if isinstance(v, str):
-                    return f"'{k}' = '{_escape_sql_string(v)}'"
-                if isinstance(v, bool):
-                    return f"'{k}' = '{'true' if v else 'false'}'"
-                return f"'{k}' = {v}"
+            def fmt(_key: str, _value: Any) -> str:
+                if isinstance(_value, str):
+                    return f"'{_key}' = '{_escape_sql_string(_value)}'"
+                if isinstance(_value, bool):
+                    return f"'{_key}' = '{'true' if _value else 'false'}'"
+                return f"'{_key}' = {_value}"
 
             sql_parts.append("TBLPROPERTIES (" + ", ".join(fmt(k, v) for k, v in props.items()) + ")")
 
         statement = "\n".join(sql_parts)
 
-        plan = CreateTablePlan(sql=statement, properties=props, warnings=warnings)
+        plan = CreateTablePlan(sql=statement, properties=props, warnings=warnings, arrow_field=field)
 
         if not execute:
-            return plan if return_plan else statement
+            return plan
 
         res = self.execute(statement, wait=wait_result)
         plan.result = res
-        return plan if return_plan else res
+        return plan
 
     def _check_location_params(
         self,
@@ -1171,8 +1143,7 @@ FROM parquet.`{temp_volume_path}`"""
             return f"{name_str}{sql_type}{nullable_str}{comment_str}"
 
         if pa.types.is_struct(field.type):
-            child_defs = [SQLEngine._field_to_ddl(child) for child in field.type]
-            struct_body = ", ".join(child_defs)
+            struct_body = ", ".join([SQLEngine._field_to_ddl(child) for child in field.type])
             return f"{name_str}STRUCT<{struct_body}>{nullable_str}{comment_str}"
 
         if pa.types.is_map(field.type):

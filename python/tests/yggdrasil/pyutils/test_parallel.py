@@ -1,7 +1,7 @@
 # test_parallel.py
 
-import time
 import concurrent.futures as cf
+import time
 
 import pytest
 

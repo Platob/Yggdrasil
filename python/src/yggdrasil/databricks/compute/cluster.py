@@ -20,31 +20,25 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
 
+from databricks.sdk import ClustersAPI
+from databricks.sdk.errors import DatabricksError
+from databricks.sdk.errors.platform import ResourceDoesNotExist
+from databricks.sdk.service.compute import (
+    ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus,
+    ClusterAccessControlRequest, ClusterPermissionLevel
+)
+from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
+
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService, Workspace
-from ...libs.databrickslib import databricks_sdk
-from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import PipIndexSettings
 from ...pyutils.python_env import PythonEnv
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
-if databricks_sdk is None:  # pragma: no cover - import guard
-    ResourceDoesNotExist = Exception  # type: ignore
-else:  # pragma: no cover - runtime fallback when SDK is missing
-    from databricks.sdk import ClustersAPI
-    from databricks.sdk.errors import DatabricksError
-    from databricks.sdk.errors.platform import ResourceDoesNotExist
-    from databricks.sdk.service.compute import (
-        ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus,
-        ClusterAccessControlRequest, ClusterPermissionLevel
-    )
-    from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
-
-    _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
-    _EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
-
+_CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
+_EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
 
 __all__ = ["Cluster"]
 
@@ -362,8 +356,8 @@ class Cluster(WorkspaceService):
                 raise_error=raise_error
             )
 
-        if raise_error:
-            self.raise_for_status()
+            if raise_error:
+                self.raise_for_status()
 
         return self
 
@@ -651,7 +645,7 @@ class Cluster(WorkspaceService):
     def update(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        access_control_list: Optional[List["ClusterAccessControlRequest"]] = None,
+        access_control_list: Optional[List["ClusterAccessControlRequest"] | bool] = True,
         wait: Optional[WaitingConfigArg] = True,
         **cluster_spec: Any
     ) -> "Cluster":
@@ -707,7 +701,7 @@ class Cluster(WorkspaceService):
 
     def update_permissions(
         self,
-        access_control_list: Optional[List["ClusterAccessControlRequest"]] = None,
+        access_control_list: Optional[List["ClusterAccessControlRequest"] | bool] = True,
     ):
         if not access_control_list:
             return self
@@ -724,11 +718,11 @@ class Cluster(WorkspaceService):
 
         return [
             ClusterAccessControlRequest(
-                group_name=name,
+                group_name=group.display,
                 permission_level=ClusterPermissionLevel.CAN_MANAGE
             )
-            for name in current_groups
-            if name not in {"users"}
+            for group in current_groups
+            if group.display not in {"users"}
         ]
 
     def _check_permission(
@@ -750,7 +744,7 @@ class Cluster(WorkspaceService):
                 permission_level=ClusterPermissionLevel.CAN_MANAGE
             )
 
-        return [
+        return self.default_permissions() + [
             self._check_permission(_)
             for _ in permission
         ]
@@ -919,127 +913,6 @@ class Cluster(WorkspaceService):
             language=language,
             context_id=context_id
         )
-
-    def execute(
-        self,
-        obj: Union[str, Callable],
-        *,
-        language: Optional["Language"] = None,
-        args: List[Any] = None,
-        kwargs: Dict[str, Any] = None,
-        env_keys: Optional[List[str]] = None,
-        timeout: Optional[dt.timedelta] = None,
-        context: Optional[ExecutionContext] = None,
-    ):
-        """Execute a command or callable on the cluster.
-
-        Args:
-            obj: Command string or callable to execute.
-            language: Optional language for command execution.
-            args: Optional positional arguments for the callable.
-            kwargs: Optional keyword arguments for the callable.
-            env_keys: Optional environment variable names to pass.
-            timeout: Optional timeout for execution.
-            context: ExecutionContext to run or create new one
-
-        Returns:
-            The decoded result from the execution context.
-        """
-        context = self.system_context if context is None else context
-
-        return context.execute(
-            obj=obj,
-            args=args,
-            kwargs=kwargs,
-            env_keys=env_keys,
-            timeout=timeout,
-        )
-
-    # ------------------------------------------------------------------
-    # decorator that routes function calls via `execute`
-    # ------------------------------------------------------------------
-    def execution_decorator(
-        self,
-        _func: Optional[Callable] = None,
-        *,
-        language: Optional["Language"] = None,
-        env_keys: Optional[List[str]] = None,
-        env_variables: Optional[Dict[str, str]] = None,
-        timeout: Optional[dt.timedelta] = None,
-        result_tag: Optional[str] = None,
-        force_local: bool = False,
-        context: Optional[ExecutionContext] = None,
-        **options
-    ):
-        """
-        Decorator to run a function via Workspace.execute instead of locally.
-
-        Usage:
-
-            @ws.remote()
-            def f(x, y): ...
-
-            @ws.remote(timeout=dt.timedelta(seconds=5))
-            def g(a): ...
-
-        You can also use it without parentheses:
-
-            @ws.remote
-            def h(z): ...
-
-        Args:
-            _func: Optional function when used as ``@ws.remote``.
-            language: Optional execution language override.
-            env_keys: Optional environment variable names to forward.
-            env_variables: Optional environment variables to inject.
-            timeout: Optional timeout for remote execution.
-            result_tag: Optional tag for parsing remote output.
-            force_local: force local execution
-            context: ExecutionContext to run or create new one
-            **options: Additional execution options passed through.
-
-        Returns:
-            A decorator or wrapped function that executes remotely.
-        """
-        if force_local or self.is_in_databricks_environment():
-            # Support both @ws.remote and @ws.remote(...)
-            if _func is not None and callable(_func):
-                return _func
-
-            def identity(x):
-                return x
-
-            return identity
-
-        context = self.system_context if context is None else context
-
-        def decorator(func: Callable):
-            if force_local or self.is_in_databricks_environment():
-                return func
-
-            serialized = CallableSerde.from_callable(func)
-
-            @functools.wraps(func)
-            def wrapper(*args, **kwargs):
-                if os.getenv("DATABRICKS_RUNTIME_VERSION") is not None:
-                    return func(*args, **kwargs)
-
-                return context.execute(
-                    obj=serialized,
-                    args=list(args),
-                    kwargs=kwargs,
-                    env_keys=env_keys,
-                    env_variables=env_variables,
-                    timeout=timeout,
-                )
-
-            return wrapper
-
-        # Support both @ws.remote and @ws.remote(...)
-        if _func is not None and callable(_func):
-            return decorator(_func)
-
-        return decorator
 
     def install_libraries(
         self,

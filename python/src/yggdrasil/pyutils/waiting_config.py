@@ -23,6 +23,13 @@ class WaitingConfig:
     backoff: float = 1.0
     max_interval: float = 10.0
 
+    def __bool__(self):
+        return self.timeout > 0
+
+    @property
+    def timeout_total_seconds(self) -> float:
+        return self.timeout
+
     @property
     def timeout_timedelta(self) -> dt.timedelta:
         return dt.timedelta(seconds=self.timeout)
@@ -74,7 +81,7 @@ class WaitingConfig:
 
             elif isinstance(arg, bool):
                 base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
-                base_interval = 2.0
+                base_interval = 1.0
                 base_backoff = 2.0
                 base_max_interval = 15.0
 
@@ -113,7 +120,7 @@ class WaitingConfig:
             final_timeout = 0.0
 
         if final_interval is None:
-            final_interval = 2.0
+            final_interval = 1.0
 
         if final_backoff is None:
             final_backoff = 2.0
@@ -147,7 +154,7 @@ class WaitingConfig:
         if self.interval == 0:
             return
 
-        sleep_s = self.interval * (self.backoff ** int(iteration))
+        sleep_s = self.interval * (self.backoff + int(iteration))
 
         if self.max_interval > 0:
             sleep_s = min(sleep_s, self.max_interval)

@@ -5,12 +5,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from ..types.dummy_class import DummyModuleClass
+from ..pyutils.dummy import Dummy
 
 try:
     from openai import OpenAI
-except:
-    OpenAI = DummyModuleClass
+except ImportError:
+    OpenAI = Dummy.from_name(
+        "openai", "OpenAI",
+        to_class=False,
+        try_import=False
+    )
 
 __all__ = ["AISession"]
 

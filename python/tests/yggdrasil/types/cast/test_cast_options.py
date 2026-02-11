@@ -148,7 +148,7 @@ def test_need_arrow_type_cast_and_nullability_check():
 
 def test_target_field_name_fallbacks():
     opt0 = CastOptions.safe_init(target_field=None)
-    assert opt0.target_field_name == ""
+    assert opt0.target_field_name is None
 
     opt1 = CastOptions.safe_init(
         source_field=pa.field("src", pa.int32()),

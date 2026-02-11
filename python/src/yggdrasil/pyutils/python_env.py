@@ -232,7 +232,7 @@ def _user_envs_dir() -> Path:
     """Return the directory where user environments are stored.
 
     Returns:
-        Path to the envs directory.
+        Path to the envs' directory.
     """
     return (_user_python_dir() / "envs").resolve()
 

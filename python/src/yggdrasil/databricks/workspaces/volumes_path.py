@@ -1,16 +1,13 @@
 import datetime as dt
 from typing import Tuple, Optional
 
-from ...libs.databrickslib import databricks_sdk, WorkspaceClient
-
-if databricks_sdk is not None:
-    from databricks.sdk.errors.platform import (
-        NotFound,
-        ResourceDoesNotExist,
-        BadRequest,
-        PermissionDenied,
-    )
-
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors.platform import (
+    NotFound,
+    ResourceDoesNotExist,
+    BadRequest,
+    PermissionDenied,
+)
 
 __all__ = [
     "get_volume_status",
@@ -30,7 +27,7 @@ def get_volume_status(
         try:
             info = client.get_metadata(full_path)
             return True, False, info.content_length, _parse_mtime(info)
-        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied) as e:
+        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
             pass
 
         try:
@@ -42,7 +39,7 @@ def get_volume_status(
         try:
             info = client.get_directory_metadata(full_path)
             return False, True, 0, _parse_mtime(info)
-        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied) as e:
+        except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied):
             pass
 
         try:

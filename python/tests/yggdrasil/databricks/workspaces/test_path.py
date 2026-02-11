@@ -245,9 +245,9 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
             "col2": ["a", "b", "c"]
         })
 
-        filepath.write_arrow(my_arrow_table)
-        folder_path.write_arrow(my_arrow_table)
-        arrow_dataset = folder_path.arrow_dataset()
+        filepath.write_table(my_arrow_table)
+        folder_path.write_table(my_arrow_table)
+        arrow_dataset = folder_path.read_arrow_dataset()
 
         data = filepath.read_arrow_table()
         self.assertTrue(my_arrow_table.equals(data))
@@ -271,7 +271,7 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
 
         folder_path.mkdir()
 
-        folder_path.write_arrow(my_arrow_table)
+        folder_path.write_table(my_arrow_table)
 
         self.assertEqual(my_arrow_table, folder_path.read_arrow_table())
 

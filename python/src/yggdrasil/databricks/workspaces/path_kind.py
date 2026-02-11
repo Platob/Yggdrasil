@@ -11,3 +11,4 @@ class DatabricksPathKind(str, Enum):
     WORKSPACE = 1
     VOLUME = 2
     DBFS = 3
+    TABLE = 4

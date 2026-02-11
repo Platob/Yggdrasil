@@ -1,5 +1,4 @@
 import json
-from dataclasses import dataclass
 from typing import Union
 
 import pyarrow as pa
@@ -12,26 +11,8 @@ from yggdrasil.types.cast.arrow_cast import (
     cast_arrow_tabular,
     cast_arrow_record_batch_reader,
     default_arrow_array,
-    record_batch_to_table,
-    record_batch_to_record_batch_reader,
-    pylist_to_record_batch,
 )
 from yggdrasil.types.cast.cast_options import CastOptions
-
-
-@pytest.fixture
-def ensure_any_to_arrow_scalar_has_options(monkeypatch):
-    from yggdrasil.types.cast import arrow_cast as ac
-
-    original = ac.any_to_arrow_scalar
-
-    def _wrapped(value, options=None):
-        if options is None:
-            options = CastOptions()
-        return original(value, options)
-
-    monkeypatch.setattr(ac, "any_to_arrow_scalar", _wrapped)
-    yield
 
 
 # ---------------------------------------------------------------------------
@@ -622,80 +603,3 @@ def test_convert_record_batch_to_record_batch_reader_and_back():
 
     assert batch_back.schema.names == ["a"]
     assert batch_back.column(0).to_pylist() == [5, 6, 7]
-
-
-# ---------------------------------------------------------------------------
-# pylist converters
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _Point:
-    x: int
-    y: str
-
-
-_Point.__annotations__ = {"x": int, "y": str}
-
-
-def test_pylist_to_arrow_table_infers_dataclass_and_handles_none_rows(ensure_any_to_arrow_scalar_has_options):
-    data = [None, _Point(1, "a"), _Point(2, "b")]
-
-    opts = CastOptions()
-    batch = pylist_to_record_batch(data, opts)
-    table = record_batch_to_table(batch, opts)
-
-    assert table.schema.names == ["x", "y"]
-    assert table.column("x").to_pylist() == [None, 1, 2]
-    assert table.column("y").to_pylist() == [None, "a", "b"]
-
-
-def test_pylist_to_arrow_table_empty_uses_target_schema_defaults(ensure_any_to_arrow_scalar_has_options):
-    target_schema = pa.schema(
-        [
-            pa.field("a", pa.int64(), nullable=False),
-            pa.field("b", pa.string(), nullable=True),
-        ]
-    )
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
-
-    batch = pylist_to_record_batch([], opts)
-    table = record_batch_to_table(batch, opts)
-
-    assert table.num_rows == 0
-    assert table.schema.equals(target_schema)
-
-
-def test_pylist_to_arrow_table_preserves_nullable_values(ensure_any_to_arrow_scalar_has_options):
-    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=True)])
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
-
-    batch = pylist_to_record_batch([{"a": 1}, {"a": None}], opts)
-    table = record_batch_to_table(batch, opts)
-
-    assert table.schema.equals(target_schema)
-    assert table.column("a").to_pylist() == [1, None]
-
-
-def test_pylist_to_arrow_table_all_none_rows_use_defaults(ensure_any_to_arrow_scalar_has_options):
-    target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-
-    opts = CastOptions.safe_init(target_field=arrow_schema_to_field(target_schema))
-    batch = pylist_to_record_batch([None], opts)
-    table = record_batch_to_table(batch, opts)
-
-    assert table.schema.equals(target_schema)
-    assert table.column("a").to_pylist() == [0]
-
-
-def test_pylist_to_record_batch_and_reader_via_convert(ensure_any_to_arrow_scalar_has_options):
-    target_field = pa.field("value", pa.int64(), nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field)
-
-    batch = pylist_to_record_batch([1, 2], opts)
-    assert batch.column(0).to_pylist() == [1, 2]
-
-    reader = record_batch_to_record_batch_reader(batch, opts)
-    table = pa.Table.from_batches(list(reader))
-    assert table.column("value").to_pylist() == [1, 2]
-

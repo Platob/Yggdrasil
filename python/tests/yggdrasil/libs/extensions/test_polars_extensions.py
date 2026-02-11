@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import zoneinfo
+from datetime import datetime, timedelta
 
 import polars as pl
 import pytest
 
 # Import module so monkeypatching (setattr on pl.DataFrame) happens.
-import yggdrasil.libs.extensions.polars_extensions as ext  # noqa: F401
+import yggdrasil.polars.extensions as ext  # noqa: F401
 
 
 def _dt(y, m, d, hh=0, mm=0, ss=0) -> datetime:

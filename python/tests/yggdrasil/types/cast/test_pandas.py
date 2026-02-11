@@ -1,10 +1,13 @@
 import pytest
 
+from yggdrasil.types.cast.arrow_cast import arrow_schema_to_field
+
 pa = pytest.importorskip("pyarrow")
 pandas = pytest.importorskip("pandas")
 
-from yggdrasil.types.cast.arrow_cast import CastOptions, arrow_schema_to_field
-from yggdrasil.types.cast.pandas_cast import cast_pandas_dataframe, cast_pandas_series
+from yggdrasil.types.cast.cast_options import CastOptions
+
+from yggdrasil.pandas.cast import cast_pandas_dataframe, cast_pandas_series
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +99,7 @@ def test_cast_pandas_dataframe_nested_schema_and_defaults():
     )
 
     opts = CastOptions.safe_init(
-        target_field=arrow_schema_to_field(target_schema),
+        target_field=target_schema,
         add_missing_columns=True,
         allow_add_columns=False,
         strict_match_names=False,

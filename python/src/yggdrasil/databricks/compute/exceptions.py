@@ -1,4 +1,4 @@
-from ...exceptions import YGGException
+from ..lib import DatabricksError
 
 __all__ = [
     "ComputeException",
@@ -7,7 +7,7 @@ __all__ = [
 ]
 
 
-class ComputeException(YGGException):
+class ComputeException(DatabricksError):
     pass
 
 

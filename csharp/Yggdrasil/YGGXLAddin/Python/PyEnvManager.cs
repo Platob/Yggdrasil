@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace YGGXLAddin.Python
 {
@@ -16,13 +17,24 @@ namespace YGGXLAddin.Python
     ///
     /// Update uses uv inside the env:
     ///   uv pip install ...
+    ///
+    /// Cache is keyed by python exe path (ExePath).
+    /// A secondary index maps env Name -> exe path key for convenience/back-compat.
     /// </summary>
     public sealed class PyEnvManager
-    {   
+    {
+        // 🔥 set env var too (choose a name that your app/tooling expects)
+        const string DEFAULT_PYTHON_ENVIRONMENT = "DEFAULT_PYTHON_ENVIRONMENT"; // or "PYTHONHOME", "PYTHON_EXE", etc.
+
         public static PyEnvManager Instance = new PyEnvManager();
 
-        private readonly Dictionary<string, PyEnv> _envs =
+        // Primary cache: exePath(full) -> PyEnv
+        private readonly Dictionary<string, PyEnv> _envsByExe =
             new Dictionary<string, PyEnv>(StringComparer.OrdinalIgnoreCase);
+
+        // Secondary index: name -> exePath(full)
+        private readonly Dictionary<string, string> _envsByName =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         // -----------------------------
         // Manager default (optional)
@@ -43,12 +55,50 @@ namespace YGGXLAddin.Python
 
         /// <summary>
         /// Returns manager default if set, otherwise system default.
+        /// Supports DEFAULT_PYTHON_ENVIRONMENT as either:
+        ///  - a python exe path
+        ///  - a cached env name
         /// </summary>
         public PyEnv Default(TimeSpan? timeout = null)
         {
             lock (_defaultLock)
             {
-                return _default ?? SystemDefault(timeout);
+                if (_default != null)
+                    return _default;
+
+                var v = Environment.GetEnvironmentVariable(DEFAULT_PYTHON_ENVIRONMENT, EnvironmentVariableTarget.User);
+
+                if (!string.IsNullOrWhiteSpace(v))
+                {
+                    v = v.Trim();
+
+                    // 1) If env var looks like a path and exists -> use it (exe-keyed cache)
+                    if (File.Exists(v))
+                    {
+                        var exeKey = NormalizeExeKey(v);
+
+                        if (!TryGetByExe(exeKey, out var cached))
+                        {
+                            cached = PyEnv.Create(name: null, exePath: v, timeout: timeout);
+                            RegisterEnv(cached);
+                        }
+
+                        return _default = cached;
+                    }
+
+                    // 2) Otherwise treat it as a loaded name/key
+                    if (TryGetByName(v, out var envFromName))
+                        return _default = envFromName;
+
+                    // 3) Slow scan fallback (safe)
+                    foreach (var e in _envsByExe.Values)
+                    {
+                        if (string.Equals(e.Name, v, StringComparison.OrdinalIgnoreCase))
+                            return _default = e;
+                    }
+                }
+
+                return _default = SystemDefault(timeout);
             }
         }
 
@@ -70,14 +120,22 @@ namespace YGGXLAddin.Python
 
             nameOrFile = nameOrFile.Trim();
 
-            if (!_envs.TryGetValue(nameOrFile, out var env))
+            PyEnv env = null;
+
+            // Prefer: name lookup
+            if (!TryGetByName(nameOrFile, out env))
             {
+                // If they passed an exe path, use exe-keyed cache
                 if (!File.Exists(nameOrFile))
                     throw new KeyNotFoundException($"Env '{nameOrFile}' not found in cache.");
 
-                env = PyEnv.Create(name: null, exePath: nameOrFile);
+                var exeKey = NormalizeExeKey(nameOrFile);
 
-                _envs[env.Name] = env;
+                if (!TryGetByExe(exeKey, out env))
+                {
+                    env = PyEnv.Create(name: null, exePath: nameOrFile);
+                    RegisterEnv(env);
+                }
             }
 
             SetDefault(env);
@@ -85,24 +143,29 @@ namespace YGGXLAddin.Python
 
         public void SetDefault(PyEnv env)
         {
-            _envs[env.Name] = env;
+            if (env == null) throw new ArgumentNullException(nameof(env));
+
+            RegisterEnv(env);
 
             lock (_defaultLock)
             {
+                Environment.SetEnvironmentVariable(DEFAULT_PYTHON_ENVIRONMENT, env.ExePath, EnvironmentVariableTarget.Process);
+
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        Environment.SetEnvironmentVariable(DEFAULT_PYTHON_ENVIRONMENT, env.ExePath, EnvironmentVariableTarget.User);
+                    }
+                    catch { }
+                });
+
                 _default = env;
             }
         }
 
         private static string ResolveSystemPythonExe(TimeSpan timeout)
         {
-            // Strategy:
-            // 1) Try "python" from PATH (works on most)
-            // 2) On Windows, also try "py -3 -c ..." to get interpreter path
-            // 3) Fallback "python3" (common on Unix)
-            //
-            // We do NOT assume File.Exists for "python" because ProcessStartInfo can resolve it via PATH.
-            // But we still want a real path: we ask python itself for sys.executable.
-
             // 1) Try "python"
             var p = TryGetExecutablePathFromInterpreter("python", timeout);
             if (!string.IsNullOrWhiteSpace(p)) return p;
@@ -110,8 +173,6 @@ namespace YGGXLAddin.Python
             // 2) Windows launcher: py
             if (IsWindows())
             {
-                // Prefer Python 3 via launcher
-                // py -3 -c "import sys; print(sys.executable)"
                 var res = RunProcess("py", "-3 -c " + QuoteArg("import sys; print(sys.executable)"), null, timeout);
                 if (res.ExitCode == 0)
                 {
@@ -135,14 +196,9 @@ namespace YGGXLAddin.Python
             if (res.ExitCode != 0) return null;
 
             var path = (res.StdOut ?? "").Trim();
-
-            // Some shells might return empty; bail.
             if (string.IsNullOrWhiteSpace(path)) return null;
 
-            // sys.executable should be an actual file path. Validate when possible.
             if (File.Exists(path)) return path;
-
-            // If it's not a file, still return it as last-ditch (but Create() will fail fast).
             return path;
         }
 
@@ -166,15 +222,24 @@ namespace YGGXLAddin.Python
             Reload();
         }
 
-        /// <summary>Snapshot of current environments.</summary>
-        public IReadOnlyDictionary<string, PyEnv> Envs => _envs;
+        /// <summary>Snapshot of current environments, keyed by exe path.</summary>
+        public IReadOnlyDictionary<string, PyEnv> Envs => _envsByExe;
 
-        /// <summary>Indexer like a dict. Throws if not found.</summary>
-        public PyEnv this[string name] => _envs[name];
+        /// <summary>Indexer by env name (back-compat). Throws if not found.</summary>
+        public PyEnv this[string name]
+        {
+            get
+            {
+                if (TryGetByName(name, out var env)) return env;
+                throw new KeyNotFoundException($"Env '{name}' not found.");
+            }
+        }
 
-        public bool TryGet(string name, out PyEnv env) => _envs.TryGetValue(name, out env);
+        /// <summary>Try-get by env name (back-compat).</summary>
+        public bool TryGet(string name, out PyEnv env) => TryGetByName(name, out env);
 
-        public IEnumerable<string> Names() => _envs.Keys.OrderBy(x => x);
+        /// <summary>Env names currently indexed.</summary>
+        public IEnumerable<string> Names() => _envsByName.Keys.OrderBy(x => x);
 
         public string GetEnvDir(string name)
         {
@@ -183,15 +248,15 @@ namespace YGGXLAddin.Python
         }
 
         /// <summary>
-        /// Re-scan BaseDir and rebuild internal dict.
+        /// Re-scan BaseDir and rebuild internal dicts.
         /// </summary>
         public void Reload()
         {
-            _envs.Clear();
+            _envsByExe.Clear();
+            _envsByName.Clear();
 
             var dftEnv = SystemDefault();
-
-            _envs[dftEnv.Name] = dftEnv;
+            RegisterEnv(dftEnv);
 
             if (!Directory.Exists(BaseDir))
                 return;
@@ -207,7 +272,7 @@ namespace YGGXLAddin.Python
                 try
                 {
                     var env = PyEnv.Create(name, pyExe);
-                    _envs[name] = env;
+                    RegisterEnv(env);
                 }
                 catch
                 {
@@ -239,7 +304,7 @@ namespace YGGXLAddin.Python
 
             // Register env first (so callers can see it even if bootstrap fails)
             var env = PyEnv.Create(name, pyExe, t);
-            _envs[name] = env;
+            RegisterEnv(env);
 
             BootstrapPipAndUv(envDir, pyExe, t);
 
@@ -268,7 +333,7 @@ namespace YGGXLAddin.Python
             var uv = Default().FindUVPath();
             var args = $"venv --python {pythonVersion} {QuoteArg(envDir)}";
 
-            var env = new System.Collections.Generic.Dictionary<string, string>
+            var env = new Dictionary<string, string>
             {
                 ["RUST_TLS_ALLOW_INVALID_CERTS"] = "1",
                 ["UV_INSECURE_HOSTS"] = "github.com",
@@ -282,7 +347,6 @@ namespace YGGXLAddin.Python
                 {
                     var localPython = $"C:\\Program Files\\Python{v.Major}{v.Minor}\\python.exe";
                     args = $"venv --python {QuoteArg(localPython)} {QuoteArg(envDir)}";
-
                     res = RunProcess(uv, args, workingDirectory: BaseDir, timeout: timeout, env: env);
                 }
             }
@@ -307,10 +371,10 @@ namespace YGGXLAddin.Python
 
         private void BootstrapPipAndUv(string envDir, string pyExe, TimeSpan timeout)
         {
-            // 1) Best-effort ensurepip (some distros disable it; don’t brick the env if it's missing)
-            var ensurePip = RunProcess(pyExe, "-m ensurepip --upgrade", workingDirectory: envDir, timeout: timeout);
+            // 1) Best-effort ensurepip
+            _ = RunProcess(pyExe, "-m ensurepip --upgrade", workingDirectory: envDir, timeout: timeout);
 
-            // 2) Upgrade pip tooling (this should generally work if pip exists)
+            // 2) Upgrade pip tooling
             var pipUp = RunProcess(
                 pyExe,
                 "-m pip install --upgrade pip setuptools wheel --disable-pip-version-check --no-input",
@@ -325,19 +389,35 @@ namespace YGGXLAddin.Python
                     pipUp.ToString());
             }
 
-            // 3) Install uv into the venv so future updates can use uv pip
+            // 3) Install/upgrade uv in the venv (so future updates can use uv pip)
             var uvInVenv = RunProcess(
                 pyExe,
-                "-m pip install --upgrade uv ygg --disable-pip-version-check --no-input",
+                "-m pip install --upgrade uv --disable-pip-version-check --no-input",
                 workingDirectory: envDir,
                 timeout: timeout);
 
             if (uvInVenv.ExitCode != 0)
             {
                 throw new InvalidOperationException(
-                    "Installing uv into venv failed.\n" +
+                    "Installing/upgrading uv into venv failed.\n" +
                     $"Cmd: {pyExe} -m pip install --upgrade uv\n" +
                     uvInVenv.ToString());
+            }
+
+            // 4) Install/upgrade ygg (latest) at bootstrap too (fast path)
+            // If uv is present, we'll do a uv-based ensure later; this makes env usable even if uv call fails.
+            var yggInVenv = RunProcess(
+                pyExe,
+                "-m pip install --upgrade ygg --disable-pip-version-check --no-input",
+                workingDirectory: envDir,
+                timeout: timeout);
+
+            if (yggInVenv.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Installing/upgrading ygg into venv failed.\n" +
+                    $"Cmd: {pyExe} -m pip install --upgrade ygg\n" +
+                    yggInVenv.ToString());
             }
         }
 
@@ -351,19 +431,21 @@ namespace YGGXLAddin.Python
 
             var envDir = GetEnvDir(name);
 
-            // Remove from dict first to avoid stale state if delete fails partially.
-            _envs.Remove(name);
+            // Remove from indexes
+            if (_envsByName.TryGetValue(name, out var exeKey))
+            {
+                _envsByName.Remove(name);
+                _envsByExe.Remove(exeKey);
+            }
 
             if (!Directory.Exists(envDir))
                 return;
 
-            // Nuke it.
             Directory.Delete(envDir, recursive: true);
         }
 
         /// <summary>
         /// Update an environment using uv pip (fast resolver).
-        /// Under the hood this just calls env.PipInstall(... useUV:true ...)
         /// </summary>
         public PyProcessResult Update(
             string name,
@@ -379,10 +461,9 @@ namespace YGGXLAddin.Python
             string cacheDir = null,
             TimeSpan? timeout = null)
         {
-            if (!_envs.TryGetValue(name, out var env))
+            if (!TryGetByName(name, out var env))
                 throw new KeyNotFoundException($"Env '{name}' not found.");
 
-            // Ensure uv exists inside the env (auto-install via pip if missing).
             _ = env.FindUVPath(installIfMissing: true, timeout: timeout);
 
             if (packageSpecs != null && packageSpecs.Length > 0)
@@ -403,7 +484,6 @@ namespace YGGXLAddin.Python
                     timeout: timeout);
             }
 
-            // requirements-only update
             return env.PipInstall(
                 packageSpec: null,
                 upgrade: upgrade,
@@ -431,18 +511,27 @@ namespace YGGXLAddin.Python
             PyEnv pyenv;
 
             if (string.IsNullOrEmpty(environment))
-                pyenv = Default();
+            {
+                pyenv = Default(timeout);
+            }
             else if (File.Exists(environment))
             {
-                pyenv = PyEnv.Create(name: null, exePath: environment);
-                _envs[pyenv.Name] = pyenv;
+                // exe path provided
+                var exeKey = NormalizeExeKey(environment);
+
+                if (!TryGetByExe(exeKey, out pyenv))
+                {
+                    pyenv = PyEnv.Create(name: null, exePath: environment, timeout: timeout);
+                    RegisterEnv(pyenv);
+                }
             }
             else
-                pyenv = _envs[environment];
+            {
+                // name provided
+                pyenv = this[environment];
+            }
 
-            
             var result = pyenv.RunCode(code, workingDirectory: workingDirectory, timeout: timeout);
-
             return result;
         }
 
@@ -451,15 +540,12 @@ namespace YGGXLAddin.Python
         /// </summary>
         private static string ResolvePythonExePath(string envDir)
         {
-            // Windows venv layout
             var win = Path.Combine(envDir, "Scripts", "python.exe");
             if (File.Exists(win)) return win;
 
-            // Unix venv layout
             var nix = Path.Combine(envDir, "bin", "python");
             if (File.Exists(nix)) return nix;
 
-            // Some distros: python3
             var nix3 = Path.Combine(envDir, "bin", "python3");
             if (File.Exists(nix3)) return nix3;
 
@@ -493,7 +579,6 @@ namespace YGGXLAddin.Python
                     if (string.IsNullOrWhiteSpace(kv.Key))
                         continue;
 
-                    // If value is null -> remove the var (optional behavior)
                     if (kv.Value == null)
                     {
                         if (psi.EnvironmentVariables.ContainsKey(kv.Key))
@@ -532,5 +617,52 @@ namespace YGGXLAddin.Python
         }
 
         private static string QuoteArg(string s) => "\"" + (s ?? "").Replace("\"", "\\\"") + "\"";
+
+        // -----------------------------
+        // Cache helpers (exe-keyed)
+        // -----------------------------
+        private static string NormalizeExeKey(string exePath)
+        {
+            if (string.IsNullOrWhiteSpace(exePath)) return null;
+            try { return Path.GetFullPath(exePath.Trim()); }
+            catch { return exePath.Trim(); } // fallback if path is weird
+        }
+
+        private void RegisterEnv(PyEnv env)
+        {
+            if (env == null) return;
+
+            var exeKey = NormalizeExeKey(env.ExePath);
+            if (string.IsNullOrWhiteSpace(exeKey))
+                throw new ArgumentException("Env exe path is required.", nameof(env));
+
+            _envsByExe[exeKey] = env;
+
+            if (!string.IsNullOrWhiteSpace(env.Name))
+                _envsByName[env.Name] = exeKey;
+        }
+
+        private bool TryGetByName(string name, out PyEnv env)
+        {
+            env = null;
+            if (string.IsNullOrWhiteSpace(name)) return false;
+
+            if (_envsByName.TryGetValue(name.Trim(), out var exeKey) &&
+                _envsByExe.TryGetValue(exeKey, out env))
+                return true;
+
+            return false;
+        }
+
+        private bool TryGetByExe(string exePathKey, out PyEnv env)
+        {
+            env = null;
+            if (string.IsNullOrWhiteSpace(exePathKey)) return false;
+
+            var key = NormalizeExeKey(exePathKey);
+            if (string.IsNullOrWhiteSpace(key)) return false;
+
+            return _envsByExe.TryGetValue(key, out env);
+        }
     }
 }

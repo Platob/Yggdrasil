@@ -40,9 +40,9 @@ class MSALAuth:
     authority: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_AUTHORITY"))
     scopes: list[str] | None = field(default_factory=lambda: os.environ.get("AZURE_SCOPES"))
 
-    _auth_app: ConfidentialClientApplication | None = None
-    _expires_at: float | None = None
-    _access_token: Optional[str] = None
+    _auth_app: ConfidentialClientApplication | None = field(default=None, repr=False, compare=False, hash=False)
+    _expires_at: float | None = field(default=None, repr=False, compare=False, hash=False)
+    _access_token: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
 
     def __setitem__(self, key, value):
         """Set an attribute via mapping-style assignment.

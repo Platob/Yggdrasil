@@ -6,7 +6,6 @@ import io
 import logging
 import os
 import posixpath
-import sys
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +13,10 @@ from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
 
+from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
+
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
-from ...libs.databrickslib import databricks_sdk, DatabricksDummyClass
-from ...pyutils.callable_serde import CallableSerde
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.modules import resolve_local_lib_path
@@ -25,13 +24,6 @@ from ...pyutils.waiting_config import WaitingConfigArg
 
 if TYPE_CHECKING:
     from .cluster import Cluster
-
-if databricks_sdk is not None:
-    from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
-else:
-    Language = DatabricksDummyClass
-    ResultType = DatabricksDummyClass
-    CommandStatusResponse = DatabricksDummyClass
 
 
 __all__ = [
@@ -413,148 +405,9 @@ print(json.dumps(meta))"""
             return decorator(f=func)
         return decorator
 
-    def execute(
-        self,
-        obj: Union[str, Callable],
-        *,
-        args: List[Any] = None,
-        kwargs: Dict[str, Any] = None,
-        env_keys: Optional[List[str]] = None,
-        env_variables: Optional[dict[str, str]] = None,
-        timeout: Optional[WaitingConfigArg] = True,
-    ):
-        """Execute a string command or a callable in the remote context.
-
-        Args:
-            obj: Command string or callable to execute.
-            args: Optional positional arguments for callables.
-            kwargs: Optional keyword arguments for callables.
-            env_keys: Environment variable names to forward.
-            env_variables: Environment variables to inject remotely.
-            timeout: Optional timeout for execution.
-
-        Returns:
-            The decoded execution result.
-        """
-        if isinstance(obj, str):
-            return self.execute_command(
-                command=obj,
-                wait=timeout,
-            )
-        elif callable(obj):
-            return self.execute_callable(
-                func=obj,
-                args=args,
-                kwargs=kwargs,
-                env_keys=env_keys,
-                env_variables=env_variables,
-                timeout=timeout,
-            )
-        else:
-            raise ValueError(f"Cannot execute {type(obj)}")
-
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
         return self.cluster.is_in_databricks_environment()
-
-    def execute_callable(
-        self,
-        func: Callable | CallableSerde,
-        args: List[Any] = None,
-        kwargs: Dict[str, Any] = None,
-        env_keys: Optional[Iterable[str]] = None,
-        env_variables: Optional[Dict[str, str]] = None,
-        timeout: Optional[WaitingConfigArg] = True,
-        command: Optional[str] = None,
-    ) -> Any:
-        """Execute a Python callable remotely and return the decoded result.
-
-        Args:
-            func: Callable or serialized callable to run remotely.
-            args: Positional arguments for the callable.
-            kwargs: Keyword arguments for the callable.
-            env_keys: Environment variable names to forward.
-            env_variables: Environment variables to inject remotely.
-            timeout: Optional timeout for execution.
-            command: Optional prebuilt command string override.
-
-        Returns:
-            The decoded return value from the remote execution.
-        """
-        if self.is_in_databricks_environment():
-            args = args or []
-            kwargs = kwargs or {}
-            return func(*args, **kwargs)
-
-        self.connect(language=Language.PYTHON)
-
-        LOGGER.debug(
-            "Executing callable %s with %s",
-            getattr(func, "__name__", type(func)),
-            self,
-        )
-
-        serialized = CallableSerde.from_callable(func)
-
-        if serialized.pkg_root:
-            self.install_temporary_libraries(libraries=serialized.pkg_root)
-
-        current_version = (sys.version_info.major, sys.version_info.minor)
-
-        if current_version != self.cluster.python_version[:2]:
-            raise RuntimeError(
-                f"Cannot execute callable: local Python version "
-                f"{current_version[0]}.{current_version[1]} does not match "
-                f"remote cluster Python version "
-                f"{self.cluster.python_version[0]}.{self.cluster.python_version[1]}"
-            )
-
-        result_tag = "<<<RESULT>>>"
-
-        command = serialized.to_command(
-            args=args,
-            kwargs=kwargs,
-            result_tag=result_tag,
-            env_keys=env_keys,
-            env_variables=env_variables
-        ) if not command else command
-
-        raw_result = self.execute_command(
-            command,
-            wait=timeout
-        )
-
-        result = serialized.parse_command_result(
-            raw_result,
-            result_tag=result_tag,
-            workspace=self.cluster.workspace
-        )
-
-        return result
-
-    def execute_command(
-        self,
-        command: str,
-        *,
-        language: Optional[Language] = None,
-        wait: Optional[WaitingConfigArg] = True,
-        raise_error: bool = True
-    ) -> str:
-        """Execute a command in this context and return decoded output.
-
-        Args:
-            command: The command string to execute.
-            language: Language to execute
-            wait: Optional timeout for execution.
-            raise_error: Raises error if failed
-
-        Returns:
-            The decoded command output string.
-        """
-        return self.command(
-            command=command,
-            language=language,
-        ).wait(wait=wait, raise_error=raise_error)
 
     # ------------------------------------------------------------------
     # generic local → remote uploader, via remote python
@@ -562,7 +415,8 @@ print(json.dumps(meta))"""
     def upload_local_path(
         self,
         paths: Union[Iterable[Tuple[LocalSpec, str]], Dict[LocalSpec, str]],
-        byte_limit: int = 64 * 1024
+        byte_limit: int = 64 * 1024,
+        wait: WaitingConfigArg | None = None
     ) -> None:
         """
         One-shot uploader. Sends exactly ONE remote command.
@@ -785,7 +639,7 @@ with zipfile.ZipFile(buf, "r") as zf:
         else:
             raise ValueError(f"Unknown manifest kind: {{kind}}")
 """
-        self.execute_command(command=cmd)
+        self.command(command=cmd).start().wait(wait=wait)
 
     # ------------------------------------------------------------------
     # upload local lib into remote site-packages

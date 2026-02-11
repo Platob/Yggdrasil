@@ -14,9 +14,9 @@ import sys
 from pathlib import Path
 from typing import Iterator, Optional
 
-import yggdrasil.pyutils.modules as m
 import pytest
 
+import yggdrasil.pyutils.modules as m
 from yggdrasil.pyutils.modules import PipIndexSettings
 
 

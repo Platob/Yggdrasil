@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from typing import Optional, Any
 
-from ..exceptions import DatabricksException
+from ..lib import DatabricksError
 
 __all__ = [
     "SqlStatementError"
@@ -10,7 +10,7 @@ __all__ = [
 
 
 @dataclass(frozen=True)
-class SqlStatementError(DatabricksException):
+class SqlStatementError(DatabricksError):
     statement_id: str
     state: str
     message: str

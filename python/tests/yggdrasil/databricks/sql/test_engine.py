@@ -26,11 +26,20 @@ class TestSQLEngine(unittest.TestCase):
 
         self.engine.insert_into(data, table_name="test_insert", mode="overwrite")
 
+        other_data = pa.table([
+            pa.array(["1", "2", "4"]),
+            pa.array([{"q": dt.datetime.now(dt.timezone.utc)}, None, None]),
+            pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
+            pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
+        ], names=["c1", "c2", "c3", "map column"])
+
+        self.engine.insert_into(data, table_name="test_insert", mode="append")
+
         n = self.engine.table_full_name(table_name="test_insert")
 
         read = self.engine.execute(f"SELECT * from {n}").to_arrow_table()
 
-        self.assertTrue(read)
+        self.assertEqual(read.num_rows, data.num_rows + other_data.num_rows)
 
         with pytest.raises(SqlStatementError):
             self.engine.execute(f"SELECT * from unknown_table")

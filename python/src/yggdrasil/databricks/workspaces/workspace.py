@@ -16,26 +16,19 @@ from typing import (
     Union, TYPE_CHECKING, List, Set
 )
 
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.dbutils import FileInfo
+from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.service.files import DirectoryEntry
+from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
+
 from .path import DatabricksPath, DatabricksPathKind
-from ...libs.databrickslib import databricks_sdk, WorkspaceClient, DatabricksDummyClass
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 from ...version import __version__ as YGGDRASIL_VERSION
 
-if databricks_sdk is not None:
-    from databricks.sdk.errors import ResourceDoesNotExist
-    from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
-    from databricks.sdk.dbutils import FileInfo
-    from databricks.sdk.service.files import DirectoryEntry
-else:
-    ResourceDoesNotExist = DatabricksDummyClass
-    ExportFormat = DatabricksDummyClass
-    ObjectInfo = DatabricksDummyClass
-    FileInfo = DatabricksDummyClass
-    DirectoryEntry = DatabricksDummyClass
-
-
 if TYPE_CHECKING:
+    from ..sql.engine import SQLEngine
     from ..sql.warehouse import SQLWarehouse
     from ..compute.cluster import Cluster
 
@@ -73,11 +66,7 @@ def is_checked_tmp_path(
 # Helpers
 # ---------------------------------------------------------------------------
 def _get_env_product():
-    v = os.getenv("DATABRICKS_PRODUCT")
-
-    if not v:
-        return "yggdrasil"
-    return v
+    return os.getenv("DATABRICKS_PRODUCT")
 
 
 def _get_env_product_version():
@@ -91,11 +80,7 @@ def _get_env_product_version():
 
 
 def _get_env_product_tag():
-    v = os.getenv("DATABRICKS_PRODUCT_TAG")
-
-    if not v:
-        return None
-    return v
+    return os.getenv("DATABRICKS_PRODUCT_TAG")
 
 
 @dataclass
@@ -141,16 +126,13 @@ class Workspace:
 
     # Runtime cache (never serialized)
     _sdk: Optional["WorkspaceClient"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _sql: Optional["SQLEngine"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _was_connected: bool = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
     # -------------------------
     # Python methods
     # -------------------------
-    def __post_init__(self):
-        self.product = self.product.strip().lower() if self.product else "yggdrasil"
-        self.product_tag = self.product_tag.strip().lower() if self.product_tag else "main"
-
     def __getstate__(self):
         """Serialize the workspace state for pickling.
 
@@ -159,6 +141,7 @@ class Workspace:
         """
         state = self.__dict__.copy()
         state.pop("_sdk", None)
+        state.pop("_sql", None)
 
         state["_was_connected"] = self._sdk is not None
         state["_cached_token"] = self.current_token()
@@ -211,6 +194,11 @@ class Workspace:
     # -------------------------
     def clone_instance(
         self,
+        host: Optional[str] = None,
+        account_id: Optional[str] = None,
+        token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
     ) -> "Workspace":
         """Clone the workspace config with overrides.
 
@@ -218,11 +206,11 @@ class Workspace:
             A new Workspace instance with updated fields.
         """
         return Workspace(
-            host = self.host,
-            account_id = self.account_id,
-            token = self.token,
-            client_id = self.client_id,
-            client_secret = self.client_secret,
+            host = host or self.host,
+            account_id = account_id or self.account_id,
+            token = token or self.token,
+            client_id = client_id or self.client_id,
+            client_secret = client_secret or self.client_secret,
             token_audience = self.token_audience,
             azure_workspace_resource_id = self.azure_workspace_resource_id,
             azure_use_msi = self.azure_use_msi,
@@ -244,7 +232,7 @@ class Workspace:
             product_version = self.product_version,
             product_tag = self.product_tag,
             custom_tags = self.custom_tags,
-            _sdk = self._sdk,
+            _sdk = None,
             _was_connected = self._was_connected,
             _cached_token = self._cached_token,
         )
@@ -348,6 +336,15 @@ class Workspace:
                 if v is not None:
                     setattr(instance, key, v)
 
+        if not self.product and self.auth_type == "external-browser":
+            conf = instance._sdk.config
+            conf._init_product(
+                self.current_user.user_name,
+                "0.0.0"
+            )
+
+            self.product, self.product_version = conf._product_info
+
         return instance
 
     # ------------------------------------------------------------------ #
@@ -424,7 +421,7 @@ class Workspace:
     # ------------------------------------------------------------------ #
     # Path helpers
     # ------------------------------------------------------------------ #
-    def filesystem(
+    def arrow_filesystem(
         self,
         workspace: Optional["Workspace"] = None,
     ):
@@ -746,18 +743,13 @@ class Workspace:
             A dict of default tags.
         """
         if update:
-            base = {
-                k: v
-                for k, v in (
-                    ("Product", self.product),
-                )
-                if v
-            }
+            base = dict()
         else:
             base = {
                 k: v
                 for k, v in (
                     ("Product", self.product),
+                    ("ProductVersion", self.product_version),
                     ("ProductTag", self.product_tag),
                 )
                 if v
@@ -787,6 +779,19 @@ class Workspace:
             A SQLEngine instance.
         """
         from ..sql import SQLEngine
+
+        if workspace is None and warehouse is None and catalog_name is None and schema_name is None:
+            if self._sql is not None:
+                return self._sql
+
+            self._sql = SQLEngine(
+                workspace=workspace,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                _warehouse=warehouse,
+            )
+
+            return self._sql
 
         workspace = self if workspace is None else workspace
 
@@ -834,6 +839,21 @@ class Workspace:
             cluster_id=cluster_id,
             cluster_name=cluster_name,
         )
+
+    def secrets(
+        self,
+        workspace: Optional["Workspace"] = None,
+        scope: Optional[str] = None,
+        key: Optional[str] = None,
+    ):
+        from ..secrets.secret import Secret
+
+        return Secret(
+            workspace=self if workspace is None else workspace,
+            scope=scope,
+            key=key,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Workspace-bound base class

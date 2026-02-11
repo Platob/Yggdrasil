@@ -103,11 +103,11 @@ class TestCluster(unittest.TestCase):
         assert result["date"] == today
 
     def test_execute(self):
-        def test():
+        def f():
             return "ok"
 
         with self.cluster.context() as context:
-            result = context.execute(test)
+            result = context.command(func=f).start().wait()
 
         self.assertEqual("ok", result)
 
@@ -117,11 +117,11 @@ class TestCluster(unittest.TestCase):
 
         with pytest.raises(ValueError):
             with self.cluster.system_context as context:
-                _ = context.execute(f)
+                _ = context.command(func=f).start().wait()
 
         with pytest.raises(ValueError):
             with self.cluster.context() as context:
-                _ = context.execute(f)
+                _ = context.command(func=f).start().wait()
 
     def test_decorator(self):
         @self.cluster.system_context.decorate(
@@ -141,6 +141,7 @@ class TestCluster(unittest.TestCase):
         result = decorated(1)
 
         assert result["os"]
+        assert "DATABRICKS_RUNTIME_VERSION" in result["os"].keys()
         assert result["value"] == 1
         assert result["env"] == "testenv"
 
@@ -156,24 +157,31 @@ class TestCluster(unittest.TestCase):
         self.assertTrue(isinstance(result, pandas.DataFrame))
 
     def test_static_decorator(self):
+        os.environ["TEST_ENV"] = "testenv"
+
         @databricks_remote_compute(
-            workspace=self.workspace
+            env_keys=["TEST_ENV"]
         )
         def decorated(a: int):
+            env = os.environ["TEST_ENV"]
+
             return {
                 "os": os.environ,
-                "value": a
+                "value": a,
+                "env": env
             }
 
         result = decorated(1)
 
         assert result["os"]
+        assert "DATABRICKS_RUNTIME_VERSION" in result["os"].keys()
         assert result["value"] == 1
+        assert result["env"] == "testenv"
 
     def test_install_temporary_lib(self):
         self.cluster.install_temporary_libraries(["path/to/folder", "pandas"])
 
     def test_execute_sql(self):
-        result = self.cluster.context(language=Language.SQL).execute("SELECT 1")
+        result = self.cluster.context(language=Language.SQL).command("SELECT 1", language=Language.SQL).start()
 
         self.assertTrue(result)

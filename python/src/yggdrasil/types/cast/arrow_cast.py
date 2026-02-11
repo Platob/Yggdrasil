@@ -20,13 +20,14 @@ __all__ = [
     "cast_arrow_tabular",
     "cast_arrow_record_batch_reader",
     "default_arrow_array",
-    "pylist_to_record_batch",
     "to_spark_arrow_type",
     "to_polars_arrow_type",
     "arrow_field_to_schema",
     "is_arrow_type_binary_like",
     "is_arrow_type_string_like",
     "is_arrow_type_list_like",
+    "record_batch_to_table",
+    "arrow_schema_to_field",
 ]
 
 logger = logging.getLogger(__name__)
@@ -465,7 +466,7 @@ def check_arrow_array_nullability(
         return pc.if_else(pc.is_null(array), default_arr, array)
 
 
-@register_converter(Any, pa.Scalar)
+@register_converter(Any, pa.RecordBatch)
 def any_to_arrow_scalar(
     scalar: Any,
     options: Optional[CastOptions] = None,
@@ -526,7 +527,7 @@ def cast_arrow_scalar(
         options: Optional cast options.
 
     Returns:
-        Casted Arrow scalar.
+        Cast Arrow scalar.
     """
     options = CastOptions.check_arg(options)
     target_field = options.target_field
@@ -803,128 +804,6 @@ def cast_arrow_record_batch_reader(
 
     return pa.RecordBatchReader.from_batches(arrow_schema, casted_batches())
 
-# ---------------------------------------------------------------------------
-# Pylist -> Arrow
-# ---------------------------------------------------------------------------
-@register_converter(Any, pa.Array)
-def any_to_arrow_array(
-    obj: Any,
-    options: Optional[CastOptions] = None,
-) -> pa.Array:
-    """Convert array-like input into an Arrow array.
-
-    Args:
-        obj: Array-like input.
-        options: Optional cast options.
-
-    Returns:
-        Arrow array.
-    """
-    options = CastOptions.check_arg(options)
-    arrow_array = None
-
-    try:
-        arrow_array = pa.array(
-            obj,
-            type=options.target_field.type if options.target_field else None,
-            safe=options.safe,
-            memory_pool=options.arrow_memory_pool
-        )
-    except:
-        pass
-
-    try:
-        arrow_array = pa.array(
-            obj,
-            safe=options.safe,
-            memory_pool=options.arrow_memory_pool
-        )
-    except:
-        pass
-
-    if arrow_array is not None:
-        return cast_arrow_array(arrow_array, options)
-
-    target_field = options.target_field
-
-    if target_field:
-        dtype = target_field.type
-    else:
-        dtype = pa.null()
-
-    if not obj:
-        return default_arrow_array(
-            dtype=dtype,
-            nullable=True,
-            size=0,
-            memory_pool=options.arrow_memory_pool
-        )
-
-    null_count = 0
-
-    for item in obj:
-        if item is not None:
-            found_scalar = any_to_arrow_scalar(item, None)
-
-            if target_field is None:
-                dtype = found_scalar.type
-                target_field = pa.field("list", dtype, nullable=null_count > 0)
-                options.target_arrow_field = target_field
-            break
-        else:
-            null_count += 1
-
-    if null_count == len(obj):
-        return default_arrow_array(
-            dtype=dtype,
-            nullable=target_field.nullable,
-            size=len(obj),
-            memory_pool=options.arrow_memory_pool
-        )
-
-    scalars = [
-        any_to_arrow_scalar(item, options)
-        for item in obj
-    ]
-    arr = pa.array(scalars, type=dtype)
-
-    return cast_arrow_array(arr, options)
-
-
-@register_converter(list, pa.RecordBatch)
-def pylist_to_record_batch(
-    data: list,
-    options: Optional[CastOptions] = None,
-) -> pa.RecordBatch:
-    """Convert a list of rows into a RecordBatch.
-
-    Args:
-        data: List of row objects.
-        options: Optional cast options.
-
-    Returns:
-        Arrow RecordBatch.
-    """
-    options = CastOptions.check_arg(options)
-
-    array: Union[pa.Array, pa.StructArray] = any_to_arrow_array(data, options)
-
-    target_field = options.target_field or arrow_array_to_field(array, None)
-    target_type: Union[pa.DataType, pa.StructType] = target_field.type
-
-    schema = arrow_field_to_schema(target_field, None)
-
-    if isinstance(array, pa.StructArray):
-        arrays = [
-            array.field(i) for i in range(target_type.num_fields)
-        ]
-    else:
-        arrays = [array]
-
-    return pa.record_batch(
-        arrays,
-        schema=schema,
-    )
 
 # ---------------------------------------------------------------------------
 # Type normalization helpers

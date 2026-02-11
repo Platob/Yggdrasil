@@ -4,36 +4,19 @@ import dataclasses
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as concurrent_wait
-from typing import Optional, Iterator, TYPE_CHECKING
+from typing import Optional, Iterator
 
 import pyarrow as pa
 import pyarrow.ipc as pipc
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import (
+    StatementState, StatementResponse, Disposition, StatementStatus
+)
 
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
-from ...libs.databrickslib import databricks_sdk, WorkspaceClient, DatabricksDummyClass
-from ...libs.pandaslib import PandasDataFrame
-from ...libs.polarslib import polars
-from ...libs.sparklib import SparkDataFrame
 from ...pyutils.waiting_config import WaitingConfigArg, WaitingConfig
 from ...requests.session import YGGSession
-from ...types import spark_dataframe_to_arrow_table, \
-    spark_schema_to_arrow_schema, arrow_table_to_spark_dataframe
-
-if databricks_sdk is not None:
-    from databricks.sdk.service.sql import (
-        StatementState, StatementResponse, Disposition, StatementStatus
-    )
-else:
-    StatementState = DatabricksDummyClass
-    StatementResponse = DatabricksDummyClass
-    Disposition = DatabricksDummyClass
-    StatementStatus = DatabricksDummyClass
-
-
-if TYPE_CHECKING:
-    pass
-
 
 DONE_STATES = {
     StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED,
@@ -59,7 +42,7 @@ class StatementResult:
 
     _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False)
 
-    _spark_df: Optional[SparkDataFrame] = dataclasses.field(default=None, repr=False)
+    _spark_df: Optional["pyspark.sql.DataFrame"] = dataclasses.field(default=None, repr=False)
     _arrow_table: Optional[pa.Table] = dataclasses.field(default=None, repr=False)
 
     def __getstate__(self):
@@ -73,7 +56,9 @@ class StatementResult:
         _spark_df = state.pop("_spark_df", None)
 
         if _spark_df is not None:
-            state["_arrow_table"] = spark_dataframe_to_arrow_table(_spark_df)
+            from ...spark.cast import spark_dataframe_to_arrow_table
+
+            state["_arrow_table"] = spark_dataframe_to_arrow_table(_spark_df, None)
 
         return state
 
@@ -328,7 +313,9 @@ class StatementResult:
             if self._arrow_table is not None:
                 return self._arrow_table.schema
             elif self._spark_df is not None:
-                return spark_schema_to_arrow_schema(self._spark_df.schema)
+                from ...spark.cast import spark_schema_to_arrow_schema
+
+                return spark_schema_to_arrow_schema(self._spark_df.schema, None)
             else:
                 raise NotImplementedError("")
 
@@ -336,7 +323,7 @@ class StatementResult:
 
         metadata = {
             "source": "databricks-sql",
-            "sid": self.statement_id or ""
+            "statement_id": self.statement_id or ""
         }
 
         if manifest is None:
@@ -424,14 +411,14 @@ class StatementResult:
             ready = {}  # idx -> bytes
             next_idx = 0
 
-            def submit_more(ex):
+            def submit_more(exx):
                 while len(pending) < max_in_flight:
                     try:
-                        idx, link = next(links_iter)
+                        _idx, link = next(links_iter)
                     except StopIteration:
                         break
-                    fut = ex.submit(_fetch_bytes, link)
-                    pending[fut] = idx
+                    _fut = exx.submit(_fetch_bytes, link)
+                    pending[_fut] = _idx
 
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 submit_more(ex)
@@ -466,7 +453,7 @@ class StatementResult:
     def to_pandas(
         self,
         parallel_pool: Optional[int] = 4
-    ) -> PandasDataFrame:
+    ) -> "pandas.DataFrame":
         """Return the result as a pandas DataFrame.
 
         Args:
@@ -489,11 +476,13 @@ class StatementResult:
         Returns:
             A polars DataFrame with the result rows.
         """
+        from ...polars.lib import polars
+
         arrow_table = self.to_arrow_table(parallel_pool=parallel_pool)
 
         return polars.from_arrow(arrow_table)
 
-    def to_spark(self) -> SparkDataFrame:
+    def to_spark(self) -> "pyspark.sql.DataFrame":
         """Return the result as a Spark DataFrame, caching it locally.
 
         Returns:
@@ -502,4 +491,6 @@ class StatementResult:
         if self._spark_df is not None:
             return self._spark_df
 
-        return arrow_table_to_spark_dataframe(self.to_arrow_table())
+        from ...spark.cast import arrow_table_to_spark_dataframe
+
+        return arrow_table_to_spark_dataframe(self.to_arrow_table(), None)

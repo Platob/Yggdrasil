@@ -9,11 +9,21 @@ from .registry import convert
 from ..python_arrow import is_arrow_type_list_like
 
 if TYPE_CHECKING:
-    from ...libs.polarslib import polars
-    from ...libs.sparklib import pyspark
+    from ...polars.lib import polars
+    from ...spark.lib import pyspark
 
 __all__ = [
     "CastOptions",
+    "CastOptionsArg"
+]
+
+CastOptionsArg = Union[
+    "CastOptions",
+    dict,
+    pa.DataType,
+    pa.Field,
+    pa.Schema,
+    None,
 ]
 
 
@@ -146,14 +156,7 @@ class CastOptions:
     @classmethod
     def check_arg(
         cls,
-        options: Union[
-            "CastOptions",
-            dict,
-            pa.DataType,
-            pa.Field,
-            pa.Schema,
-            None,
-        ] = None,
+        options: CastOptionsArg = None,
         source_field: pa.Field | pa.Schema | pa.DataType | None = None,
         target_field: pa.Field | pa.Schema | pa.DataType | None = None,
         **kwargs
@@ -339,9 +342,9 @@ class CastOptions:
             Polars field or None.
         """
         if self.source_arrow_field is not None and self._source_polars_field is None:
-            from ...types.cast.polars_cast import arrow_field_to_polars_field
+            from ...polars.cast import arrow_field_to_polars_field
 
-            setattr(self, "_source_polars_field", arrow_field_to_polars_field(self.source_arrow_field))
+            setattr(self, "_source_polars_field", arrow_field_to_polars_field(self.source_arrow_field, None))
         return self._source_polars_field
 
     @property
@@ -352,7 +355,7 @@ class CastOptions:
             Spark field or None.
         """
         if self.source_arrow_field is not None and self._source_spark_field is None:
-            from ...types.cast.spark_cast import arrow_field_to_spark_field
+            from ...spark.cast import arrow_field_to_spark_field
 
             setattr(self, "_source_spark_field", arrow_field_to_spark_field(self.source_field))
         return self._source_spark_field
@@ -409,10 +412,26 @@ class CastOptions:
             Polars field or None.
         """
         if self.target_arrow_field is not None and self._target_polars_field is None:
-            from ...types.cast.polars_cast import arrow_field_to_polars_field
+            from ...polars.cast import arrow_field_to_polars_field
 
-            setattr(self, "_target_polars_field", arrow_field_to_polars_field(self.target_arrow_field))
+            setattr(self, "_target_polars_field", arrow_field_to_polars_field(self.target_arrow_field, None))
         return self._target_polars_field
+
+    @property
+    def target_polars_schema(self) -> Optional[dict[str, "polars.Field"]]:
+        polars_field = self.target_polars_field
+
+        if polars_field is not None:
+            from ...polars.lib import polars
+            polars_type: polars.Struct = polars_field.dtype
+
+            schema = {
+                field.name: field.dtype
+                for field in polars_type.fields
+            }
+
+            return schema
+        return None
 
     @property
     def target_spark_field(self):
@@ -422,7 +441,7 @@ class CastOptions:
             Spark field or None.
         """
         if self.target_arrow_field is not None and self._target_spark_field is None:
-            from ...types.cast.spark_cast import arrow_field_to_spark_field
+            from ...spark.cast import arrow_field_to_spark_field
 
             setattr(self, "_target_spark_field", arrow_field_to_spark_field(self.target_field))
         return self._target_spark_field
@@ -451,9 +470,9 @@ class CastOptions:
         arrow_schema = self.target_arrow_schema
 
         if arrow_schema is not None:
-            from .spark_cast import arrow_schema_to_spark_schema
+            from ...spark.cast import arrow_schema_to_spark_schema
 
-            return arrow_schema_to_spark_schema(arrow_schema)
+            return arrow_schema_to_spark_schema(arrow_schema, None)
         return arrow_schema
 
 
