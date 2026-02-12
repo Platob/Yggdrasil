@@ -25,6 +25,7 @@ from databricks.sdk.service.sql import (
     ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
 )
 
+from .exceptions import SqlStatementError
 from .statement_result import StatementResult
 from .types import column_info_to_arrow_field
 from .warehouse import SQLWarehouse
@@ -465,6 +466,10 @@ class SQLEngine(WorkspaceService):
                         to_arrow_schema=True,
                     )
                 except ValueError as exc:
+                    if isinstance(data, (list, dict)):
+                        from ...polars.cast import any_to_polars_dataframe
+                        data = any_to_polars_dataframe(data, cast_options)
+
                     logger.warning(
                         "%s, creating it from input schema %s",
                         exc,
@@ -1095,7 +1100,14 @@ FROM parquet.`{temp_volume_path}`"""
         if not execute:
             return plan
 
-        res = self.execute(statement, wait=wait_result)
+        try:
+            res = self.execute(statement, wait=wait_result)
+        except SqlStatementError as e:
+            if "SCHEMA_NOT_FOUND" in e.message:
+                self.execute("CREATE SCHEMA IF NOT EXISTS `%s`" % schema_name, wait=True)
+                res = self.execute(statement, wait=wait_result)
+            else:
+                raise
         plan.result = res
         return plan
 

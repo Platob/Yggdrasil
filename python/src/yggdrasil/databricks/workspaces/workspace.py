@@ -782,6 +782,8 @@ class Workspace:
             if self._sql is not None:
                 return self._sql
 
+            workspace = self if workspace is None else workspace
+
             self._sql = SQLEngine(
                 workspace=workspace,
                 catalog_name=catalog_name,

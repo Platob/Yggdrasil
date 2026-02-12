@@ -937,7 +937,7 @@ class AbstractDataPath(ABC):
             except ImportError:
                 engine = "polars"
 
-        from_table = f"dbfs.`{self}`"
+        from_table = f"`{self}`"
         if from_table not in query:
             raise ValueError(
                 f"SQL query must contain {from_table!r} to execute query:\n{query}"
@@ -960,7 +960,6 @@ class AbstractDataPath(ABC):
             return (
                 self.read_polars()
                 .sql(query=query.replace(from_table, table_name), table_name=table_name)
-                .to_arrow(compat_level=CompatLevel.newest())
             )
 
         raise ValueError(f"Invalid engine {engine!r}, must be in: duckdb, polars, auto")
