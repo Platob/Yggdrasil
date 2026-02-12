@@ -456,7 +456,7 @@ class Secret(WorkspaceService):
             batch.append((principal, permission))
 
         if not batch:
-            raise ValueError("Provide either 'acls' or ('principal' and 'permission').")
+            return self
 
         client = self.secrets_client()
 
