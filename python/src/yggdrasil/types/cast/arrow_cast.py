@@ -30,6 +30,8 @@ __all__ = [
     "arrow_schema_to_field",
 ]
 
+from ...pyutils.serde import ObjectSerde
+
 logger = logging.getLogger(__name__)
 
 
@@ -466,7 +468,50 @@ def check_arrow_array_nullability(
         return pc.if_else(pc.is_null(array), default_arr, array)
 
 
+@register_converter(Any, pa.Table)
+def any_to_arrow_table(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> pa.Table:
+    if not isinstance(obj, pa.Table):
+        if isinstance(obj, pa.RecordBatch):
+            obj = pa.Table.from_batches([obj]) # type: ignore
+
+        else:
+            namespace = ObjectSerde.full_namespace(obj)
+
+            if namespace.startswith("pandas."):
+                from ...pandas.cast import pandas_dataframe_to_arrow_table
+
+                obj = pandas_dataframe_to_arrow_table(obj, options)
+            if namespace.startswith("pyspark."):
+                from ...spark.lib import pyspark_sql
+                from ...spark.cast import any_to_spark_dataframe
+
+                obj: pyspark_sql.DataFrame = any_to_spark_dataframe(obj, options)
+                obj = obj.toArrow()
+            else:
+                from ...polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
+
+                obj = any_to_polars_dataframe(obj, options)
+                obj = polars_dataframe_to_arrow_table(obj, options)
+
+    return cast_arrow_tabular(obj, options)
+
+
 @register_converter(Any, pa.RecordBatch)
+def any_to_arrow_record_batch(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> pa.RecordBatch:
+    if not isinstance(obj, pa.RecordBatch):
+        obj: pa.Table = any_to_arrow_table(obj, options)
+        return obj.to_batches()[0]
+
+    return cast_arrow_tabular(obj, options)
+
+
+@register_converter(Any, pa.Scalar)
 def any_to_arrow_scalar(
     scalar: Any,
     options: Optional[CastOptions] = None,

@@ -5,6 +5,7 @@ import polars
 import pyarrow as pa
 import pyarrow.types as pat
 
+from ..io.path import LocalDataPath, SystemPath
 from ..pyutils.serde import ObjectSerde
 from ..types.cast.arrow_cast import (
     cast_arrow_tabular,
@@ -482,6 +483,10 @@ def any_to_polars_dataframe(
                 [],
                 schema=options.target_polars_schema
             )
+        elif isinstance(obj, (str, SystemPath)):
+            path = LocalDataPath(obj)
+            
+            return path.read_polars(cast_options=options)
 
         namespace = ObjectSerde.full_namespace(obj)
 

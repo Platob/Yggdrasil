@@ -31,7 +31,7 @@ import shutil
 import string
 import time
 from abc import ABC, abstractmethod
-from pathlib import Path as SysPath
+from pathlib import Path as SystemPath
 from typing import Any, IO, Iterator, Optional, Union, TYPE_CHECKING
 
 try:
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from ..pandas import pandas
 
 
-__all__ = ["AbstractDataPath", "LocalDataPath"]
+__all__ = ["AbstractDataPath", "LocalDataPath", "SystemPath"]
 
 
 def _rand_str(n: int) -> str:
@@ -965,12 +965,12 @@ class AbstractDataPath(ABC):
         raise ValueError(f"Invalid engine {engine!r}, must be in: duckdb, polars, auto")
 
 
-class LocalDataPath(SysPath, AbstractDataPath):
+class LocalDataPath(SystemPath, AbstractDataPath):
     """Local filesystem path implementation (+ DatabricksPath factory)."""
 
     def __new__(
         cls,
-        base: Union["LocalDataPath", SysPath, AbstractDataPath, str] | None = None,
+        base: Union["LocalDataPath", SystemPath, AbstractDataPath, str] | None = None,
         *args,
         workspace: Optional["Workspace"] = None,
         temporary: bool = False,
