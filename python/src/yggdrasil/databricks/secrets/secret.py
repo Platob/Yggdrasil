@@ -430,7 +430,10 @@ class Secret(WorkspaceService):
         strict=False -> skip invalid entries (still raises if nothing valid is left)
         """
         if isinstance(acls, bool):
-            current_groups = self.current_user.groups or []
+            current_groups = self.current_user_groups(
+                with_public=False,
+                raise_error=False
+            )
 
             acls = [
                 (group.display, AclPermission.MANAGE)

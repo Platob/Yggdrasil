@@ -18,8 +18,9 @@ from typing import (
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.dbutils import FileInfo
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import ResourceDoesNotExist, NotFound, InternalError
 from databricks.sdk.service.files import DirectoryEntry
+from databricks.sdk.service.iam import User
 from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
 
 from .path import DatabricksPath, DatabricksPathKind
@@ -395,11 +396,50 @@ class Workspace:
             The current user object from the SDK.
         """
         try:
-            return self.sdk().current_user.me()
+            found = self.sdk().current_user.me()
         except:
+            if self.auth_type == "runtime":
+                found = User(
+                    display_name="Databricks Runtime",
+                    user_name="databricks-runtime",
+                    name="Runtime",
+                    groups=[]
+                )
+            else:
+                raise
+
+        if found is None:
             if self.auth_type == "external-browser":
                 self.reset_local_cache()
             raise
+
+        return found
+
+    def current_user_groups(
+        self,
+        with_public: bool = True,
+        raise_error: bool = True
+    ):
+        try:
+            user = self.current_user
+
+            if user is not None:
+                found = user.groups
+            else:
+                found = []
+        except (NotFound, ResourceDoesNotExist, InternalError):
+            if raise_error:
+                raise
+            found = []
+
+        if not with_public:
+            found = [
+                group
+                for group in found
+                if group.display not in {"users"}
+            ]
+
+        return found
 
     def current_token(self) -> str:
         """Return the active API token for this workspace.
@@ -944,3 +984,13 @@ class WorkspaceService(ABC):
             The current user object from the SDK.
         """
         return self.workspace.current_user
+
+    def current_user_groups(
+        self,
+        with_public: bool = True,
+        raise_error: bool = True
+    ):
+        return self.workspace.current_user_groups(
+            with_public=with_public,
+            raise_error=raise_error
+        )

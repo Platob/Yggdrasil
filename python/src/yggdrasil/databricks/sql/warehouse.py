@@ -530,7 +530,9 @@ class SQLWarehouse(WorkspaceService):
         else:
             base = []
 
-        groups = self.workspace.current_user.groups
+        groups = self.workspace.current_user_groups(
+            with_public=False
+        )
 
         if groups:
             base.extend(
@@ -539,7 +541,6 @@ class SQLWarehouse(WorkspaceService):
                     permission_level=WarehousePermissionLevel.CAN_MANAGE
                 )
                 for group in groups
-                if group.display != "users"
             )
 
         return base

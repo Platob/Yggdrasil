@@ -98,11 +98,11 @@ class Config:
 
 secrets = workspace.secrets()
 
-secrets["dbx_example/config"] = Config()
+secrets["dbx_example_scope/example_key"] = Config() # or string, int, dict, list ... any JSON serializable
 
-config = Config(**secrets["dbx_example/config"].value)
+config = Config(**secrets["dbx_example_scope/example_key"].value)
 
-secrets["dbx_example/config"].delete_secret()
+secrets["dbx_example_scope/example_key"].delete_secret()
 
 
 ## Compute
