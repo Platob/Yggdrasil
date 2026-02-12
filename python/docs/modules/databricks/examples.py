@@ -40,7 +40,6 @@ folder.write_table(data)
 pandas_df = folder.read_pandas()
 polars_df = folder.read_polars()
 
-
 ### File
 file = (folder / "file.parquet")
 file.write_table(data)
@@ -79,7 +78,8 @@ print("SQL Read")
 
 result = engine.execute(
     "select * from trading.dbx_example.write_example",
-    catalog_name=None, schema_name=None, wait=True
+    catalog_name=None, schema_name=None,
+    wait=True # Set false or timeout total seconds for async executions
 )
 
 pandas_df = result.to_pandas()

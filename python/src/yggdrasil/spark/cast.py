@@ -685,7 +685,7 @@ def arrow_table_to_spark_dataframe(
     if opts.target_arrow_schema is not None:
         table = cast_arrow_tabular(table, opts)
 
-    spark = pyspark.sql.SparkSession.getActiveSession()  # type: ignore[union-attr]
+    spark = SparkSQL.SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError(
             "An active SparkSession is required to convert Arrow data to Spark"
@@ -708,7 +708,7 @@ def any_to_spark_dataframe(
     schema using :func:`arrow_field_to_spark_field` to preserve nullability and
     metadata-driven mappings.
     """
-    spark = pyspark.sql.SparkSession.getActiveSession()  # type: ignore[union-attr]
+    spark = SparkSQL.SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError(
             "An active SparkSession is required to convert Arrow data to Spark"
