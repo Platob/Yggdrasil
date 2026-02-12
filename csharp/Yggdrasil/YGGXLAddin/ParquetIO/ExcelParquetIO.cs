@@ -181,13 +181,65 @@ namespace YGGXLAddin
                     var v = matrix[r, c];
                     if (v == null || v == DBNull.Value) { excel[r, c] = null; continue; }
 
-                    // If Parquet had DateTime, Excel Value2 wants OADate double (usually).
-                    if (v is DateTime dt) { excel[r, c] = dt.ToOADate(); continue; }
+                    // Pick a zone (IMPORTANT). If you want Zurich specifically:
+                    var zurich = TimeZoneInfo.FindSystemTimeZoneById("W. Europe Standard Time"); // Windows
+                                                                                                 // On Linux you'd use "Europe/Zurich" but Excel interop is Windows anyway.
+
+                    if (v is DateTime || v is DateTimeOffset)
+                    {
+                        excel[r, c] = ToIsoWithOffset(v, zurich);
+                        continue;
+                    }
 
                     excel[r, c] = v;
                 }
 
             return excel;
+        }
+
+        static string ToIsoWithOffset(object v, TimeZoneInfo tz = null)
+        {
+            if (v == null || v == DBNull.Value) return null;
+
+            // If Parquet was read as DateTimeOffset already: perfect.
+            if (v is DateTimeOffset dto)
+            {
+                // "o" = round-trip, includes offset
+                return dto.ToString("o");
+            }
+
+            // If Parquet was read as DateTime: we must decide what zone it "means".
+            if (v is DateTime dt)
+            {
+                tz = tz ?? TimeZoneInfo.Local;
+
+                // Treat Unspecified as "tz local time" (common for Parquet timestamps without zone).
+                // Treat Local as local.
+                // Treat Utc as UTC (offset +00:00).
+                if (dt.Kind == DateTimeKind.Utc)
+                {
+                    return new DateTimeOffset(dt, TimeSpan.Zero).ToString("o");
+                }
+
+                if (dt.Kind == DateTimeKind.Local)
+                {
+                    return new DateTimeOffset(dt).ToString("o");
+                }
+
+                // Unspecified: interpret as time in tz, compute offset for that instant
+                var offset = tz.GetUtcOffset(dt);
+                return new DateTimeOffset(dt, offset).ToString("o");
+            }
+
+            // If you also store TimeSpan and want ISO-ish:
+            if (v is TimeSpan ts)
+            {
+                // ISO 8601 duration format could be used, but usually people just want "hh:mm:ss"
+                return ts.ToString();
+            }
+
+            // Pass everything else through as string
+            return Convert.ToString(v);
         }
 
         private static object[,] NormalizeTo1Based(object raw, int rows, int cols)

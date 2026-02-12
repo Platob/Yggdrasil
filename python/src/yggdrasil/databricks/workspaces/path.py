@@ -347,7 +347,7 @@ class DatabricksPath(AbstractDataPath):
 
     def url(self):
         if self._workspace is not None:
-            return self._workspace.safe_host + self.full_path()
+            return self._workspace.safe_host.replace("https://", "dbfs://", 1) + self.full_path()
         return "dbfs://%s" % self.full_path()
 
     def full_path(self) -> str:
@@ -362,6 +362,8 @@ class DatabricksPath(AbstractDataPath):
             return self.workspace_full_path()
         elif self.kind == DatabricksPathKind.VOLUME:
             return self.files_full_path()
+        elif self.kind == DatabricksPathKind.TABLE:
+            return self.tables_full_path()
         else:
             raise ValueError(f"Unknown DatabricksPath kind: {self.kind!r}")
 
@@ -723,6 +725,14 @@ class DatabricksPath(AbstractDataPath):
             Volume path string.
         """
         return "/Volumes/%s" % "/".join(self.full_parts())
+
+    def tables_full_path(self) -> str:
+        """Return the full files (volume) path string.
+
+        Returns:
+            Volume path string.
+        """
+        return "/Tables/%s" % "/".join(self.full_parts())
 
     def exists(self, *, follow_symlinks=True) -> bool:
         """Return True if the path exists.

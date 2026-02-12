@@ -385,9 +385,7 @@ class Workspace:
 
     @property
     def safe_host(self):
-        if not self.host:
-            self.host = self.sdk().config.host
-        return self.host
+        return self.sdk().config.host
 
     @property
     def current_user(self):

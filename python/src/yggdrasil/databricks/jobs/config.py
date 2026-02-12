@@ -10,7 +10,6 @@ from enum import Enum
 from inspect import isclass
 from typing import Any, Dict, List, get_type_hints, get_origin
 
-from ...libs.sparklib import SparkSession
 from ...types.cast.registry import convert
 
 __all__ = [
@@ -321,10 +320,11 @@ class NotebookConfig:
         Returns:
             An instance of the dataclass populated from widgets or environment.
         """
+        from ...spark import pyspark_sql
         cls.init_widgets()
 
-        if SparkSession is not None:
-            spark_session = SparkSession.getActiveSession()
+        if pyspark_sql.SparkSession is not None:
+            spark_session = pyspark_sql.SparkSession.getActiveSession()
 
             if spark_session:
                 spark_session.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")

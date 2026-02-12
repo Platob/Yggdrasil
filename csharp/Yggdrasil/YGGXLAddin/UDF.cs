@@ -13,7 +13,7 @@ namespace YGGXLAddin
         // ---------------------------
         // PYEXE
         // ---------------------------
-        [ExcelFunction(Name = "PYEXE", Description = "Python execute code", IsThreadSafe = false)]
+        [ExcelFunction(Name = "PYTHON_EXECUTE", Description = "Python execute code", IsThreadSafe = false)]
         public static object PyExe(
             object code,
             string environment = null,
@@ -45,7 +45,7 @@ namespace YGGXLAddin
         // READ_DATA_PATH
         // DataPath -> temp parquet -> worksheet write (macro queued)
         // ---------------------------
-        [ExcelFunction(Name = "READ_DATA_PATH", Description = "Read DataPath and write to worksheet (parquet->cells).", IsThreadSafe = false)]
+        [ExcelFunction(Name = "READ_PATH_DATA", Description = "Read DataPath and write to worksheet (parquet->cells).", IsThreadSafe = false)]
         public static object ReadDataPath(
             string path,
             object output = null,
@@ -87,7 +87,7 @@ namespace YGGXLAddin
             }
         }
 
-        [ExcelFunction(Name = "READ_DATA_SQL", Description = "Read DataPath and write to worksheet (parquet->cells).", IsThreadSafe = false)]
+        [ExcelFunction(Name = "READ_SQL_DATA", Description = "Read DataPath and write to worksheet (parquet->cells).", IsThreadSafe = false)]
         public static object ReadDataSQL(
             string path,
             object query,
@@ -132,7 +132,7 @@ namespace YGGXLAddin
         // WRITE_DATA_PATH
         // Worksheet -> temp parquet -> DataPath write (macro queued)
         // ---------------------------
-        [ExcelFunction(Name = "WRITE_DATA_PATH", Description = "Write worksheet block to destination DataPath.", IsThreadSafe = false)]
+        [ExcelFunction(Name = "WRITE_PATH_DATA", Description = "Write worksheet block to destination DataPath.", IsThreadSafe = false)]
         public static object WriteDataPath(
             object input = null,
             string path = null,
@@ -186,10 +186,11 @@ namespace YGGXLAddin
             return path;
         }
 
-        [ExcelFunction(Name = "WRITE_DATA_SQL", Description = "Write worksheet block to destination DataPath.", IsThreadSafe = false)]
+        [ExcelFunction(Name = "WRITE_SQL_DATA", Description = "Write worksheet block to destination DataPath.", IsThreadSafe = false)]
         public static object WriteDataSQL(
             object input = null,
             string path = null,
+            string mode = null,
             int rowCount = 0,
             int columnCount = 0,
             string environment = null,
@@ -203,8 +204,9 @@ namespace YGGXLAddin
 
             workingDirectory = EnsureWorkingDir(workingDirectory);
 
+            var strMode = string.IsNullOrWhiteSpace(mode) ? "append" : mode;
             var tmp = TempParquet("write_databricks_sql_");
-            var pyCode = BuildPyWriteParquetToDatabricksSQL(tmp, path);
+            var pyCode = BuildPyWriteParquetToDatabricksSQL(tmp, path, savemode: strMode);
 
             // Important: avoid COM access on UDF thread; do EVERYTHING COM-ish inside QueueAsMacro.
             ExcelAsyncUtil.QueueAsMacro(() =>
@@ -328,7 +330,8 @@ LocalDataPath(dst).write_polars(pl.read_parquet(src))
 
         private static string BuildPyWriteParquetToDatabricksSQL(
             string srcPath,
-            string dstPath)
+            string dstPath,
+            string savemode)
         {
             string pySrc = EscapePyRaw(srcPath);
             string pyDst = EscapePyRaw(dstPath);
@@ -338,6 +341,8 @@ $@"from yggdrasil.io.path import LocalDataPath
 
 src = r""{pySrc}""
 dst = r""{pyDst}""
+savemode = r""{savemode}""
+
 dst_path = LocalDataPath(dst)
 
 # normalize empty strings too
@@ -354,6 +359,7 @@ if all(p is None for p in parts):
 df = LocalDataPath(src).read_polars()
 dst_path.sql_engine().insert_into(
     df,
+    mode=savemode,
     catalog_name=catalog_name, schema_name=schema_name,
     table_name=table_name
 )
