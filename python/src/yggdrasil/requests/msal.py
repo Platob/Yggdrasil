@@ -106,11 +106,6 @@ class MSALAuth:
             raise ValueError("client_id is required. Set AZURE_CLIENT_ID.")
         if not self.authority:
             raise ValueError("authority is required. Set AZURE_AUTHORITY or AZURE_TENANT_ID.")
-        if not self.client_secret:
-            raise ValueError(
-                "client_secret is required for client credential flow. "
-                "Set AZURE_CLIENT_SECRET or use a public client flow method."
-            )
         if not self.scopes:
             raise ValueError(
                 "scopes are required for acquire_token_for_client. "
@@ -193,10 +188,10 @@ class MSALAuth:
 
     def refresh(self, force: bool = False) -> "MSALAuth":
         """Acquire/refresh token for confidential client flow."""
-        self._ensure_confidential_flow_ready()
-        auth_app = self.auth_app
-
         if force or self.is_expired or not self._access_token:
+            self._ensure_confidential_flow_ready()
+            auth_app = self.auth_app
+
             if self.client_secret:
                 result = auth_app.acquire_token_for_client(scopes=self.scopes)
             else:

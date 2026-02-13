@@ -305,7 +305,15 @@ class SQLEngine(WorkspaceService):
     ) -> "delta.tables.DeltaTable":
         """Return a DeltaTable handle for a given table name (Spark context required)."""
         from ...spark.lib import pyspark_sql
-        from delta.tables import DeltaTable
+
+        try:
+            from delta.tables import DeltaTable
+        except ImportError:
+            from ...pyutils.pyenv import PyEnv
+
+            m = PyEnv.runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
+
+            DeltaTable = m.DeltaTable
 
         if not full_name:
             full_name = self.table_full_name(

@@ -28,7 +28,8 @@ __all__ = [
     "polars_strptime",
     "polars_dataframe_to_arrow_table",
     "arrow_table_to_polars_dataframe",
-    "any_to_polars_dataframe"
+    "any_to_polars_dataframe",
+    "any_polars_to_arrow_field"
 ]
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,13 @@ ARROW_TO_POLARS: Dict[pa.DataType, polars.DataType] = {
 }
 
 
-POLARS_BASE_TO_ARROW = {v: k for k, v in ARROW_TO_POLARS.items()}
+POLARS_BASE_TO_ARROW = {
+    v: k for k, v in ARROW_TO_POLARS.items()
+}
+
+
+def polars_type_classes():
+    return tuple(v.__class__ for v in ARROW_TO_POLARS.values())
 
 
 # ---------------------------------------------------------------------------
@@ -725,3 +732,46 @@ def polars_array_to_arrow_field(
         nullable=nullable,
         metadata=None
     )
+
+def any_polars_to_arrow_field(obj: Any, options: Optional[CastOptions]) -> pa.Field:
+    options = CastOptions.check_arg(options)
+
+    if isinstance(obj, polars.DataFrame):
+        obj = pa.field(
+            name="root",
+            type=pa.struct([
+                pa.field(name=name, type=polars_type_to_arrow_type(dtype, None))
+                for name, dtype in obj.schema.items()
+            ])
+        )
+
+        return obj
+
+    elif isinstance(obj, polars.DataType):
+        return pa.field(
+            name="root" if options.target_field is None else options.target_field.name,
+            type=polars_type_to_arrow_type(obj, options),
+            nullable=True if options.target_field is None else options.target_field.nullable,
+            metadata=None if options.target_field is None else options.target_field.metadata,
+        )
+
+    elif isinstance(obj, polars.Field):
+        return pa.field(
+            name=obj.name,
+            type=polars_type_to_arrow_type(obj.dtype, options),
+            nullable=True if options.target_field is None else options.target_field.nullable,
+            metadata=None if options.target_field is None else options.target_field.metadata,
+        )
+
+    elif obj in polars_type_classes:
+        obj = obj()
+
+        return pa.field(
+            name="root" if options.target_field is None else options.target_field.name,
+            type=polars_type_to_arrow_type(obj, options),
+            nullable=True if options.target_field is None else options.target_field.nullable,
+            metadata=None if options.target_field is None else options.target_field.metadata,
+        )
+
+    else:
+        raise ValueError(f"Cannot convert polars object {type(obj)} to pyarrow.Field")

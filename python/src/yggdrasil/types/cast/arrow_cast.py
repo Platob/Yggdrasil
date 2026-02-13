@@ -1263,19 +1263,19 @@ def any_to_arrow_field(
             from ...spark.cast import any_spark_to_arrow_field
 
             return any_spark_to_arrow_field(obj, options)
+        elif namespace.startswith("polars"):
+            from ...polars.cast import any_polars_to_arrow_field
+
+            obj = any_polars_to_arrow_field(obj, options)
+
+            if options.source_field:
+                obj = merge_arrow_fields(options.source_field, obj)
         else:
             from ...polars.lib import polars
-            from ...polars.cast import any_to_polars_dataframe, polars_type_to_arrow_type
+            from ...polars.cast import any_to_polars_dataframe, any_polars_to_arrow_field
 
             df: polars.DataFrame = any_to_polars_dataframe(obj, options)
-
-            obj = pa.field(
-                name="root",
-                type=pa.struct([
-                    pa.field(name=name, type=polars_type_to_arrow_type(dtype))
-                    for name, dtype in df.schema.items()
-                ])
-            )
+            obj = any_polars_to_arrow_field(df, options)
 
             if options.source_field:
                 obj = merge_arrow_fields(options.source_field, obj)
