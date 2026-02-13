@@ -143,6 +143,14 @@ class SQLWarehouse(WorkspaceService):
 
     _details: Optional[EndpointInfo] = dc.field(default=None, repr=False, hash=False, compare=False)
 
+    def __post_init__(self):
+        if self.warehouse_name and not self.warehouse_id:
+            found = self.find_warehouse(warehouse_name=self.warehouse_name)
+
+            self.warehouse_id = found.warehouse_id
+            self.warehouse_name = found.warehouse_name
+            self.details = found.details
+
     def warehouse_client(self):
         return self.workspace.sdk().warehouses
 
@@ -227,7 +235,7 @@ class SQLWarehouse(WorkspaceService):
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         raise_error: bool = True,
-        find_starter: bool = False
+        find_starter: bool = False,
     ):
         if warehouse_id:
             if warehouse_id == self.warehouse_id:
@@ -246,7 +254,7 @@ class SQLWarehouse(WorkspaceService):
         warehouse_name = warehouse_name or self.warehouse_name or self._make_default_name(enable_serverless_compute=True)
 
         if warehouse_name:
-            if warehouse_name == self.warehouse_name:
+            if warehouse_name == self.warehouse_name and self.warehouse_id:
                 return self
 
             warehouse_id = get_cached_warehouse_id(
@@ -268,7 +276,7 @@ class SQLWarehouse(WorkspaceService):
                 if warehouse.warehouse_name == warehouse_name:
                     set_cached_warehouse_name(
                         host=self.workspace.safe_host,
-                        warehouse_name=warehouse_name,
+                        warehouse_name=warehouse.warehouse_name,
                         warehouse_id=warehouse.warehouse_id
                     )
 
@@ -503,23 +511,25 @@ class SQLWarehouse(WorkspaceService):
 
     def update_permissions(
         self,
-        access_control_list: Optional[List[WarehouseAccessControlRequest]] = None,
-        wait: Optional[WaitingConfigArg] = None
+        permissions: Optional[List[WarehouseAccessControlRequest]] = None,
+        *,
+        wait: Optional[WaitingConfigArg] = None,
+        warehouse_id: Optional[str] = None
     ):
-        if self.warehouse_id:
+        warehouse_id = warehouse_id or self.warehouse_id
+
+        if warehouse_id:
             client = self.warehouse_client()
 
-            access_control_list = self._check_access_control_list(
-                access_control_list=access_control_list
-            )
+            permissions = self.check_permissions(permissions=permissions)
 
-            if access_control_list:
+            if permissions:
                 client.update_permissions(
-                    warehouse_id=self.warehouse_id,
-                    access_control_list=access_control_list
+                    warehouse_id=warehouse_id,
+                    access_control_list=permissions
                 )
 
-    def default_access_control_list(self, for_all: bool):
+    def default_permissions(self, for_all: bool):
         if for_all:
             base = [
                 WarehouseAccessControlRequest(
@@ -545,18 +555,18 @@ class SQLWarehouse(WorkspaceService):
 
         return base
 
-    def _check_access_control_list(
+    def check_permissions(
         self,
-        access_control_list: Optional[List[WarehouseAccessControlRequest]] = None
+        permissions: Optional[List[WarehouseAccessControlRequest]] = None
     ):
-        if access_control_list is None:
-            access_control_list = []
+        if permissions is None:
+            permissions = []
 
-        access_control_list.extend(self.default_access_control_list(
+        permissions.extend(self.default_permissions(
             for_all=self.warehouse_name.startswith("yggdrasil") if self.warehouse_name else False
         ))
 
-        return access_control_list
+        return permissions
 
     def delete(self):
         if self.warehouse_id:

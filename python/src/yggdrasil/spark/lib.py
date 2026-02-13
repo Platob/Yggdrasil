@@ -1,19 +1,12 @@
 try:
     import pyspark
-
-    pyspark_sql = pyspark.sql
 except ImportError:
-    from ..pyutils.dummy import Dummy
+    from ..pyutils.pyenv import PyEnv
 
-    pyspark = Dummy.from_name(
-        "pyspark",
-        to_class=False
-    )
+    pyspark = PyEnv.runtime_import_module(module_name="pyspark", pip_name="pyspark")
 
-    pyspark_sql = Dummy.from_name(
-        "pyspark", "sql",
-        to_class=False
-    )
+pyspark_sql = pyspark.sql
+
 
 __all__ = [
     "pyspark",

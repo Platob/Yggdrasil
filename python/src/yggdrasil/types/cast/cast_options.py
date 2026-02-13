@@ -58,6 +58,7 @@ class CastOptions:
     allow_add_columns: bool = False
     eager: bool = False
     datetime_patterns: Optional[List[str]] = None
+    merge: bool = False
 
     source_arrow_field: Optional[pa.Field] = None
     _source_spark_field: Optional["pyspark.sql.types.StructField"] = dataclasses.field(default=None, init=False, repr=False)
@@ -78,6 +79,7 @@ class CastOptions:
         allow_add_columns: bool = False,
         eager: bool = False,
         datetime_patterns: Optional[List[str]] = None,
+        merge: bool = False,
         source_field: pa.Field | pa.Schema | pa.DataType | None = None,
         target_field: pa.Field | pa.Schema | pa.DataType | None = None,
         **kwargs
@@ -91,6 +93,7 @@ class CastOptions:
             allow_add_columns: Allow extra columns if True.
             eager: Enable eager casting behavior if True.
             datetime_patterns: Optional datetime parsing patterns.
+            merge: bool merge casting
             source_field: Optional source Arrow field/schema/type.
             target_field: Optional target Arrow field/schema/type.
             **kwargs: Additional CastOptions fields.
@@ -105,6 +108,7 @@ class CastOptions:
             allow_add_columns=allow_add_columns,
             eager=eager,
             datetime_patterns=datetime_patterns,
+            merge=merge,
             **kwargs
         )
 
@@ -124,6 +128,7 @@ class CastOptions:
         allow_add_columns: bool = False,
         eager: bool = False,
         datetime_patterns: Optional[List[str]] = None,
+        merge: bool = False,
         source_field: pa.Field | pa.Schema | pa.DataType | None = None,
         source_arrow_field: pa.Field | None = None,
         target_field: pa.Field | pa.Schema | pa.DataType | None = None,
@@ -141,6 +146,7 @@ class CastOptions:
             allow_add_columns=self.allow_add_columns or allow_add_columns,
             eager=self.eager or eager,
             datetime_patterns=self.datetime_patterns or datetime_patterns,
+            merge=self.merge or merge,
             source_arrow_field=self.source_arrow_field if source_arrow_field is None else source_arrow_field,
             target_arrow_field=self.target_arrow_field if target_arrow_field is None else target_arrow_field,
         )

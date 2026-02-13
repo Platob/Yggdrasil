@@ -3,11 +3,11 @@
 from typing import Optional, Tuple, List, Any, Union
 
 import pyarrow as pa
-import pyspark.sql as SparkSQL
+from yggdrasil.spark.lib import pyspark_sql
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
 
-from ..types.cast.arrow_cast import cast_arrow_tabular, arrow_field_to_schema
+from ..types.cast.arrow_cast import cast_arrow_tabular, arrow_field_to_schema, arrow_field_to_field, arrow_type_to_field
 from ..types.cast.cast_options import CastOptions, CastOptionsArg
 from ..types.cast.registry import register_converter
 from ..types.python_defaults import default_arrow_scalar, default_python_scalar
@@ -24,6 +24,7 @@ __all__ = [
     "arrow_type_to_spark_type",
     "spark_type_to_arrow_type",
     "any_to_spark_dataframe",
+    "any_spark_to_arrow_field"
 ]
 
 # Primitive Arrow -> Spark mappings
@@ -144,28 +145,37 @@ def arrow_type_to_spark_type(
 
     raise TypeError(f"Unsupported or unknown Arrow type for Spark conversion: {arrow_type!r}")
 
-
+@register_converter(pa.Field, T.StructField)
 def arrow_field_to_spark_field(
     field: pa.Field,
-    cast_options: Any = None,
+    options: Optional[CastOptions] = None,
 ) -> T.StructField:
     """
     Convert a pyarrow.Field to a pyspark StructField.
 
     Args:
         field: Arrow field to convert.
-        cast_options: Optional casting options.
+        options: Optional casting options.
 
     Returns:
         Spark StructField representation.
     """
-    spark_type = arrow_type_to_spark_type(field.type, cast_options)
+    field = arrow_field_to_field(field, options)
+    spark_type = arrow_type_to_spark_type(field.type, options)
+
+    if field.metadata:
+        metadata = {
+            k.decode(): v.decode()
+            for k, v in field.metadata.items()
+        }
+    else:
+        metadata = None
 
     return T.StructField(
         name=field.name,
         dataType=spark_type,
         nullable=field.nullable,
-        metadata={},
+        metadata=metadata,
     )
 
 
@@ -277,11 +287,11 @@ def spark_field_to_arrow_field(
     )
 
 
-@register_converter(SparkSQL.DataFrame, SparkSQL.DataFrame)
+@register_converter(pyspark_sql.DataFrame, pyspark_sql.DataFrame)
 def cast_spark_dataframe(
-    dataframe: SparkSQL.DataFrame,
+    dataframe: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.DataFrame:
+) -> pyspark_sql.DataFrame:
     """
     Cast a Spark DataFrame using Arrow *types* but without collecting to Arrow.
 
@@ -319,7 +329,7 @@ def cast_spark_dataframe(
             field.name.casefold(): idx for idx, field in enumerate(source_arrow_fields)
         })
 
-    casted_columns: List[Tuple[T.StructField, SparkSQL.Column]] = []
+    casted_columns: List[Tuple[T.StructField, pyspark_sql.Column]] = []
     found_source_names = set()
 
     for sub_target_index, child_target_spark_field in enumerate(child_target_spark_fields):
@@ -339,7 +349,7 @@ def cast_spark_dataframe(
             child_source_arrow_field = source_arrow_fields[sub_target_index]
             child_source_spark_field = source_spark_fields[sub_target_index]
             found_source_names.add(child_source_spark_field.name)
-            df_col: SparkSQL.Column = dataframe[source_index]
+            df_col: pyspark_sql.Column = dataframe[source_index]
 
             casted_column = cast_spark_column(
                 df_col,
@@ -370,11 +380,11 @@ def cast_spark_dataframe(
     return result.sparkSession.createDataFrame(result.rdd, schema=target_spark_schema)
 
 
-@register_converter(SparkSQL.Column, SparkSQL.Column)
+@register_converter(pyspark_sql.Column, pyspark_sql.Column)
 def cast_spark_column(
-    column: SparkSQL.Column,
+    column: pyspark_sql.Column,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.Column:
+) -> pyspark_sql.Column:
     """
     Cast a single Spark Column using an Arrow target *type*.
 
@@ -419,11 +429,11 @@ def cast_spark_column(
 
 
 def check_column_nullability(
-    column: SparkSQL.Column,
+    column: pyspark_sql.Column,
     source_field: T.StructField,
     target_field: T.StructField,
-    mask: SparkSQL.Column
-) -> SparkSQL.Column:
+    mask: pyspark_sql.Column
+) -> pyspark_sql.Column:
     """Fill nulls when the target field is non-nullable.
 
     Args:
@@ -447,9 +457,9 @@ def check_column_nullability(
 
 
 def cast_spark_column_to_list(
-    column: SparkSQL.Column,
+    column: pyspark_sql.Column,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.Column:
+) -> pyspark_sql.Column:
     """
     Cast a Spark Column to an ArrayType using Arrow field type info.
 
@@ -489,9 +499,9 @@ def cast_spark_column_to_list(
 
 
 def cast_spark_column_to_struct(
-    column: SparkSQL.Column,
+    column: pyspark_sql.Column,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.Column:
+) -> pyspark_sql.Column:
     """
     Cast a Spark Column to a StructType using Arrow field type info.
 
@@ -560,9 +570,9 @@ def cast_spark_column_to_struct(
 
 
 def cast_spark_column_to_map(
-    column: SparkSQL.Column,
+    column: pyspark_sql.Column,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.Column:
+) -> pyspark_sql.Column:
     """
     Cast a Spark Column to a MapType using Arrow field type info.
 
@@ -642,9 +652,9 @@ def cast_spark_column_to_map(
 # Spark DataFrame <-> Arrow Table / RecordBatchReader
 # ---------------------------------------------------------------------------
 
-@register_converter(SparkSQL.DataFrame, pa.Table)
+@register_converter(pyspark_sql.DataFrame, pa.Table)
 def spark_dataframe_to_arrow_table(
-    dataframe: SparkSQL.DataFrame,
+    dataframe: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.Table:
     """Convert a Spark DataFrame to a pyarrow.Table.
@@ -668,11 +678,11 @@ def spark_dataframe_to_arrow_table(
     return cast_arrow_tabular(dataframe.toArrow(), CastOptions.check_arg(arrow_schema))
 
 
-@register_converter(pa.Table, SparkSQL.DataFrame)
+@register_converter(pa.Table, pyspark_sql.DataFrame)
 def arrow_table_to_spark_dataframe(
     table: pa.Table,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.DataFrame:
+) -> pyspark_sql.DataFrame:
     """Convert a pyarrow.Table to a Spark DataFrame.
 
     If a target schema is supplied, :func:`cast_arrow_table` is applied before
@@ -685,7 +695,7 @@ def arrow_table_to_spark_dataframe(
     if opts.target_arrow_schema is not None:
         table = cast_arrow_tabular(table, opts)
 
-    spark = SparkSQL.SparkSession.getActiveSession()
+    spark = pyspark_sql.SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError(
             "An active SparkSession is required to convert Arrow data to Spark"
@@ -696,11 +706,11 @@ def arrow_table_to_spark_dataframe(
     return spark.createDataFrame(table, schema=spark_schema)
 
 
-@register_converter(Any, SparkSQL.DataFrame)
+@register_converter(Any, pyspark_sql.DataFrame)
 def any_to_spark_dataframe(
     obj: Any,
     options: Optional[CastOptions] = None,
-) -> SparkSQL.DataFrame:
+) -> pyspark_sql.DataFrame:
     """Convert a pyarrow.Table to a Spark DataFrame.
 
     If a target schema is supplied, :func:`cast_arrow_table` is applied before
@@ -708,13 +718,13 @@ def any_to_spark_dataframe(
     schema using :func:`arrow_field_to_spark_field` to preserve nullability and
     metadata-driven mappings.
     """
-    spark = SparkSQL.SparkSession.getActiveSession()
+    spark = pyspark_sql.SparkSession.getActiveSession()
     if spark is None:
         raise RuntimeError(
             "An active SparkSession is required to convert Arrow data to Spark"
         )
 
-    if not isinstance(obj, SparkSQL.DataFrame):
+    if not isinstance(obj, pyspark_sql.DataFrame):
         options = CastOptions.check_arg(options)
 
         if obj is None:
@@ -729,12 +739,36 @@ def any_to_spark_dataframe(
     return cast_spark_dataframe(obj, options)
 
 
+def any_spark_to_arrow_field(obj: Any, options: Optional[CastOptions]) -> pa.Field:
+    if isinstance(obj, pa.Field):
+        return obj
+
+    if isinstance(obj, pyspark_sql.DataFrame):
+        obj = obj.schema
+
+    if isinstance(obj, T.StructField):
+        return spark_field_to_arrow_field(obj, options)
+
+    if isinstance(obj, T.DataType):
+        return arrow_type_to_field(spark_type_to_arrow_type(obj), options)
+
+    options = CastOptions.check_arg(options)
+
+    if isinstance(obj, pyspark_sql.Column):
+        if options.source_arrow_field is not None:
+            return options.source_arrow_field
+
+    raise TypeError(
+        f"Cannot convert {type(obj)} to pyarrow.Field"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Arrow <-> Spark type / field / schema converters (hooked into registry)
 # ---------------------------------------------------------------------------
-@register_converter(SparkSQL.DataFrame, T.DataType)
+@register_converter(pyspark_sql.DataFrame, T.DataType)
 def spark_dataframe_to_spark_type(
-    df: SparkSQL.DataFrame,
+    df: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     """Return the Spark DataFrame schema as a Spark data type.
@@ -749,9 +783,9 @@ def spark_dataframe_to_spark_type(
     return df.schema
 
 
-@register_converter(SparkSQL.DataFrame, T.StructField)
+@register_converter(pyspark_sql.DataFrame, T.StructField)
 def spark_dataframe_to_spark_field(
-    df: SparkSQL.DataFrame,
+    df: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     """Return a Spark StructField for the DataFrame schema.
@@ -770,9 +804,9 @@ def spark_dataframe_to_spark_field(
     )
 
 
-@register_converter(SparkSQL.DataFrame, pa.Field)
+@register_converter(pyspark_sql.DataFrame, pa.Field)
 def spark_dataframe_to_arrow_field(
-    df: SparkSQL.DataFrame,
+    df: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     """Return an Arrow field representation of the DataFrame schema.
@@ -790,9 +824,9 @@ def spark_dataframe_to_arrow_field(
     )
 
 
-@register_converter(SparkSQL.DataFrame, pa.Schema)
+@register_converter(pyspark_sql.DataFrame, pa.Schema)
 def spark_dataframe_to_arrow_schema(
-    df: SparkSQL.DataFrame,
+    df: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.DataType:
     """Return an Arrow schema representation of the DataFrame.

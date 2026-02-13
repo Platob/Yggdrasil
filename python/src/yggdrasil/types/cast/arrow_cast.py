@@ -4,16 +4,18 @@ import dataclasses
 import enum
 import logging
 from dataclasses import is_dataclass
-from typing import Optional, Union, List, Tuple, Any
+from typing import Optional, Union, List, Tuple, Any, Iterable
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.types as pat
 
 from .cast_options import CastOptions
 from .registry import register_converter
 from ..python_arrow import is_arrow_type_list_like, is_arrow_type_string_like, is_arrow_type_binary_like
 from ..python_defaults import default_arrow_scalar, default_arrow_array
 from ...dataclasses.dataclass import get_dataclass_arrow_field
+from ...pyutils.serde import ObjectSerde
 
 __all__ = [
     "cast_arrow_array",
@@ -23,16 +25,30 @@ __all__ = [
     "to_spark_arrow_type",
     "to_polars_arrow_type",
     "arrow_field_to_schema",
+    "arrow_type_to_field",
     "is_arrow_type_binary_like",
     "is_arrow_type_string_like",
     "is_arrow_type_list_like",
     "record_batch_to_table",
     "arrow_schema_to_field",
+    "arrow_field_to_field",
+    "arrow_schema_to_schema",
+    "any_to_arrow_scalar",
+    "any_to_arrow_field",
+    "any_to_arrow_table",
+    "any_to_arrow_record_batch",
+    "any_to_arrow_schema"
 ]
 
-from ...pyutils.serde import ObjectSerde
 
 logger = logging.getLogger(__name__)
+
+ArrowDataType = Union[
+    pa.DataType,
+    pa.Decimal128Type, pa.TimestampType,
+    pa.DictionaryType,
+    pa.MapType, pa.StructType, pa.FixedSizeListType
+]
 
 
 def cast_to_struct_array(
@@ -87,7 +103,7 @@ def arrow_map_to_struct_array(
     map_type: pa.MapType = array.type
 
     for child_target_field in target_type:
-        values = pc.map_lookup(array, child_target_field.name, "first")
+        values = pc.map_lookup(array, child_target_field.name, "first") # type: ignore
 
         casted = cast_arrow_array(
             values,
@@ -104,7 +120,7 @@ def arrow_map_to_struct_array(
         fields=list(target_type),
         mask=mask,
         memory_pool=options.arrow_memory_pool
-    )
+    ) # type: ignore
 
 
 @register_converter(pa.StructArray, pa.StructArray)
@@ -180,7 +196,7 @@ def arrow_struct_to_struct_array(
         fields=list(target_type),
         mask=mask,
         memory_pool=options.arrow_memory_pool
-    )
+    ) # type: ignore
 
 
 def cast_to_list_arrow_array(
@@ -252,23 +268,23 @@ def cast_to_list_arrow_array(
         return pa.ListArray.from_arrays(
             offsets,
             values,
-            type=target_type,
+            type=target_type, # type: ignore
             mask=mask
-        )
+        ) # type: ignore
     if pa.types.is_large_list(target_type):
         return pa.LargeListArray.from_arrays(
             offsets,
             values,
-            type=target_type,
+            type=target_type, # type: ignore
             mask=mask
-        )
+        ) # type: ignore
     elif pa.types.is_fixed_size_list(target_type):
         return pa.FixedSizeListArray.from_arrays(
             values,
             list_size=target_type.list_size,
-            type=target_type,
+            type=target_type, # type: ignore
             mask=mask
-        )
+        ) # type: ignore
     else:
         raise pa.ArrowInvalid(f"Cannot build arrow array for target list type {target_type}")
 
@@ -339,9 +355,9 @@ def arrow_map_to_map_array(
         keys,
         items,
         mask=mask,
-        type=target_type,
-        pool=options.arrow_memory_pool
-    )
+        type=target_type, # type: ignore
+        pool=options.arrow_memory_pool # type: ignore
+    ) # type: ignore
 
 
 @register_converter(pa.StructArray, pa.MapArray)
@@ -399,9 +415,9 @@ def arrow_struct_to_map_array(
         pa.array(keys, type=pa.string()),
         pa.array(items, type=target_type.item_type),
         mask=mask,
-        type=map_type,
-        pool=options.arrow_memory_pool
-    )
+        type=map_type, # type: ignore
+        pool=options.arrow_memory_pool # type: ignore
+    ) # type: ignore
 
 
 def cast_primitive_array(
@@ -465,7 +481,7 @@ def check_arrow_array_nullability(
             size=len(array)
         )
 
-        return pc.if_else(pc.is_null(array), default_arr, array)
+        return pc.if_else(pc.is_null(array), default_arr, array) # type: ignore
 
 
 @register_converter(Any, pa.Table)
@@ -525,37 +541,41 @@ def any_to_arrow_scalar(
     Returns:
         Arrow scalar.
     """
-    if isinstance(scalar, pa.Scalar):
-        return cast_arrow_scalar(scalar, options)
+    if not isinstance(scalar, pa.Scalar):
+        options = CastOptions.check_arg(options)
+        target_field = options.target_field
 
-    options = CastOptions.check_arg(options)
-    target_field = options.target_field
+        if scalar is None:
+            return default_arrow_scalar(
+                target_field,
+                nullable=True if target_field is None else target_field.nullable
+            )
 
-    if isinstance(scalar, enum.Enum):
-        scalar = scalar.value
+        if isinstance(scalar, enum.Enum):
+            scalar = scalar.value
 
-    if is_dataclass(scalar):
-        if not target_field:
-            target_field = get_dataclass_arrow_field(scalar)
-            options = options.copy(target_arrow_field=target_field)
-
-        scalar = dataclasses.asdict(scalar)
-
-    if target_field is None:
         if is_dataclass(scalar):
-            scalar = pa.scalar(dataclasses.asdict(scalar), type=get_dataclass_arrow_field(scalar).type)
-        else:
+            if not target_field:
+                target_field = get_dataclass_arrow_field(scalar)
+                options = options.copy(target_arrow_field=target_field)
+
+            scalar = dataclasses.asdict(scalar)
+
+        if target_field is None:
+            if is_dataclass(scalar):
+                scalar = pa.scalar(
+                    dataclasses.asdict(scalar),
+                    type=get_dataclass_arrow_field(scalar).type
+                )
+            else:
+                scalar = pa.scalar(scalar)
+
+            return scalar
+
+        try:
+            scalar = pa.scalar(scalar, type=target_field.type)
+        except pa.ArrowInvalid:
             scalar = pa.scalar(scalar)
-
-        return scalar
-
-    if scalar is None and not target_field.nullable:
-        return default_arrow_scalar(target_field)
-
-    try:
-        scalar = pa.scalar(scalar, type=target_field.type)
-    except:
-        scalar = pa.scalar(scalar)
 
     return cast_arrow_scalar(scalar, options)
 
@@ -684,7 +704,7 @@ def arrow_strptime(
 
         for pattern in patterns:
             try:
-                casted = pc.strptime(
+                casted = pc.strptime( # type: ignore
                     arr,
                     format=pattern,
                     unit=target_field.type.unit,
@@ -731,6 +751,9 @@ def cast_arrow_tabular(
         # No target schema -> return as-is
         return data
 
+    if options.merge:
+        target_arrow_schema = arrow_field_to_field
+
     if data.num_rows == 0:
         return data.__class__.from_arrays(
             arrays=[
@@ -745,18 +768,20 @@ def cast_arrow_tabular(
             schema=target_arrow_schema
         )
 
-    source_arrow_schema: pa.Schema = data.schema
+    source_arrow_schema: pa.Schema | Iterable[pa.Field] = data.schema
 
     if source_arrow_schema == target_arrow_schema:
         return data
 
     source_name_to_index = {
-        field.name: idx for idx, field in enumerate(source_arrow_schema)
+        field.name: idx
+        for idx, field in enumerate(source_arrow_schema)
     }
 
     if not options.strict_match_names:
         source_name_to_index.update({
-            field.name.casefold(): idx for idx, field in enumerate(source_arrow_schema)
+            field.name.casefold(): idx
+            for idx, field in enumerate(source_arrow_schema)
         })
 
     chunks = None
@@ -838,24 +863,24 @@ def cast_arrow_record_batch_reader(
         # Nothing to cast, just return the original reader
         return data
 
-    def casted_batches():
+    def casted_batches(opt=options):
         """Yield casted batches from a RecordBatchReader.
 
         Yields:
             Casted RecordBatch instances.
         """
         for batch in data:
-            yield cast_arrow_tabular(batch, options)
+            yield cast_arrow_tabular(batch, opt)
 
-    return pa.RecordBatchReader.from_batches(arrow_schema, casted_batches())
+    return pa.RecordBatchReader.from_batches(arrow_schema, casted_batches()) # type: ignore
 
 
 # ---------------------------------------------------------------------------
 # Type normalization helpers
 # ---------------------------------------------------------------------------
 def to_spark_arrow_type(
-    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]
-) -> Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType]:
+    dtype: ArrowDataType
+) -> ArrowDataType:
     """
     Normalize an Arrow DataType to something Spark can handle:
 
@@ -920,7 +945,7 @@ def to_spark_arrow_type(
     return dtype
 
 
-def to_polars_arrow_type(dtype: pa.DataType) -> pa.DataType:
+def to_polars_arrow_type(dtype: ArrowDataType) -> ArrowDataType:
     """
     Normalize an Arrow DataType to something Polars can handle nicely.
 
@@ -1003,7 +1028,7 @@ def table_to_record_batch(
     # Empty table: build an empty batch with same schema
     if casted.num_rows == 0:
         arrays = [pa.array([], type=f.type) for f in casted.schema]
-        return pa.RecordBatch.from_arrays(arrays, schema=casted.schema)
+        return pa.RecordBatch.from_arrays(arrays, schema=casted.schema) # type: ignore
 
     # Merge multiple batches into one RecordBatch
     arrays = [
@@ -1011,7 +1036,7 @@ def table_to_record_batch(
         for chunked_array in casted.columns
     ]
 
-    return pa.RecordBatch.from_arrays(arrays, schema=casted.schema)
+    return pa.RecordBatch.from_arrays(arrays, schema=casted.schema) # type: ignore
 
 
 @register_converter(pa.RecordBatch, pa.Table)
@@ -1023,7 +1048,7 @@ def record_batch_to_table(
     Cast a RecordBatch using `cast_arrow_tabular` and wrap as a single-batch Table.
     """
     casted = cast_arrow_tabular(data, options)
-    return pa.Table.from_batches(batches=[casted], schema=casted.schema)
+    return pa.Table.from_batches(batches=[casted], schema=casted.schema) # type: ignore
 
 
 @register_converter(pa.Table, pa.RecordBatchReader)
@@ -1038,7 +1063,7 @@ def table_to_record_batch_reader(
     return pa.RecordBatchReader.from_batches(
         casted.schema,
         casted.to_batches(),
-    )
+    ) # type: ignore
 
 
 @register_converter(pa.RecordBatchReader, pa.Table)
@@ -1050,7 +1075,7 @@ def record_batch_reader_to_table(
     Cast each batch in a RecordBatchReader and collect into a Table.
     """
     casted_reader: pa.RecordBatchReader = cast_arrow_record_batch_reader(data, options)
-    return pa.Table.from_batches(batches=list(casted_reader), schema=casted_reader.schema)
+    return pa.Table.from_batches(batches=list(casted_reader), schema=casted_reader.schema) # type: ignore
 
 
 @register_converter(pa.RecordBatch, pa.RecordBatchReader)
@@ -1062,7 +1087,7 @@ def record_batch_to_record_batch_reader(
     Cast a RecordBatch and wrap it into a single-batch RecordBatchReader.
     """
     casted = cast_arrow_tabular(data, options)
-    return pa.RecordBatchReader.from_batches(schema=casted.schema, batches=[casted])
+    return pa.RecordBatchReader.from_batches(schema=casted.schema, batches=[casted]) # type: ignore
 
 
 @register_converter(pa.RecordBatchReader, pa.RecordBatch)
@@ -1095,17 +1120,19 @@ def arrow_array_to_field(
     name = options.source_arrow_field.name if options.source_arrow_field else "root"
     metadata = options.source_arrow_field.metadata if options.source_arrow_field else None
 
-    return pa.field(
+    arrow_field = pa.field(
         name,
         array.type,
         nullable=array.type == pa.null() or array.null_count > 0,
         metadata=metadata,
     )
 
+    return arrow_field_to_field(arrow_field, options)
+
 
 @register_converter(pa.DataType, pa.Field)
 def arrow_type_to_field(
-    arrow_type: pa.DataType,
+    arrow_type: ArrowDataType,
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
     """
@@ -1116,12 +1143,51 @@ def arrow_type_to_field(
     nullable = options.source_arrow_field.nullable if options.source_arrow_field else True
     metadata = options.source_arrow_field.metadata if options.source_arrow_field else None
 
-    return pa.field(
+    arrow_field = pa.field(
         name,
         arrow_type,
         nullable=nullable,
         metadata=metadata,
     )
+
+    return arrow_field_to_field(arrow_field, options)
+
+
+@register_converter(pa.Field, pa.Field)
+def arrow_field_to_field(
+    arrow_field: pa.Field,
+    options: Optional[CastOptions] = None,
+) -> pa.Field:
+    """
+    Convert an Arrow type to a Field describing its type.
+    """
+    if options is None:
+        return arrow_field
+
+    options = CastOptions.check_arg(options)
+
+    if options.merge and options.target_arrow_field is not None:
+        return merge_arrow_fields(arrow_field, options.target_arrow_field)
+    return arrow_field
+
+
+@register_converter(pa.Schema, pa.Schema)
+def arrow_schema_to_schema(
+    arrow_schema: pa.Schema,
+    options: Optional[CastOptions] = None,
+) -> pa.Schema:
+    if options is None:
+        return arrow_schema
+
+    options = CastOptions.check_arg(options)
+
+    if options.merge and options.target_arrow_field is not None:
+        base_field = arrow_schema_to_field(arrow_schema, None)
+        casted = merge_arrow_fields(base_field, options.target_arrow_field)
+
+        return arrow_field_to_schema(casted, None)
+
+    return arrow_schema
 
 
 @register_converter(pa.Schema, pa.Field)
@@ -1142,45 +1208,246 @@ def arrow_schema_to_field(
     md = dict(data.metadata or {})
     name = md.setdefault(b"name", b"root")
 
-    return pa.field(name.decode(), dtype, False, md)
+    arrow_field = pa.field(name.decode(), dtype, False, md)
+
+    return arrow_field_to_field(arrow_field, options)
 
 
 @register_converter(pa.Field, pa.Schema)
 def arrow_field_to_schema(
-    data: pa.Field,
+    arrow_field: pa.Field,
     options: Optional[CastOptions] = None,
 ) -> pa.Schema:
     """Return a schema view of an Arrow field.
 
     Args:
-        data: Arrow field.
+        arrow_field: Arrow field.
         options: Optional cast options.
 
     Returns:
         Arrow schema.
     """
-    md = dict(data.metadata or {})
-    md[b"name"] = data.name.encode()
+    arrow_field = arrow_field_to_field(arrow_field, options)
+    md = dict(arrow_field.metadata or {})
+    md[b"name"] = arrow_field.name.encode()
 
-    if pa.types.is_struct(data.type):
-        return pa.schema(list(data.type), metadata=md)
-    return pa.schema([data], metadata=md)
+    if pa.types.is_struct(arrow_field.type):
+        return pa.schema(list(arrow_field.type), metadata=md)
+    return pa.schema([arrow_field], metadata=md)
 
 
-@register_converter(pa.Table, pa.Field)
-@register_converter(pa.RecordBatch, pa.Field)
-@register_converter(pa.RecordBatchReader, pa.Field)
-def arrow_tabular_to_field(
-    data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader],
+@register_converter(Any, pa.Field)
+def any_to_arrow_field(
+    obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
-    """Return a field representing the schema of tabular data.
+    if not isinstance(obj, pa.Field):
+        if isinstance(obj, pa.Schema):
+            return arrow_schema_to_field(obj, options)
+        elif hasattr(obj, "schema") or hasattr(obj, "arrow_schema"):
+            attr = getattr(obj, "schema", None) or getattr(obj, "arrow_schema", None)
 
-    Args:
-        data: Arrow table/batch/reader.
-        options: Optional cast options.
+            if callable(attr):
+                try:
+                    attr = attr()
+                except Exception:
+                    pass
 
-    Returns:
-        Arrow field.
+            if isinstance(attr, pa.Schema):
+                return arrow_schema_to_field(attr, options)
+
+        namespace = ObjectSerde.full_namespace(obj)
+        options = CastOptions.check_arg(options)
+
+        if namespace.startswith("pyspark"):
+            from ...spark.cast import any_spark_to_arrow_field
+
+            return any_spark_to_arrow_field(obj, options)
+        else:
+            from ...polars.lib import polars
+            from ...polars.cast import any_to_polars_dataframe, polars_type_to_arrow_type
+
+            df: polars.DataFrame = any_to_polars_dataframe(obj, options)
+
+            obj = pa.field(
+                name="root",
+                type=pa.struct([
+                    pa.field(name=name, type=polars_type_to_arrow_type(dtype))
+                    for name, dtype in df.schema.items()
+                ])
+            )
+
+            if options.source_field:
+                obj = merge_arrow_fields(options.source_field, obj)
+
+    return arrow_field_to_field(obj, options)
+
+
+@register_converter(Any, pa.Schema)
+def any_to_arrow_schema(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> pa.Schema:
+    if not isinstance(obj, pa.Schema):
+        options = CastOptions.check_arg(options)
+        obj = any_to_arrow_field(obj, options)
+
+        return arrow_field_to_schema(obj, options)
+
+    return arrow_schema_to_schema(obj, options)
+
+
+def _ci_key(name: str) -> str:
+    return (name or "").casefold()
+
+
+def _is_string_like(t: ArrowDataType) -> bool:
+    return pat.is_string(t) or pat.is_large_string(t) or pat.is_binary(t) or pat.is_large_binary(t)
+
+
+def merge_arrow_types(source: Optional[ArrowDataType], target: Optional[ArrowDataType]) -> ArrowDataType:
     """
-    return arrow_schema_to_field(data.schema, options)
+    Merge two Arrow DataTypes so incoming/source data can be aligned to a target schema.
+
+    Rules (pragmatic for Delta/Spark pipelines):
+    - If either side is null -> pick the other.
+    - Prefer the *target container shape* (struct/list/map/dict) so schema converges.
+    - Avoid obvious narrowing (int64 -> int32, float64 -> float32, decimal precision drop).
+    - Recurse for nested types (struct/list/map/dict).
+    - For incompatible primitives, prefer target if Arrow can cast source->target, else source if reverse works.
+    """
+    if source is None:
+        return target or pa.null()
+    elif target is None:
+        return source or pa.null()
+
+    # null handling
+    if pat.is_null(source):
+        return target
+    if pat.is_null(target):
+        return source
+
+    # -------- STRUCT (nested fill columns) --------
+    if pat.is_struct(source) and pat.is_struct(target):
+        s_by_ci = {_ci_key(f.name): f for f in source}
+        t_by_ci = {_ci_key(f.name): f for f in target}
+
+        merged_fields: list[pa.Field] = []
+
+        # keep TARGET ordering inside struct (more important for "match target")
+        for name_ci, tf in t_by_ci.items():
+            sf = s_by_ci.get(name_ci)
+            if sf is None:
+                merged_fields.append(tf)
+            else:
+                merged_fields.append(merge_arrow_fields(sf, tf))
+
+        # keep extra source fields (optional but usually "don’t drop data" friendly)
+        for name_ci, sf in s_by_ci.items():
+            if name_ci not in t_by_ci:
+                merged_fields.append(sf)
+
+        return pa.struct(merged_fields)
+
+    # -------- LIST / LARGE_LIST / FIXED_SIZE_LIST --------
+    if (pat.is_list(source) or pat.is_large_list(source)) and (pat.is_list(target) or pat.is_large_list(target)):
+        merged_value = merge_arrow_types(source.value_type, target.value_type)
+        if pat.is_large_list(target):
+            return pa.large_list(merged_value)
+        return pa.list_(merged_value)
+
+    if pat.is_fixed_size_list(source) and pat.is_fixed_size_list(target):
+        merged_value = merge_arrow_types(source.value_type, target.value_type)
+        # match target shape (size), data-level reshape is a separate concern
+        return pa.list_(merged_value, target.list_size)
+
+    # -------- MAP --------
+    if pat.is_map(source) and pat.is_map(target):
+        merged_key = merge_arrow_types(source.key_type, target.key_type)
+        merged_item = merge_arrow_types(source.item_type, target.item_type)
+        return pa.map_(merged_key, merged_item, keys_sorted=target.keys_sorted)
+
+    # -------- DICTIONARY --------
+    if pat.is_dictionary(source) and pat.is_dictionary(target):
+        merged_value = merge_arrow_types(source.value_type, target.value_type)
+        # target index type wins for interoperability
+        return pa.dictionary(target.index_type, merged_value, ordered=target.ordered) # type: ignore
+
+    # -------- PRIMITIVES --------
+    if pat.is_primitive(source) and pat.is_primitive(target):
+        # strings/binary: match target flavor
+        if _is_string_like(source) or _is_string_like(target):
+            return target
+
+        # boolean
+        if pat.is_boolean(source) and pat.is_boolean(target):
+            return target
+
+        # integer: avoid narrowing
+        if pat.is_integer(source) and pat.is_integer(target):
+            if source.bit_width > target.bit_width:
+                return source
+            # signed/unsigned mismatch: prefer a signed type wide enough to hold both ranges
+            if pat.is_signed_integer(source) != pat.is_signed_integer(target):
+                bw = max(source.bit_width, target.bit_width)
+                if bw <= 8:
+                    return pa.int8()
+                if bw <= 16:
+                    return pa.int16()
+                if bw <= 32:
+                    return pa.int32()
+                return pa.int64()
+            return target
+
+        # float: prefer wider
+        if pat.is_floating(source) and pat.is_floating(target):
+            return source if source.bit_width > target.bit_width else target
+
+        # int <-> float: prefer float target; otherwise avoid narrowing float->int
+        if (pat.is_integer(source) and pat.is_floating(target)) or (pat.is_floating(source) and pat.is_integer(target)):
+            return target if pat.is_floating(target) else source
+
+        # decimal: avoid losing precision/scale
+        if pat.is_decimal(source) and pat.is_decimal(target):
+            if target.precision < source.precision or target.scale < source.scale:
+                return source
+            return target
+
+        # timestamps: avoid losing tz
+        if pat.is_timestamp(source) and pat.is_timestamp(target):
+            if source.tz is not None and target.tz is None:
+                return source
+            return target
+
+    return target
+
+
+def merge_arrow_fields(source: pa.Field, target: pa.Field) -> pa.Field:
+    """
+    Merge fields with:
+    - case-insensitive name preference: keep source casing if it matches target ignoring case; else fall back.
+    - merged (nested-aware) type via merge_arrow_types()
+    - nullable = source.nullable OR target.nullable (filling cols introduces nulls)
+    - metadata merged with target overriding on key collision
+    """
+    # Name: keep source casing if it's the "same" column under case-insensitive match
+    if target.name and source.name:
+        if target.name == "root" and source.name:
+            name = source.name
+        elif source.name == "root" and target.name:
+            name = target.name
+        else:
+            name = target.name or source.name or "root"
+    else:
+        name = target.name or source.name or "root"
+
+    dtype = merge_arrow_types(source.type, target.type)
+    nullable = source.nullable or target.nullable
+    metadata = {**(source.metadata or {}), **(target.metadata or {})}
+
+    return pa.field(
+        name=name,
+        type=dtype,
+        nullable=nullable,
+        metadata=metadata if metadata else None,
+    )

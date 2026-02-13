@@ -1,228 +1,242 @@
 """MSAL-backed authentication helpers for requests sessions."""
 
-# auth_session.py
+from __future__ import annotations
+
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional, Iterable
 
 from .session import YGGSession
 
 try:
-    import msal
-
-    ConfidentialClientApplication = msal.ConfidentialClientApplication
+    from msal import ConfidentialClientApplication, PublicClientApplication
 except ImportError:
-    msal = None
-    ConfidentialClientApplication = Any
+    # Local helper that can pip-install at runtime (if that's your org's vibe)
+    from ..pyutils.pyenv import PyEnv
+
+    msal_mod = PyEnv.runtime_import_module(module_name="msal", pip_name="msal", install=True)
+    ConfidentialClientApplication = msal_mod.ConfidentialClientApplication
+    PublicClientApplication = msal_mod.PublicClientApplication
 
 
-__all__ = [
-    "MSALSession",
-    "MSALAuth"
-]
+__all__ = ["MSALSession", "MSALAuth"]
+
+
+def _parse_scopes(value: object) -> list[str] | None:
+    """
+    Accept:
+      - None
+      - list[str]
+      - "scope1 scope2"
+      - "scope1,scope2"
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        scopes = [str(x).strip() for x in value if str(x).strip()]
+        return scopes or None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        sep = "," if "," in s else " "
+        scopes = [p.strip() for p in s.split(sep) if p.strip()]
+        return scopes or None
+    raise TypeError(f"scopes must be None, list[str], or str; got {type(value)!r}")
 
 
 @dataclass
 class MSALAuth:
-    """Configuration and token cache for MSAL client credential flows.
+    """Configuration and token cache for MSAL client credential flows."""
 
-    Args:
-        tenant_id: Azure tenant ID.
-        client_id: Azure application client ID.
-        client_secret: Azure application client secret.
-        authority: Optional authority URL override.
-        scopes: List of scopes to request.
-    """
     tenant_id: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_TENANT_ID"))
     client_id: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_CLIENT_ID"))
     client_secret: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_CLIENT_SECRET"))
     authority: Optional[str] = field(default_factory=lambda: os.environ.get("AZURE_AUTHORITY"))
-    scopes: list[str] | None = field(default_factory=lambda: os.environ.get("AZURE_SCOPES"))
+    scopes: list[str] | None = field(default_factory=lambda: _parse_scopes(os.environ.get("AZURE_SCOPES")))
 
-    _auth_app: ConfidentialClientApplication | None = field(default=None, repr=False, compare=False, hash=False)
+    # Refresh a bit early to avoid edge-of-expiry races.
+    expiry_skew_seconds: int = field(default=30, repr=False, compare=False)
+
+    _auth_app: ConfidentialClientApplication | PublicClientApplication | None = field(
+        default=None, repr=False, compare=False, hash=False
+    )
     _expires_at: float | None = field(default=None, repr=False, compare=False, hash=False)
     _access_token: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
 
-    def __setitem__(self, key, value):
-        """Set an attribute via mapping-style assignment.
+    # --- pickle safety -------------------------------------------------
 
-        Args:
-            key: Attribute name to set.
-            value: Value to assign.
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_auth_app"] = None  # MSAL client isn't picklable
+        return state
 
-        Returns:
-            None.
-        """
-        self.__setattr__(key, value)
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._auth_app = None
 
-    def __getitem__(self, item):
-        """Return attribute values via mapping-style access.
+    # --- minimal mapping sugar ----------------------------------------
 
-        Args:
-            item: Attribute name to fetch.
+    def __setitem__(self, key: str, value) -> None:
+        setattr(self, key, value)
 
-        Returns:
-            The attribute value.
-        """
-        return getattr(self, item)
+    def __getitem__(self, key: str):
+        return getattr(self, key)
 
-    def __post_init__(self):
-        """Populate defaults from environment variables and validate.
+    # --- init / validation --------------------------------------------
 
-        Returns:
-            None.
-        """
+    def __post_init__(self) -> None:
+        # Normalize string fields
+        self.tenant_id = self.tenant_id.strip() if isinstance(self.tenant_id, str) else self.tenant_id
+        self.client_id = self.client_id.strip() if isinstance(self.client_id, str) else self.client_id
+        self.client_secret = self.client_secret.strip() if isinstance(self.client_secret, str) else self.client_secret
+        self.authority = self.authority.strip() if isinstance(self.authority, str) else self.authority
+
+        # Accept legacy: scopes accidentally passed as string
+        self.scopes = _parse_scopes(self.scopes)
+
         if not self.authority:
-            assert self.tenant_id, "tenant_id is required to build authority URL"
-
+            if not self.tenant_id:
+                raise ValueError("tenant_id is required when authority is not set.")
             self.authority = f"https://login.microsoftonline.com/{self.tenant_id}"
 
-        if self.scopes:
-            if isinstance(self.scopes, str):
-                self.scopes = self.scopes.split(",")
+    def _ensure_confidential_flow_ready(self) -> None:
+        if not self.client_id:
+            raise ValueError("client_id is required. Set AZURE_CLIENT_ID.")
+        if not self.authority:
+            raise ValueError("authority is required. Set AZURE_AUTHORITY or AZURE_TENANT_ID.")
+        if not self.client_secret:
+            raise ValueError(
+                "client_secret is required for client credential flow. "
+                "Set AZURE_CLIENT_SECRET or use a public client flow method."
+            )
+        if not self.scopes:
+            raise ValueError(
+                "scopes are required for acquire_token_for_client. "
+                "Set AZURE_SCOPES (e.g. 'api://<app-id>/.default' or '<resource>/.default')."
+            )
+
+    # --- msal app ------------------------------------------------------
 
     @property
-    def auth_app(self) -> ConfidentialClientApplication:
-        """Return or initialize the MSAL confidential client.
-
-        Returns:
-            MSAL confidential client instance.
+    def auth_app(self) -> ConfidentialClientApplication | PublicClientApplication:
         """
-        if not self._auth_app:
+        Lazily create MSAL client.
+
+        - If client_secret is set: ConfidentialClientApplication (app-to-app).
+        - Else: PublicClientApplication (interactive/device code/etc).
+        """
+        if self._auth_app is not None:
+            return self._auth_app
+
+        if not self.client_id:
+            raise ValueError("client_id is required. Set AZURE_CLIENT_ID.")
+        if not self.authority:
+            raise ValueError("authority is required. Set AZURE_AUTHORITY or AZURE_TENANT_ID.")
+
+        if self.client_secret:
             self._auth_app = ConfidentialClientApplication(
                 client_id=self.client_id,
                 client_credential=self.client_secret,
                 authority=self.authority,
-
             )
+        else:
+            # Note: PublicClientApplication does NOT accept client_credential/scopes in ctor.
+            self._auth_app = PublicClientApplication(
+                client_id=self.client_id,
+                authority=self.authority,
+            )
+
         return self._auth_app
 
-    @property
-    def expires_in(self) -> float:
-        """Return the number of seconds since the token expiry timestamp.
-
-        Returns:
-            Seconds elapsed since expiry (negative if not expired).
-        """
-        return time.time() - self.expires_at
+    # --- token lifecycle ----------------------------------------------
 
     @property
-    def expires_at(self) -> float:
-        """Ensure the token is fresh and return the expiry timestamp.
-
-        Returns:
-            Token expiration time as a Unix timestamp.
-        """
-        self.refresh()
-
-        return self._expires_at
+    def is_expired(self) -> bool:
+        if not self._expires_at:
+            return True
+        return (time.time() + self.expiry_skew_seconds) >= self._expires_at
 
     @property
-    def expired(self) -> bool:
-        """Return True when the token is missing or past its expiry time.
+    def seconds_to_expiry(self) -> float:
+        """Positive means still valid, negative means expired."""
+        if not self._expires_at:
+            return float("-inf")
+        return self._expires_at - time.time()
 
-        Returns:
-            True if expired or missing; False otherwise.
+    @property
+    def scope(self) -> str | None:
+        """Scopes as a normalized list[str] (or None)."""
+        if self.scopes:
+            return " ".join(self.scopes)
+        return None
+
+    @scope.setter
+    def scope(self, value: object) -> None:
         """
-        return not self._expires_at or time.time() >= self._expires_at
-
-    def refresh(self, force: bool | None = None):
-        """Acquire or refresh the token if needed.
-
-        Args:
-            force: Force refresh even if not expired.
-
-        Returns:
-            The updated MSALAuth instance.
+        Accept None | list[str] | tuple[str,...] | set[str] | "a b" | "a,b".
+        Normalizes + resets cached token (since token depends on scopes).
         """
-        if self.expired or force:
-            app = self.auth_app
-            result = app.acquire_token_for_client(scopes=self.scopes)
-            current_time = time.time()
+        if isinstance(value, (tuple, set)):
+            value = list(value)
+        # also accept any iterable of strings, but avoid treating str as iterable here
+        if value is not None and not isinstance(value, (str, list)):
+            if isinstance(value, Iterable):
+                value = list(value)  # type: ignore[arg-type]
 
-            self._access_token = result.get("access_token")
+        self.scopes = _parse_scopes(value)
 
-            if not self._access_token:
-                raise RuntimeError(f"Failed to acquire token: {result.get('error_description') or result}")
+        # scopes changed => cached token may be wrong
+        self._access_token = None
+        self._expires_at = None
 
-            # msal returns expires_in in seconds
-            self._expires_at = current_time + int(result.get("expires_in", 3600))
+    def refresh(self, force: bool = False) -> "MSALAuth":
+        """Acquire/refresh token for confidential client flow."""
+        self._ensure_confidential_flow_ready()
+        auth_app = self.auth_app
+
+        if force or self.is_expired or not self._access_token:
+            if self.client_secret:
+                result = auth_app.acquire_token_for_client(scopes=self.scopes)
+            else:
+                result = auth_app.acquire_token_interactive(scopes=self.scopes)
+
+            token = result.get("access_token")
+            if not token:
+                raise RuntimeError(
+                    f"Failed to acquire token: {result.get('error_description') or result}"
+                )
+
+            now = time.time()
+            expires_in = int(result.get("expires_in", 3600))
+            self._access_token = token
+            self._expires_at = now + expires_in
 
         return self
 
     @property
     def access_token(self) -> str:
-        """Return access token.
-
-        Returns:
-            Access token string.
-        """
         self.refresh()
-        return self._access_token
+        # refresh() guarantees it
+        return self._access_token  # type: ignore[return-value]
 
     @property
     def authorization(self) -> str:
-        """Return authorization token.
-
-        Returns:
-            Authorization header value.
-        """
         return f"Bearer {self.access_token}"
 
-    def requests_session(self, **kwargs):
-        """Build a requests session that injects the MSAL authorization header.
-
-        Args:
-            **kwargs: Passed through to MSALSession.
-
-        Returns:
-            Configured MSALSession.
-        """
-        return MSALSession(
-            msal_auth=self,
-            **kwargs
-        )
+    def requests_session(self, **kwargs) -> "MSALSession":
+        return MSALSession(msal_auth=self, **kwargs)
 
 
 class MSALSession(YGGSession):
-    """YGGSession subclass that injects MSAL authorization headers.
+    """YGGSession subclass that injects MSAL authorization headers."""
 
-    Args:
-        YGGSession: Base retry-capable session.
-    """
-    msal_auth: MSALAuth | None = None
-
-    def __init__(
-        self,
-        msal_auth: Optional[MSALAuth] = None,
-        *args,
-        **kwargs: dict
-    ):
-        """Initialize the session with optional MSAL auth configuration.
-
-        Args:
-            msal_auth: MSALAuth configuration for token injection.
-            *args: Positional args for YGGSession.
-            **kwargs: Keyword args for YGGSession.
-
-        Returns:
-            None.
-        """
+    def __init__(self, msal_auth: Optional[MSALAuth] = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.msal_auth = msal_auth
 
     def prepare_request(self, request):
-        """Prepare the request with an Authorization header when needed.
-
-        Args:
-            request: requests.PreparedRequest to mutate.
-
-        Returns:
-            Prepared request.
-        """
-        # called before sending; ensure header exists
-        if self.msal_auth is not None:
-            request.headers["Authorization"] = request.headers.get("Authorization", self.msal_auth.authorization)
-
+        if self.msal_auth is not None and "Authorization" not in request.headers:
+            request.headers["Authorization"] = self.msal_auth.authorization
         return super().prepare_request(request)

@@ -515,10 +515,7 @@ class AbstractDataPath(ABC):
                 df = pl.read_parquet(f)
 
             elif file_format == FileFormat.CSV:
-                if cast_options.safe:
-                    null_values = None
-                else:
-                    null_values = [""]
+                null_values = None if cast_options.safe else ["", "null", "N/A"]
 
                 df = pl.read_csv(
                     f,
@@ -606,12 +603,13 @@ class AbstractDataPath(ABC):
         namespace = ObjectSerde.full_namespace(obj=table)
 
         if namespace.startswith("pyarrow."):
-            if isinstance(table, pa.RecordBatch):
-                table = pa.Table.from_batches([table]) # type: ignore[arg-type]
-            elif hasattr(table, "read_all"):
-                table = table.read_all()
-            else:
-                table = pyarrow.table(table)
+            if not isinstance(table, pa.Table):
+                if isinstance(table, pa.RecordBatch):
+                    table = pa.Table.from_batches([table]) # type: ignore[arg-type]
+                elif hasattr(table, "read_all"):
+                    table = table.read_all()
+                else:
+                    table = pyarrow.table(table)
 
             return self.write_arrow_table(
                 table,
@@ -707,9 +705,7 @@ class AbstractDataPath(ABC):
         """
         mode = SaveMode.from_any(mode)
         fmt = self.check_file_format_arg(file_format)
-
-        if cast_options is not None:
-            table = cast_arrow_tabular(table, cast_options)
+        table = cast_arrow_tabular(table, cast_options)
 
         if self.is_dir_sink():
             if mode == SaveMode.OVERWRITE:
@@ -864,9 +860,7 @@ class AbstractDataPath(ABC):
 
         mode = SaveMode.from_any(mode)
         fmt = self.check_file_format_arg(file_format)
-
-        if cast_options is not None:
-            df = cast_polars_dataframe(df, cast_options)
+        df = cast_polars_dataframe(df, cast_options)
 
         if self.is_dir_sink():
             if mode == SaveMode.OVERWRITE:

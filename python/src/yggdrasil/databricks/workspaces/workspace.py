@@ -13,14 +13,14 @@ from typing import (
     BinaryIO,
     Iterator,
     Optional,
-    Union, TYPE_CHECKING, List, Set
+    Union, TYPE_CHECKING, List, Set, Iterable
 )
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.dbutils import FileInfo
 from databricks.sdk.errors import ResourceDoesNotExist, NotFound, InternalError
 from databricks.sdk.service.files import DirectoryEntry
-from databricks.sdk.service.iam import User
+from databricks.sdk.service.iam import User, ComplexValue
 from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
 
 from .path import DatabricksPath, DatabricksPathKind
@@ -419,7 +419,7 @@ class Workspace:
         self,
         with_public: bool = True,
         raise_error: bool = True
-    ):
+    ) -> Iterable[ComplexValue]:
         try:
             user = self.current_user
 

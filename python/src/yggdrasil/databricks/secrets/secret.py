@@ -281,7 +281,7 @@ class Secret(WorkspaceService):
         string_value: Optional[str] = None,
         create_scope_if_missing: bool = True,
         initial_manage_principal: Optional[str] = None,
-        acls: Optional[list[tuple[str, AclPermission]] | bool] = True,
+        permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
     ) -> "Secret":
         bytes_value, string_value = self.coerce_to_put_payload(
             value, bytes_value=bytes_value, string_value=string_value
@@ -327,13 +327,8 @@ class Secret(WorkspaceService):
             out._value = out._try_parse_value(decoded)
 
         # apply ACLs (if requested) against the *target scope*
-        if acls:
-            if acls is True:
-                # "True" means: apply whatever your put_acl() defaults to (usually self principal/permission)
-                # If your put_acl requires explicit tuples, keep this as no-op or define sensible defaults.
-                out.put_acl(scope=target_scope)
-            else:
-                out.put_acl(acls=acls, scope=target_scope)
+        if permissions:
+            out.put_acl(permissions=permissions, scope=target_scope)
 
         return out
 
@@ -416,7 +411,7 @@ class Secret(WorkspaceService):
 
     def put_acl(
         self,
-        acls: Optional[list[tuple[str, AclPermission]] | bool] = True,
+        permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
         *,
         principal: Optional[str] = None,
         permission: Optional[AclPermission] = None,
@@ -429,13 +424,13 @@ class Secret(WorkspaceService):
         strict=True  -> fail fast on first bad entry
         strict=False -> skip invalid entries (still raises if nothing valid is left)
         """
-        if isinstance(acls, bool):
+        if isinstance(permissions, bool):
             current_groups = self.current_user_groups(
                 with_public=False,
                 raise_error=False
             )
 
-            acls = [
+            permissions = [
                 (group.display, AclPermission.MANAGE)
                 for group in current_groups
                 if group.display not in {"users"}
@@ -447,8 +442,8 @@ class Secret(WorkspaceService):
 
         # Build batch from either (principal, permission) or `acls`
         batch: list[tuple[str, AclPermission]] = []
-        if acls:
-            batch.extend(acls)
+        if permissions:
+            batch.extend(permissions)
 
         if principal is not None or permission is not None:
             if not principal or permission is None:
