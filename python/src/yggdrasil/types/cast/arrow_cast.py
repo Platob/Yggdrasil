@@ -1256,8 +1256,17 @@ def any_to_arrow_field(
             if isinstance(attr, pa.Schema):
                 return arrow_schema_to_field(attr, options)
 
-        namespace = ObjectSerde.full_namespace(obj)
         options = CastOptions.check_arg(options)
+
+        if obj is None:
+            if not options.target_arrow_field:
+                raise ValueError(
+                    "Cannot convert None to pyarrow.Field"
+                )
+
+            return options.target_arrow_field
+
+        namespace = ObjectSerde.full_namespace(obj)
 
         if namespace.startswith("pyspark"):
             from ...spark.cast import any_spark_to_arrow_field

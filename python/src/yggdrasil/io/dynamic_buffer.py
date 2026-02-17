@@ -7,9 +7,14 @@ import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, IO
+from typing import Optional, Union, IO, Any, TYPE_CHECKING
+
 
 __all__ = ["DynamicBuffer", "DynamicBufferConfig"]
+
+
+if TYPE_CHECKING:
+    import xxhash
 
 
 @dataclass(frozen=False, slots=True)
@@ -31,7 +36,7 @@ class DynamicBufferConfig:
         If True, spilled temp files are not deleted on close (you can call cleanup()).
         If False, we delete the temp file on close/cleanup().
     """
-    spill_bytes: int = 64 * 1024 * 1024  # 64 MiB
+    spill_bytes: int = 128 * 1024 * 1024  # 64 MiB
     tmp_dir: Optional[Path] = None
     prefix: str = "tmp-"
     suffix: str = ".bin"
@@ -74,6 +79,42 @@ class DynamicBuffer(io.RawIOBase):
         self._path: Path | None = None
         self._closed: bool = False
 
+    def __bytes__(self) -> bytes:
+        return self.to_bytes()
+
+    def __len__(self) -> int:
+        """
+        Total payload size in bytes (does NOT change the current cursor).
+        """
+        return self.size
+
+    def __del__(self):
+        self.close()
+
+    @classmethod
+    def parse_any(
+        cls,
+        obj: Any,
+        config: DynamicBufferConfig | None = None
+    ):
+        if isinstance(obj, cls):
+            return obj
+
+        buffer = DynamicBuffer(config=config)
+
+        if isinstance(obj, io.BytesIO):
+            obj._mem = obj
+        elif isinstance(obj, (str, Path)):
+            from .path import LocalDataPath
+
+            obj._path = LocalDataPath(obj)
+            obj._file = obj._path.open("w+b", buffering=0)
+        else:
+            buffer.write_any_bytes(obj)
+            buffer.seek(0)
+
+        return buffer
+
     # -----------------------
     # Introspection
     # -----------------------
@@ -87,20 +128,19 @@ class DynamicBuffer(io.RawIOBase):
 
     @property
     def size(self) -> int:
-        fh = self._fh()
-        pos = fh.tell()
-        fh.seek(0, io.SEEK_END)
-        end = fh.tell()
-        fh.seek(pos, io.SEEK_SET)
-        return end
+        if self._mem is not None:
+            # BytesIO: safest is buffer length; avoids messing with cursor.
+            return self._mem.getbuffer().nbytes
 
-    @property
-    def keep_spilled_file(self):
-        return self._cfg.keep_spilled_file
-
-    @keep_spilled_file.setter
-    def keep_spilled_file(self, value: bool):
-        self._cfg.keep_spilled_file = value
+        try:
+            return os.fstat(self._file.fileno()).st_size
+        except Exception:
+            # fallback: preserve cursor, use seek/tell
+            pos = self._file.tell()
+            self._file.seek(0, io.SEEK_END)
+            end = self._file.tell()
+            self._file.seek(pos, io.SEEK_SET)
+            return int(end)
 
     # -----------------------
     # io.RawIOBase interface
@@ -163,7 +203,14 @@ class DynamicBuffer(io.RawIOBase):
         if self._closed:
             raise ValueError("I/O operation on closed DynamicBuffer")
 
-        mv = memoryview(b)
+        try:
+            mv = memoryview(b)
+        except TypeError:
+            if isinstance(b, str):
+                mv = memoryview(b.encode("utf-8"))
+            else:
+                raise
+
         n = len(mv)
 
         # If we're still in memory, check whether this write pushes us over.
@@ -176,25 +223,138 @@ class DynamicBuffer(io.RawIOBase):
         written = fh.write(mv.tobytes())
         return written
 
+    def write_any_bytes(self, obj: Any):
+        if obj is None:
+            return 0
+
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return self.write(obj)
+
+        blob = obj.read()
+
+        return self.write(blob)
+
+    # -----------------------
+    # Structured binary read/write (little-endian)
+    # -----------------------
+
+    def _read_exact(self, n: int) -> bytes:
+        data = self.read(n)
+        if len(data) != n:
+            raise EOFError(f"expected {n} bytes, got {len(data)}")
+        return data
+
+    # ---- ints ----
+
+    def read_int8(self) -> int:
+        return struct.unpack("<b", self._read_exact(1))[0]
+
+    def write_int8(self, value: int) -> int:
+        return self.write(struct.pack("<b", int(value)))
+
+    def read_uint8(self) -> int:
+        return struct.unpack("<B", self._read_exact(1))[0]
+
+    def write_uint8(self, value: int) -> int:
+        return self.write(struct.pack("<B", int(value)))
+
+    def read_int16(self) -> int:
+        return struct.unpack("<h", self._read_exact(2))[0]
+
+    def write_int16(self, value: int) -> int:
+        return self.write(struct.pack("<h", int(value)))
+
+    def read_uint16(self) -> int:
+        return struct.unpack("<H", self._read_exact(2))[0]
+
+    def write_uint16(self, value: int) -> int:
+        return self.write(struct.pack("<H", int(value)))
+
+    def read_int32(self) -> int:
+        return struct.unpack("<i", self._read_exact(4))[0]
+
+    def write_int32(self, value: int) -> int:
+        return self.write(struct.pack("<i", int(value)))
+
+    def read_uint32(self) -> int:
+        return struct.unpack("<I", self._read_exact(4))[0]
+
+    def write_uint32(self, value: int) -> int:
+        return self.write(struct.pack("<I", int(value)))
+
     def read_int64(self) -> int:
-        data = self.read(8)
-        return struct.unpack("<q", data)[0]
+        return struct.unpack("<q", self._read_exact(8))[0]
 
     def write_int64(self, value: int) -> int:
-        # Arrow / most binary formats: little-endian signed 64-bit
-        data = struct.pack("<q", value)
-        return self.write(data)
+        return self.write(struct.pack("<q", int(value)))
+
+    def read_uint64(self) -> int:
+        return struct.unpack("<Q", self._read_exact(8))[0]
+
+    def write_uint64(self, value: int) -> int:
+        return self.write(struct.pack("<Q", int(value)))
+
+    # ---- floats ----
+
+    def read_f32(self) -> float:
+        return struct.unpack("<f", self._read_exact(4))[0]
+
+    def write_f32(self, value: float) -> int:
+        return self.write(struct.pack("<f", float(value)))
+
+    def read_f64(self) -> float:
+        return struct.unpack("<d", self._read_exact(8))[0]
+
+    def write_f64(self, value: float) -> int:
+        return self.write(struct.pack("<d", float(value)))
+
+    # ---- bool ----
+
+    def read_bool(self) -> bool:
+        return bool(self.read_uint8())
+
+    def write_bool(self, value: bool) -> int:
+        return self.write_uint8(1 if value else 0)
+
+    # ---- bytes / strings (length-prefixed) ----
+
+    def read_bytes_u32(self) -> bytes:
+        """
+        Read: u32 length (little-endian) + payload bytes.
+        """
+        n = self.read_uint32()
+        return self._read_exact(n)
+
+    def write_bytes_u32(self, data: bytes | bytearray | memoryview) -> int:
+        mv = memoryview(data)
+        total = self.write_uint32(len(mv))
+        total += self.write(mv)
+        return total
+
+    def read_str_u32(self, encoding: str = "utf-8") -> str:
+        return self.read_bytes_u32().decode(encoding)
+
+    def write_str_u32(self, s: str, encoding: str = "utf-8") -> int:
+        b = s.encode(encoding)
+        return self.write_bytes_u32(b)
 
     # -----------------------
     # Convenience APIs
     # -----------------------
+    def xxh3_64(self) -> "xxhash.xxh3_64":
+        from ..xxhash import xxhash
+
+        h = xxhash.xxh3_64()
+        h.update(self.to_bytes())
+        return h
+
     def getvalue(self) -> bytes:
         """
         Return bytes only if still in memory.
         Raises if spilled to disk (to avoid accidental huge loads).
         """
         if self._mem is None:
-            raise RuntimeError("Buffer spilled to disk; use to_bytes() or open_reader()")
+            return self.to_bytes()
         return self._mem.getvalue()
 
     def to_bytes(self) -> bytes:

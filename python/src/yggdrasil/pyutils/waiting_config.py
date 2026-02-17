@@ -3,7 +3,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Union
 
-__all__ = ["WaitingConfig", "WaitingConfigArg"]
+import urllib3
+
+__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG"]
 
 
 def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
@@ -20,8 +22,26 @@ WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 class WaitingConfig:
     timeout: float = DEFAULT_TIMEOUT_TICKS
     interval: float = 2.0
-    backoff: float = 1.0
+    backoff: float = 2.0
     max_interval: float = 10.0
+    retries: int = 4
+
+    def __getstate__(self) -> dict:
+        return {
+            "timeout": self.timeout,
+            "interval": self.interval,
+            "backoff": self.backoff,
+            "max_interval": self.max_interval,
+            "retries": self.retries,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        # Bypass immutability during unpickling
+        object.__setattr__(self, "timeout", state.get("timeout", DEFAULT_TIMEOUT_TICKS))
+        object.__setattr__(self, "interval", state.get("interval", 2.0))
+        object.__setattr__(self, "backoff", state.get("backoff", 1.0))
+        object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
+        object.__setattr__(self, "retries", state.get("retries", 4))
 
     def __bool__(self):
         return self.timeout > 0
@@ -33,6 +53,21 @@ class WaitingConfig:
     @property
     def timeout_timedelta(self) -> dt.timedelta:
         return dt.timedelta(seconds=self.timeout)
+
+    @property
+    def timeout_urllib3(self):
+        if not self.timeout:
+            return urllib3.Timeout(
+                total=None,
+                connect=None,
+                read=None
+            )
+
+        return urllib3.Timeout(
+            total=self.timeout * 2,
+            connect=self.timeout,
+            read=self.timeout
+        )
 
     @classmethod
     def default(cls):
@@ -63,11 +98,16 @@ class WaitingConfig:
         interval: Optional[Union[int, float, dt.timedelta]] = None,
         backoff: Optional[Union[int, float, dt.timedelta]] = None,
         max_interval: Optional[Union[int, float, dt.timedelta]] = None,
-    ) -> Optional["WaitingConfig"]:
+        retries: Optional[int] = None,
+    ) -> "WaitingConfig":
+        if arg is None and timeout is None:
+            return DEFAULT_WAITING_CONFIG
+
         base_timeout: Optional[float] = None
         base_interval: Optional[float] = None
         base_backoff: Optional[float] = None
         base_max_interval: Optional[float] = None
+        base_retries: Optional[int] = None
 
         if arg is not None:
             if isinstance(arg, cls):
@@ -78,12 +118,14 @@ class WaitingConfig:
                 base_interval = arg.interval
                 base_backoff = arg.backoff
                 base_max_interval = arg.max_interval
+                base_retries = arg.retries
 
             elif isinstance(arg, bool):
                 base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
                 base_interval = 1.0
                 base_backoff = 2.0
                 base_max_interval = 15.0
+                base_retries = 4
 
             elif isinstance(arg, (int, float, dt.timedelta)):
                 base_timeout = cls._to_seconds(arg)
@@ -112,6 +154,7 @@ class WaitingConfig:
         final_interval = cls._to_seconds(interval) if interval is not None else base_interval
         final_backoff = cls._to_seconds(backoff) if backoff is not None else base_backoff
         final_max_interval = cls._to_seconds(max_interval) if max_interval is not None else base_max_interval
+        final_retries = retries if retries is not None else base_retries
 
         # defaults to match non-Optional signature
         if final_timeout is None:
@@ -130,14 +173,24 @@ class WaitingConfig:
         if final_max_interval is None:
             final_max_interval = 10.0
 
+        if final_retries is None:
+            final_retries = 4
+        elif final_retries < 0:
+            final_retries = 0
+
         return cls(
             timeout=float(final_timeout),
             interval=float(final_interval),
             backoff=float(final_backoff),
             max_interval=float(final_max_interval),
+            retries=int(final_retries)
         )
 
-    def sleep(self, iteration: int, start: float | None = None) -> None:
+    def sleep(
+        self,
+        iteration: int,
+        start: float | None = None
+    ) -> None:
         """
         iteration is 0-based (first wait => iteration=0)
 
@@ -154,7 +207,7 @@ class WaitingConfig:
         if self.interval == 0:
             return
 
-        sleep_s = self.interval * (self.backoff + int(iteration))
+        sleep_s = self.interval * (self.backoff ** iteration)
 
         if self.max_interval > 0:
             sleep_s = min(sleep_s, self.max_interval)

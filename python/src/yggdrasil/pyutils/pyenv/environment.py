@@ -128,16 +128,27 @@ class PyEnv:
             return self._uv_bin_cache
 
         logger.debug("uv_bin: resolving uv binary via runtime import")
-        uv_mod = self.import_module(module_name="uv", pip_name="uv", upgrade=False)
+
+        try:
+            import uv as uv_mod
+        except ImportError:
+            uv_mod = self.install("uv", prefer_uv=False)
+
         self._uv_bin_cache = Path(uv_mod.find_uv_bin())
+
         assert self._uv_bin_cache.is_file(), f"uv found but is not a file: {self._uv_bin_cache}"
         logger.debug("uv_bin: resolved=%s", self._uv_bin_cache)
+
         return self._uv_bin_cache
 
     # -----------------------
     # Command plumbing
     # -----------------------
-    def _pip_cmd_args(self, python: Optional[str | Path] = None) -> list[str]:
+    def _pip_cmd_args(
+        self,
+        python: Optional[str | Path] = None,
+        prefer_uv: Optional[bool] = None
+    ) -> list[str]:
         """
         Build a pip command.
 
@@ -149,7 +160,10 @@ class PyEnv:
         """
         p = python or self.python_path
 
-        if self.prefer_uv:
+        if prefer_uv is None:
+            prefer_uv = self.prefer_uv
+
+        if prefer_uv:
             args = [str(self.uv_bin), "pip"]
             logger.debug("_pip_cmd_args: prefer_uv=True args=%s", args)
             return args
@@ -178,6 +192,7 @@ class PyEnv:
         requirements: str | Path | None = None,
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
+        prefer_uv: Optional[bool] = None
     ) -> SystemCommand | None:
         """
         Lazy installation into the environment anchored by python_path.
@@ -190,7 +205,7 @@ class PyEnv:
             logger.debug("install: nothing to do (no packages, no requirements)")
             return None
 
-        cmd = self._pip_cmd_args() + ["install"]
+        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["install"]
         wait_cfg = WaitingConfig.check_arg(wait)
 
         tmp_req: Path | None = None

@@ -476,7 +476,7 @@ class AbstractDataPath(ABC):
             elif file_format == FileFormat.ORC:
                 import pyarrow.orc as orc
 
-                orc.write_table(table, path)
+                orc.write_table(table, f)
 
             elif file_format == FileFormat.ARROW_IPC:
                 import pyarrow.ipc as ipc
@@ -490,7 +490,7 @@ class AbstractDataPath(ABC):
             elif file_format == FileFormat.EXCEL:
                 import pandas as pd
 
-                pd.DataFrame(table.to_pandas()).to_excel(path, index=False)
+                pd.DataFrame(table.to_pandas()).to_excel(f, index=False)
 
             else:
                 raise ValueError(f"Unsupported Arrow write format: {file_format}")

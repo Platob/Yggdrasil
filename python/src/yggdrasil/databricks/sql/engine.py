@@ -24,6 +24,7 @@ from databricks.sdk.service.sql import (
     Disposition, Format,
     ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem
 )
+from yggdrasil.enums import SaveMode
 
 from .exceptions import SqlStatementError
 from .statement_result import StatementResult
@@ -32,6 +33,7 @@ from .warehouse import SQLWarehouse
 from ..workspaces import WorkspaceService, DatabricksPath
 from ...enums import FileFormat
 from ...pyutils.waiting_config import WaitingConfigArg
+from ...sql.engine import SQLEngine as BaseSQLEngine
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -39,7 +41,9 @@ from ...types.cast.registry import convert
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ...spark.lib import pyspark
+    import pyspark
+    import delta
+
     from ...ai.sql_session import SQLAISession, SQLFlavor
 
 
@@ -80,11 +84,8 @@ def _needs_column_mapping(col_name: str) -> bool:
 
 
 @dataclasses.dataclass
-class SQLEngine(WorkspaceService):
+class SQLEngine(BaseSQLEngine, WorkspaceService):
     """Execute SQL statements and manage tables via Databricks SQL / Spark."""
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
-
     _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _ai_session: Optional["SQLAISession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
 
@@ -200,8 +201,12 @@ class SQLEngine(WorkspaceService):
 
     def execute(
         self,
-        statement: Optional[str] = None,
+        statement: str,
         *,
+        row_limit: Optional[int] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        wait: Optional[WaitingConfigArg] = True,
         engine: Optional[Literal["spark", "api"]] = None,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
@@ -210,11 +215,7 @@ class SQLEngine(WorkspaceService):
         format: Optional[Format] = None,
         on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
         parameters: Optional[List[StatementParameterListItem]] = None,
-        row_limit: Optional[int] = None,
         wait_timeout: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        wait: Optional[WaitingConfigArg] = True
     ) -> StatementResult:
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 
@@ -329,12 +330,18 @@ class SQLEngine(WorkspaceService):
 
     def insert_into(
         self,
-        data: Union[pa.Table, pa.RecordBatch, pa.RecordBatchReader, "pyspark.sql.DataFrame"],
+        data: Union[
+            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
+            dict, list, str,
+            "pandas.DataFrame", "polars.DataFrame",
+            "pyspark.sql.DataFrame"
+        ],
+        *,
+        mode: SaveMode | str | None = None,
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        mode: str = "auto",
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -419,7 +426,7 @@ class SQLEngine(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        mode: str = "auto",
+        mode: SaveMode | str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -525,7 +532,7 @@ class SQLEngine(WorkspaceService):
             )
 
             logger.debug(
-                "Arrow inserting %s into %s",
+                "Inserting %s into %s",
                 data,
                 location
             )
@@ -545,36 +552,93 @@ class SQLEngine(WorkspaceService):
                 cast_options=cast_options
             )
 
+            mode = SaveMode.from_any(mode, default=SaveMode.AUTO)
+
             columns = list(existing_schema.names)
             cols_quoted = ", ".join([f"`{c}`" for c in columns])
 
             statements: list[str] = []
 
             if match_by:
+                # Spark path filters out null keys before merge.
+                not_null_pred = " AND ".join([f"`{k}` IS NOT NULL" for k in match_by])
+
+                # Build source subquery once (with null-key filtering)
+                source_sql = f"""SELECT {cols_quoted}
+FROM parquet.`{temp_volume_path}`
+WHERE {not_null_pred}
+""".strip()
+
+                # Join condition (SQL path doesn't have <=> easily; emulate Spark's null filtering by excluding nulls)
+                # Since we filtered nulls out of S, equality is safe.
                 on_condition = " AND ".join([f"T.`{k}` = S.`{k}`" for k in match_by])
 
-                update_cols = [c for c in columns if c not in match_by]
-                if update_cols:
-                    update_set = ", ".join([f"T.`{c}` = S.`{c}`" for c in update_cols])
-                    update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
-                else:
-                    update_clause = ""
+                if mode == SaveMode.OVERWRITE:
+                    # overwrite-by-key: delete matching keys, then append batch
+                    # Use DISTINCT keys like Spark does (data.select(keys).distinct()).
+                    key_cols = ", ".join([f"`{k}`" for k in match_by])
 
-                insert_clause = (
-                    f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                    f"VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
-                )
-
-                merge_sql = f"""MERGE INTO {location} AS T
+                    delete_sql = f"""DELETE FROM {location} AS T
 USING (
-  SELECT {cols_quoted} FROM parquet.`{temp_volume_path}`
+  SELECT DISTINCT {key_cols}
+  FROM parquet.`{temp_volume_path}`
+  WHERE {not_null_pred}
+) AS S
+ON {on_condition}
+""".strip()
+
+                    insert_sql = f"""
+INSERT INTO {location} ({cols_quoted})
+{source_sql}
+""".strip()
+
+                    statements.extend([delete_sql, insert_sql])
+
+                elif mode == SaveMode.APPEND:
+                    # insert-only: only insert rows that don't exist (no updates)
+                    insert_clause = (
+                        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                        f"VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
+                    )
+
+                    merge_sql = f"""MERGE INTO {location} AS T
+USING (
+  {source_sql}
+) AS S
+ON {on_condition}
+{insert_clause}
+""".strip()
+
+                    statements.append(merge_sql)
+
+                else:
+                    # upsert: update matched + insert not matched
+                    update_cols = [c for c in columns if c not in match_by]
+
+                    update_clause = ""
+                    if update_cols:
+                        update_set = ", ".join([f"T.`{c}` = S.`{c}`" for c in update_cols])
+                        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
+
+                    insert_clause = (
+                        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                        f"VALUES ({', '.join([f'S.`{c}`' for c in columns])})"
+                    )
+
+                    merge_sql = f"""MERGE INTO {location} AS T
+USING (
+  {source_sql}
 ) AS S
 ON {on_condition}
 {update_clause}
-{insert_clause}"""
-                statements.append(merge_sql)
+{insert_clause}
+""".strip()
+
+                    statements.append(merge_sql)
+
             else:
-                if mode.lower() in ("overwrite",):
+                # No merge keys: keep existing behavior, but use normalized mode
+                if mode == SaveMode.OVERWRITE:
                     insert_sql = f"""INSERT OVERWRITE {location}
 SELECT {cols_quoted}
 FROM parquet.`{temp_volume_path}`"""
@@ -620,11 +684,11 @@ FROM parquet.`{temp_volume_path}`"""
         self,
         data: "pyspark.sql.DataFrame",
         *,
+        mode: SaveMode | str | None = None,
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        mode: str = "auto",
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -711,11 +775,12 @@ FROM parquet.`{temp_volume_path}`"""
             logger.debug("Filtered null keys for match_by=%s", match_by)
 
         target = self.spark_table(full_name=location)
+        mode = SaveMode.from_any(mode, default=SaveMode.AUTO)
 
         if match_by:
             cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in match_by])
 
-            if mode.casefold() == "overwrite":
+            if mode == SaveMode.OVERWRITE:
                 data = data.cache()
                 distinct_keys = data.select([f"`{k}`" for k in match_by]).distinct()
 
@@ -727,6 +792,13 @@ FROM parquet.`{temp_volume_path}`"""
                 )
 
                 data.write.format("delta").mode("append").options(**spark_options).saveAsTable(location)
+            elif mode == SaveMode.APPEND:
+                (
+                    target.alias("t")
+                    .merge(data.alias("s"), cond)
+                    .whenNotMatchedInsertAll()
+                    .execute()
+                )
             else:
                 update_cols = [c for c in data.columns if c not in match_by]
                 set_expr = {c: F.expr(f"s.`{c}`") for c in update_cols}
@@ -739,10 +811,13 @@ FROM parquet.`{temp_volume_path}`"""
                     .execute()
                 )
         else:
-            if mode == "auto":
-                mode = "append"
+            if mode == SaveMode.OVERWRITE:
+                spark_mode = "overwrite"
+            else:
+                spark_mode = "append"
+
             logger.info("Spark write saveAsTable mode=%s", mode)
-            data.write.mode(mode).options(**spark_options).saveAsTable(location)
+            data.write.mode(spark_mode).options(**spark_options).saveAsTable(location)
 
         if optimize_after_merge and zorder_by:
             logger.info("Delta optimize + zorder (%s)", zorder_by)

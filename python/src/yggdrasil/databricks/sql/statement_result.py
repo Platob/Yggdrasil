@@ -4,19 +4,28 @@ import dataclasses
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as concurrent_wait
-from typing import Optional, Iterator
+from typing import Optional, Iterator, TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.ipc as pipc
+import urllib3
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import (
-    StatementState, StatementResponse, Disposition, StatementStatus
+    StatementState, StatementResponse, Disposition, StatementStatus, ExternalLink
 )
+from yggdrasil.concurrent.threading import JobThreadPoolExecutor, Job
+from yggdrasil.io.http_ import HTTPSession
 
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
 from ...pyutils.waiting_config import WaitingConfigArg, WaitingConfig
 from ...requests.session import YGGSession
+from ...sql.statement_result import StatementResult as BaseStatementResult
+
+if TYPE_CHECKING:
+    import polars
+    import pandas
+
 
 DONE_STATES = {
     StatementState.CANCELED, StatementState.CLOSED, StatementState.FAILED,
@@ -33,7 +42,7 @@ __all__ = [
 
 
 @dataclasses.dataclass
-class StatementResult:
+class StatementResult(BaseStatementResult):
     """Container for statement responses, data extraction, and conversions."""
     workspace_client: WorkspaceClient
     warehouse_id: str
@@ -217,7 +226,7 @@ class StatementResult:
             self._arrow_table = self.to_arrow_table()
         return self
 
-    def external_links(self):
+    def external_links(self) -> Iterator[ExternalLink]:
         """Yield external result links for EXTERNAL_LINKS dispositions.
 
         Yields:
@@ -230,10 +239,8 @@ class StatementResult:
         result_data = self.result
         wsdk = self.workspace_client
 
-        seen_chunk_indexes = set()
-
         while True:
-            links = getattr(result_data, "external_links", None) or []
+            links = result_data.external_links or []
             if not links:
                 return
 
@@ -252,13 +259,6 @@ class StatementResult:
                 raise ValueError(
                     f"Bad next_chunk_internal_link {next_internal!r}: {e}"
                 )
-
-            # cycle guard
-            if chunk_index in seen_chunk_indexes:
-                raise ValueError(
-                    f"Detected chunk cycle at index {chunk_index} from {next_internal!r}"
-                )
-            seen_chunk_indexes.add(chunk_index)
 
             try:
                 result_data = wsdk.statement_execution.get_statement_result_chunk_n(
@@ -356,7 +356,7 @@ class StatementResult:
             else:
                 return self._spark_df.toArrow()
 
-        batches = list(self.to_arrow_batches(parallel_pool=parallel_pool))
+        batches = list(self.to_arrow_batches(max_workers=parallel_pool))
 
         if not batches:
             return pa.Table.from_batches([], schema=self.arrow_schema())
@@ -365,13 +365,14 @@ class StatementResult:
 
     def to_arrow_batches(
         self,
-        parallel_pool: int = 4,
+        max_workers: int = 4,
+        max_in_flight: Optional[int] = None,
         batch_size: Optional[int] = None
     ) -> Iterator[pa.RecordBatch]:
         """Stream the result as Arrow record batches.
 
         Args:
-            parallel_pool: Maximum parallel fetch workers.
+            max_workers: Maximum parallel fetch workers.
             batch_size: Fetch batch size
 
         Yields:
@@ -387,68 +388,62 @@ class StatementResult:
             else:
                 raise NotImplementedError("")
         else:
-            _tls = threading.local()
+            # One pool per instance/process is best; keep it outside the hot path.
+            retry = urllib3.Retry(
+                total=3,
+                backoff_factor=0.2,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET"]),
+                raise_on_status=False,
+            )
 
-            def _get_session():
-                # requests.Session-style objects are not reliably thread-safe, so keep one per thread
-                s = getattr(_tls, "session", None)
-                if s is None:
-                    s = YGGSession()
-                    _tls.session = s
-                return s
+            http = urllib3.PoolManager(
+                num_pools=64,
+                maxsize=64,  # max connections per host pool
+                retries=retry,
+                timeout=urllib3.Timeout(connect=2.0, read=30.0),
+                headers={"Accept-Encoding": "gzip,deflate"},  # if server supports it
+                cert_reqs="CERT_REQUIRED",
+            )
 
-            def _fetch_bytes(link):
-                s = _get_session()
-                resp = s.get(link.external_link, verify=False, timeout=10)
-                resp.raise_for_status()
-                return resp.content
+            def extract_all_batches(url: str) -> list[pa.RecordBatch]:
+                # stream + keep bytes in memory (Arrow IPC needs random-ish access for some cases; stream is OK here)
+                # preload_content=True (default) reads full body; ok if blobs are not huge.
+                # If blobs are huge, see streaming note below.
+                resp = http.request("GET", url, preload_content=True)
+                try:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"GET {url} failed: {resp.status}")
+                    buf = memoryview(resp.data)
+                finally:
+                    resp.release_conn()
 
-            max_workers = max(1, int(parallel_pool) if parallel_pool else 4)
-            max_in_flight = max_workers * 2  # keeps pipeline full without exploding memory
+                batches: list[pa.RecordBatch] = []
+                with pa.input_stream(buf) as i:
+                    reader = pipc.open_stream(i)
+                    for rb in reader:
+                        # rb is RecordBatch already
+                        batches.append(rb)
+                return batches
 
-            links_iter = enumerate(self.external_links())
-            pending = {}  # future -> idx
-            ready = {}  # idx -> bytes
-            next_idx = 0
+            def jobs(self):
+                for external_link in self.external_links():
+                    if external_link.external_link:
+                        yield Job.make(extract_all_batches, external_link.external_link)
 
-            def submit_more(exx):
-                while len(pending) < max_in_flight:
-                    try:
-                        _idx, link = next(links_iter)
-                    except StopIteration:
-                        break
-                    _fut = exx.submit(_fetch_bytes, link)
-                    pending[_fut] = _idx
-
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                submit_more(ex)
-
-                while pending:
-                    done, _ = concurrent_wait(pending, return_when=FIRST_COMPLETED)
-
-                    # collect completed downloads
-                    for fut in done:
-                        idx = pending.pop(fut)
-                        ready[idx] = fut.result()  # raises here if the GET failed
-
-                    # yield strictly in-order
-                    while next_idx in ready:
-                        content = ready.pop(next_idx)
-
-                        buf = pa.BufferReader(content)
-
-                        # IPC stream (your current format)
-                        reader = pipc.open_stream(buf)
-
-                        # if it’s IPC file instead:
-                        # reader = pipc.open_file(buf)
-
-                        for batch in reader:
-                            yield batch
-
-                        next_idx += 1
-
-                    submit_more(ex)
+            with JobThreadPoolExecutor(max_workers=max_workers or 4) as ex:
+                # IMPORTANT: ordered=False usually gives better throughput.
+                # Use ordered=True only if you MUST preserve external_links order.
+                for fut in ex.as_completed(
+                    jobs(self),
+                    ordered=False,
+                    max_in_flight=max_in_flight,
+                    cancel_on_exit=True,
+                    shutdown_on_exit=True,
+                    shutdown_wait=False
+                ):
+                    for rb in fut.result():
+                        yield rb
 
     def to_pandas(
         self,

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ..sql.engine import SQLEngine
     from ..sql.warehouse import SQLWarehouse
     from ..compute.cluster import Cluster
+    from ..secrets.secret import Secret
 
 
 __all__ = [
@@ -128,6 +129,7 @@ class Workspace:
     # Runtime cache (never serialized)
     _sdk: Optional["WorkspaceClient"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _sql: Optional["SQLEngine"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _secrets: Optional["Secret"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _was_connected: bool = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
@@ -835,6 +837,10 @@ class Workspace:
 
         workspace = self if workspace is None else workspace
 
+        if warehouse is not None:
+            if isinstance(warehouse, str):
+                warehouse = self.warehouses().find_warehouse(warehouse_name=warehouse)
+
         return SQLEngine(
             workspace=workspace,
             catalog_name=catalog_name,
@@ -888,6 +894,18 @@ class Workspace:
     ):
         from ..secrets.secret import Secret
 
+        if workspace is None and scope is None and key is None:
+            if self._secrets is not None:
+                return self._secrets
+
+            self._secrets = Secret(
+                workspace=self if workspace is None else workspace,
+                scope=scope,
+                key=key,
+            )
+
+            return self._secrets
+
         return Secret(
             workspace=self if workspace is None else workspace,
             scope=scope,
@@ -906,6 +924,10 @@ DBXWorkspace = Workspace
 class WorkspaceService(ABC):
     """Base class for helpers that depend on a Workspace."""
     workspace: Workspace = dataclasses.field(default_factory=Workspace)
+
+    def __post_init__(self):
+        if self.workspace is None:
+            self.workspace = Workspace()
 
     def __enter__(self):
         """Enter a context manager and connect the workspace.

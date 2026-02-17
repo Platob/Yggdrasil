@@ -3,7 +3,6 @@ import unittest
 
 import pyarrow as pa
 import pytest
-
 from yggdrasil.databricks.sql.exceptions import SqlStatementError
 from yggdrasil.databricks.workspaces import Workspace
 
@@ -61,7 +60,7 @@ class TestSQLEngine(unittest.TestCase):
             execute=False
         )
 
-        self.engine.execute(query)
+        self.engine.execute(query.sql)
 
         self.engine.drop_table(table_name="test_warehouse_api")
 
