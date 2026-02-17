@@ -791,7 +791,12 @@ FROM parquet.`{temp_volume_path}`"""
                     .execute()
                 )
 
-                data.write.format("delta").mode("append").options(**spark_options).saveAsTable(location)
+                (
+                    data.write
+                    .format("delta").mode("append")
+                    .options(**spark_options)
+                    .saveAsTable(location)
+                )
             elif mode == SaveMode.APPEND:
                 (
                     target.alias("t")

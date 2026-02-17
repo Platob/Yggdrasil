@@ -5,7 +5,6 @@ from typing import Optional, Union, List, Any, TYPE_CHECKING
 
 import pyarrow as pa
 
-from .registry import convert
 from ..python_arrow import is_arrow_type_list_like
 
 if TYPE_CHECKING:
@@ -325,7 +324,9 @@ class CastOptions:
         Set the target_field used during casting operations.
         """
         if value is not None:
-            value = value if isinstance(value, pa.Field) else convert(value, pa.Field)
+            from .arrow_cast import any_to_arrow_field
+
+            value = any_to_arrow_field(value, None)
 
         object.__setattr__(self, "source_arrow_field", value)
 
@@ -363,7 +364,7 @@ class CastOptions:
         if self.source_arrow_field is not None and self._source_spark_field is None:
             from ...spark.cast import arrow_field_to_spark_field
 
-            setattr(self, "_source_spark_field", arrow_field_to_spark_field(self.source_field))
+            setattr(self, "_source_spark_field", arrow_field_to_spark_field(self.source_field, None))
         return self._source_spark_field
 
     @property
@@ -395,7 +396,9 @@ class CastOptions:
         Set the target_field used during casting operations.
         """
         if value is not None:
-            value = value if isinstance(value, pa.Field) else convert(value, pa.Field)
+            from .arrow_cast import any_to_arrow_field
+
+            value = any_to_arrow_field(value, None)
 
         object.__setattr__(self, "target_arrow_field", value)
 
@@ -449,7 +452,7 @@ class CastOptions:
         if self.target_arrow_field is not None and self._target_spark_field is None:
             from ...spark.cast import arrow_field_to_spark_field
 
-            setattr(self, "_target_spark_field", arrow_field_to_spark_field(self.target_field))
+            setattr(self, "_target_spark_field", arrow_field_to_spark_field(self.target_field, None))
         return self._target_spark_field
 
     @property

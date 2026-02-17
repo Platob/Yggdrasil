@@ -49,16 +49,18 @@ print(user)
 ```python
 from dataclasses import dataclass
 
-from yggdrasil.dataclasses import get_dataclass_arrow_field
+from yggdrasil.dataclasses import dataclass_to_arrow_field
 from yggdrasil.types import arrow_field_from_hint
+
 
 @dataclass
 class Event:
     ts: str
     value: float
 
+
 print(arrow_field_from_hint(list[int], name="counts"))
-print(get_dataclass_arrow_field(Event))
+print(dataclass_to_arrow_field(Event))
 ```
 
 ### 3) Run Databricks SQL and retrieve Arrow results

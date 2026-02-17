@@ -7,13 +7,13 @@ from typing import Any
 import pyarrow as pa
 
 __all__ = [
-    "get_dataclass_arrow_field"
+    "dataclass_to_arrow_field"
 ]
 
 DATACLASS_ARROW_FIELD_CACHE: dict[type, pa.Field] = {}
 
 
-def get_dataclass_arrow_field(cls_or_instance: Any) -> pa.Field:
+def dataclass_to_arrow_field(cls_or_instance: Any) -> pa.Field:
     """Return a cached Arrow Field describing the dataclass type.
 
     Args:

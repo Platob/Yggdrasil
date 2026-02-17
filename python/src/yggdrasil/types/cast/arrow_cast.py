@@ -14,7 +14,7 @@ from .cast_options import CastOptions
 from .registry import register_converter
 from ..python_arrow import is_arrow_type_list_like, is_arrow_type_string_like, is_arrow_type_binary_like
 from ..python_defaults import default_arrow_scalar, default_arrow_array
-from ...dataclasses.dataclass import get_dataclass_arrow_field
+from ...dataclasses.dataclass import dataclass_to_arrow_field
 from ...pyutils.serde import ObjectSerde
 
 __all__ = [
@@ -556,7 +556,7 @@ def any_to_arrow_scalar(
 
         if is_dataclass(scalar):
             if not target_field:
-                target_field = get_dataclass_arrow_field(scalar)
+                target_field = dataclass_to_arrow_field(scalar)
                 options = options.copy(target_arrow_field=target_field)
 
             scalar = dataclasses.asdict(scalar)
@@ -565,7 +565,7 @@ def any_to_arrow_scalar(
             if is_dataclass(scalar):
                 scalar = pa.scalar(
                     dataclasses.asdict(scalar),
-                    type=get_dataclass_arrow_field(scalar).type
+                    type=dataclass_to_arrow_field(scalar).type
                 )
             else:
                 scalar = pa.scalar(scalar)
@@ -1265,6 +1265,11 @@ def any_to_arrow_field(
                 )
 
             return options.target_arrow_field
+
+        if is_dataclass(obj):
+            from ...dataclasses.dataclass import dataclass_to_arrow_field
+
+            return dataclass_to_arrow_field(obj)
 
         namespace = ObjectSerde.full_namespace(obj)
 

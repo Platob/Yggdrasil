@@ -1,3 +1,3 @@
 """Enhanced dataclass helpers with Arrow awareness."""
 
-from .dataclass import get_dataclass_arrow_field
+from .dataclass import dataclass_to_arrow_field
