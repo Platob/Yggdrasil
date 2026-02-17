@@ -18,7 +18,7 @@ class TestSQLEngine(unittest.TestCase):
         data = pa.table([
             pa.array(["a", None, "c"]),
             pa.array([1, 2, 4]),
-            pa.array([{"q": dt.datetime.now(dt.timezone.utc)}, None, None]),
+            pa.array([{"q": dt.datetime.now(dt.timezone.utc), "v": 1.0}, None, None]),
             pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
         ], names=["c0", "c1", "c2", "c3", "map column"])
@@ -36,9 +36,25 @@ class TestSQLEngine(unittest.TestCase):
 
         n = self.engine.table_full_name(table_name="test_insert")
 
-        read = self.engine.execute(f"SELECT * from {n}").to_arrow_table()
+        result = self.engine.execute(f"SELECT * from {n}")
+
+        read = result.to_arrow_dataset()
+
+        ds_table = read.to_table()
+
+        self.assertEqual(ds_table.num_rows, data.num_rows + other_data.num_rows)
+
+        read = result.to_arrow_table()
 
         self.assertEqual(read.num_rows, data.num_rows + other_data.num_rows)
+
+        read = result.to_polars_lazy().collect()
+
+        self.assertEqual(read.shape[0], data.num_rows + other_data.num_rows)
+
+        read = result.to_polars()
+
+        self.assertEqual(read.shape[0], data.num_rows + other_data.num_rows)
 
         with pytest.raises(SqlStatementError):
             self.engine.execute(f"SELECT * from unknown_table")
@@ -71,3 +87,16 @@ class TestSQLEngine(unittest.TestCase):
         self.assertEqual(warehouse.warehouse_name, "tmp warehouse")
 
         warehouse.delete()
+
+    def test_sander(self):
+        from yggdrasil.databricks import Workspace
+
+        workspace = Workspace(
+            host="https://dbc-ffff1730-cc5b.cloud.databricks.com"
+        )
+        engine = workspace.sql(warehouse="sparq-serverless-dev-warehouse")
+
+        result = engine.execute("SELECT * FROM `batefitservices-dev-internal`.fge.raw_fge_monthly")
+        polars_df = result.to_polars_lazy()
+
+        print(polars_df)

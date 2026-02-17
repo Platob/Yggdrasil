@@ -54,5 +54,6 @@ class SQLEngine(ABC):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
+        wait: Optional[WaitingConfigArg] = True
     ):
         raise NotImplementedError

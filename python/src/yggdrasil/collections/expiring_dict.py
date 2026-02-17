@@ -122,6 +122,25 @@ class ExpiringDict(MutableMapping[K, V]):
                 if self.on_expire:
                     self.on_expire(key, entry.value)
 
+    def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
+        with self._lock:
+            self._prune()
+            entry = self._store.get(key)
+            if entry is None:
+                return default
+
+            # If somehow expired without being pruned yet
+            if entry.expires_at <= self._now_ns():
+                del self._store[key]
+                return default
+
+            if self.refresh_on_get:
+                if self.default_ttl is None:
+                    raise ValueError("refresh_on_get=True requires default_ttl")
+                self.set(key, entry.value, ttl=self.default_ttl)
+
+            return entry.value
+
     def set(self, key: K, value: V, ttl: Optional[Union[int, float, timedelta]] = None) -> None:
         with self._lock:
             self._prune()

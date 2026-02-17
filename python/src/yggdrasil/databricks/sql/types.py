@@ -53,9 +53,9 @@ STRING_TYPE_MAP = {
     # date/time/timestamp
     "DATE": pa.date32(),
     "TIME": pa.time64("ns"),
-    "TIMESTAMP": pa.timestamp("us", "UTC"),
+    "TIMESTAMP": pa.timestamp("us", "Etc/UTC"),
     "TIMESTAMP_NTZ": pa.timestamp("us"),
-    "DATETIME": pa.timestamp("us", "UTC"),
+    "DATETIME": pa.timestamp("us", "Etc/UTC"),
 
     # binary
     "BINARY": pa.binary(),
