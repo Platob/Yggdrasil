@@ -400,9 +400,11 @@ class StatementResult(BaseStatementResult):
                 return self._arrow_table
             return self._spark_df.toArrow()
 
-        return self.to_arrow_reader(
-            max_workers=max_workers
-        ).read_all()
+        batches = list(self.to_arrow_batches())
+
+        if not batches:
+            return pa.Table.from_batches([], self.arrow_schema())
+        return pa.Table.from_batches(batches)
 
     def to_arrow_batches(
         self,
@@ -682,12 +684,11 @@ class StatementResult(BaseStatementResult):
         -------
         polars.DataFrame
         """
-        lf = self.to_polars_lazy(
-            max_workers=max_workers,
-            max_in_flight=max_in_flight,
-            batch_size=batch_size,
-        )
-        return lf.collect()
+        from ...polars.lib import polars
+
+        tb = self.to_arrow_table()
+
+        return polars.from_arrow(tb)
 
     def to_spark(self) -> "pyspark.sql.DataFrame":
         """Convert results to a Spark DataFrame.
