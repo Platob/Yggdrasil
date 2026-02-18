@@ -747,6 +747,22 @@ def any_polars_to_arrow_field(obj: Any, options: Optional[CastOptions]) -> pa.Fi
 
         return obj
 
+    elif isinstance(obj, polars.Series):
+        obj = pa.field(
+            name=obj.name,
+            type=polars_type_to_arrow_type(obj.dtype, None),
+        )
+
+        return obj
+
+    elif isinstance(obj, polars.Expr):
+        obj = pa.field(
+            name=obj.name,
+            type=pa.null(),
+        )
+
+        return obj
+
     elif isinstance(obj, polars.DataType):
         return pa.field(
             name="root" if options.target_field is None else options.target_field.name,

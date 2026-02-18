@@ -327,6 +327,8 @@ class CastOptions:
             from .arrow_cast import any_to_arrow_field
 
             value = any_to_arrow_field(value, None)
+            object.__setattr__(self, "_source_spark_field", None)
+            object.__setattr__(self, "_source_polars_field", None)
 
         object.__setattr__(self, "source_arrow_field", value)
 
@@ -399,6 +401,8 @@ class CastOptions:
             from .arrow_cast import any_to_arrow_field
 
             value = any_to_arrow_field(value, None)
+            object.__setattr__(self, "_target_spark_field", None)
+            object.__setattr__(self, "_target_polars_field", None)
 
         object.__setattr__(self, "target_arrow_field", value)
 
