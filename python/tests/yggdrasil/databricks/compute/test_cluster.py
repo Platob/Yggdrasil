@@ -72,7 +72,6 @@ class TestCluster(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workspace = Workspace().connect()
-        cls.cluster = cls.workspace.clusters().push_python_environment()
         cls.cluster.install_temporary_libraries(libraries=["yggdrasil"])
 
     def test_cluster_dyn_properties(self):

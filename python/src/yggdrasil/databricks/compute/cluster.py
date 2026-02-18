@@ -109,6 +109,10 @@ class Cluster(WorkspaceService):
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
 
+    def __post_init__(self):
+        if self.cluster_name and not self.cluster_id:
+            self.cluster_id = self.find_cluster(cluster_name=self.cluster_name).cluster_id
+
     def __repr__(self):
         return "%s(url=%s)" % (
             self.__class__.__name__,
@@ -143,120 +147,6 @@ class Cluster(WorkspaceService):
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
         return self.workspace.is_in_databricks_environment()
-
-    @classmethod
-    def replicated_current_environment(
-        cls,
-        workspace: Optional["Workspace"] = None,
-        cluster_id: Optional[str] = None,
-        cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = None,
-        runtime_engine: Optional["RuntimeEngine"] = None,
-        libraries: Optional[list[str]] = None,
-        wait_update: Optional[WaitingConfigArg] = True,
-        **kwargs
-    ) -> "Cluster":
-        """Create or reuse a cluster that mirrors the current Python environment.
-
-        Args:
-            workspace: Workspace to use for the cluster.
-            cluster_id: Optional cluster id to reuse.
-            cluster_name: Optional cluster name to reuse.
-            single_user_name: Optional username for single-user clusters.
-            runtime_engine: Optional Databricks runtime engine.
-            libraries: Optional list of libraries to install.
-            wait_update: wait timeout, if None it will not wait completion
-            **kwargs: Additional cluster specification overrides.
-
-        Returns:
-            A Cluster instance configured for the current environment.
-        """
-        if workspace is None:
-            workspace = Workspace()  # your default, whatever it is
-
-        host = workspace.safe_host
-
-        # 🔥 return existing singleton for this host
-        existing = cls._env_clusters.get(host)
-
-        if existing is not None:
-            return existing
-
-        # 🔥 first time for this host → create
-        inst = cls._env_clusters[host] = (
-            cls(workspace=workspace, cluster_id=cluster_id, cluster_name=cluster_name)
-            .push_python_environment(
-                single_user_name=single_user_name,
-                runtime_engine=runtime_engine,
-                libraries=libraries,
-                wait_update=wait_update,
-                **kwargs
-            )
-        )
-
-        return inst
-
-    def push_python_environment(
-        self,
-        source: Optional[PythonEnv] = None,
-        cluster_id: Optional[str] = None,
-        cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = "current",
-        runtime_engine: Optional["RuntimeEngine"] = None,
-        libraries: Optional[list[str]] = None,
-        wait_update: Optional[WaitingConfigArg] = True,
-        **kwargs
-    ) -> "Cluster":
-        """Create/update a cluster to match the local Python environment.
-
-        Args:
-            source: Optional PythonEnv to mirror (defaults to current).
-            cluster_id: Optional cluster id to update.
-            cluster_name: Optional cluster name to update.
-            single_user_name: Optional single username for the cluster.
-            runtime_engine: Optional runtime engine selection.
-            libraries: Optional list of libraries to install.
-            wait_update: wait timeout, if None it will not wait completion
-            **kwargs: Additional cluster specification overrides.
-
-        Returns:
-            A Cluster instance configured with the local environment.
-        """
-        if source is None:
-            source = PythonEnv.get_current()
-
-        libraries = list(libraries) if libraries is not None else []
-
-        python_version = source.version_info
-
-        if python_version[0] < 3:
-            python_version = None
-        elif python_version[1] < 11:
-            python_version = None
-
-        current_user_name = self.workspace.current_user.user_name
-
-        if single_user_name == "current":
-            single_user_name = current_user_name
-
-        cluster_id = cluster_id or self.cluster_id
-        cluster_name = cluster_name or self.cluster_name
-
-        if not cluster_id and not cluster_name:
-            cluster_name = current_user_name
-
-        inst = self.create_or_update(
-            cluster_id=cluster_id,
-            cluster_name=cluster_name,
-            python_version=python_version,
-            single_user_name=single_user_name,
-            runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
-            libraries=libraries,
-            wait_update=wait_update,
-            **kwargs
-        )
-
-        return inst
 
     @property
     def details(self):
@@ -1146,6 +1036,7 @@ class Cluster(WorkspaceService):
             if pip_settings.extra_index_url and (
                 value.startswith("datamanagement")
                 or value.startswith("TSSecrets")
+                or value.startswith("TSMails")
                 or value.startswith("tgp_")
                 or value.startswith("wma-data")
             ):

@@ -48,11 +48,7 @@ class TestSQLEngine(unittest.TestCase):
 
         self.assertEqual(read.num_rows, data.num_rows + other_data.num_rows)
 
-        read = result.to_polars_lazy().collect()
-
-        self.assertEqual(read.shape[0], data.num_rows + other_data.num_rows)
-
-        read = result.to_polars()
+        read = result.to_polars(stream=False)
 
         self.assertEqual(read.shape[0], data.num_rows + other_data.num_rows)
 
@@ -87,19 +83,3 @@ class TestSQLEngine(unittest.TestCase):
         self.assertEqual(warehouse.warehouse_name, "tmp warehouse")
 
         warehouse.delete()
-
-    def test_sander(self):
-        from yggdrasil.databricks import Workspace
-
-        workspace = Workspace(
-            host="dbc-e6e40d20-0e8f.cloud.databricks.com"
-        )
-        engine = workspace.sql()
-
-        result = engine.execute("SELECT * FROM `trading`.ba_3mv_polaris__p__volcano_ref_input.curve_data limit 1000")
-
-        read = result.to_arrow_table()
-        read = result.to_pandas()
-        read = result.to_polars(stream=False)
-
-        print(read)

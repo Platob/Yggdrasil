@@ -68,18 +68,10 @@ def databricks_remote_compute(
             raise ValueError("Cannot initialize databricks workspace with %s" % type(workspace))
 
     if cluster is None:
-        if cluster_id or cluster_name:
-            cluster = workspace.clusters(
-                cluster_id=cluster_id,
-                cluster_name=cluster_name
-            )
-        else:
-            cluster = workspace.clusters().replicated_current_environment(
-                workspace=workspace,
-                cluster_name=cluster_name,
-                single_user_name=workspace.current_user.user_name,
-                wait_update=False
-            )
+        cluster = workspace.clusters(
+            cluster_id=cluster_id,
+            cluster_name=cluster_name
+        )
 
     return cluster.system_context.decorate(
         func=_func,

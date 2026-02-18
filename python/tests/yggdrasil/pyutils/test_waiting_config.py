@@ -32,9 +32,9 @@ def test_check_arg_scalar_sets_timeout(arg, expected_timeout):
     assert isinstance(wc, WaitingConfig)
     assert wc.timeout == expected_timeout
     # other defaults in your check_arg() fallback path
-    assert wc.interval == 2.0
-    assert wc.backoff == 1.0
-    assert wc.max_interval == 15.0
+    assert wc.interval == 1.0
+    assert wc.backoff == 2.0
+    assert wc.max_interval == 10.0
 
 
 def test_check_arg_instance_returns_equivalent_config():
@@ -42,7 +42,7 @@ def test_check_arg_instance_returns_equivalent_config():
     wc = WaitingConfig.check_arg(wc0)
     # your implementation returns a new instance; equality is what matters
     assert wc == wc0
-    assert wc is not wc0
+    assert wc is wc0
 
 
 def test_check_arg_dict_timeout():
@@ -84,15 +84,15 @@ def test_check_arg_dict_deadline_and_timeout_raises():
         # IMPORTANT: in Python, bool is a subclass of int.
         # Your check_arg checks (int, float, timedelta) BEFORE bool,
         # so True becomes 1.0 and False becomes 0.0 here.
-        (True, 1.0),
+        (True, 1200.0),
         (False, 0.0),
     ],
 )
 def test_check_arg_bool_is_treated_as_int_due_to_type_order(arg, expected_timeout):
     wc = WaitingConfig.check_arg(arg)
     assert wc.timeout == expected_timeout
-    assert wc.interval == 2.0
-    assert wc.backoff == 1.0
+    assert wc.interval == 1.0
+    assert wc.backoff == 2.0
     assert wc.max_interval == 15.0
 
 

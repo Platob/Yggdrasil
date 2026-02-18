@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.2.14"
+version = "0.2.20"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }

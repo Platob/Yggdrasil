@@ -1,13 +1,17 @@
-# pyenv.py
+# yggdrasil.environ.system_command.py
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Sequence, Union, TYPE_CHECKING, Optional
 
-from ..waiting_config import WaitingConfig, WaitingConfigArg
+from yggdrasil.pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+
+if TYPE_CHECKING:
+    from .environment import PyEnv
 
 __all__ = ["SystemCommandError", "SystemCommand"]
 
@@ -31,6 +35,7 @@ class SystemCommand:
     cwd: Path | None
     env: dict[str, str] | None
     popen: subprocess.Popen[str]
+    python: Optional["PyEnv"] = None
     completed: subprocess.CompletedProcess[str] | None = field(default=None, init=False, repr=False)
 
     @staticmethod
@@ -63,6 +68,7 @@ class SystemCommand:
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        python: Optional["PyEnv"] = None,
     ) -> SystemCommand:
         popen = subprocess.Popen(
             list(args),
@@ -79,6 +85,7 @@ class SystemCommand:
             cwd=cwd,
             env=env,
             popen=popen,
+            python=python
         )
 
     def poll(self) -> int | None:
@@ -104,10 +111,11 @@ class SystemCommand:
         if self.completed is not None:
             return self.completed  # type: ignore[return-value]
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.check_arg(wait)
 
-        if wait_cfg.timeout:
-            out, err = self.popen.communicate(timeout=wait_cfg.timeout_total_seconds)
+        if wait.timeout:
+            out, err = self.popen.communicate(timeout=wait.timeout_total_seconds)
+
             self.completed = subprocess.CompletedProcess(
                 args=list(self.args),
                 returncode=self.popen.returncode or 0,
@@ -115,15 +123,88 @@ class SystemCommand:
                 stderr=err,
             )
 
-            return self.raise_for_status(raise_error=raise_error)
+            return self.raise_for_status(
+                wait=wait,
+                raise_error=raise_error
+            )
         return self
+
+    def find_module_not_found_error(self) -> Optional[ModuleNotFoundError]:
+        """
+        Best-effort extraction of a ModuleNotFoundError from captured stderr.
+
+        Supports common stderr shapes:
+          - Standard Python traceback line:
+              ModuleNotFoundError: No module named 'foo'
+          - With module path:
+              ModuleNotFoundError: No module named 'foo.bar'
+          - Alternative phrasing (rare but seen):
+              No module named foo
+
+        Returns:
+          - ModuleNotFoundError(name=<module>) when detected
+          - None otherwise
+        """
+        err = self.stderr
+        if not err:
+            return None
+
+        # Most reliable: the actual exception line in a Python traceback
+        # Example: "ModuleNotFoundError: No module named 'requests'"
+        m = re.search(
+            r"ModuleNotFoundError:\s+No module named\s+['\"](?P<name>[^'\"]+)['\"]",
+            err,
+        )
+        if m:
+            name = m.group("name")
+            return ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+        # Slightly weaker: unquoted variant sometimes appears in logs
+        m = re.search(
+            r"\bNo module named\s+(?P<name>[A-Za-z_][\w\.]*)\b",
+            err,
+        )
+        if m:
+            name = m.group("name")
+            return ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+        return None
+
+    def retry(
+        self,
+        wait: WaitingConfigArg | None = True,
+        raise_error: bool = True,
+    ) -> Union["SystemCommand", "SystemCommandError"]:
+        """Re-launch the same command, replacing internal popen/completed state."""
+        new_popen = subprocess.Popen(
+            list(self.args),
+            cwd=str(self.cwd) if self.cwd else None,
+            env=self.env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # dataclass(slots=True) but not frozen — normal attribute assignment is fine.
+        self.popen = new_popen
+        self.completed = None
+        return self.wait(wait=wait, raise_error=raise_error)
 
     def raise_for_status(
         self,
-        wait: WaitingConfigArg | None = False,
-        raise_error: bool = True
+        *,
+        wait: WaitingConfigArg | None = True,
+        raise_error: bool = True,
+        install_python_modules: bool = True,
     ) -> Union["SystemCommand", "SystemCommandError"]:
         if self.returncode != 0:
+            module_err = self.find_module_not_found_error()
+
+            if install_python_modules and self.python and isinstance(module_err, ModuleNotFoundError):
+                # Ask the bound PyEnv to pip-install the missing package, then retry once.
+                self.python.install(module_err.name)
+                return self.retry(wait=wait, raise_error=raise_error)
+
             e = SystemCommandError(command=self)
 
             if raise_error:
@@ -141,17 +222,9 @@ class SystemCommandError(RuntimeError):
     def __str__(self):
         cp = self.command
 
-        return (
-            f"{cp} failed:\n"
-            f"--- stdout ---\n{cp.stdout}\n"
-            f"--- stderr ---\n{cp.stderr}\n"
-        )
+        return cp.stderr
 
     def __repr__(self):
         cp = self.command
 
-        return (
-            f"{cp} failed:\n"
-            f"--- stdout ---\n{cp.stdout}\n"
-            f"--- stderr ---\n{cp.stderr}\n"
-        )
+        return cp.stderr

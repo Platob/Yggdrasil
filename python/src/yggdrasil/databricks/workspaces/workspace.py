@@ -128,8 +128,10 @@ class Workspace:
 
     # Runtime cache (never serialized)
     _sdk: Optional["WorkspaceClient"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _clusters: Optional["Cluster"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _sql: Optional["SQLEngine"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _secrets: Optional["Secret"] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+
     _was_connected: bool = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
@@ -144,7 +146,7 @@ class Workspace:
         """
         state = self.__dict__.copy()
 
-        for service in ("_sdk", "_sql", "_secrets"):
+        for service in ("_sdk", "_sql", "_secrets", "_clusters"):
             state[service] = None
 
         if self.auth_type in ["external-browser", "runtime"]:
@@ -881,8 +883,22 @@ class Workspace:
         """
         from ..compute.cluster import Cluster
 
+        workspace = self if workspace is None else workspace
+
+        if workspace is self and cluster_id is None and cluster_name is None:
+            if self._clusters is not None:
+                return self._clusters
+
+            self._clusters = Cluster(
+                workspace=workspace,
+                cluster_id=cluster_id,
+                cluster_name=cluster_name,
+            )
+
+            return self._clusters
+
         return Cluster(
-            workspace=self if workspace is None else workspace,
+            workspace=workspace,
             cluster_id=cluster_id,
             cluster_name=cluster_name,
         )
@@ -895,12 +911,14 @@ class Workspace:
     ):
         from ..secrets.secret import Secret
 
-        if workspace is None and scope is None and key is None:
+        workspace = self if workspace is None else workspace
+
+        if workspace is self and scope is None and key is None:
             if self._secrets is not None:
                 return self._secrets
 
             self._secrets = Secret(
-                workspace=self if workspace is None else workspace,
+                workspace=workspace,
                 scope=scope,
                 key=key,
             )
@@ -908,7 +926,7 @@ class Workspace:
             return self._secrets
 
         return Secret(
-            workspace=self if workspace is None else workspace,
+            workspace=workspace,
             scope=scope,
             key=key,
         )
