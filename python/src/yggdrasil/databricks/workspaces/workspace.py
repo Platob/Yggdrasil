@@ -44,6 +44,18 @@ __all__ = [
 
 LOGGER = logging.getLogger(__name__)
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, Set[str]] = ExpiringDict()
+# Fields that hold live, non-serializable state — always dropped
+_RUNTIME_FIELDS = frozenset({"_sdk", "_sql", "_secrets", "_clusters"})
+
+# Fields that are cheap to re-derive and not worth pickling when None
+_SKIP_IF_NONE = frozenset({
+    "token_audience", "azure_workspace_resource_id", "azure_use_msi",
+    "azure_client_secret", "azure_client_id", "azure_tenant_id",
+    "azure_environment", "google_credentials", "google_service_account",
+    "debug_truncate_bytes", "debug_headers", "rate_limit",
+    "http_timeout_seconds", "retry_timeout_seconds",
+    "custom_tags", "product_tag",
+})
 
 def is_checked_tmp_path(
     host: str,
@@ -138,35 +150,80 @@ class Workspace:
     # -------------------------
     # Python methods
     # -------------------------
-    def __getstate__(self):
+    def __getstate__(self) -> dict:
         """Serialize the workspace state for pickling.
 
+        Omits live SDK handles, strips None-valued optional fields to keep
+        the payload lean, and captures a bearer token only when the auth
+        strategy won't survive a round-trip (browser / runtime sessions).
+
         Returns:
-            A pickle-ready state dictionary.
+            A compact, pickle-ready state dictionary.
         """
-        state = self.__dict__.copy()
+        # Auth types that cannot re-authenticate after unpickling
+        _EPHEMERAL_AUTH = {"external-browser", "runtime"}
 
-        for service in ("_sdk", "_sql", "_secrets", "_clusters"):
-            state[service] = None
+        state: dict = {}
 
-        if self.auth_type in ["external-browser", "runtime"]:
+        for key, value in self.__dict__.items():
+            if key in _RUNTIME_FIELDS:
+                continue  # always drop live handles
+            if key in _SKIP_IF_NONE and value is None:
+                continue  # prune empty optionals
+            state[key] = value
+
+        # Normalise ephemeral auth so connect() will fall back cleanly
+        if state.get("auth_type") in _EPHEMERAL_AUTH:
             state["auth_type"] = None
 
-        state["_was_connected"] = self._sdk is not None
-        state["_cached_token"] = self.current_token()
+        # Cache a bearer token only when the token field won't survive on its
+        # own (i.e. we're not using a static PAT that is already in self.token)
+        was_connected = self._sdk is not None
+        state["_was_connected"] = was_connected
+
+        if was_connected and not self.token:
+            # Only pay the cost of fetching a token when we actually need it
+            try:
+                state["_cached_token"] = self.current_token()
+            except Exception:
+                state["_cached_token"] = None
+        else:
+            # Static PAT is already stored in `token`; no need to duplicate it
+            state["_cached_token"] = None
 
         return state
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: dict) -> None:
         """Restore workspace state after unpickling.
+
+        Fills missing optional keys with their dataclass defaults so the
+        instance is fully valid even when the state was stripped by
+        __getstate__.  Reconnects only when the original instance was
+        connected and enough credentials are available to do so.
 
         Args:
             state: Serialized state dictionary.
         """
+        # Re-hydrate any keys that were pruned as None during pickling so
+        # the instance is attribute-complete (dataclass invariant).
+        for field in _SKIP_IF_NONE:
+            state.setdefault(field, None)
+
         self.__dict__.update(state)
         self._sdk = None
 
-        if self._was_connected:
+        # Guard: only reconnect when there is a usable credential
+        has_credential = bool(
+            self.token
+            or self._cached_token
+            or self.client_id
+            or self.profile
+            or self.azure_client_id
+            or self.google_service_account
+            or self.is_in_databricks_environment()
+        )
+
+        if self._was_connected and has_credential:
             self.connect(reset=True)
 
     def __enter__(self) -> "Workspace":

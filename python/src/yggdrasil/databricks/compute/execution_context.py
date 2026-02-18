@@ -17,9 +17,9 @@ from databricks.sdk.service.compute import Language, ResultType, CommandStatusRe
 
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
+from ...environ.modules import resolve_local_lib_path
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.modules import resolve_local_lib_path
 from ...pyutils.waiting_config import WaitingConfigArg
 
 if TYPE_CHECKING:
@@ -33,6 +33,16 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
 BytesLike = Union[bytes, bytearray, memoryview]
+# Module-level constants
+_CTX_RUNTIME_FIELDS = frozenset({
+    "_lock",           # threading.RLock — never picklable
+})
+
+_CTX_RESET_FIELDS = frozenset({
+    "_remote_metadata",  # temp_path is remote-process-local; zero on restore
+                         # caller re-fetches lazily on first access
+})
+
 
 @dc.dataclass(frozen=True)
 class BytesSource:
@@ -104,19 +114,52 @@ class ExecutionContext:
     _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False, compare=False, hash=False)
     _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False, compare=False, hash=False)
 
-    # --- Pickle / cloudpickle support (don’t serialize locks or cached remote metadata) ---
-    def __getstate__(self):
-        """Serialize context state, excluding locks and remote metadata."""
-        state = self.__dict__.copy()
+    def __getstate__(self) -> dict:
+        """Serialize context state for pickling.
 
-        # name-mangled field for _lock in instance dict:
-        state.pop("_lock", None)
+        Drops unpickable threading primitives and resets fields whose
+        values are only meaningful in the originating process:
+
+        - ``_lock``: RLock is not picklable and must always be reconstructed
+        - ``_remote_metadata``: contains a ``temp_path`` that only exists on
+          the remote cluster's filesystem; stale after transport.  The
+          ``site_packages_path`` and ``os_env`` within it are also
+          process/host-specific.  Drop it and let the lazy property
+          re-fetch on first use.
+
+        ``_uploaded_package_roots`` is preserved: remote paths remain valid
+        across processes as long as the cluster session is alive, so we avoid
+        redundant re-uploads.
+
+        Returns:
+            A compact, pickle-ready state dictionary.
+        """
+        state = {}
+
+        for key, value in self.__dict__.items():
+            if key in _CTX_RUNTIME_FIELDS:
+                continue
+            if key in _CTX_RESET_FIELDS:
+                state[key] = None  # preserve key for attribute completeness
+                continue
+            state[key] = value
 
         return state
 
-    def __setstate__(self, state):
-        """Restore context state, rehydrating locks if needed."""
-        state["_lock"] = state.get("_lock", threading.RLock())
+    def __setstate__(self, state: dict) -> None:
+        """Restore context state after unpickling.
+
+        Always constructs a fresh RLock — never attempts to restore a
+        serialized one.  Ensures all expected attributes are present even
+        when the state was produced by an older serialized form.
+
+        Args:
+            state: Serialized state dictionary.
+        """
+        state["_lock"] = threading.RLock()  # always fresh
+        state.setdefault("_remote_metadata", None)
+        state.setdefault("_was_connected", None)
+        state.setdefault("_uploaded_package_roots", ExpiringDict())
 
         self.__dict__.update(state)
 
@@ -210,16 +253,6 @@ print(json.dumps(meta))"""
             The underlying WorkspaceClient instance.
         """
         return self.cluster.workspace.sdk()
-
-    def shared_cache_path(
-        self,
-        suffix: str
-    ):
-        assert suffix, "Missing suffix arg"
-
-        return self.cluster.shared_cache_path(
-            suffix="/context/%s" % suffix.lstrip("/")
-        )
 
     def create(
         self,

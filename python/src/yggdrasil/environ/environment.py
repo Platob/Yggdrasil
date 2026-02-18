@@ -32,8 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Union, Iterable
 
-from yggdrasil.environ.userinfo import UserInfo
-
+from .userinfo import UserInfo
 from .system_command import SystemCommand
 from ..pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 

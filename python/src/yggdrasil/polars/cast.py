@@ -763,7 +763,7 @@ def any_polars_to_arrow_field(obj: Any, options: Optional[CastOptions]) -> pa.Fi
             metadata=None if options.target_field is None else options.target_field.metadata,
         )
 
-    elif obj in polars_type_classes:
+    elif obj in polars_type_classes():
         obj = obj()
 
         return pa.field(

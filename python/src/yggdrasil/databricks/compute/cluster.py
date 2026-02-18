@@ -26,14 +26,13 @@ from databricks.sdk.service.compute import (
     ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus,
     ClusterAccessControlRequest, ClusterPermissionLevel
 )
-from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
+from databricks.sdk.service.compute import SparkVersion
 
 from .execution_context import ExecutionContext
-from ..workspaces.workspace import WorkspaceService, Workspace
+from ..workspaces.workspace import WorkspaceService
+from ...environ.pip_settings import PipIndexSettings
 from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.modules import PipIndexSettings
-from ...pyutils.python_env import PythonEnv
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
@@ -44,6 +43,8 @@ __all__ = ["Cluster"]
 
 LOGGER = logging.getLogger(__name__)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
+_CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context"})
+_CLUSTER_SKIP_IF_NONE = frozenset({"_details", "cluster_name"})
 
 
 def set_cached_cluster_name(
@@ -83,6 +84,7 @@ _PYTHON_BY_DBR: dict[str, tuple[int, int]] = {
     "17.3": (3, 12),
     "18.0": (3, 12),
 }
+ALL_PURPOSE_CLUSTER: "Cluster | None" = None
 
 
 @dataclass
@@ -112,6 +114,59 @@ class Cluster(WorkspaceService):
     def __post_init__(self):
         if self.cluster_name and not self.cluster_id:
             self.cluster_id = self.find_cluster(cluster_name=self.cluster_name).cluster_id
+
+    def __getstate__(self) -> dict:
+        """Serialize cluster state for pickling.
+
+        Drops live execution contexts; preserves cluster details to avoid
+        a redundant API round-trip on restore.  The details refresh
+        timestamp is zeroed so the first ``fresh_details()`` call after
+        unpickling always re-validates against the API.
+
+        Returns:
+            A compact, pickle-ready state dictionary.
+        """
+        state = {}
+
+        for key, value in self.__dict__.items():
+            if key in _CLUSTER_RUNTIME_FIELDS:
+                continue
+            if key in _CLUSTER_SKIP_IF_NONE and value is None:
+                continue
+            state[key] = value
+
+        # Zero the refresh timestamp: stale wall-clock values from the
+        # originating process are meaningless in the receiving process,
+        # so force a re-fetch on the first fresh_details() call.
+        state["_details_refresh_time"] = 0.0
+
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore cluster state after unpickling.
+
+        Re-hydrates pruned optional keys so the instance is
+        attribute-complete, then syncs cluster_id/cluster_name from
+        any restored ClusterDetails to keep identifiers consistent.
+
+        Args:
+            state: Serialized state dictionary.
+        """
+        for field in _CLUSTER_SKIP_IF_NONE:
+            state.setdefault(field, None)
+
+        # Execution context is always reconstructed lazily on first access
+        state["_system_context"] = None
+
+        self.__dict__.update(state)
+
+        # If details survived the round-trip, re-sync the scalar identifiers.
+        # This is cheaper than an API call and keeps __repr__ / url() correct.
+        if self._details is not None:
+            if self._details.cluster_id:
+                self.cluster_id = self._details.cluster_id
+            if self._details.cluster_name:
+                self.cluster_name = self._details.cluster_name
 
     def __repr__(self):
         return "%s(url=%s)" % (
@@ -288,6 +343,27 @@ class Cluster(WorkspaceService):
 
         return _PYTHON_BY_DBR.get(v)
 
+    def all_purpose_cluster(
+        self,
+        name: str = "Yggdrasil All Purpose",
+    ):
+        global ALL_PURPOSE_CLUSTER
+
+        if ALL_PURPOSE_CLUSTER is not None:
+            return ALL_PURPOSE_CLUSTER
+
+        ALL_PURPOSE_CLUSTER = self.find_cluster(
+            cluster_name=name,
+            raise_error=False
+        )
+
+        if ALL_PURPOSE_CLUSTER is None:
+            ALL_PURPOSE_CLUSTER = self.create(
+                cluster_name=name
+            )
+
+        return ALL_PURPOSE_CLUSTER
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
@@ -399,7 +475,7 @@ class Cluster(WorkspaceService):
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
         **kwargs
     ):
-        pip_settings = PipIndexSettings.default_settings()
+        pip_settings = PipIndexSettings.current()
 
         new_details = ClusterDetails(**{
             **details.as_shallow_dict(),
@@ -859,7 +935,6 @@ class Cluster(WorkspaceService):
             if wait_timeout is not None:
                 self.wait_installed_libraries(
                     timeout=wait_timeout,
-                    pip_settings=pip_settings,
                     raise_error=raise_error
                 )
 
@@ -931,14 +1006,12 @@ class Cluster(WorkspaceService):
     def wait_installed_libraries(
         self,
         timeout: dt.timedelta = dt.timedelta(minutes=20),
-        pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
     ):
         """Wait for library installations to finish on the cluster.
 
         Args:
             timeout: Maximum time to wait for installs.
-            pip_settings: Optional pip index settings.
             raise_error: Whether to raise on failures.
 
         Returns:
@@ -1008,7 +1081,7 @@ class Cluster(WorkspaceService):
         if isinstance(value, Library):
             return value
 
-        pip_settings = PipIndexSettings.default_settings() if pip_settings is None else pip_settings
+        pip_settings = PipIndexSettings.current() if pip_settings is None else pip_settings
 
         if isinstance(value, str):
             if os.path.exists(value):

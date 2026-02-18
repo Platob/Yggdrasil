@@ -32,6 +32,14 @@ FAILED_STATES = {
     CommandStatus.ERROR, CommandStatus.CANCELLED
 }
 
+# Module-level constants — computed once at import time
+_CMD_RUNTIME_FIELDS = frozenset({"_details"})
+
+# Fields dropped when serializing for remote cluster execution
+# (command is reconstructed remotely; context_id / command_id are local)
+_CMD_REMOTE_DROP = frozenset({"command", "command_id"})
+
+
 if TYPE_CHECKING:
     from .execution_context import ExecutionContext
 
@@ -62,6 +70,62 @@ class CommandExecution:
                     k: os.getenv(k)
                     for k in self.environ
                 }
+
+    def __getstate__(self) -> dict:
+        """Serialize for pickling.
+
+        Two distinct pickle consumers exist:
+
+        1. **Remote cluster execution** (via ``make_python_function_command``):
+           ``dill.dumps(self)`` embeds this object in generated Python code
+           that runs on the Databricks cluster.  Only ``decode_payload`` /
+           ``encode_object`` are called there, so we need ``context.workspace``
+           but not the live command state or SDK handles.
+
+        2. **Local process serialization** (Spark UDFs, multiprocessing):
+           Same rules as (1) — live handles don't survive cross-process.
+
+        In both cases we drop:
+        - ``_details``: live SDK response object, meaningless after transport
+        - ``command``: can be 10s of KB; the remote side never calls ``.start()``
+        - ``command_id``: local execution handle, invalid on the remote
+
+        Returns:
+            A lean, pickle-ready state dictionary.
+        """
+        state = {}
+
+        for key, value in self.__dict__.items():
+            if key in _CMD_RUNTIME_FIELDS:
+                continue
+            if key in _CMD_REMOTE_DROP and value is not None:
+                # Preserve None explicitly so __setstate__ can restore defaults
+                # without an attribute error, but drop non-None payloads.
+                state[key] = None
+                continue
+            state[key] = value
+
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore command execution state after unpickling.
+
+        Ensures all expected attributes are present even when the state was
+        produced by a stripped ``__getstate__``.  The execution context is
+        left as-is; callers must invoke ``connect(reset=True)`` if they need
+        a live context after unpickling.
+
+        Args:
+            state: Serialized state dictionary.
+        """
+        # Guarantee attribute completeness for fields that may have been
+        # pruned or were absent in older serialized states.
+        state.setdefault("_details", None)
+        state.setdefault("command", None)
+        state.setdefault("command_id", None)
+        state.setdefault("environ", None)
+
+        self.__dict__.update(state)
 
     def __call__(self, *args, **kwargs):
         assert self.command, "Cannot call %s, missing command" % self
@@ -518,6 +582,7 @@ class CommandExecution:
 
         cmd = f"""
 import base64, dill, os
+from yggdrasil.environ.environment
 
 if __ENVIRON__:
     for k, v in __ENVIRON__.items():
