@@ -5,12 +5,14 @@ from typing import Optional, Union, TYPE_CHECKING
 import pyarrow as pa
 
 from .statement_result import StatementResult
+from ..enums import SaveMode
 from ..pyutils.waiting_config import WaitingConfigArg
 from ..types.cast.cast_options import CastOptions
 
 if TYPE_CHECKING:
     import polars
     import pandas
+    import pyspark
 
 
 __all__ = [
@@ -20,8 +22,6 @@ __all__ = [
 
 @dataclass
 class SQLEngine(ABC):
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
 
     @abstractmethod
     def execute(
@@ -46,7 +46,7 @@ class SQLEngine(ABC):
             "pyspark.sql.DataFrame"
         ],
         *,
-        mode: str = "auto",
+        mode: SaveMode | str | None = None,
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,

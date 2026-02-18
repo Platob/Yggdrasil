@@ -148,6 +148,8 @@ class CreateTablePlan:
 @dataclasses.dataclass
 class SQLEngine(BaseSQLEngine, WorkspaceService):
     """Execute SQL statements and manage tables via Databricks SQL / Spark."""
+    catalog_name: Optional[str] = None
+    schema_name: Optional[str] = None
 
     _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _ai_session: Optional["SQLAISession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
@@ -414,8 +416,9 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 warehouse_id="SparkSQL",
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
-                _spark_df=df,
             )
+
+            result._spark_df = df
         else:
             # --- Warehouse API path ---
             wh = self.warehouse(

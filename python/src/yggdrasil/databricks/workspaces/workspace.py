@@ -143,8 +143,12 @@ class Workspace:
             A pickle-ready state dictionary.
         """
         state = self.__dict__.copy()
-        state.pop("_sdk", None)
-        state.pop("_sql", None)
+
+        for service in ("_sdk", "_sql", "_secrets"):
+            state[service] = None
+
+        if self.auth_type in ["external-browser", "runtime"]:
+            state["auth_type"] = None
 
         state["_was_connected"] = self._sdk is not None
         state["_cached_token"] = self.current_token()
@@ -159,9 +163,6 @@ class Workspace:
         """
         self.__dict__.update(state)
         self._sdk = None
-
-        if self.auth_type in ["external-browser", "runtime"]:
-            self.auth_type = None
 
         if self._was_connected:
             self.connect(reset=True)

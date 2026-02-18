@@ -34,16 +34,16 @@
     <NuGetPackageImportStamp>
     </NuGetPackageImportStamp>
     <BootstrapperEnabled>true</BootstrapperEnabled>
-    <PublishUrl>C:\Users\NFILLO\PycharmProjects\Yggdrasil\csharp\publishp\</PublishUrl>
+    <PublishUrl>C:\Users\NFILLO\PycharmProjects\publish\</PublishUrl>
     <InstallUrl />
     <TargetCulture>en</TargetCulture>
-    <ApplicationVersion>1.0.0.1</ApplicationVersion>
+    <ApplicationVersion>1.0.0.0</ApplicationVersion>
     <AutoIncrementApplicationRevision>false</AutoIncrementApplicationRevision>
     <UpdateEnabled>true</UpdateEnabled>
-    <UpdateInterval>7</UpdateInterval>
+    <UpdateInterval>1</UpdateInterval>
     <UpdateIntervalUnits>days</UpdateIntervalUnits>
     <ProductName>YGGXLAddin</ProductName>
-    <PublisherName />
+    <PublisherName>Yggdrasil</PublisherName>
     <SupportUrl />
     <FriendlyName>YGGXLAddin</FriendlyName>
     <OfficeApplicationDescription />
@@ -351,6 +351,9 @@
   </PropertyGroup>
   <PropertyGroup>
     <ManifestCertificateThumbprint>F31C44116098B4638400A80AFFD753F72A07C0E4</ManifestCertificateThumbprint>
+  </PropertyGroup>
+  <PropertyGroup>
+    <SignAssembly>false</SignAssembly>
   </PropertyGroup>
   <!-- Include the build rules for a C# project. -->
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />

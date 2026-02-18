@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import functools
 import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Iterator, Optional, Union, List, Callable, Dict, ClassVar
+from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.errors import DatabricksError
@@ -744,7 +743,12 @@ class Cluster(WorkspaceService):
                 permission_level=ClusterPermissionLevel.CAN_MANAGE
             )
 
-        return self.default_permissions() + [
+        defaults = self.default_permissions()
+
+        if isinstance(permission, bool):
+            return defaults if permission else []
+
+        return defaults + [
             self._check_permission(_)
             for _ in permission
         ]

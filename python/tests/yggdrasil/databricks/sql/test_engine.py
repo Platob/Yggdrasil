@@ -92,11 +92,14 @@ class TestSQLEngine(unittest.TestCase):
         from yggdrasil.databricks import Workspace
 
         workspace = Workspace(
-            host="https://dbc-ffff1730-cc5b.cloud.databricks.com"
+            host="dbc-e6e40d20-0e8f.cloud.databricks.com"
         )
-        engine = workspace.sql(warehouse="sparq-serverless-dev-warehouse")
+        engine = workspace.sql()
 
-        result = engine.execute("SELECT * FROM `batefitservices-dev-internal`.fge.raw_fge_monthly")
-        polars_df = result.to_polars_lazy()
+        result = engine.execute("SELECT * FROM `trading`.ba_3mv_polaris__p__volcano_ref_input.curve_data limit 1000")
 
-        print(polars_df)
+        read = result.to_arrow_table()
+        read = result.to_pandas()
+        read = result.to_polars(stream=False)
+
+        print(read)
