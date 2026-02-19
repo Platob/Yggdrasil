@@ -163,6 +163,8 @@ class CommandExecution:
         major, minor, _ = PyEnv.current().version_info
         pyversion = f"{major}.{minor}"
 
+        self.context.install_temporary_libraries(libraries=["yggdrasil"])
+
         command = (
             self.command
             .replace("__ARGS__", repr(args_b64))
@@ -605,7 +607,22 @@ class CommandExecution:
             func, byte_limit=64 * 1024, byref=byref, recurse=recurse
         )
 
+        # Inject ctx_libs into sys.path when the context has uploaded temporary libs
+        syspath_lines: list[str] = []
+
+        rm = self.context.remote_metadata
+
+        if rm and rm.libs_path:
+            syspath_lines = [
+                "import os as _os, sys as _sys",
+                f"_p = _os.path.normpath(_os.path.expandvars(_os.path.expanduser({rm.libs_path!r})))",
+                "if _os.path.isdir(_p) and _p not in _sys.path:",
+                "    _sys.path.insert(0, _p)",
+                "del _p, _os, _sys",
+            ]
+
         inner_code = "\n".join([
+            *syspath_lines,  # ← injected before any imports
             "import base64, dill",
             f"command = dill.loads(base64.b64decode({command_b64!r}.encode('ascii')))",
             "args    = dill.loads(base64.b64decode(args_b64.encode('ascii')))",

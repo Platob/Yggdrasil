@@ -66,25 +66,9 @@ LocalSpec = Union[
 
 @dc.dataclass
 class RemoteMetadata:
-    """Metadata describing the remote cluster execution environment."""
-    site_packages_path: Optional[str] = dc.field(default=None)
-    os_env: Dict[str, str] = dc.field(default_factory=dict)
-    version_info: Tuple[int, int, int] = dc.field(default=(0, 0, 0))
-    temp_path: str = ""
-
-    def os_env_diff(
-        self,
-        current: Optional[Dict] = None
-    ):
-        """Return environment variables present locally but missing remotely."""
-        if current is None:
-            current = os.environ
-
-        return {
-            k: v
-            for k, v in current.items()
-            if k not in self.os_env.keys()
-        }
+    version_info: tuple[int, int]
+    tmp_path: str
+    libs_path: str
 
 
 @dc.dataclass
@@ -205,48 +189,21 @@ class ExecutionContext:
     def remote_metadata(self) -> RemoteMetadata:
         """Fetch and cache remote environment metadata for the cluster."""
         # fast path (no lock)
-        rm = self._remote_metadata
-        if rm is not None:
-            return rm
-
-        # slow path guarded
-        with self._lock:
-            # double-check after acquiring lock
-            if self._remote_metadata is None:
-                cmd = r"""import glob, json, os, tempfile
-from yggdrasil.pyutils.python_env import PythonEnv
-
-current_env = PythonEnv.get_current()
-meta = {}
-
-# temp dir (explicit + stable for downstream code)
-tmp_dir = tempfile.mkdtemp(prefix="tmp_")
-meta["temp_path"] = tmp_dir
-os.environ["TMPDIR"] = tmp_dir  # many libs respect this
-
-# find site-packages
-for path in glob.glob('/local_**/.ephemeral_nfs/cluster_libraries/python/lib/python*/site-*', recursive=False):
-    if path.endswith('site-packages'):
-        meta["site_packages_path"] = path
-        break
-
-# env vars snapshot
-os_env = meta["os_env"] = {}
-for k, v in os.environ.items():
-    os_env[k] = v
-
-meta["version_info"] = current_env.version_info
-
-print(json.dumps(meta))"""
-
-                content = self.command(
-                    command=cmd,
-                    language=Language.PYTHON,
-                ).start().wait().result(unpickle=True)
-
-                self._remote_metadata = RemoteMetadata(**content)
-
+        if self._remote_metadata is not None:
             return self._remote_metadata
+
+        key = self.context_key or self.context_id
+
+        tmp_path = f"~/.ygg/dbx-ctx/{key}/tmp/"
+        libs_path = f"~/.ygg/dbx-ctx/{key}/Lib/site-packages/"
+
+        self._remote_metadata = RemoteMetadata(
+            version_info=self.cluster.python_version,
+            tmp_path=tmp_path,
+            libs_path=libs_path
+        )
+
+        return self._remote_metadata
 
     # ------------ internal helpers ------------
     def workspace_client(self):
@@ -398,9 +355,26 @@ print(json.dumps(meta))"""
         command: Optional[str] = None,
         language: Optional[Language] = None,
         environ: Optional[Dict[str, str]] = None,
-        packages: list[str] | None = None
-    ):
+        packages: list[str] | None = None,
+        inject_libs: bool = True,  # new param
+    ) -> "CommandExecution":
         context = self if context is None else context
+
+        # Prepend sys.path injection when we have uploaded libs
+        if (
+            inject_libs
+            and command is not None
+            and (language is None or language == Language.PYTHON)
+        ):
+            rm = self._remote_metadata  # use cached value only — no lazy fetch here
+            if rm and rm.libs_path and self._uploaded_package_roots:
+                syspath_prefix = (
+                    f"import sys as _sys\n"
+                    f"if {rm.libs_path!r} not in _sys.path:\n"
+                    f"    _sys.path.insert(0, {rm.libs_path!r})\n"
+                    f"del _sys\n"
+                )
+                command = syspath_prefix + command
 
         return CommandExecution(
             context=context,
@@ -413,7 +387,7 @@ print(json.dumps(meta))"""
             command=command,
             func=func,
             environ=environ,
-            packages=packages
+            packages=packages,
         )
 
     def decorate(
@@ -695,61 +669,32 @@ with zipfile.ZipFile(buf, "r") as zf:
         self,
         libraries: str | ModuleType | List[str | ModuleType],
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
-        """
-        Upload a local Python lib/module into the remote cluster's
-        site-packages.
+        connected = self.connect()
 
-        `local_lib` can be:
-        - path to a folder  (e.g. "./ygg")
-        - path to a file    (e.g. "./ygg/__init__.py")
-        - module name       (e.g. "ygg")
-        - module object     (e.g. import ygg; workspace.upload_local_lib(ygg))
-        Args:
-            libraries: Library path, name, module, or iterable of these.
-
-        Returns:
-            The resolved library or list of libraries uploaded.
-        """
         if isinstance(libraries, (list, tuple, set)):
-            return [
-                self.install_temporary_libraries(l) for l in libraries
-            ]
+            return [connected.install_temporary_libraries(l) for l in libraries]
 
         resolved = resolve_local_lib_path(libraries)
-
-        LOGGER.debug(
-            "Installing temporary lib '%s' in %s",
-            resolved,
-            self
-        )
-
         str_resolved = str(resolved)
-        existing = self._uploaded_package_roots.get(str_resolved)
 
-        if not existing:
-            remote_site_packages_path = self.remote_metadata.site_packages_path
+        if connected._uploaded_package_roots.get(str_resolved):
+            return libraries
 
-            if resolved.is_dir():
-                # site-packages/<package_name>/
-                remote_target = posixpath.join(remote_site_packages_path, resolved.name)
-            else:
-                # site-packages/<module_file>
-                remote_target = posixpath.join(remote_site_packages_path, resolved.name)
+        libs_path = connected.remote_metadata.libs_path
 
-            self.upload_local_path({
-                str_resolved: remote_target
-            })
+        # Ensure the ctx_libs directory exists on the remote
+        connected.command(
+            command=f"import os; os.makedirs({libs_path!r}, exist_ok=True)"
+        ).start().wait()
 
-            self._uploaded_package_roots[str_resolved] = remote_target
+        # Packages go into ctx_libs/<package_name>/ or ctx_libs/<module>.py
+        remote_target = posixpath.join(libs_path, resolved.name)
 
-            LOGGER.info(
-                "Installed temporary lib '%s' in %s",
-                resolved,
-                self
-            )
+        connected.upload_local_path({str_resolved: remote_target})
+        connected._uploaded_package_roots[str_resolved] = remote_target
 
+        LOGGER.info("Installed temporary lib '%s' → %s on %s", resolved, remote_target, connected)
         return libraries
-
 
 def _decode_result(
     result: CommandStatusResponse,
