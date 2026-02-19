@@ -182,6 +182,50 @@ class PyEnv:
     # ── Python resolution ─────────────────────────────────────────────────────
 
     @staticmethod
+    def _databricks_python_path() -> Path | None:
+        """Return the Python interpreter path for the current Databricks cluster.
+
+        Detection relies on the ``DATABRICKS_RUNTIME_VERSION`` environment
+        variable, which is always set by the Databricks runtime.  The
+        interpreter path is read from ``PYSPARK_PYTHON`` (preferred) or
+        ``PYSPARK_DRIVER_PYTHON`` as a fallback.
+
+        Returns
+        -------
+        Path | None
+            Absolute path to the cluster Python interpreter, or ``None`` when
+            not running inside a Databricks runtime or when neither env var
+            resolves to an existing file.
+        """
+        if os.getenv("DATABRICKS_RUNTIME_VERSION") is None:
+            return None
+
+        for var in ("PYSPARK_PYTHON", "PYSPARK_DRIVER_PYTHON"):
+            value = os.getenv(var)
+            if not value:
+                continue
+            p = Path(value)
+            if p.exists() and p.is_file():
+                logger.debug(
+                    "PyEnv._databricks_python_path: resolved via %s=%s",
+                    var,
+                    value,
+                )
+                return p.resolve()
+            logger.warning(
+                "PyEnv._databricks_python_path: %s=%r does not point to a file",
+                var,
+                value,
+            )
+
+        logger.warning(
+            "PyEnv._databricks_python_path: DATABRICKS_RUNTIME_VERSION is set but "
+            "neither PYSPARK_PYTHON nor PYSPARK_DRIVER_PYTHON resolves to a file; "
+            "falling back to sys.executable",
+        )
+        return None
+
+    @staticmethod
     def resolve_python_executable(python: str | Path | None) -> Path:
         """
         Resolve a Python interpreter selector to an absolute :class:`~pathlib.Path`.
@@ -210,6 +254,9 @@ class PyEnv:
             If the selector cannot be resolved to a file on ``PATH`` or disk.
         """
         if python is None:
+            databricks_py = PyEnv._databricks_python_path()
+            if databricks_py is not None:
+                return databricks_py
             return Path(sys.executable).resolve()
 
         p = Path(python)
