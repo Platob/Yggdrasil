@@ -17,7 +17,7 @@ import os
 import time
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar
+from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar, Callable, Iterable
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.errors import DatabricksError
@@ -30,7 +30,9 @@ from databricks.sdk.service.compute import SparkVersion
 
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService
+from ...environ import UserInfo, PyEnv
 from ...environ.pip_settings import PipIndexSettings
+from ...io.url import URL
 from ...pyutils.equality import dicts_equal
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
@@ -43,7 +45,7 @@ __all__ = ["Cluster"]
 
 LOGGER = logging.getLogger(__name__)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
-_CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context"})
+_CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context", "_contexts"})
 _CLUSTER_SKIP_IF_NONE = frozenset({"_details", "cluster_name"})
 
 
@@ -104,9 +106,10 @@ class Cluster(WorkspaceService):
     cluster_id: Optional[str] = None
     cluster_name: Optional[str] = None
     
-    _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False)
-    _details_refresh_time: float = dataclasses.field(default=0, repr=False)
-    _system_context: Optional[ExecutionContext] = dataclasses.field(default=None, repr=False)
+    _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _details_refresh_time: float = dataclasses.field(default=0, repr=False, hash=False, compare=False)
+    _system_context: Optional[ExecutionContext] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
@@ -157,6 +160,7 @@ class Cluster(WorkspaceService):
 
         # Execution context is always reconstructed lazily on first access
         state["_system_context"] = None
+        state["_contexts"] = {}
 
         self.__dict__.update(state)
 
@@ -175,13 +179,13 @@ class Cluster(WorkspaceService):
         )
 
     def __str__(self):
-        return self.url()
+        return self.url().to_string()
 
-    def url(self) -> str:
-        return "%s/compute/clusters/%s" % (
+    def url(self) -> URL:
+        return URL.parse("%s/compute/clusters/%s" % (
             self.workspace.safe_host,
             self.cluster_id or "unknown"
-        )
+        ))
 
     @property
     def id(self):
@@ -359,7 +363,8 @@ class Cluster(WorkspaceService):
 
         if ALL_PURPOSE_CLUSTER is None:
             ALL_PURPOSE_CLUSTER = self.create(
-                cluster_name=name
+                cluster_name=name,
+                libraries=["ygg", "uv"]
             )
 
         return ALL_PURPOSE_CLUSTER
@@ -867,21 +872,67 @@ class Cluster(WorkspaceService):
     def context(
         self,
         language: Optional["Language"] = None,
-        context_id: Optional[str] = None
+        context_id: Optional[str] = None,
+        context_key: Optional[str] = None
     ) -> ExecutionContext:
         """Create a command execution context for this cluster.
 
         Args:
             language: Optional language for the execution context.
             context_id: Optional existing context id to reuse.
+            context_key: Optional cache key to reuse context
 
         Returns:
             An ExecutionContext instance.
         """
+        if context_key:
+            existing = self._contexts.get(context_key)
+
+            if existing is None:
+                existing = self._contexts[context_key] = ExecutionContext(
+                    cluster=self,
+                    language=language,
+                    context_id=context_id,
+                    context_key=context_key
+                )
+
+            return existing
+
         return ExecutionContext(
             cluster=self,
             language=language,
-            context_id=context_id
+            context_id=context_id,
+            context_key=context_key
+        )
+
+    def decorate(
+        self,
+        func: Optional[Callable] = None,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+        command_id: Optional[str] = None,
+        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+        context_key: Optional[str] = None
+    ) -> Callable:
+        language = Language.PYTHON if language is None else language
+
+        if not context_key:
+            usr, env = UserInfo.current(), PyEnv.current()
+            major, minor, _ = env.version_info
+
+            context_key = f"{usr.hostname}-py{major}.{minor}"
+
+        context = self.context(
+            language=language,
+            context_key=context_key
+        )
+
+        return context.decorate(
+            func=func,
+            command=command,
+            language=language,
+            command_id=command_id,
+            environ=environ
         )
 
     def install_libraries(

@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from json import JSONDecodeError
@@ -17,6 +18,8 @@ from databricks.sdk.service.compute import (
 )
 
 from .exceptions import ClientTerminatedSession
+from ...environ import PyEnv
+from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
@@ -50,6 +53,19 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
+
+def _pkg_name(spec: str) -> str:
+    """Strip PEP 508 version specifiers to get the bare package name."""
+    return re.split(r"[=<>!~;@\[]", spec)[0].strip().lower()
+
+DEFAULT_PACKAGES = ["ygg", "dill", "pandas", "mongoengine", "sqlalchemy"]
+
+def _dedup_packages(defaults: list[str], extra: list[str] | None) -> list[str]:
+    """Merge default + user packages, user versions win on conflict."""
+    seen: dict[str, str] = {}
+    for pkg in defaults + (extra or []):
+        seen[_pkg_name(pkg)] = pkg  # later entry (user-supplied) overwrites
+    return list(seen.values())
 
 
 @dataclass
@@ -144,12 +160,16 @@ class CommandExecution:
 
         args_b64 = base64.b64encode(args_blob).decode("ascii")
         kwargs_b64 = base64.b64encode(kwargs_blob).decode("ascii")
+        major, minor, _ = PyEnv.current().version_info
+        pyversion = f"{major}.{minor}"
 
         command = (
             self.command
             .replace("__ARGS__", repr(args_b64))
             .replace("__KWARGS__", repr(kwargs_b64))
             .replace("__ENVIRON__", repr(env_blob))
+            .replace("__CTX_KEY__", repr(self.context.context_key))
+            .replace("__PYVERSION__", repr(pyversion))
         )
 
         run = (
@@ -173,13 +193,15 @@ class CommandExecution:
         )
 
     def __str__(self):
-        return self.url()
+        return self.url().to_string()
 
-    def url(self) -> str:
-        return "%s/command/%s" % (
-            self.context.url(),
-            self.command_id or "unknown"
-        )
+    def url(self) -> URL:
+        url = self.context.url()
+
+        return url.with_query_items({
+            **url.query_dict,
+            **{"command": self.command_id or "unknown"}
+        })
 
     def create(
         self,
@@ -189,6 +211,7 @@ class CommandExecution:
         language: Optional[Language] = None,
         command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+        packages: list[str] | None = None
     ):
         context = self.context if context is None else context
         command = self.command if command is None else command
@@ -210,6 +233,7 @@ class CommandExecution:
             if callable(func):
                 command = self.make_python_function_command(
                     func=func,
+                    packages=packages
                 )
 
         if language is None:
@@ -568,35 +592,50 @@ class CommandExecution:
         tag: str = "__CALL_RESULT__",
         byref: Any = None,
         recurse: Any = None,
-    ):
-        # Serialize the command object (self) as ASCII-safe base64
-        command_bytes = dill.dumps(self)
-        command_b64 = base64.b64encode(command_bytes).decode("ascii")
-
-        # Func serialized by strict encoder: DILL:<compression>:b64:<...> or DATABRICKS_PATH:<compression>:path:<...>
-        serialized_func = self.encode_object(
-            func,
-            byte_limit=64 * 1024,
-            byref=byref, recurse=recurse
+        packages: list[str] | None = None,
+    ) -> str:
+        proxy = CommandExecution(
+            context=self.context,
+            language=self.language,
+            environ=self.environ,
         )
 
-        cmd = f"""
+        command_b64: str = base64.b64encode(dill.dumps(proxy)).decode("ascii")
+        serialized_func: str = self.encode_object(
+            func, byte_limit=64 * 1024, byref=byref, recurse=recurse
+        )
+
+        inner_code = "\n".join([
+            "import base64, dill",
+            f"command = dill.loads(base64.b64decode({command_b64!r}.encode('ascii')))",
+            "args    = dill.loads(base64.b64decode(args_b64.encode('ascii')))",
+            "kwargs  = dill.loads(base64.b64decode(kwargs_b64.encode('ascii')))",
+            f"f  = command.decode_payload({serialized_func!r}, temporary=False)",
+            "a  = [command.decode_payload(x) for x in args]",
+            "kw = {k: command.decode_payload(v) for k, v in kwargs.items()}",
+            "r  = f(*a, **kw)",
+            f"print({tag!r} + command.encode_object(r))",
+        ])
+
+        resolved_packages = _dedup_packages(DEFAULT_PACKAGES, packages)
+
+        inner_b64: str = base64.b64encode(inner_code.encode("utf-8")).decode("ascii")
+
+        cmd = f"""\
 import base64, dill, os
-from yggdrasil.environ.environment
+from yggdrasil.environ import PyEnv
 
-if __ENVIRON__:
-    for k, v in __ENVIRON__.items():
-        if k and v:
-            os.environ[k] = v
+_inner = base64.b64decode({inner_b64!r}.encode('ascii')).decode('utf-8')
+_globs = {{
+    "args_b64":   __ARGS__,
+    "kwargs_b64": __KWARGS__,
+}}
 
-command = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
-args = dill.loads(base64.b64decode(__ARGS__.encode("ascii")))
-kwargs = dill.loads(base64.b64decode(__KWARGS__.encode("ascii")))
-f = command.decode_payload({serialized_func!r}, temporary=False)
-a = [command.decode_payload(x) for x in args]
-kw = {{k: command.decode_payload(v) for k, v in kwargs.items()}}
-r = f(*a, **kw)
-print({tag!r} + command.encode_object(r))"""
+pyenv  = PyEnv.resolve_env(identifier=__CTX_KEY__, version=__PYVERSION__, packages={resolved_packages!r})
+result = pyenv.run_python_code(code=_inner, env=__ENVIRON__, globs=_globs)
+
+print(result.stdout or "")
+"""
 
         return cmd
 
@@ -686,8 +725,8 @@ print({tag!r} + command.encode_object(r))"""
         except ModuleNotFoundError as e:
             module_name = e.name
 
-            if module_name and not module_name.startswith("ygg"):
-                self.context.cluster.install_temporary_libraries(libraries=[module_name])
+            if module_name:
+                self.context.install_temporary_libraries(libraries=[module_name])
 
                 return (
                     self

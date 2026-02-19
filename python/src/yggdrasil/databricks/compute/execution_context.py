@@ -18,6 +18,7 @@ from databricks.sdk.service.compute import Language, ResultType, CommandStatusRe
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
 from ...environ.modules import resolve_local_lib_path
+from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.waiting_config import WaitingConfigArg
@@ -106,6 +107,7 @@ class ExecutionContext:
     """
     cluster: "Cluster"
     context_id: Optional[str] = None
+    context_key: Optional[str] = None
 
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
 
@@ -182,13 +184,14 @@ class ExecutionContext:
         )
 
     def __str__(self):
-        return self.url()
+        return self.url().to_string()
 
-    def url(self) -> str:
-        return "%s/context/%s" % (
-            self.cluster.url(),
-            self.context_id or "unknown"
-        )
+    def url(self) -> URL:
+        url = self.cluster.url()
+
+        return url.with_query_items({
+            "context": self.context_id or "unknown"
+        })
 
     @property
     def workspace(self):
@@ -257,6 +260,8 @@ print(json.dumps(meta))"""
     def create(
         self,
         language: "Language",
+        context_key: Optional[str] = None,
+        *,
         wait: Optional[WaitingConfigArg] = True,
     ) -> "ExecutionContext":
         """Create a command execution context, retrying if needed.
@@ -302,14 +307,19 @@ print(json.dumps(meta))"""
                 language=language,
             ).response
 
-        LOGGER.info(
-            "Created %s",
-            self
+        instance = ExecutionContext(
+            cluster=self.cluster,
+            context_id=created.id,
+            context_key=context_key,
+            language=language
         )
 
-        self.context_id = created.id
+        LOGGER.info(
+            "Created %s",
+            instance
+        )
 
-        return self
+        return instance
 
     def connect(
         self,
@@ -388,6 +398,7 @@ print(json.dumps(meta))"""
         command: Optional[str] = None,
         language: Optional[Language] = None,
         environ: Optional[Dict[str, str]] = None,
+        packages: list[str] | None = None
     ):
         context = self if context is None else context
 
@@ -401,7 +412,8 @@ print(json.dumps(meta))"""
             language=language,
             command=command,
             func=func,
-            environ=environ
+            environ=environ,
+            packages=packages
         )
 
     def decorate(
@@ -411,6 +423,7 @@ print(json.dumps(meta))"""
         language: Optional[Language] = None,
         command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+        packages: list[str] | None = None
     ) -> Callable:
         language = Language.PYTHON if language is None else language
 
@@ -431,7 +444,8 @@ print(json.dumps(meta))"""
                 command_id=cid,
                 command=cmd,
                 language=l,
-                environ=env
+                environ=env,
+                packages=packages
             )
 
         if func is not None and callable(func):

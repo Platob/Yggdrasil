@@ -1,39 +1,52 @@
-# yggdrasil.environ.environment.py
+"""
+pyenv.py — Thin wrapper around a Python interpreter for environment management.
+
+Provides :class:`PyEnv`, a dataclass that anchors all package-management and
+subprocess-execution operations to a single Python interpreter path.  It
+preferentially delegates to ``uv`` for speed but falls back to ``pip``/``python``
+when ``uv`` is unavailable or explicitly disabled.
+
+Typical usage
+-------------
+::
+
+    # Use the current interpreter (singleton)
+    env = PyEnv.current()
+    env.install("pyarrow", "pandas")
+
+    # Resolve or create a named venv
+    env = PyEnv.get_or_create("3.12", packages=["pyarrow"])
+
+    # Execute arbitrary Python in a subprocess
+    env.run_python_code("import pyarrow; print(pyarrow.__version__)")
+
+Module-level globals
+--------------------
+CURRENT_PYENV : PyEnv | None
+    Singleton for the running interpreter; populated on first call to
+    :meth:`PyEnv.current`.
+
+PIP_MODULE_NAME_MAPPINGS : dict[str, str]
+    Maps Python import names to their pip distribution names where they differ
+    (e.g. ``"yaml"`` → ``"PyYAML"``).
+"""
+
 from __future__ import annotations
 
-import json
-
-"""
-Tiny environment manager + runtime import helper.
-
-Design constraints:
-- `python_path` is the interpreter anchor (a specific python executable)
-- No venv_dir stored on the object
-- Location-based via `cwd`
-- Prefers `uv` for pip + execution when `prefer_uv=True`
-
-Execution strategy (managed envs):
-- prefer_uv=True  -> `uv run --python <python_path> python ...`
-- prefer_uv=False -> `<python_path> ...` directly
-
-Also includes a best-effort "current user info" probe:
-- Always returns OS-level runtime identity (username, home, host, etc.)
-- Optionally returns Databricks identity when available (via Spark `current_user()` or env vars)
-"""
-
-import re
 import importlib
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence, Union, Iterable
+from typing import Any, Iterable, Sequence
 
-from .userinfo import UserInfo
 from .system_command import SystemCommand
+from .userinfo import UserInfo
 from ..pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 __all__ = [
@@ -44,7 +57,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
 # import name -> pip distribution name
+# ---------------------------------------------------------------------------
+#: Maps Python import names to their pip distribution names where they differ.
+#: Extend this dict when adding new dependencies whose import name differs from
+#: the installable package name.
 PIP_MODULE_NAME_MAPPINGS: dict[str, str] = {
     "jwt": "PyJWT",
     "yaml": "PyYAML",
@@ -52,54 +70,144 @@ PIP_MODULE_NAME_MAPPINGS: dict[str, str] = {
     "dateutil": "python-dateutil",
     "yggdrasil": "ygg",
 }
-# matches:
-#   "3" / "3.12" / "3.13.12"
-#   "python3" / "python3.12" / "python3.13.12"
+
+# Matches: "3" / "3.12" / "3.13.12" / "python3" / "python3.12" / "python3.13.12"
 _PY_VERSION_RE = re.compile(
     r"^\s*(?:python)?\s*(\d+(?:\.\d+){0,2})\s*$",
     flags=re.IGNORECASE,
 )
-CURRENT_PYENV: "PyEnv | None" = None
 
+#: Module-level singleton — set on first call to :meth:`PyEnv.current`.
+CURRENT_PYENV: PyEnv | None = None
+
+
+def safe_pip_name(value: str | tuple[str, str] | Iterable[str | tuple[str, str]]) -> str | list[str]:
+    """
+    Map an import name to its pip distribution name, or return it unchanged.
+
+    Looks up *value* in :data:`PIP_MODULE_NAME_MAPPINGS`.  Accepts either a
+    single string or an iterable of strings; the return type mirrors the input.
+
+    Parameters
+    ----------
+    value:
+        A single import-name string, or an iterable of import-name strings.
+
+    Returns
+    -------
+    str | list[str]
+        The mapped pip distribution name(s).
+
+    Examples
+    --------
+    ::
+
+        safe_pip_name("yaml")          # → "PyYAML"
+        safe_pip_name("numpy")         # → "numpy"  (no mapping needed)
+        safe_pip_name(["yaml", "jwt"]) # → ["PyYAML", "PyJWT"]
+    """
+    if isinstance(value, str):
+        return PIP_MODULE_NAME_MAPPINGS.get(value, value)
+    elif isinstance(value, tuple) and len(value) == 2 and value[1].isdigit():
+        return "%s==%s" % (value[0], value[1])
+    return [safe_pip_name(v) for v in value]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PyEnv
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class PyEnv:
     """
-    Tiny env manager.
+    Thin wrapper around a single Python interpreter path.
 
-    Constraints:
-      - `python_path` is the python executable used as the anchor
-      - NO venv_dir stored on the object
-      - location-based via `cwd`
+    :class:`PyEnv` is the central primitive for all environment-related
+    operations: package management (install / update / uninstall), subprocess
+    execution, and dynamic module imports with auto-install.
 
-    Prefers uv for both pip operations and execution when `prefer_uv=True`.
+    Design constraints
+    ------------------
+    * ``python_path`` is the sole interpreter anchor — no ``venv_dir`` is
+      stored separately.  The venv root is discovered at runtime by walking up
+      the directory tree looking for ``pyvenv.cfg``.
+    * All operations are working-directory–relative via ``cwd``.
+    * When ``prefer_uv=True`` (the default), ``uv`` is used for pip operations
+      and subprocess execution, falling back to standard pip / the interpreter
+      directly when ``prefer_uv=False``.
 
-    Execution strategy (managed envs):
-      - prefer_uv=True  -> `uv run --python <python_path> python ...`
-      - prefer_uv=False -> `<python_path> ...` directly
+    Execution strategy
+    ------------------
+    * ``prefer_uv=True``  → ``uv run --python <python_path> python …``
+    * ``prefer_uv=False`` → ``<python_path> …``
+
+    Attributes
+    ----------
+    python_path : Path
+        Absolute path to the Python interpreter for this environment.
+    cwd : Path
+        Working directory used for all subprocess invocations.
+    prefer_uv : bool
+        When ``True`` (default), ``uv`` is preferred over bare pip/python calls.
+
+    Notes
+    -----
+    The ``_uv_bin_cache`` field is internal; it is populated lazily on first
+    access to :attr:`uv_bin` and is not part of the public interface.
     """
 
     python_path: Path
     cwd: Path = field(default_factory=lambda: Path.cwd().resolve())
     prefer_uv: bool = True
 
+    # Internal cache — not exposed in __repr__ or __init__
+    _version_info: tuple[int, int, int] | None = field(default=None, init=False, repr=False)
     _uv_bin_cache: Path | None = field(default=None, init=False, repr=False)
 
-    # -----------------------
-    # Python resolution
-    # -----------------------
+    def __getstate__(self) -> dict:
+        return {
+            "python_path": self.python_path,
+            "cwd": self.cwd,
+            "prefer_uv": self.prefer_uv,
+            # Drop _version_info and _uv_bin_cache — both are lazy, cheap to recompute
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        object.__setattr__(self, "python_path", state["python_path"])
+        object.__setattr__(self, "cwd", state["cwd"])
+        object.__setattr__(self, "prefer_uv", state["prefer_uv"])
+        object.__setattr__(self, "_version_info", None)
+        object.__setattr__(self, "_uv_bin_cache", None)
+
+    # ── Python resolution ─────────────────────────────────────────────────────
+
     @staticmethod
     def resolve_python_executable(python: str | Path | None) -> Path:
         """
-        Resolve a python interpreter executable.
+        Resolve a Python interpreter selector to an absolute :class:`~pathlib.Path`.
 
-        Accepts:
-          - None -> sys.executable
-          - Path to python executable
-          - "python", "python3.12", "3.12" style selectors (best-effort)
+        Accepts several forms of selector:
 
-        Raises:
-          - FileNotFoundError if selector cannot be resolved.
+        * ``None``           → ``sys.executable`` (the running interpreter)
+        * :class:`~pathlib.Path` → resolved directly when the file exists
+        * ``"python3.12"``   → looked up via :func:`shutil.which`
+        * ``"3.12"``         → prepended with ``"python"`` then which'd
+        * ``"/usr/bin/python3"`` → resolved as-is
+
+        Parameters
+        ----------
+        python:
+            Selector for the desired interpreter.
+
+        Returns
+        -------
+        Path
+            Absolute path to the resolved interpreter.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the selector cannot be resolved to a file on ``PATH`` or disk.
         """
         if python is None:
             return Path(sys.executable).resolve()
@@ -119,9 +227,8 @@ class PyEnv:
 
         return Path(found).resolve()
 
-    # -----------------------
-    # Construction funnel
-    # -----------------------
+    # ── Construction ──────────────────────────────────────────────────────────
+
     @classmethod
     def create(
         cls,
@@ -129,78 +236,68 @@ class PyEnv:
         *,
         cwd: Path | None = None,
         prefer_uv: bool = True,
-        packages: Optional[list[str]] = None,
-    ) -> "PyEnv":
+        packages: list[str] | None = None,
+    ) -> PyEnv:
         """
-        Single constructor funnel.
+        Primary constructor — resolves and normalises all paths, then
+        optionally installs packages into the new environment.
 
-        Normalizes:
-          - python_path (resolved)
-          - cwd (resolved; defaults to current process cwd)
+        This is the preferred low-level factory when you already have a
+        resolved :class:`~pathlib.Path` to an interpreter.  Higher-level
+        callers should use :meth:`get_or_create` instead.
 
-        Applies:
-          - prefer_uv
+        Parameters
+        ----------
+        python_path:
+            Path to the Python interpreter.  Resolved to an absolute path
+            internally.
+        cwd:
+            Working directory for subprocesses.  Defaults to ``Path.cwd()``.
+        prefer_uv:
+            Use ``uv`` for pip operations when ``True`` (default).
+        packages:
+            Optional list of packages to install immediately after creation.
 
-        Optional:
-          - installs packages into the resolved env
+        Returns
+        -------
+        PyEnv
+            A fully initialized environment instance.
         """
         env = cls(
             python_path=python_path.resolve(),
             cwd=(cwd or Path.cwd()).resolve(),
             prefer_uv=prefer_uv,
         )
-
         if packages:
             env.install(*packages)
-
         return env
 
-    # -----------------------
-    # Helpers for get_or_create
-    # -----------------------
-    @staticmethod
-    def _venv_python_from_dir(venv_dir: Path) -> Path:
-        """
-        Given a venv directory, resolve the python executable inside it.
-        """
-        candidates = [
-            venv_dir / "bin" / "python",
-            venv_dir / "bin" / "python3",
-            venv_dir / "Scripts" / "python.exe",
-            venv_dir / "Scripts" / "python",
-        ]
-        for c in candidates:
-            if c.exists() and c.is_file():
-                return c.resolve()
-        raise ValueError(f"Cannot find python executable inside venv dir: {venv_dir}")
-
-    @staticmethod
-    def _looks_like_path(s: str) -> bool:
-        """
-        Heuristic: any path separator, starts with '.' or '~', or looks like an absolute path.
-        """
-        if not s:
-            return False
-        if s.startswith(("~", ".", "/")):
-            return True
-        if os.name == "nt" and len(s) >= 2 and s[1] == ":":
-            return True
-        return ("/" in s) or ("\\" in s)
-
-    # -----------------------
-    # Singleton
-    # -----------------------
     @classmethod
     def current(
         cls,
         *,
         python: str | Path | None = None,
         prefer_uv: bool = True,
-    ) -> "PyEnv":
+    ) -> PyEnv:
         """
-        Return a singleton "current interpreter" PyEnv.
+        Return the module-level singleton for the current interpreter.
 
-        The first call creates the singleton; subsequent calls reuse it.
+        Created on first call; subsequent calls always return the same
+        instance regardless of arguments.  This makes it safe to call
+        ``PyEnv.current()`` repeatedly without incurring repeated setup cost.
+
+        Parameters
+        ----------
+        python:
+            Interpreter selector passed to :meth:`resolve_python_executable`.
+            Ignored on subsequent calls once the singleton exists.
+        prefer_uv:
+            Forwarded to :meth:`create` on first construction.
+
+        Returns
+        -------
+        PyEnv
+            The module-level :data:`CURRENT_PYENV` singleton.
         """
         global CURRENT_PYENV
 
@@ -224,36 +321,66 @@ class PyEnv:
         identifier: str | Path | None = None,
         *,
         version: str | None = None,
-        packages: Optional[list[str]] = None,
+        packages: list[str] | None = None,
         prefer_uv: bool = True,
         seed: bool = True,
-    ) -> "PyEnv":
+    ) -> PyEnv:
         """
         Resolve or create a Python environment from a flexible identifier.
 
-        Resolution order:
-          - None / "current" / "sys" / ""  -> singleton current interpreter
-          - PyEnv instance                 -> returned as-is
-          - Version selector ("3.12", "python3.12", "3.13.1", ...)
-                                           -> resolved interpreter
-          - Path to python executable      -> used directly
-          - Path to existing venv dir      -> python extracted from venv
-          - Path to non-existing dir       -> venv created via `uv venv`
-          - Bare name / token              -> resolved via shutil.which
+        This is the primary high-level factory.  It handles all common
+        forms of environment specification and returns a ready-to-use
+        :class:`PyEnv`.
+
+        Resolution order
+        ----------------
+        1. ``None`` / ``"current"`` / ``"sys"`` / ``""``
+               → return the :meth:`current` singleton.
+        2. A :class:`PyEnv` instance
+               → returned as-is (packages installed if provided).
+        3. Version selector (``"3.12"``, ``"python3.12"``, …)
+               → venv created/located under
+               ``~/.local/yggdrasil/python/envs/<selector>``.
+        4. Path to a Python executable
+               → used directly.
+        5. Path to an existing venv directory
+               → Python executable extracted from it.
+        6. Path to a non-existing directory
+               → venv created via ``uv venv``.
+        7. Bare name / token
+               → resolved via :func:`shutil.which`.
+
+        Parameters
+        ----------
+        identifier:
+            Environment specifier — see resolution order above.
+        version:
+            Pin a specific Python version when creating a new venv
+            (e.g. ``"3.12"``).  Overrides the version implied by *identifier*.
+        packages:
+            Packages to install after resolving the environment.
+        prefer_uv:
+            Prefer ``uv`` for all operations (default: ``True``).
+        seed:
+            Pass ``--seed`` to ``uv venv`` when creating a new environment,
+            which pre-installs pip/setuptools/wheel.
+
+        Returns
+        -------
+        PyEnv
+            A resolved and optionally package-populated environment.
         """
         if isinstance(identifier, PyEnv):
             if packages:
                 identifier.install(*packages)
             return identifier
 
-        cwd = Path.cwd().resolve()
-
         env = cls.resolve_env(
             identifier,
-            cwd=cwd,
+            cwd=Path.cwd().resolve(),
             prefer_uv=prefer_uv,
             seed=seed,
-            version=version
+            version=version,
         )
 
         if packages:
@@ -266,51 +393,76 @@ class PyEnv:
         cls,
         identifier: str | Path | None,
         *,
-        cwd: Path,
-        prefer_uv: bool,
-        seed: bool,
+        cwd: Path | None = None,
+        prefer_uv: bool = True,
+        seed: bool = True,
         version: str | None = None,
-    ) -> "PyEnv":
-        """Pure resolution logic — no package installation side-effects."""
+        packages: list[str] | None = None
+    ) -> PyEnv:
+        """
+        Pure resolution logic with no package-installation side-effects.
 
-        # --- None / empty string -> current singleton ---
+        Implements the same resolution order as :meth:`get_or_create` but
+        without installing packages.  Intended for internal use and for
+        callers that want to separate resolution from installation.
+
+        Parameters
+        ----------
+        identifier:
+            Environment specifier (see :meth:`get_or_create` for full details).
+        cwd:
+            Working directory for the returned :class:`PyEnv`.
+        prefer_uv:
+            Prefer ``uv`` for operations.
+        seed:
+            Pass ``--seed`` when creating a new venv.
+        version:
+            Override or supply a Python version for venv creation.
+
+        Returns
+        -------
+        PyEnv
+            Resolved environment.
+        """
         if not identifier:
             return cls.current(prefer_uv=prefer_uv)
 
         if isinstance(identifier, str):
             s = identifier.strip()
 
-            if not s or s.lower() in {"current", "sys", "sys.executable"}:
+            if not s or s.lower() in {"current", "sys", "system"}:
                 return cls.current(prefer_uv=prefer_uv)
 
-            if "/" not in s and "\\" not in s:
-                identifier = Path.home() / ".local" / "yggdrasil" / "python" / "envs" / s
-            else:
-                # Version selector: "3.12", "python3.13.1", etc.
-                m = _PY_VERSION_RE.match(s)
-                if m:
-                    version = version or m.group(1)
+            m = _PY_VERSION_RE.match(s)
+            if m:
+                version = version or m.group(1)
+                # Fall through to create_venv with a pinned version
+            elif cls._looks_like_path(s):
+                identifier = Path(s)
 
-                # Promote to Path if it looks like one, else treat as a bare name/selector
-                elif cls._looks_like_path(s):
-                    identifier = Path(s)
-                else:
-                    py = cls.resolve_python_executable(s)
+            else:
+                # Version-only string: place venv under the standard location
+                identifier = Path.home() / ".local" / "yggdrasil" / "python" / "envs" / s
+
+                py = cls._venv_python_from_dir(identifier, raise_error=False)
+
+                if py.is_file() and "python" in py.name:
                     return cls.create(py, cwd=cwd, prefer_uv=prefer_uv)
 
-        # --- Path resolution ---
         path = Path(identifier).expanduser()  # type: ignore[arg-type]
 
+        # If the path is already a Python executable, use it directly
         if path.is_file() and "python" in path.name:
             return cls.create(path, cwd=cwd, prefer_uv=prefer_uv)
 
-        # Non-existent path -> create venv
+        # Otherwise treat as a venv directory (existing or to be created)
         return cls.create_venv(
             path,
-            cwd=cwd,
+            cwd=cwd or Path.cwd().resolve(),
             prefer_uv=prefer_uv,
             seed=seed,
-            version=version
+            version=version,
+            packages=packages
         )
 
     @classmethod
@@ -322,51 +474,103 @@ class PyEnv:
         prefer_uv: bool = True,
         seed: bool = True,
         version: str | None = None,
-    ) -> "PyEnv":
-        """Create a new venv at `venv_dir` via uv and return a PyEnv anchored to it."""
+        packages: list[str] | None = None
+    ) -> PyEnv:
+        """
+        Create a new virtual environment at *venv_dir* via ``uv`` and return
+        a :class:`PyEnv` anchored to it.
+
+        After creation the environment is automatically seeded with
+        ``ygg``, ``pandas``, and ``dill``.
+
+        Parameters
+        ----------
+        venv_dir:
+            Target directory for the new venv.  Parent directories are
+            created automatically.
+        cwd:
+            Working directory for the returned :class:`PyEnv`.
+        prefer_uv:
+            Prefer ``uv`` for all operations in the returned environment.
+        seed:
+            Pass ``--seed`` to ``uv venv`` (pre-installs pip/setuptools/wheel).
+        version:
+            Python version to pin for the new venv (e.g. ``"3.12"``).
+            Falls back to the current interpreter's version if not provided.
+
+        Returns
+        -------
+        PyEnv
+            Environment anchored to the newly created venv.
+        """
         anchor = cls.current()
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        # version kwarg pins the interpreter; falls back to current anchor
-        python_pin = version or str(anchor.python_path)
-
         cmd = [
             str(anchor.uv_bin), "venv", str(venv_dir),
-            "--python", python_pin,
+            "--python", version or str(anchor.python_path),
             *(["--seed"] if seed else []),
         ]
-        logger.info("_create_venv_env: cmd=%s", cmd)
+        logger.info("create_venv: cmd=%s", cmd)
         SystemCommand.run_lazy(cmd, cwd=cwd).wait(True)
 
         py = cls._venv_python_from_dir(venv_dir)
-        return cls.create(py, cwd=cwd, prefer_uv=prefer_uv)
+        env = cls.create(py, cwd=cwd, prefer_uv=prefer_uv)
+        # Seed with baseline packages expected by the Yggdrasil framework
+
+        if packages:
+            env.install(*packages)
+
+        return env
+
+    # ── Properties ────────────────────────────────────────────────────────────
 
     @property
     def is_current(self) -> bool:
-        """True if this instance is the module singleton returned by PyEnv.current()."""
+        """
+        ``True`` if this instance is the module-level singleton.
+
+        Useful for guard-clauses (e.g. in :meth:`delete`) where operating on
+        the active interpreter would be dangerous.
+        """
         return CURRENT_PYENV is not None and CURRENT_PYENV is self
 
     @property
-    def userinfo(self):
+    def userinfo(self) -> UserInfo:
+        """Return the current :class:`~.userinfo.UserInfo` singleton."""
         return UserInfo.current()
 
     @property
     def version_info(self) -> tuple[int, int, int]:
         """
-        Return (major, minor, micro) for this environment's python interpreter.
+        Return the interpreter's version as ``(major, minor, micro)``.
+
+        Executes a short Python one-liner in a subprocess to query
+        ``sys.version_info``, so it reflects the *environment's* interpreter,
+        not necessarily the calling process.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            ``(major, minor, micro)`` — e.g. ``(3, 12, 4)``.
+
+        Raises
+        ------
+        subprocess.CalledProcessError
+            If the subprocess exits with a non-zero status.
         """
+        if self._version_info:
+            return self._version_info
+
         code = (
             "import sys, json; "
             "print(json.dumps([sys.version_info.major, sys.version_info.minor, sys.version_info.micro]))"
         )
-
-        if self.prefer_uv:
-            cmd = self._uv_run_prefix() + ["python", "-c", code]
-        else:
-            cmd = [str(self.python_path), "-c", code]
-
-        # We want stdout; SystemCommand doesn't expose a nice CompletedProcess here,
-        # so use subprocess directly for this tiny query.
+        cmd = (
+            self._uv_run_prefix() + ["python", "-c", code]
+            if self.prefer_uv
+            else [str(self.python_path), "-c", code]
+        )
         res = subprocess.run(
             cmd,
             cwd=str(self.cwd),
@@ -376,33 +580,47 @@ class PyEnv:
             check=True,
         )
         major, minor, micro = json.loads(res.stdout.strip())
-        return int(major), int(minor), int(micro)
+        self._version_info = int(major), int(minor), int(micro)
 
-    # -----------------------
-    # uv resolution (cached)
-    # -----------------------
+        return self._version_info
+
     @property
     def uv_bin(self) -> Path:
         """
-        Resolve `uv` binary location, installing uv into the *current* interpreter if needed.
+        Resolve the ``uv`` binary, installing it into the current interpreter
+        if it is absent.  The result is cached after the first access.
 
-        Caches the resolved path on first access.
+        ``uv`` is used as the preferred backend for all pip and venv operations
+        when :attr:`prefer_uv` is ``True``.
+
+        Returns
+        -------
+        Path
+            Absolute path to the ``uv`` executable.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``uv`` resolves but the reported path is not an actual file.
         """
         if self._uv_bin_cache:
             return self._uv_bin_cache
 
-        logger.debug("uv_bin: resolving uv binary via runtime import")
-
+        logger.debug("uv_bin: resolving via runtime import")
         try:
             import uv as uv_mod
         except ImportError:
+            # Auto-install uv using the plain pip fallback to avoid recursion
             uv_mod = self.install("uv", prefer_uv=False)
 
         self._uv_bin_cache = Path(uv_mod.find_uv_bin())
-        assert self._uv_bin_cache.is_file(), f"uv found but is not a file: {self._uv_bin_cache}"
+        if not self._uv_bin_cache.is_file():
+            raise FileNotFoundError(f"uv resolved but is not a file: {self._uv_bin_cache}")
 
         logger.debug("uv_bin: resolved=%s", self._uv_bin_cache)
         return self._uv_bin_cache
+
+    # ── Package management ────────────────────────────────────────────────────
 
     def requirements(
         self,
@@ -411,27 +629,33 @@ class PyEnv:
         with_system: bool = False,
     ) -> list[tuple[str, str]]:
         """
-        Return installed packages as requirements.txt-style lines: ["name==version", ...].
+        Return installed packages as ``(name, version)`` tuples, sorted by name.
 
+        Delegates to ``uv pip list`` or ``python -m pip list`` depending on
+        *prefer_uv*.
+
+        Parameters
+        ----------
         prefer_uv:
-          - None  -> use self.prefer_uv
-          - True  -> use `uv pip ...`
-          - False -> use `<python> -m pip ...`
-
+            ``None`` → use :attr:`self.prefer_uv`; ``True`` → ``uv pip list``;
+            ``False`` → ``<python> -m pip list``.
         with_system:
-          - False: excludes baseline tooling packages (pip/setuptools/wheel)
-          - True: include everything
+            When ``True``, includes baseline tooling (pip / setuptools / wheel)
+            in the results.  Excluded by default to keep output clean.
 
-        Implementation notes:
-          - Uses `pip list --format=json` (portable & parseable).
-          - When prefer_uv=True, uses `uv pip` (NOT `uv run`) to avoid project-resolution behavior.
-          - Output is sorted for determinism.
+        Returns
+        -------
+        list[tuple[str, str]]
+            Alphabetically sorted ``(name, version)`` pairs.
+
+        Raises
+        ------
+        subprocess.CalledProcessError
+            If the pip invocation fails.
+        ValueError
+            If the pip JSON output is not a list.
         """
-        prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
-
-        # IMPORTANT: when prefer_uv=True, use "uv pip" (not "uv run python -m pip")
         cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["list", "--format=json"]
-
         res = subprocess.run(
             cmd,
             cwd=str(self.cwd),
@@ -440,13 +664,12 @@ class PyEnv:
             capture_output=True,
             check=True,
         )
-
         pkgs = json.loads(res.stdout or "[]")
         if not isinstance(pkgs, list):
             raise ValueError("Unexpected pip output: expected JSON list")
 
-        system_names = {"pip", "setuptools", "wheel"}  # minimal, cross-platform
-        out: list[str] = []
+        _system = {"pip", "setuptools", "wheel"}
+        out: list[tuple[str, str]] = []
         for item in pkgs:
             if not isinstance(item, dict):
                 continue
@@ -454,96 +677,81 @@ class PyEnv:
             version = str(item.get("version", "")).strip()
             if not name or not version:
                 continue
-            if (not with_system) and (name.lower() in system_names):
+            if not with_system and name.lower() in _system:
                 continue
             out.append((name, version))
-
         return out
 
-    # -----------------------
-    # Command plumbing
-    # -----------------------
-    def _pip_cmd_args(
-        self,
-        python: Optional[str | Path] = None,
-        prefer_uv: Optional[bool] = None,
-    ) -> list[str]:
-        """
-        Build a pip command.
-
-        prefer_uv=True:
-          uv pip
-
-        prefer_uv=False:
-          <python> -m pip
-        """
-        p = python or self.python_path
-        prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
-
-        if prefer_uv:
-            args = [str(self.uv_bin), "pip"]
-            logger.debug("_pip_cmd_args: prefer_uv=True args=%s", args)
-            return args
-
-        args = [str(p), "-m", "pip"]
-        logger.debug("_pip_cmd_args: prefer_uv=False args=%s", args)
-        return args
-
-    def _uv_run_prefix(self, python: Optional[str | Path] = None) -> list[str]:
-        """
-        Prefix for running commands inside uv's managed environment resolution.
-
-        uv run --python <python_path> <command...>
-        """
-        p = python or self.python_path
-        prefix = [str(self.uv_bin), "run", "--python", str(p)]
-
-        return prefix
-
-    # -----------------------
-    # Public API (packages)
-    # -----------------------
     def install(
         self,
         *packages: str,
         requirements: str | Path | None = None,
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
-        prefer_uv: Optional[bool] = None,
+        prefer_uv: bool | None = None,
     ) -> SystemCommand | None:
         """
-        Lazy installation into the environment anchored by python_path.
+        Install packages into the environment anchored by :attr:`python_path`.
 
-        requirements behavior:
-          - if `requirements` points to an existing file -> use it
-          - else treat it as requirements *content* and write a temp file
+        Supports both positional package names and a requirements file (or raw
+        requirements-file content written to a temp file automatically).
+
+        Parameters
+        ----------
+        *packages:
+            Package names to install (import names are mapped via
+            :func:`safe_pip_name` automatically).
+        requirements:
+            Path to an existing requirements file **or** raw requirements-file
+            content as a string.  When raw content is provided it is written to
+            a temporary file inside :attr:`cwd`.
+        extra_args:
+            Additional arguments forwarded verbatim to ``pip install``.
+        wait:
+            Waiting strategy passed to :class:`~.system_command.SystemCommand`.
+            Defaults to synchronous wait (``True``).
+        prefer_uv:
+            Override :attr:`self.prefer_uv` for this single call.
+
+        Returns
+        -------
+        SystemCommand | None
+            The running/completed command, or ``None`` if there was nothing to
+            install.
+
+        Notes
+        -----
+        Temporary requirements files are automatically cleaned up after a
+        synchronous install completes.  For async installs (``wait=False``)
+        the caller is responsible for cleanup.
         """
         if not packages and requirements is None:
             return None
 
         cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["install"]
         wait_cfg = WaitingConfig.check_arg(wait)
-
         tmp_req: Path | None = None
-        if requirements is not None:
-            p = Path(requirements).expanduser()
-            if p.exists():
-                cmd += ["-r", str(p)]
-            else:
-                import tempfile
 
+        if requirements is not None:
+            req_path = Path(requirements).expanduser()
+            if req_path.exists():
+                cmd += ["-r", str(req_path)]
+            else:
+                # Treat the value as raw requirements content; write to a temp file
+                import tempfile
                 self.cwd.mkdir(parents=True, exist_ok=True)
-                fd, name = tempfile.mkstemp(prefix="requirements_", suffix=".txt", dir=str(self.cwd))
+                fd, name = tempfile.mkstemp(
+                    prefix="requirements_", suffix=".txt", dir=str(self.cwd)
+                )
                 tmp_req = Path(name)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(str(requirements).strip() + "\n")
                 cmd += ["-r", str(tmp_req)]
 
         if packages:
-            cmd += [safe_pip_name(_) for _ in packages]
-
+            cmd += [safe_pip_name(p) for p in packages]
         if extra_args:
-            cmd += [*extra_args]
+            cmd += list(extra_args)
 
         logger.info("install: cmd=%s cwd=%s wait=%s", cmd, self.cwd, bool(wait_cfg))
         result = SystemCommand.run_lazy(cmd, cwd=self.cwd)
@@ -559,7 +767,6 @@ class PyEnv:
                         tmp_req,
                         exc_info=True,
                     )
-
         return result
 
     def update(
@@ -568,10 +775,27 @@ class PyEnv:
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
     ) -> SystemCommand | None:
-        """Upgrade packages in the anchored environment."""
+        """
+        Upgrade one or more packages in the anchored environment.
+
+        Equivalent to ``pip install --upgrade <packages>``.
+
+        Parameters
+        ----------
+        *packages:
+            Names of packages to upgrade.
+        extra_args:
+            Additional arguments forwarded to ``pip install --upgrade``.
+        wait:
+            Waiting strategy.  Defaults to synchronous wait.
+
+        Returns
+        -------
+        SystemCommand | None
+            The running/completed command, or ``None`` if *packages* is empty.
+        """
         if not packages:
             return None
-
         cmd = self._pip_cmd_args() + ["install", "--upgrade", *packages, *extra_args]
         logger.info("update: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
@@ -582,10 +806,27 @@ class PyEnv:
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
     ) -> SystemCommand | None:
-        """Uninstall packages from the anchored environment."""
+        """
+        Uninstall one or more packages from the anchored environment.
+
+        Equivalent to ``pip uninstall <packages>``.
+
+        Parameters
+        ----------
+        *packages:
+            Names of packages to remove.
+        extra_args:
+            Additional arguments forwarded to ``pip uninstall``.
+        wait:
+            Waiting strategy.  Defaults to synchronous wait.
+
+        Returns
+        -------
+        SystemCommand | None
+            The running/completed command, or ``None`` if *packages* is empty.
+        """
         if not packages:
             return None
-
         cmd = self._pip_cmd_args() + ["uninstall", *packages, *extra_args]
         logger.info("uninstall: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
@@ -594,21 +835,87 @@ class PyEnv:
         self,
         *args: str,
         wait: WaitingConfigArg | None = True,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> SystemCommand:
         """
-        Run a pip command and wait for completion.
+        Run an arbitrary pip subcommand and return the result.
 
-        Example:
+        A thin escape-hatch for pip invocations not covered by the higher-level
+        helpers (:meth:`install`, :meth:`update`, :meth:`uninstall`).
+
+        Parameters
+        ----------
+        *args:
+            Arguments forwarded verbatim to the pip invocation.
+        wait:
+            Waiting strategy.  Defaults to synchronous wait.
+
+        Returns
+        -------
+        SystemCommand
+            The running/completed command.
+
+        Examples
+        --------
+        ::
+
             env.pip("list")
             env.pip("install", "polars")
+            env.pip("show", "pyarrow")
         """
         cmd = self._pip_cmd_args() + list(args)
         logger.debug("pip: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
 
-    # -----------------------
-    # Public API (execution)
-    # -----------------------
+    def delete(self) -> None:
+        """
+        Delete the virtual environment that contains this interpreter.
+
+        Walks up from :attr:`python_path` looking for ``pyvenv.cfg`` (the venv
+        root marker) and removes that entire directory tree with
+        :func:`shutil.rmtree`.
+
+        Raises
+        ------
+        ValueError
+            If this environment is the :meth:`current` singleton, or if no
+            ``pyvenv.cfg`` is found within 4 parent levels of
+            :attr:`python_path`.
+        RuntimeError
+            If the directory removal fails.
+
+        Warnings
+        --------
+        This operation is irreversible.  Ensure no active processes are using
+        the environment before calling this method.
+        """
+        if self.is_current:
+            raise ValueError("Cannot delete the current singleton PyEnv.")
+
+        # Walk up to find the venv root (indicated by pyvenv.cfg)
+        candidate = self.python_path.parent
+        venv_root: Path | None = None
+        for _ in range(4):
+            if (candidate / "pyvenv.cfg").exists():
+                venv_root = candidate
+                break
+            candidate = candidate.parent
+
+        if venv_root is None:
+            raise ValueError(
+                f"Cannot determine venv root for python_path={self.python_path!r}. "
+                "No pyvenv.cfg found within 4 parent levels."
+            )
+
+        logger.debug("PyEnv.delete: removing venv_root=%s", venv_root)
+        try:
+            shutil.rmtree(venv_root)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to delete venv at {venv_root}: {exc}") from exc
+
+        logger.info("PyEnv.delete: removed venv_root=%s", venv_root)
+
+    # ── Execution ─────────────────────────────────────────────────────────────
+
     def run_python_code(
         self,
         code: str,
@@ -618,61 +925,91 @@ class PyEnv:
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
         stdin: str | None = None,
-        python: Union["PyEnv", Path, str, None] = None,
+        python: PyEnv | Path | str | None = None,
         packages: list[str] | None = None,
         prefer_uv: bool | None = None,
+        globs: dict[str, Any] | None = None,
     ) -> SystemCommand:
         """
-        Run arbitrary Python code, optionally targeting a different interpreter and/or
-        ensuring requirements are installed before execution.
+        Execute Python source code in a subprocess under this (or another)
+        environment.
 
+        The code is passed via the ``-c`` flag.  Variables in *globs* are
+        serialised as ``name = repr(value)`` and prepended to the code block,
+        making simple primitives, dicts, and base64 strings available inside
+        the subprocess without any IPC overhead.
+
+        Parameters
+        ----------
+        code:
+            Python source string to execute.
+        cwd:
+            Override the working directory.  Defaults to :attr:`self.cwd`.
+        env:
+            Extra environment variables merged *over* ``os.environ``.
+        wait:
+            Waiting strategy.  Defaults to synchronous wait.
+        raise_error:
+            Raise :class:`~.system_command.SystemCommandError` on non-zero exit
+            when ``True`` (default).
+        stdin:
+            Text written to the subprocess stdin pipe immediately after launch.
         python:
-          - None: use self.python_path
-          - PyEnv: use that env's python_path
-          - Path/str: resolved via resolve_python_executable (if selector) or used as path
+            Override the target interpreter — accepts a :class:`PyEnv`
+            instance, a path, or a selector string.  Defaults to ``self``.
+        packages:
+            Install these packages into *self* before running the code.
+        prefer_uv:
+            Override :attr:`self.prefer_uv` for this call.
+        globs:
+            Mapping of variable names to values injected at the top of the
+            code string via ``repr()``.  Safe for primitives, dicts, and
+            base64-encoded strings.
 
-        requirements:
-          - None: don't install anything
-          - list[str]: pip install those packages
-          - str/Path:
-              * if Path exists -> treat as requirements file (-r)
-              * else treat as requirements content and write a temp file (existing install() behavior)
+        Returns
+        -------
+        SystemCommand
+            The running or completed command object.
+
+        Notes
+        -----
+        * When *python* is provided, package installation still targets
+          *self*, not the override interpreter.
+        * stdin write errors are swallowed with a warning to avoid masking
+          the primary error from the code execution itself.
         """
-        merged_env = dict(os.environ)
-        if env:
-            merged_env.update(env)
-
-        # Resolve target env/interpreter for execution + optional installs
-        target: PyEnv = self.get_or_create(identifier=python) if python is not None else self
-
-        # Build exec command using the *target* interpreter
+        merged_env = {**os.environ, **(env or {})}
+        target = self.get_or_create(identifier=python) if python is not None else self
         prefer_uv = target.prefer_uv if prefer_uv is None else prefer_uv
 
         if packages:
-            self.install(
-                *packages,
-            )
+            self.install(*packages)
 
-        if prefer_uv:
-            cmd = target._uv_run_prefix() + ["python", "-c", code]
-        else:
-            cmd = [str(target.python_path), "-c", code]
+        # Inject globals as literal assignments at the top of the code block
+        if globs:
+            prefix = "\n".join(f"{k} = {v!r}" for k, v in globs.items())
+            code = prefix + "\n" + code
 
-        rr = SystemCommand.run_lazy(cmd, cwd=cwd or target.cwd, env=merged_env, python=self)
+        cmd = (
+            target._uv_run_prefix() + ["python", "-c", code]
+            if prefer_uv
+            else [str(target.python_path), "-c", code]
+        )
+
+        proc = SystemCommand.run_lazy(cmd, cwd=cwd or target.cwd, env=merged_env, python=self)
 
         if stdin is not None:
             try:
-                rr.popen.stdin.write(stdin)  # type: ignore[union-attr]
-                rr.popen.stdin.flush()  # type: ignore[union-attr]
-                rr.popen.stdin.close()  # type: ignore[union-attr]
+                proc.popen.stdin.write(stdin)
+                proc.popen.stdin.flush()
+                proc.popen.stdin.close()
             except Exception:
                 logger.warning("run_python_code: failed writing stdin", exc_info=True)
 
-        return rr.wait(wait=wait, raise_error=raise_error)
+        return proc.wait(wait=wait, raise_error=raise_error)
 
-    # -----------------------
-    # Runtime import + auto-install (current interpreter)
-    # -----------------------
+    # ── Runtime import + auto-install ─────────────────────────────────────────
+
     @classmethod
     def runtime_import_module(
         cls,
@@ -683,19 +1020,33 @@ class PyEnv:
         upgrade: bool = False,
     ):
         """
-        Convenience wrapper that always targets the current interpreter.
+        Class-level convenience wrapper for :meth:`import_module`.
 
-        Calls:
-            PyEnv.current().import_module(...)
+        Delegates to ``PyEnv.current().import_module(...)`` so callers don't
+        need to obtain a :class:`PyEnv` instance first.
+
+        Parameters
+        ----------
+        module_name:
+            Name used in ``import``.  Derived from *pip_name* if omitted.
+        install:
+            Auto-install via pip when the module is not found.
+        pip_name:
+            Distribution name for pip.  Defaults to the mapping in
+            :data:`PIP_MODULE_NAME_MAPPINGS` or *module_name* as-is.
+        upgrade:
+            Force a pip upgrade even if the import already succeeds.
+
+        Returns
+        -------
+        types.ModuleType
+            The imported module object.
         """
-        return (
-            cls.current()
-            .import_module(
-                module_name=module_name,
-                install=install,
-                pip_name=pip_name,
-                upgrade=upgrade,
-            )
+        return cls.current().import_module(
+            module_name=module_name,
+            install=install,
+            pip_name=pip_name,
+            upgrade=upgrade,
         )
 
     def import_module(
@@ -707,56 +1058,189 @@ class PyEnv:
         upgrade: bool = False,
     ):
         """
-        Import a module, installing it at runtime with pip if missing
-        (into the *current* interpreter).
+        Import a module into the current interpreter, installing it if missing.
 
-        Args:
-            module_name: name used in `import`
-            install: if True, install missing modules via pip
-            pip_name: name used for pip install (defaults to mapping or module_name)
-            upgrade: if True, do a pip upgrade install even if import succeeds
+        Combines :func:`importlib.import_module` with an automatic pip install
+        fallback, making it straightforward to use optional dependencies
+        without pre-populating the environment.
 
-        Returns:
-            Imported module object.
+        Parameters
+        ----------
+        module_name:
+            Name used in ``import``; derived from *pip_name* if omitted.
+        install:
+            Auto-install via pip when the module is not found.  Set to
+            ``False`` to propagate :class:`ModuleNotFoundError` immediately.
+        pip_name:
+            Distribution name for pip (defaults to the
+            :data:`PIP_MODULE_NAME_MAPPINGS` lookup or *module_name* as-is).
+        upgrade:
+            Run a pip upgrade even if the import already succeeds.
 
-        Raises:
-            ModuleNotFoundError if module import and/or installation fails.
+        Returns
+        -------
+        types.ModuleType
+            The imported module object.
+
+        Raises
+        ------
+        ValueError
+            If neither *module_name* nor *pip_name* is provided.
+        ModuleNotFoundError
+            If both the import and the installation attempt fail.
+
+        Examples
+        --------
+        ::
+
+            pa = env.import_module("pyarrow")
+            yaml = env.import_module("yaml")          # maps to PyYAML
+            toml = env.import_module(pip_name="toml") # derives module_name
         """
         if not module_name:
             if not pip_name:
-                raise ValueError("Need at least module_name or pip_name to import")
+                raise ValueError("Provide at least one of module_name or pip_name.")
             module_name = pip_name.replace("-", "_")
 
         if not upgrade:
             try:
-                mod = importlib.import_module(module_name)
-                return mod
+                return importlib.import_module(module_name)
             except ModuleNotFoundError:
                 if not install:
                     raise
 
-        if pip_name is None:
-            pip_name = safe_pip_name(module_name)
-
+        pip_name = pip_name or safe_pip_name(module_name)
         result = self.install(pip_name, wait=False)
         error = result.raise_for_status(raise_error=False)
 
         if isinstance(error, Exception):
             raise ModuleNotFoundError(
-                "No module named '%s'" % module_name,
-                name=module_name,
+                f"No module named '{module_name}'", name=module_name
             ) from error
 
         importlib.invalidate_caches()
-        mod = importlib.import_module(module_name)
-        return mod
+        return importlib.import_module(module_name)
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-def safe_pip_name(value: str | Iterable[str]):
-    if isinstance(value, str):
-        return PIP_MODULE_NAME_MAPPINGS.get(value, value)
+    def _pip_cmd_args(
+        self,
+        python: str | Path | None = None,
+        prefer_uv: bool | None = None,
+    ) -> list[str]:
+        """
+        Build the base pip invocation prefix as a list of strings.
 
-    return [
-        safe_pip_name(_)
-        for _ in value
-    ]
+        * ``prefer_uv=True``  → ``["<uv>", "pip"]``
+        * ``prefer_uv=False`` → ``["<python>", "-m", "pip"]``
+
+        Parameters
+        ----------
+        python:
+            Override the interpreter path.  Defaults to :attr:`python_path`.
+        prefer_uv:
+            Override :attr:`self.prefer_uv` for this call.
+
+        Returns
+        -------
+        list[str]
+            Command prefix ready for extension with pip sub-commands.
+        """
+        prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
+        p = python or self.python_path
+
+        if prefer_uv:
+            return [str(self.uv_bin), "pip"]
+        return [str(p), "-m", "pip"]
+
+    def _uv_run_prefix(self, python: str | Path | None = None) -> list[str]:
+        """
+        Return the ``uv run --python <path>`` prefix for subprocess execution.
+
+        Parameters
+        ----------
+        python:
+            Override the interpreter path.  Defaults to :attr:`python_path`.
+
+        Returns
+        -------
+        list[str]
+            ``["<uv>", "run", "--python", "<python_path>"]``
+        """
+        return [str(self.uv_bin), "run", "--python", str(python or self.python_path)]
+
+    @staticmethod
+    def _venv_python_from_dir(venv_dir: Path, raise_error: bool = True) -> Path:
+        """
+        Locate the Python executable inside a venv directory.
+
+        Checks the standard platform-specific locations in order:
+
+        * ``bin/python``        (POSIX)
+        * ``bin/python3``       (POSIX fallback)
+        * ``Scripts/python.exe`` (Windows)
+        * ``Scripts/python``    (Windows bare)
+
+        Parameters
+        ----------
+        venv_dir:
+            Root directory of the virtual environment.
+        raise_error:
+            Raises error if not found
+
+        Returns
+        -------
+        Path
+            Absolute path to the Python executable.
+
+        Raises
+        ------
+        ValueError
+            If no Python executable is found in any expected location.
+        """
+        candidates = [
+            venv_dir / "bin" / "python",
+            venv_dir / "bin" / "python3",
+            venv_dir / "Scripts" / "python.exe",
+            venv_dir / "Scripts" / "python",
+        ]
+        for c in candidates:
+            if c.exists() and c.is_file():
+                return c.resolve()
+
+        if raise_error:
+            raise ValueError(f"No Python executable found inside venv: {venv_dir}")
+
+        if os.name == "nt":
+            return venv_dir / "Scripts" / "python.exe"
+        else:
+            return venv_dir / "bin" / "python"
+
+    @staticmethod
+    def _looks_like_path(s: str) -> bool:
+        """
+        Return ``True`` if *s* resembles a filesystem path rather than a bare
+        name or version selector.
+
+        Heuristics
+        ----------
+        * Starts with ``~``, ``.``, or ``/``
+        * On Windows, starts with a drive letter (``C:``)
+        * Contains ``/`` or ``\\``
+
+        Parameters
+        ----------
+        s:
+            String to classify.
+
+        Returns
+        -------
+        bool
+        """
+        if not s:
+            return False
+        if s.startswith(("~", ".", "/")):
+            return True
+        if os.name == "nt" and len(s) >= 2 and s[1] == ":":
+            return True
+        return "/" in s or "\\" in s

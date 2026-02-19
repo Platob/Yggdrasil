@@ -13,7 +13,7 @@ try:
     from msal import ConfidentialClientApplication, PublicClientApplication
 except ImportError:
     # Local helper that can pip-install at runtime (if that's your org's vibe)
-    from ..pyutils.pyenv import PyEnv
+    from ..environ import PyEnv
 
     msal_mod = PyEnv.runtime_import_module(module_name="msal", pip_name="msal", install=True)
     ConfidentialClientApplication = msal_mod.ConfidentialClientApplication

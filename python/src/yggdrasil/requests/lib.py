@@ -1,7 +1,7 @@
 try:
     import requests
 except ImportError:
-    from ..pyutils.pyenv import PyEnv
+    from ..environ import PyEnv
 
     requests = PyEnv.runtime_import_module(module_name="requests", pip_name="requests", install=True)
 

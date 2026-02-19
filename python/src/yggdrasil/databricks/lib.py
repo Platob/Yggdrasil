@@ -5,7 +5,7 @@ from __future__ import annotations
 try:
     import databricks.sdk as databricks_sdk
 except ImportError:
-    from ..pyutils.pyenv import PyEnv
+    from ..environ import PyEnv
 
     databricks_sdk = PyEnv.runtime_import_module(module_name="databricks.sdk", pip_name="databricks-sdk", install=True)
 

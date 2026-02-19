@@ -124,10 +124,8 @@ class TestCluster(unittest.TestCase):
                 _ = context.command(func=f).start().wait()
 
     def test_decorator(self):
-        @self.cluster.system_context.decorate(
-            environ={
-                "TEST_ENV": "testenv"
-            }
+        @self.cluster.decorate(
+            environ={"TEST_ENV": "testenv"}
         )
         def decorated(a: int):
             env = os.environ["TEST_ENV"]

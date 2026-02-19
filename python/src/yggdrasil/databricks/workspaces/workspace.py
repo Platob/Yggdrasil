@@ -24,6 +24,7 @@ from databricks.sdk.service.iam import User, ComplexValue
 from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
 
 from .path import DatabricksPath, DatabricksPathKind
+from ...environ import UserInfo
 from ...pyutils.expiring_dict import ExpiringDict
 from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 from ...version import __version__ as YGGDRASIL_VERSION
@@ -845,12 +846,17 @@ class Workspace:
         if update:
             base = dict()
         else:
+            userinfo = UserInfo.current()
+
             base = {
                 k: v
                 for k, v in (
                     ("Product", self.product),
                     ("ProductVersion", self.product_version),
                     ("ProductTag", self.product_tag),
+                    ("UserSAM", userinfo.sam),
+                    ("UserEmail", userinfo.email),
+                    ("UserHostname", userinfo.hostname),
                 )
                 if v
             }
