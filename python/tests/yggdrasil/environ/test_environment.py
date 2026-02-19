@@ -528,6 +528,10 @@ class TestRunPythonCode:
         result = PyEnv.current().run_python_code("pass", prefer_uv=False)
         assert result is not None
 
+    def test_error_raise_module_not_found(self):
+        cmd = PyEnv.resolve_env("tmp", version="3.10").run_python_code("import dill").wait(raise_error=True)
+        cmd
+
 
 # ---------------------------------------------------------------------------
 # TestImportModule

@@ -648,7 +648,7 @@ _globs = {{
     "kwargs_b64": __KWARGS__,
 }}
 
-pyenv  = PyEnv.resolve_env(identifier=__CTX_KEY__, version=__PYVERSION__, packages={resolved_packages!r})
+pyenv  = PyEnv.current().resolve_env(identifier=__CTX_KEY__, version=__PYVERSION__, packages={resolved_packages!r})
 result = pyenv.run_python_code(code=_inner, env=__ENVIRON__, globs=_globs)
 
 print(result.stdout or "")

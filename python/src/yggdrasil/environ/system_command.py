@@ -347,9 +347,11 @@ class SystemCommand:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
         # dataclass(slots=True) but not frozen — normal attribute assignment is fine.
         self.popen = new_popen
         self.completed = None
+
         return self.wait(wait=wait, raise_error=raise_error)
 
     def raise_for_status(
@@ -362,7 +364,7 @@ class SystemCommand:
         if self.returncode != 0:
             module_err = self.find_module_not_found_error()
 
-            if install_python_modules and self.python and isinstance(module_err, ModuleNotFoundError):
+            if install_python_modules and self.python is not None and isinstance(module_err, ModuleNotFoundError):
                 if self.installed_modules is None:
                     self.installed_modules = set()
 
@@ -371,6 +373,8 @@ class SystemCommand:
 
                 # Ask the bound PyEnv to pip-install the missing package, then retry once.
                 self.python.install(module_err.name)
+
+                self.installed_modules.add(module_err.name)
 
                 return self.retry(wait=wait, raise_error=raise_error)
 

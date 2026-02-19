@@ -66,7 +66,7 @@ LocalSpec = Union[
 
 @dc.dataclass
 class RemoteMetadata:
-    version_info: tuple[int, int]
+    context_path: str
     tmp_path: str
     libs_path: str
 
@@ -194,11 +194,12 @@ class ExecutionContext:
 
         key = self.context_key or self.context_id
 
-        tmp_path = f"~/.ygg/dbx-ctx/{key}/tmp/"
-        libs_path = f"~/.ygg/dbx-ctx/{key}/Lib/site-packages/"
+        context_path = f"~/.ygg/dbx-ctx/{key}"
+        tmp_path = context_path + "/tmp/"
+        libs_path = context_path + "/python/lib/site-packages/"
 
         self._remote_metadata = RemoteMetadata(
-            version_info=self.cluster.python_version,
+            context_path=context_path,
             tmp_path=tmp_path,
             libs_path=libs_path
         )
@@ -349,11 +350,12 @@ class ExecutionContext:
     # ------------ public API ------------
     def command(
         self,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+        *,
         context: Optional["ExecutionContext"] = None,
         func: Optional[Callable] = None,
         command_id: Optional[str] = None,
-        command: Optional[str] = None,
-        language: Optional[Language] = None,
         environ: Optional[Dict[str, str]] = None,
         packages: list[str] | None = None,
         inject_libs: bool = True,  # new param
@@ -366,8 +368,8 @@ class ExecutionContext:
             and command is not None
             and (language is None or language == Language.PYTHON)
         ):
-            rm = self._remote_metadata  # use cached value only — no lazy fetch here
-            if rm and rm.libs_path and self._uploaded_package_roots:
+            rm = self.remote_metadata  # use cached value only — no lazy fetch here
+            if rm and rm.libs_path:
                 syspath_prefix = (
                     f"import sys as _sys\n"
                     f"if {rm.libs_path!r} not in _sys.path:\n"
@@ -602,6 +604,10 @@ class ExecutionContext:
 
         cmd = f"""import base64, io, os, zipfile, zlib
 
+def _ep(p):
+    \"\"\"Expand ~ and normalise path on the remote host.\"\"\"
+    return os.path.expanduser(p)
+
 packed_b64 = {data_b64!r}
 manifest = {manifest!r}
 
@@ -629,7 +635,7 @@ with zipfile.ZipFile(buf, "r") as zf:
 
         if kind in ("file", "bytes"):
             zip_name = item["zip"]
-            remote_file = item["remote"]
+            remote_file = _ep(item["remote"])          # ← expanded
             if zip_name not in names:
                 raise FileNotFoundError(f"Missing in zip: {{zip_name}}")
 
@@ -642,7 +648,8 @@ with zipfile.ZipFile(buf, "r") as zf:
 
         elif kind == "dir":
             prefix = item["zip_prefix"]
-            remote_root = item["remote_root"]
+            remote_root = _ep(item["remote_root"])     # ← expanded
+
             os.makedirs(remote_root, exist_ok=True)
 
             for n in names:
@@ -680,12 +687,7 @@ with zipfile.ZipFile(buf, "r") as zf:
         if connected._uploaded_package_roots.get(str_resolved):
             return libraries
 
-        libs_path = connected.remote_metadata.libs_path
-
-        # Ensure the ctx_libs directory exists on the remote
-        connected.command(
-            command=f"import os; os.makedirs({libs_path!r}, exist_ok=True)"
-        ).start().wait()
+        libs_path = "/local_disk0/.ephemeral_nfs/cluster_libraries/python/lib/python3.12/site-packages" # connected.remote_metadata.libs_path
 
         # Packages go into ctx_libs/<package_name>/ or ctx_libs/<module>.py
         remote_target = posixpath.join(libs_path, resolved.name)

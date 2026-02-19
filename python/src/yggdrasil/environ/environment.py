@@ -193,6 +193,7 @@ class PyEnv:
         * ``"python3.12"``   → looked up via :func:`shutil.which`
         * ``"3.12"``         → prepended with ``"python"`` then which'd
         * ``"/usr/bin/python3"`` → resolved as-is
+        * Path to a directory   → searches for a Python executable within it
 
         Parameters
         ----------
@@ -209,12 +210,17 @@ class PyEnv:
         FileNotFoundError
             If the selector cannot be resolved to a file on ``PATH`` or disk.
         """
-        if python is None:
+        if python is None or python == "":
             return Path(sys.executable).resolve()
 
         p = Path(python)
-        if p.exists() and p.is_file():
+
+        if p.is_file() and "python" in p.name:
             return p.resolve()
+
+        # Directory: search for a Python executable inside it
+        if p.is_dir():
+            return PyEnv._find_python_in_dir(p)
 
         s = str(python).strip()
         if s and s[0].isdigit():
@@ -226,6 +232,76 @@ class PyEnv:
             raise FileNotFoundError(f"Python executable not found: {python!r}")
 
         return Path(found).resolve()
+
+    @staticmethod
+    def _find_python_in_dir(folder: Path) -> Path:
+        """
+        Search *folder* recursively for a Python executable, preferring
+        standard venv layouts before falling back to a glob scan.
+
+        Search order
+        ------------
+        1. ``bin/python``, ``bin/python3`` (POSIX venv)
+        2. ``Scripts/python.exe``, ``Scripts/python`` (Windows venv)
+        3. Any ``python*`` / ``python*.exe`` file found via recursive glob,
+           preferring higher version numbers and shorter paths.
+
+        Parameters
+        ----------
+        folder:
+            Directory to search.
+
+        Returns
+        -------
+        Path
+            Absolute path to the best-matching Python executable found.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no Python executable is found anywhere under *folder*.
+        """
+        folder = folder.expanduser().resolve()
+
+        # 1. Standard venv locations first
+        candidates = [
+            folder / "bin" / "python",
+            folder / "bin" / "python3",
+            folder / "Scripts" / "python.exe",
+            folder / "Scripts" / "python",
+        ]
+        for c in candidates:
+            if c.is_file():
+                logger.debug("_find_python_in_dir: venv hit %s", c)
+                return c.resolve()
+
+        # 2. Recursive glob — collect all python* executables
+        patterns = ["**/python", "**/python3", "**/python3.*", "**/python.exe"]
+        found: list[Path] = []
+        for pattern in patterns:
+            for match in folder.glob(pattern):
+                if match.is_file() and os.access(match, os.X_OK):
+                    found.append(match)
+
+        if not found:
+            raise FileNotFoundError(
+                f"No Python executable found under directory: {folder}"
+            )
+
+        # 3. Rank: prefer shorter paths (closer to root) and higher version numbers
+        def _rank(p: Path) -> tuple[int, tuple[int, ...], int]:
+            # Extract version digits from filename, e.g. "python3.12" → (3, 12)
+            version_match = re.search(r"(\d+)(?:\.(\d+))?", p.name)
+            version = tuple(int(x) for x in version_match.groups("0")) if version_match else (0,)
+            return (
+                0 if "python3" in p.name else 1,  # prefer python3.x over plain python
+                tuple(-v for v in version),  # higher version = lower rank value
+                len(p.parts),  # shorter path preferred
+            )
+
+        best = sorted(found, key=_rank)[0]
+        logger.debug("_find_python_in_dir: glob hit %s (from %d candidates)", best, len(found))
+        return best.resolve()
 
     # ── Construction ──────────────────────────────────────────────────────────
 
@@ -305,19 +381,19 @@ class PyEnv:
             return CURRENT_PYENV
 
         py = cls.resolve_python_executable(python)
-        CURRENT_PYENV = cls.create(py, cwd=Path.cwd(), prefer_uv=prefer_uv)
+        CURRENT_PYENV = cls.create(py, prefer_uv=prefer_uv)
+        parts = py.parts
+        if len(parts) > 1 and parts[1] == "usr":
+            CURRENT_PYENV = CURRENT_PYENV.resolve_env(
+                identifier="ygg-py3.12",
+                version="3.12",
+                packages=["ygg", "uv"],
+            )
 
-        logger.debug(
-            "PyEnv.current: created CURRENT_PYENV python_path=%s cwd=%s prefer_uv=%s",
-            CURRENT_PYENV.python_path,
-            CURRENT_PYENV.cwd,
-            CURRENT_PYENV.prefer_uv,
-        )
         return CURRENT_PYENV
 
-    @classmethod
     def get_or_create(
-        cls,
+        self,
         identifier: str | Path | None = None,
         *,
         version: str | None = None,
@@ -375,7 +451,7 @@ class PyEnv:
                 identifier.install(*packages)
             return identifier
 
-        env = cls.resolve_env(
+        env = self.resolve_env(
             identifier,
             cwd=Path.cwd().resolve(),
             prefer_uv=prefer_uv,
@@ -388,9 +464,8 @@ class PyEnv:
 
         return env
 
-    @classmethod
     def resolve_env(
-        cls,
+        self,
         identifier: str | Path | None,
         *,
         cwd: Path | None = None,
@@ -425,38 +500,38 @@ class PyEnv:
             Resolved environment.
         """
         if not identifier:
-            return cls.current(prefer_uv=prefer_uv)
+            return self
 
         if isinstance(identifier, str):
             s = identifier.strip()
 
             if not s or s.lower() in {"current", "sys", "system"}:
-                return cls.current(prefer_uv=prefer_uv)
+                return self.current(prefer_uv=prefer_uv)
 
             m = _PY_VERSION_RE.match(s)
             if m:
                 version = version or m.group(1)
                 # Fall through to create_venv with a pinned version
-            elif cls._looks_like_path(s):
+            elif self._looks_like_path(s):
                 identifier = Path(s)
 
             else:
                 # Version-only string: place venv under the standard location
                 identifier = Path.home() / ".local" / "yggdrasil" / "python" / "envs" / s
 
-                py = cls._venv_python_from_dir(identifier, raise_error=False)
+                py = self._venv_python_from_dir(identifier, raise_error=False)
 
                 if py.is_file() and "python" in py.name:
-                    return cls.create(py, cwd=cwd, prefer_uv=prefer_uv)
+                    return self.create(py, cwd=cwd, prefer_uv=prefer_uv)
 
         path = Path(identifier).expanduser()  # type: ignore[arg-type]
 
         # If the path is already a Python executable, use it directly
         if path.is_file() and "python" in path.name:
-            return cls.create(path, cwd=cwd, prefer_uv=prefer_uv)
+            return self.create(path, cwd=cwd, prefer_uv=prefer_uv)
 
         # Otherwise treat as a venv directory (existing or to be created)
-        return cls.create_venv(
+        return self.create_venv(
             path,
             cwd=cwd or Path.cwd().resolve(),
             prefer_uv=prefer_uv,
@@ -465,9 +540,8 @@ class PyEnv:
             packages=packages
         )
 
-    @classmethod
     def create_venv(
-        cls,
+        self,
         venv_dir: Path,
         *,
         cwd: Path,
@@ -503,7 +577,7 @@ class PyEnv:
         PyEnv
             Environment anchored to the newly created venv.
         """
-        anchor = cls.current()
+        anchor = self
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -514,8 +588,8 @@ class PyEnv:
         logger.info("create_venv: cmd=%s", cmd)
         SystemCommand.run_lazy(cmd, cwd=cwd).wait(True)
 
-        py = cls._venv_python_from_dir(venv_dir)
-        env = cls.create(py, cwd=cwd, prefer_uv=prefer_uv)
+        py = self._venv_python_from_dir(venv_dir)
+        env = self.create(py, cwd=cwd, prefer_uv=prefer_uv)
         # Seed with baseline packages expected by the Yggdrasil framework
 
         if packages:
@@ -752,6 +826,8 @@ class PyEnv:
             cmd += [safe_pip_name(p) for p in packages]
         if extra_args:
             cmd += list(extra_args)
+
+        cmd += ["--python", str(self.python_path)]
 
         logger.info("install: cmd=%s cwd=%s wait=%s", cmd, self.cwd, bool(wait_cfg))
         result = SystemCommand.run_lazy(cmd, cwd=self.cwd)
@@ -996,7 +1072,7 @@ class PyEnv:
             else [str(target.python_path), "-c", code]
         )
 
-        proc = SystemCommand.run_lazy(cmd, cwd=cwd or target.cwd, env=merged_env, python=self)
+        proc = SystemCommand.run_lazy(cmd, cwd=cwd or target.cwd, env=merged_env, python=target)
 
         if stdin is not None:
             try:
