@@ -551,7 +551,8 @@ class PyEnv:
         seed: bool = True,
         version: str | None = None,
         packages: list[str] | None = None,
-        linked: bool = False
+        linked: bool = False,
+        native_tls: bool = True
     ) -> PyEnv:
         """
         Create a new virtual environment at *venv_dir* via ``uv`` and return
@@ -590,13 +591,14 @@ class PyEnv:
             if linked:
                 version = anchor.python_path
             else:
-                major, minor, patch = sys.version_info[:3]
+                major, minor, patch = anchor.version_info[:3]
                 version = "%s.%s.%s" % (major, minor, patch)
 
         cmd = [
             str(anchor.uv_bin), "venv", str(folder),
             "--python", version,
             *(["--seed"] if seed else []),
+            *(["--native-tls"] if native_tls else []),
         ]
         logger.info("create_venv: cmd=%s", cmd)
         SystemCommand.run_lazy(cmd, cwd=cwd).wait(True)
@@ -692,18 +694,30 @@ class PyEnv:
         if self._uv_bin_cache:
             return self._uv_bin_cache
 
-        logger.debug("uv_bin: resolving via runtime import")
-        try:
-            import uv as uv_mod
-        except ImportError:
-            # Auto-install uv using the plain pip fallback to avoid recursion
-            uv_mod = self.install("uv", prefer_uv=False)
+        if str(self.python_path) == sys.executable:
+            try:
+                import uv
+            except ImportError:
+                uv = self.import_module("uv", install=True)
 
-        self._uv_bin_cache = Path(uv_mod.find_uv_bin())
+            self._uv_bin_cache = uv.find_uv_bin()
+        else:
+            # Auto-install uv using the plain pip fallback to avoid recursion
+            self._uv_bin_cache = (
+                self.run_python_code(
+                    "import uv; print(uv.find_uv_bin())",
+                    prefer_uv=False,
+                    auto_install=True,
+                    wait=30
+                )
+                .stdout.strip("\n")
+            )
+
+        self._uv_bin_cache = Path(self._uv_bin_cache)
+
         if not self._uv_bin_cache.is_file():
             raise FileNotFoundError(f"uv resolved but is not a file: {self._uv_bin_cache}")
 
-        logger.debug("uv_bin: resolved=%s", self._uv_bin_cache)
         return self._uv_bin_cache
 
     # ── Package management ────────────────────────────────────────────────────
@@ -811,6 +825,18 @@ class PyEnv:
         synchronous install completes.  For async installs (``wait=False``)
         the caller is responsible for cleanup.
         """
+        prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
+
+        if prefer_uv and packages:
+            uv = [_ for _ in packages if _.startswith("uv")]
+
+            if uv:
+                subprocess.run([str(self.python_path), "-m", "pip", "install", "uv"], check=True, timeout=30)
+
+                self._uv_bin_cache = None
+
+                packages = [_ for _ in packages if not _.startswith("uv")]
+
         if not packages and requirements is None:
             return None
 
@@ -836,12 +862,12 @@ class PyEnv:
 
         if packages:
             cmd += [safe_pip_name(p) for p in packages]
+
         if extra_args:
             cmd += list(extra_args)
 
         cmd += ["--python", str(self.python_path)]
 
-        logger.info("install: cmd=%s cwd=%s wait=%s", cmd, self.cwd, bool(wait_cfg))
         result = SystemCommand.run_lazy(cmd, cwd=self.cwd)
 
         if wait_cfg:
@@ -954,7 +980,7 @@ class PyEnv:
         logger.debug("pip: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
 
-    def delete(self) -> None:
+    def delete(self, raise_error: bool = True) -> None:
         """
         Delete the virtual environment that contains this interpreter.
 
@@ -982,6 +1008,7 @@ class PyEnv:
         # Walk up to find the venv root (indicated by pyvenv.cfg)
         candidate = self.python_path.parent
         venv_root: Path | None = None
+
         for _ in range(4):
             if (candidate / "pyvenv.cfg").exists():
                 venv_root = candidate
@@ -989,14 +1016,16 @@ class PyEnv:
             candidate = candidate.parent
 
         if venv_root is None:
-            raise ValueError(
-                f"Cannot determine venv root for python_path={self.python_path!r}. "
-                "No pyvenv.cfg found within 4 parent levels."
-            )
+            if raise_error:
+                raise ValueError(
+                    f"Cannot determine venv root for python_path={self.python_path!r}. "
+                    "No pyvenv.cfg found within 4 parent levels."
+                )
 
-        logger.debug("PyEnv.delete: removing venv_root=%s", venv_root)
+            venv_root = self.python_path.parent.parent
+
         try:
-            shutil.rmtree(venv_root)
+            shutil.rmtree(venv_root, ignore_errors=not raise_error)
         except Exception as exc:
             raise RuntimeError(f"Failed to delete venv at {venv_root}: {exc}") from exc
 
@@ -1017,6 +1046,7 @@ class PyEnv:
         packages: list[str] | None = None,
         prefer_uv: bool | None = None,
         globs: dict[str, Any] | None = None,
+        auto_install: bool = True
     ) -> SystemCommand:
         """
         Execute Python source code in a subprocess under this (or another)
@@ -1084,7 +1114,10 @@ class PyEnv:
             else [str(target.python_path), "-c", code]
         )
 
-        proc = SystemCommand.run_lazy(cmd, cwd=cwd or target.cwd, env=merged_env, python=target)
+        proc = SystemCommand.run_lazy(
+            cmd, cwd=cwd or target.cwd,
+            env=merged_env, python=target,
+        )
 
         if stdin is not None:
             try:
@@ -1094,7 +1127,7 @@ class PyEnv:
             except Exception:
                 logger.warning("run_python_code: failed writing stdin", exc_info=True)
 
-        return proc.wait(wait=wait, raise_error=raise_error)
+        return proc.wait(wait=wait, raise_error=raise_error, auto_install=auto_install)
 
     # ── Runtime import + auto-install ─────────────────────────────────────────
 

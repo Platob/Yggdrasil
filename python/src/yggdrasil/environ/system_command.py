@@ -74,7 +74,7 @@ class SystemCommand:
     env: dict[str, str] | None
     popen: subprocess.Popen[str]
     python: Optional["PyEnv"] = None
-    installed_modules: set[str] | None = field(default=None, init=False, repr=False)
+    installed_python_modules: set[str] | None = field(default=None, init=False, repr=False)
     completed: subprocess.CompletedProcess[str] | None = field(default=None, init=False, repr=False)
 
     def __getstate__(self) -> dict:
@@ -93,7 +93,7 @@ class SystemCommand:
             "cwd": self.cwd,
             "env": self.env,
             "python": self.python,
-            "installed_modules": self.installed_modules,
+            "installed_modules": self.installed_python_modules,
             "completed": self.completed,
             "_popen_returncode": returncode,  # preserved for .returncode property
         }
@@ -312,6 +312,7 @@ class SystemCommand:
         self,
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
+        auto_install: bool = True
     ) -> Union["SystemCommand", "SystemCommandError"]:
         if self.completed is not None:
             return self.completed  # type: ignore[return-value]
@@ -328,7 +329,11 @@ class SystemCommand:
                 stderr=err,
             )
 
-            return self.raise_for_status(wait=wait, raise_error=raise_error)
+            return self.raise_for_status(
+                wait=wait,
+                raise_error=raise_error,
+                auto_install=auto_install
+            )
 
         return self
 
@@ -359,24 +364,26 @@ class SystemCommand:
         *,
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
-        install_python_modules: bool = True,
+        auto_install: bool = True,
     ) -> Union["SystemCommand", "SystemCommandError"]:
         if self.returncode != 0:
-            module_err = self.find_module_not_found_error()
+            if auto_install:
+                if self.python is not None:
+                    if self.installed_python_modules is None:
+                        self.installed_python_modules = set()
 
-            if install_python_modules and self.python is not None and isinstance(module_err, ModuleNotFoundError):
-                if self.installed_modules is None:
-                    self.installed_modules = set()
+                    module_err = self.find_module_not_found_error()
 
-                if module_err.name in self.installed_modules:
-                    raise module_err
+                    if isinstance(module_err, ModuleNotFoundError):
+                        if module_err.name in self.installed_python_modules:
+                            raise module_err
 
-                # Ask the bound PyEnv to pip-install the missing package, then retry once.
-                self.python.install(module_err.name)
+                        # Ask the bound PyEnv to pip-install the missing package, then retry once.
+                        self.python.install(module_err.name)
 
-                self.installed_modules.add(module_err.name)
+                        self.installed_python_modules.add(module_err.name)
 
-                return self.retry(wait=wait, raise_error=raise_error)
+                        return self.retry(wait=wait, raise_error=raise_error)
 
             e = SystemCommandError(command=self)
 

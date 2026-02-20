@@ -529,14 +529,14 @@ class TestRunPythonCode:
         assert result is not None
 
     def test_error_raise_module_not_found(self):
-        env = PyEnv.current().venv("tmp")
+        env = PyEnv.current().venv("test_error_raise_module_not_found", version="3.9")
 
         assert env.python_path != PyEnv.current().python_path
 
         try:
             result = env.run_python_code("import dill; print('ok')")
         finally:
-            env.delete()
+            env.delete(raise_error=False)
 
         assert result.stdout == "ok\n"
 
