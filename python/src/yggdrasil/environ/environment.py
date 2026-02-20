@@ -306,7 +306,7 @@ class PyEnv:
     # ── Construction ──────────────────────────────────────────────────────────
 
     @classmethod
-    def create(
+    def instance(
         cls,
         python_path: Path,
         *,
@@ -344,8 +344,10 @@ class PyEnv:
             cwd=(cwd or Path.cwd()).resolve(),
             prefer_uv=prefer_uv,
         )
+
         if packages:
             env.install(*packages)
+
         return env
 
     @classmethod
@@ -381,10 +383,10 @@ class PyEnv:
             return CURRENT_PYENV
 
         py = cls.resolve_python_executable(python)
-        CURRENT_PYENV = cls.create(py, prefer_uv=prefer_uv)
+        CURRENT_PYENV = cls.instance(py, prefer_uv=prefer_uv)
         parts = py.parts
         if len(parts) > 1 and parts[1] == "usr":
-            CURRENT_PYENV = CURRENT_PYENV.resolve_env(
+            CURRENT_PYENV = CURRENT_PYENV.venv(
                 identifier="ygg-py3.12",
                 version="3.12",
                 packages=["ygg", "uv"],
@@ -451,7 +453,7 @@ class PyEnv:
                 identifier.install(*packages)
             return identifier
 
-        env = self.resolve_env(
+        env = self.venv(
             identifier,
             cwd=Path.cwd().resolve(),
             prefer_uv=prefer_uv,
@@ -464,7 +466,7 @@ class PyEnv:
 
         return env
 
-    def resolve_env(
+    def venv(
         self,
         identifier: str | Path | None,
         *,
@@ -500,7 +502,7 @@ class PyEnv:
             Resolved environment.
         """
         if not identifier:
-            return self
+            return self.current(prefer_uv=prefer_uv)
 
         if isinstance(identifier, str):
             s = identifier.strip()
@@ -522,16 +524,16 @@ class PyEnv:
                 py = self._venv_python_from_dir(identifier, raise_error=False)
 
                 if py.is_file() and "python" in py.name:
-                    return self.create(py, cwd=cwd, prefer_uv=prefer_uv)
+                    return self.instance(py, cwd=cwd, prefer_uv=prefer_uv)
 
         path = Path(identifier).expanduser()  # type: ignore[arg-type]
 
         # If the path is already a Python executable, use it directly
         if path.is_file() and "python" in path.name:
-            return self.create(path, cwd=cwd, prefer_uv=prefer_uv)
+            return self.instance(path, cwd=cwd, prefer_uv=prefer_uv)
 
         # Otherwise treat as a venv directory (existing or to be created)
-        return self.create_venv(
+        return self.create(
             path,
             cwd=cwd or Path.cwd().resolve(),
             prefer_uv=prefer_uv,
@@ -540,15 +542,16 @@ class PyEnv:
             packages=packages
         )
 
-    def create_venv(
+    def create(
         self,
-        venv_dir: Path,
+        folder: Path | str,
         *,
         cwd: Path,
         prefer_uv: bool = True,
         seed: bool = True,
         version: str | None = None,
-        packages: list[str] | None = None
+        packages: list[str] | None = None,
+        linked: bool = False
     ) -> PyEnv:
         """
         Create a new virtual environment at *venv_dir* via ``uv`` and return
@@ -559,7 +562,7 @@ class PyEnv:
 
         Parameters
         ----------
-        venv_dir:
+        folder:
             Target directory for the new venv.  Parent directories are
             created automatically.
         cwd:
@@ -577,20 +580,29 @@ class PyEnv:
         PyEnv
             Environment anchored to the newly created venv.
         """
+        if isinstance(folder, str):
+            folder = Path(folder)
+
         anchor = self
-        venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        folder.parent.mkdir(parents=True, exist_ok=True)
+
+        if not version:
+            if linked:
+                version = anchor.python_path
+            else:
+                major, minor, patch = sys.version_info[:3]
+                version = "%s.%s.%s" % (major, minor, patch)
 
         cmd = [
-            str(anchor.uv_bin), "venv", str(venv_dir),
-            "--python", version or str(anchor.python_path),
+            str(anchor.uv_bin), "venv", str(folder),
+            "--python", version,
             *(["--seed"] if seed else []),
         ]
         logger.info("create_venv: cmd=%s", cmd)
         SystemCommand.run_lazy(cmd, cwd=cwd).wait(True)
 
-        py = self._venv_python_from_dir(venv_dir)
-        env = self.create(py, cwd=cwd, prefer_uv=prefer_uv)
-        # Seed with baseline packages expected by the Yggdrasil framework
+        py = self._venv_python_from_dir(folder)
+        env = self.instance(py, cwd=cwd, prefer_uv=prefer_uv)
 
         if packages:
             env.install(*packages)

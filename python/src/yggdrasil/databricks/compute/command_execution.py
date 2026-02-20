@@ -403,7 +403,7 @@ class CommandExecution:
                 module_name = e.name
 
                 if module_name and not module_name.startswith("ygg"):
-                    self.context.cluster.install_temporary_libraries(
+                    self.context.install_temporary_libraries(
                         libraries=[module_name]
                     )
 

@@ -142,29 +142,29 @@ class TestVenvPythonFromDir:
 
 
 # ---------------------------------------------------------------------------
-# TestPyEnvCreate
+# TestPyEnvInstance
 # ---------------------------------------------------------------------------
 
-class TestPyEnvCreate:
+class TestPyEnvInstance:
     def test_python_path_resolved(self):
-        env = PyEnv.create(Path(sys.executable))
+        env = PyEnv.instance(Path(sys.executable))
         assert env.python_path == Path(sys.executable).resolve()
 
     def test_prefer_uv_default_true(self):
-        env = PyEnv.create(Path(sys.executable))
+        env = PyEnv.instance(Path(sys.executable))
         assert env.prefer_uv is True
 
     def test_prefer_uv_false(self):
-        env = PyEnv.create(Path(sys.executable), prefer_uv=False)
+        env = PyEnv.instance(Path(sys.executable), prefer_uv=False)
         assert env.prefer_uv is False
 
     def test_cwd_resolved(self, tmp_path):
-        env = PyEnv.create(Path(sys.executable), cwd=tmp_path)
+        env = PyEnv.instance(Path(sys.executable), cwd=tmp_path)
         assert env.cwd == tmp_path.resolve()
 
     def test_packages_triggers_real_install(self):
         # "pip" is always present — a no-op reinstall that proves the pathway works
-        env = PyEnv.create(Path(sys.executable), packages=["pip"])
+        env = PyEnv.instance(Path(sys.executable), packages=["pip"])
         reqs = {n for n, _ in env.requirements(with_system=True)}
         assert "pip" in reqs
 
@@ -243,22 +243,22 @@ class TestPyEnvResolveEnv:
     def teardown_method(self): _reset_singleton()
 
     def test_none_returns_current(self):
-        assert PyEnv.resolve_env(None) is _env_module.CURRENT_PYENV
+        assert PyEnv.current().venv(None) is _env_module.CURRENT_PYENV
 
     def test_current_keyword(self):
-        assert PyEnv.resolve_env("current") is _env_module.CURRENT_PYENV
+        assert PyEnv.current().venv("current") is _env_module.CURRENT_PYENV
 
     def test_sys_executable_string(self):
-        env = PyEnv.resolve_env(sys.executable)
+        env = PyEnv.current().venv(sys.executable)
         assert env.python_path == Path(sys.executable).resolve()
 
     def test_path_object(self):
-        env = PyEnv.resolve_env(Path(sys.executable))
+        env = PyEnv.current().venv(Path(sys.executable))
         assert env.python_path == Path(sys.executable).resolve()
 
     def test_nonexistent_dir_creates_venv(self, tmp_path):
         venv_dir = tmp_path / "new_env"
-        env = PyEnv.resolve_env(venv_dir)
+        env = PyEnv.current().venv(venv_dir)
         assert venv_dir.exists()
         assert env.python_path.is_file()
         env.delete()
@@ -416,7 +416,7 @@ class TestUninstall:
         then confirm it's gone from requirements().
         """
         venv_dir = tmp_path / "iso_venv"
-        env = PyEnv.create_venv(venv_dir, cwd=tmp_path, seed=False)
+        env = PyEnv.current().create(venv_dir, cwd=tmp_path, seed=False)
         env.install("pip")  # ensure pip is available
         env.install("six")
         before = {n for n, _ in env.requirements()}
@@ -462,7 +462,7 @@ class TestDelete:
 
     def test_real_venv_deleted(self, tmp_path):
         venv_dir = tmp_path / "del_venv"
-        env = PyEnv.create_venv(venv_dir, cwd=tmp_path, seed=False)
+        env = PyEnv.current().create(venv_dir, cwd=tmp_path, seed=False)
         assert venv_dir.exists()
         env.delete()
         assert not venv_dir.exists()
@@ -473,7 +473,7 @@ class TestDelete:
         in the finaliser so pytest can clean up tmp_path.
         """
         venv_dir = tmp_path / "locked_venv"
-        env = PyEnv.create_venv(venv_dir, cwd=tmp_path, seed=False)
+        env = PyEnv.current().create(venv_dir, cwd=tmp_path, seed=False)
 
         # Remove write permission on the venv root
         original_mode = venv_dir.stat().st_mode
@@ -529,8 +529,16 @@ class TestRunPythonCode:
         assert result is not None
 
     def test_error_raise_module_not_found(self):
-        cmd = PyEnv.resolve_env("tmp", version="3.10").run_python_code("import dill").wait(raise_error=True)
-        cmd
+        env = PyEnv.current().venv("tmp")
+
+        assert env.python_path != PyEnv.current().python_path
+
+        try:
+            result = env.run_python_code("import dill; print('ok')")
+        finally:
+            env.delete()
+
+        assert result.stdout == "ok\n"
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +591,7 @@ class TestIntegrationSmoke:
         assert vi == (sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
 
     def test_resolve_env_round_trip(self):
-        env = PyEnv.resolve_env(sys.executable)
+        env = PyEnv.current().venv(sys.executable)
         assert env.python_path == Path(sys.executable).resolve()
         assert env.version_info[0] >= 3
 
@@ -598,7 +606,7 @@ class TestIntegrationSmoke:
 
     def test_full_venv_lifecycle(self, tmp_path):
         venv_dir = tmp_path / "full_lifecycle"
-        env = PyEnv.create_venv(venv_dir, cwd=tmp_path, seed=False)
+        env = PyEnv.current().create(venv_dir, cwd=tmp_path, seed=False)
         assert venv_dir.exists()
         assert env.python_path.is_file()
         assert env.version_info[0] >= 3
