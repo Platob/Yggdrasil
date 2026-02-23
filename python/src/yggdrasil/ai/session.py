@@ -113,7 +113,7 @@ class AISession(ABC):
     model:    str = "gemini-2.5-flash"
     retry:    RetryConfig = field(default_factory=RetryConfig)
 
-    _client: OpenAI = field(init=False, repr=False)
+    _client: OpenAI = field(default=None, init=False, repr=False)
 
     @property
     def client(self):
