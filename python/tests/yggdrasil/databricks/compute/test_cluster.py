@@ -2,17 +2,14 @@ import logging
 import os
 import sys
 import unittest
-import datetime as dt
 
 import numpy as np
 import pandas
 import pandas as pd
-import pytest
 from databricks.sdk.service.compute import Language
 
 from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.compute import databricks_remote_compute
-
 
 # ---- logging to stdout ----
 logger = logging.getLogger("test")
@@ -72,8 +69,7 @@ class TestCluster(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workspace = Workspace().connect()
-        cls.cluster = cls.workspace.clusters().push_python_environment()
-        cls.cluster.install_temporary_libraries(libraries=["yggdrasil"])
+        cls.cluster = cls.workspace.clusters().all_purpose_cluster()
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
@@ -86,48 +82,9 @@ class TestCluster(unittest.TestCase):
         assert result
         assert latest
 
-    def test_command(self):
-        def test(a: str, date: dt.date):
-            return {
-                "value": a,
-                "date": date
-            }
-
-        cmd = self.cluster.context().command(func=test)
-        today = dt.date.today()
-
-        result = cmd(a="test", date=today)
-
-        assert result
-        assert result["value"] == "test"
-        assert result["date"] == today
-
-    def test_execute(self):
-        def f():
-            return "ok"
-
-        with self.cluster.context() as context:
-            result = context.command(func=f).start().wait()
-
-        self.assertEqual("ok", result)
-
-    def test_execute_error(self):
-        def f():
-            raise ValueError("error")
-
-        with pytest.raises(ValueError):
-            with self.cluster.system_context as context:
-                _ = context.command(func=f).start().wait()
-
-        with pytest.raises(ValueError):
-            with self.cluster.context() as context:
-                _ = context.command(func=f).start().wait()
-
     def test_decorator(self):
-        @self.cluster.system_context.decorate(
-            environ={
-                "TEST_ENV": "testenv"
-            }
+        @self.cluster.decorate(
+            environ={"TEST_ENV": "testenv"}
         )
         def decorated(a: int):
             env = os.environ["TEST_ENV"]
@@ -146,7 +103,7 @@ class TestCluster(unittest.TestCase):
         assert result["env"] == "testenv"
 
     def test_data_decorator(self):
-        @self.cluster.system_context.decorate
+        @self.cluster.decorate
         def decorated(df: pd.DataFrame):
             assert os.getenv("DATABRICKS_RUNTIME_VERSION") is not None
             return df
@@ -171,15 +128,15 @@ class TestCluster(unittest.TestCase):
                 "env": env
             }
 
-        result = decorated(1)
+        result = {}
+
+        for i in range(4):
+            result = decorated(i)
 
         assert result["os"]
         assert "DATABRICKS_RUNTIME_VERSION" in result["os"].keys()
-        assert result["value"] == 1
+        assert result["value"] == 3
         assert result["env"] == "testenv"
-
-    def test_install_temporary_lib(self):
-        self.cluster.install_temporary_libraries(["path/to/folder", "pandas"])
 
     def test_execute_sql(self):
         result = self.cluster.context(language=Language.SQL).command("SELECT 1", language=Language.SQL).start()

@@ -10,14 +10,12 @@ for clusters. Metadata is stored in custom tags prefixed with
 from __future__ import annotations
 
 import dataclasses
-import datetime as dt
 import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass
-from types import ModuleType
-from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar
+from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar, Callable, Iterable
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.errors import DatabricksError
@@ -26,15 +24,16 @@ from databricks.sdk.service.compute import (
     ClusterDetails, Language, Kind, State, DataSecurityMode, Library, PythonPyPiLibrary, LibraryInstallStatus,
     ClusterAccessControlRequest, ClusterPermissionLevel
 )
-from databricks.sdk.service.compute import SparkVersion, RuntimeEngine
+from databricks.sdk.service.compute import SparkVersion
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .execution_context import ExecutionContext
-from ..workspaces.workspace import WorkspaceService, Workspace
+from ..workspaces.workspace import WorkspaceService
+from ...dataclasses.expiring import ExpiringDict
+from ...environ import UserInfo, PyEnv
+from ...environ.pip_settings import PipIndexSettings
+from ...io.url import URL
 from ...pyutils.equality import dicts_equal
-from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.modules import PipIndexSettings
-from ...pyutils.python_env import PythonEnv
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
 _EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
@@ -44,6 +43,8 @@ __all__ = ["Cluster"]
 
 LOGGER = logging.getLogger(__name__)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
+_CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context", "_contexts"})
+_CLUSTER_SKIP_IF_NONE = frozenset({"_details", "cluster_name"})
 
 
 def set_cached_cluster_name(
@@ -82,7 +83,10 @@ _PYTHON_BY_DBR: dict[str, tuple[int, int]] = {
     "17.2": (3, 12),
     "17.3": (3, 12),
     "18.0": (3, 12),
+    "18.1": (3, 12),
 }
+
+ALL_PURPOSE_CLUSTER: "Cluster | None" = None
 
 
 @dataclass
@@ -102,12 +106,70 @@ class Cluster(WorkspaceService):
     cluster_id: Optional[str] = None
     cluster_name: Optional[str] = None
     
-    _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False)
-    _details_refresh_time: float = dataclasses.field(default=0, repr=False)
-    _system_context: Optional[ExecutionContext] = dataclasses.field(default=None, repr=False)
+    _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _details_refresh_time: float = dataclasses.field(default=0, repr=False, hash=False, compare=False)
+    _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
     # host → Cluster instance
     _env_clusters: ClassVar[Dict[str, "Cluster"]] = {}
+
+    def __post_init__(self):
+        if self.cluster_name and not self.cluster_id:
+            self.cluster_id = self.find_cluster(cluster_name=self.cluster_name).cluster_id
+
+    def __getstate__(self) -> dict:
+        """Serialize cluster state for pickling.
+
+        Drops live execution contexts; preserves cluster details to avoid
+        a redundant API round-trip on restore.  The details refresh
+        timestamp is zeroed so the first ``fresh_details()`` call after
+        unpickling always re-validates against the API.
+
+        Returns:
+            A compact, pickle-ready state dictionary.
+        """
+        state = {}
+
+        for key, value in self.__dict__.items():
+            if key in _CLUSTER_RUNTIME_FIELDS:
+                continue
+            if key in _CLUSTER_SKIP_IF_NONE and value is None:
+                continue
+            state[key] = value
+
+        # Zero the refresh timestamp: stale wall-clock values from the
+        # originating process are meaningless in the receiving process,
+        # so force a re-fetch on the first fresh_details() call.
+        state["_details_refresh_time"] = 0.0
+
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore cluster state after unpickling.
+
+        Re-hydrates pruned optional keys so the instance is
+        attribute-complete, then syncs cluster_id/cluster_name from
+        any restored ClusterDetails to keep identifiers consistent.
+
+        Args:
+            state: Serialized state dictionary.
+        """
+        for field in _CLUSTER_SKIP_IF_NONE:
+            state.setdefault(field, None)
+
+        # Execution context is always reconstructed lazily on first access
+        state["_system_context"] = None
+        state["_contexts"] = {}
+
+        self.__dict__.update(state)
+
+        # If details survived the round-trip, re-sync the scalar identifiers.
+        # This is cheaper than an API call and keeps __repr__ / url() correct.
+        if self._details is not None:
+            if self._details.cluster_id:
+                self.cluster_id = self._details.cluster_id
+            if self._details.cluster_name:
+                self.cluster_name = self._details.cluster_name
 
     def __repr__(self):
         return "%s(url=%s)" % (
@@ -116,13 +178,13 @@ class Cluster(WorkspaceService):
         )
 
     def __str__(self):
-        return self.url()
+        return self.url().to_string()
 
-    def url(self) -> str:
-        return "%s/compute/clusters/%s" % (
+    def url(self) -> URL:
+        return URL.parse("%s/compute/clusters/%s" % (
             self.workspace.safe_host,
             self.cluster_id or "unknown"
-        )
+        ))
 
     @property
     def id(self):
@@ -134,129 +196,9 @@ class Cluster(WorkspaceService):
         """Return the current cluster name."""
         return self.cluster_name
 
-    @property
-    def system_context(self):
-        if self._system_context is None:
-            self._system_context = self.context(language=Language.PYTHON)
-        return self._system_context
-
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
         return self.workspace.is_in_databricks_environment()
-
-    @classmethod
-    def replicated_current_environment(
-        cls,
-        workspace: Optional["Workspace"] = None,
-        cluster_id: Optional[str] = None,
-        cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = None,
-        runtime_engine: Optional["RuntimeEngine"] = None,
-        libraries: Optional[list[str]] = None,
-        wait_update: Optional[WaitingConfigArg] = True,
-        **kwargs
-    ) -> "Cluster":
-        """Create or reuse a cluster that mirrors the current Python environment.
-
-        Args:
-            workspace: Workspace to use for the cluster.
-            cluster_id: Optional cluster id to reuse.
-            cluster_name: Optional cluster name to reuse.
-            single_user_name: Optional username for single-user clusters.
-            runtime_engine: Optional Databricks runtime engine.
-            libraries: Optional list of libraries to install.
-            wait_update: wait timeout, if None it will not wait completion
-            **kwargs: Additional cluster specification overrides.
-
-        Returns:
-            A Cluster instance configured for the current environment.
-        """
-        if workspace is None:
-            workspace = Workspace()  # your default, whatever it is
-
-        host = workspace.safe_host
-
-        # 🔥 return existing singleton for this host
-        existing = cls._env_clusters.get(host)
-
-        if existing is not None:
-            return existing
-
-        # 🔥 first time for this host → create
-        inst = cls._env_clusters[host] = (
-            cls(workspace=workspace, cluster_id=cluster_id, cluster_name=cluster_name)
-            .push_python_environment(
-                single_user_name=single_user_name,
-                runtime_engine=runtime_engine,
-                libraries=libraries,
-                wait_update=wait_update,
-                **kwargs
-            )
-        )
-
-        return inst
-
-    def push_python_environment(
-        self,
-        source: Optional[PythonEnv] = None,
-        cluster_id: Optional[str] = None,
-        cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = "current",
-        runtime_engine: Optional["RuntimeEngine"] = None,
-        libraries: Optional[list[str]] = None,
-        wait_update: Optional[WaitingConfigArg] = True,
-        **kwargs
-    ) -> "Cluster":
-        """Create/update a cluster to match the local Python environment.
-
-        Args:
-            source: Optional PythonEnv to mirror (defaults to current).
-            cluster_id: Optional cluster id to update.
-            cluster_name: Optional cluster name to update.
-            single_user_name: Optional single username for the cluster.
-            runtime_engine: Optional runtime engine selection.
-            libraries: Optional list of libraries to install.
-            wait_update: wait timeout, if None it will not wait completion
-            **kwargs: Additional cluster specification overrides.
-
-        Returns:
-            A Cluster instance configured with the local environment.
-        """
-        if source is None:
-            source = PythonEnv.get_current()
-
-        libraries = list(libraries) if libraries is not None else []
-
-        python_version = source.version_info
-
-        if python_version[0] < 3:
-            python_version = None
-        elif python_version[1] < 11:
-            python_version = None
-
-        current_user_name = self.workspace.current_user.user_name
-
-        if single_user_name == "current":
-            single_user_name = current_user_name
-
-        cluster_id = cluster_id or self.cluster_id
-        cluster_name = cluster_name or self.cluster_name
-
-        if not cluster_id and not cluster_name:
-            cluster_name = current_user_name
-
-        inst = self.create_or_update(
-            cluster_id=cluster_id,
-            cluster_name=cluster_name,
-            python_version=python_version,
-            single_user_name=single_user_name,
-            runtime_engine=runtime_engine or RuntimeEngine.PHOTON,
-            libraries=libraries,
-            wait_update=wait_update,
-            **kwargs
-        )
-
-        return inst
 
     @property
     def details(self):
@@ -289,11 +231,19 @@ class Cluster(WorkspaceService):
     @details.setter
     def details(self, value: "ClusterDetails"):
         """Cache cluster details and update identifiers."""
-        self._details_refresh_time = time.time()
-        self._details = value
+        if isinstance(value, ClusterDetails):
+            self._details_refresh_time = time.time()
+            self._details = value
+
+            self.cluster_name = value.cluster_name
+        else:
+            self._details_refresh_time = 0
+            self._details = None
+
+            self.cluster_name = None
 
         self.cluster_id = value.cluster_id
-        self.cluster_name = value.cluster_name
+
 
     @property
     def state(self):
@@ -322,6 +272,10 @@ class Cluster(WorkspaceService):
         """Return True when the cluster is in an error state."""
         return self.state == State.ERROR
 
+    @property
+    def requirements(self):
+        return self.context(context_key="system").requirements
+
     def raise_for_status(self):
         """Raise a DatabricksError if the cluster is in an error state."""
         if self.is_error:
@@ -344,14 +298,16 @@ class Cluster(WorkspaceService):
             The current Cluster instance.
         """
         wait = WaitingConfig.check_arg(wait)
-        iteration, start = 0, time.time()
 
-        if wait.timeout:
+        if wait:
+            iteration, start = 0, time.time()
+
             while self.is_pending:
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
 
             self.wait_installed_libraries(
+                wait=wait,
                 raise_error=raise_error
             )
 
@@ -397,6 +353,42 @@ class Cluster(WorkspaceService):
             return None
 
         return _PYTHON_BY_DBR.get(v)
+
+    def all_purpose_cluster(
+        self,
+        name: Optional[str] = None,
+        python_version: Optional[str | tuple[int, ...]] = None,
+    ):
+        global ALL_PURPOSE_CLUSTER
+
+        if ALL_PURPOSE_CLUSTER is not None:
+            return ALL_PURPOSE_CLUSTER
+
+        if not name:
+            if not python_version:
+                major, minor, _ = PyEnv.current().version_info
+                python_version = f"{major}.{minor}"
+
+            name = f"Yggdrasil All Purpose py{python_version}"
+
+        ALL_PURPOSE_CLUSTER = self.find_cluster(
+            cluster_name=name,
+            raise_error=False
+        )
+
+        if ALL_PURPOSE_CLUSTER is None:
+            ALL_PURPOSE_CLUSTER = self.create_or_update(
+                cluster_name=name,
+                python_version=python_version,
+                libraries=[
+                    "ygg", "uv", "dill",
+                    "mongoengine", "sqlalchemy",
+                    "wma-data",
+                    "datamanagement", "TSSecrets"
+                ]
+            )
+
+        return ALL_PURPOSE_CLUSTER
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -509,7 +501,7 @@ class Cluster(WorkspaceService):
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
         **kwargs
     ):
-        pip_settings = PipIndexSettings.default_settings()
+        pip_settings = PipIndexSettings.current()
 
         new_details = ClusterDetails(**{
             **details.as_shallow_dict(),
@@ -615,10 +607,14 @@ class Cluster(WorkspaceService):
             The current Cluster instance.
         """
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
-        update_details = self._check_details(details=ClusterDetails(), **cluster_spec)
+
         update_details = {
             k: v
-            for k, v in update_details.as_shallow_dict().items()
+            for k, v in (
+                self._check_details(details=ClusterDetails(), **cluster_spec)
+                .as_shallow_dict()
+                .items()
+            )
             if k in _CREATE_ARG_NAMES
         }
 
@@ -635,7 +631,7 @@ class Cluster(WorkspaceService):
             self
         )
 
-        self.install_libraries(libraries=libraries, raise_error=False, wait_timeout=None)
+        self.install_libraries(libraries=libraries, raise_error=False, wait=False)
 
         self.wait_for_status(wait=wait)
 
@@ -659,7 +655,7 @@ class Cluster(WorkspaceService):
         Returns:
             The updated Cluster instance.
         """
-        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
+        self.install_libraries(libraries=libraries, wait=False, raise_error=False)
 
         existing_details = {
             k: v
@@ -901,27 +897,74 @@ class Cluster(WorkspaceService):
     def context(
         self,
         language: Optional["Language"] = None,
-        context_id: Optional[str] = None
+        context_id: Optional[str] = None,
+        context_key: Optional[str] = None
     ) -> ExecutionContext:
         """Create a command execution context for this cluster.
 
         Args:
             language: Optional language for the execution context.
             context_id: Optional existing context id to reuse.
+            context_key: Optional cache key to reuse context
 
         Returns:
             An ExecutionContext instance.
         """
+        if context_key:
+            existing = self._contexts.get(context_key)
+
+            if existing is None:
+                existing = self._contexts[context_key] = ExecutionContext(
+                    cluster=self,
+                    language=language,
+                    context_id=context_id,
+                    context_key=context_key
+                )
+
+            return existing
+
         return ExecutionContext(
             cluster=self,
             language=language,
-            context_id=context_id
+            context_id=context_id,
+            context_key=context_key
+        )
+
+    def decorate(
+        self,
+        func: Optional[Callable] = None,
+        *,
+        command: Optional[str] = None,
+        language: Optional[Language] = None,
+        command_id: Optional[str] = None,
+        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+        context_key: Optional[str] = None
+    ) -> Callable:
+        language = Language.PYTHON if language is None else language
+
+        if not context_key:
+            usr, env = UserInfo.current(), PyEnv.current()
+            major, minor, _ = env.version_info
+
+            context_key = f"{usr.hostname}-py{major}.{minor}"
+
+        context = self.context(
+            language=language,
+            context_key=context_key
+        )
+
+        return context.decorate(
+            func=func,
+            command=command,
+            language=language,
+            command_id=command_id,
+            environ=environ
         )
 
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
+        wait: Optional[WaitingConfigArg] = True,
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
     ) -> "Cluster":
@@ -929,7 +972,7 @@ class Cluster(WorkspaceService):
 
         Args:
             libraries: Libraries or package names to install.
-            wait_timeout: Optional timeout for installation.
+            wait: Optional timeout for installation.
             pip_settings: Optional pip index settings.
             raise_error: Whether to raise on install failure.
 
@@ -966,12 +1009,10 @@ class Cluster(WorkspaceService):
                 ]
             )
 
-            if wait_timeout is not None:
-                self.wait_installed_libraries(
-                    timeout=wait_timeout,
-                    pip_settings=pip_settings,
-                    raise_error=raise_error
-                )
+            self.wait_installed_libraries(
+                wait=wait,
+                raise_error=raise_error
+            )
 
         return self
 
@@ -1040,15 +1081,13 @@ class Cluster(WorkspaceService):
 
     def wait_installed_libraries(
         self,
-        timeout: dt.timedelta = dt.timedelta(minutes=20),
-        pip_settings: Optional[PipIndexSettings] = None,
+        wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
     ):
         """Wait for library installations to finish on the cluster.
 
         Args:
-            timeout: Maximum time to wait for installs.
-            pip_settings: Optional pip index settings.
+            wait: Maximum time to wait for installs.
             raise_error: Whether to raise on failures.
 
         Returns:
@@ -1057,58 +1096,41 @@ class Cluster(WorkspaceService):
         if not self.is_running:
             return self
 
-        statuses = list(self.installed_library_statuses())
+        wait = WaitingConfig.check_arg(wait)
 
-        max_time = time.time() + timeout.total_seconds()
-
-        while True:
-            failed = [
-                _.library for _ in statuses
-                if _.library and _.status == LibraryInstallStatus.FAILED
-            ]
-
-            if failed:
-                if raise_error:
-                    raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
-
-                LOGGER.exception(
-                    "Libraries %s in %s failed to install",
-                    failed, self
-                )
-
-            running = [
-                _ for _ in statuses if _.status in (
-                    LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING,
-                    LibraryInstallStatus.RESOLVING
-                )
-            ]
-
-            if not running:
-                break
-
-            if time.time() > max_time:
-                raise TimeoutError(
-                    "Waiting %s to install libraries timed out" % self
-                )
-
-            time.sleep(5)
+        if wait:
             statuses = list(self.installed_library_statuses())
+            start, iteration = time.time(), 0
+
+            while True:
+                failed = [
+                    _.library for _ in statuses
+                    if _.library and _.status == LibraryInstallStatus.FAILED
+                ]
+
+                if failed:
+                    if raise_error:
+                        raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
+
+                    LOGGER.exception(
+                        "Libraries %s in %s failed to install",
+                        failed, self
+                    )
+
+                running = [
+                    _ for _ in statuses if _.status in (
+                        LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING,
+                        LibraryInstallStatus.RESOLVING
+                    )
+                ]
+
+                if not running:
+                    break
+
+                wait.sleep(iteration=iteration, start=start)
+                statuses = list(self.installed_library_statuses())
 
         return self
-
-    def install_temporary_libraries(
-        self,
-        libraries: str | ModuleType | List[str | ModuleType],
-    ):
-        """Upload local libraries to the cluster's site-packages.
-
-        Args:
-            libraries: Library path, name, module, or iterable of these.
-
-        Returns:
-            The uploaded library argument(s).
-        """
-        return self.system_context.install_temporary_libraries(libraries=libraries)
 
     def _check_library(
         self,
@@ -1118,7 +1140,7 @@ class Cluster(WorkspaceService):
         if isinstance(value, Library):
             return value
 
-        pip_settings = PipIndexSettings.default_settings() if pip_settings is None else pip_settings
+        pip_settings = PipIndexSettings.current() if pip_settings is None else pip_settings
 
         if isinstance(value, str):
             if os.path.exists(value):
@@ -1146,6 +1168,7 @@ class Cluster(WorkspaceService):
             if pip_settings.extra_index_url and (
                 value.startswith("datamanagement")
                 or value.startswith("TSSecrets")
+                or value.startswith("TSMails")
                 or value.startswith("tgp_")
                 or value.startswith("wma-data")
             ):

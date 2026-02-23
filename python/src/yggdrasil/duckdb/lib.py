@@ -1,7 +1,7 @@
 try:
     import duckdb
 except ImportError:
-    from ..pyutils.pyenv import PyEnv
+    from ..environ import PyEnv
 
     duckdb = PyEnv.runtime_import_module(module_name="duckdb", pip_name="duckdb", install=True)
 

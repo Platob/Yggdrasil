@@ -74,14 +74,9 @@ def databricks_remote_compute(
                 cluster_name=cluster_name
             )
         else:
-            cluster = workspace.clusters().replicated_current_environment(
-                workspace=workspace,
-                cluster_name=cluster_name,
-                single_user_name=workspace.current_user.user_name,
-                wait_update=False
-            )
+            cluster = workspace.clusters().all_purpose_cluster()
 
-    return cluster.system_context.decorate(
+    return cluster.decorate(
         func=_func,
         environ=env_keys,
     )

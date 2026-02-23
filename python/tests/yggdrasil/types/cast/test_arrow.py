@@ -581,7 +581,7 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
         result = convert(
             array,
             pa.Array,
-            source_arrow_field=source_hint,
+            source_field=source_hint,
             options=target_hint,
         )
     finally:

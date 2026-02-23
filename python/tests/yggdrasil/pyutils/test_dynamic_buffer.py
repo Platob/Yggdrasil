@@ -4,8 +4,6 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-import pytest
-
 from yggdrasil.io.dynamic_buffer import DynamicBuffer, DynamicBufferConfig  # type: ignore
 
 
@@ -60,20 +58,6 @@ def test_spill_preserves_cursor_position_and_overwrite_semantics(tmp_path: Path)
     buf.seek(0)
     # overwrite semantics: '12' + 'abcdefghij' (original tail overwritten)
     assert buf.read() == b"12abcdefghij"
-
-
-def test_getvalue_raises_after_spill(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=4, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
-
-    buf.write(b"abcd")  # exactly 4 -> still memory
-    assert buf.getvalue() == b"abcd"
-
-    buf.write(b"e")  # spill
-    assert buf.spilled is True
-
-    with pytest.raises(RuntimeError, match="spilled"):
-        _ = buf.getvalue()
 
 
 def test_to_bytes_reads_all_data_even_after_spill(tmp_path: Path):

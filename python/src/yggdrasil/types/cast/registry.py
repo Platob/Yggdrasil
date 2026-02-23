@@ -1,4 +1,5 @@
-"""Type conversion registry and default converters.
+"""
+Type conversion registry and default converters.
 
 Small, predictable conversion engine:
 - Fast lookup for exact (from, to)
@@ -22,6 +23,7 @@ from typing import (
     Any,
     Callable,
     Optional,
+    ParamSpec,
     TypeVar,
     Union,
     get_args,
@@ -39,13 +41,15 @@ if TYPE_CHECKING:
 __all__ = ["register_converter", "convert"]
 
 T = TypeVar("T")
-R = TypeVar("R")
+F = TypeVar("F", bound=Callable[..., Any])
+P = ParamSpec("P")
 
+# Runtime converter shape used by the registry.
 Converter = Callable[[Any, Optional["CastOptions"]], Any]
 RegistryKey = tuple[Any, Any]
 
 
-def _identity(x: Any, _: "CastOptions") -> Any:
+def _identity(x: Any, _opts: Optional["CastOptions"] = None) -> Any:
     return x
 
 
@@ -53,17 +57,26 @@ _registry: dict[RegistryKey, Converter] = {}
 _any_registry: dict[Any, Converter] = {}
 
 
-def register_converter(from_hint: Any, to_hint: Any) -> Callable[[Converter], Converter]:
-    """Decorator: register a converter from `from_hint` -> `to_hint`.
+def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
+    """
+    Decorator: register a converter from `from_hint` -> `to_hint`.
 
-    Converter signature: (value, options) -> converted_value
+    Keeps the original function signature (so decorated functions remain
+    precisely typed), while registering the function as a runtime Converter.
+
+    Expected runtime behavior:
+      func(value, options) -> converted_value
+    where `options` may be None.
     """
 
-    def decorator(func: Converter) -> Converter:
+    def decorator(func: F) -> F:
+        conv = func  # viewed as Converter at runtime
+
         if from_hint in (Any, object):
-            _any_registry[to_hint] = func
+            _any_registry[to_hint] = conv  # type: ignore[assignment]
         else:
-            _registry[(from_hint, to_hint)] = func
+            _registry[(from_hint, to_hint)] = conv  # type: ignore[assignment]
+
         return func
 
     return decorator
@@ -122,17 +135,16 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
     if any_converter is not None:
         return any_converter
 
+    # late import side-effect: ensure namespace-specific converters are registered
     if check_namespace:
         namespace = ObjectSerde.full_namespace(from_type)
 
         if namespace.startswith("polars"):
-            from ...polars.cast import cast_polars_dataframe  # type: ignore
-
+            from ...polars import cast as _polars_cast  # noqa: F401
         elif namespace.startswith("pandas"):
-            from ...pandas.cast import cast_pandas_dataframe  # type: ignore
-
+            from ...pandas import cast as _pandas_cast  # noqa: F401
         elif namespace.startswith("pyspark"):
-            from ...spark.cast import cast_spark_dataframe  # type: ignore
+            from ...spark import cast as _spark_cast  # noqa: F401
 
         return find_converter(from_type, to_hint, check_namespace=False)
 
@@ -168,7 +180,7 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
             except TypeError:
                 continue
 
-            def composed(v: Any, o: "CastOptions", _c1=c1, _c2=c2) -> Any:
+            def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:
                 return _c2(_c1(v, o), o)
 
             return composed
@@ -214,7 +226,7 @@ def convert(
     if options is None and not kwargs:
         try:
             if isinstance(value, target_hint):
-                return value
+                return value  # type: ignore[return-value]
         except Exception:
             pass
 
@@ -252,7 +264,7 @@ def convert(
     # last-resort identity-ish
     try:
         if target_hint is Any or isinstance(value, target_hint):
-            return value
+            return value  # type: ignore[return-value]
     except Exception:
         pass
 
@@ -300,7 +312,6 @@ def _convert_mapping(
 # ----------------------------
 # Built-in converters
 # ----------------------------
-
 
 def convert_to_python_enum(value: Any, target: type[enum.Enum], options: Optional["CastOptions"] = None) -> enum.Enum:
     if isinstance(value, target):
@@ -386,7 +397,6 @@ def convert_to_python_iterable(
 # ----------------------------
 # Default registrations
 # ----------------------------
-
 
 @register_converter(str, int)
 def _str_to_int(value: str, opts: Any) -> int:

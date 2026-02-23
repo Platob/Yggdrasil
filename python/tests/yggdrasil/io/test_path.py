@@ -8,10 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pytest
-
-from yggdrasil.enums import SaveMode
-from yggdrasil.enums.io.file_format import FileFormat
-from yggdrasil.io.path import LocalDataPath, _ensure_bytes, _rand_str
+from yggdrasil.io.enums import FileFormat, SaveMode
+from yggdrasil.io.path import LocalDataPath
+from yggdrasil.io.path.abstract import _ensure_bytes, _rand_str
 
 
 # -------------------------

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Never, Iterable, Optional
+from typing import Any, Iterable, Optional
 import importlib
 
 __all__ = ["Dummy"]
@@ -137,7 +137,7 @@ class Dummy:
     def dotted(self) -> str:
         return ".".join(self._module_path) if self._module_path else "<unknown>"
 
-    def _raise(self, action: str, detail: str | None = None) -> Never:
+    def _raise(self, action: str, detail: str | None = None) -> None:
         root = self._module_path[0] if self._module_path else "<unknown>"
         target = self.dotted()
         extra = f" ({detail})" if detail else ""

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Mapping, MutableMapping, Literal
 
 __all__ = [
     "anonymize_parameters"
 ]
 
+_REMOVE = object()  # internal sentinel
 
 _SENSITIVE_PARAM_KEYS = {
     "password", "pass", "pwd",
@@ -15,18 +16,6 @@ _SENSITIVE_PARAM_KEYS = {
     "api_key", "apikey", "x_api_key",
     "secret", "client_secret",
     "authorization", "auth", "bearer",
-    "session", "sessionid", "session_id",
-    "cookie", "set_cookie",
-    "email", "phone",
-    "ssn", "social", "creditcard", "card", "pan", "cvv",
-}
-
-# keys that are often identifiers (safe-ish to hash for correlation)
-_IDENTIFIER_KEYS = {
-    "user", "user_id", "userid", "uid",
-    "account", "account_id",
-    "customer", "customer_id",
-    "device_id", "installation_id",
 }
 
 # simple detectors for common sensitive shapes
@@ -55,55 +44,70 @@ def _to_str(v: Any) -> str:
 def anonymize_parameters(
     params: Any,
     *,
-    mode: str = "redact",        # "redact" | "hash"
+    mode: Literal["remove", "redact", "hash"] = "remove",
     salt: str = "",
-    max_str_len: int = 200,      # avoid logging giant blobs
-    preserve_keys: bool = True,  # if False, hash param names too
+    max_str_len: int = 200,
+    preserve_keys: bool = True,
 ) -> Any:
     """
     Anonymize parameters in nested structures (dict/list/tuple).
-    - Sensitive keys => redact or hash value
-    - Identifier keys => prefer hash (even in redact mode, can keep as redacted if you want)
-    - Token/JWT/email/phone-ish values => redact/hash
+
+    - remove: drops sensitive/identifier keys from mappings; filters secret-ish items from sequences
+    - redact: replaces sensitive values with "<redacted>"
+    - hash: replaces sensitive values with "<hash:...>" for safe correlation
+
+    Also:
+    - token/JWT/email/phone-ish values => redact/hash/remove (depending on mode)
     - Truncates very long strings to keep logs sane
     """
+
+    def _maybe_trim(s: str) -> str:
+        return (s[:max_str_len] + "…") if len(s) > max_str_len else s
+
+    def _handle_secret_scalar(s: str) -> Any:
+        # value-based secret detection
+        secretish = (
+            bool(_JWT_RE.search(s))
+            or bool(_HEX_RE.match(s))
+            or bool(_BASE64ISH_RE.match(s))
+            or bool(_EMAIL_RE.search(s))
+            or bool(_PHONE_RE.search(s))
+        )
+        if not secretish:
+            return _maybe_trim(s)
+
+        if mode == "remove":
+            return _REMOVE
+        if mode == "hash":
+            return f"<hash:{_hash(s, salt=salt)}>"
+        return "<redacted>"
 
     def sanitize_value(k_lc: str, v: Any) -> Any:
         # recurse for nested structures
         if isinstance(v, Mapping):
             return sanitize_mapping(v)
         if isinstance(v, (list, tuple)):
-            out_seq = [sanitize_value(k_lc, item) for item in v]
-            return out_seq if isinstance(v, list) else tuple(out_seq)
+            out_items = []
+            for item in v:
+                sv = sanitize_value(k_lc, item)
+                if sv is _REMOVE:
+                    continue
+                out_items.append(sv)
+            return out_items if isinstance(v, list) else tuple(out_items)
 
         # scalar
         s = _to_str(v)
 
-        # trim huge values early
-        if len(s) > max_str_len:
-            s_trim = s[:max_str_len] + "…"
-        else:
-            s_trim = s
-
         # key-based rules
         if k_lc in _SENSITIVE_PARAM_KEYS:
-            return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else "<redacted>"
-
-        if k_lc in _IDENTIFIER_KEYS:
-            # identifiers are the classic “debugging needs correlation” case
-            return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else "<redacted>"
+            if mode == "remove":
+                return _REMOVE
+            if mode == "hash":
+                return f"<hash:{_hash(s, salt=salt)}>"
+            return "<redacted>"
 
         # value-based rules (catch secrets even if key is innocent)
-        if _JWT_RE.search(s) or _HEX_RE.match(s) or _BASE64ISH_RE.match(s):
-            return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else "<redacted>"
-
-        if _EMAIL_RE.search(s):
-            return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else "<redacted>"
-
-        if _PHONE_RE.search(s):
-            return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else "<redacted>"
-
-        return s_trim
+        return _handle_secret_scalar(s)
 
     def sanitize_mapping(m: Mapping[Any, Any]) -> MutableMapping[str, Any]:
         out: MutableMapping[str, Any] = {}  # preserves insertion order
@@ -111,16 +115,35 @@ def anonymize_parameters(
             k_str = str(k).strip()
             k_lc = _key_norm(k_str)
             out_k = k_str if preserve_keys else f"p:{_hash(k_str, salt=salt)}"
-            out[out_k] = sanitize_value(k_lc, v)
+
+            sv = sanitize_value(k_lc, v)
+            if sv is _REMOVE:
+                continue  # <- the "remove mode" behavior
+            out[out_k] = sv
         return out
 
-    # entrypoint: preserve non-mapping structures too
+    # entrypoint
     if isinstance(params, Mapping):
         return sanitize_mapping(params)
+
     if isinstance(params, (list, tuple)):
-        out_seq = [anonymize_parameters(x, mode=mode, salt=salt, max_str_len=max_str_len, preserve_keys=preserve_keys) for x in params]
-        return out_seq if isinstance(params, list) else tuple(out_seq)
+        out_items = []
+        for x in params:
+            sx = anonymize_parameters(
+                x, mode=mode, salt=salt, max_str_len=max_str_len, preserve_keys=preserve_keys
+            )
+            if sx is _REMOVE:
+                continue
+            out_items.append(sx)
+        return out_items if isinstance(params, list) else tuple(out_items)
 
     # scalar root
     s = _to_str(params)
-    return f"<hash:{_hash(s, salt=salt)}>" if mode == "hash" else ("<redacted>" if len(s) > 0 else s)
+    if mode == "remove":
+        # only "remove" it if it looks secret-ish; otherwise keep trimmed
+        v = _handle_secret_scalar(s)
+        return None if v is _REMOVE else v
+
+    if mode == "hash":
+        return f"<hash:{_hash(s, salt=salt)}>"
+    return "<redacted>" if len(s) > 0 else s

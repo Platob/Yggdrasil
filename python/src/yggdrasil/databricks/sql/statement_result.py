@@ -29,7 +29,7 @@ from databricks.sdk.service.sql import (
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
 from ...concurrent.threading import JobThreadPoolExecutor, Job
-from ...sql.statement_result import StatementResult as BaseStatementResult
+from ...data.statement_result import StatementResult as BaseStatementResult
 from ...types import cast_arrow_tabular
 from ...types.cast.cast_options import CastOptions
 
@@ -329,7 +329,10 @@ class StatementResult(BaseStatementResult):
                 resp.release_conn()
 
             with pa.input_stream(buf) as src:
-                tb = pipc.open_stream(src).read_all()
+                tb: pa.Table = (
+                    pipc.open_stream(src)
+                    .read_all()
+                )
                 casted = cast_arrow_tabular(tb, cast_options)
                 return casted.to_batches()
 

@@ -71,7 +71,7 @@ def test_send_get_stream_false_preloads_content():
 
     assert 200 <= resp.status_code < 400
     # non-stream: should have content available immediately
-    content = resp.content if hasattr(resp, "content") else resp.read()
+    content = resp.content
     assert isinstance(content, (bytes, bytearray))
     assert b"<html" in content.lower()
 
@@ -83,7 +83,7 @@ def test_redirect_followed():
     resp = s.send(req, stream=False)
 
     assert resp.status_code == 200
-    content = resp.content if hasattr(resp, "content") else resp.read()
+    content = resp.content
     assert b"httpbin" in content.lower()
 
 
@@ -108,7 +108,7 @@ def test_post_json_roundtrip():
     resp = s.send(req, stream=False)
     assert resp.status_code == 200
 
-    raw = resp.content if hasattr(resp, "content") else resp.read()
+    raw = resp.content
     data = json.loads(raw.decode("utf-8"))
 
     assert data["json"] == payload
