@@ -10,16 +10,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, TypeVar
 
-from ..dataclasses.expiring import Expiring
-from ..pyutils.dummy import Dummy
-
 try:
-    from openai import OpenAI, Stream
-    from openai.types.chat import ChatCompletionChunk
+    from openai import OpenAI
 except ImportError:
-    OpenAI = Dummy.from_name("openai", "OpenAI", to_class=False, try_import=False)
-    Stream = None
-    ChatCompletionChunk = None
+    from yggdrasil.environ import PyEnv
+
+    openai = PyEnv.runtime_import_module(module_name="openai", pip_name="OpenAI", install=True)
+    from openai import OpenAI
+
+from yggdrasil.dataclasses.expiring import Expiring
 
 __all__ = [
     "AISession",
