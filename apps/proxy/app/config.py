@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,7 +11,12 @@ class Settings(BaseSettings):
 
     # Server
     host: str = "0.0.0.0"
-    port: int = 8000
+    # Databricks Apps injects DATABRICKS_APP_PORT at runtime; fall back to PORT
+    # or the hardcoded default when running locally.
+    port: int = Field(
+        default=8000,
+        validation_alias=AliasChoices("DATABRICKS_APP_PORT", "PORT", "port"),
+    )
     debug: bool = False
 
     # API

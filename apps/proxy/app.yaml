@@ -1,0 +1,24 @@
+# Databricks Apps deployment configuration
+# https://docs.databricks.com/en/dev-tools/databricks-apps/app-runtime.html
+#
+# Databricks injects DATABRICKS_APP_PORT at runtime.  main.py reads it via
+# Settings.port (AliasChoices: DATABRICKS_APP_PORT > PORT > 8000).
+
+command:
+  - python
+  - main.py
+
+# Declare any additional environment variables your app needs.
+# Remove / add entries as required.
+env:
+  # Point the frontend proxy at your actual frontend service.
+  - name: FRONTEND_UPSTREAM
+    value: "http://localhost:5173"
+
+  # Uncomment and set to forward only a sub-path to the upstream.
+  # - name: FRONTEND_STRIP_PREFIX
+  #   value: ""
+
+  # Example: expose a Databricks SQL warehouse ID from a resource reference.
+  # - name: WAREHOUSE_ID
+  #   valueFrom: sql_warehouse
