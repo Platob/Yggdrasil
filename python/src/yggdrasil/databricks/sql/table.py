@@ -12,13 +12,13 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.io.enums import SaveMode
 
 from .types import arrow_field_to_column_info, column_info_to_arrow_field
 from ..workspaces.workspace import WorkspaceService
 from ...concurrent.threading import Job
 from ...dataclasses.expiring import Expiring, RefreshResult
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from ...enums import SaveMode
 from ...types import any_to_arrow_schema
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ class Table(WorkspaceService):
         return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
 
     def safe_full_name(self) -> str:
-        return f"´{self.catalog_name}´.´{self.schema_name}´.´{self.table_name}´"
+        return f"`{self.catalog_name}`.`{self.schema_name}`.`{self.table_name}`"
 
     def __repr__(self) -> str:
         return f"Table({self.full_name()})"
@@ -556,6 +556,9 @@ class Table(WorkspaceService):
                 raise ValueError(f"Unsupported filter operator: {op!r}")
 
             col_sql = _quote_ident(col)
+
+            if val is None:
+                return f"{col_sql} IS NULL"
 
             if op_norm in ("IS", "IS NOT"):
                 # IS (NOT) expects NULL/TRUE/FALSE typically

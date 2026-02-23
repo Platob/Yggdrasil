@@ -8,7 +8,7 @@ from yggdrasil.io.dynamic_buffer import DynamicBuffer, DynamicBufferConfig
 
 def _try_import_internal_xxhash():
     try:
-        from yggdrasil.xxhash import xxhash as xxhash_mod
+        from yggdrasil.xxhash.lib import xxhash as xxhash_mod
     except Exception:
         return None
     return xxhash_mod

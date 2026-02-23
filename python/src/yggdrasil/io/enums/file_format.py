@@ -1,4 +1,4 @@
-# yggdrasil/enums/io/file_format.py
+# yggdrasil/io/enums/file_format.py
 """
 FileFormat enumeration
 ======================

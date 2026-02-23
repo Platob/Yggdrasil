@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 import pyarrow as pa
-
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 if TYPE_CHECKING:
@@ -193,10 +192,10 @@ class StatementResult(ABC):
         StatementResult
             Self.
         """
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.check_arg(wait)
 
         # Convention: falsy timeout => don't wait (or waiting disabled)
-        if not wait_cfg.timeout:
+        if not wait:
             if raise_error:
                 self.raise_for_status()
             return self
@@ -204,7 +203,7 @@ class StatementResult(ABC):
         iteration, start = 0, time.time()
 
         while not self.done:
-            wait_cfg.sleep(iteration=iteration, start=start)
+            wait.sleep(iteration=iteration, start=start)
             iteration += 1
             self.refresh_status()
 
@@ -327,7 +326,7 @@ class StatementResult(ABC):
             maintain_order=maintain_order,
             stream=stream,
         )
-        return pds.dataset(reader)
+        return pds.dataset(reader, schema=reader.schema)
 
     def to_arrow_table(
         self,

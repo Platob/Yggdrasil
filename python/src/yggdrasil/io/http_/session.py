@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Mapping, Union, Any, Literal
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -16,12 +16,15 @@ from urllib3.exceptions import (
     ProtocolError,
     SSLError,
 )
-
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.io.response import FULL_ARROW_SCHEMA
+
 from .response import HTTPResponse
+from ..dynamic_buffer import DynamicBuffer
+from ..enums import SaveMode
 from ..request import PreparedRequest
 from ..session import Session
-from ...enums import SaveMode
+from ..url import URL
 
 if TYPE_CHECKING:
     from ...databricks.sql.table import Table
@@ -93,6 +96,42 @@ class HTTPSession(Session):
             ca_certs=None,
         )
 
+    def request(
+        self,
+        method: str,
+        url: Optional[Union[URL, str]] = None,
+        *,
+        params: Optional[Mapping[str, str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        json: Optional[Any] = None,
+        stream: bool = True,
+        add_statistics: Optional[bool] = None,
+        wait: Optional[WaitingConfigArg] = None,
+        normalize: bool = True,
+        cache: Optional["Table"] = None
+    ) -> HTTPResponse:
+        if add_statistics is None:
+            add_statistics = cache is not None
+
+        request = self.prepare_request(
+            method=method,
+            url=url,
+            params=params,
+            headers=headers,
+            body=body,
+            json=json,
+            normalize=normalize,
+        )
+
+        return self.send(
+            request=request,
+            add_statistics=add_statistics,
+            stream=stream,
+            wait=wait,
+            cache=cache
+        )
+
     def send(
         self,
         request: PreparedRequest,
@@ -100,21 +139,31 @@ class HTTPSession(Session):
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        anonymize: Literal["remove", "redact", "hash"] = "remove",
     ) -> HTTPResponse:
         """
         Implementation of the abstract send method.
         Handles the actual urllib3 network call and custom retry logic.
         """
+        if add_statistics is None:
+            add_statistics = cache is not None
+
         if cache is not None:
-            anon = request.anonymize(mode="redact")
-            ds = cache.to_arrow_dataset(
+            anon = request.anonymize(mode=anonymize)
+            # cache.create(FULL_ARROW_SCHEMA)
+            batch = cache.to_arrow_dataset(
                 filters=[
-                    ("request_host", "=", anon.url.host),
-                    ("request_path", "=", anon.url.path),
-                    ("request_body_hash64", "=", anon.body.xxh3_64().intdigest()),
+                    ("request_url_host", "=", anon.url.host),
+                    ("request_url_path", "=", anon.url.path),
+                    ("request_url_query", "=", anon.url.query),
+                    ("request_body_hash64", "=", anon.body.xxh3_64().intdigest() if anon.body else None),
                 ]
             ).to_table()
+            responses = list(HTTPResponse.from_arrow_batch(batch))
+
+            if responses:
+                return responses[-1]
 
         http_pool = self._http_pool
         wait_cfg = self.waiting if wait is None else WaitingConfig.check_arg(wait)
@@ -154,6 +203,7 @@ class HTTPSession(Session):
                     stream=stream,
                     received_at_timestamp=received_at_timestamp
                 )
+                break
 
             except RETRYABLE_EXC as e:
                 last_exc = e
@@ -174,10 +224,10 @@ class HTTPSession(Session):
 
         if cache is not None:
             # insert
-            batch = result.anonymize(mode="redact").to_arrow_batch()
+            batch = result.anonymize(mode=anonymize).to_arrow_batch(parse=False)
             cache.insert(
                 batch,
-                mode=SaveMode.APPEND,
-                match_by=["request_host", "request_path", "request_body"]
+                mode=SaveMode.AUTO,
+                match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash64"]
             )
         return result

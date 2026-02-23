@@ -3,14 +3,14 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, is_dataclass, replace
-from typing import Mapping, Any, Iterable
+from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pyarrow as pa
-from yggdrasil.io.headers import anonymize_headers
 
+from yggdrasil.io.headers import anonymize_headers
 from .dynamic_buffer import DynamicBuffer
-from .request import PreparedRequest
+from .request import PreparedRequest, ARROW_SCHEMA as REQUEST_ARROW_SCHEMA
 
 __all__ = ["Response", "HTTPError"]
 
@@ -50,44 +50,57 @@ def _get_charset(headers: Mapping[str, str]) -> str:
     return "utf-8"
 
 
-# ------------------- anonymization helpers -------------------
+ARROW_SCHEMA = pa.schema(
+    [
+        pa.field(
+            name="response_status_code",
+            type=pa.int32(),
+            nullable=False,
+            metadata={"comment": "HTTP status code returned by the server"},
+        ),
+        # ✅ headers as list<struct<key:string,value:string>>
+        pa.field(
+            name="response_headers",
+            type=pa.list_(
+                pa.struct(
+                    [
+                        pa.field("key", pa.string(), nullable=True),
+                        pa.field("value", pa.string(), nullable=True),
+                    ]
+                )
+            ),
+            nullable=True,
+            metadata={"comment": "Raw HTTP response headers (ordered)"},
+        ),
+        pa.field(
+            name="response_body",
+            type=pa.binary(),
+            nullable=True,
+            metadata={"comment": "Raw binary payload of the response"},
+        ),
+        # keep name "body_hash" if you already depend on it, but make it honest: 32B blake3
+        pa.field(
+            name="response_body_hash",
+            type=pa.binary(32),
+            nullable=True,
+            metadata={"algorithm": "blake3", "comment": "256-bit BLAKE3 digest of the body"},
+        ),
+        pa.field(
+            name="response_body_hash64",
+            type=pa.int64(),
+            nullable=True,
+            metadata={"algorithm": "xxh3_64", "comment": "XXH3 64-bit int hash of the body"},
+        ),
+        pa.field(
+            name="response_received_at",
+            type=pa.timestamp("us", "UTC"),
+            nullable=False,
+            metadata={"comment": "UTC timestamp when the response was captured"},
+        ),
+    ]
+)
 
-_DEFAULT_SENSITIVE_HEADER_KEYS = {
-    # auth
-    "authorization",
-    "proxy-authorization",
-    # cookies
-    "cookie",
-    "set-cookie",
-    # common api key headers
-    "x-api-key",
-    "api-key",
-    "apikey",
-    "x-auth-token",
-    "x-csrf-token",
-    "x-xsrf-token",
-    # cloud/vendor-ish
-    "x-amz-security-token",
-    "x-amz-access-token",
-}
-
-_DEFAULT_SENSITIVE_QUERY_KEYS = {
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "api_key",
-    "apikey",
-    "key",
-    "signature",
-    "sig",
-    "password",
-    "passwd",
-    "secret",
-    "client_secret",
-    "session",
-    "sid",
-}
+FULL_ARROW_SCHEMA = pa.schema(list(REQUEST_ARROW_SCHEMA) + list(ARROW_SCHEMA))
 
 
 def _redact_headers(
@@ -405,7 +418,7 @@ class Response:
 
     def anonymize(
         self,
-        mode: str = "redact"
+        mode: Literal["remove", "redact", "hash"] = "remove",
     ) -> "Response":
         """
         Clean/boring + composable:
@@ -421,83 +434,185 @@ class Response:
     def to_arrow_batch(
         self,
         parse: bool = False,
-        *,
-        request_prefix: str = "request_",
-        column_prefix: str = "response_",
     ) -> pa.RecordBatch:
         """
         Single-row RecordBatch representing this response, with the request exploded
         into columns via request.to_arrow_batch(column_prefix=request_prefix).
+
+        Conventions:
+        - response_headers: map<string,string> (null if empty)
+        - response_body: raw bytes (null if empty)
+        - response_body_blake3: 32-byte digest (null if empty)
+        - response_body_hash64: int64 xxh3_64 digest (null if empty)
         """
         if parse:
             raise NotImplementedError
 
         # 1) Explode request into columns (single-row)
-        req_rb = self.request.to_arrow_batch(parse=False, column_prefix=request_prefix)
-
-        # 2) Response schema with Field Metadata
-        resp_schema = pa.schema(
-            [
-                pa.field(
-                    name=f"{column_prefix}status_code",
-                    type=pa.int32(),
-                    nullable=False,
-                    metadata={"comment": "HTTP status code returned by the server"},
-                ),
-                pa.field(
-                    name=f"{column_prefix}headers",
-                    type=pa.map_(
-                        pa.field("key", pa.string(), nullable=False),
-                        pa.field("value", pa.string(), nullable=False),
-                    ),
-                    nullable=True,
-                    metadata={"comment": "Raw HTTP response headers"},
-                ),
-                pa.field(
-                    name=f"{column_prefix}body",
-                    type=pa.binary(),
-                    nullable=True,
-                    metadata={"comment": "Raw binary payload of the response"},
-                ),
-                pa.field(
-                    name=f"{column_prefix}body_hash",
-                    type=pa.binary(),
-                    nullable=True,
-                    metadata={"algorithm": "blake3", "comment": "Blake3 hash of the body"},
-                ),
-                pa.field(
-                    name=f"{column_prefix}body_hash64",
-                    type=pa.int64(),
-                    nullable=True,
-                    metadata={"algorithm": "xxh3_64", "comment": "XXH3 int 64 hash of the body"},
-                ),
-                pa.field(
-                    name=f"{column_prefix}received_at",
-                    type=pa.timestamp("us", "UTC"),
-                    nullable=False,
-                    metadata={"comment": "UTC timestamp when the response was captured"},
-                ),
-            ]
-        )
+        req_rb = self.request.to_arrow_batch(parse=False)
 
         # 3) Values -> Arrow arrays
-        headers_v = None if not self.headers else dict(self.headers)
-        body_bytes = self.buffer.to_bytes()
+        headers_v = None
+        if self.headers:
+            # sorted deterministically by (lower(key), key, value)
+            # keeps logs stable while still being human-readable
+            headers_v = [
+                {"key": str(k), "value": str(v)}
+                for (k, v) in sorted(
+                    self.headers.items(),
+                    key=lambda kv: (str(kv[0]).lower(), str(kv[0]), str(kv[1])),
+                )
+                if k and v
+            ]
 
-        body_h = self.buffer.blake3().digest() if body_bytes is not None else None
-        body_h64 = self.buffer.xxh3_64().intdigest() if body_bytes is not None else None
+        if self.buffer:
+            body_bytes = self.buffer.to_bytes()
+            body_blake3_32 = self.buffer.blake3().digest()
+            body_h64 = self.buffer.xxh3_64().intdigest()
+        else:
+            body_bytes, body_blake3_32, body_h64 = None, None, None
 
         resp_arrays = [
-            pa.array([self.status_code], type=resp_schema.field(0).type),
-            pa.array([headers_v], type=resp_schema.field(1).type),
-            pa.array([body_bytes], type=resp_schema.field(2).type),
-            pa.array([body_h], type=resp_schema.field(3).type),
-            pa.array([body_h64], type=resp_schema.field(4).type),
-            pa.array([self.received_at_timestamp], type=resp_schema.field(5).type),
+            pa.array([self.status_code], type=ARROW_SCHEMA.field("response_status_code").type),
+            pa.array([headers_v], type=ARROW_SCHEMA.field("response_headers").type),
+            pa.array([body_bytes], type=ARROW_SCHEMA.field("response_body").type),
+            pa.array([body_blake3_32], type=ARROW_SCHEMA.field("response_body_hash").type),
+            pa.array([body_h64], type=ARROW_SCHEMA.field("response_body_hash64").type),
+            pa.array([self.received_at_timestamp], type=ARROW_SCHEMA.field("response_received_at").type),
         ]
 
         # 4) Combine request columns + response columns into one RecordBatch
-        full_schema = pa.schema(list(req_rb.schema) + list(resp_schema))
         full_arrays = list(req_rb.columns) + resp_arrays
 
-        return pa.RecordBatch.from_arrays(full_arrays, schema=full_schema) # type: ignore
+        return pa.RecordBatch.from_arrays(full_arrays, schema=FULL_ARROW_SCHEMA)  # type: ignore
+
+    @classmethod
+    def from_arrow_batch(
+        cls,
+        batch: pa.RecordBatch | pa.Table,
+        *,
+        parse: bool = False,
+        normalize: bool = True,
+    ) -> Iterator["Response"]:
+        """
+        Zero-copy-ish streaming decode: yields Response per row.
+
+        Accepts:
+          - pa.RecordBatch (single chunk)
+          - pa.Table (possibly chunked) -> iterates batches
+
+        Notes:
+          - request fields are decoded via PreparedRequest.parse_dict
+          - response_headers stored as list<struct<key,value>> (order preserved)
+          - response_body stored as binary -> DynamicBuffer
+        """
+        if parse:
+            raise NotImplementedError("parse=True not implemented (yet)")
+
+        def _headers_from_liststruct(x: Any) -> Mapping[str, str]:
+            # x is typically: list[{"key": "...", "value": "..."}] or None
+            if not x:
+                return {}
+            out: dict[str, str] = {}
+            for kv in x:
+                if not kv:
+                    continue
+                k = kv.get("key")
+                v = kv.get("value")
+                if k is None or v is None:
+                    continue
+                ks = str(k)
+                vs = str(v)
+                if ks and vs:
+                    out[ks] = vs
+            return out
+
+        def _iter_batches(obj: pa.RecordBatch | pa.Table) -> Iterator[pa.RecordBatch]:
+            if isinstance(obj, pa.RecordBatch):
+                yield obj
+                return
+            # Table: preserve chunking, avoid materializing whole table
+            for rb in obj.to_batches():
+                yield rb
+
+        # columns we expect (names in FULL_ARROW_SCHEMA)
+        req_cols: Sequence[str] = [f.name for f in REQUEST_ARROW_SCHEMA]
+        # response cols (names in ARROW_SCHEMA above)
+        resp_cols: Sequence[str] = [f.name for f in ARROW_SCHEMA]
+
+        for rb in _iter_batches(batch):
+            # Fast path: column-wise access then row index
+            cols = {name: rb.column(name) for name in list(req_cols) + list(resp_cols) if name in rb.schema.names}
+            n = rb.num_rows
+
+            for i in range(n):
+                # ---- rebuild request dict ----
+                # request_headers is list<struct<key,value>>
+                req_d: dict[str, Any] = {}
+
+                # required fields
+                req_d["method"] = cols["request_method"][i].as_py() if "request_method" in cols else "GET"
+                req_d["url"] = cols["request_url"][i].as_py() if "request_url" in cols else ""
+
+                # headers (arrow list<struct>)
+                if "request_headers" in cols:
+                    req_hdrs = cols["request_headers"][i].as_py()
+                    req_d["headers"] = _headers_from_liststruct(req_hdrs)
+                else:
+                    req_d["headers"] = {}
+
+                # body (binary)
+                if "request_body" in cols:
+                    b = cols["request_body"][i].as_py()
+                    req_d["buffer"] = b  # DynamicBuffer.parse_any can take bytes
+                else:
+                    req_d["buffer"] = None
+
+                # sent_at
+                if "request_sent_at" in cols:
+                    # timestamp(us) -> python datetime or int depending on as_py;
+                    # we want int microseconds in this file, so handle both.
+                    ts = cols["request_sent_at"][i].as_py()
+                    if ts is None:
+                        req_d["sent_at_timestamp"] = 0
+                    elif hasattr(ts, "timestamp"):
+                        # datetime -> seconds float; convert to us
+                        req_d["sent_at_timestamp"] = int(ts.timestamp() * 1_000_000)
+                    else:
+                        # sometimes Arrow returns int-like
+                        req_d["sent_at_timestamp"] = int(ts)
+                else:
+                    req_d["sent_at_timestamp"] = 0
+
+                request = PreparedRequest.parse_dict(req_d, normalize=normalize)
+
+                # ---- response pieces ----
+                status_code = int(cols["response_status_code"][i].as_py()) if "response_status_code" in cols else 0
+
+                if "response_headers" in cols:
+                    resp_hdrs = cols["response_headers"][i].as_py()
+                    headers = _headers_from_liststruct(resp_hdrs)
+                else:
+                    headers = {}
+
+                body_bytes = cols["response_body"][i].as_py() if "response_body" in cols else None
+                buffer = DynamicBuffer.parse_any(obj=body_bytes) if body_bytes is not None else DynamicBuffer()
+
+                if "response_received_at" in cols:
+                    rts = cols["response_received_at"][i].as_py()
+                    if rts is None:
+                        received_at = 0
+                    elif hasattr(rts, "timestamp"):
+                        received_at = int(rts.timestamp() * 1_000_000)
+                    else:
+                        received_at = int(rts)
+                else:
+                    received_at = 0
+
+                yield cls(
+                    request=request,
+                    status_code=status_code,
+                    headers=headers,
+                    buffer=buffer,
+                    received_at_timestamp=received_at,
+                )

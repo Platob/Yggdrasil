@@ -7,7 +7,6 @@ except ImportError:  # keep runtime non-blocking
         module_name="xxhash", pip_name="xxhash", install=True
     )
 
-
 __all__ = [
     "xxhash"
 ]

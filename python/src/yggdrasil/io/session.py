@@ -286,6 +286,9 @@ class Session(ABC):
         normalize: bool = True,
         cache: Optional["Table"] = None
     ) -> Response:
+        if add_statistics is None:
+            add_statistics = cache is not None
+
         request = self.prepare_request(
             method=method,
             url=url,

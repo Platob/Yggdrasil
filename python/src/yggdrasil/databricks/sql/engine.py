@@ -31,17 +31,16 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 import pyarrow as pa
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import Disposition
-
 from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.enums import SaveMode
+from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
+from yggdrasil.io.enums import SaveMode, FileFormat
+
 from .exceptions import SqlStatementError
 from .statement_result import StatementResult
 from .table import Table
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..workspaces import WorkspaceService, DatabricksPath
 from ...data.engine import SQLEngine as BaseSQLEngine
-from ...enums import FileFormat
-from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -848,12 +847,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
             statements: list[str] = []
 
             if match_by:
-                not_null_pred = " AND ".join([f"{_quote_ident(k)} IS NOT NULL" for k in match_by])
-
-                source_sql = f"""SELECT {cols_quoted}
-FROM parquet.{_quote_ident(str(temp_volume_path))}
-WHERE {not_null_pred}""".strip()
-
+                source_sql = f"SELECT {cols_quoted} FROM parquet.{_quote_ident(str(temp_volume_path))}"
                 on_condition = " AND ".join([f"T.{_quote_ident(k)} = S.{_quote_ident(k)}" for k in match_by])
 
                 if mode == SaveMode.OVERWRITE:
@@ -863,7 +857,6 @@ WHERE {not_null_pred}""".strip()
 USING (
   SELECT DISTINCT {key_cols}
   FROM parquet.{_quote_ident(str(temp_volume_path))}
-  WHERE {not_null_pred}
 ) AS S
 ON {on_condition}""".strip()
 

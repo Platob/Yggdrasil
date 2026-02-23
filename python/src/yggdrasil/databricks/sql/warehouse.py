@@ -517,6 +517,7 @@ class SQLWarehouse(WorkspaceService):
     def create(
         self,
         name: Optional[str] = None,
+        *,
         permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         wait: Optional[WaitingConfigArg] = None,
         **warehouse_specs

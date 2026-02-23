@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Tuple, Union, Any
+from typing import Mapping, Tuple, Union, Any, Literal
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -16,13 +16,10 @@ from yggdrasil.io.parameters import anonymize_parameters
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
-# RFC 3986-ish safe sets
 _SAFE_PATH = "/:@-._~!$&'()*+,;="
-# Query must NOT escape separators '&' and '=' when query is already structured
 _SAFE_QUERY = "-._~!$'()*+,;=:@/?&="
 _SAFE_FRAGMENT = "-._~!$&'()*+,;=:@/?"
 
-# port == 0 means "absent"
 _NO_PORT = 0
 
 
@@ -39,7 +36,6 @@ def _strip_trailing_dot(host: str) -> str:
 def _normalize_path(path: str) -> str:
     if not path:
         return ""
-    # collapse repeated slashes (except keep single "/")
     if path != "/" and "//" in path:
         while "//" in path:
             path = path.replace("//", "/")
@@ -47,9 +43,6 @@ def _normalize_path(path: str) -> str:
 
 
 def _remove_default_port(scheme: str, host: str, port: int) -> int:
-    """
-    Return 0 when port is absent or is the scheme default.
-    """
     if not scheme or not host or port <= 0:
         return _NO_PORT
     default = _DEFAULT_PORTS.get(scheme)
@@ -61,12 +54,10 @@ def _encode_userinfo(userinfo: str) -> str:
 
 
 def _encode_path(path: str) -> str:
-    # keep existing '%' to avoid double-encoding
     return quote(path, safe=_SAFE_PATH + "%")
 
 
 def _encode_query(query: str) -> str:
-    # Query is structured: keep '&' and '='; keep '%' to avoid double-encoding
     return quote(query, safe=_SAFE_QUERY + "%")
 
 
@@ -79,13 +70,6 @@ def _decode_maybe(s: str, decode: bool) -> str:
 
 
 def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
-    """
-    Parse netloc into (userinfo, host, port). Port uses 0 as "absent".
-    Handles:
-      - userinfo@host:port
-      - IPv6: [::1]:8080
-      - host without port
-    """
     if not netloc:
         return "", "", _NO_PORT
 
@@ -102,7 +86,6 @@ def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
     if hostport.startswith("["):
         rb = hostport.find("]")
         if rb == -1:
-            # malformed, treat whole as host
             return userinfo, hostport, _NO_PORT
         host = hostport[1:rb]
         rest = hostport[rb + 1 :]
@@ -123,15 +106,25 @@ def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
     return userinfo, host, port
 
 
+def _s(x: str | None) -> str:
+    """None-safe string: None -> ''."""
+    return x or ""
+
+
+def _p(x: int | None) -> int:
+    """None-safe port: None -> 0 (absent)."""
+    return x or _NO_PORT
+
+
 @dataclass(frozen=True, slots=True)
 class URL:
-    scheme: str = ""
-    userinfo: str = ""
-    host: str = ""
-    port: int = _NO_PORT  # 0 means absent
-    path: str = ""
-    query: str = ""
-    fragment: str = ""
+    scheme: str | None = None
+    userinfo: str | None = None
+    host: str | None = None
+    port: int | None = None  # None/0 means absent
+    path: str | None = None
+    query: str | None = None
+    fragment: str | None = None
 
     @classmethod
     def parse_any(
@@ -145,17 +138,9 @@ class URL:
             return obj
 
         if isinstance(obj, dict):
-            return cls.parse_dict(
-                obj,
-                decode=decode,
-                normalize=normalize
-            )
+            return cls.parse_dict(obj, decode=decode, normalize=normalize)
 
-        return cls.parse(
-            raw=str(obj),
-            decode=decode,
-            normalize=normalize,
-        )
+        return cls.parse(raw=str(obj), decode=decode, normalize=normalize)
 
     @classmethod
     def parse(
@@ -176,13 +161,13 @@ class URL:
 
         if not normalize:
             return URL(
-                scheme=scheme,
-                userinfo=userinfo,
-                host=host,
-                port=port,
-                path=path,
-                query=query,
-                fragment=fragment,
+                scheme=scheme or None,
+                userinfo=userinfo or None,
+                host=host or None,
+                port=port or None,
+                path=path or None,
+                query=query or None,
+                fragment=fragment or None,
             )
 
         scheme_n = _lower_if(scheme)
@@ -197,13 +182,13 @@ class URL:
             query_n = urlencode(items, doseq=True)
 
         return cls(
-            scheme=scheme_n,
-            userinfo=userinfo,
-            host=host_n,
-            port=port_n,
-            path=path_n,
-            query=query_n,
-            fragment=fragment,
+            scheme=scheme_n or None,
+            userinfo=userinfo or None,
+            host=host_n or None,
+            port=port_n or None,
+            path=path_n or None,
+            query=query_n or None,
+            fragment=fragment or None,
         )
 
     @classmethod
@@ -214,55 +199,34 @@ class URL:
         decode: bool = False,
         normalize: bool = True,
     ) -> "URL":
-        """
-        Build a URL from a mapping.
-
-        Supported inputs:
-          - {"url": "..."} (delegates to parse)
-          - {"scheme","netloc","path","query","fragment"} (like urlsplit result)
-          - {"scheme","userinfo","host","port","path","query","fragment"}
-          - {"scheme","netloc", ...} plus overrides (userinfo/host/port)
-
-        Notes:
-          - port == 0 / None => absent
-          - if both netloc and (userinfo/host/port) are provided, explicit fields win
-        """
         if not d:
             return cls()
 
-        # 1) Common shortcut: {"url": "..."}
         raw = d.get("url") or d.get("raw")
         if raw is not None:
             return cls.parse(str(raw), decode=decode, normalize=normalize)
 
-        # 2) Pull split-ish fields
         scheme = str(d.get("scheme") or "")
         path = str(d.get("path") or "")
         query = str(d.get("query") or "")
         fragment = str(d.get("fragment") or "")
 
-        # Optional full authority in one string
         netloc = d.get("netloc")
         if netloc is None:
-            # Some libs use "authority"
             netloc = d.get("authority")
         netloc_s = str(netloc) if netloc is not None else ""
 
-        # 3) Parse netloc if present
         userinfo = ""
         host = ""
         port = _NO_PORT
         if netloc_s:
             userinfo, host, port = _parse_netloc(netloc_s, decode=decode)
 
-        # 4) Explicit overrides win (for dicts that already have fields split out)
         if "userinfo" in d and d["userinfo"] is not None:
-            userinfo = str(d["userinfo"])
-            userinfo = _decode_maybe(userinfo, decode)
+            userinfo = _decode_maybe(str(d["userinfo"]), decode)
 
         if "host" in d and d["host"] is not None:
-            host = str(d["host"])
-            host = _decode_maybe(host, decode)
+            host = _decode_maybe(str(d["host"]), decode)
 
         if "port" in d:
             p = d.get("port")
@@ -274,23 +238,21 @@ class URL:
                 ps = str(p)
                 port = int(ps) if ps.isdigit() and int(ps) > 0 else _NO_PORT
 
-        # 5) Decode other parts (optionally)
         path = _decode_maybe(path, decode)
         query = _decode_maybe(query, decode)
         fragment = _decode_maybe(fragment, decode)
 
         if not normalize:
             return cls(
-                scheme=scheme,
-                userinfo=userinfo,
-                host=host,
-                port=port,
-                path=path,
-                query=query.lstrip("?"),
-                fragment=fragment.lstrip("#"),
+                scheme=scheme or None,
+                userinfo=userinfo or None,
+                host=host or None,
+                port=port or None,
+                path=path or None,
+                query=(query.lstrip("?") or None),
+                fragment=(fragment.lstrip("#") or None),
             )
 
-        # 6) Apply the same normalization policy as parse()
         scheme_n = _lower_if(scheme)
         host_n = _strip_trailing_dot(_lower_if(host))
         path_n = _normalize_path(path)
@@ -305,13 +267,13 @@ class URL:
         fragment_n = fragment.lstrip("#")
 
         return cls(
-            scheme=scheme_n,
-            userinfo=userinfo,
-            host=host_n,
-            port=port_n,
-            path=path_n,
-            query=query_n,
-            fragment=fragment_n,
+            scheme=scheme_n or None,
+            userinfo=userinfo or None,
+            host=host_n or None,
+            port=port_n or None,
+            path=path_n or None,
+            query=query_n or None,
+            fragment=fragment_n or None,
         )
 
     def __str__(self) -> str:
@@ -324,33 +286,28 @@ class URL:
 
     @property
     def query_dict(self) -> Mapping[str, Tuple[str, ...]]:
-        """
-        Parsed query as an immutable mapping: key -> tuple(values...)
-
-        - Preserves original order of values per key (matching parse_qsl order)
-        - Empty query => {}
-        - Keeps blank values (k=) and keys without '=' (k) as ("",)
-        """
-        if not self.query:
+        q = _s(self.query)
+        if not q:
             return {}
 
         out: dict[str, list[str]] = {}
-        for k, v in parse_qsl(self.query, keep_blank_values=True):
+        for k, v in parse_qsl(q, keep_blank_values=True):
             out.setdefault(k, []).append(v)
 
         return {k: tuple(vs) for k, vs in out.items()}
 
     @property
     def is_absolute(self):
-        return bool(self.scheme) and bool(self.host)
+        return bool(_s(self.scheme)) and bool(_s(self.host))
 
     def to_string(self, *, encode: bool = True) -> str:
-        scheme = self.scheme
-        host = self.host
-        userinfo = self.userinfo
-        path = self.path
-        query = self.query
-        fragment = self.fragment
+        scheme = _s(self.scheme)
+        host = _s(self.host)
+        userinfo = _s(self.userinfo)
+        path = _s(self.path)
+        query = _s(self.query)
+        fragment = _s(self.fragment)
+        port = _p(self.port)
 
         if encode:
             if userinfo:
@@ -358,198 +315,6 @@ class URL:
             path = _encode_path(path)
             query = _encode_query(query)
             fragment = _encode_fragment(fragment)
-
-        netloc = ""
-        if host:
-            out_host = host
-            # bracket IPv6
-            if ":" in out_host and not out_host.startswith("["):
-                out_host = f"[{out_host}]"
-            netloc = out_host
-
-            if self.port > 0:
-                netloc = f"{netloc}:{self.port}"
-
-            if userinfo:
-                netloc = f"{userinfo}@{netloc}"
-
-        return urlunsplit((scheme, netloc, path, query, fragment))
-
-    @property
-    def authority(self) -> str:
-        if not self.host:
-            return ""
-        host = self.host
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = host
-        if self.port > 0:
-            netloc = f"{netloc}:{self.port}"
-        if self.userinfo:
-            netloc = f"{self.userinfo}@{netloc}"
-        return netloc
-
-    def join(self, ref: Union[str, "URL"]) -> "URL":
-        base = self.to_string(encode=True)
-        target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
-        return URL.parse(urljoin(base, target), normalize=True)
-
-    # Immutable edits
-    def with_scheme(self, scheme: str) -> "URL":
-        scheme_n = _lower_if(scheme)
-        return URL(
-            scheme=scheme_n,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=_remove_default_port(scheme_n, self.host, self.port),
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
-
-    def with_userinfo(self, userinfo: str) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=userinfo,
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
-
-    def with_host(self, host: str) -> "URL":
-        host_n = _strip_trailing_dot(_lower_if(host))
-        port_n = _remove_default_port(self.scheme, host_n, self.port)
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=host_n,
-            port=port_n,
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
-
-    def with_path(self, path: str) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=_normalize_path(path),
-            query=self.query,
-            fragment=self.fragment,
-        )
-
-    def with_query(self, query: str) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=query.lstrip("?"),
-            fragment=self.fragment,
-        )
-
-    def with_fragment(self, fragment: str) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=self.query,
-            fragment=fragment.lstrip("#"),
-        )
-
-    # Query helpers
-    def query_items(self, *, keep_blank_values: bool = True) -> Tuple[Tuple[str, str], ...]:
-        if not self.query:
-            return ()
-        return tuple(parse_qsl(self.query, keep_blank_values=keep_blank_values))
-
-    def with_query_items(self, items: Mapping[str, str] | Tuple[Tuple[str, str], ...]) -> "URL":
-        q = urlencode(items if isinstance(items, tuple) else list(items.items()), doseq=True)
-        return self.with_query(q)
-
-    # ------------------- URL anonymization -------------------
-
-    def anonymize(
-        self,
-        mode: str = "redact",  # "redact" | "hash"
-    ) -> "URL":
-        """
-        Returns a new URL with sensitive parts redacted.
-
-        - Query: for keys in sensitive_query_keys, replace *values* with query_replacement.
-          Keeps the key names so your logs remain groupable.
-        - Userinfo: if strip_userinfo, removes user:pass@ completely.
-        - Fragment: optionally redact entire fragment (sometimes people shove tokens in there).
-        - No mutation; URL is frozen.
-
-        normalize:
-          - False (default): preserve existing ordering/format as much as possible, only touching
-            the sensitive bits (good for debugging parity).
-          - True: canonicalize like parse(normalize=True) after editing.
-        """
-        result = self
-
-        if self.query:
-            params = self.query_dict
-            anon = anonymize_parameters(params, mode=mode)
-
-            if params != anon:
-                result = self.with_query_items(anon)
-
-        if self.userinfo:
-            result = self.with_userinfo(
-                userinfo="<redacted>"
-            )
-
-        return result
-
-    def xxh3_64(
-        self,
-        *,
-        exclude_userinfo: bool = False,
-        exclude_scheme: bool = False,
-        exclude_host: bool = False,
-        exclude_port: bool = False,
-        exclude_path: bool = False,
-        exclude_query: bool | list[str] | None = None,
-        exclude_fragment: bool = False,
-    ) -> int:
-        """
-        Stable 64-bit xxh3 hash of a canonical URL with selective exclusions.
-
-        exclude_query semantics:
-        - None           → include full query (sorted, canonical)
-        - True           → exclude entire query
-        - list[str]      → exclude only those query parameter names
-        """
-        from ..xxhash import xxhash
-
-        scheme = "" if exclude_scheme else self.scheme
-        host = "" if exclude_host else self.host
-        userinfo = "" if (exclude_userinfo or exclude_host) else self.userinfo
-
-        path = "" if exclude_path else self.path
-        fragment = "" if exclude_fragment else self.fragment
-
-        query = ""
-        if exclude_query is not True:
-            query = self.query
-            if query:
-                items = parse_qsl(query, keep_blank_values=True)
-                if isinstance(exclude_query, list):
-                    excl = set(exclude_query)
-                    items = [(k, v) for (k, v) in items if k not in excl]
-                items.sort(key=lambda kv: (kv[0], kv[1]))
-                query = urlencode(items, doseq=True)
-
-        port = _NO_PORT if (exclude_port or exclude_host) else self.port
 
         netloc = ""
         if host:
@@ -564,8 +329,141 @@ class URL:
             if userinfo:
                 netloc = f"{userinfo}@{netloc}"
 
-        s = urlunsplit((scheme, netloc, path, query, fragment))
+        return urlunsplit((scheme, netloc, path, query, fragment))
 
-        h = xxhash.xxh3_64()
-        h.update(s.encode("utf-8"))
-        return h
+    @property
+    def authority(self) -> str:
+        host = _s(self.host)
+        if not host:
+            return ""
+        out_host = host
+        if ":" in out_host and not out_host.startswith("["):
+            out_host = f"[{out_host}]"
+        netloc = out_host
+
+        port = _p(self.port)
+        if port > 0:
+            netloc = f"{netloc}:{port}"
+
+        userinfo = _s(self.userinfo)
+        if userinfo:
+            netloc = f"{userinfo}@{netloc}"
+
+        return netloc
+
+    def join(self, ref: Union[str, "URL"]) -> "URL":
+        base = self.to_string(encode=True)
+        target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
+        return URL.parse(urljoin(base, target), normalize=True)
+
+    # Immutable edits (nullable in, nullable out)
+    def with_scheme(self, scheme: str | None) -> "URL":
+        scheme_n = _lower_if(_s(scheme))
+        host = _s(self.host)
+        port_n = _remove_default_port(scheme_n, _strip_trailing_dot(_lower_if(host)), _p(self.port))
+        return URL(
+            scheme=scheme_n or None,
+            userinfo=self.userinfo,
+            host=self.host,
+            port=port_n or None,
+            path=self.path,
+            query=self.query,
+            fragment=self.fragment,
+        )
+
+    def with_userinfo(self, userinfo: str | None) -> "URL":
+        return URL(
+            scheme=self.scheme,
+            userinfo=(userinfo or None),
+            host=self.host,
+            port=self.port,
+            path=self.path,
+            query=self.query,
+            fragment=self.fragment,
+        )
+
+    def with_host(self, host: str | None) -> "URL":
+        host_n = _strip_trailing_dot(_lower_if(_s(host)))
+        port_n = _remove_default_port(_s(self.scheme), host_n, _p(self.port))
+        return URL(
+            scheme=self.scheme,
+            userinfo=self.userinfo,
+            host=host_n or None,
+            port=port_n or None,
+            path=self.path,
+            query=self.query,
+            fragment=self.fragment,
+        )
+
+    def with_path(self, path: str | None) -> "URL":
+        return URL(
+            scheme=self.scheme,
+            userinfo=self.userinfo,
+            host=self.host,
+            port=self.port,
+            path=(_normalize_path(_s(path)) or None),
+            query=self.query,
+            fragment=self.fragment,
+        )
+
+    def with_query(self, query: str | None) -> "URL":
+        q = _s(query).lstrip("?")
+        return URL(
+            scheme=self.scheme,
+            userinfo=self.userinfo,
+            host=self.host,
+            port=self.port,
+            path=self.path,
+            query=q or None,
+            fragment=self.fragment,
+        )
+
+    def with_fragment(self, fragment: str | None) -> "URL":
+        f = _s(fragment).lstrip("#")
+        return URL(
+            scheme=self.scheme,
+            userinfo=self.userinfo,
+            host=self.host,
+            port=self.port,
+            path=self.path,
+            query=self.query,
+            fragment=f or None,
+        )
+
+    # Query helpers
+    def query_items(self, *, keep_blank_values: bool = True) -> Tuple[Tuple[str, str], ...]:
+        q = _s(self.query)
+        if not q:
+            return ()
+        return tuple(parse_qsl(q, keep_blank_values=keep_blank_values))
+
+    def with_query_items(
+        self,
+        items: Mapping[str, str] | Tuple[Tuple[str, str], ...],
+        *,
+        sort_keys: bool = True,
+    ) -> "URL":
+        seq = items if isinstance(items, tuple) else list(items.items())
+        if sort_keys:
+            seq = sorted(seq, key=lambda kv: kv[0])
+        q = urlencode(seq, doseq=True)
+        return self.with_query(q)
+
+    def anonymize(
+        self,
+        mode: Literal["remove", "redact", "hash"] = "remove",
+        *,
+        sort_keys: bool = True
+    ) -> "URL":
+        result = self
+
+        if _s(self.query):
+            params = self.query_dict
+            anon = anonymize_parameters(params, mode=mode)
+            if params != anon:
+                result = self.with_query_items(anon, sort_keys=sort_keys)
+
+        if _s(self.userinfo):
+            result = result.with_userinfo(userinfo="<redacted>" if mode == "redact" else None)
+
+        return result

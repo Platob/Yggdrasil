@@ -1140,11 +1140,6 @@ def cast_arrow_tabular(
     if target_arrow_schema is None:
         return data
 
-    if options.merge:
-        # NOTE: arrow_field_to_field used as placeholder; full merge logic is
-        # expected to be wired here in a future revision.
-        target_arrow_schema = arrow_field_to_field  # type: ignore  # FIXME
-
     if data.num_rows == 0:
         # Fast path: return correctly-typed empty container.
         return data.__class__.from_arrays(

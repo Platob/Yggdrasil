@@ -41,9 +41,9 @@ from typing import Any, IO, Iterator, Optional, Union, TYPE_CHECKING
 
 import pyarrow as pa
 from pyarrow.fs import FileSystem, FileType
+from yggdrasil.io.enums.file_format import FileFormat
 
-from ...enums import SaveMode
-from ...enums.io.file_format import FileFormat
+from ..enums import SaveMode
 from ...pyutils.serde import ObjectSerde
 from ...types.cast.arrow_cast import cast_arrow_tabular
 from ...types.cast.cast_options import CastOptions, CastOptionsArg

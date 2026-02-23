@@ -3,10 +3,10 @@ from dataclasses import dataclass
 from typing import Optional, Union, TYPE_CHECKING
 
 import pyarrow as pa
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.io.enums import SaveMode
 
 from .statement_result import StatementResult
-from ..enums import SaveMode
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from ..types.cast.cast_options import CastOptions
 
 if TYPE_CHECKING:

@@ -73,6 +73,9 @@ class DynamicBuffer(io.RawIOBase):
     # ---------------------------------------------------------------------
     # Dunder
     # ---------------------------------------------------------------------
+    def __bool__(self):
+        return self.size > 0
+
     def __bytes__(self) -> bytes:
         return self.to_bytes()
 
@@ -174,7 +177,15 @@ class DynamicBuffer(io.RawIOBase):
         if self._closed:
             raise ValueError("I/O operation on closed DynamicBuffer")
 
-        mv = memoryview(b)
+        try:
+            mv = memoryview(b)
+        except TypeError:
+            if isinstance(b, str):
+                b = b.encode("utf-8")
+            elif hasattr(b, "read"):
+                b = b.read()
+            mv = memoryview(b)
+
         n = len(mv)
 
         if self._mem is not None:
@@ -291,8 +302,8 @@ class DynamicBuffer(io.RawIOBase):
     # Convenience
     # ---------------------------------------------------------------------
     def xxh3_64(self) -> "xxhash.xxh3_64":
-        from ..xxhash import xxhash
-        h = xxhash.xxh3_64()
+        from yggdrasil.xxhash import xxh3_64
+        h = xxh3_64()
         h.update(self.memoryview())
         return h
 
@@ -303,7 +314,7 @@ class DynamicBuffer(io.RawIOBase):
         if self._mem is not None:
             # in-memory: just hash bytes
             h.update(self._mem.getbuffer())
-            return h.hexdigest()
+            return h
 
         # spilled: mmap by path (fast)
         if self._path is None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Mapping, MutableMapping, Union
+from typing import Mapping, MutableMapping, Union, Literal
 
 __all__ = [
     "HeaderValue",
@@ -65,20 +65,32 @@ def _mask_ip_like(s: str) -> str:
 def anonymize_headers(
     headers: Mapping[HeaderValue, HeaderValue],
     *,
-    mode: str = "redact",           # "redact" | "hash"
-    salt: str = "",                 # used when mode="hash"
+    mode: Literal["remove", "redact", "hash"] = "remove",
+    salt: str = "",
     keep_content_type: bool = True,
     keep_accept: bool = True,
     keep_host: bool = False,
-    preserve_keys: bool = False,     # if False, hash header names too (rarely needed)
+    preserve_keys: bool = False,
 ) -> MutableMapping[str, str]:
     """
     Returns a sanitized copy of headers. Use mode="hash" to keep stable fingerprints.
 
+    - remove: drops sensitive headers entirely
     - redact: replaces sensitive values with "<redacted>"
     - hash: replaces sensitive values with "<hash:...>" so you can correlate safely
     """
     out: MutableMapping[str, str] = {}  # keeps insertion order in py3.7+
+
+    def _emit(out_key: str, value: str) -> None:
+        out[out_key] = value
+
+    def _handle_sensitive_value(out_key: str, raw_value: str) -> None:
+        if mode == "remove":
+            return
+        if mode == "hash":
+            _emit(out_key, f"<hash:{_hash(raw_value, salt=salt)}>")
+        else:
+            _emit(out_key, "<redacted>")
 
     for k_raw, v_raw in headers.items():
         k = _to_text(k_raw)
@@ -90,52 +102,67 @@ def anonymize_headers(
         out_key = k_norm if preserve_keys else f"h:{_hash(k_norm, salt=salt)}"
 
         # Allow some common safe headers to pass (optionally)
-        if (k_lc == "content-type" and keep_content_type) or (k_lc == "accept" and keep_accept) or (k_lc == "host" and keep_host):
-            out[out_key] = v
+        if (
+            (k_lc == "content-type" and keep_content_type)
+            or (k_lc == "accept" and keep_accept)
+            or (k_lc == "host" and keep_host)
+        ):
+            _emit(out_key, v)
             continue
 
-        # Hard sensitive headers: full wipe/hash
+        # Hard sensitive headers
         if k_lc in _SENSITIVE_KEYS:
-            if mode == "hash":
-                out[out_key] = f"<hash:{_hash(v, salt=salt)}>"
-            else:
-                out[out_key] = "<redacted>"
+            _handle_sensitive_value(out_key, v)
             continue
 
         # Authorization patterns even if header name isn’t in list
         if k_lc == "authorization":
             m = _BEARER_RE.match(v)
             if m:
+                if mode == "remove":
+                    continue
                 token = m.group(1)
-                out[out_key] = f"Bearer <{'hash:'+_hash(token, salt=salt) if mode=='hash' else 'redacted'}>"
+                if mode == "hash":
+                    _emit(out_key, f"Bearer <hash:{_hash(token, salt=salt)}>")
+                else:
+                    _emit(out_key, "Bearer <redacted>")
                 continue
+
             m = _BASIC_RE.match(v)
             if m:
+                if mode == "remove":
+                    continue
                 creds = m.group(1)
-                out[out_key] = f"Basic <{'hash:'+_hash(creds, salt=salt) if mode=='hash' else 'redacted'}>"
+                if mode == "hash":
+                    _emit(out_key, f"Basic <hash:{_hash(creds, salt=salt)}>")
+                else:
+                    _emit(out_key, "Basic <redacted>")
                 continue
+
+            # Unknown auth scheme -> treat as sensitive
+            _handle_sensitive_value(out_key, v)
+            continue
 
         # Partially sensitive: mask a bit (IPs, full URLs, UA entropy)
         if k_lc in _PARTIAL_KEYS:
+            # In remove mode, we still keep these but masked (useful for debugging).
+            # If you want these dropped too, add: `if mode == "remove": continue`
             vv = _mask_ip_like(v)
 
-            # Trim high-entropy user-agent-ish strings while keeping product tokens
             if k_lc == "user-agent":
-                # keep first ~60 chars; enough for “Chrome vs curl” debugging
                 vv = vv[:60] + ("…" if len(vv) > 60 else "")
-            # Drop query params from referer/origin-ish
             if k_lc in {"referer", "origin"}:
                 vv = vv.split("?", 1)[0]
 
-            out[out_key] = vv
+            _emit(out_key, vv)
             continue
 
-        # Generic token-ish detection: if value looks like a long JWT-ish blob, redact/hash
+        # Generic token-ish detection: redact/hash/remove
         if len(v) >= 40 and re.search(r"[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+", v):
-            out[out_key] = f"<hash:{_hash(v, salt=salt)}>" if mode == "hash" else "<redacted>"
+            _handle_sensitive_value(out_key, v)
             continue
 
         # Otherwise keep as-is
-        out[out_key] = v
+        _emit(out_key, v)
 
     return out

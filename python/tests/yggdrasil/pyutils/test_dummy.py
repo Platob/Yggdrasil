@@ -5,7 +5,7 @@ import types
 import pytest
 import importlib
 
-from yggdrasil.pyutils.dummy import Dummy  # noqa: F401
+from yggdrasil.pyutils.dummy import Dummy
 
 
 def test_from_name_builds_path_strs_and_iterables() -> None:
