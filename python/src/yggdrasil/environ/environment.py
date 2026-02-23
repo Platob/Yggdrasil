@@ -47,12 +47,13 @@ from typing import Any, Iterable, Sequence
 
 from .system_command import SystemCommand
 from .userinfo import UserInfo
-from ..pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 __all__ = [
     "PyEnv",
     "PIP_MODULE_NAME_MAPPINGS",
     "CURRENT_PYENV",
+    "SYSTEM_LIBS"
 ]
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,223 @@ _PY_VERSION_RE = re.compile(
 
 #: Module-level singleton — set on first call to :meth:`PyEnv.current`.
 CURRENT_PYENV: PyEnv | None = None
+
+SYSTEM_LIBS: list[str] = [
+    # Core Python / packaging
+    "pip",
+    "setuptools",
+    "wheel",
+    "packaging",
+    "importlib-metadata",
+    "zipp",
+    "typing-extensions",
+    "typing-inspection",
+    "annotated-types",
+    "annotated-doc",
+    "iniconfig",
+    "pluggy",
+    "platformdirs",
+    "pathspec",
+    "filelock",
+    "distro",
+    "six",
+    "decorator",
+    "wrapt",
+    "deprecated",
+    "future",
+    "more-itertools",
+    "toolz",
+    "attrs",
+    "rpds-py",
+    "referencing",
+    "jsonschema",
+    "jsonschema-specifications",
+    "blessed",
+    # Networking / HTTP
+    "certifi",
+    "charset-normalizer",
+    "idna",
+    "urllib3",
+    "requests",
+    "requests-toolbelt",
+    "httpx-sse",
+    "httpcore",
+    "h11",
+    "anyio",
+    "sniffio",
+    "aiofiles",
+    "aiosignal",
+    "aiohappyeyeballs",
+    "frozenlist",
+    "multidict",
+    "yarl",
+    "propcache",
+    "websocket-client",
+    "dnspython",
+    "brotli",
+    "greenlet",
+    "gpustat",
+    "h5py",
+    "librt",
+    "nvidia-ml-py",
+    "opencv-python",
+    "proglog",
+    "pydub",
+    "requests-kerberos",
+    "watch",
+    "wcwidth",
+    "av",
+    "uvicorn",
+    "ansicon",
+    "absl-py",
+    # Crypto / Auth
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "pyopenssl",
+    "oauthlib",
+    "requests-oauthlib",
+    "pyasn1",
+    "pyasn1-modules",
+    "rsa",
+    "id",
+    # Serialization / Data formats
+    "pyyaml",
+    "tomlkit",
+    "jiter",
+    "jinja2",
+    "markupsafe",
+    "grpcio",
+    "grpcio-status",
+    "googleapis-common-protos",
+    "proto-plus",
+    "cloudpickle",
+    "multiprocess",
+    "locket",
+    "partd",
+    # Stdlib extensions
+    "python-dateutil",
+    "tzlocal",
+    "isodate",
+    "aniso8601",
+    "regex",
+    "click",
+    "rich",
+    "pygments",
+    "markdown",
+    "markdown-it-py",
+    "mdurl",
+    "nh3",
+    "colorama",
+    "tqdm",
+    "psutil",
+    "gitpython",
+    "gitdb",
+    "smmap",
+    "loguru",
+    "sentry-sdk",
+    "python-dotenv",
+    "pydantic-core",
+    "pydantic-settings",
+    "aiohttp",
+    "cachetools",
+    # Build / Dev / CI tools
+    "build",
+    "pyproject-hooks",
+    "black",
+    "mypy",
+    "mypy-extensions",
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+    "pathlib2",
+    "semantic-version",
+    "twine",
+    "readme-renderer",
+    "docutils",
+    "rfc3986",
+    "keyring",
+    "jaraco-classes",
+    "jaraco-context",
+    "jaraco-functools",
+    "uv",
+    # Numeric / Scientific
+    "sympy",
+    "mpmath",
+    "arro3-core",
+    "polars-runtime-32",
+    "xarray",
+    "contourpy",
+    "cycler",
+    "fonttools",
+    "kiwisolver",
+    "pyparsing",
+    "matplotlib",
+    "pillow",
+    "imageio",
+    # Cloud / Object storage
+    "botocore",
+    "jmespath",
+    "s3transfer",
+    "google-auth",
+    "google-auth-oauthlib",
+    "google-api-core",
+    "google-cloud-core",
+    "google-cloud-storage",
+    "google-cloud-storage-control",
+    "google-resumable-media",
+    "google-crc32c",
+    "googleapis-common-protos",
+    "grpc-google-iam-v1",
+    # ML / AI
+    "torch",
+    "torchvision",
+    "torchdata",
+    "tokenizers",
+    "safetensors",
+    "sentencepiece",
+    "datasets",
+    "huggingface-hub",
+    "hf-xet",
+    "accelerate",
+    "peft",
+    "diffusers",
+    "timm",
+    "einops",
+    "tensorboard",
+    "tensorboard-data-server",
+    "wandb",
+    "networkx",
+    # Web / API frameworks
+    "starlette",
+    "uvicorn",
+    "werkzeug",
+    "itsdangerous",
+    "blinker",
+    "python-multipart",
+    "sse-starlette",
+    "gradio",
+    "gradio-client",
+    "safehttpx",
+    "mcp",
+    "openai",
+    # Spark / Big data
+    "pyspark",
+    "py4j",
+    "delta-spark",
+    # Misc utilities
+    "beautifulsoup4",
+    "soupsieve",
+    "filelock",
+    "typer",
+    "typer-slim",
+    "shellingham",
+    "remote-pdb",
+    "groovy",
+    "pytokens",
+    "unitycatalog",
+    "pyproject-hooks",
+]
 
 
 def safe_pip_name(value: str | tuple[str, str] | Iterable[str | tuple[str, str]]) -> str | list[str]:
@@ -157,12 +375,12 @@ class PyEnv:
     """
 
     python_path: Path
-    cwd: Path = field(default_factory=lambda: Path.cwd().resolve())
+    cwd: Path = field(default_factory=lambda: Path.cwd())
     prefer_uv: bool = True
 
     # Internal cache — not exposed in __repr__ or __init__
     _version_info: tuple[int, int, int] | None = field(default=None, init=False, repr=False)
-    _uv_bin_cache: Path | None = field(default=None, init=False, repr=False)
+    _uv_bin: Path | None = field(default=None, init=False, repr=False)
 
     def __getstate__(self) -> dict:
         return {
@@ -211,12 +429,12 @@ class PyEnv:
             If the selector cannot be resolved to a file on ``PATH`` or disk.
         """
         if python is None or python == "":
-            return Path(sys.executable).resolve()
+            return Path(sys.executable)
 
         p = Path(python)
 
         if p.is_file() and "python" in p.name:
-            return p.resolve()
+            return p
 
         # Directory: search for a Python executable inside it
         if p.is_dir():
@@ -231,7 +449,7 @@ class PyEnv:
             logger.error("resolve_python_executable: not found selector=%r", python)
             raise FileNotFoundError(f"Python executable not found: {python!r}")
 
-        return Path(found).resolve()
+        return Path(found)
 
     @staticmethod
     def _find_python_in_dir(folder: Path) -> Path:
@@ -261,7 +479,7 @@ class PyEnv:
         FileNotFoundError
             If no Python executable is found anywhere under *folder*.
         """
-        folder = folder.expanduser().resolve()
+        folder = folder.expanduser()
 
         # 1. Standard venv locations first
         candidates = [
@@ -273,7 +491,7 @@ class PyEnv:
         for c in candidates:
             if c.is_file():
                 logger.debug("_find_python_in_dir: venv hit %s", c)
-                return c.resolve()
+                return c
 
         # 2. Recursive glob — collect all python* executables
         patterns = ["**/python", "**/python3", "**/python3.*", "**/python.exe"]
@@ -301,7 +519,7 @@ class PyEnv:
 
         best = sorted(found, key=_rank)[0]
         logger.debug("_find_python_in_dir: glob hit %s (from %d candidates)", best, len(found))
-        return best.resolve()
+        return best
 
     # ── Construction ──────────────────────────────────────────────────────────
 
@@ -340,8 +558,8 @@ class PyEnv:
             A fully initialized environment instance.
         """
         env = cls(
-            python_path=python_path.resolve(),
-            cwd=(cwd or Path.cwd()).resolve(),
+            python_path=python_path,
+            cwd=(cwd or Path.cwd()),
             prefer_uv=prefer_uv,
         )
 
@@ -384,13 +602,6 @@ class PyEnv:
 
         py = cls.resolve_python_executable(python)
         CURRENT_PYENV = cls.instance(py, prefer_uv=prefer_uv)
-        parts = py.parts
-        if len(parts) > 1 and parts[1] == "usr":
-            CURRENT_PYENV = CURRENT_PYENV.venv(
-                identifier="ygg-py3.12",
-                version="3.12",
-                packages=["ygg", "uv"],
-            )
 
         return CURRENT_PYENV
 
@@ -455,7 +666,7 @@ class PyEnv:
 
         env = self.venv(
             identifier,
-            cwd=Path.cwd().resolve(),
+            cwd=Path.cwd(),
             prefer_uv=prefer_uv,
             seed=seed,
             version=version,
@@ -535,7 +746,7 @@ class PyEnv:
         # Otherwise treat as a venv directory (existing or to be created)
         return self.create(
             path,
-            cwd=cwd or Path.cwd().resolve(),
+            cwd=cwd or Path.cwd(),
             prefer_uv=prefer_uv,
             seed=seed,
             version=version,
@@ -546,13 +757,15 @@ class PyEnv:
         self,
         folder: Path | str,
         *,
-        cwd: Path,
+        cwd: Path | None = None,
         prefer_uv: bool = True,
         seed: bool = True,
         version: str | None = None,
         packages: list[str] | None = None,
         linked: bool = False,
-        native_tls: bool = True
+        native_tls: bool = True,
+        wait: WaitingConfigArg | None = True,
+        clear: bool = True
     ) -> PyEnv:
         """
         Create a new virtual environment at *venv_dir* via ``uv`` and return
@@ -582,7 +795,10 @@ class PyEnv:
             Environment anchored to the newly created venv.
         """
         if isinstance(folder, str):
-            folder = Path(folder)
+            if self._looks_like_path(folder):
+                folder = Path(folder)
+            else:
+                folder = Path.home() / ".local" / "yggdrasil" / "python" / "envs" / folder
 
         anchor = self
         folder.parent.mkdir(parents=True, exist_ok=True)
@@ -595,10 +811,11 @@ class PyEnv:
                 version = "%s.%s.%s" % (major, minor, patch)
 
         cmd = [
-            str(anchor.uv_bin), "venv", str(folder),
+            str(anchor.uv_path), "venv", str(folder),
             "--python", version,
             *(["--seed"] if seed else []),
             *(["--native-tls"] if native_tls else []),
+            *(["--clear"] if clear else []),
         ]
         logger.info("create_venv: cmd=%s", cmd)
         SystemCommand.run_lazy(cmd, cwd=cwd).wait(True)
@@ -607,7 +824,7 @@ class PyEnv:
         env = self.instance(py, cwd=cwd, prefer_uv=prefer_uv)
 
         if packages:
-            env.install(*packages)
+            env.install(*packages, wait=wait)
 
         return env
 
@@ -622,6 +839,17 @@ class PyEnv:
         the active interpreter would be dangerous.
         """
         return CURRENT_PYENV is not None and CURRENT_PYENV is self
+
+    def is_windows(self):
+        return os.name == "nt"
+
+    @property
+    def bin_path(self):
+        return self.python_path.parent
+
+    @property
+    def root_path(self):
+        return self.bin_path.parent
 
     @property
     def userinfo(self) -> UserInfo:
@@ -673,7 +901,7 @@ class PyEnv:
         return self._version_info
 
     @property
-    def uv_bin(self) -> Path:
+    def uv_path(self) -> Path:
         """
         Resolve the ``uv`` binary, installing it into the current interpreter
         if it is absent.  The result is cached after the first access.
@@ -691,8 +919,14 @@ class PyEnv:
         FileNotFoundError
             If ``uv`` resolves but the reported path is not an actual file.
         """
-        if self._uv_bin_cache:
-            return self._uv_bin_cache
+        if self._uv_bin:
+            return self._uv_bin
+
+        candidate = (self.bin_path / "uv.exe") if os.name == "nt" else (self.bin_path / "uv")
+
+        if candidate.is_file():
+            self._uv_bin = candidate
+            return self._uv_bin
 
         if str(self.python_path) == sys.executable:
             try:
@@ -700,25 +934,17 @@ class PyEnv:
             except ImportError:
                 uv = self.import_module("uv", install=True)
 
-            self._uv_bin_cache = uv.find_uv_bin()
+            self._uv_bin = uv.find_uv_bin()
         else:
             # Auto-install uv using the plain pip fallback to avoid recursion
-            self._uv_bin_cache = (
-                self.run_python_code(
-                    "import uv; print(uv.find_uv_bin())",
-                    prefer_uv=False,
-                    auto_install=True,
-                    wait=30
-                )
-                .stdout.strip("\n")
-            )
+            self._uv_bin = shutil.which("uv")
 
-        self._uv_bin_cache = Path(self._uv_bin_cache)
+        self._uv_bin = Path(self._uv_bin)
 
-        if not self._uv_bin_cache.is_file():
-            raise FileNotFoundError(f"uv resolved but is not a file: {self._uv_bin_cache}")
+        if not self._uv_bin.is_file():
+            raise FileNotFoundError(f"uv resolved but is not a valid path: {self._uv_bin}")
 
-        return self._uv_bin_cache
+        return self._uv_bin
 
     # ── Package management ────────────────────────────────────────────────────
 
@@ -726,6 +952,7 @@ class PyEnv:
         self,
         prefer_uv: bool | None = None,
         *,
+        target: Path | str | None = None,
         with_system: bool = False,
     ) -> list[tuple[str, str]]:
         """
@@ -755,7 +982,18 @@ class PyEnv:
         ValueError
             If the pip JSON output is not a list.
         """
-        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["list", "--format=json"]
+        cmd = self._pip_cmd_args(prefer_uv=prefer_uv)
+
+        if target:
+            if isinstance(target, str):
+                target = Path(target)
+
+            target = target.expanduser()
+
+            cmd += ["--directory", str(target)]
+
+        cmd += ["list", "--format=json"]
+
         res = subprocess.run(
             cmd,
             cwd=str(self.cwd),
@@ -768,17 +1006,23 @@ class PyEnv:
         if not isinstance(pkgs, list):
             raise ValueError("Unexpected pip output: expected JSON list")
 
-        _system = {"pip", "setuptools", "wheel"}
         out: list[tuple[str, str]] = []
         for item in pkgs:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "")).strip()
             version = str(item.get("version", "")).strip()
+
             if not name or not version:
                 continue
-            if not with_system and name.lower() in _system:
-                continue
+
+            if not with_system:
+                if name.lower() in SYSTEM_LIBS:
+                    continue
+                elif name.startswith("test-") or name.startswith("test_")\
+                    or name.startswith("win32") or name.startswith("pywin32"):
+                    continue
+
             out.append((name, version))
         return out
 
@@ -789,6 +1033,7 @@ class PyEnv:
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
         prefer_uv: bool | None = None,
+        target: Path | str | None = None
     ) -> SystemCommand | None:
         """
         Install packages into the environment anchored by :attr:`python_path`.
@@ -833,7 +1078,7 @@ class PyEnv:
             if uv:
                 subprocess.run([str(self.python_path), "-m", "pip", "install", "uv"], check=True, timeout=30)
 
-                self._uv_bin_cache = None
+                self._uv_bin = None
 
                 packages = [_ for _ in packages if not _.startswith("uv")]
 
@@ -866,7 +1111,16 @@ class PyEnv:
         if extra_args:
             cmd += list(extra_args)
 
-        cmd += ["--python", str(self.python_path)]
+        if prefer_uv:
+            cmd += ["--python", str(self.python_path)]
+
+        if target:
+            if isinstance(target, str):
+                target = Path(target)
+
+            target = target.expanduser()
+            target.mkdir(parents=True, exist_ok=True)
+            cmd += ["--target", str(target)]
 
         result = SystemCommand.run_lazy(cmd, cwd=self.cwd)
 
@@ -1046,7 +1300,7 @@ class PyEnv:
         packages: list[str] | None = None,
         prefer_uv: bool | None = None,
         globs: dict[str, Any] | None = None,
-        auto_install: bool = True
+        auto_install: bool = False
     ) -> SystemCommand:
         """
         Execute Python source code in a subprocess under this (or another)
@@ -1174,6 +1428,7 @@ class PyEnv:
         self,
         module_name: str | None = None,
         *,
+        wait: WaitingConfigArg = True,
         install: bool = True,
         pip_name: str | None = None,
         upgrade: bool = False,
@@ -1231,7 +1486,7 @@ class PyEnv:
                     raise
 
         pip_name = pip_name or safe_pip_name(module_name)
-        result = self.install(pip_name, wait=False)
+        result = self.install(pip_name, wait=wait)
         error = result.raise_for_status(raise_error=False)
 
         if isinstance(error, Exception):
@@ -1271,7 +1526,7 @@ class PyEnv:
         p = python or self.python_path
 
         if prefer_uv:
-            return [str(self.uv_bin), "pip"]
+            return [str(self.uv_path), "pip"]
         return [str(p), "-m", "pip"]
 
     def _uv_run_prefix(self, python: str | Path | None = None) -> list[str]:
@@ -1288,7 +1543,7 @@ class PyEnv:
         list[str]
             ``["<uv>", "run", "--python", "<python_path>"]``
         """
-        return [str(self.uv_bin), "run", "--python", str(python or self.python_path)]
+        return [str(self.uv_path), "run", "--python", str(python or self.python_path)]
 
     @staticmethod
     def _venv_python_from_dir(venv_dir: Path, raise_error: bool = True) -> Path:
@@ -1319,15 +1574,20 @@ class PyEnv:
         ValueError
             If no Python executable is found in any expected location.
         """
-        candidates = [
-            venv_dir / "bin" / "python",
-            venv_dir / "bin" / "python3",
-            venv_dir / "Scripts" / "python.exe",
-            venv_dir / "Scripts" / "python",
-        ]
+        if os.name == "nt":
+            candidates = [
+                venv_dir / "Scripts" / "python.exe",
+                venv_dir / "Scripts" / "python",
+            ]
+        else:
+            candidates = [
+                venv_dir / "bin" / "python",
+                venv_dir / "bin" / "python3",
+            ]
+
         for c in candidates:
             if c.exists() and c.is_file():
-                return c.resolve()
+                return c
 
         if raise_error:
             raise ValueError(f"No Python executable found inside venv: {venv_dir}")

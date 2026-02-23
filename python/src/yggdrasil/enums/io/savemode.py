@@ -12,7 +12,7 @@ class SaveMode(str, Enum):
     ERROR_IF_EXISTS = "error_if_exists"
 
     @classmethod
-    def from_any(cls, value: object, default: Optional["SaveMode"] = None) -> "SaveMode":
+    def parse_any(cls, value: object, default: Optional["SaveMode"] = None) -> "SaveMode":
         """
         Normalize user input into a SaveMode.
 

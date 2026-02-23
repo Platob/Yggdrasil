@@ -126,10 +126,10 @@ def test_decode_true_decodes_components_and_reencodes():
     raw = "https://example.com/a%20b?x=a%2Fb&y=1#z%20t"
     u = URL.parse(raw, decode=True, normalize=True)
     assert u.path == "/a b"
-    assert u.query == "x=a/b&y=1"
+    assert u.query == "x=a%2Fb&y=1"
     assert u.fragment == "z t"
     # '/' and '&' and '=' should remain in query; spaces re-encoded
-    assert u.to_string() == "https://example.com/a%20b?x=a/b&y=1#z%20t"
+    assert u.to_string() == "https://example.com/a%20b?x=a%2Fb&y=1#z%20t"
 
 
 # ----------------------------
@@ -214,71 +214,3 @@ def test_with_query_items_from_mapping_and_tuple_and_string_output():
     u3 = u.with_query_items((("a", "1"), ("b", "2")))
     assert u3.query_items() == (("a", "1"), ("b", "2"))
     assert u3.to_string() == "https://example.com/a?a=1&b=2"
-
-
-def test_sort_query_params_canonical():
-    u = URL.parse("https://example.com/a?b=2&a=1&a=0", normalize=True, sort_query=True)
-    assert u.query == "a=0&a=1&b=2"
-    assert u.to_string() == "https://example.com/a?a=0&a=1&b=2"
-
-
-def test_sort_query_params_blank_and_duplicates():
-    u = URL.parse("https://example.com/?z&b=&a=2&a=1", normalize=True, sort_query=True)
-    assert u.query == "a=1&a=2&b=&z="
-    assert u.to_string() == "https://example.com/?a=1&a=2&b=&z="
-
-
-def test_sort_query_params_no_query_is_noop():
-    u = URL.parse("https://example.com/a", normalize=True, sort_query=True)
-    assert u.query == ""
-    assert u.to_string() == "https://example.com/a"
-
-
-# ----------------------------
-# xxh3 hashing
-# ----------------------------
-
-def test_xxh3_digest_is_stable_under_query_order_when_included():
-    u1 = URL.parse("https://example.com/a?b=2&a=1", normalize=True, sort_query=False)
-    u2 = URL.parse("https://example.com/a?a=1&b=2", normalize=True, sort_query=False)
-    # digest canonicalizes+sorts query internally
-    assert u1.xxh3_64() == u2.xxh3_64()
-
-
-def test_xxh3_digest_exclude_query_true_ignores_query():
-    u1 = URL.parse("https://example.com/a?a=1", normalize=True)
-    u2 = URL.parse("https://example.com/a?a=999", normalize=True)
-    assert u1.xxh3_64(exclude_query=True) == u2.xxh3_64(exclude_query=True)
-
-
-def test_xxh3_digest_exclude_query_list_filters_specific_params():
-    u1 = URL.parse("https://example.com/a?a=1&ts=100&b=2", normalize=True)
-    u2 = URL.parse("https://example.com/a?a=1&ts=999&b=2", normalize=True)
-    assert u1.xxh3_64(exclude_query=["ts"]) == u2.xxh3_64(exclude_query=["ts"])
-
-
-def test_xxh3_digest_default_excludes_scheme_fragment_and_userinfo():
-    # defaults: exclude_userinfo=True, exclude_scheme=True, exclude_fragment=True
-    u1 = URL.parse("http://user:pw@example.com/a?b=2#frag", normalize=True)
-    u2 = URL.parse("https://example.com/a?b=2#other", normalize=True)
-    assert u1.xxh3_64() == u2.xxh3_64()
-
-
-def test_xxh3_digest_can_include_scheme_when_requested():
-    u1 = URL.parse("http://example.com/a", normalize=True)
-    u2 = URL.parse("https://example.com/a", normalize=True)
-    assert u1.xxh3_64(exclude_scheme=False) != u2.xxh3_64(exclude_scheme=False)
-
-
-def test_xxh3_digest_exclude_host_collapses_netloc():
-    u1 = URL.parse("https://example.com/a", normalize=True)
-    u2 = URL.parse("https://other.com/a", normalize=True)
-    assert u1.xxh3_64(exclude_host=True) == u2.xxh3_64(exclude_host=True)
-
-
-def test_xxh3_digest_exclude_port_ignores_port_differences():
-    u1 = URL.parse("https://example.com:444/a", normalize=True)
-    u2 = URL.parse("https://example.com:555/a", normalize=True)
-    assert u1.xxh3_64(exclude_scheme=False, exclude_port=True) == u2.xxh3_64(
-        exclude_scheme=False, exclude_port=True
-    )

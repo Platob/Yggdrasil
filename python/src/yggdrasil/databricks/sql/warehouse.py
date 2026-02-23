@@ -5,6 +5,7 @@ import time
 from typing import Optional, Sequence, Any, Type, TypeVar, Union, List
 
 from databricks.sdk import WarehousesAPI
+from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import (
     State, EndpointInfo,
     EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
@@ -15,10 +16,11 @@ from databricks.sdk.service.sql import (
 )
 
 from .statement_result import StatementResult
-from ..workspaces import WorkspaceService
+from ..workspaces import Workspace, WorkspaceService
+from ...concurrent.threading import Job
+from ...dataclasses.expiring import ExpiringDict
 from ...pyutils.equality import dicts_equal
-from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
 _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
@@ -29,7 +31,7 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
-NAME_ID_CACHE: dict[str, ExpiringDict] = {}
+CACHE_MAP: dict[str, ExpiringDict[str, "SQLWarehouse"]] = {}
 T = TypeVar("T")
 
 
@@ -61,24 +63,25 @@ def safeEndpointInfo(src: Union[GetWarehouseResponse, EndpointInfo]) -> Endpoint
     return EndpointInfo(**payload)
 
 
-def set_cached_warehouse_name(
-    host: str,
-    warehouse_name: str,
-    warehouse_id: str
+def set_cached_warehouse(
+    workspace: Workspace,
+    warehouse: "SQLWarehouse"
 ) -> None:
-    existing = NAME_ID_CACHE.get(host)
+    host = workspace.safe_host
+    existing = CACHE_MAP.get(host)
 
-    if not existing:
-        existing = NAME_ID_CACHE[host] = ExpiringDict(default_ttl=60)
+    if existing is None:
+        existing = CACHE_MAP[host] = ExpiringDict(default_ttl=3600)
 
-    existing[warehouse_name] = warehouse_id
+    existing[warehouse.warehouse_name] = warehouse
 
 
-def get_cached_warehouse_id(
-    host: str,
+def get_cached_warehouse(
+    workspace: Workspace,
     warehouse_name: str,
-) -> str:
-    existing = NAME_ID_CACHE.get(host)
+) -> Optional["SQLWarehouse"]:
+    host = workspace.safe_host
+    existing = CACHE_MAP.get(host)
 
     return existing.get(warehouse_name) if existing else None
 
@@ -151,7 +154,7 @@ class SQLWarehouse(WorkspaceService):
             self.warehouse_name = found.warehouse_name
             self.details = found.details
 
-    def warehouse_client(self):
+    def client(self):
         return self.workspace.sdk().warehouses
 
     @property
@@ -161,7 +164,7 @@ class SQLWarehouse(WorkspaceService):
         return self._details
 
     def latest_details(self):
-        return self.warehouse_client().get(id=self.warehouse_id)
+        return self.client().get(id=self.warehouse_id)
 
     def refresh(self):
         self.details = self.latest_details()
@@ -220,22 +223,37 @@ class SQLWarehouse(WorkspaceService):
 
         return self
 
-    def start(self):
-        if not self.is_running:
-            self.warehouse_client().start(id=self.warehouse_id)
+    def start(
+        self,
+        wait: Optional[WaitingConfigArg] = True,
+        raise_error: bool = True
+    ):
+        if self.warehouse_id:
+            if not self.is_running:
+                try:
+                    response = self.client().start(id=self.warehouse_id)
+                except Exception:
+                    if raise_error:
+                        raise
+                    return self
+
+                if wait:
+                    wait = WaitingConfig.check_arg(wait)
+                    response.result(timeout=wait.timeout_timedelta)
+
         return self
 
     def stop(self):
         if self.is_running:
-            return self.warehouse_client().stop(id=self.warehouse_id)
+            return self.client().stop(id=self.warehouse_id)
         return self
 
     def find_warehouse(
         self,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
+        find_default: bool = False,
         raise_error: bool = True,
-        find_starter: bool = False,
     ):
         if warehouse_id:
             if warehouse_id == self.warehouse_id:
@@ -246,59 +264,143 @@ class SQLWarehouse(WorkspaceService):
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name
             )
+        elif warehouse_name:
+            warehouse_name = warehouse_name or self.warehouse_name
 
-        elif self.warehouse_id:
-            return self
-
-        starter_warehouse, starter_name = None, "Serverless Starter Warehouse"
-        warehouse_name = warehouse_name or self.warehouse_name or self._make_default_name(enable_serverless_compute=True)
-
-        if warehouse_name:
-            if warehouse_name == self.warehouse_name and self.warehouse_id:
-                return self
-
-            warehouse_id = get_cached_warehouse_id(
-                host=self.workspace.safe_host,
+            cached = get_cached_warehouse(
+                workspace=self.workspace,
                 warehouse_name=warehouse_name
             )
 
-            if warehouse_id:
-                if warehouse_id == self.warehouse_id:
-                    return self
-
-                return SQLWarehouse(
-                    workspace=self.workspace,
-                    warehouse_id=warehouse_id,
-                    warehouse_name=warehouse_name
-                )
+            if cached is not None:
+                return cached
 
             for warehouse in self.list_warehouses():
                 if warehouse.warehouse_name == warehouse_name:
-                    set_cached_warehouse_name(
-                        host=self.workspace.safe_host,
-                        warehouse_name=warehouse.warehouse_name,
-                        warehouse_id=warehouse.warehouse_id
+                    set_cached_warehouse(
+                        workspace=self.workspace,
+                        warehouse=warehouse
                     )
+
+                    if warehouse_name == self.warehouse_name:
+                        self.warehouse_id = warehouse_id
+                        return self
 
                     return warehouse
 
-                elif warehouse.warehouse_name == starter_name:
-                    starter_warehouse = warehouse
+            if raise_error:
+                raise ResourceDoesNotExist(
+                    f"Cannot find SQL warehouse {warehouse_name!r}"
+                )
 
-        if find_starter and starter_warehouse is not None:
-            return starter_warehouse
-
-        if raise_error:
-            v = warehouse_name or warehouse_id
-
-            raise ValueError(
-                f"SQL Warehouse {v!r} not found"
+            return None
+        elif self.warehouse_id:
+            return self
+        elif self.warehouse_name:
+            return self.find_warehouse(
+                warehouse_name=self.warehouse_name,
+                raise_error=raise_error,
+                find_default=False
             )
 
+        if find_default:
+            return self.find_default(raise_error=raise_error)
+        if raise_error:
+            raise ResourceDoesNotExist(
+                f"Cannot find SQL warehouse, no parameters given"
+            )
         return None
 
+    def find_default(self, raise_error: bool = True):
+        classic = get_cached_warehouse(
+            workspace=self.workspace,
+            warehouse_name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME
+        )
+
+        if classic is not None:
+            if classic.state not in {State.RUNNING, State.STARTING, State.STOPPING}:
+                classic.start(wait=False, raise_error=False)
+            else:
+                return classic
+
+        serverless = get_cached_warehouse(
+            workspace=self.workspace,
+            warehouse_name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+        )
+
+        if serverless is not None:
+            return serverless
+
+        first_found = None
+
+        for warehouse in self.list_warehouses():
+            if first_found is None:
+                first_found = warehouse
+
+            if warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
+                classic = warehouse
+
+                set_cached_warehouse(
+                    workspace=self.workspace,
+                    warehouse=classic
+                )
+
+                if classic._details.state == State.RUNNING:
+                    return classic
+                elif classic._details.state != State.STARTING:
+                    classic.start(wait=False, raise_error=False)
+
+                if serverless is not None:
+                    return serverless
+            elif warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+                serverless = warehouse
+
+                set_cached_warehouse(
+                    workspace=self.workspace,
+                    warehouse=serverless
+                )
+
+                if classic is not None:
+                    return serverless
+
+        if serverless is None:
+            try:
+                created = self.create(
+                    name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+                    permissions=["users"],
+                )
+
+                set_cached_warehouse(workspace=self.workspace, warehouse=created)
+
+                return created
+            except:
+                pass
+
+        if classic is None:
+            Job.make(
+                self.create,
+                name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
+                permissions=["users"],
+            ).fire_and_forget()
+
+        if serverless is not None:
+            return serverless
+
+        if first_found is not None:
+            return first_found
+
+        if raise_error:
+            raise ResourceDoesNotExist(
+                f"Cannot find default SQL warehouse, no parameters given"
+            )
+
+        return self.create_or_update(
+            name=self.warehouse_name or DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+            permissions=["users"]
+        )
+
     def list_warehouses(self):
-        for info in self.warehouse_client().list():
+        for info in self.client().list():
             warehouse = SQLWarehouse(
                 workspace=self.workspace,
                 warehouse_id=info.id,
@@ -307,12 +409,6 @@ class SQLWarehouse(WorkspaceService):
             )
 
             yield warehouse
-
-    def _make_default_name(self, enable_serverless_compute: bool = True):
-        return "%s%s" % (
-            self.workspace.product or "yggdrasil",
-            " serverless" if enable_serverless_compute else ""
-        )
 
     def _check_details(
         self,
@@ -342,7 +438,7 @@ class SQLWarehouse(WorkspaceService):
             )
 
         if details.cluster_size is None:
-            details.cluster_size = "Small"
+            details.cluster_size = "X-Small"
 
         if details.warehouse_type is None:
             details.warehouse_type = EndpointInfoWarehouseType.PRO
@@ -353,9 +449,14 @@ class SQLWarehouse(WorkspaceService):
             details.warehouse_type = EndpointInfoWarehouseType.PRO
 
         if not details.name:
-            details.name = self._make_default_name(
-                enable_serverless_compute=details.enable_serverless_compute
-            )
+            if details.enable_serverless_compute:
+                details.name = DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+            else:
+                details.name = DEFAULT_ALL_PURPOSE_CLASSIC_NAME
+
+        if not details.auto_stop_mins:
+            if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
+                details.auto_stop_mins = 30
 
         default_tags = self.workspace.default_tags(update=update)
 
@@ -379,7 +480,7 @@ class SQLWarehouse(WorkspaceService):
             ])
 
         if not details.max_num_clusters:
-            details.max_num_clusters = 4
+            details.max_num_clusters = 8
 
         return details
 
@@ -387,6 +488,7 @@ class SQLWarehouse(WorkspaceService):
         self,
         warehouse_id: Optional[str] = None,
         name: Optional[str] = None,
+        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         wait: Optional[WaitingConfig] = None,
         **warehouse_specs
     ):
@@ -395,23 +497,33 @@ class SQLWarehouse(WorkspaceService):
             warehouse_id=warehouse_id,
             warehouse_name=name,
             raise_error=False,
-            find_starter=False
         )
 
         if found is not None:
-            return found.update(name=name, wait=wait, **warehouse_specs)
+            return found.update(
+                name=name,
+                permissions=permissions,
+                wait=wait,
+                **warehouse_specs
+            )
 
-        return self.create(name=name, wait=wait, **warehouse_specs)
+        return self.create(
+            name=name,
+            permissions=permissions,
+            wait=wait,
+            **warehouse_specs
+        )
 
     def create(
         self,
         name: Optional[str] = None,
+        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         wait: Optional[WaitingConfigArg] = None,
         **warehouse_specs
     ):
         name = name or self.warehouse_name
 
-        checked_wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.check_arg(wait)
 
         details = self._check_details(
             keys=_CREATE_ARG_NAMES,
@@ -426,17 +538,19 @@ class SQLWarehouse(WorkspaceService):
             if k in _CREATE_ARG_NAMES
         }
 
-        if checked_wait.timeout:
-            info = self.warehouse_client().create_and_wait(
-                timeout=checked_wait.timeout_timedelta,
+        if wait or permissions:
+            info = self.client().create_and_wait(
+                timeout=wait.timeout_timedelta,
                 **update_details
             )
         else:
-            info = self.warehouse_client().create(**update_details)
+            info = self.client().create(**update_details)
 
             update_details["id"] = info.response.id
 
             info = EndpointInfo(**update_details)
+
+        self.update_permissions(permissions=permissions, wait=wait)
 
         created = SQLWarehouse(
             workspace=self.workspace,
@@ -445,13 +559,12 @@ class SQLWarehouse(WorkspaceService):
             _details=info
         )
 
-        created.update_permissions()
-
         return created
 
     def update(
         self,
         wait: Optional[WaitingConfigArg] = None,
+        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         **warehouse_specs
     ):
         if not warehouse_specs:
@@ -493,80 +606,75 @@ class SQLWarehouse(WorkspaceService):
             )
 
             if wait.timeout:
-                self.details = self.warehouse_client().edit_and_wait(
+                self.details = self.client().edit_and_wait(
                     timeout=wait.timeout_timedelta,
                     **update_details
                 )
             else:
-                _ = self.warehouse_client().edit(**update_details)
+                _ = self.client().edit(**update_details)
 
                 self.details = EndpointInfo(**update_details)
 
-            LOGGER.info(
-                "Updated %s",
-                self
-            )
+        self.update_permissions(permissions=permissions, wait=wait)
+
+        LOGGER.info(
+            "Updated %s",
+            self
+        )
 
         return self
 
     def update_permissions(
         self,
-        permissions: Optional[List[WarehouseAccessControlRequest]] = None,
+        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         *,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: Optional[WaitingConfigArg] = True,
         warehouse_id: Optional[str] = None
     ):
         warehouse_id = warehouse_id or self.warehouse_id
 
-        if warehouse_id:
-            client = self.warehouse_client()
+        permissions = [
+            self.check_permission(_)
+            for _ in permissions
+        ] if permissions else []
 
-            permissions = self.check_permissions(permissions=permissions)
-
-            if permissions:
-                client.update_permissions(
+        if permissions and warehouse_id:
+            if wait:
+                self.client().update_permissions(
                     warehouse_id=warehouse_id,
                     access_control_list=permissions
                 )
+            else:
+                Job.make(
+                    self.client().update_permissions,
+                    warehouse_id=warehouse_id,
+                    access_control_list=permissions
+                ).fire_and_forget()
 
-    def default_permissions(self, for_all: bool):
-        if for_all:
-            base = [
-                WarehouseAccessControlRequest(
-                    group_name="users",
+        return self
+
+    @staticmethod
+    def check_permission(
+        permission: WarehouseAccessControlRequest | str
+    ):
+        if isinstance(permission, str):
+            if permission == "users":
+                return WarehouseAccessControlRequest(
+                    group_name=permission,
                     permission_level=WarehousePermissionLevel.CAN_USE
                 )
-            ]
-        else:
-            base = []
-
-        groups = self.workspace.current_user_groups(
-            with_public=False
-        )
-
-        if groups:
-            base.extend(
-                WarehouseAccessControlRequest(
-                    group_name=group.display,
+            elif "@" in permission:
+                return WarehouseAccessControlRequest(
+                    user_name=permission,
+                    permission_level=WarehousePermissionLevel.CAN_USE
+                )
+            else:
+                return WarehouseAccessControlRequest(
+                    group_name=permission,
                     permission_level=WarehousePermissionLevel.CAN_MANAGE
                 )
-                for group in groups
-            )
 
-        return base
-
-    def check_permissions(
-        self,
-        permissions: Optional[List[WarehouseAccessControlRequest]] = None
-    ):
-        if permissions is None:
-            permissions = []
-
-        permissions.extend(self.default_permissions(
-            for_all=self.warehouse_name.startswith("yggdrasil") if self.warehouse_name else False
-        ))
-
-        return permissions
+        return permission
 
     def delete(self):
         if self.warehouse_id:
@@ -575,7 +683,7 @@ class SQLWarehouse(WorkspaceService):
                 self
             )
 
-            self.warehouse_client().delete(id=self.warehouse_id)
+            self.client().delete(id=self.warehouse_id)
 
             LOGGER.info(
                 "Deleted %s",
@@ -672,3 +780,7 @@ class SQLWarehouse(WorkspaceService):
         )
 
         return execution.wait(wait=wait)
+
+
+DEFAULT_ALL_PURPOSE_CLASSIC_NAME = "Yggdrasil All Purpose"
+DEFAULT_ALL_PURPOSE_SERVERLESS_NAME = DEFAULT_ALL_PURPOSE_CLASSIC_NAME + " Serverless"

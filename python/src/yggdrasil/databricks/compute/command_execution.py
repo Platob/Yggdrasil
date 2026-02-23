@@ -4,7 +4,6 @@ import io
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from json import JSONDecodeError
@@ -21,7 +20,7 @@ from .exceptions import ClientTerminatedSession
 from ...environ import PyEnv
 from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 DONE_STATES = {
     CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
@@ -53,19 +52,6 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
-
-def _pkg_name(spec: str) -> str:
-    """Strip PEP 508 version specifiers to get the bare package name."""
-    return re.split(r"[=<>!~;@\[]", spec)[0].strip().lower()
-
-DEFAULT_PACKAGES = ["ygg", "dill", "pandas", "mongoengine", "sqlalchemy"]
-
-def _dedup_packages(defaults: list[str], extra: list[str] | None) -> list[str]:
-    """Merge default + user packages, user versions win on conflict."""
-    seen: dict[str, str] = {}
-    for pkg in defaults + (extra or []):
-        seen[_pkg_name(pkg)] = pkg  # later entry (user-supplied) overwrites
-    return list(seen.values())
 
 
 @dataclass
@@ -163,8 +149,6 @@ class CommandExecution:
         major, minor, _ = PyEnv.current().version_info
         pyversion = f"{major}.{minor}"
 
-        self.context.install_temporary_libraries(libraries=["yggdrasil"])
-
         command = (
             self.command
             .replace("__ARGS__", repr(args_b64))
@@ -184,9 +168,6 @@ class CommandExecution:
         )
 
         return run.wait(raise_error=True).result(raise_error=True)
-
-    def __bool__(self):
-        return self.done
 
     def __repr__(self):
         return "%s(url=%s)" % (
@@ -256,6 +237,9 @@ class CommandExecution:
             if not reset:
                 return self
 
+            if not self.done:
+                self.cancel(wait=False)
+
             self._details = None
             self.command_id = None
 
@@ -290,6 +274,25 @@ class CommandExecution:
 
         return self
 
+    def cancel(
+        self,
+        wait: WaitingConfigArg | None = True
+    ):
+        if self.command_id:
+            wait = WaitingConfig.check_arg(wait)
+            client = self.context.workspace_client().command_execution
+
+            response = client.cancel(
+                cluster_id=self.cluster_id,
+                context_id=self.context_id,
+                command_id=self.command_id
+            )
+
+            if wait:
+                response.result(timeout=wait.timeout_timedelta)
+
+        return self
+
     @property
     def workspace(self):
         return self.context.workspace
@@ -316,20 +319,31 @@ class CommandExecution:
     def done(self):
         return self.state in DONE_STATES
 
+    def _command_status(self):
+        try:
+            return self.client().command_status(
+                cluster_id=self.cluster_id,
+                context_id=self.context_id,
+                command_id=self.command_id
+            )
+        except InternalError:
+            self.context.cluster.ensure_running()
+            self.start(reset=True)
+
+            return self.client().command_status(
+                cluster_id=self.cluster_id,
+                context_id=self.context_id,
+                command_id=self.command_id
+            )
+
     @property
     def details(self) -> CommandStatusResponse:
         if self._details is None:
-            self._details = self.client().command_status(
-                cluster_id=self.cluster_id,
-                context_id=self.context_id,
-                command_id=self.command_id
-            )
+            self._details = self._command_status()
+
         elif self._details.status not in DONE_STATES:
-            self._details = self.client().command_status(
-                cluster_id=self.cluster_id,
-                context_id=self.context_id,
-                command_id=self.command_id
-            )
+            self._details = self._command_status()
+
         return self._details
 
     @details.setter
@@ -343,30 +357,8 @@ class CommandExecution:
             )
             self.command_id = value.id
 
-    @property
-    def results_metadata(self):
-        return self.details.results
-
     def client(self) -> CommandExecutionAPI:
         return self.context.workspace_client().command_execution
-
-    def connect(self, reset: bool = False):
-        self.context = self.context.connect(language=self.language)
-
-        return self
-
-    def cancel(self, raise_error: bool = False):
-        if self.command_id:
-            try:
-                self.client().cancel_and_wait(
-                    cluster_id=self.cluster_id,
-                    command_id=self.command_id,
-                    context_id=self.context_id
-                )
-            except Exception as e:
-                if raise_error:
-                    raise e
-                LOGGER.exception(e)
 
     def raise_for_status(self):
         if self.state in FAILED_STATES:
@@ -393,41 +385,15 @@ class CommandExecution:
 
         if wait.timeout:
             while self.running:
-                wait.sleep(iteration=iteration, start=start)
-                iteration += 1
+                try:
+                    wait.sleep(iteration=iteration, start=start)
+                    iteration += 1
+                except KeyboardInterrupt:
+                    self.cancel(wait=False)
+                    raise
 
         if raise_error:
-            try:
-                self.raise_for_status()
-            except ModuleNotFoundError as e:
-                module_name = e.name
-
-                if module_name and not module_name.startswith("ygg"):
-                    self.context.install_temporary_libraries(
-                        libraries=[module_name]
-                    )
-
-                    return (
-                        self
-                        .start(reset=True)
-                        .wait(wait=wait, raise_error=raise_error)
-                    )
-                else:
-                    raise e
-            except ClientTerminatedSession as e:
-                LOGGER.error(
-                    "%s aborted: %s",
-                    self,
-                    e
-                )
-
-                self.context = self.context.connect(reset=True)
-
-                return (
-                    self
-                    .start(reset=True)
-                    .wait(wait=wait, raise_error=raise_error)
-                )
+            self.raise_for_status()
 
         return self
 
@@ -439,6 +405,46 @@ class CommandExecution:
         recurse: Any = None,
         compression: Optional[str] = None
     ) -> str:
+        """Serialize *obj* to a JSON envelope that ``decode_payload`` can reconstruct.
+
+        Dispatch table (checked in order):
+
+        +-----------------------+------------------------------------------+
+        | Type                  | Strategy                                 |
+        +=======================+==========================================+
+        | ``pyarrow.Table``     | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``polars.DataFrame``  | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``pandas.DataFrame``  | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``pandas.Series``     | Parquet via single-column DataFrame →    |
+        |                       | DBFS temp file; index and name preserved |
+        +-----------------------+------------------------------------------+
+        | ``Generator`` /       | Each item encoded recursively            |
+        | ``Iterator``          |                                          |
+        +-----------------------+------------------------------------------+
+        | Anything else         | ``dill`` → optional gzip → inline b64    |
+        |                       | or DBFS temp file if > *byte_limit*      |
+        +-----------------------+------------------------------------------+
+
+        Args:
+            obj: Object to encode.
+            byte_limit: Maximum inline payload size in bytes before spilling to
+                a DBFS temporary file (default 32 KiB).
+            byref: Passed through to ``dill.dump`` — serialize by reference when
+                ``True`` (useful for large closures that reference module-level
+                objects).
+            recurse: Passed through to ``dill.dump`` — recursively serialise
+                referenced objects.
+            compression: Force ``"gzip"`` compression regardless of size.
+                Defaults to auto-compress when the raw payload exceeds
+                *byte_limit*.
+
+        Returns:
+            A JSON string describing how to reconstruct the object on the remote
+            side.  See ``decode_payload`` for the envelope schema.
+        """
         buffer = io.BytesIO()
 
         from ...polars.lib import polars
@@ -473,6 +479,37 @@ class CommandExecution:
                 "func": func,
                 "file": dbx_path.full_path()
             })
+
+        # --- pandas.Series ---
+        # Encode as a single-column Parquet file.  The series name (or a
+        # synthetic "__series__" fallback) becomes the column name, and the
+        # index is written as a named reset column so it survives the
+        # round-trip through Parquet without loss.
+        if isinstance(obj, pandas.Series):
+            func = "pandas.read_parquet_series"
+            extension = "parquet"
+
+            series_name = obj.name if obj.name is not None else "__series__"
+            index_name  = obj.index.name if obj.index.name is not None else "__index__"
+
+            # Reset the index into a regular column so Parquet preserves it.
+            df = obj.rename(series_name).reset_index()
+            df.columns = [index_name] + [series_name]
+            df.to_parquet(path=buffer, index=False)
+
+            buffer.seek(0)
+            dbx_path = self.workspace.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json.dumps({
+                "func": func,
+                "file": dbx_path.full_path(),
+                "series_name": series_name,
+                "index_name": index_name,
+                # Preserve the original name exactly (None is meaningful).
+                "original_name": obj.name,
+            })
+
         elif isinstance(obj, pandas.DataFrame):
             func = "pandas.read_parquet"
             extension = "parquet"
@@ -487,6 +524,7 @@ class CommandExecution:
                 "cpr": compression,
                 "file": dbx_path.full_path()
             })
+
         elif isinstance(obj, (Generator, Iterator)):
             return json.dumps({
                 "func": "generator",
@@ -526,6 +564,40 @@ class CommandExecution:
         payload: Union[str, bytes, dict, list],
         temporary: bool = True
     ):
+        """Reconstruct an object from a JSON envelope produced by ``encode_object``.
+
+        Recognised ``func`` values:
+
+        +---------------------------------+------------------------------------------+
+        | ``func``                        | Action                                   |
+        +=================================+==========================================+
+        | ``"dill.load"``                 | dill-deserialise from inline b64 or file |
+        +---------------------------------+------------------------------------------+
+        | ``"pyarrow.parquet.read_table"``| Read Parquet file → ``pyarrow.Table``    |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_parquet"``       | Read Parquet file → ``pandas.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_parquet_series"``| Read Parquet file → ``pandas.Series``   |
+        |                                 | (restores name and index)                |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_pickle"``        | Read pickle file → ``pandas.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"polars.read_parquet"``       | Read Parquet file → ``polars.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"generator"``                 | Lazy generator over recursively decoded  |
+        |                                 | items                                    |
+        +---------------------------------+------------------------------------------+
+
+        Args:
+            payload: JSON string, bytes, pre-parsed dict, or list.  Non-JSON
+                strings are returned as-is.
+            temporary: When ``True``, DBFS paths are treated as temporary files
+                and may be cleaned up after reading.
+
+        Returns:
+            The reconstructed Python object, or *payload* unchanged if it does
+            not match any known envelope schema.
+        """
         if isinstance(payload, (str, bytes)):
             try:
                 payload = json.loads(payload)
@@ -552,12 +624,34 @@ class CommandExecution:
                         blob = gzip.decompress(blob)
 
                     return dill.loads(blob)
+
                 elif func.startswith("pyarrow."):
                     import pyarrow.parquet as pq
 
                     buff = io.BytesIO(blob)
-
                     return pq.read_table(buff)
+
+                elif func == "pandas.read_parquet_series":
+                    # Reconstruct a pandas.Series from the single-column
+                    # Parquet file written by encode_object.
+                    import pandas
+
+                    series_name   = payload.get("series_name", "__series__")
+                    index_name    = payload.get("index_name",  "__index__")
+                    original_name = payload.get("original_name")  # may be None
+
+                    buff = io.BytesIO(blob)
+                    df   = pandas.read_parquet(buff)
+
+                    # Restore the index from its saved column, then extract
+                    # the value column as a Series with the original name.
+                    if index_name in df.columns:
+                        df = df.set_index(index_name)
+                        df.index.name = None if index_name == "__index__" else index_name
+
+                    series = df[series_name].rename(original_name)
+                    return series
+
                 elif func.startswith("pandas."):
                     import pandas
 
@@ -569,6 +663,7 @@ class CommandExecution:
                         return pandas.read_pickle(buff, compression=compression)
                     else:
                         raise NotImplementedError
+
                 elif func == "generator":
                     items = payload.get("items")
 
@@ -578,11 +673,13 @@ class CommandExecution:
                                 yield self.decode_payload(item)
 
                     return gen()
+
                 elif func.startswith("polars."):
                     import polars
 
                     buff = io.BytesIO(blob)
                     return polars.read_parquet(buff)
+
                 else:
                     raise NotImplementedError
 
@@ -607,26 +704,13 @@ class CommandExecution:
             func, byte_limit=64 * 1024, byref=byref, recurse=recurse
         )
 
-        # Inject ctx_libs into sys.path when the context has uploaded temporary libs
-        syspath_lines: list[str] = []
-
-        rm = self.context.remote_metadata
-
-        if rm and rm.libs_path:
-            syspath_lines = [
-                "import os as _os, sys as _sys",
-                f"_p = _os.path.normpath(_os.path.expandvars(_os.path.expanduser({rm.libs_path!r})))",
-                "if _os.path.isdir(_p) and _p not in _sys.path:",
-                "    _sys.path.insert(0, _p)",
-                "del _p, _os, _sys",
-            ]
+        syspath_lines = self.context.syspath_lines()
 
         inner_code = "\n".join([
-            *syspath_lines,  # ← injected before any imports
             "import base64, dill",
             f"command = dill.loads(base64.b64decode({command_b64!r}.encode('ascii')))",
-            "args    = dill.loads(base64.b64decode(args_b64.encode('ascii')))",
-            "kwargs  = dill.loads(base64.b64decode(kwargs_b64.encode('ascii')))",
+            "args    = dill.loads(base64.b64decode(__ARGS__.encode('ascii')))",
+            "kwargs  = dill.loads(base64.b64decode(__KWARGS__.encode('ascii')))",
             f"f  = command.decode_payload({serialized_func!r}, temporary=False)",
             "a  = [command.decode_payload(x) for x in args]",
             "kw = {k: command.decode_payload(v) for k, v in kwargs.items()}",
@@ -634,24 +718,17 @@ class CommandExecution:
             f"print({tag!r} + command.encode_object(r))",
         ])
 
-        resolved_packages = _dedup_packages(DEFAULT_PACKAGES, packages)
-
-        inner_b64: str = base64.b64encode(inner_code.encode("utf-8")).decode("ascii")
-
         cmd = f"""\
+{syspath_lines}
+
 import base64, dill, os
-from yggdrasil.environ import PyEnv
 
-_inner = base64.b64decode({inner_b64!r}.encode('ascii')).decode('utf-8')
-_globs = {{
-    "args_b64":   __ARGS__,
-    "kwargs_b64": __KWARGS__,
-}}
+env = __ENVIRON__
+if env:
+    for k, v in env.items():
+        os.environ[k] = v
 
-pyenv  = PyEnv.current().resolve_env(identifier=__CTX_KEY__, version=__PYVERSION__, packages={resolved_packages!r})
-result = pyenv.run_python_code(code=_inner, env=__ENVIRON__, globs=_globs)
-
-print(result.stdout or "")
+{inner_code}
 """
 
         return cmd
@@ -743,7 +820,11 @@ print(result.stdout or "")
             module_name = e.name
 
             if module_name:
-                self.context.install_temporary_libraries(libraries=[module_name])
+                self.context.install_temporary_libraries(
+                    libraries=[module_name],
+                    pip_install=False
+                )
+                self.context.check_with_env(env=PyEnv.current())
 
                 return (
                     self

@@ -29,18 +29,19 @@ from threading import Thread
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
+from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import Disposition
-from yggdrasil.collections.expiring_dict import ExpiringDict
-from yggdrasil.enums import SaveMode
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.enums import SaveMode
 from .exceptions import SqlStatementError
 from .statement_result import StatementResult
-from .types import column_info_to_arrow_field
-from .warehouse import SQLWarehouse
+from .table import Table
+from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..workspaces import WorkspaceService, DatabricksPath
+from ...data.engine import SQLEngine as BaseSQLEngine
 from ...enums import FileFormat
-from ...pyutils.waiting_config import WaitingConfigArg, WaitingConfig
-from ...sql.engine import SQLEngine as BaseSQLEngine
+from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from ...types.cast.cast_options import CastOptions
 from ...types.cast.registry import convert
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
     import pandas
     import polars
 
-    from ...ai.sql_session import SQLAISession, SQLFlavor
+    from ...ai.sql_session import SQLSession, SQLFlavor
 
 
 __all__ = [
@@ -152,7 +153,8 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
     schema_name: Optional[str] = None
 
     _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
-    _ai_session: Optional["SQLAISession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _last_default_wh_check: int = dataclasses.field(default=0, repr=False, hash=False, compare=False)
+    _ai_session: Optional["SQLSession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _cached_queries: Optional[ExpiringDict[str, StatementResult]] = dataclasses.field(default=ExpiringDict, repr=False, hash=False, compare=False)
 
     # -------------------------------------------------------------------------------------
@@ -279,23 +281,37 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
             self._warehouse = wh.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
-                raise_error=False,
-                find_starter=True,
+                find_default=True
             )
 
-            if self._warehouse is None:
-                self._warehouse = wh.create_or_update()
+            self._last_default_wh_check = time.time()
 
-        return self._warehouse.find_warehouse(
-            warehouse_id=warehouse_id,
-            warehouse_name=warehouse_name,
-            raise_error=True,
-        )
+            return self._warehouse.find_warehouse(
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name
+            )
 
-    def ai_session(
+        if warehouse_id or warehouse_name:
+            return self._warehouse.find_warehouse(
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name
+            )
+
+        if self._warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+            now_s = time.time()
+            if (now_s - self._last_default_wh_check) > 30:
+                self._warehouse = self._warehouse.find_default()
+                self._last_default_wh_check = now_s
+
+        return self._warehouse
+
+    def ai(
         self,
-        model: str = "databricks-gemini-2-5-pro",
+        model: str = "databricks-claude-sonnet-4-6",
+        *,
         flavor: Optional["SQLFlavor"] = None,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None
     ):
         """
         Create a SQL AI session (LLM-assisted SQL).
@@ -307,19 +323,36 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 SQL dialect/flavor. Defaults to Databricks.
 
         Returns:
-            SQLAISession.
+            SQLSession.
         """
-        from ...ai.sql_session import SQLAISession, SQLFlavor
+        from ...ai.sql_session import SQLSession, SQLFlavor
 
         if flavor is None:
             flavor = SQLFlavor.DATABRICKS
 
-        return SQLAISession(
+        session = SQLSession(
             model=model,
-            api_key=self.workspace.current_token(),
+            api_key=self.workspace.current_token(expiring=False),
             base_url="%s/serving-endpoints" % self.workspace.safe_host,
             flavor=flavor,
         )
+
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+        client = self.table(
+            catalog_name=catalog_name or "default",
+            schema_name=schema_name or "default",
+            table_name="default"
+        )
+
+        if catalog_name and schema_name:
+            for table in client.list_tables(catalog_name, schema_name):
+                session.register_schema(
+                    alias=table.safe_full_name(),
+                    schema=table.arrow_schema
+                )
+
+        return session
 
     # -------------------------------------------------------------------------------------
     # Execution
@@ -480,7 +513,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         try:
             from delta.tables import DeltaTable
         except ImportError:
-            from ...pyutils.pyenv import PyEnv
+            from ...environ import PyEnv
 
             m = PyEnv.runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
             DeltaTable = m.DeltaTable
@@ -495,6 +528,28 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         return DeltaTable.forName(
             sparkSession=pyspark_sql.SparkSession.getActiveSession(),
             tableOrViewName=full_name,
+        )
+
+    def table(
+        self,
+        location: Optional[str] = None,
+        *,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+    ):
+        _, catalog_name, schema_name, table_name = self._check_location_params(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+        )
+
+        return Table(
+            workspace=self.workspace,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name
         )
 
     # -------------------------------------------------------------------------------------
@@ -530,6 +585,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
+        existing_schema: pa.Schema | None = None,
     ) -> None:
         """
         Insert data into a Delta table.
@@ -619,6 +675,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
+                existing_schema=existing_schema
             )
 
     # -------------------------------------------------------------------------------------
@@ -712,14 +769,13 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         with self.connect() as connected:
             if existing_schema is None:
                 try:
-                    existing_schema = connected.get_table_schema(
+                    existing_schema = connected.table(
                         location=location,
                         catalog_name=catalog_name,
                         schema_name=schema_name,
                         table_name=table_name,
-                        to_arrow_schema=True,
-                    )
-                except ValueError as exc:
+                    ).arrow_schema
+                except ResourceDoesNotExist as exc:
                     if isinstance(data, (list, dict)):
                         from ...polars.cast import any_to_polars_dataframe
 
@@ -727,7 +783,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
 
                     logger.warning("%s, creating it from input schema %s", exc, repr(data))
 
-                    plan = connected.create_table(
+                    connected.create_table(
                         field=data,  # convertible to pa.Field via convert() in create_table
                         catalog_name=catalog_name,
                         schema_name=schema_name,
@@ -737,7 +793,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                     )
 
                     try:
-                        connected.arrow_insert_into(
+                        return connected.arrow_insert_into(
                             data=data,
                             location=location,
                             catalog_name=catalog_name,
@@ -751,9 +807,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                             zorder_by=zorder_by,
                             optimize_after_merge=optimize_after_merge,
                             vacuum_hours=vacuum_hours,
-                            existing_schema=plan.arrow_schema,
                         )
-                        return
                     except Exception:
                         logger.exception(
                             "Arrow insert failed after auto-creating %s; attempting cleanup (DROP TABLE)", location
@@ -786,7 +840,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 cast_options=cast_options,
             )
 
-            mode = SaveMode.from_any(mode, default=SaveMode.AUTO)
+            mode = SaveMode.parse_any(mode, default=SaveMode.AUTO)
 
             columns = list(existing_schema.names)
             cols_quoted = ", ".join([_quote_ident(c) for c in columns])
@@ -987,12 +1041,11 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
             spark_options["overwriteSchema"] = "true"
 
         try:
-            existing_schema = self.get_table_schema(
+            existing_schema = self.table(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name,
-                to_arrow_schema=False,
-            )
+            ).arrow_field
         except ValueError:
             logger.warning("Destination table missing; creating table %s via overwrite write", location)
             data_df = convert(data, DataFrame)
@@ -1013,7 +1066,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
             logger.debug("Filtered null keys for match_by=%s", match_by)
 
         target = self.spark_table(full_name=location)
-        mode = SaveMode.from_any(mode, default=SaveMode.AUTO)
+        mode = SaveMode.parse_any(mode, default=SaveMode.AUTO)
 
         if match_by:
             cond = " AND ".join([f"t.{_quote_ident(k)} <=> s.{_quote_ident(k)}" for k in match_by])
@@ -1075,74 +1128,15 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
     # Schema + table management
     # -------------------------------------------------------------------------------------
 
-    def get_table_schema(
-        self,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        to_arrow_schema: bool = True,
-    ) -> Union[pa.Field, pa.Schema]:
-        """
-        Fetch a table schema from Unity Catalog and convert it to Arrow types.
-
-        Args:
-            location:
-                Optional fully qualified table name (catalog.schema.table).
-            catalog_name:
-                Optional catalog override (used when `location` not provided/partial).
-            schema_name:
-                Optional schema override (used when `location` not provided/partial).
-            table_name:
-                Optional table name (used when `location` not provided).
-            to_arrow_schema:
-                If True returns a `pa.Schema`.
-                If False returns a `pa.Field` with STRUCT type representing the table schema.
-
-        Returns:
-            `pa.Schema` or `pa.Field` depending on `to_arrow_schema`.
-
-        Raises:
-            ValueError:
-                If the table cannot be retrieved from Unity Catalog.
-        """
-        location, catalog_name, schema_name, table_name = self._check_location_params(
-            location=location,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=False,
-        )
-
-        client = self.workspace.sdk().tables
-
-        try:
-            table = client.get(location)
-        except Exception as e:
-            raise ValueError(f"Table {location} not found, {type(e)} {e}")
-
-        fields = [column_info_to_arrow_field(_) for _ in table.columns]
-
-        metadata = {
-            b"engine": b"databricks",
-            b"full_name": location.encode("utf-8"),
-            b"catalog_name": (catalog_name or "").encode("utf-8"),
-            b"schema_name": (schema_name or "").encode("utf-8"),
-            b"table_name": (table_name or "").encode("utf-8"),
-        }
-
-        if to_arrow_schema:
-            return pa.schema(fields, metadata=metadata)
-
-        return pa.field(location, pa.struct(fields), metadata=metadata)
-
     def drop_table(
         self,
         location: Optional[str] = None,
+        *,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         wait: Optional[WaitingConfigArg] = True,
+        raise_error: bool = True
     ) -> None:
         """
         Drop a table if it exists.
@@ -1162,17 +1156,12 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
-        location, _, _, _ = self._check_location_params(
-            location=location,
+        return self.table(
+            location,
             catalog_name=catalog_name,
             schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=True,
-        )
-
-        logger.debug("Dropping table if exists: %s", location)
-        self.execute(f"DROP TABLE IF EXISTS {location}", wait=wait)
-        logger.info("Dropped table if exists: %s", location)
+            table_name=table_name
+        ).delete(wait=wait, raise_error=raise_error)
 
     def create_table(
         self,

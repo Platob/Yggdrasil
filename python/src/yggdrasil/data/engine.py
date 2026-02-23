@@ -6,7 +6,7 @@ import pyarrow as pa
 
 from .statement_result import StatementResult
 from ..enums import SaveMode
-from ..pyutils.waiting_config import WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from ..types.cast.cast_options import CastOptions
 
 if TYPE_CHECKING:

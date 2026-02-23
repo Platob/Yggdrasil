@@ -1,13 +1,17 @@
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Mapping, Any, Union
+from typing import Optional, Mapping, Any, Union, TYPE_CHECKING
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
 from .dynamic_buffer import DynamicBuffer
 from .request import PreparedRequest
 from .response import Response
 from .url import URL
-from ..pyutils.waiting_config import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
+
+if TYPE_CHECKING:
+    from ..databricks.sql.table import Table
+
 
 __all__ = ["Session"]
 
@@ -68,9 +72,10 @@ class Session(ABC):
         self,
         request: PreparedRequest,
         *,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
+        cache: Optional["Table"] = None
     ) -> Response:
         raise NotImplementedError
 
@@ -81,11 +86,12 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "GET",
@@ -96,6 +102,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def post(
@@ -103,13 +110,14 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "POST",
@@ -122,6 +130,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def put(
@@ -129,13 +138,14 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "PUT",
@@ -148,6 +158,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def patch(
@@ -155,13 +166,14 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "PATCH",
@@ -174,6 +186,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def delete(
@@ -181,13 +194,14 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "DELETE",
@@ -200,6 +214,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def head(
@@ -207,11 +222,12 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         stream: bool = False,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "HEAD",
@@ -222,6 +238,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     def options(
@@ -229,13 +246,14 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         return self.request(
             "OPTIONS",
@@ -248,6 +266,7 @@ class Session(ABC):
             stream=stream,
             wait=wait,
             normalize=normalize,
+            cache=cache,
         )
 
     # --- Request Orchestration ---
@@ -262,9 +281,10 @@ class Session(ABC):
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> Response:
         request = self.prepare_request(
             method=method,
@@ -281,6 +301,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             stream=stream,
             wait=wait,
+            cache=cache
         )
 
     def prepare_request(
@@ -293,6 +314,7 @@ class Session(ABC):
         body: Optional[Union[DynamicBuffer, bytes]] = None,
         json: Optional[Any] = None,
         normalize: bool = True,
+        cache: Optional["Table"] = None
     ) -> PreparedRequest:
         full_url = url
         if self.base_url:

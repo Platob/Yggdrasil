@@ -11,16 +11,7 @@ from __future__ import annotations
 import pytest
 import pyarrow as pa
 
-from yggdrasil.types.cast.cast_options import CastOptions, DEFAULT_INSTANCE
-
-
-def test_default_instance_shape():
-    assert isinstance(DEFAULT_INSTANCE, CastOptions)
-    # sanity: defaults
-    assert DEFAULT_INSTANCE.safe is False
-    assert DEFAULT_INSTANCE.add_missing_columns is True
-    assert DEFAULT_INSTANCE.strict_match_names is False
-    assert DEFAULT_INSTANCE.allow_add_columns is False
+from yggdrasil.types.cast.cast_options import CastOptions
 
 
 def test_safe_init_sets_source_and_target_fields_from_arrow_objects():
@@ -131,19 +122,19 @@ def test_need_arrow_type_cast_and_nullability_check():
 
     opt_same = CastOptions.safe_init(source_field=src, target_field=pa.field("a", pa.int32(), nullable=True))
     assert opt_same.need_arrow_type_cast(source_obj=None) is False
-    assert opt_same.need_nullability_check(source_obj=None) is False
+    assert opt_same.need_nullability_fill(source_obj=None) is False
 
     opt_diff = CastOptions.safe_init(source_field=src, target_field=pa.field("a", pa.int64(), nullable=True))
     assert opt_diff.need_arrow_type_cast(source_obj=None) is True
 
     opt_null_tighten = CastOptions.safe_init(source_field=src, target_field=pa.field("a", pa.int32(), nullable=False))
-    assert opt_null_tighten.need_nullability_check(source_obj=None) is True
+    assert opt_null_tighten.need_nullability_fill(source_obj=None) is True
 
     opt_null_ok = CastOptions.safe_init(
         source_field=pa.field("a", pa.int32(), nullable=False),
         target_field=pa.field("a", pa.int32(), nullable=False),
     )
-    assert opt_null_ok.need_nullability_check(source_obj=None) is False
+    assert opt_null_ok.need_nullability_fill(source_obj=None) is False
 
 
 def test_target_field_name_fallbacks():

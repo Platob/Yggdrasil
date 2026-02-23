@@ -2,42 +2,46 @@
 from __future__ import annotations
 
 import io
+import mmap
 import os
 import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, IO, Any, TYPE_CHECKING
-
+from typing import Any, IO, Optional, Union, TYPE_CHECKING
 
 __all__ = ["DynamicBuffer", "DynamicBufferConfig"]
 
+from yggdrasil.io.path import AbstractDataPath
 
 if TYPE_CHECKING:
     import xxhash
+    import blake3
 
 
-@dataclass(frozen=False, slots=True)
+BytesLike = Union[bytes, bytearray, memoryview]
+
+
+@dataclass(slots=True)
 class DynamicBufferConfig:
     """
     Configuration for DynamicBuffer.
 
     spill_bytes:
-        When buffered data size exceeds this threshold, switch from in-memory BytesIO
+        When buffered data exceeds this threshold, spill from in-memory BytesIO
         to a real temporary file on disk.
 
     tmp_dir:
         Directory where spill files are created. If None, uses system temp dir.
 
     prefix/suffix:
-        Naming for the temp file when spilling to disk.
+        Naming for the spill file.
 
     keep_spilled_file:
-        If True, spilled temp files are not deleted on close (you can call cleanup()).
-        If False, we delete the temp file on close/cleanup().
+        If True, spilled temp files are not deleted on close/cleanup.
     """
-    spill_bytes: int = 128 * 1024 * 1024  # 64 MiB
-    tmp_dir: Optional[Path] = None
+    spill_bytes: int = 128 * 1024 * 1024  # 128 MiB
+    tmp_dir: Optional[AbstractDataPath] = None
     prefix: str = "tmp-"
     suffix: str = ".bin"
     keep_spilled_file: bool = False
@@ -48,27 +52,13 @@ class DynamicBuffer(io.RawIOBase):
     A bytes buffer that starts in memory and spills to a local temp file
     when it grows beyond a threshold.
 
-    Practical uses:
-      - serialization buffers (dill/pickle/parquet writes)
-      - staging upload payloads without blowing RAM
-      - "read as bytes" semantics while supporting large payloads
-
-    Key properties:
-      - file-like: supports write(), read(), seek(), tell(), flush(), close()
-      - getvalue() works only if still in-memory (else raises)
-      - to_bytes() returns bytes (loads entire payload; be careful for huge buffers)
-      - path returns the spill file path if spilled, else None
-      - underlying IO always positioned at end after write()
-
-    Notes:
-      - This is a byte buffer (binary mode).
-      - Not thread-safe (like most IO objects).
+    - file-like: write/read/seek/tell/flush/close
+    - getvalue(): returns bytes (loads if spilled; see docs)
+    - to_bytes(): reads entire payload (can be huge)
+    - memoryview(): zero-copy view for in-mem, mmap view when spilled
     """
 
-    def __init__(
-        self,
-        config: DynamicBufferConfig | None = None
-    ) -> None:
+    def __init__(self, config: DynamicBufferConfig | None = None) -> None:
         super().__init__()
         self._cfg = config or DynamicBufferConfig()
         if self._cfg.spill_bytes < 1:
@@ -76,48 +66,61 @@ class DynamicBuffer(io.RawIOBase):
 
         self._mem: io.BytesIO | None = io.BytesIO()
         self._file: IO[bytes] | None = None
-        self._path: Path | None = None
+        self._path: AbstractDataPath | None = None
+        self._mmap: mmap.mmap | None = None
         self._closed: bool = False
 
+    # ---------------------------------------------------------------------
+    # Dunder
+    # ---------------------------------------------------------------------
     def __bytes__(self) -> bytes:
         return self.to_bytes()
 
     def __len__(self) -> int:
-        """
-        Total payload size in bytes (does NOT change the current cursor).
-        """
         return self.size
 
-    def __del__(self):
-        self.close()
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
+    # ---------------------------------------------------------------------
+    # Factories
+    # ---------------------------------------------------------------------
     @classmethod
-    def parse_any(
-        cls,
-        obj: Any,
-        config: DynamicBufferConfig | None = None
-    ):
+    def parse_any(cls, obj: Any, config: DynamicBufferConfig | None = None) -> "DynamicBuffer":
+        """
+        Create a DynamicBuffer from:
+          - DynamicBuffer: returns as-is
+          - io.BytesIO: wraps as in-mem
+          - str/Path: opens as file-backed (w+b)
+          - bytes-like / file-like: reads and stores
+        """
         if isinstance(obj, cls):
             return obj
 
-        buffer = DynamicBuffer(config=config)
+        buf = cls(config=config)
 
         if isinstance(obj, io.BytesIO):
-            obj._mem = obj
-        elif isinstance(obj, (str, Path)):
-            from .path import LocalDataPath
+            buf._mem = obj
+            return buf
 
-            obj._path = LocalDataPath(obj)
-            obj._file = obj._path.open("w+b", buffering=0)
-        else:
-            buffer.write_any_bytes(obj)
-            buffer.seek(0)
+        if isinstance(obj, (str, Path)):
+            # local path (no fancy LocalDataPath dependency here)
+            p = Path(obj)
+            buf._path = p
+            buf._file = p.open("w+b", buffering=0)
+            buf._mem = None
+            return buf
 
-        return buffer
+        buf.write_any_bytes(obj)
+        buf.seek(0)
+        return buf
 
-    # -----------------------
+    # ---------------------------------------------------------------------
     # Introspection
-    # -----------------------
+    # ---------------------------------------------------------------------
     @property
     def spilled(self) -> bool:
         return self._file is not None
@@ -129,22 +132,20 @@ class DynamicBuffer(io.RawIOBase):
     @property
     def size(self) -> int:
         if self._mem is not None:
-            # BytesIO: safest is buffer length; avoids messing with cursor.
             return self._mem.getbuffer().nbytes
-
+        fh = self._fh()
         try:
-            return os.fstat(self._file.fileno()).st_size
+            return os.fstat(fh.fileno()).st_size
         except Exception:
-            # fallback: preserve cursor, use seek/tell
-            pos = self._file.tell()
-            self._file.seek(0, io.SEEK_END)
-            end = self._file.tell()
-            self._file.seek(pos, io.SEEK_SET)
+            pos = fh.tell()
+            fh.seek(0, io.SEEK_END)
+            end = fh.tell()
+            fh.seek(pos, io.SEEK_SET)
             return int(end)
 
-    # -----------------------
+    # ---------------------------------------------------------------------
     # io.RawIOBase interface
-    # -----------------------
+    # ---------------------------------------------------------------------
     def readable(self) -> bool:
         return True
 
@@ -154,39 +155,9 @@ class DynamicBuffer(io.RawIOBase):
     def seekable(self) -> bool:
         return True
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        try:
-            self.flush()
-        except Exception:
-            pass
-
-        try:
-            if self._mem is not None:
-                self._mem.close()
-        finally:
-            self._mem = None
-
-        try:
-            if self._file is not None:
-                self._file.close()
-        finally:
-            self._file = None
-
-        if self._path is not None and not self._cfg.keep_spilled_file:
-            try:
-                self._path.unlink(missing_ok=True)  # py3.8+ ok
-            except Exception:
-                pass
-
-        self._closed = True
-        super().close()
-
     def flush(self) -> None:
-        fh = self._fh()
         try:
-            fh.flush()
+            self._fh().flush()
         except Exception:
             pass
 
@@ -199,52 +170,40 @@ class DynamicBuffer(io.RawIOBase):
     def read(self, size: int = -1) -> bytes:
         return self._fh().read(size)
 
-    def write(self, b: Union[bytes, bytearray, memoryview]) -> int:
+    def write(self, b: BytesLike) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed DynamicBuffer")
 
-        try:
-            mv = memoryview(b)
-        except TypeError:
-            if isinstance(b, str):
-                mv = memoryview(b.encode("utf-8"))
-            else:
-                raise
-
+        mv = memoryview(b)
         n = len(mv)
 
-        # If we're still in memory, check whether this write pushes us over.
         if self._mem is not None:
-            current_size = self._mem.getbuffer().nbytes
-            if current_size + n > self._cfg.spill_bytes:
+            current = self._mem.getbuffer().nbytes
+            if current + n > self._cfg.spill_bytes:
                 self._spill_to_file()
 
-        fh = self._fh()
-        written = fh.write(mv.tobytes())
-        return written
+        return self._fh().write(mv.tobytes())
 
-    def write_any_bytes(self, obj: Any):
+    def write_any_bytes(self, obj: Any) -> int:
+        """
+        Accept bytes-like or file-like (must have .read()).
+        """
         if obj is None:
             return 0
-
         if isinstance(obj, (bytes, bytearray, memoryview)):
             return self.write(obj)
+        if hasattr(obj, "read"):
+            return self.write(obj.read())
+        raise TypeError(f"Unsupported object for write_any_bytes: {type(obj)!r}")
 
-        blob = obj.read()
-
-        return self.write(blob)
-
-    # -----------------------
+    # ---------------------------------------------------------------------
     # Structured binary read/write (little-endian)
-    # -----------------------
-
+    # ---------------------------------------------------------------------
     def _read_exact(self, n: int) -> bytes:
         data = self.read(n)
         if len(data) != n:
             raise EOFError(f"expected {n} bytes, got {len(data)}")
         return data
-
-    # ---- ints ----
 
     def read_int8(self) -> int:
         return struct.unpack("<b", self._read_exact(1))[0]
@@ -294,8 +253,6 @@ class DynamicBuffer(io.RawIOBase):
     def write_uint64(self, value: int) -> int:
         return self.write(struct.pack("<Q", int(value)))
 
-    # ---- floats ----
-
     def read_f32(self) -> float:
         return struct.unpack("<f", self._read_exact(4))[0]
 
@@ -308,24 +265,17 @@ class DynamicBuffer(io.RawIOBase):
     def write_f64(self, value: float) -> int:
         return self.write(struct.pack("<d", float(value)))
 
-    # ---- bool ----
-
     def read_bool(self) -> bool:
         return bool(self.read_uint8())
 
     def write_bool(self, value: bool) -> int:
         return self.write_uint8(1 if value else 0)
 
-    # ---- bytes / strings (length-prefixed) ----
-
     def read_bytes_u32(self) -> bytes:
-        """
-        Read: u32 length (little-endian) + payload bytes.
-        """
         n = self.read_uint32()
         return self._read_exact(n)
 
-    def write_bytes_u32(self, data: bytes | bytearray | memoryview) -> int:
+    def write_bytes_u32(self, data: BytesLike) -> int:
         mv = memoryview(data)
         total = self.write_uint32(len(mv))
         total += self.write(mv)
@@ -335,33 +285,66 @@ class DynamicBuffer(io.RawIOBase):
         return self.read_bytes_u32().decode(encoding)
 
     def write_str_u32(self, s: str, encoding: str = "utf-8") -> int:
-        b = s.encode(encoding)
-        return self.write_bytes_u32(b)
+        return self.write_bytes_u32(s.encode(encoding))
 
-    # -----------------------
-    # Convenience APIs
-    # -----------------------
+    # ---------------------------------------------------------------------
+    # Convenience
+    # ---------------------------------------------------------------------
     def xxh3_64(self) -> "xxhash.xxh3_64":
         from ..xxhash import xxhash
-
         h = xxhash.xxh3_64()
-        h.update(self.to_bytes())
+        h.update(self.memoryview())
+        return h
+
+    def blake3(self) -> "blake3.blake3":
+        from yggdrasil.blake3 import blake3
+        h = blake3(max_threads=blake3.AUTO)
+
+        if self._mem is not None:
+            # in-memory: just hash bytes
+            h.update(self._mem.getbuffer())
+            return h.hexdigest()
+
+        # spilled: mmap by path (fast)
+        if self._path is None:
+            # fallback: stream from fh
+            self._fh().seek(0)
+            while chunk := self._fh().read(8 * 1024 * 1024):
+                h.update(chunk)
+            return h
+
+        h.update_mmap(str(self._path))
         return h
 
     def getvalue(self) -> bytes:
         """
-        Return bytes only if still in memory.
-        Raises if spilled to disk (to avoid accidental huge loads).
+        Return bytes. If spilled, reads the full file into memory.
         """
-        if self._mem is None:
-            return self.to_bytes()
-        return self._mem.getvalue()
+        if self._mem is not None:
+            return self._mem.getvalue()
+        return self.to_bytes()
+
+    def memoryview(self) -> memoryview:
+        """
+        - In-memory: returns a view of the BytesIO bytes (copies once via getvalue()).
+          If you want *true* zero-copy, store a bytearray instead of BytesIO.
+        - Spilled: returns memoryview(mmap(file)).
+        """
+        if self._mem is not None:
+            return memoryview(self._mem.getvalue())
+
+        fh = self._fh()
+        fileno = fh.fileno()
+        size = os.fstat(fileno).st_size
+        if size == 0:
+            return memoryview(b"")
+
+        # refresh mmap if needed
+        if self._mmap is None or self._mmap.closed:
+            self._mmap = mmap.mmap(fileno, length=0, access=mmap.ACCESS_READ)
+        return memoryview(self._mmap)
 
     def to_bytes(self) -> bytes:
-        """
-        Read the entire buffer into memory.
-        Be careful: if you spilled, this could be huge.
-        """
         fh = self._fh()
         pos = fh.tell()
         try:
@@ -374,34 +357,61 @@ class DynamicBuffer(io.RawIOBase):
                 pass
 
     def open_reader(self) -> IO[bytes]:
-        """
-        Return a new readable handle positioned at start.
-        - If in-memory: returns a new BytesIO copy
-        - If spilled: opens the spill file in 'rb'
-        """
         if self._mem is not None:
             return io.BytesIO(self._mem.getvalue())
         if self._path is None:
             raise RuntimeError("Spilled buffer missing path (unexpected)")
-        return open(self._path, "rb")
+        return self._path.open("rb")
 
     def open_writer(self) -> IO[bytes]:
-        """
-        Return the underlying writable handle (position preserved).
-        Mostly for advanced scenarios.
-        """
         return self._fh()
 
     def cleanup(self) -> None:
-        """
-        Explicit cleanup (same behavior as close regarding file deletion).
-        Safe to call multiple times.
-        """
         self.close()
 
-    # -----------------------
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+        # Close mmap first (it pins the file on Windows)
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+            self._mmap = None
+
+        if self._mem is not None:
+            try:
+                self._mem.close()
+            except Exception:
+                pass
+            self._mem = None
+
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+        if self._path is not None and self.spilled and not self._cfg.keep_spilled_file:
+            try:
+                self._path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        self._closed = True
+        super().close()
+
+    # ---------------------------------------------------------------------
     # Internals
-    # -----------------------
+    # ---------------------------------------------------------------------
     def _fh(self) -> IO[bytes]:
         if self._closed:
             raise ValueError("I/O operation on closed DynamicBuffer")
@@ -420,16 +430,12 @@ class DynamicBuffer(io.RawIOBase):
             return
 
         cfg = self._cfg
-
         tmp_dir = str(cfg.tmp_dir) if cfg.tmp_dir is not None else None
         fd, name = tempfile.mkstemp(prefix=cfg.prefix, suffix=cfg.suffix, dir=tmp_dir)
         path = Path(name)
 
-        # We want a binary file handle with random access.
-        # Use os.fdopen so the fd is managed correctly.
         f = os.fdopen(fd, "w+b", buffering=0)
 
-        # Copy bytes + preserve cursor position
         mem = self._mem
         mem_pos = mem.tell()
         mem.seek(0)
@@ -437,8 +443,11 @@ class DynamicBuffer(io.RawIOBase):
         f.flush()
         f.seek(mem_pos)
 
-        # Switch backing store
-        mem.close()
+        try:
+            mem.close()
+        except Exception:
+            pass
+
         self._mem = None
         self._file = f
         self._path = path

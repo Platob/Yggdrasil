@@ -286,11 +286,11 @@ class TestPyEnvProperties:
         assert all(isinstance(x, int) for x in vi)
 
     def test_uv_bin_is_real_file(self):
-        assert PyEnv.current().uv_bin.is_file()
+        assert PyEnv.current().uv_path.is_file()
 
     def test_uv_bin_cached(self):
         env = PyEnv.current()
-        assert env.uv_bin is env.uv_bin
+        assert env.uv_path is env.uv_path
 
 
 # ---------------------------------------------------------------------------

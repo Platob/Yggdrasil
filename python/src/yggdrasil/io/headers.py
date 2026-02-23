@@ -69,8 +69,8 @@ def anonymize_headers(
     salt: str = "",                 # used when mode="hash"
     keep_content_type: bool = True,
     keep_accept: bool = True,
-    keep_host: bool = True,
-    preserve_keys: bool = True,     # if False, hash header names too (rarely needed)
+    keep_host: bool = False,
+    preserve_keys: bool = False,     # if False, hash header names too (rarely needed)
 ) -> MutableMapping[str, str]:
     """
     Returns a sanitized copy of headers. Use mode="hash" to keep stable fingerprints.

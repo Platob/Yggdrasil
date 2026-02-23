@@ -47,7 +47,7 @@ print(results)
 ## Bootstrap: controlled waiting configuration
 
 ```python
-from yggdrasil.pyutils.waiting_config import WaitingConfig
+from yggdrasil.dataclasses.waiting import WaitingConfig
 
 wait_cfg = WaitingConfig(
     timeout_seconds=60,

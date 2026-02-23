@@ -1,10 +1,21 @@
-"""Polars DataFrame extension helpers for joins and resampling."""
+"""
+Polars DataFrame extension helpers for joins and resampling.
+
+Includes compatibility monkeypatches for older Polars builds:
+
+- pl.Expr.dtype property (get/set) if missing
+- pl.Field.nullable: bool property (get/set) if missing
+- pl.Field.metadata: Optional[dict[bytes, bytes]] property (get/set) if missing
+
+Also overrides pl.Expr.alias and pl.Expr.cast to preserve injected metadata.
+"""
 
 from __future__ import annotations
 
 import datetime
 import inspect
-from typing import Any, Literal, Mapping, Sequence
+import weakref
+from typing import Any, Literal, Mapping, Optional, Sequence
 
 from .lib import polars as pl
 
@@ -12,6 +23,192 @@ __all__ = [
     "join_coalesced",
     "resample",
 ]
+
+# ---------------------------------------------------------------------
+# Monkeypatches: pl.Expr.dtype, pl.Field.nullable, pl.Field.metadata
+# Prefer setattr/getattr; fallback to id-map if Polars objects disallow attrs.
+# ---------------------------------------------------------------------
+
+# Private attribute names stored on Polars objects (when possible)
+_YGG_EXPR_DTYPE_ATTR = "_ygg_dtype"
+_YGG_EXPR_META_ATTR = "_ygg_expr_meta"  # reserved (optional future use)
+
+_YGG_FIELD_NULLABLE_ATTR = "_ygg_nullable"
+_YGG_FIELD_METADATA_ATTR = "_ygg_metadata"
+
+# Fallback stores (used only when setattr/getattr fails)
+_EXPR_DTYPE_FALLBACK: dict[int, object] = {}
+_FIELD_NULLABLE_FALLBACK: dict[int, bool] = {}
+_FIELD_METADATA_FALLBACK: dict[int, Optional[dict[bytes, bytes]]] = {}
+
+
+def _fallback_set(store: dict, obj: object, value: object) -> None:
+    """Store by id(obj) with best-effort cleanup on GC."""
+    k = id(obj)
+    store[k] = value
+    try:
+        weakref.finalize(obj, store.pop, k, None)
+    except Exception:
+        # If finalize can't attach, accept possible stale entries.
+        pass
+
+
+def _try_getattr(obj: object, name: str):
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def _try_setattr(obj: object, name: str, value: object) -> bool:
+    """Return True if stored on the object; False if impossible."""
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        pass
+    try:
+        object.__setattr__(obj, name, value)
+        return True
+    except Exception:
+        return False
+
+
+# ---- pl.Expr.dtype ---------------------------------------------------
+
+def _expr_dtype_get(self: "pl.Expr"):
+    v = _try_getattr(self, _YGG_EXPR_DTYPE_ATTR)
+    if v is not None:
+        return v
+    return _EXPR_DTYPE_FALLBACK.get(id(self))
+
+
+def _expr_dtype_set(self: "pl.Expr", value) -> None:
+    if not _try_setattr(self, _YGG_EXPR_DTYPE_ATTR, value):
+        _fallback_set(_EXPR_DTYPE_FALLBACK, self, value)
+
+
+def ensure_polars_expr_dtype_property() -> None:
+    """Add pl.Expr.dtype property (getter+setter) ONLY if it doesn't exist."""
+    if pl is None:
+        return
+    if hasattr(pl.Expr, "dtype"):
+        return
+    pl.Expr.dtype = property(_expr_dtype_get, _expr_dtype_set)  # type: ignore[attr-defined]
+
+
+# ---- pl.Field.nullable -----------------------------------------------
+
+def _field_nullable_get(self: "pl.Field") -> bool:
+    v = _try_getattr(self, _YGG_FIELD_NULLABLE_ATTR)
+    if v is not None:
+        return bool(v)
+    v2 = _FIELD_NULLABLE_FALLBACK.get(id(self))
+    return True if v2 is None else bool(v2)  # default True
+
+
+def _field_nullable_set(self: "pl.Field", value: bool) -> None:
+    v = bool(value)
+    if not _try_setattr(self, _YGG_FIELD_NULLABLE_ATTR, v):
+        _fallback_set(_FIELD_NULLABLE_FALLBACK, self, v)
+
+
+# ---- pl.Field.metadata -----------------------------------------------
+
+def _field_metadata_get(self: "pl.Field") -> Optional[dict[bytes, bytes]]:
+    v = _try_getattr(self, _YGG_FIELD_METADATA_ATTR)
+    if v is not None:
+        return v  # type: ignore[return-value]
+    return _FIELD_METADATA_FALLBACK.get(id(self))
+
+
+def _field_metadata_set(self: "pl.Field", value: Optional[dict[bytes, bytes]]) -> None:
+    if value is not None:
+        if not isinstance(value, dict):
+            raise TypeError(f"Field.metadata must be dict[bytes, bytes] or None, got {type(value)}")
+        out: dict[bytes, bytes] = {}
+        for k, v in value.items():
+            if not isinstance(k, (bytes, bytearray)) or not isinstance(v, (bytes, bytearray)):
+                raise TypeError("Field.metadata must be dict[bytes, bytes] (bytes keys and bytes values)")
+            out[bytes(k)] = bytes(v)
+        value = out
+
+    if not _try_setattr(self, _YGG_FIELD_METADATA_ATTR, value):
+        _fallback_set(_FIELD_METADATA_FALLBACK, self, value)
+
+
+def ensure_polars_field_nullable_metadata_properties() -> None:
+    """Add pl.Field.nullable and pl.Field.metadata properties ONLY if missing."""
+    if pl is None:
+        return
+
+    if not hasattr(pl.Field, "nullable"):
+        pl.Field.nullable = property(_field_nullable_get, _field_nullable_set)  # type: ignore[attr-defined]
+
+    if not hasattr(pl.Field, "metadata"):
+        pl.Field.metadata = property(_field_metadata_get, _field_metadata_set)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------
+# Preserve injected Expr metadata across alias/cast
+# ---------------------------------------------------------------------
+
+def _copy_expr_attrs(src: "pl.Expr", dst: "pl.Expr") -> "pl.Expr":
+    """Best-effort copy of our injected Expr attrs from src -> dst."""
+    for attr in (_YGG_EXPR_DTYPE_ATTR, _YGG_EXPR_META_ATTR):
+        v = _try_getattr(src, attr)
+        if v is None:
+            continue
+        _try_setattr(dst, attr, v) or _fallback_set(_EXPR_DTYPE_FALLBACK, dst, v) if attr == _YGG_EXPR_DTYPE_ATTR else None
+    return dst
+
+
+def patch_expr_alias_cast_preserve_metadata() -> None:
+    if pl is None:
+        return
+
+    # ---- alias ----
+    if hasattr(pl.Expr, "alias") and not getattr(pl.Expr, "_ygg_alias_patched", False):
+        _orig_alias = pl.Expr.alias  # type: ignore[attr-defined]
+
+        def _alias(self: "pl.Expr", *args, **kwargs):
+            out = _orig_alias(self, *args, **kwargs)
+            return _copy_expr_attrs(self, out)
+
+        pl.Expr.alias = _alias  # type: ignore[assignment]
+        _try_setattr(pl.Expr, "_ygg_alias_patched", True)
+
+    # ---- cast ----
+    if hasattr(pl.Expr, "cast") and not getattr(pl.Expr, "_ygg_cast_patched", False):
+        _orig_cast = pl.Expr.cast  # type: ignore[attr-defined]
+
+        def _cast(self: "pl.Expr", *args, **kwargs):
+            out = _orig_cast(self, *args, **kwargs)
+
+            # Preserve existing metadata first
+            _copy_expr_attrs(self, out)
+
+            # Update dtype metadata to match cast target when provided
+            target_dtype = args[0] if args else kwargs.get("dtype")
+            if target_dtype is not None:
+                if not _try_setattr(out, _YGG_EXPR_DTYPE_ATTR, target_dtype):
+                    _fallback_set(_EXPR_DTYPE_FALLBACK, out, target_dtype)
+
+            return out
+
+        pl.Expr.cast = _cast  # type: ignore[assignment]
+        _try_setattr(pl.Expr, "_ygg_cast_patched", True)
+
+
+# Patch on import
+ensure_polars_expr_dtype_property()
+ensure_polars_field_nullable_metadata_properties()
+patch_expr_alias_cast_preserve_metadata()
+
+
+# ---------------------------------------------------------------------
+# DataFrame helpers
+# ---------------------------------------------------------------------
 
 AggSpec = Mapping[str, Any] | Sequence["pl.Expr"]
 
@@ -41,14 +238,6 @@ def join_coalesced(
 
 
 def _normalize_group_by(group_by: str | Sequence[str] | None) -> list[str] | None:
-    """Normalize group_by inputs into a list or None.
-
-    Args:
-        group_by: Grouping column or columns.
-
-    Returns:
-        List of column names or None.
-    """
     if group_by is None:
         return None
     if isinstance(group_by, str):
@@ -67,15 +256,6 @@ def _filter_kwargs_for_callable(fn: object, kwargs: dict[str, Any]) -> dict[str,
 
 
 def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
-    """Build a Polars expression from an aggregation spec.
-
-    Args:
-        col: Column name to aggregate.
-        agg: Aggregation spec (expr, callable, or string).
-
-    Returns:
-        Polars expression.
-    """
     base = pl.col(col)
 
     if isinstance(agg, pl.Expr):
@@ -99,14 +279,6 @@ def _expr_from_agg(col: str, agg: Any) -> "pl.Expr":
 
 
 def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
-    """Normalize aggregation specs into a list of Polars expressions.
-
-    Args:
-        agg: Mapping or sequence of aggregation specs.
-
-    Returns:
-        List of Polars expressions.
-    """
     if isinstance(agg, Mapping):
         return [_expr_from_agg(col, spec) for col, spec in agg.items()]
 
@@ -118,72 +290,40 @@ def _normalize_aggs(agg: AggSpec) -> list["pl.Expr"]:
 
 
 def _is_datetime(dtype: object) -> bool:
-    """Return True when the dtype is a Polars datetime.
-
-    Args:
-        dtype: Polars dtype to inspect.
-
-    Returns:
-        True if dtype is Polars Datetime.
-    """
-    # Datetime-only inference (per requirement), version-safe.
+    # Datetime-only inference (ignore Date).
     return isinstance(dtype, pl.Datetime)
 
 
 def _infer_time_col(df: "pl.DataFrame") -> str:
-    """Infer the first datetime-like column name from a DataFrame.
-
-    Args:
-        df: Polars DataFrame to inspect.
-
-    Returns:
-        Column name of the first datetime field.
-    """
-    # Find first Datetime column in schema order; ignore Date columns.
     for name, dtype in df.schema.items():
         if _is_datetime(dtype):
             return name
-    raise ValueError(
-        "resample: time_col not provided and no Datetime column found in DataFrame schema."
-    )
+    raise ValueError("resample: time_col not provided and no Datetime column found in DataFrame schema.")
 
 
 def _ensure_datetime_like(df: "pl.DataFrame", time_col: str) -> "pl.DataFrame":
-    """Ensure a time column is cast to datetime for resampling.
-
-    Args:
-        df: Polars DataFrame.
-        time_col: Column name to validate.
-
-    Returns:
-        DataFrame with time column cast to datetime if needed.
-    """
     dtype = df.schema.get(time_col)
     if dtype is None:
         raise KeyError(f"resample: time_col '{time_col}' not found in DataFrame columns.")
 
-    # Explicit Date time_col is allowed, but we cast it up so minute/hour resampling works.
+    # Date is allowed but cast up so sub-day resampling works.
     if isinstance(dtype, pl.Date):
         return df.with_columns(pl.col(time_col).cast(pl.Datetime))
 
     if isinstance(dtype, pl.Datetime):
         return df
 
-    # If user passed a non-temporal column explicitly, try to cast for convenience.
+    # Convenience: attempt cast for non-temporal column.
     return df.with_columns(pl.col(time_col).cast(pl.Datetime))
 
 
 def _timedelta_to_polars_duration(td: datetime.timedelta) -> str:
-    """
-    Convert python timedelta -> polars duration string.
-    We pick the largest unit that divides evenly (w/d/h/m/s/ms/us).
-    """
+    """Convert python timedelta -> polars duration string (w/d/h/m/s/ms/us)."""
     if td < datetime.timedelta(0):
         raise ValueError(f"Negative timedelta not supported: {td!r}")
 
     total_us = int(td.total_seconds() * 1_000_000)
 
-    # Polars duration strings: "1w", "1d", "1h", "1m", "1s", "10ms", "10us"
     units = [
         (7 * 24 * 3600 * 1_000_000, "w"),
         (24 * 3600 * 1_000_000, "d"),
@@ -198,19 +338,10 @@ def _timedelta_to_polars_duration(td: datetime.timedelta) -> str:
         if total_us % factor == 0:
             return f"{total_us // factor}{suffix}"
 
-    # Should never hit because "us" covers everything
     return f"{total_us}us"
 
 
 def _normalize_duration(v: str | datetime.timedelta | None) -> str | None:
-    """Normalize duration inputs to a Polars duration string.
-
-    Args:
-        v: Duration string, timedelta, or None.
-
-    Returns:
-        Normalized duration string or None.
-    """
     if v is None:
         return None
     if isinstance(v, str):
@@ -228,18 +359,6 @@ def _upsample_single(
     offset: str | datetime.timedelta | None,
     keep_group_order: bool,
 ) -> "pl.DataFrame":
-    """Upsample a single DataFrame with normalized duration arguments.
-
-    Args:
-        df: Polars DataFrame to upsample.
-        time_col: Name of the time column.
-        every: Sampling interval.
-        offset: Optional offset interval.
-        keep_group_order: Preserve input order when grouping.
-
-    Returns:
-        Upsampled Polars DataFrame.
-    """
     df = df.sort(time_col)
 
     every_n = _normalize_duration(every)
@@ -283,18 +402,10 @@ def resample(
     keep_group_order: bool = True,
 ) -> "pl.DataFrame":
     """
-    Pandas-ish resample for Polars:
+    Pandas-ish resample for Polars.
 
     - agg is None  -> upsample (insert missing timestamps)
     - agg provided -> group_by_dynamic + aggregations
-
-    If time_col is None:
-      - infer first Datetime column (NOT Date) by schema order
-      - raise ValueError if none exists
-
-    Timedelta support:
-      - every/period/offset accept str or datetime.timedelta; timedelta gets normalized
-        to polars duration strings to keep older polars compatible.
     """
     gb = _normalize_group_by(group_by)
 
@@ -388,13 +499,10 @@ def resample(
         },
     )
 
-    return (
-        df.group_by_dynamic(**gbd_kwargs)
-        .agg(aggs)
-        .sort([*(gb or []), time_col])
-    )
+    return df.group_by_dynamic(**gbd_kwargs).agg(aggs).sort([*(gb or []), time_col])
 
 
+# Attach methods to Polars DataFrame at import time
 if pl is not None:
     setattr(pl.DataFrame, "join_coalesced", join_coalesced)
     setattr(pl.DataFrame, "resample", resample)

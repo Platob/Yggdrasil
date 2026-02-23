@@ -6,7 +6,7 @@ import time
 import pytest
 
 # Be resilient to project layout differences
-from yggdrasil.pyutils.waiting_config import WaitingConfig, DEFAULT_WAITING_CONFIG
+from yggdrasil.dataclasses.waiting import WaitingConfig, DEFAULT_WAITING_CONFIG
 
 
 def test_default_instance_matches_constant():

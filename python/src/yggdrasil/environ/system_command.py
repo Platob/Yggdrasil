@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence, Union, TYPE_CHECKING, Optional
 
-from yggdrasil.pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 if TYPE_CHECKING:
     from .environment import PyEnv
@@ -312,7 +312,7 @@ class SystemCommand:
         self,
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
-        auto_install: bool = True
+        auto_install: bool = False
     ) -> Union["SystemCommand", "SystemCommandError"]:
         if self.completed is not None:
             return self.completed  # type: ignore[return-value]

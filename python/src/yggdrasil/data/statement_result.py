@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 import pyarrow as pa
-from yggdrasil.pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 if TYPE_CHECKING:
     import pandas
@@ -51,7 +52,7 @@ class StatementResult(ABC):
     # Lifecycle / internal caches (NOT dataclass fields)
     # -------------------------------------------------------------------------
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         # These are intentionally not dataclass fields.
         self._arrow_table: Optional[pa.Table] = None
         self._spark_df: Optional["pyspark.sql.DataFrame"] = None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -17,10 +17,14 @@ from urllib3.exceptions import (
     SSLError,
 )
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .response import HTTPResponse
 from ..request import PreparedRequest
 from ..session import Session
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
+from ...enums import SaveMode
+
+if TYPE_CHECKING:
+    from ...databricks.sql.table import Table
 
 __all__ = ["HTTPSession"]
 
@@ -93,24 +97,35 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
         *,
-        add_statistics: bool = False,
+        add_statistics: Optional[bool] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None
+        wait: Optional[WaitingConfigArg] = None,
+        cache: Optional["Table"] = None
     ) -> HTTPResponse:
         """
         Implementation of the abstract send method.
         Handles the actual urllib3 network call and custom retry logic.
         """
+        if cache is not None:
+            anon = request.anonymize(mode="redact")
+            ds = cache.to_arrow_dataset(
+                filters=[
+                    ("request_host", "=", anon.url.host),
+                    ("request_path", "=", anon.url.path),
+                    ("request_body_hash64", "=", anon.body.xxh3_64().intdigest()),
+                ]
+            ).to_table()
+
         http_pool = self._http_pool
         wait_cfg = self.waiting if wait is None else WaitingConfig.check_arg(wait)
 
         start = time.time()
         last_exc: Exception | None = None
         num_tries = max(wait_cfg.retries, 0) + 1
+        result: HTTPResponse = None
 
         for iteration in range(num_tries):
             resp: BaseHTTPResponse | None = None
-
             request.sent_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
 
             try:
@@ -133,7 +148,7 @@ class HTTPSession(Session):
                     wait_cfg.sleep(iteration=iteration, start=start)
                     continue
 
-                return HTTPResponse.from_urllib3(
+                result = HTTPResponse.from_urllib3(
                     request=request,
                     response=resp,
                     stream=stream,
@@ -152,6 +167,17 @@ class HTTPSession(Session):
                 wait_cfg.sleep(iteration=iteration, start=start)
                 continue
 
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("Retry loop exited unexpectedly")
+        if result is None:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("Retry loop exited unexpectedly")
+
+        if cache is not None:
+            # insert
+            batch = result.anonymize(mode="redact").to_arrow_batch()
+            cache.insert(
+                batch,
+                mode=SaveMode.APPEND,
+                match_by=["request_host", "request_path", "request_body"]
+            )
+        return result

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping, Tuple, Union, Any, Iterable, Optional
+from typing import Mapping, Tuple, Union, Any
 from urllib.parse import (
     parse_qsl,
     quote,

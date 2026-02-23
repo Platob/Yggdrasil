@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
+from threading import Thread
 from typing import Any, Callable, Deque, Dict, Generator, Iterable, Iterator, Optional, Set, Tuple
 
 __all__ = ["Job", "JobThreadPoolExecutor"]
@@ -29,6 +30,15 @@ class Job:
 
     def run(self) -> Any:
         return self.func(*self.args, **self.kwargs)
+
+    def fire_and_forget(self):
+        t = Thread(
+            target=self.func,
+            args=self.args or (),
+            kwargs=self.kwargs or {}
+        )
+
+        t.start()
 
 
 class JobThreadPoolExecutor(ThreadPoolExecutor):

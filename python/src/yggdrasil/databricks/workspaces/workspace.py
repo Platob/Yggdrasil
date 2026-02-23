@@ -6,14 +6,14 @@ import os
 import posixpath
 import time
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Thread
+from threading import Thread, RLock
 from typing import (
     BinaryIO,
     Iterator,
     Optional,
-    Union, TYPE_CHECKING, List, Set, Iterable
+    Union, TYPE_CHECKING, List, Set, Iterable, ClassVar
 )
 
 from databricks.sdk import WorkspaceClient
@@ -23,10 +23,10 @@ from databricks.sdk.service.files import DirectoryEntry
 from databricks.sdk.service.iam import User, ComplexValue
 from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .path import DatabricksPath, DatabricksPathKind
+from ...dataclasses.expiring import ExpiringDict, Expiring, RefreshResult
 from ...environ import UserInfo
-from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 from ...version import __version__ as YGGDRASIL_VERSION
 
 if TYPE_CHECKING:
@@ -147,6 +147,12 @@ class Workspace:
 
     _was_connected: bool = dataclasses.field(default=None, repr=False, compare=False, hash=False)
     _cached_token: Optional[str] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+
+    # -------------------------
+    # Singleton / "current" workspace
+    # -------------------------
+    _CURRENT: ClassVar[Optional["Workspace"]] = None
+    _CURRENT_LOCK: ClassVar[RLock] = RLock()
 
     # -------------------------
     # Python methods
@@ -331,6 +337,12 @@ class Workspace:
 
         instance = self.clone_instance() if clone else self
 
+        if not instance.product:
+            current_user = UserInfo.current()
+
+            instance.product = current_user.email or current_user.hostname or "yggdrasil"
+            instance.product_version = YGGDRASIL_VERSION
+
         # Build Config from config_dict if available, else from fields.
         kwargs = {
             "host": instance.host,
@@ -367,7 +379,10 @@ class Workspace:
             if "cannot configure default credentials" in str(e) and instance.auth_type is None:
                 last_error = e
 
-                auth_types = ["runtime"] if instance.is_in_databricks_environment() else ["external-browser"]
+                if instance.is_in_databricks_environment():
+                    auth_types = ["runtime"]
+                else:
+                    auth_types = ["external-browser"]
 
                 for auth_type in auth_types:
                     build_kwargs["auth_type"] = auth_type
@@ -394,20 +409,13 @@ class Workspace:
                 raise e
 
         # backfill resolved config values
+        conf = instance._sdk.config
+
         for key in list(kwargs.keys()):
             if getattr(instance, key, None) is None:
-                v = getattr(instance._sdk.config, key, None)
+                v = getattr(conf, key, None)
                 if v is not None:
                     setattr(instance, key, v)
-
-        if not self.product and self.auth_type == "external-browser":
-            conf = instance._sdk.config
-            conf._init_product(
-                self.current_user.user_name,
-                "0.0.0"
-            )
-
-            self.product, self.product_version = conf._product_info
 
         return instance
 
@@ -450,6 +458,38 @@ class Workspace:
     @property
     def safe_host(self):
         return self.sdk().config.host
+
+    @property
+    def aws_region(self):
+        return "eu-central-1"
+
+    @classmethod
+    def current(cls, reset: bool = False, **overrides) -> "Workspace":
+        """
+        Return the process-wide singleton Workspace instance.
+
+        - Thread-safe lazy init.
+        - Does NOT auto-connect (keeps your existing lazy sdk() behavior).
+        - Optional overrides are applied only when creating (or when reset=True).
+        """
+        with cls._CURRENT_LOCK:
+            if reset or cls._CURRENT is None:
+                cls._CURRENT = cls(**overrides)
+            elif overrides:
+                # "best effort" update: only set provided keys
+                for k, v in overrides.items():
+                    setattr(cls._CURRENT, k, v)
+
+            return cls._CURRENT
+
+    @classmethod
+    def set_current(cls, workspace: Optional["Workspace"]) -> None:
+        """
+        Replace the singleton (useful for tests / dependency injection).
+        Pass None to clear.
+        """
+        with cls._CURRENT_LOCK:
+            cls._CURRENT = workspace
 
     @property
     def current_user(self):
@@ -504,7 +544,10 @@ class Workspace:
 
         return found
 
-    def current_token(self) -> str:
+    def current_token(
+        self,
+        expiring: bool = False
+    ) -> str:
         """Return the active API token for this workspace.
 
         Returns:
@@ -515,9 +558,20 @@ class Workspace:
 
         sdk = self.sdk()
         conf = sdk.config
-        token = conf._credentials_strategy(conf)()["Authorization"].replace("Bearer ", "")
 
-        return token
+        created_at_ns = time.time_ns()
+        token = conf._credentials_strategy(conf)()["Authorization"].replace("Bearer ", "")
+        ttl = 1_800_000_000_000
+
+        if not expiring:
+            return token
+
+        return WorkspaceToken.create(
+            token,
+            created_at=created_at_ns,
+            ttl=ttl,
+            workspace=self
+        )
 
     # ------------------------------------------------------------------ #
     # Path helpers
@@ -854,9 +908,8 @@ class Workspace:
                     ("Product", self.product),
                     ("ProductVersion", self.product_version),
                     ("ProductTag", self.product_tag),
-                    ("UserSAM", userinfo.sam),
-                    ("UserEmail", userinfo.email),
-                    ("UserHostname", userinfo.hostname),
+                    ("CreatorEmail", userinfo.email),
+                    ("CreatorHostname", userinfo.hostname),
                 )
                 if v
             }
@@ -1005,11 +1058,7 @@ DBXWorkspace = Workspace
 @dataclass
 class WorkspaceService(ABC):
     """Base class for helpers that depend on a Workspace."""
-    workspace: Workspace = dataclasses.field(default_factory=Workspace)
-
-    def __post_init__(self):
-        if self.workspace is None:
-            self.workspace = Workspace()
+    workspace: Workspace
 
     def __enter__(self):
         """Enter a context manager and connect the workspace.
@@ -1098,3 +1147,11 @@ class WorkspaceService(ABC):
             with_public=with_public,
             raise_error=raise_error
         )
+
+
+@dataclass
+class WorkspaceToken(Expiring[str]):
+    workspace: Workspace = field(default_factory=Workspace)
+
+    def _refresh(self) -> RefreshResult[str]:
+        return RefreshResult.make(self.workspace.current_token(expiring=False))

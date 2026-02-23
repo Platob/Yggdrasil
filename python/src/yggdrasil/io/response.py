@@ -460,10 +460,16 @@ class Response:
                     metadata={"comment": "Raw binary payload of the response"},
                 ),
                 pa.field(
+                    name=f"{column_prefix}body_hash",
+                    type=pa.binary(),
+                    nullable=True,
+                    metadata={"algorithm": "blake3", "comment": "Blake3 hash of the body"},
+                ),
+                pa.field(
                     name=f"{column_prefix}body_hash64",
                     type=pa.int64(),
                     nullable=True,
-                    metadata={"algorithm": "xxh3_64", "comment": "64-bit hash of the body"},
+                    metadata={"algorithm": "xxh3_64", "comment": "XXH3 int 64 hash of the body"},
                 ),
                 pa.field(
                     name=f"{column_prefix}received_at",
@@ -478,15 +484,16 @@ class Response:
         headers_v = None if not self.headers else dict(self.headers)
         body_bytes = self.buffer.to_bytes()
 
-        # Minor optimization: use the already converted body_bytes
+        body_h = self.buffer.blake3().digest() if body_bytes is not None else None
         body_h64 = self.buffer.xxh3_64().intdigest() if body_bytes is not None else None
 
         resp_arrays = [
             pa.array([self.status_code], type=resp_schema.field(0).type),
             pa.array([headers_v], type=resp_schema.field(1).type),
             pa.array([body_bytes], type=resp_schema.field(2).type),
-            pa.array([body_h64], type=resp_schema.field(3).type),
-            pa.array([self.received_at_timestamp], type=resp_schema.field(4).type),
+            pa.array([body_h], type=resp_schema.field(3).type),
+            pa.array([body_h64], type=resp_schema.field(4).type),
+            pa.array([self.received_at_timestamp], type=resp_schema.field(5).type),
         ]
 
         # 4) Combine request columns + response columns into one RecordBatch

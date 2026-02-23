@@ -241,30 +241,53 @@ class PreparedRequest:
         self,
         parse: bool = False,
         *,
-        column_prefix: str = "",
+        column_prefix: str = "request_",
     ) -> pa.RecordBatch:
         if parse:
             raise NotImplementedError
 
         schema = pa.schema(
             [
-                pa.field(f"{column_prefix}method", pa.string(), nullable=False, metadata={"comment": "The HTTP verb (GET, POST, etc.)"}),
-                pa.field(f"{column_prefix}url", pa.string(), nullable=False, metadata={"comment": "The full request URL string"}),
-                pa.field(f"{column_prefix}url_scheme", pa.string(), nullable=True, metadata={"comment": "URL protocol (e.g., http, https)"}),
-                pa.field(f"{column_prefix}url_userinfo", pa.string(), nullable=True, metadata={"comment": "Authentication information in the URL"}),
-                pa.field(f"{column_prefix}url_host", pa.string(), nullable=True, metadata={"comment": "Domain name or IP address of the server"}),
-                pa.field(f"{column_prefix}url_port", pa.int32(), nullable=True, metadata={"comment": "TCP port number"}),
-                pa.field(f"{column_prefix}url_path", pa.string(), nullable=True, metadata={"comment": "Hierarchical path to the resource"}),
+                pa.field(f"{column_prefix}method", pa.string(), nullable=False,
+                         metadata={"comment": "The HTTP verb (GET, POST, etc.)"}),
+                pa.field(f"{column_prefix}url", pa.string(), nullable=False,
+                         metadata={"comment": "The full request URL string"}),
+                pa.field(f"{column_prefix}url_scheme", pa.string(), nullable=True,
+                         metadata={"comment": "URL protocol (e.g., http, https)"}),
+                pa.field(f"{column_prefix}url_userinfo", pa.string(), nullable=True,
+                         metadata={"comment": "Authentication information in the URL"}),
+                pa.field(f"{column_prefix}url_host", pa.string(), nullable=True,
+                         metadata={"comment": "Domain name or IP address of the server"}),
+                pa.field(f"{column_prefix}url_port", pa.int32(), nullable=True,
+                         metadata={"comment": "TCP port number"}),
+                pa.field(f"{column_prefix}url_path", pa.string(), nullable=True,
+                         metadata={"comment": "Hierarchical path to the resource"}),
                 pa.field(
                     f"{column_prefix}url_query",
-                    pa.map_(pa.field("key", pa.string(), nullable=False), pa.field("value", pa.string(), nullable=False)),
+                    pa.map_(pa.field("key", pa.string(), nullable=False),
+                            pa.field("value", pa.string(), nullable=False)),
                     nullable=True,
                     metadata={"comment": "Parsed query string parameters as key-value pairs"},
                 ),
-                pa.field(f"{column_prefix}url_fragment", pa.string(), nullable=True, metadata={"comment": "The internal anchor or fragment identifier"}),
-                pa.field(f"{column_prefix}body", pa.binary(), nullable=True, metadata={"comment": "Raw binary payload of the request"}),
-                pa.field(f"{column_prefix}body_hash64", pa.int64(), nullable=True, metadata={"comment": "64-bit hash (xxh3) of the request body", "algorithm": "xxh3_64"}),
-                pa.field(f"{column_prefix}sent_at", pa.timestamp("us", "UTC"), nullable=False, metadata={"comment": "UTC timestamp of when the request was dispatched"}),
+                pa.field(f"{column_prefix}url_fragment", pa.string(), nullable=True,
+                         metadata={"comment": "The internal anchor or fragment identifier"}),
+                pa.field(
+                    name=f"{column_prefix}body_hash",
+                    type=pa.binary(),
+                    nullable=True,
+                    metadata={"algorithm": "blake3", "comment": "Blake3 hash of the body"},
+                ),
+                pa.field(
+                    name=f"{column_prefix}body_hash64",
+                    type=pa.int64(),
+                    nullable=True,
+                    metadata={"algorithm": "xxh3_64", "comment": "XXH3 int 64 hash of the body"},
+                ),
+                pa.field(f"{column_prefix}body_blake3", pa.binary(32), nullable=True,
+                         metadata={"comment": "256-bit BLAKE3 cryptographic hash of the request body",
+                                   "algorithm": "blake3"}),
+                pa.field(f"{column_prefix}sent_at", pa.timestamp("us", "UTC"), nullable=False,
+                         metadata={"comment": "UTC timestamp of when the request was dispatched"}),
             ]
         )
 
@@ -281,7 +304,12 @@ class PreparedRequest:
         q = u.query_dict
         q_v = None if not q else {k: "|".join(vs) for k, vs in q.items()}
 
-        body_bytes, body_h64 = (None, None) if self.buffer is None else (self.buffer.to_bytes(), self.buffer.xxh3_64().intdigest())
+        if self.buffer is None:
+            body_bytes, body_h64, body_blake3 = None, None, None
+        else:
+            body_bytes = self.buffer.to_bytes()
+            body_h = self.buffer.blake3().digest()
+            body_h64 = self.buffer.xxh3_64().intdigest()
 
         arrays = [
             pa.array([self.method], type=pa.string()),
@@ -294,6 +322,7 @@ class PreparedRequest:
             pa.array([q_v], type=schema.field(f"{column_prefix}url_query").type),
             pa.array([fragment_v], type=pa.string()),
             pa.array([body_bytes], type=pa.binary()),
+            pa.array([body_h64], type=pa.binary()),
             pa.array([body_h64], type=pa.int64()),
             pa.array([self.sent_at_timestamp], type=pa.timestamp("us", "UTC")),
         ]

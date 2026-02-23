@@ -78,8 +78,13 @@ class TestSQLEngine(unittest.TestCase):
 
     def test_warehouse_crud(self):
         warehouses = self.workspace.warehouses()
-        warehouse = warehouses.create(name="tmp warehouse")
 
-        self.assertEqual(warehouse.warehouse_name, "tmp warehouse")
+        warehouse = None
 
-        warehouse.delete()
+        try:
+            warehouse = warehouses.create(name="tmp warehouse", wait=False)
+
+            self.assertEqual(warehouse.warehouse_name, "tmp warehouse")
+        finally:
+            if warehouse:
+                warehouse.delete()

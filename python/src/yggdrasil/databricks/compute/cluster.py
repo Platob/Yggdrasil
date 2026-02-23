@@ -10,13 +10,11 @@ for clusters. Metadata is stored in custom tags prefixed with
 from __future__ import annotations
 
 import dataclasses
-import datetime as dt
 import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass
-from types import ModuleType
 from typing import Any, Iterator, Optional, Union, List, Dict, ClassVar, Callable, Iterable
 
 from databricks.sdk import ClustersAPI
@@ -28,14 +26,14 @@ from databricks.sdk.service.compute import (
 )
 from databricks.sdk.service.compute import SparkVersion
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .execution_context import ExecutionContext
 from ..workspaces.workspace import WorkspaceService
+from ...dataclasses.expiring import ExpiringDict
 from ...environ import UserInfo, PyEnv
 from ...environ.pip_settings import PipIndexSettings
 from ...io.url import URL
 from ...pyutils.equality import dicts_equal
-from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.waiting_config import WaitingConfig, WaitingConfigArg
 
 _CREATE_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.create).parameters.keys()}
 _EDIT_ARG_NAMES = {_ for _ in inspect.signature(ClustersAPI.edit).parameters.keys()}
@@ -85,7 +83,9 @@ _PYTHON_BY_DBR: dict[str, tuple[int, int]] = {
     "17.2": (3, 12),
     "17.3": (3, 12),
     "18.0": (3, 12),
+    "18.1": (3, 12),
 }
+
 ALL_PURPOSE_CLUSTER: "Cluster | None" = None
 
 
@@ -106,9 +106,8 @@ class Cluster(WorkspaceService):
     cluster_id: Optional[str] = None
     cluster_name: Optional[str] = None
     
-    _details: Optional["ClusterDetails"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _details_refresh_time: float = dataclasses.field(default=0, repr=False, hash=False, compare=False)
-    _system_context: Optional[ExecutionContext] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
     # host → Cluster instance
@@ -197,12 +196,6 @@ class Cluster(WorkspaceService):
         """Return the current cluster name."""
         return self.cluster_name
 
-    @property
-    def system_context(self):
-        if self._system_context is None:
-            self._system_context = self.context(language=Language.PYTHON)
-        return self._system_context
-
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
         return self.workspace.is_in_databricks_environment()
@@ -238,11 +231,19 @@ class Cluster(WorkspaceService):
     @details.setter
     def details(self, value: "ClusterDetails"):
         """Cache cluster details and update identifiers."""
-        self._details_refresh_time = time.time()
-        self._details = value
+        if isinstance(value, ClusterDetails):
+            self._details_refresh_time = time.time()
+            self._details = value
+
+            self.cluster_name = value.cluster_name
+        else:
+            self._details_refresh_time = 0
+            self._details = None
+
+            self.cluster_name = None
 
         self.cluster_id = value.cluster_id
-        self.cluster_name = value.cluster_name
+
 
     @property
     def state(self):
@@ -271,6 +272,10 @@ class Cluster(WorkspaceService):
         """Return True when the cluster is in an error state."""
         return self.state == State.ERROR
 
+    @property
+    def requirements(self):
+        return self.context(context_key="system").requirements
+
     def raise_for_status(self):
         """Raise a DatabricksError if the cluster is in an error state."""
         if self.is_error:
@@ -293,14 +298,16 @@ class Cluster(WorkspaceService):
             The current Cluster instance.
         """
         wait = WaitingConfig.check_arg(wait)
-        iteration, start = 0, time.time()
 
-        if wait.timeout:
+        if wait:
+            iteration, start = 0, time.time()
+
             while self.is_pending:
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
 
             self.wait_installed_libraries(
+                wait=wait,
                 raise_error=raise_error
             )
 
@@ -349,12 +356,20 @@ class Cluster(WorkspaceService):
 
     def all_purpose_cluster(
         self,
-        name: str = "Yggdrasil All Purpose",
+        name: Optional[str] = None,
+        python_version: Optional[str | tuple[int, ...]] = None,
     ):
         global ALL_PURPOSE_CLUSTER
 
         if ALL_PURPOSE_CLUSTER is not None:
             return ALL_PURPOSE_CLUSTER
+
+        if not name:
+            if not python_version:
+                major, minor, _ = PyEnv.current().version_info
+                python_version = f"{major}.{minor}"
+
+            name = f"Yggdrasil All Purpose py{python_version}"
 
         ALL_PURPOSE_CLUSTER = self.find_cluster(
             cluster_name=name,
@@ -362,9 +377,15 @@ class Cluster(WorkspaceService):
         )
 
         if ALL_PURPOSE_CLUSTER is None:
-            ALL_PURPOSE_CLUSTER = self.create(
+            ALL_PURPOSE_CLUSTER = self.create_or_update(
                 cluster_name=name,
-                libraries=["ygg", "uv"]
+                python_version=python_version,
+                libraries=[
+                    "ygg", "uv", "dill",
+                    "mongoengine", "sqlalchemy",
+                    "wma-data",
+                    "datamanagement", "TSSecrets"
+                ]
             )
 
         return ALL_PURPOSE_CLUSTER
@@ -586,10 +607,14 @@ class Cluster(WorkspaceService):
             The current Cluster instance.
         """
         cluster_spec["autotermination_minutes"] = int(cluster_spec.get("autotermination_minutes", 30))
-        update_details = self._check_details(details=ClusterDetails(), **cluster_spec)
+
         update_details = {
             k: v
-            for k, v in update_details.as_shallow_dict().items()
+            for k, v in (
+                self._check_details(details=ClusterDetails(), **cluster_spec)
+                .as_shallow_dict()
+                .items()
+            )
             if k in _CREATE_ARG_NAMES
         }
 
@@ -606,7 +631,7 @@ class Cluster(WorkspaceService):
             self
         )
 
-        self.install_libraries(libraries=libraries, raise_error=False, wait_timeout=None)
+        self.install_libraries(libraries=libraries, raise_error=False, wait=False)
 
         self.wait_for_status(wait=wait)
 
@@ -630,7 +655,7 @@ class Cluster(WorkspaceService):
         Returns:
             The updated Cluster instance.
         """
-        self.install_libraries(libraries=libraries, wait_timeout=None, raise_error=False)
+        self.install_libraries(libraries=libraries, wait=False, raise_error=False)
 
         existing_details = {
             k: v
@@ -908,6 +933,7 @@ class Cluster(WorkspaceService):
     def decorate(
         self,
         func: Optional[Callable] = None,
+        *,
         command: Optional[str] = None,
         language: Optional[Language] = None,
         command_id: Optional[str] = None,
@@ -938,7 +964,7 @@ class Cluster(WorkspaceService):
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        wait_timeout: Optional[dt.timedelta] = dt.timedelta(minutes=20),
+        wait: Optional[WaitingConfigArg] = True,
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
     ) -> "Cluster":
@@ -946,7 +972,7 @@ class Cluster(WorkspaceService):
 
         Args:
             libraries: Libraries or package names to install.
-            wait_timeout: Optional timeout for installation.
+            wait: Optional timeout for installation.
             pip_settings: Optional pip index settings.
             raise_error: Whether to raise on install failure.
 
@@ -983,11 +1009,10 @@ class Cluster(WorkspaceService):
                 ]
             )
 
-            if wait_timeout is not None:
-                self.wait_installed_libraries(
-                    timeout=wait_timeout,
-                    raise_error=raise_error
-                )
+            self.wait_installed_libraries(
+                wait=wait,
+                raise_error=raise_error
+            )
 
         return self
 
@@ -1056,13 +1081,13 @@ class Cluster(WorkspaceService):
 
     def wait_installed_libraries(
         self,
-        timeout: dt.timedelta = dt.timedelta(minutes=20),
+        wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
     ):
         """Wait for library installations to finish on the cluster.
 
         Args:
-            timeout: Maximum time to wait for installs.
+            wait: Maximum time to wait for installs.
             raise_error: Whether to raise on failures.
 
         Returns:
@@ -1071,58 +1096,41 @@ class Cluster(WorkspaceService):
         if not self.is_running:
             return self
 
-        statuses = list(self.installed_library_statuses())
+        wait = WaitingConfig.check_arg(wait)
 
-        max_time = time.time() + timeout.total_seconds()
-
-        while True:
-            failed = [
-                _.library for _ in statuses
-                if _.library and _.status == LibraryInstallStatus.FAILED
-            ]
-
-            if failed:
-                if raise_error:
-                    raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
-
-                LOGGER.exception(
-                    "Libraries %s in %s failed to install",
-                    failed, self
-                )
-
-            running = [
-                _ for _ in statuses if _.status in (
-                    LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING,
-                    LibraryInstallStatus.RESOLVING
-                )
-            ]
-
-            if not running:
-                break
-
-            if time.time() > max_time:
-                raise TimeoutError(
-                    "Waiting %s to install libraries timed out" % self
-                )
-
-            time.sleep(5)
+        if wait:
             statuses = list(self.installed_library_statuses())
+            start, iteration = time.time(), 0
+
+            while True:
+                failed = [
+                    _.library for _ in statuses
+                    if _.library and _.status == LibraryInstallStatus.FAILED
+                ]
+
+                if failed:
+                    if raise_error:
+                        raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
+
+                    LOGGER.exception(
+                        "Libraries %s in %s failed to install",
+                        failed, self
+                    )
+
+                running = [
+                    _ for _ in statuses if _.status in (
+                        LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING,
+                        LibraryInstallStatus.RESOLVING
+                    )
+                ]
+
+                if not running:
+                    break
+
+                wait.sleep(iteration=iteration, start=start)
+                statuses = list(self.installed_library_statuses())
 
         return self
-
-    def install_temporary_libraries(
-        self,
-        libraries: str | ModuleType | List[str | ModuleType],
-    ):
-        """Upload local libraries to the cluster's site-packages.
-
-        Args:
-            libraries: Library path, name, module, or iterable of these.
-
-        Returns:
-            The uploaded library argument(s).
-        """
-        return self.system_context.install_temporary_libraries(libraries=libraries)
 
     def _check_library(
         self,

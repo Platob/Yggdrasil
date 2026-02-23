@@ -11,17 +11,18 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple
+from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple, Literal
 
 from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
 
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
+from ...dataclasses.expiring import ExpiringDict
+from ...environ import PyEnv, UserInfo
 from ...environ.modules import resolve_local_lib_path
 from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
-from ...pyutils.expiring_dict import ExpiringDict
-from ...pyutils.waiting_config import WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -97,6 +98,9 @@ class ExecutionContext:
 
     _was_connected: Optional[bool] = dc.field(default=None, repr=False, compare=False, hash=False)
     _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False, compare=False, hash=False)
+    _requirements: Optional[list[tuple[str]]] = dc.field(default=None, repr=False, compare=False, hash=False)
+    _pyenv_check_timestamp: int = dc.field(default=0, repr=False, compare=False, hash=False)
+
     _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False, compare=False, hash=False)
     _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False, compare=False, hash=False)
 
@@ -192,11 +196,15 @@ class ExecutionContext:
         if self._remote_metadata is not None:
             return self._remote_metadata
 
-        key = self.context_key or self.context_id
+        if not self.context_key:
+            usr, env = UserInfo.current(), PyEnv.current()
+            major, minor, _ = env.version_info
 
-        context_path = f"~/.ygg/dbx-ctx/{key}"
+            self.context_key = f"{usr.hostname}-py{major}.{minor}"
+
+        context_path = f"~/.ygg/dbx-ctx/{self.context_key}"
         tmp_path = context_path + "/tmp/"
-        libs_path = context_path + "/python/lib/site-packages/"
+        libs_path = context_path + "/python/lib/site-packages"
 
         self._remote_metadata = RemoteMetadata(
             context_path=context_path,
@@ -205,6 +213,32 @@ class ExecutionContext:
         )
 
         return self._remote_metadata
+
+    @property
+    def requirements(self):
+        if self._requirements is not None:
+            return self._requirements
+
+        command = f"uv pip --directory {str(self.remote_metadata.libs_path)!r} list --format=json"
+
+        try:
+            reqs = self.command(
+                command=command,
+                language="shell",
+                include_libs=True
+            ).start().result()
+
+            self._requirements = [
+                (kw["name"], kw["version"])
+                for kw in reqs
+            ]
+        except Exception as e:
+            if "exit code 2" in str(e):
+                self._requirements = []
+            else:
+                raise e
+
+        return self._requirements
 
     # ------------ internal helpers ------------
     def workspace_client(self):
@@ -268,7 +302,7 @@ class ExecutionContext:
         instance = ExecutionContext(
             cluster=self.cluster,
             context_id=created.id,
-            context_key=context_key,
+            context_key=context_key or self.context_key or os.urandom(8).hex(),
             language=language
         )
 
@@ -313,6 +347,7 @@ class ExecutionContext:
 
         return self.create(
             language=language,
+            context_key=self.context_key,
             wait=wait
         )
 
@@ -348,35 +383,53 @@ class ExecutionContext:
             self.context_id = None
 
     # ------------ public API ------------
+    def syspath_lines(self):
+        return "\n".join([
+            "import os, sys",
+            f"_p = os.path.expanduser({self.remote_metadata.libs_path!r})",
+            "if _p not in sys.path:",
+            "    sys.path.insert(0, _p)",
+        ])
+    
     def command(
         self,
         command: Optional[str] = None,
-        language: Optional[Language] = None,
+        language: Optional[Language | Literal["python", "r", "sql", "scala", "shell"]] = None,
         *,
         context: Optional["ExecutionContext"] = None,
         func: Optional[Callable] = None,
         command_id: Optional[str] = None,
         environ: Optional[Dict[str, str]] = None,
         packages: list[str] | None = None,
-        inject_libs: bool = True,  # new param
+        include_libs: bool = False
     ) -> "CommandExecution":
         context = self if context is None else context
+        
+        if command:
+            if language == "shell":
+                language = Language.PYTHON
 
-        # Prepend sys.path injection when we have uploaded libs
-        if (
-            inject_libs
-            and command is not None
-            and (language is None or language == Language.PYTHON)
-        ):
-            rm = self.remote_metadata  # use cached value only — no lazy fetch here
-            if rm and rm.libs_path:
-                syspath_prefix = (
-                    f"import sys as _sys\n"
-                    f"if {rm.libs_path!r} not in _sys.path:\n"
-                    f"    _sys.path.insert(0, {rm.libs_path!r})\n"
-                    f"del _sys\n"
-                )
-                command = syspath_prefix + command
+                command = f"""
+import subprocess, sys, shlex, pathlib
+
+cmd = shlex.split({str(command)!r})
+cmd = [str(pathlib.Path(arg).expanduser()) if arg.startswith("~/") else arg for arg in cmd]
+
+p = subprocess.run(cmd, text=True, capture_output=True)
+
+print(p.stdout)
+
+if p.returncode != 0:
+    raise RuntimeError(
+        f"Command {{cmd}} failed with exit code {{p.returncode}}:\\n"
+        f"stderr: {{p.stderr.strip()}}"
+    )
+"""
+            if include_libs:
+                command = self.syspath_lines() + "\n" + command
+        else:
+            if isinstance(language, str):
+                language = Language[language]
 
         return CommandExecution(
             context=context,
@@ -661,6 +714,7 @@ with zipfile.ZipFile(buf, "r") as zf:
 
                 target = os.path.join(remote_root, rel)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
+                print(target)
                 with zf.open(n, "r") as src, open(target, "wb") as dst:
                     dst.write(src.read())
 
@@ -675,28 +729,91 @@ with zipfile.ZipFile(buf, "r") as zf:
     def install_temporary_libraries(
         self,
         libraries: str | ModuleType | List[str | ModuleType],
+        *,
+        pip_install: bool = False
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
         connected = self.connect()
 
-        if isinstance(libraries, (list, tuple, set)):
-            return [connected.install_temporary_libraries(l) for l in libraries]
+        is_collection = isinstance(libraries, (list, tuple, set))
+        items = list(libraries) if is_collection else [libraries]
+        libs_path = connected.remote_metadata.libs_path
 
-        resolved = resolve_local_lib_path(libraries)
-        str_resolved = str(resolved)
+        if pip_install:
+            items = [str(x) for x in items]
 
-        if connected._uploaded_package_roots.get(str_resolved):
-            return libraries
+            r = self.command(
+                command=f"""import subprocess, pathlib, shlex, sys
+tgt = pathlib.Path({str(self.remote_metadata.libs_path)!r}).expanduser()
+tgt.mkdir(parents=True, exist_ok=True)
 
-        libs_path = "/local_disk0/.ephemeral_nfs/cluster_libraries/python/lib/python3.12/site-packages" # connected.remote_metadata.libs_path
+items = {items!r}
 
-        # Packages go into ctx_libs/<package_name>/ or ctx_libs/<module>.py
-        remote_target = posixpath.join(libs_path, resolved.name)
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True)
 
-        connected.upload_local_path({str_resolved: remote_target})
-        connected._uploaded_package_roots[str_resolved] = remote_target
+# 1) global attempt
+cmd_all = ["uv","pip","install", *items, "--update", "--target", str(tgt)]
+p = run(cmd_all)
 
-        LOGGER.info("Installed temporary lib '%s' → %s on %s", resolved, remote_target, connected)
+if p.returncode == 0:
+    print("[ok] installed all")
+    sys.exit(0)
+
+print("[warn] bulk install failed, falling back to per-package installs")
+print(p.stderr.strip() or p.stdout.strip())
+
+# 2) per-item fallback (ignore errors)
+failed = []
+for it in items:
+    p2 = run(["uv","pip","install", it, "--update", "--target", str(tgt)])
+    if p2.returncode != 0:
+        failed.append(it)
+        msg = (p2.stderr.strip() or p2.stdout.strip())
+        print(f"[fail] {{it}} -> {{msg}}")
+
+if failed:
+    raise RuntimeError(f"Failed to install {{failed}}")
+print("[done] fallback complete. failed:", failed)
+sys.exit(0)
+"""
+            ).start().wait()
+        else:
+            upload_map = {
+                str(resolved): posixpath.join(libs_path, resolved.name)
+                for lib in items
+                if not connected._uploaded_package_roots.get(str(resolved := resolve_local_lib_path(lib)))
+            }
+
+            if upload_map:
+                connected.upload_local_path(upload_map)
+                connected._uploaded_package_roots.update(upload_map)
+                for str_resolved, remote_target in upload_map.items():
+                    LOGGER.info("Installed temporary lib '%s' → %s on %s", str_resolved, remote_target, connected)
+
         return libraries
+
+    def check_with_env(
+        self,
+        env: PyEnv,
+        wait: WaitingConfigArg = True
+    ):
+        local_reqs = env.requirements(with_system=False)
+        remote_reqs = self.requirements
+        diffs = diff_installed_libraries(local_reqs, remote_reqs)
+        diffs = [
+            "%s==%s" % (name, meta["current"])
+            for name, meta in diffs.items()
+            if meta and meta["current"] and not name.startswith("ygg")
+        ]
+
+        if diffs:
+            self.install_temporary_libraries(
+                libraries=diffs,
+                pip_install=True
+            )
+            self._requirements = None
+
+        return self
 
 def _decode_result(
     result: CommandStatusResponse,
@@ -733,3 +850,29 @@ def _decode_result(
         output = ""
 
     return output
+
+
+def diff_installed_libraries(
+    current: list[tuple[str, str]],
+    target: list[tuple[str, str]],
+) -> dict[str, dict[str, str | None]]:
+    """
+    Compare two package lists by name + major.minor version.
+    Returns packages that differ, with exact full versions.
+    """
+    def to_major_minor(version: str) -> str:
+        return ".".join(version.split(".")[:2])
+
+    current_map = {name: ver for name, ver in current}
+    target_map  = {name: ver for name, ver in target}
+
+    all_names = current_map.keys() | target_map.keys()
+
+    return {
+        name: {
+            "current": current_map.get(name),
+            "target":  target_map.get(name),
+        }
+        for name in all_names
+        if to_major_minor(current_map.get(name) or "0.0") != to_major_minor(target_map.get(name) or "0.0")
+    }

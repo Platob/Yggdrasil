@@ -186,6 +186,12 @@ class WaitingConfig:
             retries=int(final_retries)
         )
 
+    def is_expired(self, start: float):
+        if not start:
+            return False
+
+        return time.time() - start > self.timeout_total_seconds
+
     def sleep(
         self,
         iteration: int,
