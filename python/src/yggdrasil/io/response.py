@@ -10,7 +10,7 @@ import pyarrow as pa
 
 from yggdrasil.io.headers import anonymize_headers
 from .dynamic_buffer import DynamicBuffer
-from .request import PreparedRequest, ARROW_SCHEMA as REQUEST_ARROW_SCHEMA
+from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
 __all__ = ["Response", "HTTPError"]
 
@@ -50,57 +50,70 @@ def _get_charset(headers: Mapping[str, str]) -> str:
     return "utf-8"
 
 
+# -----------------------------
+# Response schema (fixed + fully described)
+# -----------------------------
 ARROW_SCHEMA = pa.schema(
     [
         pa.field(
             name="response_status_code",
             type=pa.int32(),
             nullable=False,
-            metadata={"comment": "HTTP status code returned by the server"},
+            metadata={
+                "comment": "HTTP status code returned by the server",
+            },
         ),
-        # ✅ headers as list<struct<key:string,value:string>>
         pa.field(
             name="response_headers",
-            type=pa.list_(
-                pa.struct(
-                    [
-                        pa.field("key", pa.string(), nullable=True),
-                        pa.field("value", pa.string(), nullable=True),
-                    ]
-                )
-            ),
+            type=pa.map_(pa.string(), pa.string(), keys_sorted=True),
             nullable=True,
-            metadata={"comment": "Raw HTTP response headers (ordered)"},
+            metadata={
+                "comment": "Raw HTTP response headers as ordered key/value pairs",
+                "keys_sorted": "true"
+            },
         ),
         pa.field(
             name="response_body",
             type=pa.binary(),
             nullable=True,
-            metadata={"comment": "Raw binary payload of the response"},
+            metadata={
+                "comment": "Raw binary payload of the response (bytes)",
+            },
         ),
-        # keep name "body_hash" if you already depend on it, but make it honest: 32B blake3
         pa.field(
             name="response_body_hash",
-            type=pa.binary(32),
+            type=pa.binary(),
             nullable=True,
-            metadata={"algorithm": "blake3", "comment": "256-bit BLAKE3 digest of the body"},
-        ),
-        pa.field(
-            name="response_body_hash64",
-            type=pa.int64(),
-            nullable=True,
-            metadata={"algorithm": "xxh3_64", "comment": "XXH3 64-bit int hash of the body"},
+            metadata={
+                "comment": "256-bit BLAKE3 digest of response_body (32 bytes)",
+                "algorithm": "blake3",
+            },
         ),
         pa.field(
             name="response_received_at",
             type=pa.timestamp("us", "UTC"),
             nullable=False,
-            metadata={"comment": "UTC timestamp when the response was captured"},
+            metadata={
+                "comment": "UTC timestamp when the response was captured",
+                "unit": "us",
+                "tz": "UTC",
+            },
         ),
-    ]
+    ],
+    metadata={
+        "comment": "HTTP response record (single row), designed for deterministic logging + replay.",
+    },
 )
 
-FULL_ARROW_SCHEMA = pa.schema(list(REQUEST_ARROW_SCHEMA) + list(ARROW_SCHEMA))
+# -----------------------------
+# Full schema (request + response)
+# -----------------------------
+FULL_ARROW_SCHEMA = pa.schema(
+    list(REQUEST_ARROW_SCHEMA) + list(ARROW_SCHEMA),
+    metadata={
+        "comment": "HTTP prepared request and response flattened into columns for single-row logging batches.",
+    },
+)
 
 
 def _redact_headers(
@@ -451,33 +464,29 @@ class Response:
         # 1) Explode request into columns (single-row)
         req_rb = self.request.to_arrow_batch(parse=False)
 
-        # 3) Values -> Arrow arrays
+        # response_headers as map<string,string>
         headers_v = None
         if self.headers:
-            # sorted deterministically by (lower(key), key, value)
-            # keeps logs stable while still being human-readable
-            headers_v = [
-                {"key": str(k), "value": str(v)}
+            headers_v = {
+                str(k): str(v)
                 for (k, v) in sorted(
-                    self.headers.items(),
+                    dict(self.headers).items(),
                     key=lambda kv: (str(kv[0]).lower(), str(kv[0]), str(kv[1])),
                 )
                 if k and v
-            ]
+            }
 
         if self.buffer:
             body_bytes = self.buffer.to_bytes()
             body_blake3_32 = self.buffer.blake3().digest()
-            body_h64 = self.buffer.xxh3_64().intdigest()
         else:
-            body_bytes, body_blake3_32, body_h64 = None, None, None
+            body_bytes, body_blake3_32 = None, None
 
         resp_arrays = [
             pa.array([self.status_code], type=ARROW_SCHEMA.field("response_status_code").type),
             pa.array([headers_v], type=ARROW_SCHEMA.field("response_headers").type),
             pa.array([body_bytes], type=ARROW_SCHEMA.field("response_body").type),
             pa.array([body_blake3_32], type=ARROW_SCHEMA.field("response_body_hash").type),
-            pa.array([body_h64], type=ARROW_SCHEMA.field("response_body_hash64").type),
             pa.array([self.received_at_timestamp], type=ARROW_SCHEMA.field("response_received_at").type),
         ]
 
@@ -509,23 +518,16 @@ class Response:
         if parse:
             raise NotImplementedError("parse=True not implemented (yet)")
 
-        def _headers_from_liststruct(x: Any) -> Mapping[str, str]:
-            # x is typically: list[{"key": "...", "value": "..."}] or None
+        def _headers_from_map(x: Any) -> Mapping[str, str]:
             if not x:
                 return {}
-            out: dict[str, str] = {}
-            for kv in x:
-                if not kv:
-                    continue
-                k = kv.get("key")
-                v = kv.get("value")
-                if k is None or v is None:
-                    continue
-                ks = str(k)
-                vs = str(v)
-                if ks and vs:
-                    out[ks] = vs
-            return out
+            if isinstance(x, dict):
+                return {str(k): str(v) for k, v in x.items() if k is not None and v is not None}
+            # fallback: sometimes list of (k,v)
+            try:
+                return {str(k): str(v) for k, v in x if k is not None and v is not None}
+            except Exception:
+                return {}
 
         def _iter_batches(obj: pa.RecordBatch | pa.Table) -> Iterator[pa.RecordBatch]:
             if isinstance(obj, pa.RecordBatch):
@@ -548,16 +550,17 @@ class Response:
             for i in range(n):
                 # ---- rebuild request dict ----
                 # request_headers is list<struct<key,value>>
-                req_d: dict[str, Any] = {}
+                req_d: dict[str, Any] = {
+                    "method": cols["request_method"][i].as_py() if "request_method" in cols else "GET",
+                    "url": cols["request_url"][i].as_py() if "request_url" in cols else ""
+                }
 
                 # required fields
-                req_d["method"] = cols["request_method"][i].as_py() if "request_method" in cols else "GET"
-                req_d["url"] = cols["request_url"][i].as_py() if "request_url" in cols else ""
 
                 # headers (arrow list<struct>)
                 if "request_headers" in cols:
                     req_hdrs = cols["request_headers"][i].as_py()
-                    req_d["headers"] = _headers_from_liststruct(req_hdrs)
+                    req_d["headers"] = _headers_from_map(req_hdrs)
                 else:
                     req_d["headers"] = {}
 
@@ -591,7 +594,7 @@ class Response:
 
                 if "response_headers" in cols:
                     resp_hdrs = cols["response_headers"][i].as_py()
-                    headers = _headers_from_liststruct(resp_hdrs)
+                    headers = _headers_from_map(resp_hdrs)
                 else:
                     headers = {}
 

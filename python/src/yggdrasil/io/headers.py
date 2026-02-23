@@ -70,7 +70,7 @@ def anonymize_headers(
     keep_content_type: bool = True,
     keep_accept: bool = True,
     keep_host: bool = False,
-    preserve_keys: bool = False,
+    preserve_keys: bool = True,
 ) -> MutableMapping[str, str]:
     """
     Returns a sanitized copy of headers. Use mode="hash" to keep stable fingerprints.
@@ -92,7 +92,7 @@ def anonymize_headers(
         else:
             _emit(out_key, "<redacted>")
 
-    for k_raw, v_raw in headers.items():
+    for k_raw, v_raw in dict(headers).items():
         k = _to_text(k_raw)
         v = _to_text(v_raw)
 

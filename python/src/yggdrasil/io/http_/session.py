@@ -157,7 +157,7 @@ class HTTPSession(Session):
                     ("request_url_host", "=", anon.url.host),
                     ("request_url_path", "=", anon.url.path),
                     ("request_url_query", "=", anon.url.query),
-                    ("request_body_hash64", "=", anon.body.xxh3_64().intdigest() if anon.body else None),
+                    ("request_body_hash", "=", anon.body.blake3().digest() if anon.body else None),
                 ]
             ).to_table()
             responses = list(HTTPResponse.from_arrow_batch(batch))
@@ -222,12 +222,12 @@ class HTTPSession(Session):
                 raise last_exc
             raise RuntimeError("Retry loop exited unexpectedly")
 
-        if cache is not None:
+        if cache is not None and result.ok:
             # insert
             batch = result.anonymize(mode=anonymize).to_arrow_batch(parse=False)
             cache.insert(
                 batch,
                 mode=SaveMode.AUTO,
-                match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash64"]
+                match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash"]
             )
         return result

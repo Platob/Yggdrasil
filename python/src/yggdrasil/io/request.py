@@ -10,106 +10,104 @@ from yggdrasil.io.headers import anonymize_headers
 from .dynamic_buffer import DynamicBuffer
 from .url import URL
 
-__all__ = ["PreparedRequest", "ARROW_SCHEMA"]
+__all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
 
 
-ARROW_SCHEMA = pa.schema(
+REQUEST_ARROW_SCHEMA = pa.schema(
     [
         pa.field(
             "request_method",
             pa.string(),
             nullable=False,
-            metadata={"comment": "The HTTP verb (GET, POST, etc.)"},
+            metadata={"comment": "HTTP verb (GET, POST, etc.)"},
         ),
         pa.field(
             "request_url",
             pa.string(),
             nullable=False,
-            metadata={"comment": "The full request URL string"},
+            metadata={"comment": "Full request URL as string"},
         ),
+
+        # ---- URL components (best-effort parsed) ----
         pa.field(
             "request_url_scheme",
             pa.string(),
             nullable=False,
-            metadata={"comment": "URL protocol (e.g., http, https)"},
+            metadata={"comment": "URL scheme (e.g., http, https)"},
         ),
         pa.field(
             "request_url_userinfo",
             pa.string(),
             nullable=True,
-            metadata={"comment": "Authentication information in the URL"},
+            metadata={"comment": "Userinfo from URL authority (e.g., user:pass). Avoid persisting secrets."},
         ),
         pa.field(
             "request_url_host",
             pa.string(),
             nullable=True,
-            metadata={"comment": "Domain name or IP address of the server"},
+            metadata={"comment": "Host (domain or IP)"},
         ),
         pa.field(
             "request_url_port",
             pa.int32(),
             nullable=True,
-            metadata={"comment": "TCP port number"},
+            metadata={"comment": "Port number if explicitly specified"},
         ),
         pa.field(
             "request_url_path",
             pa.string(),
             nullable=True,
-            metadata={"comment": "Hierarchical path to the resource"},
+            metadata={"comment": "Path component of the URL"},
         ),
         pa.field(
             "request_url_query",
             pa.string(),
             nullable=True,
-            metadata={"comment": "Parsed query string parameters as key-value pairs"},
+            metadata={"comment": "Raw query string (without leading '?')"},
         ),
         pa.field(
             "request_url_fragment",
             pa.string(),
             nullable=True,
-            metadata={"comment": "The internal anchor or fragment identifier"},
+            metadata={"comment": "Fragment identifier (without leading '#')"},
         ),
-        # ✅ headers as list<struct<key:string,value:string>>
+
+        # ---- headers/body ----
         pa.field(
-            name="request_headers",
-            type=pa.list_(
-                pa.struct(
-                    [
-                        pa.field("key", pa.string(), nullable=True),
-                        pa.field("value", pa.string(), nullable=True),
-                    ]
-                )
-            ),
+            "request_headers",
+            pa.map_(pa.string(), pa.string(), keys_sorted=True),
             nullable=True,
-            metadata={"comment": "Raw HTTP response headers (ordered)"},
+            metadata={
+                "comment": "HTTP request headers as map<string,string> (keys sorted; duplicates collapsed)",
+                "keys_sorted": "true",
+            },
         ),
-        # ✅ raw bytes body (you asked for it)
         pa.field(
-            name="request_body",
-            type=pa.binary(),
+            "request_body",
+            pa.binary(),
             nullable=True,
             metadata={"comment": "Raw request body bytes"},
         ),
-        # ✅ hashes
+
+        # ---- hashes ----
         pa.field(
-            name="request_body_hash",
-            type=pa.binary(32),
+            "request_body_hash",
+            pa.binary(32),
             nullable=True,
-            metadata={"algorithm": "blake3", "comment": "256-bit BLAKE3 digest of the body"},
+            metadata={"comment": "BLAKE3-256 digest of request_body (32 bytes)", "algorithm": "blake3", "byte_width": "32"},
         ),
-        pa.field(
-            name="request_body_hash64",
-            type=pa.int64(),
-            nullable=True,
-            metadata={"algorithm": "xxh3_64", "comment": "XXH3 64-bit int hash of the body"},
-        ),
+
+        # ---- timing ----
         pa.field(
             "request_sent_at",
             pa.timestamp("us", "UTC"),
             nullable=False,
-            metadata={"comment": "UTC timestamp of when the request was dispatched", "unit": "us", "tz": "UTC"},
+            metadata={"comment": "UTC timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
         ),
-    ]
+    ],
+    metadata={
+        "comment": "HTTP prepared request flattened into deterministic columns for logging/replay.",
+    },
 )
 
 
@@ -371,25 +369,23 @@ class PreparedRequest:
         if self.buffer:
             body_bytes = self.buffer.to_bytes()
             body_blake3_32 = self.buffer.blake3().digest()
-            body_h64 = self.buffer.xxh3_64().intdigest()
         else:
-            body_bytes, body_blake3_32, body_h64 = None, None, None
+            body_bytes, body_blake3_32 = None, None
 
         arrays = [
-            pa.array([self.method], type=ARROW_SCHEMA.field("request_method").type),
-            pa.array([url_s], type=ARROW_SCHEMA.field("request_url").type),
-            pa.array([scheme_v], type=ARROW_SCHEMA.field("request_url_scheme").type),
-            pa.array([userinfo_v], type=ARROW_SCHEMA.field("request_url_userinfo").type),
-            pa.array([host_v], type=ARROW_SCHEMA.field("request_url_host").type),
-            pa.array([port_v], type=ARROW_SCHEMA.field("request_url_port").type),
-            pa.array([path_v], type=ARROW_SCHEMA.field("request_url_path").type),
-            pa.array([q_v], type=ARROW_SCHEMA.field("request_url_query").type),
-            pa.array([fragment_v], type=ARROW_SCHEMA.field("request_url_fragment").type),
-            pa.array([headers_v], type=ARROW_SCHEMA.field("request_headers").type),
-            pa.array([body_bytes], type=ARROW_SCHEMA.field("request_body").type),
-            pa.array([body_blake3_32], type=ARROW_SCHEMA.field("request_body_hash").type),
-            pa.array([body_h64], type=ARROW_SCHEMA.field("request_body_hash64").type),
-            pa.array([self.sent_at_timestamp], type=ARROW_SCHEMA.field("request_sent_at").type),
+            pa.array([self.method], type=REQUEST_ARROW_SCHEMA.field("request_method").type),
+            pa.array([url_s], type=REQUEST_ARROW_SCHEMA.field("request_url").type),
+            pa.array([scheme_v], type=REQUEST_ARROW_SCHEMA.field("request_url_scheme").type),
+            pa.array([userinfo_v], type=REQUEST_ARROW_SCHEMA.field("request_url_userinfo").type),
+            pa.array([host_v], type=REQUEST_ARROW_SCHEMA.field("request_url_host").type),
+            pa.array([port_v], type=REQUEST_ARROW_SCHEMA.field("request_url_port").type),
+            pa.array([path_v], type=REQUEST_ARROW_SCHEMA.field("request_url_path").type),
+            pa.array([q_v], type=REQUEST_ARROW_SCHEMA.field("request_url_query").type),
+            pa.array([fragment_v], type=REQUEST_ARROW_SCHEMA.field("request_url_fragment").type),
+            pa.array([headers_v], type=REQUEST_ARROW_SCHEMA.field("request_headers").type),
+            pa.array([body_bytes], type=REQUEST_ARROW_SCHEMA.field("request_body").type),
+            pa.array([body_blake3_32], type=REQUEST_ARROW_SCHEMA.field("request_body_hash").type),
+            pa.array([self.sent_at_timestamp], type=REQUEST_ARROW_SCHEMA.field("request_sent_at").type),
         ]
 
-        return pa.RecordBatch.from_arrays(arrays, schema=ARROW_SCHEMA)  # type: ignore
+        return pa.RecordBatch.from_arrays(arrays, schema=REQUEST_ARROW_SCHEMA)  # type: ignore
