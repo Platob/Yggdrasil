@@ -34,13 +34,6 @@ FAILED_STATES = {
     CommandStatus.ERROR, CommandStatus.CANCELLED
 }
 
-# Module-level constants — computed once at import time
-_CMD_RUNTIME_FIELDS = frozenset({"_details"})
-
-# Fields dropped when serializing for remote cluster execution
-# (command is reconstructed remotely; context_id / command_id are local)
-_CMD_REMOTE_DROP = frozenset({"command", "command_id"})
-
 
 if TYPE_CHECKING:
     from .execution_context import ExecutionContext
@@ -63,6 +56,7 @@ class CommandExecution:
     command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
     environ: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False, hash=False)
 
+    _pyfunc: Optional[Callable] = field(default=None, repr=False, compare=False, hash=False)
     _details: Optional[CommandStatusResponse] = field(default=None, repr=False, compare=False, hash=False)
 
     def __post_init__(self):
@@ -95,17 +89,16 @@ class CommandExecution:
         Returns:
             A lean, pickle-ready state dictionary.
         """
-        state = {}
+        state = self.__dict__.copy()
 
-        for key, value in self.__dict__.items():
-            if key in _CMD_RUNTIME_FIELDS:
-                continue
-            if key in _CMD_REMOTE_DROP and value is not None:
-                # Preserve None explicitly so __setstate__ can restore defaults
-                # without an attribute error, but drop non-None payloads.
-                state[key] = None
-                continue
-            state[key] = value
+        if self.environ:
+            environ = {
+                k: os.getenv(v)
+                for k, v in self.environ
+                if k and v
+            }
+
+            state["environ"] = environ
 
         return state
 
@@ -122,14 +115,19 @@ class CommandExecution:
         """
         # Guarantee attribute completeness for fields that may have been
         # pruned or were absent in older serialized states.
-        state.setdefault("_details", None)
-        state.setdefault("command", None)
-        state.setdefault("command_id", None)
-        state.setdefault("environ", None)
+        for key in ("_details", "command", "command_id", "environ"):
+            state[key] = state.get(key, None)
 
         self.__dict__.update(state)
 
     def __call__(self, *args, **kwargs):
+        if self.context.is_in_databricks_environment() and self._pyfunc is not None:
+            if self.environ:
+                for k, v in self.environ:
+                    os.environ[str(k)] = str(v)
+
+            return self._pyfunc(*args, **kwargs)
+
         assert self.command, "Cannot call %s, missing command" % self
 
         args_blob = dill.dumps([self.encode_object(_) for _ in args])
@@ -183,7 +181,7 @@ class CommandExecution:
 
         return url.with_query_items({
             **url.query_dict,
-            **{"command": self.command_id or "unknown"}
+            **{"command_id": self.command_id or "unknown"}
         })
 
     def create(

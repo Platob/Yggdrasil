@@ -1,3 +1,4 @@
+import base64
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, TYPE_CHECKING, Union, Iterator
@@ -512,8 +513,6 @@ class Table(WorkspaceService):
             # Quote each token with backticks.
             parts = [p.strip() for p in name.split(".") if p.strip()]
             return ".".join(f"`{p.replace('`','``')}`" for p in parts)
-
-        import base64
 
         def _sql_literal(v) -> str:
             # bytes -> base64 string literal

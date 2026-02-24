@@ -45,6 +45,7 @@ import pyspark.sql.functions as F
 import pyspark.sql.types as T
 
 from yggdrasil.spark.lib import pyspark_sql
+from ..pyutils.serde import ObjectSerde
 from ..types.cast.arrow_cast import (
     arrow_field_to_field,
     arrow_field_to_schema,
@@ -1469,14 +1470,30 @@ def any_to_spark_dataframe(
     if obj is None:
         return spark.createDataFrame([], schema=opts.target_spark_schema)
 
-    # Route through Polars as the intermediate representation for arbitrary inputs.
-    from ..polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
+    namespace = ObjectSerde.full_namespace(obj)
 
-    arrow_table  = polars_dataframe_to_arrow_table(
-        any_to_polars_dataframe(obj, opts), opts
-    )
-    spark_schema = arrow_schema_to_spark_schema(arrow_table.schema, None)
-    df           = spark.createDataFrame(arrow_table, schema=spark_schema)
+    if namespace.startswith("pyarrow"):
+        if isinstance(obj, pa.RecordBatch):
+            obj = pa.Table.from_batches([obj], schema=obj.schema) # type: ignore
+        elif hasattr(obj, "to_table"):
+            obj = obj.to_table()
+
+        if isinstance(obj, pa.Table):
+            spark_schema = arrow_schema_to_spark_schema(obj.schema, None)
+            df = spark.createDataFrame(obj, schema=spark_schema)
+        else:
+            raise ValueError(
+                f"Cannot convert {type(obj)} to pyspark.sql.DataFrame"
+            )
+    else:
+        # Route through Polars as the intermediate representation for arbitrary inputs.
+        from ..polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
+
+        arrow_table = polars_dataframe_to_arrow_table(
+            any_to_polars_dataframe(obj, opts), opts
+        )
+        spark_schema = arrow_schema_to_spark_schema(arrow_table.schema, None)
+        df = spark.createDataFrame(arrow_table, schema=spark_schema)
 
     return cast_spark_dataframe(df, opts)
 

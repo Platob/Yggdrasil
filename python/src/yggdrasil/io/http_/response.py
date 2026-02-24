@@ -41,7 +41,7 @@ class HTTPResponse(Response):
         return cls(
             request=request,
             status_code=response.status,
-            headers=response.headers,
+            headers=dict(response.headers),
             buffer=buffer,
             received_at_timestamp=received_at_timestamp
         )

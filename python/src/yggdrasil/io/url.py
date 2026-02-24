@@ -467,3 +467,52 @@ class URL:
             result = result.with_userinfo(userinfo="<redacted>" if mode == "redact" else None)
 
         return result
+
+    @property
+    def is_databricks(self) -> bool:
+        return self.scheme == "dbfs"
+
+    def to_databricks_table(self):
+        if not self.is_databricks:
+            raise ValueError(
+                f"Expected Databricks URI with scheme 'dbfs', got scheme={self.scheme!r}"
+            )
+
+        if not self.query:
+            raise ValueError(
+                "Databricks URI is missing query string. "
+                "Expected query params: catalog_name, schema_name, table_name"
+            )
+
+        from yggdrasil.databricks.sql.table import Table
+        from yggdrasil.databricks.workspaces import Workspace
+
+        # query_dict is assumed to be like: {"catalog_name": ["x"], ...}
+        items: dict[str, Any] = {
+            k: (v[0] if isinstance(v, (list, tuple)) and v else v)
+            for k, v in self.query_dict.items()
+        }
+
+        required = ("catalog_name", "schema_name", "table_name")
+        missing = [key for key in required if not items.get(key)]
+
+        if missing:
+            raise ValueError(
+                "Missing required Databricks table query params: "
+                f"{', '.join(missing)}. "
+                "Expected query params: catalog_name, schema_name, table_name"
+            )
+
+        catalog_name = items["catalog_name"]
+        schema_name = items["schema_name"]
+        table_name = items["table_name"]
+
+        if not self.host:
+            raise ValueError("Databricks URI is missing host")
+
+        return Table(
+            workspace=Workspace(host=self.host),
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+        )

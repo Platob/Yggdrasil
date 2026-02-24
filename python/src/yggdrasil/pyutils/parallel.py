@@ -15,10 +15,13 @@ from typing import (
     ParamSpec,
 )
 
-import dill
+try:
+    import dill
 
-ForkingPickler.loads = dill.loads
-ForkingPickler.dumps = dill.dumps
+    ForkingPickler.loads = dill.loads
+    ForkingPickler.dumps = dill.dumps
+except ImportError:
+    pass
 
 P = ParamSpec("P")
 R = TypeVar("R")
