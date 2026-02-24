@@ -7,7 +7,7 @@ from typing import Mapping, Any, Optional, MutableMapping, Literal
 import pyarrow as pa
 from yggdrasil.io.headers import anonymize_headers
 
-from .dynamic_buffer import DynamicBuffer
+from .buffer import BytesIO
 from .url import URL
 
 __all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
@@ -61,7 +61,13 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         ),
         pa.field(
             "request_url_query",
-            pa.string(),
+            pa.list_(pa.field(
+                name="entries",
+                type=pa.struct([
+                    pa.field("key", pa.string()),
+                    pa.field("values", pa.list_(pa.string()))
+                ])
+            )),
             nullable=True,
             metadata={"comment": "Raw query string (without leading '?')"},
         ),
@@ -75,7 +81,13 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         # ---- headers/body ----
         pa.field(
             "request_headers",
-            pa.map_(pa.string(), pa.string(), keys_sorted=True),
+            pa.list_(pa.field(
+                name="entries",
+                type=pa.struct([
+                    pa.field("key", pa.string()),
+                    pa.field("value", pa.string())
+                ])
+            )),
             nullable=True,
             metadata={
                 "comment": "HTTP request headers as map<string,string> (keys sorted; duplicates collapsed)",
@@ -116,7 +128,7 @@ class PreparedRequest:
     method: str
     url: URL
     headers: Mapping[str, str]
-    buffer: Optional[DynamicBuffer]
+    buffer: Optional[BytesIO]
     sent_at_timestamp: int = 0  # time.time_ns() // 1000
 
     @classmethod
@@ -133,9 +145,9 @@ class PreparedRequest:
         url = URL.parse_any(url, normalize=normalize)
 
         if body is not None:
-            body = DynamicBuffer.parse_any(obj=body)
+            body = BytesIO.parse_any(obj=body)
         elif json is not None:
-            body = DynamicBuffer()
+            body = BytesIO()
             json_module.dump(json, body)
             body.seek(0)
 
@@ -286,9 +298,9 @@ class PreparedRequest:
         if body_obj is None:
             body_obj = d.get("data")
 
-        buffer: Optional[DynamicBuffer] = None
+        buffer: Optional[BytesIO] = None
         if body_obj is not None:
-            buffer = DynamicBuffer.parse_any(obj=body_obj)
+            buffer = BytesIO.parse_any(obj=body_obj)
 
         # sent_at timestamp (ns)
         sent_at = (

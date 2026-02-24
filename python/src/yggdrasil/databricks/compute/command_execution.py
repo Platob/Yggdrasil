@@ -16,11 +16,11 @@ from databricks.sdk.service.compute import (
     Language, CommandExecutionAPI, CommandStatusResponse, CommandStatus, ResultType
 )
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .exceptions import ClientTerminatedSession
 from ...environ import PyEnv
 from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 DONE_STATES = {
     CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR

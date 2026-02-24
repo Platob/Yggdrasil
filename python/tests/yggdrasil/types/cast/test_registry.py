@@ -1,12 +1,11 @@
 import dataclasses
 import datetime
 import enum
-from typing import List, Set, Tuple, Dict, Any
+from typing import List
 
-import pyarrow as pa
 import pytest
 
-from yggdrasil.types.cast.registry import convert, convert_to_python_iterable
+from yggdrasil.data.cast.registry import convert
 
 
 def test_builtin_converters():

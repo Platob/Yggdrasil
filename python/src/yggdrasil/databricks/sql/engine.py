@@ -31,19 +31,19 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 import pyarrow as pa
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import Disposition
+
+from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
+from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.registry import convert
+from yggdrasil.data.engine import SQLEngine as BaseSQLEngine
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
-
 from .exceptions import SqlStatementError
 from .statement_result import StatementResult
 from .table import Table
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..workspaces import WorkspaceService, DatabricksPath
-from ...data.engine import SQLEngine as BaseSQLEngine
-from ...types import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
-from ...types.cast.cast_options import CastOptions
-from ...types.cast.registry import convert
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +466,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 wait=wait,
+                row_limit=row_limit
             )
 
         if cache_for is not None:

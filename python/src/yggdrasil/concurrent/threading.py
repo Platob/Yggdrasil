@@ -7,13 +7,17 @@ bounded in-flight window, supporting both completion-order and submission-order 
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, Callable, Deque, Dict, Generator, Iterable, Iterator, Optional, Set, Tuple
 
-__all__ = ["Job", "JobThreadPoolExecutor"]
+__all__ = ["Job", "JobPoolExecutor"]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +45,7 @@ class Job:
         t.start()
 
 
-class JobThreadPoolExecutor(ThreadPoolExecutor):
+class JobPoolExecutor(ThreadPoolExecutor):
     """
     ThreadPoolExecutor helper for infinite / huge job streams with a bounded in-flight window.
 
@@ -51,6 +55,20 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
     max_in_flight controls the maximum number of concurrently in-flight futures the helper
     will keep submitted at any time. (Alias of max_buffer; max_buffer kept for back-compat.)
     """
+
+    def __init__(
+        self,
+        max_workers: int = None,
+        job_name_prefix: str = '',
+        initializer=None,
+        initargs=()
+    ):
+        super().__init__(
+            max_workers=max_workers,
+            thread_name_prefix=job_name_prefix,
+            initializer=initializer,
+            initargs=initargs
+        )
 
     def submit_job(self, job: Job) -> Future:
         return self.submit(job.run)
@@ -62,6 +80,21 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
             return None
         return self.submit_job(job)
 
+    @classmethod
+    def parse_any(
+        cls,
+        obj: Any,
+        *,
+        max_workers: Optional[int] = None,
+    ):
+        if isinstance(obj, cls):
+            return cls
+
+        if not max_workers:
+            max_workers = int(obj)
+
+        return cls(max_workers=max_workers)
+
     @staticmethod
     def _cancel_all(fs: Iterable[Future]) -> None:
         # Best effort: cancels queued/not-started futures.
@@ -69,6 +102,23 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
         for f in fs:
             if not f.done():
                 f.cancel()
+
+    def _unpack(
+        self,
+        fut: Future,
+        raise_error: bool,
+        pending: list
+    ) -> Tuple[Future, Any, Optional[BaseException]]:
+        exc = fut.exception()
+        if exc is not None:
+            if raise_error:
+                self._cancel_all(pending)
+                raise exc
+
+            LOGGER.exception(exc)
+
+            return fut, None, exc
+        return fut, fut.result(), None
 
     def as_completed(
         self,
@@ -79,24 +129,18 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
         cancel_on_exit: bool = False,
         shutdown_on_exit: bool = False,
         shutdown_wait: bool = False,
-    ) -> Generator[Future, None, None]:
+        raise_error: bool = True,
+    ) -> Generator[Tuple[Future, Any, Optional[BaseException]], None, None]:
         """
-        Consume a (possibly infinite) Job iterable and yield Futures.
+        Consume a (possibly infinite) Job iterable and yield (future, result, exc) triples.
 
-        Cleanup behavior:
-          - If the caller stops iteration early (break/return), or an exception happens,
-            we cancel any remaining queued futures (best-effort).
-          - Optionally, also shutdown the executor (Py 3.9+: cancel_futures=True).
+        Each yield is a 3-tuple:
+            future  – the completed Future object
+            result  – future.result() on success, None on error
+            exc     – the exception on failure, None on success
 
-        Args:
-            job_generator: Source of Job objects (can be infinite).
-            ordered:
-                - False: yield futures as completed (completion order).
-                - True: yield futures in submission order (may block behind slow jobs).
-            max_in_flight: Max number of in-flight jobs at once (must be > 0).
-            cancel_on_exit: Cancel remaining futures when generator exits early.
-            shutdown_on_exit: Also call shutdown(cancel_futures=True) on exit.
-            shutdown_wait: If shutdown_on_exit, whether to wait for worker threads.
+        If raise_error=True, exceptions are re-raised at the yield site instead of
+        being returned as the third element.
         """
         if not max_in_flight:
             max_in_flight = self._max_workers * 2
@@ -107,20 +151,25 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
             inflight: Deque[Future] = deque()
 
             try:
-                # Prime in-flight window
                 for _ in range(max_in_flight):
                     fut = self._try_submit_next(it)
                     if fut is None:
                         break
                     inflight.append(fut)
 
-                # Drain + refill, strictly preserving submission order
                 while inflight:
                     head = inflight[0]
                     if not head.done():
                         wait({head}, return_when=FIRST_COMPLETED)
 
-                    yield inflight.popleft()
+                    f, result, exc = self._unpack(
+                        inflight.popleft(),
+                        raise_error=raise_error,
+                        pending=inflight,
+                    )
+
+                    if exc is None:
+                        yield result
 
                     fut = self._try_submit_next(it)
                     if fut is not None:
@@ -130,27 +179,32 @@ class JobThreadPoolExecutor(ThreadPoolExecutor):
                 if cancel_on_exit:
                     self._cancel_all(inflight)
                 if shutdown_on_exit:
-                    # Py 3.9+: cancels futures still in the queue (not running yet)
                     self.shutdown(wait=shutdown_wait, cancel_futures=True)
 
         else:
             pending: Set[Future] = set()
 
             try:
-                # Prime in-flight window
                 for _ in range(max_in_flight):
                     fut = self._try_submit_next(it)
                     if fut is None:
                         break
                     pending.add(fut)
 
-                # Drain + refill, yielding as tasks complete
                 while pending:
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
 
                     for fut in done:
                         pending.discard(fut)
-                        yield fut
+
+                        f, result, exc = self._unpack(
+                            fut,
+                            raise_error=raise_error,
+                            pending=pending,
+                        )
+
+                        if exc is None:
+                            yield result
 
                         new_fut = self._try_submit_next(it)
                         if new_fut is not None:

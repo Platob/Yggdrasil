@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import base64
 import time
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Mapping, Union, Any, Literal
+from typing import Optional, TYPE_CHECKING, Mapping, Union, Any, Literal, Iterator
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -20,11 +21,12 @@ from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.response import FULL_ARROW_SCHEMA
 
 from .response import HTTPResponse
-from ..dynamic_buffer import DynamicBuffer
+from ..buffer import BytesIO
 from ..enums import SaveMode
 from ..request import PreparedRequest
 from ..session import Session
 from ..url import URL
+from yggdrasil.concurrent.threading import JobPoolExecutor
 
 if TYPE_CHECKING:
     from ...databricks.sql.table import Table
@@ -103,7 +105,7 @@ class HTTPSession(Session):
         *,
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         add_statistics: Optional[bool] = None,
@@ -132,6 +134,25 @@ class HTTPSession(Session):
             cache=cache
         )
 
+    @staticmethod
+    def _sql_match_clause(request: PreparedRequest):
+        def fmt(key, value):
+            if value is None:
+                return f"{key} is null"
+            if isinstance(value, bytes):
+                value = base64.b64encode(value).decode("ascii")
+            return f"{key} = '{value}'"
+
+        return " AND ".join(
+            fmt(k, v)
+            for k, v in (
+                ("request_url_host", request.url.host),
+                ("request_url_path", request.url.path),
+                ("request_url_query", request.url.query),
+                ("request_body_hash", request.body.blake3().digest() if request.body else None),
+            )
+        )
+
     def send(
         self,
         request: PreparedRequest,
@@ -139,7 +160,7 @@ class HTTPSession(Session):
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
-        cache: Optional["Table"] = None,
+        cache: Optional[Union["Table", bool]] = None,
         anonymize: Literal["remove", "redact", "hash"] = "remove",
     ) -> HTTPResponse:
         """
@@ -151,15 +172,10 @@ class HTTPSession(Session):
 
         if cache is not None:
             anon = request.anonymize(mode=anonymize)
-            # cache.create(FULL_ARROW_SCHEMA)
-            batch = cache.to_arrow_dataset(
-                filters=[
-                    ("request_url_host", "=", anon.url.host),
-                    ("request_url_path", "=", anon.url.path),
-                    ("request_url_query", "=", anon.url.query),
-                    ("request_body_hash", "=", anon.body.blake3().digest() if anon.body else None),
-                ]
-            ).to_table()
+            query = f"""select * from {cache.full_name(safe=True)}
+where {self._sql_match_clause(anon)}"""
+
+            batch = cache.sql(query).to_arrow_table()
             responses = list(HTTPResponse.from_arrow_batch(batch))
 
             if responses:
@@ -231,3 +247,16 @@ class HTTPSession(Session):
                 match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash"]
             )
         return result
+
+    def send_many(
+        self,
+        requests: Iterator[PreparedRequest],
+        *,
+        add_statistics: Optional[bool] = None,
+        stream: bool = True,
+        wait: Optional[WaitingConfigArg] = None,
+        cache: Optional["Table"] = None,
+        ordered: bool = False,
+        pool: Optional[JobPoolExecutor | int] = None
+    ):
+        raise NotImplementedError

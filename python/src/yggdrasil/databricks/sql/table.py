@@ -13,14 +13,14 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
+
+from yggdrasil.arrow.cast import any_to_arrow_schema
+from yggdrasil.concurrent.threading import Job
+from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.enums import SaveMode
-
 from .types import arrow_field_to_column_info, column_info_to_arrow_field
 from ..workspaces.workspace import WorkspaceService
-from ...concurrent.threading import Job
-from ...dataclasses.expiring import Expiring, RefreshResult
-from ...types import any_to_arrow_schema
 
 if TYPE_CHECKING:
     from ...deltalake import DeltaTable
@@ -45,11 +45,22 @@ class Table(WorkspaceService):
     def schema_full_name(self):
         return f"{self.catalog_name}.{self.schema_name}"
 
-    def full_name(self) -> str:
-        return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
+    def full_name(
+        self,
+        safe: str | bool | None = None
+    ) -> str:
+        if safe:
+            if isinstance(safe, bool):
+                safe = "`"
+            else:
+                safe = safe or "`"
 
-    def safe_full_name(self) -> str:
-        return f"`{self.catalog_name}`.`{self.schema_name}`.`{self.table_name}`"
+            return "%s%s%s.%s%s%s.%s%s%s" % (
+                safe, self.catalog_name, safe,
+                safe, self.schema_name, safe,
+                safe, self.table_name, safe
+            )
+        return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
 
     def __repr__(self) -> str:
         return f"Table({self.full_name()})"
@@ -501,98 +512,43 @@ class Table(WorkspaceService):
             version=version
         )
 
+    def sql(
+        self,
+        statement: str,
+        *,
+        row_limit: Optional[int] = None,
+        wait: Optional[WaitingConfigArg] = True,
+        cache_for: Optional[WaitingConfigArg] = None
+    ):
+        return self.workspace.sql().execute(
+            statement=statement,
+            row_limit=row_limit,
+            wait=wait,
+            cache_for=cache_for,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
+
     def to_arrow_dataset(
         self,
         *,
-        filters: Optional[list[tuple[str, str, str]]] = None
+        filters: Optional[list[tuple[str, str, str]]] = None,
+        row_limit: Optional[int] = None,
+        wait: Optional[WaitingConfigArg] = True,
+        cache_for: Optional[WaitingConfigArg] = None
     ):
-        engine = self.workspace.sql()
-
-        def _quote_ident(name: str) -> str:
-            # Support dotted paths like "a.b.c" or struct access "col.field"
-            # Quote each token with backticks.
-            parts = [p.strip() for p in name.split(".") if p.strip()]
-            return ".".join(f"`{p.replace('`','``')}`" for p in parts)
-
-        def _sql_literal(v) -> str:
-            # bytes -> base64 string literal
-            if isinstance(v, (bytes, bytearray, memoryview)):
-                b64 = base64.b64encode(bytes(v)).decode("ascii")
-                return "'" + b64 + "'"  # store/compare as base64 text
-
-            s = str(v).strip()
-
-            if s.lower().startswith("sql:"):
-                return s[4:].strip()
-
-            if s.lower() in ("null", "none"):
-                return "NULL"
-
-            if s.lower() in ("true", "false"):
-                return s.upper()
-
-            try:
-                float(s)
-                return s
-            except ValueError:
-                pass
-
-            return "'" + s.replace("'", "''") + "'"
-
-        def _build_predicate(col: str, op: str, val: str) -> str:
-            op_norm = op.strip().upper()
-
-            # Whitelist ops (expand as needed)
-            allowed = {
-                "=", "!=", "<>", ">", ">=", "<", "<=",
-                "LIKE", "NOT LIKE",
-                "IS", "IS NOT",
-                "IN", "NOT IN",
-            }
-            if op_norm == "==":
-                op_norm = "="
-            elif op_norm not in allowed:
-                raise ValueError(f"Unsupported filter operator: {op!r}")
-
-            col_sql = _quote_ident(col)
-
-            if val is None:
-                return f"{col_sql} IS NULL"
-
-            if op_norm in ("IS", "IS NOT"):
-                # IS (NOT) expects NULL/TRUE/FALSE typically
-                return f"{col_sql} {op_norm} {_sql_literal(val)}"
-
-            if op_norm in ("IN", "NOT IN"):
-                raw = val.strip()
-
-                # Accept "a,b,c" OR "(a,b,c)" OR "['a','b']" (lightweight)
-                if raw.startswith("(") and raw.endswith(")"):
-                    inner = raw[1:-1].strip()
-                    items = [x.strip() for x in inner.split(",") if x.strip()]
-                else:
-                    # If user passes a single token like "sql:(select ...)" allow it
-                    if raw.lower().startswith("sql:"):
-                        return f"{col_sql} {op_norm} {_sql_literal(raw)}"
-                    items = [x.strip() for x in raw.split(",") if x.strip()]
-
-                if not items:
-                    # IN () is invalid SQL — choose a predicate that’s always false/true
-                    return "FALSE" if op_norm == "IN" else "TRUE"
-
-                items_sql = ", ".join(_sql_literal(x) for x in items)
-                return f"{col_sql} {op_norm} ({items_sql})"
-
-            # Normal binary ops
-            return f"{col_sql} {op_norm} {_sql_literal(val)}"
-
-        query = f"SELECT * FROM {self.safe_full_name()}"
+        statement = f"SELECT * FROM {self.full_name(safe=True)}"
 
         if filters:
             predicates = [_build_predicate(c, o, v) for (c, o, v) in filters]
-            query += " WHERE " + " AND ".join(predicates)
+            statement += " WHERE " + " AND ".join(predicates)
 
-        return engine.execute(query).to_arrow_dataset()
+        return self.sql(
+            statement=statement,
+            row_limit=row_limit,
+            wait=wait,
+            cache_for=cache_for
+        ).to_arrow_dataset()
 
     def insert(
         self,
@@ -614,6 +570,7 @@ class Table(WorkspaceService):
             match_by=match_by,
         )
 
+
 @dataclass
 class TableFilesystem(Expiring[FileSystem]):
     table: Optional[Table] = field(default=None)
@@ -634,3 +591,82 @@ class TableFilesystem(Expiring[FileSystem]):
             ttl_ns=ttl_ns,
             expires_at_ns=created_at_ns + ttl_ns
         )
+
+
+def _quote_ident(name: str) -> str:
+    # Support dotted paths like "a.b.c" or struct access "col.field"
+    # Quote each token with backticks.
+    parts = [p.strip() for p in name.split(".") if p.strip()]
+    return ".".join(f"`{p.replace('`','``')}`" for p in parts)
+
+def _sql_literal(v) -> str:
+    # bytes -> base64 string literal
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        b64 = base64.b64encode(bytes(v)).decode("ascii")
+        return "'" + b64 + "'"  # store/compare as base64 text
+
+    s = str(v).strip()
+
+    if s.lower().startswith("sql:"):
+        return s[4:].strip()
+
+    if s.lower() in ("null", "none"):
+        return "NULL"
+
+    if s.lower() in ("true", "false"):
+        return s.upper()
+
+    try:
+        float(s)
+        return s
+    except ValueError:
+        pass
+
+    return "'" + s.replace("'", "''") + "'"
+
+def _build_predicate(col: str, op: str, val: str) -> str:
+    op_norm = op.strip().upper()
+
+    # Whitelist ops (expand as needed)
+    allowed = {
+        "=", "!=", "<>", ">", ">=", "<", "<=",
+        "LIKE", "NOT LIKE",
+        "IS", "IS NOT",
+        "IN", "NOT IN",
+    }
+    if op_norm == "==":
+        op_norm = "="
+    elif op_norm not in allowed:
+        raise ValueError(f"Unsupported filter operator: {op!r}")
+
+    col_sql = _quote_ident(col)
+
+    if val is None:
+        return f"{col_sql} IS NULL"
+
+    if op_norm in ("IS", "IS NOT"):
+        # IS (NOT) expects NULL/TRUE/FALSE typically
+        return f"{col_sql} {op_norm} {_sql_literal(val)}"
+
+    if op_norm in ("IN", "NOT IN"):
+        raw = val.strip()
+
+        # Accept "a,b,c" OR "(a,b,c)" OR "['a','b']" (lightweight)
+        if raw.startswith("(") and raw.endswith(")"):
+            inner = raw[1:-1].strip()
+            items = [x.strip() for x in inner.split(",") if x.strip()]
+        else:
+            # If user passes a single token like "sql:(select ...)" allow it
+            if raw.lower().startswith("sql:"):
+                return f"{col_sql} {op_norm} {_sql_literal(raw)}"
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+
+        if not items:
+            # IN () is invalid SQL — choose a predicate that’s always false/true
+            return "FALSE" if op_norm == "IN" else "TRUE"
+
+        items_sql = ", ".join(_sql_literal(x) for x in items)
+        return f"{col_sql} {op_norm} ({items_sql})"
+
+    # Normal binary ops
+    return f"{col_sql} {op_norm} {_sql_literal(val)}"

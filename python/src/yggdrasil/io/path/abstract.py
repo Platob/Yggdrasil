@@ -41,12 +41,12 @@ from typing import Any, IO, Iterator, Optional, Union, TYPE_CHECKING
 
 import pyarrow as pa
 from pyarrow.fs import FileSystem, FileType
-from yggdrasil.io.enums.file_format import FileFormat
 
-from ..enums import SaveMode
-from ...pyutils.serde import ObjectSerde
-from ...types.cast.arrow_cast import cast_arrow_tabular
-from ...types.cast.cast_options import CastOptions, CastOptionsArg
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions, CastOptionsArg
+from yggdrasil.io.enums import SaveMode
+from yggdrasil.io.enums.file_format import FileFormat
+from yggdrasil.pyutils.serde import ObjectSerde
 
 if TYPE_CHECKING:
     import pyarrow.dataset
@@ -311,7 +311,7 @@ class AbstractDataPath(ABC):
         other: "AbstractDataPath",
         *,
         mode: Optional[Union[SaveMode, str]] = None,
-        parallel: Optional[Union[int, ThreadPoolExecutor]] = 4,
+        pool: Optional[Union[int, ThreadPoolExecutor]] = 4,
         allow_not_found: bool = True,
     ) -> "AbstractDataPath":
         """
@@ -324,7 +324,7 @@ class AbstractDataPath(ABC):
             is wrapped in a ``LocalDataPath``.
         mode:
             :class:`SaveMode` controlling conflict resolution.
-        parallel:
+        pool:
             Worker count (``int``) or an existing :class:`~concurrent.futures.ThreadPoolExecutor`
             for directory copies.  ``None`` disables threading.
         allow_not_found:
@@ -345,7 +345,7 @@ class AbstractDataPath(ABC):
             return self.sync_file(
                 other=other,
                 mode=mode,
-                parallel=parallel,
+                pool=pool,
                 allow_not_found=allow_not_found,
             )
 
@@ -353,7 +353,7 @@ class AbstractDataPath(ABC):
             return self.sync_dir(
                 other=other,
                 mode=mode,
-                parallel=parallel,
+                pool=pool,
                 allow_not_found=allow_not_found,
             )
 
@@ -367,13 +367,13 @@ class AbstractDataPath(ABC):
         other: "AbstractDataPath",
         *,
         mode: Optional[Union[SaveMode, str]] = None,
-        parallel: Optional[Union[int, ThreadPoolExecutor]] = None,
+        pool: Optional[Union[int, ThreadPoolExecutor]] = None,
         allow_not_found: bool = True,
     ) -> "AbstractDataPath":
         """
         Copy this *file* to *other*.
 
-        When *parallel* is a :class:`~concurrent.futures.ThreadPoolExecutor`,
+        When *pool* is a :class:`~concurrent.futures.ThreadPoolExecutor`,
         the copy is submitted as a future and returned immediately.
 
         Raises
@@ -395,12 +395,12 @@ class AbstractDataPath(ABC):
             raise ValueError(f"sync_file() requires a file source, got: {self}")
 
         # Off-load to executor when requested (non-blocking).
-        if isinstance(parallel, ThreadPoolExecutor):
-            return parallel.submit(  # type: ignore[return-value]
+        if isinstance(pool, ThreadPoolExecutor):
+            return pool.submit(  # type: ignore[return-value]
                 self.sync_file,
                 other=other,
                 mode=mode,
-                parallel=None,
+                pool=None,
                 allow_not_found=allow_not_found,
             )
 
@@ -441,7 +441,7 @@ class AbstractDataPath(ABC):
         other: "AbstractDataPath",
         *,
         mode: Optional[Union[SaveMode, str]] = None,
-        parallel: Optional[Union[int, ThreadPoolExecutor]] = 4,
+        pool: Optional[Union[int, ThreadPoolExecutor]] = 4,
         allow_not_found: bool = True,
     ) -> "AbstractDataPath":
         """
@@ -449,7 +449,7 @@ class AbstractDataPath(ABC):
 
         Parameters
         ----------
-        parallel:
+        pool:
             Number of worker threads (``int``) or an existing executor.
             ``None`` runs copies sequentially in the calling thread.
         """
@@ -468,12 +468,12 @@ class AbstractDataPath(ABC):
         # Build or reuse executor.
         _owned_executor: Optional[ThreadPoolExecutor] = None
         executor: Optional[ThreadPoolExecutor]
-        if parallel is None:
+        if pool is None:
             executor = None
-        elif isinstance(parallel, ThreadPoolExecutor):
-            executor = parallel
+        elif isinstance(pool, ThreadPoolExecutor):
+            executor = pool
         else:
-            _owned_executor = ThreadPoolExecutor(max_workers=int(parallel))
+            _owned_executor = ThreadPoolExecutor(max_workers=int(pool))
             executor = _owned_executor
 
         base_parts = self.path_parts()
@@ -501,7 +501,7 @@ class AbstractDataPath(ABC):
                     src_file.sync_file(
                         other=dst_file,
                         mode=mode,
-                        parallel=None,
+                        pool=None,
                         allow_not_found=allow_not_found,
                     )
                 else:
@@ -510,7 +510,7 @@ class AbstractDataPath(ABC):
                             src_file.sync_file,
                             other=dst_file,
                             mode=mode,
-                            parallel=None,  # never nest executors
+                            pool=None,  # never nest executors
                             allow_not_found=allow_not_found,
                         )
                     )

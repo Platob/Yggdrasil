@@ -31,7 +31,7 @@ def dataclass_to_arrow_field(cls_or_instance: Any) -> pa.Field:
         if existing is not None:
             return existing
 
-        from yggdrasil.types.python_arrow import arrow_field_from_hint
+        from yggdrasil.arrow.python_arrow import arrow_field_from_hint
 
         built = arrow_field_from_hint(cls)
         DATACLASS_ARROW_FIELD_CACHE[cls] = built

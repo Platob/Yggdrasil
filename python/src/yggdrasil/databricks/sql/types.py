@@ -8,8 +8,7 @@ import pyarrow as pa
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo, ColumnTypeName
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
 
-from yggdrasil.types import is_arrow_type_list_like
-from yggdrasil.types.cast.arrow_cast import ArrowDataType
+from yggdrasil.arrow.cast import ArrowDataType, is_arrow_type_list_like
 
 STRING_TYPE_MAP = {
     # boolean

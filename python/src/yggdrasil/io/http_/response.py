@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from urllib3 import BaseHTTPResponse
 
-from ..dynamic_buffer import DynamicBuffer
+from ..buffer import BytesIO
 from ..request import PreparedRequest
 from ..response import Response
 
@@ -24,7 +24,7 @@ class HTTPResponse(Response):
         stream: bool,
         received_at_timestamp: int
     ) -> "Response":
-        buffer = DynamicBuffer()
+        buffer = BytesIO()
 
         try:
             if stream:

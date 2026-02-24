@@ -26,12 +26,12 @@ from databricks.sdk.service.sql import (
     ExternalLink,
 )
 
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.concurrent.threading import JobPoolExecutor, Job
+from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
-from ...concurrent.threading import JobThreadPoolExecutor, Job
-from ...data.statement_result import StatementResult as BaseStatementResult
-from ...types import cast_arrow_tabular
-from ...types.cast.cast_options import CastOptions
 
 if TYPE_CHECKING:
     pass
@@ -289,7 +289,7 @@ class StatementResult(BaseStatementResult):
                 return
             raise NotImplementedError("Persisted without Arrow table or Spark DF")
 
-        cast_options = CastOptions.safe_init(
+        cast_options = CastOptions(
             safe=True,
             target_field=self.arrow_schema
         )
@@ -341,8 +341,8 @@ class StatementResult(BaseStatementResult):
                 if link.external_link:
                     yield Job.make(extract_batches, link.external_link)
 
-        with JobThreadPoolExecutor(max_workers=max_workers or 4) as ex:
-            for fut in ex.as_completed(
+        with JobPoolExecutor.parse_any(max_workers or 4) as ex:
+            for f in ex.as_completed(
                 jobs(),
                 ordered=maintain_order,
                 max_in_flight=max_in_flight,
@@ -350,8 +350,8 @@ class StatementResult(BaseStatementResult):
                 shutdown_on_exit=True,
                 shutdown_wait=False,
             ):
-                for rb in fut.result():
-                    yield rb
+                for batch in f:
+                    yield batch
 
     def to_arrow_reader(
         self,

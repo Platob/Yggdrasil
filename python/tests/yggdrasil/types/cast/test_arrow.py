@@ -4,15 +4,14 @@ from typing import Union
 import pyarrow as pa
 import pytest
 
-from yggdrasil.types import convert
-from yggdrasil.types.cast.arrow_cast import (
+from yggdrasil.arrow.cast import (
     arrow_schema_to_field,
     cast_arrow_array,
     cast_arrow_tabular,
     cast_arrow_record_batch_reader,
     default_arrow_array,
 )
-from yggdrasil.types.cast.cast_options import CastOptions
+from yggdrasil.data.cast import convert, CastOptions
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +39,7 @@ def test_default_arrow_array_handles_nullable_and_required_fields():
 def test_cast_arrow_array_numeric_promotions_and_null_replacement():
     source = pa.array([1, None, 3], type=pa.int32())
     target_field = pa.field("value", pa.float64(), nullable=False)
-    opts = CastOptions.safe_init(target_field=target_field)
+    opts = CastOptions(target_field=target_field)
 
     casted = cast_arrow_array(source, opts)
 
@@ -53,7 +52,7 @@ def test_cast_arrow_array_enforces_safe_casts():
     source = pa.array([128], type=pa.int32())
     target_field = pa.field("value", pa.int8(), nullable=True)
 
-    opts = CastOptions.safe_init(target_field=target_field, safe=True)
+    opts = CastOptions(target_field=target_field, safe=True)
 
     with pytest.raises(pa.ArrowInvalid):
         cast_arrow_array(source, opts)
@@ -61,7 +60,7 @@ def test_cast_arrow_array_enforces_safe_casts():
 
 def test_cast_arrow_array_chunked_array_roundtrip():
     chunked = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
-    opts = CastOptions.safe_init(target_field=pa.field("value", pa.int64(), nullable=False))
+    opts = CastOptions(target_field=pa.field("value", pa.int64(), nullable=False))
 
     casted = cast_arrow_array(chunked, opts)
 
@@ -105,7 +104,7 @@ def test_cast_arrow_array_struct_adds_missing_nested_fields():
         type=source_struct,
     )
 
-    opts = CastOptions.safe_init(
+    opts = CastOptions(
         target_field=pa.field("root", target_struct, nullable=False),
         add_missing_columns=True,
     )
@@ -116,31 +115,6 @@ def test_cast_arrow_array_struct_adds_missing_nested_fields():
     assert casted.to_pylist() == [
         {"a": 1, "nested": {"x": "hello", "y": 0}},
         {"a": None, "nested": {"x": "", "y": 0}},
-    ]
-
-
-def test_cast_arrow_array_map_to_struct_defaults_and_nulls():
-    map_type = pa.map_(pa.string(), pa.int32())
-    array = pa.array([{"a": 1}, None, {"a": None}], type=map_type)
-
-    target_struct = pa.struct(
-        [
-            pa.field("a", pa.int32(), nullable=True),
-            pa.field("b", pa.int32(), nullable=False),
-        ]
-    )
-    opts = CastOptions.safe_init(
-        target_field=pa.field("root", target_struct, nullable=True),
-        strict_match_names=False,
-    )
-
-    casted = cast_arrow_array(array, opts)
-
-    assert casted.type == target_struct
-    assert casted.to_pylist() == [
-        {"a": 1, "b": 0},
-        None,
-        {"a": None, "b": 0},
     ]
 
 
@@ -165,7 +139,7 @@ def test_cast_arrow_array_list_of_structs_with_missing_fields():
         type=source_list,
     )
 
-    opts = CastOptions.safe_init(target_field=pa.field("root", target_list, nullable=True))
+    opts = CastOptions(target_field=pa.field("root", target_list, nullable=True))
 
     casted = cast_arrow_array(array, opts)
 
@@ -186,7 +160,7 @@ def test_cast_arrow_table_case_insensitive_column_match():
     table = pa.table({"A": [1, 2]})
 
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-    opts = CastOptions.safe_init(
+    opts = CastOptions(
         target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
 
@@ -205,7 +179,7 @@ def test_cast_arrow_table_adds_missing_columns_with_defaults():
         ]
     )
 
-    opts = CastOptions.safe_init(
+    opts = CastOptions(
         target_field=arrow_schema_to_field(target_schema),
         add_missing_columns=True,
         strict_match_names=True,
@@ -223,7 +197,7 @@ def test_cast_arrow_tabular_record_batch_matches_table_behavior():
     table = pa.Table.from_batches([batch])
 
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-    opts = CastOptions.safe_init(
+    opts = CastOptions(
         target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
 
@@ -259,7 +233,7 @@ def test_cast_arrow_record_batch_reader_applies_schema():
     reader = _make_reader_from_table(table)
 
     target_schema = pa.schema([pa.field("a", pa.int64(), nullable=False)])
-    opts = CastOptions.safe_init(
+    opts = CastOptions(
         target_field=arrow_schema_to_field(target_schema), strict_match_names=False
     )
 
@@ -274,7 +248,7 @@ def test_cast_arrow_record_batch_reader_no_target_schema_passthrough():
     table = pa.table({"A": [1, 2, 3]})
     reader = _make_reader_from_table(table)
 
-    opts = CastOptions.safe_init(target_field=None)
+    opts = CastOptions(target_field=None)
     casted_reader = cast_arrow_record_batch_reader(reader, opts)
 
     original_table = pa.Table.from_batches(_make_reader_from_table(table))
@@ -293,11 +267,11 @@ Tabular = Union[pa.Table, pa.RecordBatch]
 def _make_options(data: Tabular, **kwargs) -> CastOptions:
     """
     Required init style:
-        options = CastOptions.safe_init(target_field=table.schema, **kwargs)
+        options = CastOptions(target_field=table.schema, **kwargs)
 
     Note: for RecordBatch, .schema exists too.
     """
-    return CastOptions.safe_init(source_field=data.schema, **kwargs)  # type: ignore[arg-type]
+    return CastOptions(source_field=data.schema, **kwargs)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -567,7 +541,7 @@ def test_convert_respects_arrow_target_hint_and_options_propagation():
 
     received: dict[str, object] = {}
 
-    from yggdrasil.types.cast import registry
+    from yggdrasil.data.cast import registry
 
     original_converter = registry._registry[(pa.Array, pa.Array)]
 

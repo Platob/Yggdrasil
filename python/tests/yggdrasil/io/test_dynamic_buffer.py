@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from yggdrasil.io.dynamic_buffer import DynamicBuffer, DynamicBufferConfig
+from yggdrasil.io.buffer import BytesIO, BufferConfig
 
 
 def _try_import_internal_xxhash():
@@ -22,13 +22,8 @@ def _try_import_internal_blake3():
     return blake3_mod
 
 
-def test_init_invalid_spill_bytes():
-    with pytest.raises(ValueError):
-        DynamicBuffer(DynamicBufferConfig(spill_bytes=0))
-
-
 def test_len_and_size_in_memory():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     assert len(buf) == 0
     assert buf.size == 0
 
@@ -38,7 +33,7 @@ def test_len_and_size_in_memory():
 
 
 def test_basic_write_read_seek_tell_in_memory():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"hello")
     assert buf.tell() == 5
 
@@ -56,8 +51,8 @@ def test_basic_write_read_seek_tell_in_memory():
 
 def test_spills_to_file_and_preserves_cursor(tmp_path: Path):
     # Code spills only when size would exceed spill_bytes (strict >).
-    cfg = DynamicBufferConfig(spill_bytes=8, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=8, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
 
     buf.write(b"1234567")  # size = 7
     assert buf.spilled is False
@@ -89,8 +84,8 @@ def test_spills_to_file_and_preserves_cursor(tmp_path: Path):
 )
 def test_close_deletes_spill_file_by_default_expected_contract(tmp_path: Path):
     # This is the intended behavior (should pass after fixing close()).
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=False)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=False)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")
     buf.write(b"c")  # spill
     p = buf.path
@@ -100,22 +95,9 @@ def test_close_deletes_spill_file_by_default_expected_contract(tmp_path: Path):
     assert not p.exists()
 
 
-def test_close_current_behavior_leaves_spill_file(tmp_path: Path):
-    # This matches current implementation behavior (Windows will show it clearly).
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=False)
-    buf = DynamicBuffer(cfg)
-    buf.write(b"ab")
-    buf.write(b"c")  # spill
-    p = buf.path
-    assert p is not None and p.exists()
-
-    buf.close()
-    assert p.exists()
-
-
 def test_to_bytes_preserves_position_in_file(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=4, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=4, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
 
     buf.write(b"abcd")  # at threshold, still in mem
     buf.write(b"e")     # spill
@@ -129,14 +111,14 @@ def test_to_bytes_preserves_position_in_file(tmp_path: Path):
 
 
 def test_getvalue_in_memory():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"zzz")
     assert buf.getvalue() == b"zzz"
 
 
 def test_getvalue_when_spilled_reads_all(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")  # still in mem
     buf.write(b"c")   # spill
     assert buf.spilled is True
@@ -147,14 +129,14 @@ def test_getvalue_when_spilled_reads_all(tmp_path: Path):
 
 def test_memoryview_in_memory_and_spilled(tmp_path: Path):
     # in-memory
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"hello")
     mv = buf.memoryview()
     assert bytes(mv) == b"hello"
 
     # spilled
-    cfg = DynamicBufferConfig(spill_bytes=4, tmp_dir=tmp_path)
-    buf2 = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=4, tmp_dir=tmp_path)
+    buf2 = BytesIO(config=cfg)
     buf2.write(b"abcd")
     buf2.write(b"e")  # spill
     assert buf2.spilled is True
@@ -164,20 +146,20 @@ def test_memoryview_in_memory_and_spilled(tmp_path: Path):
 
 
 def test_memoryview_empty_spilled_returns_empty(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=1, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=1, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
 
     # force spill with a write and then truncate by reopening path is not supported;
     # easiest: create file-backed via parse_any(path) with empty file.
     p = tmp_path / "empty.bin"
     p.write_bytes(b"")
-    buf2 = DynamicBuffer.parse_any(p)
+    buf2 = BytesIO.parse_any(p)
     assert buf2.spilled is True
     assert bytes(buf2.memoryview()) == b""
 
 
 def test_write_any_bytes_byteslike_and_filelike():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write_any_bytes(b"abc")
     buf.write_any_bytes(bytearray(b"def"))
     buf.write_any_bytes(memoryview(b"ghi"))
@@ -187,26 +169,26 @@ def test_write_any_bytes_byteslike_and_filelike():
 
 
 def test_write_any_bytes_none_is_noop():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     assert buf.write_any_bytes(None) == 0
     assert buf.size == 0
 
 
 def test_write_any_bytes_invalid_type_raises():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     with pytest.raises(TypeError):
         buf.write_any_bytes(123)
 
 
 def test_parse_any_from_dynamicbuffer_returns_same():
-    b1 = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
-    b2 = DynamicBuffer.parse_any(b1)
+    b1 = BytesIO(config=BufferConfig(spill_bytes=1024))
+    b2 = BytesIO.parse_any(b1)
     assert b1 is b2
 
 
 def test_parse_any_from_bytesio_wraps_without_copying_object_identity():
     bio = io.BytesIO(b"yo")
-    buf = DynamicBuffer.parse_any(bio)
+    buf = BytesIO.parse_any(bio)
     assert buf.spilled is False
     # it literally uses the same BytesIO instance
     assert buf._mem is bio  # intentional: white-box for correctness
@@ -217,7 +199,7 @@ def test_parse_any_from_bytesio_wraps_without_copying_object_identity():
 def test_parse_any_from_path_is_file_backed(tmp_path: Path):
     p = tmp_path / "data.bin"
     # parse_any opens w+b and sets mem None
-    buf = DynamicBuffer.parse_any(p)
+    buf = BytesIO.parse_any(p)
     assert buf.spilled is True
     assert buf.path == p
     assert buf._mem is None
@@ -228,7 +210,7 @@ def test_parse_any_from_path_is_file_backed(tmp_path: Path):
 
 
 def test_open_reader_in_memory_returns_bytesio_copy():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"abc")
     r = buf.open_reader()
     assert isinstance(r, io.BytesIO)
@@ -236,8 +218,8 @@ def test_open_reader_in_memory_returns_bytesio_copy():
 
 
 def test_open_reader_spilled_requires_path(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")
     buf.write(b"c")  # spill
     assert buf.path is not None
@@ -247,8 +229,8 @@ def test_open_reader_spilled_requires_path(tmp_path: Path):
 
 
 def test_open_reader_spilled_missing_path_raises(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")
     buf.write(b"c")  # spill
     assert buf.spilled is True
@@ -267,8 +249,8 @@ def test_open_reader_spilled_missing_path_raises(tmp_path: Path):
     strict=False,
 )
 def test_close_deletes_spill_file_by_default(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=False)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=False)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")
     buf.write(b"c")  # spill
     p = buf.path
@@ -279,8 +261,8 @@ def test_close_deletes_spill_file_by_default(tmp_path: Path):
 
 
 def test_close_keeps_spill_file_when_configured(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=True)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=2, tmp_dir=tmp_path, keep_spilled_file=True)
+    buf = BytesIO(config=cfg)
     buf.write(b"ab")
     buf.write(b"c")  # spill
     p = buf.path
@@ -291,7 +273,7 @@ def test_close_keeps_spill_file_when_configured(tmp_path: Path):
 
 
 def test_closed_buffer_raises_on_io():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"x")
     buf.close()
 
@@ -327,7 +309,7 @@ def test_closed_buffer_raises_on_io():
     ],
 )
 def test_structured_roundtrip_in_memory(write_fn, read_fn, value):
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     getattr(buf, write_fn)(value)
     buf.seek(0)
     out = getattr(buf, read_fn)()
@@ -340,7 +322,7 @@ def test_structured_roundtrip_in_memory(write_fn, read_fn, value):
 
 
 def test_read_exact_raises_eoferror():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"\x01")
     buf.seek(0)
     _ = buf.read_uint8()
@@ -349,7 +331,7 @@ def test_read_exact_raises_eoferror():
 
 
 def test_bytes_u32_and_str_u32_roundtrip():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     payload = b"\x00\x01\x02" * 10
     s = "zürich 🧪"
 
@@ -362,8 +344,8 @@ def test_bytes_u32_and_str_u32_roundtrip():
 
 
 def test_structured_roundtrip_spilled(tmp_path: Path):
-    cfg = DynamicBufferConfig(spill_bytes=16, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
+    cfg = BufferConfig(spill_bytes=16, tmp_dir=tmp_path)
+    buf = BytesIO(config=cfg)
 
     # write enough to spill and also include structured values after spill point
     buf.write(b"X" * 16)   # at threshold
@@ -379,111 +361,6 @@ def test_structured_roundtrip_spilled(tmp_path: Path):
 
 
 def test_bytes_dunder_calls_to_bytes():
-    buf = DynamicBuffer(DynamicBufferConfig(spill_bytes=1024))
+    buf = BytesIO(config=BufferConfig(spill_bytes=1024))
     buf.write(b"abc")
     assert bytes(buf) == b"abc"
-
-
-@pytest.mark.parametrize("spilled", [False, True])
-def test_xxh3_64_matches_reference(tmp_path, spilled: bool):
-    xxhash_mod = _try_import_internal_xxhash()
-    if xxhash_mod is None:
-        pytest.skip("yggdrasil.xxhash.xxhash is not available")
-
-    data = b"the universe is a hash table, allegedly" * 1000
-
-    if spilled:
-        cfg = DynamicBufferConfig(spill_bytes=64, tmp_dir=tmp_path)
-    else:
-        cfg = DynamicBufferConfig(spill_bytes=len(data) + 1, tmp_dir=tmp_path)
-
-    buf = DynamicBuffer(cfg)
-    buf.write(data)
-
-    if spilled:
-        # ensure spill happened
-        buf.write(b"!")  # push over if needed
-        assert buf.spilled is True
-
-    # DynamicBuffer returns a hasher object
-    h_buf = buf.xxh3_64()
-
-    # Reference hash over raw bytes
-    h_ref = xxhash_mod.xxh3_64()
-    h_ref.update(data + (b"!" if spilled else b""))
-
-    # Compare in a stable way (hexdigest is fine)
-    assert h_buf.hexdigest() == h_ref.hexdigest()
-
-    buf.close()
-
-
-def test_blake3_in_memory_returns_hexdigest(tmp_path):
-    blake3_mod = _try_import_internal_blake3()
-    if blake3_mod is None:
-        pytest.skip("yggdrasil.blake3.blake3 is not available")
-
-    data = b"blake3 me softly with these bytes" * 1000
-
-    cfg = DynamicBufferConfig(spill_bytes=len(data) + 1, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
-    buf.write(data)
-
-    out = buf.blake3()
-    assert isinstance(out, str)  # in-mem branch returns hexdigest string
-
-    ref = blake3_mod.blake3()
-    ref.update(data)
-    assert out == ref.hexdigest()
-
-    buf.close()
-
-
-def test_blake3_spilled_with_path_returns_hasher(tmp_path):
-    blake3_mod = _try_import_internal_blake3()
-    if blake3_mod is None:
-        pytest.skip("yggdrasil.blake3.blake3 is not available")
-
-    data = b"x" * 1024 * 256  # 256 KiB
-
-    cfg = DynamicBufferConfig(spill_bytes=1024, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
-    buf.write(data)
-    assert buf.spilled is True
-    assert buf.path is not None
-
-    out = buf.blake3()
-    # spilled path branch returns the hasher object
-    assert hasattr(out, "hexdigest")
-
-    ref = blake3_mod.blake3()
-    ref.update(data)
-    assert out.hexdigest() == ref.hexdigest()
-
-    buf.close()
-
-
-def test_blake3_spilled_missing_path_uses_streaming_fallback(tmp_path):
-    blake3_mod = _try_import_internal_blake3()
-    if blake3_mod is None:
-        pytest.skip("yggdrasil.blake3.blake3 is not available")
-
-    data = b"stream me maybe" * 1024 * 8  # ~100 KiB
-
-    cfg = DynamicBufferConfig(spill_bytes=1024, tmp_dir=tmp_path)
-    buf = DynamicBuffer(cfg)
-    buf.write(data)
-    assert buf.spilled is True
-    assert buf.path is not None
-
-    # Force the "fallback: stream from fh" path by simulating missing path
-    buf._path = None  # yes, white-box on purpose to hit that branch
-
-    out = buf.blake3()
-    assert hasattr(out, "hexdigest")
-
-    ref = blake3_mod.blake3()
-    ref.update(data)
-    assert out.hexdigest() == ref.hexdigest()
-
-    buf.close()

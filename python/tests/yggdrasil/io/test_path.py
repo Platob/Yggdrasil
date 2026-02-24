@@ -282,7 +282,7 @@ def test_sync_file_overwrite_streaming(tmp_path):
     src.write_bytes(b"hello")
     dst.write_bytes(b"old")
 
-    src.sync_file(dst, mode=SaveMode.OVERWRITE, parallel=None)
+    src.sync_file(dst, mode=SaveMode.OVERWRITE, pool=None)
     assert dst.read_bytes() == b"hello"
 
 
@@ -293,7 +293,7 @@ def test_sync_file_ignore_existing(tmp_path):
     src.write_bytes(b"new")
     dst.write_bytes(b"existing")
 
-    src.sync_file(dst, mode=SaveMode.IGNORE, parallel=None)
+    src.sync_file(dst, mode=SaveMode.IGNORE, pool=None)
     assert dst.read_bytes() == b"existing"
 
 
@@ -305,7 +305,7 @@ def test_sync_file_error_if_exists(tmp_path):
     dst.write_bytes(b"existing")
 
     with pytest.raises(FileExistsError):
-        src.sync_file(dst, mode=SaveMode.ERROR_IF_EXISTS, parallel=None)
+        src.sync_file(dst, mode=SaveMode.ERROR_IF_EXISTS, pool=None)
 
 
 def test_sync_file_append_local_to_local(tmp_path):
@@ -315,7 +315,7 @@ def test_sync_file_append_local_to_local(tmp_path):
     dst.write_bytes(b"AAA")
     src.write_bytes(b"BBB")
 
-    src.sync_file(dst, mode=SaveMode.APPEND, parallel=None)
+    src.sync_file(dst, mode=SaveMode.APPEND, pool=None)
     assert dst.read_bytes() == b"AAABBB"
 
 
@@ -325,7 +325,7 @@ def test_sync_file_parallel_executor_returns_future(tmp_path):
     src.write_bytes(b"yo")
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        fut = src.sync_file(dst, mode=SaveMode.OVERWRITE, parallel=ex)
+        fut = src.sync_file(dst, mode=SaveMode.OVERWRITE, pool=ex)
         fut.result()
 
     assert dst.read_bytes() == b"yo"
@@ -336,7 +336,7 @@ def test_sync_file_allow_not_found_true_noop(tmp_path):
     dst = LocalDataPath(tmp_path / "dst.bin")
 
     # should not raise, should not create dst
-    src.sync_file(dst, allow_not_found=True, parallel=None)
+    src.sync_file(dst, allow_not_found=True, pool=None)
     assert not dst.exists()
 
 
@@ -345,7 +345,7 @@ def test_sync_file_allow_not_found_false_raises(tmp_path):
     dst = LocalDataPath(tmp_path / "dst.bin")
 
     with pytest.raises(FileNotFoundError):
-        src.sync_file(dst, allow_not_found=False, parallel=None)
+        src.sync_file(dst, allow_not_found=False, pool=None)
 
 
 def test_sync_dir_copies_tree_sequential(tmp_path):
@@ -361,7 +361,7 @@ def test_sync_dir_copies_tree_sequential(tmp_path):
         },
     )
 
-    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, parallel=None)
+    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, pool=None)
     assert _tree_bytes(dst_dir) == {
         "a.bin": b"a",
         os.path.join("sub", "b.bin"): b"b",
@@ -375,7 +375,7 @@ def test_sync_dir_parallel_int(tmp_path):
 
     _mk_tree(src_dir, {f"files/{i}.bin": f"v{i}".encode() for i in range(50)})
 
-    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, parallel=8)
+    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, pool=8)
     assert _tree_bytes(dst_dir) == {
         os.path.join("files", f"{i}.bin"): f"v{i}".encode() for i in range(50)
     }
@@ -388,7 +388,7 @@ def test_sync_dir_parallel_executor(tmp_path):
     _mk_tree(src_dir, {"x.bin": b"x", "y.bin": b"y"})
 
     with ThreadPoolExecutor(max_workers=4) as ex:
-        src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, parallel=ex)
+        src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, pool=ex)
 
     assert _tree_bytes(dst_dir) == {"x.bin": b"x", "y.bin": b"y"}
 
@@ -400,7 +400,7 @@ def test_sync_dir_ignore_existing_file(tmp_path):
     _mk_tree(src_dir, {"a.bin": b"new", "b.bin": b"b"})
     _mk_tree(dst_dir, {"a.bin": b"existing"})  # should be kept
 
-    src_dir.sync_dir(dst_dir, mode=SaveMode.IGNORE, parallel=None)
+    src_dir.sync_dir(dst_dir, mode=SaveMode.IGNORE, pool=None)
     assert _tree_bytes(dst_dir) == {"a.bin": b"existing", "b.bin": b"b"}
 
 
@@ -412,7 +412,7 @@ def test_sync_dir_error_if_exists(tmp_path):
     _mk_tree(dst_dir, {"a.bin": b"existing"})
 
     with pytest.raises(FileExistsError):
-        src_dir.sync_dir(dst_dir, mode=SaveMode.ERROR_IF_EXISTS, parallel=None)
+        src_dir.sync_dir(dst_dir, mode=SaveMode.ERROR_IF_EXISTS, pool=None)
 
 
 def test_sync_dir_does_not_delete_extras(tmp_path):
@@ -422,7 +422,7 @@ def test_sync_dir_does_not_delete_extras(tmp_path):
     _mk_tree(src_dir, {"a.bin": b"a"})
     _mk_tree(dst_dir, {"extra.bin": b"zzz"})
 
-    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, parallel=None)
+    src_dir.sync_dir(dst_dir, mode=SaveMode.OVERWRITE, pool=None)
     assert _tree_bytes(dst_dir) == {"a.bin": b"a", "extra.bin": b"zzz"}
 
 
@@ -430,7 +430,7 @@ def test_sync_dir_allow_not_found_true_noop(tmp_path):
     src_dir = LocalDataPath(tmp_path / "missing_dir")
     dst_dir = LocalDataPath(tmp_path / "dst")
 
-    src_dir.sync_dir(dst_dir, allow_not_found=True, parallel=None)
+    src_dir.sync_dir(dst_dir, allow_not_found=True, pool=None)
     assert not dst_dir.exists()
 
 
@@ -439,7 +439,7 @@ def test_sync_dir_allow_not_found_false_raises(tmp_path):
     dst_dir = LocalDataPath(tmp_path / "dst")
 
     with pytest.raises(FileNotFoundError):
-        src_dir.sync_dir(dst_dir, allow_not_found=False, parallel=None)
+        src_dir.sync_dir(dst_dir, allow_not_found=False, pool=None)
 
 
 def test_sync_dispatch_file(tmp_path):
@@ -447,7 +447,7 @@ def test_sync_dispatch_file(tmp_path):
     dst = LocalDataPath(tmp_path / "dst.bin")
     src.write_bytes(b"data")
 
-    src.sync(dst, parallel=None)
+    src.sync(dst, pool=None)
     assert dst.read_bytes() == b"data"
 
 
@@ -456,5 +456,5 @@ def test_sync_dispatch_dir(tmp_path):
     dst_dir = LocalDataPath(tmp_path / "dst")
     _mk_tree(src_dir, {"a.bin": b"a"})
 
-    src_dir.sync(dst_dir, parallel=None)
+    src_dir.sync(dst_dir, pool=None)
     assert _tree_bytes(dst_dir) == {"a.bin": b"a"}

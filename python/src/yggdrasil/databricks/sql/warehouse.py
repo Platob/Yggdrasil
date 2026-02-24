@@ -17,7 +17,7 @@ from databricks.sdk.service.sql import (
 
 from .statement_result import StatementResult
 from ..workspaces import Workspace, WorkspaceService
-from ...concurrent.threading import Job
+from yggdrasil.concurrent.threading import Job
 from ...dataclasses.expiring import ExpiringDict
 from ...pyutils.equality import dicts_equal
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
@@ -443,16 +443,22 @@ class SQLWarehouse(WorkspaceService):
         if details.warehouse_type is None:
             details.warehouse_type = EndpointInfoWarehouseType.PRO
 
-        if details.enable_serverless_compute is None:
-            details.enable_serverless_compute = details.warehouse_type.value == EndpointInfoWarehouseType.PRO.value
-        elif details.enable_serverless_compute:
-            details.warehouse_type = EndpointInfoWarehouseType.PRO
-
         if not details.name:
             if details.enable_serverless_compute:
                 details.name = DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
             else:
                 details.name = DEFAULT_ALL_PURPOSE_CLASSIC_NAME
+
+        if details.enable_serverless_compute is None:
+            if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
+                details.enable_serverless_compute = False
+            elif details.name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+                details.enable_serverless_compute = True
+            else:
+                details.enable_serverless_compute = "verless" in details.name.lower()
+
+        if details.enable_serverless_compute:
+            details.warehouse_type = EndpointInfoWarehouseType.PRO
 
         if not details.auto_stop_mins:
             if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:

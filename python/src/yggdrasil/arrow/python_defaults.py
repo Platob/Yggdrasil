@@ -332,7 +332,7 @@ def default_python_scalar(hint: Any):
     origin = get_origin(hint)
 
     if origin is None and not inspect.isclass(hint):
-        from .cast import convert
+        from yggdrasil.data.cast import convert
 
         arrow_field: pa.Field = convert(hint, pa.Field)
         arrow_scalar = default_arrow_scalar(dtype=arrow_field.type, nullable=arrow_field.nullable)

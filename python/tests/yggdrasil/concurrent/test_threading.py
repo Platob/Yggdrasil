@@ -19,7 +19,7 @@ from typing import Callable, List, Set
 
 import pytest
 
-from yggdrasil.concurrent.threading import Job, JobThreadPoolExecutor
+from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 
 
 # ----------------- helpers -----------------
@@ -57,7 +57,7 @@ def test_job_make_and_run_basic():
 
 
 def test_as_completed_rejects_non_positive_limits():
-    with JobThreadPoolExecutor(max_workers=2) as ex:
+    with JobPoolExecutor(max_workers=2) as ex:
         with pytest.raises(ValueError):
             list(ex.as_completed([], max_in_flight=0))
         with pytest.raises(ValueError):
@@ -71,9 +71,9 @@ def test_as_completed_rejects_non_positive_limits():
 
 
 def test_as_completed_empty_iterable_yields_nothing_ordered_and_unordered():
-    with JobThreadPoolExecutor(max_workers=2) as ex:
+    with JobPoolExecutor(max_workers=2) as ex:
         assert list(ex.as_completed([], ordered=False, max_in_flight=10)) == []
-    with JobThreadPoolExecutor(max_workers=2) as ex:
+    with JobPoolExecutor(max_workers=2) as ex:
         assert list(ex.as_completed([], ordered=True, max_in_flight=10)) == []
 
 
@@ -94,7 +94,7 @@ def test_unordered_completion_allows_overtake():
 
     jobs = [Job.make(slow), Job.make(fast, "fast1"), Job.make(fast, "fast2")]
 
-    with JobThreadPoolExecutor(max_workers=3) as ex:
+    with JobPoolExecutor(max_workers=3) as ex:
         gen = ex.as_completed(jobs, ordered=False, max_in_flight=3)
 
         f1 = next(gen)
@@ -128,7 +128,7 @@ def test_ordered_blocks_behind_head_and_preserves_order():
 
     jobs = [Job.make(slow), Job.make(fast)]
 
-    with JobThreadPoolExecutor(max_workers=2) as ex:
+    with JobPoolExecutor(max_workers=2) as ex:
         gen = ex.as_completed(jobs, ordered=True, max_in_flight=2)
 
         box = {}
@@ -183,7 +183,7 @@ def test_unordered_respects_max_in_flight_peak_concurrency():
     jobs = [Job.make(tracked, i) for i in range(20)]
     results: List[int] = []
 
-    with JobThreadPoolExecutor(max_workers=20) as ex:
+    with JobPoolExecutor(max_workers=20) as ex:
         gen = ex.as_completed(jobs, ordered=False, max_in_flight=max_in_flight)
 
         t = threading.Thread(target=_drain_futures, args=(gen, results), daemon=True)
@@ -225,7 +225,7 @@ def test_ordered_respects_max_in_flight_peak_concurrency_and_output_order():
     jobs = [Job.make(tracked, i) for i in range(12)]
     results: List[int] = []
 
-    with JobThreadPoolExecutor(max_workers=12) as ex:
+    with JobPoolExecutor(max_workers=12) as ex:
         gen = ex.as_completed(jobs, ordered=True, max_in_flight=max_in_flight)
 
         t = threading.Thread(target=_drain_futures, args=(gen, results), daemon=True)
@@ -252,7 +252,7 @@ def test_unordered_yields_all_results_exactly_once():
     n = 200
     jobs = [Job.make(work, i) for i in range(n)]
 
-    with JobThreadPoolExecutor(max_workers=8) as ex:
+    with JobPoolExecutor(max_workers=8) as ex:
         results = [f.result(timeout=1.0) for f in ex.as_completed(jobs, ordered=False, max_in_flight=25)]
 
     assert len(results) == n
@@ -269,7 +269,7 @@ def test_ordered_yields_all_results_exactly_once_in_order():
     n = 200
     jobs = [Job.make(work, i) for i in range(n)]
 
-    with JobThreadPoolExecutor(max_workers=8) as ex:
+    with JobPoolExecutor(max_workers=8) as ex:
         results = [f.result(timeout=1.0) for f in ex.as_completed(jobs, ordered=True, max_in_flight=25)]
 
     assert results == list(range(n))
@@ -297,7 +297,7 @@ def test_breaking_early_from_huge_stream_is_safe_and_plausible_subset():
     k = 5
     max_in_flight = 10
 
-    with JobThreadPoolExecutor(max_workers=4) as ex:
+    with JobPoolExecutor(max_workers=4) as ex:
         gen = ex.as_completed(job_stream(), ordered=False, max_in_flight=max_in_flight)
         out: List[int] = []
         _drain_futures(gen, out, stop_after=k)
@@ -335,7 +335,7 @@ def test_max_buffer_alias_overrides_max_in_flight():
     jobs = [Job.make(tracked, i) for i in range(20)]
     results: List[int] = []
 
-    with JobThreadPoolExecutor(max_workers=20) as ex:
+    with JobPoolExecutor(max_workers=20) as ex:
         gen = ex.as_completed(
             jobs,
             ordered=False,

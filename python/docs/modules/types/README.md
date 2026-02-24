@@ -42,7 +42,7 @@ print(schema)
 
 ```python
 from dataclasses import dataclass
-from yggdrasil.types.cast.registry import convert
+from yggdrasil.data.cast.registry import convert
 
 @dataclass
 class User:

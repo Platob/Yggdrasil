@@ -1,13 +1,14 @@
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Mapping, Any, Union, TYPE_CHECKING
+from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
-from .dynamic_buffer import DynamicBuffer
+from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import Response
 from .url import URL
+from ..concurrent.threading import JobPoolExecutor
 
 if TYPE_CHECKING:
     from ..databricks.sql.table import Table
@@ -20,7 +21,9 @@ __all__ = ["Session"]
 class Session(ABC):
     base_url: Optional[URL] = None
     verify: bool = True
-    waiting: WaitingConfig = field(default_factory=lambda: DEFAULT_WAITING_CONFIG)
+
+    waiting: WaitingConfig = field(default_factory=lambda: DEFAULT_WAITING_CONFIG, repr=False, compare=False, hash=False)
+    cache: Optional["Table"] = field(default=None, repr=False, compare=False, hash=False)
 
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
@@ -79,6 +82,19 @@ class Session(ABC):
     ) -> Response:
         raise NotImplementedError
 
+    @abstractmethod
+    def send_many(
+        self,
+        requests: Iterator[PreparedRequest],
+        *,
+        add_statistics: Optional[bool] = None,
+        stream: bool = True,
+        wait: Optional[WaitingConfigArg] = None,
+        cache: Optional["Table"] = None,
+        pool: Optional[JobPoolExecutor | int] = None
+    ):
+        raise NotImplementedError
+
     # --- Convenience HTTP Methods ---
 
     def get(
@@ -112,7 +128,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -140,7 +156,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -168,7 +184,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -196,7 +212,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -248,7 +264,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -278,7 +294,7 @@ class Session(ABC):
         *,
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         add_statistics: Optional[bool] = None,
@@ -314,7 +330,7 @@ class Session(ABC):
         *,
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[DynamicBuffer, bytes]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
         json: Optional[Any] = None,
         normalize: bool = True,
         cache: Optional["Table"] = None

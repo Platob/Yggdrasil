@@ -8,7 +8,7 @@ import uuid
 import pyarrow as pa
 import pytest
 
-from yggdrasil.types.python_defaults import (
+from yggdrasil.arrow.python_defaults import (
     default_arrow_array,
     default_arrow_scalar,
     default_python_scalar,
@@ -123,7 +123,7 @@ def test_default_python_scalar_non_class_goes_through_convert_without_mocking():
     hint = polars.Int32()
 
     # Use real converter to determine expected
-    from yggdrasil.types.cast import convert
+    from yggdrasil.data.cast import convert
 
     arrow_field = convert(hint, pa.Field)
     assert isinstance(arrow_field, pa.Field)

@@ -1,4 +1,5 @@
 import datetime as dt
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -18,13 +19,13 @@ DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
 WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WaitingConfig:
     timeout: float = DEFAULT_TIMEOUT_TICKS
-    interval: float = 2.0
-    backoff: float = 2.0
-    max_interval: float = 10.0
-    retries: int = 4
+    interval: float = 0.5
+    backoff: float = 1.5
+    max_interval: float = 15.0
+    retries: int = 8
 
     def __getstate__(self) -> dict:
         return {
@@ -38,10 +39,10 @@ class WaitingConfig:
     def __setstate__(self, state: dict) -> None:
         # Bypass immutability during unpickling
         object.__setattr__(self, "timeout", state.get("timeout", DEFAULT_TIMEOUT_TICKS))
-        object.__setattr__(self, "interval", state.get("interval", 2.0))
+        object.__setattr__(self, "interval", state.get("interval", 1.5))
         object.__setattr__(self, "backoff", state.get("backoff", 1.0))
         object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
-        object.__setattr__(self, "retries", state.get("retries", 4))
+        object.__setattr__(self, "retries", state.get("retries", 8))
 
     def __bool__(self):
         return self.timeout > 0
@@ -122,10 +123,10 @@ class WaitingConfig:
 
             elif isinstance(arg, bool):
                 base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
-                base_interval = 1.0
-                base_backoff = 2.0
+                base_interval = 0.5
+                base_backoff = 1.5
                 base_max_interval = 15.0
-                base_retries = 4
+                base_retries = 8
 
             elif isinstance(arg, (int, float, dt.timedelta)):
                 base_timeout = cls._to_seconds(arg)
@@ -163,18 +164,18 @@ class WaitingConfig:
             final_timeout = 0.0
 
         if final_interval is None:
-            final_interval = 1.0
+            final_interval = 0.5
 
         if final_backoff is None:
-            final_backoff = 2.0
+            final_backoff = 1.5
         elif final_backoff < 1:
-            final_backoff = 2.0
+            final_backoff = 1.5
 
         if final_max_interval is None:
             final_max_interval = 10.0
 
         if final_retries is None:
-            final_retries = 4
+            final_retries = 8
         elif final_retries < 0:
             final_retries = 0
 
@@ -192,6 +193,9 @@ class WaitingConfig:
 
         return time.time() - start > self.timeout_total_seconds
 
+    import math
+    import time
+
     def sleep(
         self,
         iteration: int,
@@ -200,8 +204,9 @@ class WaitingConfig:
         """
         iteration is 0-based (first wait => iteration=0)
 
+        Smoother growth than pure exponential:
         - interval == 0 => no sleep
-        - backoff >= 1 => interval * backoff**iteration
+        - backoff >= 1 => interval * backoff**f(iteration), where f is softened
         - max_interval == 0 => no cap, else cap sleep to max_interval
         - if start is provided and timeout > 0:
             * raise TimeoutError if already out of time
@@ -213,7 +218,11 @@ class WaitingConfig:
         if self.interval == 0:
             return
 
-        sleep_s = self.interval * (self.backoff ** iteration)
+        # Smooth exponent growth (0, 1, ~1.41, ~1.73, 2, ...)
+        # Compared to pure exponential (0,1,2,3,4,...), this grows much less aggressively.
+        growth_exp = math.sqrt(iteration)
+
+        sleep_s = self.interval * (self.backoff ** growth_exp)
 
         if self.max_interval > 0:
             sleep_s = min(sleep_s, self.max_interval)

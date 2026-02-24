@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 from yggdrasil.databricks import Workspace
 from yggdrasil.databricks.secrets import Secret  # adjust if your import path differs
-from yggdrasil.pyutils.serde import ObjectSerde
 
 
 class TestSecrets(unittest.TestCase):

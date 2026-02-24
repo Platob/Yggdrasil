@@ -11,7 +11,7 @@ class TestSQLEngine(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.test_data = pa.table([
+        cls.arrow_data = pa.table([
             pa.array(["a", None, "c"]),
             pa.array([1, 2, 4]),
             pa.array([{"q": dt.datetime.now(dt.timezone.utc), "v": 1.0}, None, None]),
@@ -22,15 +22,17 @@ class TestSQLEngine(unittest.TestCase):
         cls.workspace = Workspace().connect()
         cls.engine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
 
-        cls.table = cls.engine.table("test_table_crud").create(
-            cls.test_data,
-        )
+        cls.table = cls.engine.table("test_table_crud").create(cls.arrow_data)
+        cls.table.insert(cls.arrow_data)
 
     @classmethod
     def tearDownClass(cls):
         cls.table.delete()
 
-    def test_credentials(self):
-        credentials = self.table.credentials()
+    def test_arrow_schema(self):
+        assert isinstance(self.table.arrow_schema, pa.Schema)
 
-        assert credentials is not None
+    def test_arrow_dataset(self):
+        arrow_table = self.table.to_arrow_dataset(row_limit=2).to_table()
+
+        assert arrow_table.num_rows == 2

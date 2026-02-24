@@ -409,6 +409,17 @@ class Secret(WorkspaceService):
     # ACL management
     # -------------------------
 
+    @staticmethod
+    def check_permission(
+        principal: str,
+        permission: AclPermission = None
+    ):
+        if permission is None:
+            if principal == "users":
+                return AclPermission.READ
+            return AclPermission.MANAGE
+        return permission
+
     def put_acl(
         self,
         permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
@@ -435,6 +446,11 @@ class Secret(WorkspaceService):
                 for group in current_groups
                 if group.display not in {"users"}
             ]
+        else:
+            permissions = [
+                self.check_permission(_)
+                for _ in permissions
+            ]
 
         scope = scope or self.scope
         if not scope:
@@ -446,8 +462,10 @@ class Secret(WorkspaceService):
             batch.extend(permissions)
 
         if principal is not None or permission is not None:
-            if not principal or permission is None:
+            if not principal:
                 raise ValueError("Both 'principal' and 'permission' must be provided for single ACL.")
+            if not permission:
+                permission = self.check_permission(principal)
             batch.append((principal, permission))
 
         if not batch:

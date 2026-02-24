@@ -36,7 +36,7 @@ import pyarrow as pa
 from ...pyutils.serde import ObjectSerde
 
 if TYPE_CHECKING:
-    from .cast_options import CastOptions
+    from .options import CastOptions
 
 __all__ = ["register_converter", "convert"]
 
@@ -137,14 +137,15 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
     # late import side-effect: ensure namespace-specific converters are registered
     if check_namespace:
-        namespace = ObjectSerde.full_namespace(from_type)
+        from_namespace = ObjectSerde.full_namespace(from_type)
+        to_namespace = ObjectSerde.full_namespace(to_hint)
 
-        if namespace.startswith("polars"):
-            from ...polars import cast as _polars_cast  # noqa: F401
-        elif namespace.startswith("pandas"):
-            from ...pandas import cast as _pandas_cast  # noqa: F401
-        elif namespace.startswith("pyspark"):
-            from ...spark import cast as _spark_cast  # noqa: F401
+        if from_namespace.startswith("polars") or to_namespace.startswith("polars"):
+            from yggdrasil.polars import cast as _polars_cast  # noqa: F401
+        elif from_namespace.startswith("pandas") or to_namespace.startswith("pandas"):
+            from yggdrasil.pandas import cast as _pandas_cast  # noqa: F401
+        elif from_namespace.startswith("pyspark") or to_namespace.startswith("pyspark"):
+            from yggdrasil.spark import cast as _spark_cast  # noqa: F401
 
         return find_converter(from_type, to_hint, check_namespace=False)
 
@@ -217,8 +218,8 @@ def convert(
     **kwargs: Any,
 ) -> T:
     """Convert `value` to `target_hint` using registered converters + built-ins."""
-    from yggdrasil.types.python_defaults import default_scalar
-    from yggdrasil.types.cast.cast_options import CastOptions
+    from yggdrasil.arrow.python_defaults import default_scalar
+    from yggdrasil.data.cast import CastOptions
 
     is_optional, target_hint = _unwrap_optional(target_hint)
 
@@ -342,7 +343,7 @@ def convert_to_python_enum(value: Any, target: type[enum.Enum], options: Optiona
 
 
 def convert_to_python_dataclass(value: Any, target: type[T], options: Optional["CastOptions"] = None) -> T:
-    from yggdrasil.types.python_defaults import default_scalar
+    from yggdrasil.arrow.python_defaults import default_scalar
 
     if isinstance(value, target):
         return value
@@ -383,7 +384,7 @@ def convert_to_python_iterable(
 
     # Arrow -> pylist (optionally cast through Arrow type hint)
     if isinstance(value, (pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch)):
-        from .. import arrow_field_from_hint
+        from yggdrasil.arrow.python_arrow import arrow_field_from_hint
 
         try:
             value = convert(value, arrow_field_from_hint(elem_hint), options=options)

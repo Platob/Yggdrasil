@@ -3,9 +3,7 @@
 import dataclasses
 from typing import Any, List, Optional, Union, TYPE_CHECKING
 
-import pyarrow as pa
-
-from ..python_arrow import is_arrow_type_list_like
+import yggdrasil.arrow as pa
 
 if TYPE_CHECKING:
     import polars
@@ -83,13 +81,8 @@ class CastOptions:
         default=None, init=False, repr=False
     )
 
-    # ------------------------------------------------------------------
-    # Construction helpers
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def safe_init(
-        cls,
+    def __init__(
+        self,
         safe: bool = False,
         add_missing_columns: bool = True,
         strict_match_names: bool = False,
@@ -99,51 +92,54 @@ class CastOptions:
         merge: bool = False,
         source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
         target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-    ) -> "CastOptions":
-        """Build a CastOptions instance with optional source/target fields.
+    ):
+        self.safe = safe
+        self.add_missing_columns = add_missing_columns
+        self.strict_match_names = strict_match_names
+        self.allow_add_columns = allow_add_columns
+        self.eager = eager
+        self.datetime_patterns = datetime_patterns
+        self.merge = merge
 
-        Parameters
-        ----------
-        safe:
-            Enable safe casting.
-        add_missing_columns:
-            Add missing columns when True.
-        strict_match_names:
-            Require exact field-name matches when True.
-        allow_add_columns:
-            Preserve extra columns when True.
-        eager:
-            Enable eager casting when True.
-        datetime_patterns:
-            Optional datetime parsing patterns.
-        merge:
-            Enable merge casting when True.
-        source_field:
-            Optional source Arrow field / schema / type.
-        target_field:
-            Optional target Arrow field / schema / type.
-
-        Returns
-        -------
-        CastOptions
-        """
-        instance = cls(
-            safe=safe,
-            add_missing_columns=add_missing_columns,
-            strict_match_names=strict_match_names,
-            allow_add_columns=allow_add_columns,
-            eager=eager,
-            datetime_patterns=datetime_patterns,
-            merge=merge,
-        )
+        # private caches — must exist before the setters fire
+        object.__setattr__(self, "source_arrow_field", None)
+        object.__setattr__(self, "_source_polars_field", None)
+        object.__setattr__(self, "_source_spark_field", None)
+        object.__setattr__(self, "target_arrow_field", None)
+        object.__setattr__(self, "_target_polars_field", None)
+        object.__setattr__(self, "_target_spark_field", None)
+        object.__setattr__(self, "arrow_memory_pool", None)
 
         if source_field is not None:
-            instance.source_field = source_field
+            self.source_field = source_field
 
         if target_field is not None:
-            instance.target_field = target_field
+            self.target_field = target_field
 
-        return instance
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def safe_init(cls, **kwargs) -> "CastOptions":
+        """Deprecated alias — construct CastOptions(...) directly."""
+        return cls(**kwargs)
+
+    @classmethod
+    def check_arg(
+        cls,
+        options: CastOptionsArg = None,
+        source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
+        target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
+        **kwargs,
+    ) -> "CastOptions":
+        if isinstance(options, CastOptions):
+            if kwargs or source_field is not None or target_field is not None:
+                return options.copy(source_field=source_field, target_field=target_field, **kwargs)
+            return options
+
+        resolved_target = target_field if target_field is not None else options
+        return cls(source_field=source_field, target_field=resolved_target, **kwargs)
 
     def copy(
         self,
@@ -157,15 +153,7 @@ class CastOptions:
         source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
         target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
     ) -> "CastOptions":
-        """Return a new CastOptions with selected fields overridden.
-
-        Boolean flags are OR-ed with the current instance's values so that
-        enabling a flag is additive rather than destructive. ``add_missing_columns``
-        falls back to ``self.add_missing_columns`` when *None* is passed.
-        Fields (source / target) replace the current value only when explicitly
-        provided.
-        """
-        return self.safe_init(
+        return CastOptions(
             safe=self.safe or safe,
             add_missing_columns=self.add_missing_columns if add_missing_columns is None else add_missing_columns,
             strict_match_names=self.strict_match_names or strict_match_names,
@@ -175,51 +163,6 @@ class CastOptions:
             merge=self.merge or merge,
             source_field=source_field if source_field is not None else self.source_arrow_field,
             target_field=target_field if target_field is not None else self.target_arrow_field,
-        )
-
-    @classmethod
-    def check_arg(
-        cls,
-        options: CastOptionsArg = None,
-        source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-        target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-        **kwargs,
-    ) -> "CastOptions":
-        """Normalise an argument into a CastOptions instance.
-
-        * If *options* is already a ``CastOptions``, return it (optionally
-          updated via :meth:`copy` when extra arguments are supplied).
-        * Otherwise treat *options* as a target-field hint (falls back to
-          *target_field*) and build a fresh instance via :meth:`safe_init`.
-
-        Parameters
-        ----------
-        options:
-            Existing ``CastOptions``, a raw Arrow type / field / schema, or
-            ``None``.
-        source_field:
-            Optional source field override.
-        target_field:
-            Optional target field override.
-        **kwargs:
-            Additional keyword arguments forwarded to :meth:`safe_init` /
-            :meth:`copy`.
-        """
-        if isinstance(options, CastOptions):
-            if kwargs or source_field is not None or target_field is not None:
-                return options.copy(
-                    source_field=source_field,
-                    target_field=target_field,
-                    **kwargs,
-                )
-            return options
-
-        # Treat a bare type/field/schema as an implicit target_field.
-        resolved_target = target_field if target_field is not None else options
-        return cls.safe_init(
-            source_field=source_field,
-            target_field=resolved_target,
-            **kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -255,22 +198,18 @@ class CastOptions:
         new value on next access.
         """
         if value is not None and not isinstance(value, pa.Field):
-            from .arrow_cast import any_to_arrow_field
+            from yggdrasil.arrow.cast import any_to_arrow_field
 
             value = any_to_arrow_field(value, None)
         object.__setattr__(self, "source_arrow_field", value)
         object.__setattr__(self, "_source_polars_field", None)
         object.__setattr__(self, "_source_spark_field", None)
 
-    def source_child_arrow_field(self, index: int) -> pa.Field:
-        """Return a child source Arrow field by *index*."""
-        return self._child_arrow_field(self.source_arrow_field, index=index)
-
     @property
     def source_polars_field(self) -> Optional["polars.Field"]:
         """Lazily computed Polars field for the source."""
         if self.source_arrow_field is not None and self._source_polars_field is None:
-            from ...polars.cast import arrow_field_to_polars_field
+            from yggdrasil.polars.cast import arrow_field_to_polars_field
 
             object.__setattr__(
                 self,
@@ -283,7 +222,7 @@ class CastOptions:
     def source_spark_field(self) -> Optional["pyspark.sql.types.StructField"]:
         """Lazily computed Spark field for the source."""
         if self.source_arrow_field is not None and self._source_spark_field is None:
-            from ...spark.cast import arrow_field_to_spark_field
+            from yggdrasil.spark.cast import arrow_field_to_spark_field
 
             object.__setattr__(
                 self,
@@ -309,7 +248,7 @@ class CastOptions:
         new value on next access.
         """
         if value is not None and not isinstance(value, pa.Field):
-            from .arrow_cast import any_to_arrow_field
+            from yggdrasil.arrow.cast import any_to_arrow_field
 
             value = any_to_arrow_field(value, None)
         object.__setattr__(self, "target_arrow_field", value)
@@ -325,15 +264,11 @@ class CastOptions:
             return self.source_field.name
         return self.target_field.name
 
-    def target_child_arrow_field(self, index: int) -> pa.Field:
-        """Return a child target Arrow field by *index*."""
-        return self._child_arrow_field(self.target_arrow_field, index=index)
-
     @property
     def target_polars_field(self) -> Optional["polars.Field"]:
         """Lazily computed Polars field for the target."""
         if self.target_arrow_field is not None and self._target_polars_field is None:
-            from ...polars.cast import arrow_field_to_polars_field
+            from yggdrasil.polars.cast import arrow_field_to_polars_field
 
             object.__setattr__(
                 self,
@@ -358,7 +293,7 @@ class CastOptions:
     def target_spark_field(self) -> Optional["pyspark.sql.types.StructField"]:
         """Lazily computed Spark field for the target."""
         if self.target_arrow_field is not None and self._target_spark_field is None:
-            from ...spark.cast import arrow_field_to_spark_field
+            from yggdrasil.spark.cast import arrow_field_to_spark_field
 
             object.__setattr__(
                 self,
@@ -376,7 +311,7 @@ class CastOptions:
         """
         if self.target_field is None:
             return None
-        from .arrow_cast import arrow_field_to_schema
+        from yggdrasil.arrow.cast import arrow_field_to_schema
 
         return arrow_field_to_schema(self.target_field, None)
 
@@ -386,7 +321,7 @@ class CastOptions:
         arrow_schema = self.target_arrow_schema
         if arrow_schema is None:
             return None
-        from ...spark.cast import arrow_schema_to_spark_schema
+        from yggdrasil.spark.cast import arrow_schema_to_spark_schema
 
         return arrow_schema_to_spark_schema(arrow_schema, None)
 
@@ -423,17 +358,101 @@ class CastOptions:
         return self.source_field.nullable and not self.target_field.nullable
 
     # ------------------------------------------------------------------
+    # Source child accessors
+    # ------------------------------------------------------------------
+
+    def source_child_arrow_field(
+        self,
+        index: int = None,
+        name: str = None,
+        raise_error: bool = True
+    ) -> pa.Field:
+        """Return a child source Arrow field by *index* or *name*."""
+        return self._child_arrow_field(
+            self.source_arrow_field,
+            index=index,
+            name=name,
+            raise_error=raise_error
+        )
+
+    def source_child_polars_field(
+        self,
+        index: int = None,
+        name: str = None,
+        raise_error: bool = True
+    ) -> "polars.Field":
+        """Return a child source Polars field by *index* or *name*."""
+        from yggdrasil.polars.cast import arrow_field_to_polars_field
+
+        arrow = self.source_child_arrow_field(index=index, name=name, raise_error=raise_error)
+        return arrow_field_to_polars_field(arrow)
+
+    # ------------------------------------------------------------------
+    # Target child accessors
+    # ------------------------------------------------------------------
+
+    def target_child_arrow_field(
+        self,
+        index: int = None,
+        name: str = None,
+        raise_error: bool = True
+    ) -> pa.Field:
+        """Return a child target Arrow field by *index* or *name*."""
+        return self._child_arrow_field(
+            self.target_arrow_field,
+            index=index,
+            name=name,
+            raise_error=raise_error
+        )
+
+    def target_child_polars_field(
+        self,
+        index: int = None,
+        name: str = None,
+        raise_error: bool = True
+    ) -> "polars.Field":
+        """Return a child target Polars field by *index* or *name*."""
+        from yggdrasil.polars.cast import arrow_field_to_polars_field
+
+        arrow = self.target_child_arrow_field(index=index, name=name, raise_error=raise_error)
+        return arrow_field_to_polars_field(arrow)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _child_arrow_field(arrow_field: pa.Field, index: int) -> pa.Field:
-        """Return a child Arrow field by *index* for nested types.
+    def _child_arrow_field(
+        self,
+        arrow_field: pa.Field,
+        index: int = None,
+        name: str = None,
+        raise_error: bool = True
+    ) -> Optional[pa.Field]:
+        """Return a child Arrow field by *index* or *name* for nested types.
 
-        For structs, returns the field at *index*. For list-like types,
-        returns the value field. For maps, synthesises an ``entries`` struct
-        field containing the key and item fields. Non-nested types are
-        returned unchanged.
+        For structs, returns the field at *index* or by *name* (case-sensitive
+        when ``safe=True``, case-insensitive when ``safe=False``).
+        For list-like types, returns the value field. For maps, synthesises an
+        ``entries`` struct field containing the key and item fields.
+        Non-nested types are returned unchanged.
+
+        Parameters
+        ----------
+        arrow_field:
+            The parent Arrow field to inspect.
+        index:
+            Child field index (used when *name* is not provided).
+        name:
+            Child field name. Takes precedence over *index*.
+        raise_error:
+            If ``True``, raise on lookup failure. If ``False``, return ``None``.
+
+        Raises
+        ------
+        KeyError
+            If a name lookup finds no match and ``raise_error=True``.
+        NotImplementedError
+            If the nested type is not supported and ``raise_error=True``.
         """
         source_type: Union[pa.DataType, pa.ListType, pa.StructType, pa.MapType] = (
             arrow_field.type
@@ -443,16 +462,47 @@ class CastOptions:
             return arrow_field
 
         if pa.types.is_struct(source_type):
+            if name is not None:
+                if self.strict_match_names:
+                    try:
+                        return source_type.field(name)
+                    except KeyError:
+                        if raise_error:
+                            raise
+                        return None
+
+                name_lower = name.lower()
+                for i in range(source_type.num_fields):
+                    f = source_type.field(i)
+                    if f.name.lower() == name_lower:
+                        return f
+
+                if raise_error:
+                    raise KeyError(
+                        f"No field matching {name!r} (case-insensitive) in struct {source_type}"
+                    )
+                return None
+
             return source_type.field(index)
 
-        if is_arrow_type_list_like(source_type):
+        if (
+            pa.types.is_list(source_type)
+            or pa.types.is_large_list(source_type)
+            or pa.types.is_list_view(source_type)
+            or pa.types.is_large_list_view(source_type)
+            or pa.types.is_fixed_size_list(source_type)
+        ):
             return source_type.value_field
 
         if pa.types.is_map(source_type):
+            m = self.target_arrow_field
             return pa.field(
-                "entries",
-                pa.struct([source_type.key_field, source_type.item_field]),
+                name="entries",
+                type=pa.struct([source_type.key_field, source_type.value_field]),
                 nullable=False,
+                metadata=None if m is None else m.metadata
             )
 
-        raise NotImplementedError(f"Unsupported nested Arrow type: {source_type}")
+        if raise_error:
+            raise NotImplementedError(f"Unsupported nested Arrow type: {source_type}")
+        return None

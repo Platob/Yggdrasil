@@ -9,7 +9,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import pyarrow as pa
 
 from yggdrasil.io.headers import anonymize_headers
-from .dynamic_buffer import DynamicBuffer
+from .buffer import BytesIO
 from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
 __all__ = ["Response", "HTTPError"]
@@ -64,8 +64,14 @@ ARROW_SCHEMA = pa.schema(
             },
         ),
         pa.field(
-            name="response_headers",
-            type=pa.map_(pa.string(), pa.string(), keys_sorted=True),
+            "response_headers",
+            pa.list_(pa.field(
+                name="entries",
+                type=pa.struct([
+                    pa.field("key", pa.string()),
+                    pa.field("value", pa.string())
+                ])
+            )),
             nullable=True,
             metadata={
                 "comment": "Raw HTTP response headers as ordered key/value pairs",
@@ -238,7 +244,7 @@ class Response:
     # Core HTTP bits
     status_code: int
     headers: Mapping[str, str]
-    buffer: DynamicBuffer
+    buffer: BytesIO
 
     received_at_timestamp: int  # time.time_ns() // 1000
 
@@ -348,9 +354,9 @@ class Response:
             body_obj = d.get("data")
 
         if body_obj is None:
-            buffer = DynamicBuffer()  # Response.buffer is non-optional
+            buffer = BytesIO()  # Response.buffer is non-optional
         else:
-            buffer = DynamicBuffer.parse_any(obj=body_obj)
+            buffer = BytesIO.parse_any(obj=body_obj)
 
         # ---- received_at timestamp (us) ----
         ts_obj = (
@@ -599,7 +605,7 @@ class Response:
                     headers = {}
 
                 body_bytes = cols["response_body"][i].as_py() if "response_body" in cols else None
-                buffer = DynamicBuffer.parse_any(obj=body_bytes) if body_bytes is not None else DynamicBuffer()
+                buffer = BytesIO.parse_any(obj=body_bytes) if body_bytes is not None else BytesIO()
 
                 if "response_received_at" in cols:
                     rts = cols["response_received_at"][i].as_py()
