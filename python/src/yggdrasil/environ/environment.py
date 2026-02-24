@@ -1032,6 +1032,7 @@ class PyEnv:
         requirements: str | Path | None = None,
         extra_args: Sequence[str] = (),
         wait: WaitingConfigArg | None = True,
+        raise_error: bool = True,
         prefer_uv: bool | None = None,
         target: Path | str | None = None
     ) -> SystemCommand | None:
@@ -1086,7 +1087,7 @@ class PyEnv:
             return None
 
         cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["install"]
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.check_arg(wait)
         tmp_req: Path | None = None
 
         if requirements is not None:
@@ -1122,10 +1123,9 @@ class PyEnv:
             target.mkdir(parents=True, exist_ok=True)
             cmd += ["--target", str(target)]
 
-        result = SystemCommand.run_lazy(cmd, cwd=self.cwd)
+        result = SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait=wait, raise_error=raise_error)
 
-        if wait_cfg:
-            result.wait(wait=wait_cfg)
+        if wait:
             if tmp_req is not None:
                 try:
                     tmp_req.unlink(missing_ok=True)
@@ -1135,6 +1135,7 @@ class PyEnv:
                         tmp_req,
                         exc_info=True,
                     )
+
         return result
 
     def update(
@@ -1486,13 +1487,8 @@ class PyEnv:
                     raise
 
         pip_name = pip_name or safe_pip_name(module_name)
-        result = self.install(pip_name, wait=wait)
-        error = result.raise_for_status(raise_error=False)
 
-        if isinstance(error, Exception):
-            raise ModuleNotFoundError(
-                f"No module named '{module_name}'", name=module_name
-            ) from error
+        self.install(pip_name, wait=wait, raise_error=True)
 
         importlib.invalidate_caches()
         return importlib.import_module(module_name)

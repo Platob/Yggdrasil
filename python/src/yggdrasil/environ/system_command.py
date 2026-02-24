@@ -313,13 +313,13 @@ class SystemCommand:
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
         auto_install: bool = False
-    ) -> Union["SystemCommand", "SystemCommandError"]:
+    ) -> "SystemCommand":
         if self.completed is not None:
             return self.completed  # type: ignore[return-value]
 
         wait = WaitingConfig.check_arg(wait)
 
-        if wait.timeout:
+        if wait:
             out, err = self.popen.communicate(timeout=wait.timeout_total_seconds)
 
             self.completed = subprocess.CompletedProcess(
@@ -329,7 +329,8 @@ class SystemCommand:
                 stderr=err,
             )
 
-            return self.raise_for_status(
+        if raise_error:
+            self.raise_for_status(
                 wait=wait,
                 raise_error=raise_error,
                 auto_install=auto_install
@@ -359,14 +360,12 @@ class SystemCommand:
 
         return self.wait(wait=wait, raise_error=raise_error)
 
-    def raise_for_status(
+    def exception(
         self,
-        *,
         wait: WaitingConfigArg | None = True,
-        raise_error: bool = True,
         auto_install: bool = True,
-    ) -> Union["SystemCommand", "SystemCommandError"]:
-        if self.returncode != 0:
+    ) -> Optional["SystemCommandError"]:
+        if self.completed and self.returncode != 0:
             if auto_install:
                 if self.python is not None:
                     if self.installed_python_modules is None:
@@ -383,13 +382,23 @@ class SystemCommand:
 
                         self.installed_python_modules.add(module_err.name)
 
-                        return self.retry(wait=wait, raise_error=raise_error)
+                        return self.retry(wait=wait, raise_error=False)
 
-            e = SystemCommandError(command=self)
+            return SystemCommandError(command=self)
+        return None
 
-            if raise_error:
-                raise e
-            return e
+    def raise_for_status(
+        self,
+        *,
+        wait: WaitingConfigArg | None = True,
+        raise_error: bool = True,
+        auto_install: bool = True,
+    ) -> Union["SystemCommand", "SystemCommandError"]:
+        if raise_error:
+            error = self.exception(wait=wait, auto_install=auto_install)
+
+            if error is not None:
+                raise error
 
         return self
 

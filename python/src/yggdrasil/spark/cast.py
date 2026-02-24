@@ -199,13 +199,18 @@ def arrow_type_to_spark_type(
     # Numeric fallbacks (handles exotic / extension types)
     if pat.is_integer(arrow_type):
         return T.LongType()
+
     if pat.is_floating(arrow_type):
         return T.DoubleType()
 
     # Binary / string fallbacks
-    if pat.is_binary(arrow_type) or pat.is_large_binary(arrow_type):
+    if (
+        pat.is_binary(arrow_type) or pat.is_large_binary(arrow_type)
+        or pat.is_fixed_size_binary(arrow_type) or pat.is_binary_view(arrow_type)
+    ):
         return T.BinaryType()
-    if pat.is_string(arrow_type) or pat.is_large_string(arrow_type):
+
+    if pat.is_string(arrow_type) or pat.is_large_string(arrow_type) or pat.is_string_view(arrow_type):
         return T.StringType()
 
     raise TypeError(
