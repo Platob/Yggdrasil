@@ -94,7 +94,7 @@ class CommandExecution:
         if self.environ:
             environ = {
                 k: os.getenv(v)
-                for k, v in self.environ
+                for k, v in self.environ.items()
                 if k and v
             }
 
