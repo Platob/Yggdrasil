@@ -156,16 +156,17 @@ class CommandExecution:
             .replace("__PYVERSION__", repr(pyversion))
         )
 
-        run = (
-            self.create(
-                context=self.context,
-                command=command,
-                language=self.language
+        with self.context as temporary:
+            run = (
+                self.create(
+                    context=temporary,
+                    command=command,
+                    language=self.language
+                )
+                .start()
             )
-            .start()
-        )
 
-        return run.wait(raise_error=True).result(raise_error=True)
+            return run.wait(raise_error=True).result(raise_error=True)
 
     def __repr__(self):
         return "%s(url=%s)" % (

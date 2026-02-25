@@ -13,10 +13,12 @@ from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple, Literal
 
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
 
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
+from ...concurrent.threading import Job
 from ...dataclasses.expiring import ExpiringDict
 from ...environ import PyEnv, UserInfo
 from ...environ.modules import resolve_local_lib_path
@@ -96,7 +98,6 @@ class ExecutionContext:
 
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
 
-    _was_connected: Optional[bool] = dc.field(default=None, repr=False, compare=False, hash=False)
     _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False, compare=False, hash=False)
     _requirements: Optional[list[tuple[str]]] = dc.field(default=None, repr=False, compare=False, hash=False)
     _pyenv_check_timestamp: int = dc.field(default=0, repr=False, compare=False, hash=False)
@@ -148,22 +149,20 @@ class ExecutionContext:
         """
         state["_lock"] = threading.RLock()  # always fresh
         state.setdefault("_remote_metadata", None)
-        state.setdefault("_was_connected", None)
         state.setdefault("_uploaded_package_roots", ExpiringDict())
 
         self.__dict__.update(state)
 
     def __enter__(self) -> "ExecutionContext":
         """Enter a context manager, opening a remote execution context."""
-        self.cluster.__enter__()
-        self._was_connected = self.context_id is not None
-        return self.connect()
+        return self.create(
+            language=self.language,
+            context_key=self.context_key
+        )
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context manager and close the remote context if created."""
-        if not self._was_connected:
-            self.close(wait=False)
-        self.cluster.__exit__(exc_type, exc_val=exc_val, exc_tb=exc_tb)
+        self.close(wait=False, raise_error=False)
 
     def __repr__(self):
         return "%s(url=%s)" % (
@@ -265,11 +264,6 @@ class ExecutionContext:
         Returns:
             The created command execution context response.
         """
-        LOGGER.debug(
-            "Creating Databricks command execution context for %s",
-            self.cluster
-        )
-
         client = self.workspace_client().command_execution
 
         try:
@@ -304,11 +298,6 @@ class ExecutionContext:
             context_id=created.id,
             context_key=context_key or self.context_key or os.urandom(8).hex(),
             language=language
-        )
-
-        LOGGER.info(
-            "Created %s",
-            instance
         )
 
         return instance
@@ -351,7 +340,11 @@ class ExecutionContext:
             wait=wait
         )
 
-    def close(self, wait: bool = True) -> None:
+    def close(
+        self,
+        wait: bool = True,
+        raise_error: bool = True
+    ) -> None:
         """Destroy the remote command execution context if it exists.
 
         Returns:
@@ -369,16 +362,14 @@ class ExecutionContext:
                     context_id=self.context_id,
                 )
             else:
-                Thread(
-                    target=client.command_execution.destroy,
-                    kwargs={
-                        "cluster_id": self.cluster.cluster_id,
-                        "context_id": self.context_id,
-                    }
-                ).start()
-        except BaseException:
-            # non-fatal: context cleanup best-effort
-            pass
+                Job.make(
+                    client.command_execution.destroy,
+                    cluster_id=self.cluster_id,
+                    context_id=self.context_id
+                ).fire_and_forget()
+        except DatabricksError:
+            if raise_error:
+                raise
         finally:
             self.context_id = None
 

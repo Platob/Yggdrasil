@@ -125,8 +125,9 @@ def _eval_expr_on_series(
 _DATETIME_FORMATS_WITH_TZ = [
     "%Y-%m-%dT%H:%M:%S%.f%z",
     "%Y-%m-%dT%H:%M:%S%z",
-    "%Y-%m-%d %H:%M:%S%.f%z",   # ← space separator with fractional seconds
-    "%Y-%m-%d %H:%M%z",         # ← space separator, no seconds (matches your example)
+    "%Y-%m-%d %H:%M:%S%.f%z",  # space sep, fractional seconds, offset
+    "%Y-%m-%d %H:%M:%S%z",     # space sep, no fractional seconds, offset
+    "%Y-%m-%d %H:%M%z",        # space sep, no seconds, offset  ← matches "2026-02-17 03:00+01:00"
 ]
 
 # All remaining formats — strptime yields naive Datetime[tu].
@@ -172,31 +173,34 @@ _TIME_FORMATS = [
 ]
 
 
-def _unsafe_string_to_datetime(arr: pl.Expr, dtype: pl.Datetime) -> pl.Expr:
-    """Parse string to Datetime, trying many formats, yielding a naive result.
+def _normalize_utc_offset(arr: pl.Expr) -> pl.Expr:
+    """Rewrite '+01:00' / '-05:30' style offsets to '+0100' / '-0530'.
 
-    tz-aware formats (%z) are parsed to UTC then stripped to naive so that
-    the entire coalesce list has a uniform dtype (no supertype resolution
-    across tz-aware / naive that would raise SchemaError).
-
-    The caller (:func:`cast_polars_array_to_temporal`) applies timezone
-    semantics via :func:`_apply_tz` after this function returns.
+    Polars strptime %z handles +HHMM but not +HH:MM (RFC 3339 style).
+    Only rewrites if a colon-offset is actually present — leaves other
+    strings untouched.
     """
+    return arr.str.replace(
+        r"([+-])(\d{2}):(\d{2})$",
+        r"${1}${2}${3}",
+    )
+
+
+def _unsafe_string_to_datetime(arr: pl.Expr, dtype: pl.Datetime) -> pl.Expr:
     tu = dtype.time_unit or "us"
     bare = pl.Datetime(tu)
     utc  = pl.Datetime(tu, "UTC")
 
-    # Parse tz-aware formats → UTC → strip to naive (uniform bare dtype)
+    normalized = _normalize_utc_offset(arr)  # +HH:MM → +HHMM
+
     tz_parsed = [
-        _safe_strptime(arr, utc, fmt)
+        _safe_strptime(normalized, utc, fmt)
             .dt.convert_time_zone("UTC")
             .dt.replace_time_zone(None)
         for fmt in _DATETIME_FORMATS_WITH_TZ
     ]
-    # Parse naive formats directly
     naive_parsed = [_safe_strptime(arr, bare, fmt) for fmt in _DATETIME_FORMATS_NAIVE]
 
-    # All branches now have dtype Datetime[tu] — safe to coalesce
     return pl.coalesce(tz_parsed + naive_parsed)
 
 
@@ -526,7 +530,7 @@ def cast_polars_array_to_struct(
     series_name = array.name if not is_expr else options.source_arrow_field.name
 
     # Non-struct source: JSON decode or direct cast
-    if not spf.dtype.is_(pl.Struct):
+    if not spf.dtype.__class__ is pl.Struct:
         if spf.dtype.__class__ in (pl.String, pl.Utf8, pl.Object):
             array = array.str.json_decode(dtype=tpf.dtype)
         return array.cast(tpf.dtype, strict=options.safe).alias(series_name)
@@ -575,10 +579,6 @@ def cast_polars_array_to_list(
     options: "CastOptions",
 ) -> Union[pl.Series, pl.Expr]:
     is_expr = isinstance(array, pl.Expr)
-
-    from yggdrasil.arrow.cast import cast_arrow_array
-    arr = cast_arrow_array(array.to_arrow(), options)
-    return pl.from_arrow(arr)
 
     saf, taf = options.source_arrow_field, options.target_arrow_field
     spf, tpf = options.source_polars_field, options.target_polars_field

@@ -920,11 +920,36 @@ class TestCastPolarsDataframe:
         assert result["ts"][1] == dt.datetime(2026, 2, 18, 0, 0, 0, tzinfo=dt.timezone.utc)
 
     def test_list_string_tz_to_datetime(self):
-        df = pl.DataFrame({"ts": ["2026-02-17 03:00+01:00", "2026-02-18 01:00+01:00"]})
-        result = _cast_df(df, _schema(("ts", pa.timestamp("us", "UTC"))), safe=False)
-        assert result["ts"].dtype == pl.Datetime("us", "UTC")
-        assert result["ts"][0] == dt.datetime(2026, 2, 17, 2, 0, 0, tzinfo=dt.timezone.utc)
-        assert result["ts"][1] == dt.datetime(2026, 2, 18, 0, 0, 0, tzinfo=dt.timezone.utc)
+        df = pl.DataFrame({
+            "ts": [
+                [
+                    {"data": "2026-02-17 03:00+01:00", "value": "123"},
+                    {"data": "2026-02-18 01:00+01:00", "value": "456"},  # → UTC 2026-02-18 00:00
+                ]
+            ]
+        })
+
+        result = _cast_df(df, _schema(("ts", pa.list_(
+            pa.struct([
+                pa.field("data", pa.timestamp("us", "UTC")),  # case matches source keys
+                pa.field("value", pa.float64()),
+            ])))), safe=False
+        )
+
+        # The column is a List[Struct], so drill in:
+        ts_structs = result["ts"].explode()  # Series of Struct rows
+        data_col = ts_structs.struct.field("data")  # Series of Datetime[us, UTC]
+        value_col = ts_structs.struct.field("value")  # Series of Float64
+
+        assert result["ts"].dtype == pl.List(
+            pl.Struct({"data": pl.Datetime("us", "UTC"), "value": pl.Float64})
+        )
+
+        assert data_col[0] == dt.datetime(2026, 2, 17, 2, 0, 0, tzinfo=dt.timezone.utc)
+        assert data_col[1] == dt.datetime(2026, 2, 18, 0, 0, 0, tzinfo=dt.timezone.utc)
+
+        assert value_col[0] == 123.0
+        assert value_col[1] == 456.0
 
     def test_int_to_date(self):
         df = pl.DataFrame({"d": pl.Series([19723, 19724], dtype=pl.Int32())})
