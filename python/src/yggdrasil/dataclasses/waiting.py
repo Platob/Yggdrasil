@@ -48,6 +48,10 @@ class WaitingConfig:
         return self.timeout > 0
 
     @property
+    def total_try_count(self) -> int:
+        return max(self.retries + 1, 1)
+
+    @property
     def timeout_total_seconds(self) -> float:
         return self.timeout
 

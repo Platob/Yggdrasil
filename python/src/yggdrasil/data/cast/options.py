@@ -483,7 +483,25 @@ class CastOptions:
                     )
                 return None
 
-            return source_type.field(index)
+            # --- index lookup (with optional name validation) ---
+            try:
+                f = source_type.field(index)
+            except IndexError:
+                if raise_error:
+                    raise
+                return None
+
+            if name is not None:
+                expected = name if self.strict_match_names else name.lower()
+                actual = f.name if self.strict_match_names else f.name.lower()
+                if actual != expected:
+                    if raise_error:
+                        raise KeyError(
+                            f"Field at index {index} is {f.name!r}, expected {name!r}"
+                        )
+                    return None
+
+            return f
 
         if (
             pa.types.is_list(source_type)

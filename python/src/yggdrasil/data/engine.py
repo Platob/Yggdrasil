@@ -31,7 +31,7 @@ class SQLEngine(ABC):
         row_limit: Optional[int] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         **kwargs
     ) -> StatementResult:
         raise NotImplementedError
@@ -54,6 +54,6 @@ class SQLEngine(ABC):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        wait: Optional[WaitingConfigArg] = True
+        wait: WaitingConfigArg = True
     ):
         raise NotImplementedError

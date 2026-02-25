@@ -225,7 +225,7 @@ class SQLWarehouse(WorkspaceService):
 
     def start(
         self,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True
     ):
         if self.warehouse_id:
@@ -635,7 +635,7 @@ class SQLWarehouse(WorkspaceService):
         self,
         permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         *,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         warehouse_id: Optional[str] = None
     ):
         warehouse_id = warehouse_id or self.warehouse_id
@@ -712,7 +712,7 @@ class SQLWarehouse(WorkspaceService):
         wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        wait: Optional[WaitingConfigArg] = True
+        wait: WaitingConfigArg = True
     ) -> StatementResult:
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 

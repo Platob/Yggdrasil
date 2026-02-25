@@ -285,7 +285,7 @@ class Cluster(WorkspaceService):
 
     def wait_for_status(
         self,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True
     ):
         """Wait for the cluster to exit pending states.
@@ -641,7 +641,7 @@ class Cluster(WorkspaceService):
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
         access_control_list: Optional[List["ClusterAccessControlRequest"] | bool] = True,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         **cluster_spec: Any
     ) -> "Cluster":
         """Update cluster configuration and optionally install libraries.
@@ -822,7 +822,7 @@ class Cluster(WorkspaceService):
 
     def ensure_running(
         self,
-        wait: Optional[WaitingConfigArg] = True
+        wait: WaitingConfigArg = True
     ) -> "Cluster":
         """Ensure the cluster is running.
 
@@ -833,7 +833,7 @@ class Cluster(WorkspaceService):
 
     def start(
         self,
-        wait: Optional[WaitingConfigArg] = True
+        wait: WaitingConfigArg = True
     ) -> "Cluster":
         """Start the cluster if it is not already running.
 
@@ -866,7 +866,7 @@ class Cluster(WorkspaceService):
 
     def restart(
         self,
-        wait: Optional[WaitingConfigArg] = True
+        wait: WaitingConfigArg = True
     ):
         """Restart the cluster, waiting for libraries to install.
 
@@ -964,7 +964,7 @@ class Cluster(WorkspaceService):
     def install_libraries(
         self,
         libraries: Optional[List[Union[str, "Library"]]] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         pip_settings: Optional[PipIndexSettings] = None,
         raise_error: bool = True,
     ) -> "Cluster":

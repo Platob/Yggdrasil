@@ -364,7 +364,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         row_limit: Optional[int] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         engine: Optional[Literal["spark", "api"]] = None,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
@@ -578,7 +578,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         ## Databricks specific
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
@@ -701,7 +701,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
@@ -1129,7 +1129,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True
     ) -> None:
         """

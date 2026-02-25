@@ -702,7 +702,7 @@ class Workspace:
     def clean_tmp_folder(
         self,
         raise_error: bool = True,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         volume_name: Optional[str] = None,

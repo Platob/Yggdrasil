@@ -369,7 +369,7 @@ class CommandExecution:
 
     def wait(
         self,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True
     ):
         if not self.command_id:
@@ -794,45 +794,55 @@ if env:
 
     def result(
         self,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         unpickle: bool = True
     ) -> Any:
-        try:
-            self.wait(raise_error=raise_error)
+        wait = WaitingConfig.check_arg(wait)
+        installed_modules: set[str] = set()
+        last_exc: Exception | None = None
 
-            obj = self.decode_response(
-                response=self.details,
-                language=self.language,
-                raise_error=raise_error,
-                unpickle=unpickle
-            )
-        except (InternalError, ClientTerminatedSession):
-            self.context = self.context.connect(reset=True)
+        for attempt in range(wait.total_try_count):
+            try:
+                self.wait(wait=wait, raise_error=raise_error)
 
-            return (
-                self
-                .start(reset=True)
-                .result(raise_error=raise_error, unpickle=unpickle)
-            )
-        except ModuleNotFoundError as e:
-            module_name = e.name
+                return self.decode_response(
+                    response=self.details,
+                    language=self.language,
+                    raise_error=raise_error,
+                    unpickle=unpickle
+                )
 
-            if module_name:
+            except (InternalError, ClientTerminatedSession) as e:
+                last_exc = e
+                self.context = self.context.connect(reset=True)
+                self.start(reset=True)
+
+            except ModuleNotFoundError as e:
+                last_exc = e
+                module_name = e.name
+
+                if not module_name or module_name in installed_modules:
+                    raise
+
                 self.context.install_temporary_libraries(
                     libraries=[module_name],
                     pip_install=False
                 )
-                self.context.check_with_env(env=PyEnv.current())
-
-                return (
-                    self
-                    .start(reset=True)
-                    .result(raise_error=raise_error, unpickle=unpickle)
+                self.context.check_with_env(
+                    env=PyEnv.current(),
+                    wait=WaitingConfig(timeout=60),
+                    raise_error=False
                 )
-            else:
-                raise e
+                installed_modules.add(module_name)
+                self.start(reset=True)
 
-        return obj
+        if last_exc is None:
+            last_exc = RuntimeError(f"Failed to get result with {wait}")
+
+        if raise_error:
+            raise last_exc
+        return None
 
 
 def raise_error_from_response(

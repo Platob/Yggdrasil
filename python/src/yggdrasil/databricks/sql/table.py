@@ -517,7 +517,7 @@ class Table(WorkspaceService):
         statement: str,
         *,
         row_limit: Optional[int] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         cache_for: Optional[WaitingConfigArg] = None
     ):
         return self.workspace.sql().execute(
@@ -534,7 +534,7 @@ class Table(WorkspaceService):
         *,
         filters: Optional[list[tuple[str, str, str]]] = None,
         row_limit: Optional[int] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         cache_for: Optional[WaitingConfigArg] = None
     ):
         statement = f"SELECT * FROM {self.full_name(safe=True)}"

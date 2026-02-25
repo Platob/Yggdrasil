@@ -22,7 +22,7 @@ from ...environ import PyEnv, UserInfo
 from ...environ.modules import resolve_local_lib_path
 from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -254,7 +254,7 @@ class ExecutionContext:
         language: "Language",
         context_key: Optional[str] = None,
         *,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
     ) -> "ExecutionContext":
         """Create a command execution context, retrying if needed.
 
@@ -316,7 +316,7 @@ class ExecutionContext:
     def connect(
         self,
         language: Optional[Language] = None,
-        wait: Optional[WaitingConfigArg] = True,
+        wait: WaitingConfigArg = True,
         reset: bool = False,
     ) -> "ExecutionContext":
         """Create a remote command execution context if not already open.
@@ -730,6 +730,8 @@ with zipfile.ZipFile(buf, "r") as zf:
         self,
         libraries: str | ModuleType | List[str | ModuleType],
         *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
         pip_install: bool = False
     ) -> Union[str, ModuleType, List[str | ModuleType]]:
         connected = self.connect()
@@ -741,7 +743,7 @@ with zipfile.ZipFile(buf, "r") as zf:
         if pip_install:
             items = [str(x) for x in items]
 
-            r = self.command(
+            self.command(
                 command=f"""import subprocess, pathlib, shlex, sys
 tgt = pathlib.Path({str(self.remote_metadata.libs_path)!r}).expanduser()
 tgt.mkdir(parents=True, exist_ok=True)
@@ -776,7 +778,7 @@ if failed:
 print("[done] fallback complete. failed:", failed)
 sys.exit(0)
 """
-            ).start().wait()
+            ).start().wait(wait=wait, raise_error=raise_error)
         else:
             upload_map = {
                 str(resolved): posixpath.join(libs_path, resolved.name)
@@ -795,7 +797,8 @@ sys.exit(0)
     def check_with_env(
         self,
         env: PyEnv,
-        wait: WaitingConfigArg = True
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True
     ):
         local_reqs = env.requirements(with_system=False)
         remote_reqs = self.requirements
@@ -809,7 +812,9 @@ sys.exit(0)
         if diffs:
             self.install_temporary_libraries(
                 libraries=diffs,
-                pip_install=True
+                pip_install=True,
+                wait=wait,
+                raise_error=raise_error
             )
             self._requirements = None
 
