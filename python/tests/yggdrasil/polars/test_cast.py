@@ -912,6 +912,13 @@ class TestCastPolarsDataframe:
         result = _cast_df(df, _schema(("ts", pa.timestamp("us"))), safe=False)
         assert result["ts"].dtype == pl.Datetime("us")
 
+    def test_string_tz_to_datetime(self):
+        s = "2026-02-17 03:00+01:00"
+        df = pl.DataFrame({"ts": ["2026-02-17 03:00+01:00", "2026-02-17 03:00+01:00"]})
+        result = _cast_df(df, _schema(("ts", pa.timestamp("us", "UTC"))), safe=False)
+        assert result["ts"].dtype == pl.Datetime("us", "UTC")
+        assert result["ts"][0] == dt.datetime(2026, 2, 17, 2, 0, 0, tzinfo=dt.timezone.utc)
+
     def test_int_to_date(self):
         df = pl.DataFrame({"d": pl.Series([19723, 19724], dtype=pl.Int32())})
         result = _cast_df(df, _schema(("d", pa.date32())), safe=False)

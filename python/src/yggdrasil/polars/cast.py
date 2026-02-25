@@ -125,6 +125,8 @@ def _eval_expr_on_series(
 _DATETIME_FORMATS_WITH_TZ = [
     "%Y-%m-%dT%H:%M:%S%.f%z",
     "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%d %H:%M:%S%.f%z",   # ← space separator with fractional seconds
+    "%Y-%m-%d %H:%M%z",         # ← space separator, no seconds (matches your example)
 ]
 
 # All remaining formats — strptime yields naive Datetime[tu].
