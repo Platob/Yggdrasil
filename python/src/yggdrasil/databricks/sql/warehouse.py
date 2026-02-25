@@ -15,12 +15,13 @@ from databricks.sdk.service.sql import (
     WarehouseAccessControlRequest, WarehousePermissionLevel
 )
 
+import yggdrasil.arrow as pa
+from yggdrasil.concurrent.threading import Job
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.pyutils.equality import dicts_equal
 from .statement_result import StatementResult
 from ..workspaces import Workspace, WorkspaceService
-from yggdrasil.concurrent.threading import Job
-from ...dataclasses.expiring import ExpiringDict
-from ...pyutils.equality import dicts_equal
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
 _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
@@ -712,7 +713,8 @@ class SQLWarehouse(WorkspaceService):
         wait_timeout: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        wait: WaitingConfigArg = True
+        wait: WaitingConfigArg = True,
+        arrow_schema: Optional[pa.Schema] = None
     ) -> StatementResult:
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 

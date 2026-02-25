@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, is_dataclass, replace
-from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator
+from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator, TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pyarrow as pa
@@ -12,29 +12,24 @@ from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
-__all__ = ["Response", "HTTPError"]
+if TYPE_CHECKING:
+    import polars as pl
+    import pandas as pd
+    from starlette.responses import Response as StarletteResponse
+    from fastapi import Response as FastAPIResponse
+
+__all__ = [
+    "Response",
+    "ARROW_SCHEMA",
+    "RESPONSE_ARROW_SCHEMA",
+]
 
 
-class HTTPError(RuntimeError):
-    """Raised when an HTTP response indicates an error status."""
-
-    def __init__(self, message: str, *, response: "Response"):
-        super().__init__(message)
-        self.response = response
-
-
-def _reason_phrase(status_code: int) -> str:
-    # Avoid pulling in requests/http; keep it lightweight.
-    # This covers the common ones; unknown => empty.
-    try:
-        from http import HTTPStatus
-        return HTTPStatus(status_code).phrase
-    except Exception:
-        return ""
-
+# ---------------------------------------------------------------------------
+# Charset / content-type helpers
+# ---------------------------------------------------------------------------
 
 def _get_charset(headers: Mapping[str, str]) -> str:
-    # Try to parse Content-Type: ...; charset=utf-8
     ct = ""
     for k, v in headers.items():
         if k.lower() == "content-type":
@@ -42,7 +37,6 @@ def _get_charset(headers: Mapping[str, str]) -> str:
             break
     if not ct:
         return "utf-8"
-
     parts = [p.strip() for p in ct.split(";")]
     for p in parts[1:]:
         if p.lower().startswith("charset="):
@@ -50,41 +44,69 @@ def _get_charset(headers: Mapping[str, str]) -> str:
     return "utf-8"
 
 
-# -----------------------------
-# Response schema (fixed + fully described)
-# -----------------------------
+def _detect_content_type(headers: Mapping[str, str]) -> str | None:
+    """Return the bare content-type token (no params) from response headers."""
+    for k, v in headers.items():
+        if k.lower() == "content-type":
+            return v.split(";")[0].strip().lower()
+    return None
+
+
+def _content_type_family(ct: str | None) -> str:
+    """Map a bare content-type string to a broad parsing family."""
+    if not ct:
+        return "unknown"
+    if ct == "application/json" or ct.endswith("+json"):
+        return "json"
+    if ct in (
+        "application/x-ndjson",
+        "application/jsonlines",
+        "application/x-jsonlines",
+        "text/x-ndjson",
+    ):
+        return "ndjson"
+    if ct in ("text/csv", "application/csv", "text/tab-separated-values"):
+        return "csv"
+    if ct == "text/plain":
+        return "text"
+    if ct in (
+        "application/vnd.apache.arrow.stream",
+        "application/vnd.apache.arrow.file",
+        "application/x-arrow",
+    ):
+        return "arrow"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Arrow schemas
+# ---------------------------------------------------------------------------
+
 ARROW_SCHEMA = pa.schema(
     [
         pa.field(
             name="response_status_code",
             type=pa.int32(),
             nullable=False,
-            metadata={
-                "comment": "HTTP status code returned by the server",
-            },
+            metadata={"comment": "HTTP status code returned by the server"},
         ),
         pa.field(
             "response_headers",
-            pa.list_(pa.field(
-                name="entries",
-                type=pa.struct([
-                    pa.field("key", pa.string()),
-                    pa.field("value", pa.string())
-                ])
-            )),
+            pa.map_(pa.string(), pa.string()),
             nullable=True,
-            metadata={
-                "comment": "Raw HTTP response headers as ordered key/value pairs",
-                "keys_sorted": "true"
-            },
+            metadata={"comment": "Raw HTTP response headers as ordered key/value pairs"},
+        ),
+        pa.field(
+            "response_tags",
+            pa.map_(pa.string(), pa.string()),
+            nullable=True,
+            metadata={"comment": "Arbitrary string tags attached to this response"},
         ),
         pa.field(
             name="response_body",
             type=pa.binary(),
             nullable=True,
-            metadata={
-                "comment": "Raw binary payload of the response (bytes)",
-            },
+            metadata={"comment": "Raw binary payload of the response (bytes)"},
         ),
         pa.field(
             name="response_body_hash",
@@ -111,16 +133,17 @@ ARROW_SCHEMA = pa.schema(
     },
 )
 
-# -----------------------------
-# Full schema (request + response)
-# -----------------------------
-FULL_ARROW_SCHEMA = pa.schema(
+RESPONSE_ARROW_SCHEMA = pa.schema(
     list(REQUEST_ARROW_SCHEMA) + list(ARROW_SCHEMA),
     metadata={
         "comment": "HTTP prepared request and response flattened into columns for single-row logging batches.",
     },
 )
 
+
+# ---------------------------------------------------------------------------
+# Internal URL / header helpers
+# ---------------------------------------------------------------------------
 
 def _redact_headers(
     headers: Mapping[str, str] | None,
@@ -130,14 +153,11 @@ def _redact_headers(
 ) -> Mapping[str, str] | None:
     if not headers:
         return headers
-
     sens = {k.lower() for k in sensitive_keys}
-
-    out: dict[str, str] = {}
-    for k, v in headers.items():
-        out[k] = replacement if k.lower() in sens else v
-
-    # Preserve mapping type if possible (e.g., OrderedDict)
+    out: dict[str, str] = {
+        k: (replacement if k.lower() in sens else v)
+        for k, v in headers.items()
+    }
     try:
         return type(headers)(out)  # type: ignore[call-arg]
     except Exception:
@@ -152,45 +172,30 @@ def _sanitize_url(
 ) -> str:
     if not url:
         return url
-
     sens = {k.lower() for k in sensitive_query_keys}
     parts = urlsplit(url)
-
-    # Strip userinfo (user:pass@host)
     netloc = parts.netloc
     if "@" in netloc:
         netloc = netloc.split("@", 1)[1]
-
-    # Redact sensitive query param values (keep keys)
     if parts.query:
         q = parse_qsl(parts.query, keep_blank_values=True)
         q2 = [(k, replacement if k.lower() in sens else v) for (k, v) in q]
         query = urlencode(q2, doseq=True)
     else:
         query = parts.query
-
     return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 
 
 def _copy_with_updates(obj: Any, **updates: Any) -> Any:
-    """
-    Best-effort copy that supports dataclasses + normal objects.
-
-    - dataclass: dataclasses.replace
-    - non-dataclass: copy.copy + setattr
-    """
     if not updates:
         return obj
-
     if is_dataclass(obj):
         return replace(obj, **updates)
-
     new_obj = copy.copy(obj)
     for k, v in updates.items():
         try:
             setattr(new_obj, k, v)
         except Exception:
-            # Don't block anonymization if an attribute is read-only.
             pass
     return new_obj
 
@@ -210,32 +215,39 @@ def _to_url_string(url_obj: Any) -> str | None:
 
 
 def _rebuild_url_like(original_url_obj: Any, url_string: str) -> Any:
-    """
-    Best-effort attempt to reconstruct the same URL object type.
-    Falls back to the sanitized string.
-    """
     if original_url_obj is None:
         return url_string
-
     url_cls = type(original_url_obj)
-
-    # Common patterns for URL wrapper types
     for ctor in ("from_string", "parse", "from_url", "from_str"):
         if hasattr(url_cls, ctor):
             try:
                 return getattr(url_cls, ctor)(url_string)
             except Exception:
                 pass
-
-    # If original was already a string, keep it a string
     if isinstance(original_url_obj, str):
         return url_string
-
-    # Can't rebuild; return string (caller may or may not accept it)
     return url_string
 
 
-# ------------------- Response -------------------
+# ---------------------------------------------------------------------------
+# Hop-by-hop headers (shared by to_starlette / to_fastapi)
+# ---------------------------------------------------------------------------
+
+_HOP_BY_HOP: frozenset[str] = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+# ---------------------------------------------------------------------------
+# Response
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Response:
@@ -246,80 +258,44 @@ class Response:
     headers: Mapping[str, str]
     buffer: BytesIO
 
-    received_at_timestamp: int  # time.time_ns() // 1000
+    received_at_timestamp: int   # µs since epoch (time.time_ns() // 1000)
+    tags: Mapping[str, str]
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
 
     @classmethod
-    def parse_any(
-        cls,
-        obj: Any,
-        *,
-        normalize: bool = True,
-    ) -> "Response":
+    def parse_any(cls, obj: Any, *, normalize: bool = True) -> "Response":
         if isinstance(obj, cls):
             return obj
-
         if isinstance(obj, str):
             return cls.parse_str(obj, normalize=normalize)
-
         if isinstance(obj, Mapping):
             return cls.parse_dict(obj, normalize=normalize)
-
-        # last-resort: stringify (useful for wrappers/log objects)
         return cls.parse_str(str(obj), normalize=normalize)
 
     @classmethod
-    def parse_str(
-        cls,
-        raw: str,
-        *,
-        normalize: bool = True,
-    ) -> "Response":
-        """
-        Accepts JSON string representing a Response-ish dict.
-        """
+    def parse_str(cls, raw: str, *, normalize: bool = True) -> "Response":
         s = raw.strip()
         if not s:
             raise ValueError("Response.parse_str: empty string")
-
         try:
             d = json.loads(s)
         except Exception as e:
             raise ValueError("Response.parse_str: expected JSON object string") from e
-
         if not isinstance(d, Mapping):
             raise ValueError("Response.parse_str: JSON must decode to an object")
-
         return cls.parse_dict(d, normalize=normalize)
 
     @classmethod
-    def parse_dict(
-        cls,
-        d: Mapping[str, Any],
-        *,
-        normalize: bool = True,
-    ) -> "Response":
-        """
-        Parses a Response from a mapping.
-
-        Supported shapes (field aliases included):
-          - request:  "request" | ("method","url","headers","body" in same dict) fallback
-          - status:   "status_code" | "status" | "code"
-          - headers:  "headers" | "header" | "hdrs"
-          - body:     "buffer" | "body" | "content" | "data"
-          - received: "received_at_timestamp" | "received_at" | "timestamp" | "time_us" | "time_ns"
-        """
+    def parse_dict(cls, d: Mapping[str, Any], *, normalize: bool = True) -> "Response":
         if not d:
             raise ValueError("Response.parse_dict: empty mapping")
 
-        # ---- request ----
-        req_obj = d.get("request")
-        if req_obj is None:
-            # some logs flatten request fields at top-level
-            # (PreparedRequest.parse_dict already supports a bunch of aliases)
-            req_obj = d
+        req_obj = d.get("request") or d
         request = PreparedRequest.parse_any(req_obj, normalize=normalize)
 
-        # ---- status code ----
         status = (
             d.get("status_code")
             if "status_code" in d
@@ -329,59 +305,33 @@ class Response:
         )
         if status is None or status == "":
             raise ValueError("Response.parse_dict: missing status_code/status/code")
+        status_code = int(status) if isinstance(status, int) else int(float(str(status).strip()))
 
-        if isinstance(status, int):
-            status_code = int(status)
-        else:
-            s = str(status).strip()
-            status_code = int(s) if s.isdigit() else int(float(s))
-
-        # ---- headers ----
         headers_obj = d.get("headers") or d.get("header") or d.get("hdrs") or {}
-        if headers_obj is None:
-            headers_obj = {}
         if not isinstance(headers_obj, Mapping):
             raise ValueError("Response.parse_dict: headers must be a mapping")
         headers: dict[str, str] = {str(k): str(v) for k, v in headers_obj.items()}
 
-        # ---- body/buffer ----
-        body_obj = d.get("buffer")
-        if body_obj is None:
-            body_obj = d.get("body")
-        if body_obj is None:
-            body_obj = d.get("content")
-        if body_obj is None:
-            body_obj = d.get("data")
+        body_obj = (
+            d.get("buffer")
+            or d.get("body")
+            or d.get("content")
+            or d.get("data")
+        )
+        buffer = BytesIO.parse_any(obj=body_obj) if body_obj is not None else BytesIO()
 
-        if body_obj is None:
-            buffer = BytesIO()  # Response.buffer is non-optional
-        else:
-            buffer = BytesIO.parse_any(obj=body_obj)
-
-        # ---- received_at timestamp (us) ----
         ts_obj = (
             d.get("received_at_timestamp")
-            if "received_at_timestamp" in d
-            else d.get("received_at")
-            if "received_at" in d
-            else d.get("time_us")
-            if "time_us" in d
-            else d.get("timestamp")
-            if "timestamp" in d
-            else d.get("time_ns")
+            or d.get("received_at")
+            or d.get("time_us")
+            or d.get("timestamp")
+            or d.get("time_ns")
         )
-
         received_at_ts = 0
         if ts_obj is not None and ts_obj != "":
-            if isinstance(ts_obj, int):
-                received_at_ts = ts_obj
-            else:
-                s = str(ts_obj).strip()
-                received_at_ts = int(s) if s.isdigit() else 0
+            received_at_ts = int(ts_obj) if isinstance(ts_obj, int) else 0
 
-        # If provided as ns, convert to us (Response expects us in this file: time.time_ns() // 1000)
-        if "time_ns" in d and isinstance(ts_obj, int):
-            received_at_ts = ts_obj
+        tags = d.get("tags") or None
 
         return cls(
             request=request,
@@ -389,7 +339,12 @@ class Response:
             headers=headers,
             buffer=buffer,
             received_at_timestamp=received_at_ts,
+            tags=tags,
         )
+
+    # ------------------------------------------------------------------
+    # Core properties
+    # ------------------------------------------------------------------
 
     @property
     def content(self) -> bytes:
@@ -397,8 +352,7 @@ class Response:
 
     @property
     def text(self) -> str:
-        charset = _get_charset(self.headers)
-        return self.content.decode(charset, errors="replace")
+        return self.content.decode(_get_charset(self.headers), errors="replace")
 
     def json(self) -> Any:
         return json.loads(self.content)
@@ -407,120 +361,151 @@ class Response:
     def ok(self) -> bool:
         return 200 <= self.status_code < 400
 
+    # ------------------------------------------------------------------
+    # raise_for_status — delegates to exceptions module
+    # ------------------------------------------------------------------
+
     def raise_for_status(self, *, max_body: int = 2048) -> None:
         """
-        Raise HTTPError if status_code is 4xx/5xx.
+        Raise the most specific HTTPStatusError subclass for 4xx/5xx.
+        No-op for 1xx/2xx/3xx.
 
-        max_body: include up to N bytes of response body in the error message (decoded).
+        Raises
+        ------
+        exceptions.BadRequest          (400)
+        exceptions.UnauthorizedError   (401)
+        exceptions.ForbiddenError      (403)
+        exceptions.NotFoundError       (404)
+        exceptions.MethodNotAllowed    (405)
+        exceptions.ConflictError       (409)
+        exceptions.GoneError           (410)
+        exceptions.UnprocessableEntity (422)
+        exceptions.TooManyRequests     (429)
+        exceptions.InternalServerError (500)
+        exceptions.BadGatewayError     (502)
+        exceptions.ServiceUnavailable  (503)
+        exceptions.GatewayTimeout      (504)
+        exceptions.ClientError         (other 4xx)
+        exceptions.ServerError         (other 5xx)
         """
-        if 200 <= self.status_code < 400:
-            return
+        if not self.ok:
+            raise self.error()
 
-        method = self.request.method
-        url = self.request.url.to_string()
+    def error(self):
+        if not self.ok:
+            from .errors import make_for_status
+            return make_for_status(self)
+        return
 
-        reason = _reason_phrase(self.status_code)
-        base = f"{self.status_code}{(' ' + reason) if reason else ''} for {method} {url}"
+    # ------------------------------------------------------------------
+    # Anonymisation
+    # ------------------------------------------------------------------
 
-        body_snip = self.content[:max_body]
-        msg = base
-
-        if body_snip:
-            charset = _get_charset(self.headers)
-            text_snip = body_snip.decode(charset, errors="replace").strip()
-            if text_snip:
-                # Keep it readable; don't dump megabytes
-                suffix = "…" if len(self.content) > max_body else ""
-                msg = f"{base}\nResponse body ({min(len(self.content), max_body)} bytes){suffix}:\n{text_snip}"
-
-        raise HTTPError(msg, response=self)
-
-    def anonymize(
-        self,
-        mode: Literal["remove", "redact", "hash"] = "remove",
-    ) -> "Response":
-        """
-        Clean/boring + composable:
-        - headers redaction happens here
-        - URL redaction happens in URL.anonymize()
-        """
+    def anonymize(self, mode: Literal["remove", "redact", "hash"] = "remove") -> "Response":
         return replace(
             self,
             request=self.request.anonymize(mode=mode),
             headers=anonymize_headers(self.headers, mode=mode),
         )
 
-    def to_arrow_batch(
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_polars(
         self,
-        parse: bool = False,
-    ) -> pa.RecordBatch:
-        """
-        Single-row RecordBatch representing this response, with the request exploded
-        into columns via request.to_arrow_batch(column_prefix=request_prefix).
+        parse: bool = True,
+        *,
+        infer_schema_length: int | None = 100,
+        lazy: bool = False,
+        add_metadata: bool = False,
+    ) -> "pl.DataFrame | pl.LazyFrame":
+        from yggdrasil.polars.lib import polars as pl
 
-        Conventions:
-        - response_headers: map<string,string> (null if empty)
-        - response_body: raw bytes (null if empty)
-        - response_body_blake3: 32-byte digest (null if empty)
-        - response_body_hash64: int64 xxh3_64 digest (null if empty)
-        """
+        if not parse:
+            return pl.from_arrow(self.to_arrow_batch(parse=False))
+
+        content_type = _detect_content_type(self.headers)
+        body = self.buffer
+        body.seek(0)
+
+        meta: dict[str, Any] = {
+            "request_method": self.request.method,
+            "request_url": self.request.url.to_string(),
+            "response_status_code": self.status_code,
+            "response_received_at": self.received_at_timestamp,
+            "response_content_type": content_type or "",
+        }
+
+        family = _content_type_family(content_type)
+
+        if family == "json":
+            df = _polars_from_json(body, meta if add_metadata else {}, self.headers, pl)
+        elif family == "ndjson":
+            df = pl.read_ndjson(body)
+        elif family == "csv":
+            df = pl.read_csv(body, infer_schema_length=infer_schema_length)
+        elif family == "arrow":
+            import pyarrow as _pa
+            reader = (
+                _pa.ipc.open_stream
+                if "stream" in (content_type or "")
+                else _pa.ipc.open_file
+            )
+            df = pl.from_arrow(reader(body).read_all())
+        else:
+            df = _polars_fallback(self, meta, body, pl)
+            return df.lazy() if lazy else df
+
+        if add_metadata:
+            df = _attach_meta(df, meta, pl)
+
+        return df.lazy() if lazy else df
+
+    def to_pandas(self, parse: bool = True) -> "pd.DataFrame":
+        from yggdrasil.pandas.lib import pandas  # type: ignore
+        return self.to_polars(parse=parse).to_pandas()
+
+    def to_arrow_batch(self, parse: bool = False) -> pa.RecordBatch:
         if parse:
-            raise NotImplementedError
+            from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
+            return polars_dataframe_to_arrow_table(
+                self.to_polars(parse=parse)
+            ).to_batches()[0]
 
-        # 1) Explode request into columns (single-row)
         req_rb = self.request.to_arrow_batch(parse=False)
 
-        # response_headers as map<string,string>
-        headers_v = None
-        if self.headers:
-            headers_v = {
-                str(k): str(v)
-                for (k, v) in sorted(
-                    dict(self.headers).items(),
-                    key=lambda kv: (str(kv[0]).lower(), str(kv[0]), str(kv[1])),
-                )
-                if k and v
-            }
+        headers_v = {str(k): str(v) for k, v in (self.headers.items() if self.headers else ())}
+        tags_v = {str(k): str(v) for k, v in (self.tags.items() if self.tags else ())}
 
         if self.buffer:
             body_bytes = self.buffer.to_bytes()
             body_blake3_32 = self.buffer.blake3().digest()
         else:
-            body_bytes, body_blake3_32 = None, None
+            body_bytes = body_blake3_32 = None
 
         resp_arrays = [
-            pa.array([self.status_code], type=ARROW_SCHEMA.field("response_status_code").type),
-            pa.array([headers_v], type=ARROW_SCHEMA.field("response_headers").type),
-            pa.array([body_bytes], type=ARROW_SCHEMA.field("response_body").type),
-            pa.array([body_blake3_32], type=ARROW_SCHEMA.field("response_body_hash").type),
+            pa.array([self.status_code],        type=ARROW_SCHEMA.field("response_status_code").type),
+            pa.array([headers_v],               type=ARROW_SCHEMA.field("response_headers").type),
+            pa.array([tags_v],                  type=ARROW_SCHEMA.field("response_tags").type),
+            pa.array([body_bytes],              type=ARROW_SCHEMA.field("response_body").type),
+            pa.array([body_blake3_32],          type=ARROW_SCHEMA.field("response_body_hash").type),
             pa.array([self.received_at_timestamp], type=ARROW_SCHEMA.field("response_received_at").type),
         ]
 
-        # 4) Combine request columns + response columns into one RecordBatch
-        full_arrays = list(req_rb.columns) + resp_arrays
-
-        return pa.RecordBatch.from_arrays(full_arrays, schema=FULL_ARROW_SCHEMA)  # type: ignore
+        return pa.RecordBatch.from_arrays(
+            list(req_rb.columns) + resp_arrays,
+            schema=RESPONSE_ARROW_SCHEMA,
+        )  # type: ignore
 
     @classmethod
-    def from_arrow_batch(
+    def from_arrow(
         cls,
         batch: pa.RecordBatch | pa.Table,
         *,
         parse: bool = False,
         normalize: bool = True,
     ) -> Iterator["Response"]:
-        """
-        Zero-copy-ish streaming decode: yields Response per row.
-
-        Accepts:
-          - pa.RecordBatch (single chunk)
-          - pa.Table (possibly chunked) -> iterates batches
-
-        Notes:
-          - request fields are decoded via PreparedRequest.parse_dict
-          - response_headers stored as list<struct<key,value>> (order preserved)
-          - response_body stored as binary -> DynamicBuffer
-        """
         if parse:
             raise NotImplementedError("parse=True not implemented (yet)")
 
@@ -529,7 +514,6 @@ class Response:
                 return {}
             if isinstance(x, dict):
                 return {str(k): str(v) for k, v in x.items() if k is not None and v is not None}
-            # fallback: sometimes list of (k,v)
             try:
                 return {str(k): str(v) for k, v in x if k is not None and v is not None}
             except Exception:
@@ -539,89 +523,174 @@ class Response:
             if isinstance(obj, pa.RecordBatch):
                 yield obj
                 return
-            # Table: preserve chunking, avoid materializing whole table
             for rb in obj.to_batches():
                 yield rb
 
-        # columns we expect (names in FULL_ARROW_SCHEMA)
         req_cols: Sequence[str] = [f.name for f in REQUEST_ARROW_SCHEMA]
-        # response cols (names in ARROW_SCHEMA above)
         resp_cols: Sequence[str] = [f.name for f in ARROW_SCHEMA]
 
         for rb in _iter_batches(batch):
-            # Fast path: column-wise access then row index
-            cols = {name: rb.column(name) for name in list(req_cols) + list(resp_cols) if name in rb.schema.names}
-            n = rb.num_rows
-
-            for i in range(n):
-                # ---- rebuild request dict ----
-                # request_headers is list<struct<key,value>>
+            cols = {
+                name: rb.column(name)
+                for name in list(req_cols) + list(resp_cols)
+                if name in rb.schema.names
+            }
+            for i in range(rb.num_rows):
                 req_d: dict[str, Any] = {
                     "method": cols["request_method"][i].as_py() if "request_method" in cols else "GET",
-                    "url": cols["request_url"][i].as_py() if "request_url" in cols else ""
+                    "url":    cols["request_url"][i].as_py()    if "request_url"    in cols else "",
+                    "headers": _headers_from_map(cols["request_headers"][i].as_py()) if "request_headers" in cols else {},
+                    "tags":    _headers_from_map(cols["request_tags"][i].as_py())    if "request_tags"    in cols else {},
+                    "buffer":  cols["request_body"][i].as_py()                       if "request_body"    in cols else None,
+                    "sent_at_timestamp": (
+                        _arrow_ts_col_to_us(cols["request_sent_at"], i)
+                        if "request_sent_at" in cols else 0
+                    ),
                 }
-
-                # required fields
-
-                # headers (arrow list<struct>)
-                if "request_headers" in cols:
-                    req_hdrs = cols["request_headers"][i].as_py()
-                    req_d["headers"] = _headers_from_map(req_hdrs)
-                else:
-                    req_d["headers"] = {}
-
-                # body (binary)
-                if "request_body" in cols:
-                    b = cols["request_body"][i].as_py()
-                    req_d["buffer"] = b  # DynamicBuffer.parse_any can take bytes
-                else:
-                    req_d["buffer"] = None
-
-                # sent_at
-                if "request_sent_at" in cols:
-                    # timestamp(us) -> python datetime or int depending on as_py;
-                    # we want int microseconds in this file, so handle both.
-                    ts = cols["request_sent_at"][i].as_py()
-                    if ts is None:
-                        req_d["sent_at_timestamp"] = 0
-                    elif hasattr(ts, "timestamp"):
-                        # datetime -> seconds float; convert to us
-                        req_d["sent_at_timestamp"] = int(ts.timestamp() * 1_000_000)
-                    else:
-                        # sometimes Arrow returns int-like
-                        req_d["sent_at_timestamp"] = int(ts)
-                else:
-                    req_d["sent_at_timestamp"] = 0
-
                 request = PreparedRequest.parse_dict(req_d, normalize=normalize)
 
-                # ---- response pieces ----
-                status_code = int(cols["response_status_code"][i].as_py()) if "response_status_code" in cols else 0
-
-                if "response_headers" in cols:
-                    resp_hdrs = cols["response_headers"][i].as_py()
-                    headers = _headers_from_map(resp_hdrs)
-                else:
-                    headers = {}
-
-                body_bytes = cols["response_body"][i].as_py() if "response_body" in cols else None
-                buffer = BytesIO.parse_any(obj=body_bytes) if body_bytes is not None else BytesIO()
-
-                if "response_received_at" in cols:
-                    rts = cols["response_received_at"][i].as_py()
-                    if rts is None:
-                        received_at = 0
-                    elif hasattr(rts, "timestamp"):
-                        received_at = int(rts.timestamp() * 1_000_000)
-                    else:
-                        received_at = int(rts)
-                else:
-                    received_at = 0
+                status_code  = int(cols["response_status_code"][i].as_py()) if "response_status_code" in cols else 0
+                headers      = _headers_from_map(cols["response_headers"][i].as_py()) if "response_headers" in cols else {}
+                tags         = _headers_from_map(cols["response_tags"][i].as_py())    if "response_tags"    in cols else {}
+                body_bytes   = cols["response_body"][i].as_py()                       if "response_body"    in cols else None
+                buffer       = BytesIO.parse_any(obj=body_bytes) if body_bytes is not None else BytesIO()
+                received_at  = _arrow_ts_col_to_us(cols["response_received_at"], i)  if "response_received_at" in cols else 0
 
                 yield cls(
                     request=request,
                     status_code=status_code,
                     headers=headers,
                     buffer=buffer,
+                    tags=tags,
                     received_at_timestamp=received_at,
                 )
+
+    # ------------------------------------------------------------------
+    # ASGI — Starlette / FastAPI
+    # ------------------------------------------------------------------
+
+    def to_starlette(self) -> "StarletteResponse":
+        """
+        Convert to a ``starlette.responses.Response`` for direct return
+        from a Starlette or FastAPI route handler.
+
+        - Hop-by-hop headers are stripped.
+        - ``Content-Length`` is recomputed from the decompressed buffer.
+        - ``media_type`` is parsed from ``Content-Type`` so Starlette
+          sets the header correctly without duplication.
+        """
+        from starlette.responses import Response as _SResponse
+
+        body = self.buffer.to_bytes() if self.buffer else b""
+
+        headers: dict[str, str] = {
+            k: v
+            for k, v in (self.headers or {}).items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+        headers["content-length"] = str(len(body))
+
+        media_type = _detect_content_type(self.headers) or "application/octet-stream"
+
+        return _SResponse(
+            content=body,
+            status_code=self.status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+
+    def to_fastapi(self) -> "FastAPIResponse":
+        """
+        Convert to a ``fastapi.Response`` for direct return from a
+        FastAPI route handler.
+
+        FastAPI's ``Response`` is a subclass of Starlette's, but
+        returning the FastAPI type keeps FastAPI's dependency injection,
+        background task hooks, and OpenAPI response modelling intact.
+
+        Falls back to ``to_starlette()`` transparently when FastAPI is
+        not installed.
+        """
+        try:
+            from fastapi import Response as _FResponse
+        except ImportError:
+            return self.to_starlette()  # type: ignore[return-value]
+
+        body = self.buffer.to_bytes() if self.buffer else b""
+
+        headers: dict[str, str] = {
+            k: v
+            for k, v in (self.headers or {}).items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+        headers["content-length"] = str(len(body))
+
+        media_type = _detect_content_type(self.headers) or "application/octet-stream"
+
+        return _FResponse(
+            content=body,
+            status_code=self.status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DataFrame helpers (module-level → testable independently)
+# ---------------------------------------------------------------------------
+
+def _polars_from_json(
+    body: BytesIO,
+    meta: dict[str, Any],
+    headers: Mapping[str, str],
+    pl: Any,
+) -> Any:
+    charset = _get_charset(headers)
+    payload = json.loads(body.to_bytes().decode(charset, errors="replace"))
+
+    if isinstance(payload, list):
+        if not payload:
+            df = pl.DataFrame()
+        elif all(isinstance(row, dict) for row in payload):
+            df = pl.from_dicts(payload)
+        else:
+            df = pl.DataFrame({"value": payload})
+    elif isinstance(payload, dict):
+        row = {
+            k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
+            for k, v in payload.items()
+        }
+        df = pl.from_dicts([row])
+    else:
+        df = pl.from_dicts([{"body_json": json.dumps(payload)}])
+
+    return _attach_meta(df, meta, pl)
+
+
+def _polars_fallback(
+    response: "Response",
+    meta: dict[str, Any],
+    body: Any,
+    pl: Any,
+) -> Any:
+    raw = body.to_bytes() if hasattr(body, "to_bytes") else (body or b"")
+    row = dict(meta)
+    row["response_body"] = raw if raw else None
+    row["response_body_size"] = len(raw)
+    return pl.from_dicts([row])
+
+
+def _attach_meta(df: Any, meta: dict[str, Any], pl: Any) -> Any:
+    import polars as _pl
+    existing = set(df.columns)
+    for col_name, val in meta.items():
+        if col_name not in existing:
+            df = df.with_columns(_pl.lit(val).alias(col_name))
+    return df
+
+
+def _arrow_ts_col_to_us(col: pa.ChunkedArray | pa.Array, i: int) -> int:
+    scalar = col[i]
+    if scalar is None or not scalar.is_valid:
+        return 0
+    return scalar.value if scalar.value is not None else 0

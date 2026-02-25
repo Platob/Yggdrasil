@@ -5,8 +5,8 @@ from dataclasses import dataclass, replace
 from typing import Mapping, Any, Optional, MutableMapping, Literal
 
 import pyarrow as pa
-from yggdrasil.io.headers import anonymize_headers
 
+from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .url import URL
 
@@ -44,7 +44,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         pa.field(
             "request_url_host",
             pa.string(),
-            nullable=True,
+            nullable=False,
             metadata={"comment": "Host (domain or IP)"},
         ),
         pa.field(
@@ -61,13 +61,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         ),
         pa.field(
             "request_url_query",
-            pa.list_(pa.field(
-                name="entries",
-                type=pa.struct([
-                    pa.field("key", pa.string()),
-                    pa.field("values", pa.list_(pa.string()))
-                ])
-            )),
+            pa.string(),
             nullable=True,
             metadata={"comment": "Raw query string (without leading '?')"},
         ),
@@ -81,17 +75,19 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         # ---- headers/body ----
         pa.field(
             "request_headers",
-            pa.list_(pa.field(
-                name="entries",
-                type=pa.struct([
-                    pa.field("key", pa.string()),
-                    pa.field("value", pa.string())
-                ])
-            )),
-            nullable=True,
+            pa.map_(pa.string(), pa.string()),
+            nullable=False,
             metadata={
                 "comment": "HTTP request headers as map<string,string> (keys sorted; duplicates collapsed)",
                 "keys_sorted": "true",
+            },
+        ),
+        pa.field(
+            "request_tags",
+            pa.map_(pa.string(), pa.string()),
+            nullable=False,
+            metadata={
+                "comment": "Raw HTTP request tags as ordered key/value pairs",
             },
         ),
         pa.field(
@@ -129,6 +125,7 @@ class PreparedRequest:
     url: URL
     headers: Mapping[str, str]
     buffer: Optional[BytesIO]
+    tags: Optional[Mapping[str, str]]
     sent_at_timestamp: int = 0  # time.time_ns() // 1000
 
     @classmethod
@@ -138,6 +135,7 @@ class PreparedRequest:
         url: URL | str,
         headers: Optional[MutableMapping[str, str]] = None,
         body: Optional[Any] = None,
+        tags: Optional[Mapping[str, str]] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True,
@@ -162,7 +160,11 @@ class PreparedRequest:
         if body is not None:
             headers["Content-Length"] = body.size
 
-        return cls(method=method, url=url, headers=headers, buffer=body, sent_at_timestamp=0)
+        return cls(
+            method=method, url=url, headers=headers, buffer=body,
+            tags=tags,
+            sent_at_timestamp=0
+        )
 
     @classmethod
     def parse_any(
@@ -320,11 +322,14 @@ class PreparedRequest:
                 s = str(sent_at)
                 sent_at_ts = int(s) if s.isdigit() else 0
 
+        tags = d.get("tags", None) or None
+
         return cls(
             method=method_s,
             url=url,
             headers=headers,
             buffer=buffer,
+            tags=tags,
             sent_at_timestamp=sent_at_ts,
         )
 
@@ -365,18 +370,14 @@ class PreparedRequest:
         fragment_v = u.fragment
         q_v = u.query
 
-        headers_v = None
-        if self.headers:
-            # sorted deterministically by (lower(key), key, value)
-            # keeps logs stable while still being human-readable
-            headers_v = [
-                {"key": str(k), "value": str(v)}
-                for (k, v) in sorted(
-                    self.headers.items(),
-                    key=lambda kv: (str(kv[0]).lower(), str(kv[0]), str(kv[1])),
-                )
-                if k and v
-            ]
+        headers_v = {
+            str(k): str(v)
+            for k, v in (self.headers.items() if self.headers else ())
+        }
+        tags_v = {
+            str(k): str(v)
+            for k, v in (self.tags.items() if self.tags else ())
+        }
 
         if self.buffer:
             body_bytes = self.buffer.to_bytes()
@@ -395,6 +396,7 @@ class PreparedRequest:
             pa.array([q_v], type=REQUEST_ARROW_SCHEMA.field("request_url_query").type),
             pa.array([fragment_v], type=REQUEST_ARROW_SCHEMA.field("request_url_fragment").type),
             pa.array([headers_v], type=REQUEST_ARROW_SCHEMA.field("request_headers").type),
+            pa.array([tags_v], type=REQUEST_ARROW_SCHEMA.field("request_tags").type),
             pa.array([body_bytes], type=REQUEST_ARROW_SCHEMA.field("request_body").type),
             pa.array([body_blake3_32], type=REQUEST_ARROW_SCHEMA.field("request_body_hash").type),
             pa.array([self.sent_at_timestamp], type=REQUEST_ARROW_SCHEMA.field("request_sent_at").type),

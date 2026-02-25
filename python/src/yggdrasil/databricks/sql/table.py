@@ -518,7 +518,8 @@ class Table(WorkspaceService):
         *,
         row_limit: Optional[int] = None,
         wait: WaitingConfigArg = True,
-        cache_for: Optional[WaitingConfigArg] = None
+        cache_for: Optional[WaitingConfigArg] = None,
+        arrow_schema: Optional[pa.Schema] = None
     ):
         return self.workspace.sql().execute(
             statement=statement,
@@ -527,6 +528,7 @@ class Table(WorkspaceService):
             cache_for=cache_for,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
+            arrow_schema=arrow_schema
         )
 
     def to_arrow_dataset(

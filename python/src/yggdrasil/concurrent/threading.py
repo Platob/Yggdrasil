@@ -8,6 +8,7 @@ bounded in-flight window, supporting both completion-order and submission-order 
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
@@ -59,16 +60,16 @@ class JobPoolExecutor(ThreadPoolExecutor):
     def __init__(
         self,
         max_workers: int = None,
+        max_in_flight: int = None,
         job_name_prefix: str = '',
-        initializer=None,
-        initargs=()
     ):
         super().__init__(
             max_workers=max_workers,
             thread_name_prefix=job_name_prefix,
-            initializer=initializer,
-            initargs=initargs
         )
+
+        self.job_name_prefix = job_name_prefix
+        self.max_in_flight = max_in_flight if max_in_flight else max_workers * 2
 
     def submit_job(self, job: Job) -> Future:
         return self.submit(job.run)
@@ -90,10 +91,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         if isinstance(obj, cls):
             return cls
 
-        if not max_workers:
-            max_workers = int(obj)
-
-        return cls(max_workers=max_workers)
+        return cls(max_workers=max_workers or os.cpu_count())
 
     @staticmethod
     def _cancel_all(fs: Iterable[Future]) -> None:
@@ -102,6 +100,10 @@ class JobPoolExecutor(ThreadPoolExecutor):
         for f in fs:
             if not f.done():
                 f.cancel()
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
 
     def _unpack(
         self,
@@ -142,9 +144,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         If raise_error=True, exceptions are re-raised at the yield site instead of
         being returned as the third element.
         """
-        if not max_in_flight:
-            max_in_flight = self._max_workers * 2
-
+        max_in_flight = max_in_flight or self.max_in_flight
         it = iter(job_generator)
 
         if ordered:

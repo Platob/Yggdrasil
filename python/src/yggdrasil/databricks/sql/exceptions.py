@@ -1,8 +1,13 @@
 """Custom exceptions for Databricks SQL helpers."""
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional, TYPE_CHECKING
+
+from databricks.sdk.service.sql import ServiceErrorCode, StatementState
 
 from ..lib import DatabricksError
+
+if TYPE_CHECKING:
+    from .statement_result import StatementResult
 
 __all__ = [
     "SqlStatementError"
@@ -12,44 +17,40 @@ __all__ = [
 @dataclass(frozen=True)
 class SqlStatementError(DatabricksError):
     statement_id: str
-    state: str
+    state: StatementState
     message: str
-    error_code: Optional[str] = None
-    sql_state: Optional[str] = None
+    error_code: ServiceErrorCode
     url: Optional[str] = None
 
     def __str__(self) -> str:
-        meta = []
+        return f"[%s][%s][%s]: %s" % (
+            self.url,
+            self.state.value,
+            self.error_code.value,
+            self.message
+        )
 
-        if self.error_code:
-            meta.append(f"code={self.error_code}")
-        if self.sql_state:
-            meta.append(f"state={self.sql_state}")
-        if self.url:
-            meta.append(f"url={self.url}")
-
-        meta_str = f" ({', '.join(meta)})" if meta else ""
-
-        return f"SQL statement {self.statement_id!r} failed [{self.state}]: {self.message}{meta_str}"
+    def __repr__(self):
+        return f"SqlStatementError(url={self.url!r}, message={self.message!r})"
 
     @classmethod
-    def from_statement(cls, stmt: Any) -> "SqlStatementError":
-        statement_id = getattr(stmt, "statement_id", "<unknown>")
-        state = getattr(stmt, "state", "<unknown>")
+    def from_statement(cls, stmt: "StatementResult") -> "SqlStatementError":
+        statement_id = stmt.statement_id or "<unknown>"
+        state = stmt.state
+        status = stmt.status
 
-        err = getattr(getattr(stmt, "status", None), "error", None)
+        if status and status.error:
+            message = status.error.message or "Unknown"
+            error_code = status.error.error_code or ServiceErrorCode.INTERNAL_ERROR
+        else:
+            message, error_code = "Unknown", ServiceErrorCode.INTERNAL_ERROR
 
-        message = getattr(err, "message", None) or "Unknown SQL error"
-        error_code = getattr(err, "error_code", None)
-        sql_state = getattr(err, "sql_state", None)
-
-        url = getattr(err, "monitoring_url", None)
+        url = str(stmt.monitoring_url)
 
         return cls(
-            statement_id=str(statement_id),
-            state=str(state),
-            message=str(message),
-            error_code=str(error_code) if error_code is not None else None,
-            sql_state=str(sql_state) if sql_state is not None else None,
-            url=str(url) if url is not None else None
+            statement_id=statement_id,
+            state=state,
+            message=message,
+            error_code=error_code,
+            url=url
         )

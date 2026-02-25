@@ -9,6 +9,8 @@ from .request import PreparedRequest
 from .response import Response
 from .url import URL
 from ..concurrent.threading import JobPoolExecutor
+from ..environ import UserInfo
+from yggdrasil.version import __version__ as YGG_VERSION
 
 if TYPE_CHECKING:
     from ..databricks.sql.table import Table
@@ -104,6 +106,8 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
@@ -115,6 +119,8 @@ class Session(ABC):
             params=params,
             add_statistics=add_statistics,
             headers=headers,
+            body=body,
+            tags=tags,
             stream=stream,
             wait=wait,
             normalize=normalize,
@@ -129,6 +135,7 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -142,6 +149,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             stream=stream,
             wait=wait,
@@ -157,6 +165,7 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -170,6 +179,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             stream=stream,
             wait=wait,
@@ -185,6 +195,7 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -198,6 +209,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             stream=stream,
             wait=wait,
@@ -213,6 +225,7 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -226,6 +239,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             stream=stream,
             wait=wait,
@@ -240,6 +254,8 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
+        body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         stream: bool = False,
         wait: Optional[WaitingConfigArg] = None,
         normalize: bool = True,
@@ -251,6 +267,8 @@ class Session(ABC):
             params=params,
             add_statistics=add_statistics,
             headers=headers,
+            body=body,
+            tags=tags,
             stream=stream,
             wait=wait,
             normalize=normalize,
@@ -265,6 +283,7 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         wait: Optional[WaitingConfigArg] = None,
@@ -278,6 +297,7 @@ class Session(ABC):
             add_statistics=add_statistics,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             stream=stream,
             wait=wait,
@@ -295,6 +315,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         add_statistics: Optional[bool] = None,
@@ -311,6 +332,7 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             normalize=normalize,
         )
@@ -331,6 +353,7 @@ class Session(ABC):
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         normalize: bool = True,
         cache: Optional["Table"] = None
@@ -348,11 +371,26 @@ class Session(ABC):
             items.extend((k, v) for k, v in params.items())
             full_url = u.with_query_items(tuple(items))
 
+        if headers is None:
+            headers = {}
+
+        usr = UserInfo.current()
+
+        if YGG_VERSION:
+            headers["X-YGG-Version"] = YGG_VERSION
+
+        if usr.email:
+            headers["X-YGG-User-Mail"] = usr.email
+
+        if usr.hostname:
+            headers["X-YGG-User-Host"] = usr.email
+
         return PreparedRequest.prepare(
             method=method,
             url=full_url,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             normalize=normalize,
         )

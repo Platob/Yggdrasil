@@ -58,7 +58,8 @@ class StatementResult(BaseStatementResult):
     statement_id: str
     disposition: Disposition
 
-    _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False)
+    _arrow_schema: Optional[pa.Schema] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
 
     # ----------------------------
     # Dunder / convenience
@@ -149,7 +150,9 @@ class StatementResult(BaseStatementResult):
     def raise_for_status(self) -> "StatementResult":
         """Raise `SqlStatementError` if the statement is in a failed state."""
         if self.failed:
-            raise SqlStatementError.from_statement(self)
+            error = SqlStatementError.from_statement(self)
+
+            raise error
         return self
 
     # ----------------------------
@@ -185,22 +188,28 @@ class StatementResult(BaseStatementResult):
         pyarrow.Schema
             Arrow schema with metadata including source and statement id.
         """
+        if self._arrow_schema is not None:
+            return self._arrow_schema
+
         if self.persisted:
             if self._arrow_table is not None:
-                return self._arrow_table.schema
-            if self._spark_df is not None:
+                self._arrow_schema = self._arrow_table.schema
+            elif self._spark_df is not None:
                 from ...spark.cast import spark_schema_to_arrow_schema
-                return spark_schema_to_arrow_schema(self._spark_df.schema, None)
-            raise NotImplementedError("Persisted without Arrow table or Spark DF")
+                self._arrow_schema = spark_schema_to_arrow_schema(self._spark_df.schema, None)
+            else:
+                raise NotImplementedError("Persisted without Arrow table or Spark DF")
+        else:
+            manifest = self.manifest
+            metadata = {"source": "databricks-sql", "statement_id": self.statement_id or ""}
 
-        manifest = self.manifest
-        metadata = {"source": "databricks-sql", "statement_id": self.statement_id or ""}
+            if manifest is None:
+                return pa.schema([], metadata=metadata)
 
-        if manifest is None:
-            return pa.schema([], metadata=metadata)
+            fields = [column_info_to_arrow_field(c) for c in manifest.schema.columns]
+            self._arrow_schema = pa.schema(fields, metadata=metadata)
 
-        fields = [column_info_to_arrow_field(c) for c in manifest.schema.columns]
-        return pa.schema(fields, metadata=metadata)
+        return self._arrow_schema
 
     # ----------------------------
     # External links

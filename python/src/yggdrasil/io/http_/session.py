@@ -17,16 +17,17 @@ from urllib3.exceptions import (
     ProtocolError,
     SSLError,
 )
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io.response import FULL_ARROW_SCHEMA
 
+import yggdrasil.arrow as pa
+from yggdrasil.concurrent.threading import JobPoolExecutor, Job
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .response import HTTPResponse
 from ..buffer import BytesIO
 from ..enums import SaveMode
 from ..request import PreparedRequest
+from ..response import RESPONSE_ARROW_SCHEMA
 from ..session import Session
 from ..url import URL
-from yggdrasil.concurrent.threading import JobPoolExecutor
 
 if TYPE_CHECKING:
     from ...databricks.sql.table import Table
@@ -48,41 +49,14 @@ RETRYABLE_EXC = (
 
 @dataclass
 class HTTPSession(Session):
+    pool_connections: int = 10  # number of hosts to keep pools for
+    pool_maxsize: int = 10  # max connections per host
+    pool_block: bool = False  # block when pool is full instead of discarding
+
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
 
-    def __post_init__(self):
-        if self._http_pool is None:
-            # Use waiting config to define retry policy for the pool
-            num_tries = max(self.waiting.retries, 0) + 1
-
-            retries = urllib3.Retry(
-                total=num_tries * 2,
-                connect=num_tries,
-                read=num_tries,
-                backoff_factor=self.waiting.backoff,
-                status_forcelist=(429, 500, 502, 503, 504),
-                raise_on_status=False,
-            )
-
-            self._http_pool = urllib3.PoolManager(
-                retries=retries,
-                cert_reqs="CERT_REQUIRED" if self.verify else "CERT_NONE",
-                ca_certs=None,
-            )
-
-    def __getstate__(self) -> dict:
-        state = super().__getstate__()
-        # Ensure thread locks and pool managers aren't pickled
-        state.pop("_http", None)
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        super().__setstate__(state)
-
-        # Re-initialize the lock; _http will be lazily created in pool_manager()
-        # Use waiting config to define retry policy for the pool
+    def _build_pool(self) -> urllib3.PoolManager:
         num_tries = max(self.waiting.retries, 0) + 1
-
         retries = urllib3.Retry(
             total=num_tries * 2,
             connect=num_tries,
@@ -91,12 +65,28 @@ class HTTPSession(Session):
             status_forcelist=(429, 500, 502, 503, 504),
             raise_on_status=False,
         )
-
-        self._http_pool = urllib3.PoolManager(
+        return urllib3.PoolManager(
+            num_pools=self.pool_connections,
+            maxsize=self.pool_maxsize,
+            block=self.pool_block,
             retries=retries,
             cert_reqs="CERT_REQUIRED" if self.verify else "CERT_NONE",
             ca_certs=None,
         )
+
+    def __post_init__(self):
+        if self._http_pool is None:
+            self._http_pool = self._build_pool()
+
+    def __getstate__(self) -> dict:
+        state = super().__getstate__()
+        state.pop("_http", None)
+        state.pop("_http_pool", None)   # ← also drop the pool; it holds sockets
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        super().__setstate__(state)
+        self._http_pool = self._build_pool()
 
     def request(
         self,
@@ -106,6 +96,7 @@ class HTTPSession(Session):
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
+        tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         add_statistics: Optional[bool] = None,
@@ -122,6 +113,7 @@ class HTTPSession(Session):
             params=params,
             headers=headers,
             body=body,
+            tags=tags,
             json=json,
             normalize=normalize,
         )
@@ -157,9 +149,10 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
         *,
+        wait: Optional[WaitingConfigArg] = None,
+        raise_error: bool = True,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
         cache: Optional[Union["Table", bool]] = None,
         anonymize: Literal["remove", "redact", "hash"] = "remove",
     ) -> HTTPResponse:
@@ -175,8 +168,19 @@ class HTTPSession(Session):
             query = f"""select * from {cache.full_name(safe=True)}
 where {self._sql_match_clause(anon)}"""
 
-            batch = cache.sql(query).to_arrow_table()
-            responses = list(HTTPResponse.from_arrow_batch(batch))
+            try:
+                sql_cache_statement = cache.sql(query)
+            except Exception as e:
+                if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
+                    cache.create(
+                        RESPONSE_ARROW_SCHEMA,
+                        if_not_exists=True
+                    )
+                    sql_cache_statement = cache.sql(query)
+                else:
+                    raise
+
+            responses = list(HTTPResponse.from_arrow(sql_cache_statement.to_arrow_table()))
 
             if responses:
                 return responses[-1]
@@ -217,6 +221,7 @@ where {self._sql_match_clause(anon)}"""
                     request=request,
                     response=resp,
                     stream=stream,
+                    tags=None,
                     received_at_timestamp=received_at_timestamp
                 )
                 break
@@ -234,9 +239,11 @@ where {self._sql_match_clause(anon)}"""
                 continue
 
         if result is None:
-            if last_exc is not None:
-                raise last_exc
-            raise RuntimeError("Retry loop exited unexpectedly")
+            if raise_error:
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError("Retry loop exited unexpectedly")
+            return None
 
         if cache is not None and result.ok:
             # insert
@@ -252,11 +259,164 @@ where {self._sql_match_clause(anon)}"""
         self,
         requests: Iterator[PreparedRequest],
         *,
+        wait: Optional[WaitingConfigArg] = None,
+        raise_error: bool = True,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
         cache: Optional["Table"] = None,
         ordered: bool = False,
-        pool: Optional[JobPoolExecutor | int] = None
+        batch_size: Optional[int] = None,
+        pool: Optional[JobPoolExecutor | int] = None,
+        max_in_flight: Optional[int] = None
     ):
-        raise NotImplementedError
+        if add_statistics is None:
+            add_statistics = cache is not None
+
+        # Default worker count to pool_maxsize so the thread pool and the
+        # connection pool are naturally matched — no thread ever waits on a
+        # connection slot and no connection slot goes unused.
+        if pool is None:
+            pool = self.pool_maxsize
+
+        with JobPoolExecutor.parse_any(pool) as pool:
+            if not batch_size:
+                batch_size: int = pool.max_workers * 10
+
+            if cache is None:
+                def jobs():
+                    for req in requests:
+                        yield Job.make(
+                            self.send,
+                            req,
+                            wait=wait, raise_error=raise_error,
+                            add_statistics=add_statistics,
+                            stream=stream
+                        )
+
+                yield from pool.as_completed(
+                    jobs(),
+                    ordered=ordered,
+                    max_in_flight=max_in_flight,
+                    cancel_on_exit=True,
+                    shutdown_on_exit=True,
+                    raise_error=raise_error
+                )
+            else:
+                import itertools
+
+                def _batched(it: Iterator, n: int) -> Iterator[list]:
+                    it = iter(it)
+                    while True:
+                        batch = list(itertools.islice(it, n))
+                        if not batch:
+                            break
+                        yield batch
+
+                for batch in _batched(requests, batch_size):
+                    # ── Cache lookup for the entire batch ────────────────────────
+                    anon_batch = [req.anonymize(mode="remove") for req in batch]
+
+                    clauses = " OR ".join(
+                        f"({self._sql_match_clause(a)})" for a in anon_batch
+                    )
+                    query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {clauses}"
+
+                    try:
+                        sql_cache_statement = cache.sql(query)
+                    except Exception as e:
+                        if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
+                            cache.create(
+                                RESPONSE_ARROW_SCHEMA,
+                                if_not_exists=True
+                            )
+                            sql_cache_statement = cache.sql(query)
+                        else:
+                            raise
+
+                    arrow_batch = sql_cache_statement.to_arrow_table()
+                    cached_responses = list(HTTPResponse.from_arrow(arrow_batch))
+
+                    # Build a lookup: (host, path, query, body_hash) → latest response
+                    def _cache_key(r: HTTPResponse) -> tuple:
+                        return (
+                            r.request.url.host,
+                            r.request.url.path,
+                            r.request.url.query,
+                            r.request.body.blake3().digest() if r.request.body else None,
+                        )
+
+                    def _request_key(req: PreparedRequest) -> tuple:
+                        anon = req.anonymize(mode="remove")
+                        return (
+                            anon.url.host,
+                            anon.url.path,
+                            anon.url.query,
+                            base64.b64encode(req.body.blake3().digest()) if req.body else None,
+                        )
+
+                    cache_map: dict[tuple, HTTPResponse] = {}
+                    for r in cached_responses:
+                        cache_map[_cache_key(r)] = r  # last-write-wins → most recent row
+
+                    # ── Partition: hits vs misses ─────────────────────────────────
+                    hits: list[HTTPResponse] = []
+                    misses: list[PreparedRequest] = []
+
+                    for req in batch:
+                        key = _request_key(req)
+                        if key in cache_map:
+                            hits.append(cache_map[key])
+                        else:
+                            misses.append(req)
+
+                    # ── Yield cached hits immediately ─────────────────────────────
+                    # (respect ordered=False; hits come back as-is)
+                    for resp in hits:
+                        yield resp
+
+                    if not misses:
+                        continue
+
+                    # ── Fire network requests for misses ─────────────────────────
+                    def miss_jobs():
+                        for req in misses:
+                            yield Job.make(
+                                self.send, req,
+                                wait=wait,
+                                raise_error=raise_error,
+                                add_statistics=add_statistics,
+                                stream=stream,
+                                cache=None,  # avoid double-caching inside send()
+                            )
+
+                    to_insert: list[HTTPResponse] = []
+
+                    for resp in pool.as_completed(
+                        miss_jobs(),
+                        ordered=ordered,
+                        max_in_flight=max_in_flight,
+                        cancel_on_exit=True,
+                        shutdown_on_exit=False,  # pool is shared across batches
+                        raise_error=raise_error,
+                    ):
+                        if resp is not None and resp.ok:
+                            to_insert.append(resp)
+                        yield resp
+
+                    # ── Bulk insert successful responses ─────────────────────────
+                    if to_insert:
+                        batches = [
+                            r.anonymize(mode="remove").to_arrow_batch(parse=False)
+                            for r in to_insert
+                        ]
+                        combined = pa.Table.from_batches(batches).combine_chunks()
+                        cache.insert(
+                            combined,
+                            mode=SaveMode.AUTO,
+                            match_by=[
+                                "request_url_host",
+                                "request_url_path",
+                                "request_url_query",
+                                "request_body_hash",
+                            ]
+                        )

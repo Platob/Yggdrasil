@@ -24,6 +24,9 @@ _SENSITIVE_KEYS = {
     "x-xsrf-token",
     "x-amz-security-token",
     "x-amz-access-token",
+    "x-ygg-version",
+    "x-ygg-user-mail",
+    "x-ygg-user-host",
 }
 
 # Often sensitive, but sometimes useful. We’ll partially mask.

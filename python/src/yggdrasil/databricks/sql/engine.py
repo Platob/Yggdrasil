@@ -369,7 +369,8 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         byte_limit: Optional[int] = None,
-        cache_for: Optional[WaitingConfigArg] = None
+        cache_for: Optional[WaitingConfigArg] = None,
+        arrow_schema: Optional[pa.Schema] = None
     ) -> StatementResult:
         """
         Execute a SQL statement using either Spark SQL or the Databricks SQL Statement Execution API.
@@ -466,7 +467,8 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 wait=wait,
-                row_limit=row_limit
+                row_limit=row_limit,
+                arrow_schema=arrow_schema
             )
 
         if cache_for is not None:

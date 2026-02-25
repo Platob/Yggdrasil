@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from dataclasses import dataclass, field, is_dataclass, fields
+from enum import Enum
 from typing import Optional, Tuple, Any, Iterator, Union
 
 from databricks.sdk.service.workspace import AclPermission
@@ -13,12 +15,138 @@ __all__ = ["Secret"]
 
 BytesLike = Union[bytes, bytearray, memoryview]
 
+# Signature bytes are exactly 4 bytes and serve as a content prefix
+# embedded in the base64-encoded bytes_value stored in Databricks.
+#
+# Wire format (unencrypted):
+#   [ 4-byte signature ] [ payload bytes ]
+#
+# Wire format (encrypted, Signature.ENCR):
+#   [ b"ENCR" ] [ 16-byte PBKDF2 salt ] [ Fernet ciphertext ]
+#
+# BYTE  -> payload is raw binary
+# JSON  -> payload is UTF-8 JSON text
+# DILL  -> payload is dill-serialized Python object (caller manages dill import)
+# ENCR  -> payload is AES-128-CBC + HMAC-SHA256 (Fernet) encrypted bytes;
+#          the inner plaintext carries its own nested signature so the
+#          round-trip is: encrypt(sig_prefix + plaintext) -> ENCR-prefixed blob
+
+_PBKDF2_ITERATIONS = 480_000  # OWASP 2023 recommendation for PBKDF2-HMAC-SHA256
+_SALT_LEN = 16
+
+
+def _derive_fernet_key(secret_key: str, salt: bytes) -> bytes:
+    """Derive a 32-byte key from *secret_key* + *salt* via PBKDF2-HMAC-SHA256,
+    then base64url-encode it so Fernet can consume it directly."""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=_PBKDF2_ITERATIONS,
+        backend=default_backend(),
+    )
+    raw_key = kdf.derive(secret_key.encode("utf-8"))
+    return base64.urlsafe_b64encode(raw_key)
+
+
+def _encrypt(plaintext: bytes, secret_key: str) -> bytes:
+    """Return ``salt (16 B) + fernet_ciphertext``."""
+    from cryptography.fernet import Fernet
+
+    salt = os.urandom(_SALT_LEN)
+    fernet = Fernet(_derive_fernet_key(secret_key, salt))
+    return salt + fernet.encrypt(plaintext)
+
+
+def _decrypt(ciphertext: bytes, secret_key: str) -> bytes:
+    """Expect ``salt (16 B) + fernet_ciphertext``, return plaintext bytes."""
+    from cryptography.fernet import Fernet, InvalidToken
+
+    if len(ciphertext) < _SALT_LEN:
+        raise ValueError("Encrypted payload is too short to contain a valid salt.")
+    salt, token = ciphertext[:_SALT_LEN], ciphertext[_SALT_LEN:]
+    fernet = Fernet(_derive_fernet_key(secret_key, salt))
+    try:
+        return fernet.decrypt(token)
+    except InvalidToken as exc:
+        raise ValueError("Decryption failed – wrong secret_key or corrupted payload.") from exc
+
+
+class Signature(bytes, Enum):
+    RAW = b"BYTE"
+    JSON = b"JSON"
+    DILL = b"DILL"
+    ENCR = b"ENCR"
+
+    # ---------------------------------------------------------------
+    # Encoding helpers
+    # ---------------------------------------------------------------
+
+    def encode_payload(self, payload: bytes, *, secret_key: Optional[str] = None) -> str:
+        """Prepend this signature to *payload* and return a base64 string.
+
+        When ``self`` is ``Signature.ENCR`` a *secret_key* **must** be supplied;
+        the payload is encrypted before the prefix is attached.
+        """
+        if self is Signature.ENCR:
+            if not secret_key:
+                raise ValueError("secret_key is required for Signature.ENCR encoding.")
+            payload = _encrypt(payload, secret_key)
+        return base64.b64encode(self.value + payload).decode("ascii")
+
+    @staticmethod
+    def decode_payload(
+        b64: str,
+        *,
+        secret_key: Optional[str] = None,
+    ) -> Tuple["Signature | None", bytes]:
+        """Decode a base64 string and strip the leading signature.
+
+        Returns ``(signature, payload_bytes)``.
+
+        For ``Signature.ENCR`` blobs the payload is decrypted automatically when
+        *secret_key* is provided.  If *secret_key* is omitted the raw encrypted
+        bytes are returned so callers can decide what to do.
+
+        If no recognised signature is found the full decoded bytes are returned
+        with ``signature=None`` so callers can fall back to heuristics.
+        """
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            return None, b64.encode("utf-8") if isinstance(b64, str) else bytes(b64)
+
+        if len(raw) < 4:
+            return None, raw
+
+        prefix = raw[:4]
+        payload = raw[4:]
+
+        for sig in Signature:
+            if sig.value == prefix:
+                if sig is Signature.ENCR and secret_key:
+                    payload = _decrypt(payload, secret_key)
+                return sig, payload
+
+        # No known prefix – treat the whole buffer as the payload
+        return None, raw
+
 
 @dataclass
 class Secret(WorkspaceService):
     scope: Optional[str] = None
     key: Optional[str] = None
     update_timestamp: Optional[float] = None
+
+    # When set, all reads and writes transparently encrypt / decrypt the payload
+    # using AES-128-CBC + HMAC-SHA256 (Fernet) with a PBKDF2-derived key.
+    # The wire format is: base64( b"ENCR" + 16-byte-salt + fernet-ciphertext ).
+    # Set to None to disable encryption (plain signature-prefixed storage).
+    secret_key: Optional[str] = field(default=None, repr=False)
 
     _value: Optional[Any] = field(default=None, repr=False)
 
@@ -75,44 +203,76 @@ class Secret(WorkspaceService):
     def coerce_to_put_payload(
         value: Any,
         *,
-        bytes_value: Optional[str],
-        string_value: Optional[str],
+        signature: Signature | None = None,
+        secret_key: Optional[str] = None,
+        bytes_value: Optional[str] = None,
+        string_value: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        Databricks put_secret supports either:
-          - string_value: str
-          - bytes_value: base64-encoded string
+        Convert *value* to either ``(bytes_value, None)`` or ``(None, string_value)``
+        as expected by the Databricks ``put_secret`` API.
 
-        Enhancements:
-          - if `value` is a dataclass, serialize via asdict() then json.dumps()
+        When a *secret_key* is provided, the payload is **always** written as an
+        encrypted ``bytes_value`` regardless of the input type, and the signature
+        is forced to ``Signature.ENCR``:
+
+            bytes_value = base64( b"ENCR" + 16-byte-salt + Fernet(plaintext) )
+
+        where ``plaintext = <4-byte-inner-sig> + <serialised-payload>`` so the
+        type information survives the encryption round-trip.
+
+        Without a *secret_key* the inference rules are:
+          - dataclass / dict / list / other JSON-able types  -> ``Signature.JSON``
+          - ``bytes`` / ``bytearray`` / ``memoryview``       -> ``Signature.RAW``
+          - ``str``                                          -> plain ``string_value``
+                                                               (no prefix, backwards-compatible)
+
+        Explicit ``bytes_value`` / ``string_value`` kwargs bypass all coercion.
         """
+        # Caller-supplied raw values bypass all coercion
         if bytes_value is not None or string_value is not None:
             return bytes_value, string_value
 
         if value is None:
             return None, None
 
-        # dataclass -> JSON
+        # ── serialise to (inner_sig, payload_bytes) ────────────────
         if is_dataclass(value):
-            metadata: dict[str, Any] = {}
-            for f in fields(value):
-                if f.name.startswith("_"):
-                    continue
-                metadata[f.name] = getattr(value, f.name)
+            metadata: dict[str, Any] = {
+                f.name: getattr(value, f.name)
+                for f in fields(value)
+                if not f.name.startswith("_")
+            }
+            inner_sig = signature or Signature.JSON
+            payload = json.dumps(metadata).encode("utf-8")
 
-            return None, json.dumps(metadata)
+        elif isinstance(value, str):
+            if secret_key or signature is not None:
+                inner_sig = signature or Signature.JSON
+                payload = value.encode("utf-8")
+            else:
+                # Default: keep as plain string_value (no prefix) for readability
+                return None, value
 
-        # Already a string: use string_value
-        if isinstance(value, str):
-            return None, value
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            inner_sig = signature or Signature.RAW
+            payload = bytes(value)
 
-        # Raw bytes: encode as base64 string
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            b = bytes(value)
-            return base64.b64encode(b).decode("utf-8"), None
+        else:
+            inner_sig = signature or Signature.JSON
+            try:
+                payload = json.dumps(value).encode("utf-8")
+            except (TypeError, ValueError):
+                payload = str(value).encode("utf-8")
 
-        # Anything else: try JSON, fall back to str()
-        return None, json.dumps(value)
+        # ── wrap with encryption when secret_key is present ────────
+        if secret_key:
+            # Embed the inner signature inside the plaintext so type info
+            # is preserved after decryption: plaintext = inner_sig + payload
+            plaintext = inner_sig.value + payload
+            return Signature.ENCR.encode_payload(plaintext, secret_key=secret_key), None
+
+        return inner_sig.encode_payload(payload), None
 
     # -------------------------
     # Value parsing (read)
@@ -123,25 +283,30 @@ class Secret(WorkspaceService):
         return (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))
 
     @staticmethod
-    def _try_parse_value(v: Any) -> Any:
+    def _try_parse_value(v: Any, *, secret_key: Optional[str] = None) -> Any:
         """
-        Best-effort parsing when reading.
-        - If it's JSON (object/array), parse into Python types.
-        - If it's base64 that decodes cleanly into UTF-8 JSON/object/array, parse that too.
-        - Otherwise return as-is.
+        Best-effort parsing when reading back a secret.
+
+        1. If the stored value is base64 with a known ``Signature`` prefix:
+             - ``Signature.ENCR`` -> decrypt with *secret_key*, then recurse on
+               the plaintext which carries its own inner 4-byte signature.
+               Raises ``ValueError`` if *secret_key* is missing or wrong.
+             - ``Signature.JSON`` -> ``json.loads(payload)``
+             - ``Signature.RAW``  -> raw ``bytes``
+             - ``Signature.DILL`` -> raw ``bytes`` (caller must ``dill.loads``)
+        2. No signature found: fall back to heuristics (direct JSON, plain string).
         """
         if v is None:
             return None
 
-        # bytes -> maybe utf-8 -> maybe json
+        # ── bytes input ────────────────────────────────────────────
         if isinstance(v, (bytes, bytearray, memoryview)):
             b = bytes(v)
             try:
                 s = b.decode("utf-8")
             except Exception:
                 return b
-            # recurse through string path
-            return Secret._try_parse_value(s)
+            return Secret._try_parse_value(s, secret_key=secret_key)
 
         if not isinstance(v, str):
             return v
@@ -150,25 +315,56 @@ class Secret(WorkspaceService):
         if not s:
             return v
 
-        # direct JSON
+        # ── try signature-prefixed base64 first ────────────────────
+        sig, payload = Signature.decode_payload(s, secret_key=secret_key)
+
+        if sig is Signature.ENCR:
+            # decode_payload already decrypted; plaintext = inner_sig (4B) + data
+            if len(payload) < 4:
+                raise ValueError("Decrypted ENCR payload is too short to contain an inner signature.")
+            inner_sig_bytes = payload[:4]
+            inner_payload = payload[4:]
+            # Resolve inner signature and recurse as if we read a plain prefixed blob
+            for inner_sig in Signature:
+                if inner_sig.value == inner_sig_bytes:
+                    # Reconstruct a standard prefixed b64 string and recurse
+                    reconstructed = base64.b64encode(inner_sig.value + inner_payload).decode("ascii")
+                    return Secret._try_parse_value(reconstructed)
+            # Unknown inner sig – return raw bytes
+            return inner_payload
+
+        if sig is Signature.JSON:
+            try:
+                return json.loads(payload.decode("utf-8"))
+            except Exception:
+                return payload.decode("utf-8", errors="replace")
+
+        if sig is Signature.RAW:
+            return payload  # raw bytes; caller decides
+
+        if sig is Signature.DILL:
+            return payload  # raw bytes; caller does dill.loads(...)
+
+        # sig is None -> no recognised prefix, fall through to heuristics
+
+        # ── heuristic: direct JSON string ─────────────────────────
         if Secret._looks_like_json(s):
             try:
                 return json.loads(s)
             except Exception:
                 return v
 
-        # maybe base64 containing utf-8 (possibly json)
-        # IMPORTANT: don't aggressively "decode everything"; only accept if decode is clean and "printable-ish".
+        # ── heuristic: base64 containing utf-8 / json ─────────────
+        # (legacy values written before signatures were introduced)
         try:
             decoded = base64.b64decode(s, validate=True)
         except Exception:
             return v
 
-        # if it decodes, see if it's utf-8; if not, return raw bytes
         try:
             decoded_text = decoded.decode("utf-8")
         except Exception:
-            return decoded
+            return decoded  # opaque binary
 
         dt = decoded_text.strip()
         if Secret._looks_like_json(dt):
@@ -177,8 +373,89 @@ class Secret(WorkspaceService):
             except Exception:
                 return decoded_text
 
-        # not json; keep as text (not bytes) because caller probably wants a string
         return decoded_text
+
+    def decode_value(
+        self,
+        *,
+        as_type: type | None = None,
+        encoding: str = "utf-8",
+        secret_key: str | None = None,
+    ) -> Any:
+        """Decode the secret's stored value into a typed Python object.
+
+        Builds on :meth:`value` (which handles signature stripping and optional
+        decryption) and adds an explicit *as_type* coercion layer on top, so
+        callers can request a concrete type without writing their own
+        ``isinstance`` ladder.
+
+        Supported *as_type* targets
+        ---------------------------
+        ``str``
+            Decode bytes with *encoding*; JSON-serialise non-string objects.
+        ``bytes``
+            Encode strings with *encoding*; JSON-serialise other objects.
+        ``dict`` / ``list``
+            Parse via ``json.loads`` when the value is a string or bytes;
+            raise ``TypeError`` if the result is the wrong container type.
+        ``int`` / ``float``
+            Cast via the target type's constructor.
+        ``None`` *(default)*
+            Return the value as-is after signature parsing (same as
+            :attr:`value`).
+
+        Parameters
+        ----------
+        as_type:
+            Target Python type.  ``None`` returns the parsed value unchanged.
+        encoding:
+            Charset used for ``str`` ↔ ``bytes`` coercions.  Defaults to
+            ``"utf-8"``.
+        secret_key:
+            Override the instance-level ``self.secret_key`` for this single
+            call.  Useful when the caller holds the key but does not want it
+            stored on the object.
+
+        Returns
+        -------
+        Any
+            Parsed and optionally coerced secret value.
+
+        Raises
+        ------
+        ValueError
+            When decryption fails (wrong key or corrupted payload).
+        TypeError
+            When the parsed value cannot be coerced to *as_type*.
+        json.JSONDecodeError
+            When ``dict`` / ``list`` coercion is requested but the value is
+            not valid JSON.
+
+        Examples
+        --------
+        >>> secret["myapp:db_password"].decode_value(as_type=str)
+        'hunter2'
+
+        >>> secret["myapp:config"].decode_value(as_type=dict)
+        {'host': 'localhost', 'port': 5432}
+
+        >>> secret["myapp:cert"].decode_value(as_type=bytes)
+        b'\\x30\\x82...'
+        """
+        effective_key = secret_key or self.secret_key
+
+        # Re-parse from raw storage when a different secret_key is supplied,
+        # otherwise use the already-cached value to avoid a network round-trip.
+        if effective_key != self.secret_key and self.scope and self.key:
+            raw_secret = self.find_secret(scope=self.scope, key=self.key, secret_key=effective_key)
+            v = raw_secret._value
+        else:
+            v = self.value  # triggers lazy fetch if needed
+
+        if v is None or as_type is None:
+            return v
+
+        return _coerce_value(v, as_type=as_type, encoding=encoding)
 
     # -------------------------
     # Errors
@@ -213,6 +490,7 @@ class Secret(WorkspaceService):
         *,
         scope: Optional[str] = None,
         key: Optional[str] = None,
+        secret_key: Optional[str] = None,
     ) -> "Secret":
         scope, key = self._resolve_scope_key(full_key=full_key, scope=scope, key=key)
         client = self.secrets_client()
@@ -220,12 +498,14 @@ class Secret(WorkspaceService):
         response = client.get_secret(scope=scope, key=key)
 
         raw = response.value
-        parsed = self._try_parse_value(raw)
+        effective_key = secret_key or self.secret_key
+        parsed = self._try_parse_value(raw, secret_key=effective_key)
 
         return Secret(
             workspace=self.workspace,
             scope=scope,
             key=response.key,
+            secret_key=effective_key,
             _value=parsed,
         )
 
@@ -233,12 +513,11 @@ class Secret(WorkspaceService):
     def value(self) -> Optional[Any]:
         """
         Lazy read + best-effort parse.
-        If the secret looks like JSON, returns Python objects (dict/list/etc).
-        If it looks like base64-encoded UTF-8, returns decoded string (or parsed JSON).
-        Otherwise returns original string/bytes.
+        Values written with a ``Signature`` prefix are decoded accordingly.
+        When ``self.secret_key`` is set, ``ENCR``-prefixed blobs are decrypted
+        transparently.  Legacy values (no prefix) fall back to heuristic detection.
         """
         if self._value is None and self.scope and self.key:
-            # fetch raw value, parse, cache
             fetched = self.find_secret(scope=self.scope, key=self.key)
             self._value = fetched._value
         return self._value
@@ -251,7 +530,6 @@ class Secret(WorkspaceService):
             return v
         if isinstance(v, bytes):
             return v.decode(encoding, errors=errors)
-        # for dict/list/etc
         try:
             return json.dumps(v)
         except Exception:
@@ -277,14 +555,21 @@ class Secret(WorkspaceService):
         full_key: Optional[str] = None,
         scope: Optional[str] = None,
         key: Optional[str] = None,
+        signature: Optional[Signature] = None,
+        secret_key: Optional[str] = None,
         bytes_value: Optional[str] = None,
         string_value: Optional[str] = None,
         create_scope_if_missing: bool = True,
         initial_manage_principal: Optional[str] = None,
         permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
     ) -> "Secret":
+        effective_key = secret_key or self.secret_key
         bytes_value, string_value = self.coerce_to_put_payload(
-            value, bytes_value=bytes_value, string_value=string_value
+            value,
+            signature=signature,
+            secret_key=effective_key,
+            bytes_value=bytes_value,
+            string_value=string_value,
         )
 
         if bytes_value is None and string_value is None:
@@ -312,21 +597,28 @@ class Secret(WorkspaceService):
             else:
                 raise
 
-        # decide whether to mutate self or return a new instance
         same_identity = (self.scope == target_scope) and (self.key == target_key)
-        out = self if same_identity else Secret(workspace=self.workspace, scope=target_scope, key=target_key)
+        out = self if same_identity else Secret(
+            workspace=self.workspace,
+            scope=target_scope,
+            key=target_key,
+            secret_key=effective_key,
+        )
 
-        # update local cache in a parsed form (matches .value behavior)
-        if string_value is not None:
-            out._value = out._try_parse_value(string_value)
+        # Update local cache via the same parse path so .value is consistent.
+        # For encrypted writes we already have the plaintext in *value*; cache
+        # it directly to avoid a redundant decrypt round-trip.
+        if effective_key and value is not None:
+            # Re-parse the original (unencrypted) value for the cache
+            if bytes_value is not None:
+                out._value = self._try_parse_value(bytes_value, secret_key=effective_key)
+            else:
+                out._value = value
         elif bytes_value is not None:
-            try:
-                decoded = base64.b64decode(bytes_value)
-            except Exception:
-                decoded = bytes_value
-            out._value = out._try_parse_value(decoded)
+            out._value = self._try_parse_value(bytes_value)
+        elif string_value is not None:
+            out._value = self._try_parse_value(string_value)
 
-        # apply ACLs (if requested) against the *target scope*
         if permissions:
             out.put_acl(permissions=permissions, scope=target_scope)
 
@@ -361,7 +653,8 @@ class Secret(WorkspaceService):
                 workspace=self.workspace,
                 scope=scope,
                 key=info.key,
-                update_timestamp=float(info.last_updated_timestamp) / 1000.0
+                secret_key=self.secret_key,
+                update_timestamp=float(info.last_updated_timestamp) / 1000.0,
             )
             for info in client.list_secrets(scope=scope)
         )
@@ -412,7 +705,7 @@ class Secret(WorkspaceService):
     @staticmethod
     def check_permission(
         principal: str,
-        permission: AclPermission = None
+        permission: AclPermission = None,
     ):
         if permission is None:
             if principal == "users":
@@ -438,7 +731,7 @@ class Secret(WorkspaceService):
         if isinstance(permissions, bool):
             current_groups = self.current_user_groups(
                 with_public=False,
-                raise_error=False
+                raise_error=False,
             )
 
             permissions = [
@@ -447,16 +740,12 @@ class Secret(WorkspaceService):
                 if group.display not in {"users"}
             ]
         else:
-            permissions = [
-                self.check_permission(_)
-                for _ in permissions
-            ]
+            permissions = [self.check_permission(_) for _ in permissions]
 
         scope = scope or self.scope
         if not scope:
             raise ValueError("'scope' must be provided (or set on self).")
 
-        # Build batch from either (principal, permission) or `acls`
         batch: list[tuple[str, AclPermission]] = []
         if permissions:
             batch.extend(permissions)
@@ -522,3 +811,80 @@ class Secret(WorkspaceService):
         client = self.secrets_client()
         client.delete_acl(scope=scope, principal=principal)
         return self
+
+
+def _coerce_value(v: Any, *, as_type: type, encoding: str = "utf-8") -> Any:
+    """Coerce *v* to *as_type*.
+
+    Kept separate from :meth:`Secret.decode_value` so it can be unit-tested
+    without a Databricks workspace.
+
+    Raises
+    ------
+    TypeError
+        When the coercion path does not exist or the result is the wrong type.
+    json.JSONDecodeError
+        When JSON parsing is required and the input is not valid JSON.
+    """
+    # ── str ────────────────────────────────────────────────────────────────
+    if as_type is str:
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return bytes(v).decode(encoding)
+        try:
+            return json.dumps(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    # ── bytes ──────────────────────────────────────────────────────────────
+    if as_type is bytes:
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return bytes(v)
+        if isinstance(v, str):
+            return v.encode(encoding)
+        try:
+            return json.dumps(v).encode(encoding)
+        except (TypeError, ValueError):
+            return str(v).encode(encoding)
+
+    # ── dict ───────────────────────────────────────────────────────────────
+    if as_type is dict:
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, (str, bytes, bytearray)):
+            s = v.decode(encoding) if isinstance(v, (bytes, bytearray)) else v
+            result = json.loads(s)
+            if not isinstance(result, dict):
+                raise TypeError(f"JSON decoded to {type(result).__name__!r}, expected dict.")
+            return result
+        raise TypeError(f"Cannot coerce {type(v).__name__!r} to dict.")
+
+    # ── list ───────────────────────────────────────────────────────────────
+    if as_type is list:
+        if isinstance(v, list):
+            return v
+        if isinstance(v, (str, bytes, bytearray)):
+            s = v.decode(encoding) if isinstance(v, (bytes, bytearray)) else v
+            result = json.loads(s)
+            if not isinstance(result, list):
+                raise TypeError(f"JSON decoded to {type(result).__name__!r}, expected list.")
+            return result
+        raise TypeError(f"Cannot coerce {type(v).__name__!r} to list.")
+
+    # ── numeric ────────────────────────────────────────────────────────────
+    if as_type in (int, float):
+        if isinstance(v, as_type):
+            return v
+        try:
+            return as_type(v)
+        except (ValueError, TypeError) as exc:
+            raise TypeError(f"Cannot coerce {type(v).__name__!r} to {as_type.__name__}.") from exc
+
+    # ── fallback: attempt direct constructor ───────────────────────────────
+    try:
+        return as_type(v)
+    except Exception as exc:
+        raise TypeError(
+            f"No coercion path from {type(v).__name__!r} to {as_type.__name__!r}."
+        ) from exc

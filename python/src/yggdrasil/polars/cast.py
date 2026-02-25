@@ -977,8 +977,9 @@ def cast_polars_lazyframe(
 # ---------------------------------------------------------------------------
 
 @register_converter(pl.DataFrame, pa.Table)
+@register_converter(pl.LazyFrame, pa.Table)
 def polars_dataframe_to_arrow_table(
-    data: pl.DataFrame,
+    data: pl.DataFrame | pl.LazyFrame,
     options: Optional[CastOptions] = None,
 ) -> pa.Table:
     """Convert a Polars DataFrame to a ``pyarrow.Table``.

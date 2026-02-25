@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
 
@@ -22,6 +23,7 @@ class HTTPResponse(Response):
         request: "PreparedRequest",
         response: BaseHTTPResponse,
         stream: bool,
+        tags: Optional[Mapping[str, str]],
         received_at_timestamp: int
     ) -> "Response":
         buffer = BytesIO()
@@ -43,5 +45,6 @@ class HTTPResponse(Response):
             status_code=response.status,
             headers=dict(response.headers),
             buffer=buffer,
+            tags=tags,
             received_at_timestamp=received_at_timestamp
         )

@@ -8,6 +8,7 @@ import shutil
 import struct
 import tempfile
 import uuid
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, IO, Optional, Union, TYPE_CHECKING
@@ -460,6 +461,139 @@ class BytesIO(io.RawIOBase):
 
         h.update_mmap(str(self._path))
         return h
+
+    def decode(
+        self,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+        *,
+        as_type: type | None = None,
+        chunk_size: int = 8 * 1024 * 1024,
+    ) -> Any:
+        """Decode the buffer's contents into a Python object.
+
+        Decoding strategy is determined by *as_type* when provided, otherwise
+        by attempting JSON first and falling back to a plain string.
+
+        Parameters
+        ----------
+        encoding:
+            Text encoding used for ``bytes → str`` conversion.
+            Defaults to ``"utf-8"``.
+        errors:
+            Error handler for :meth:`bytes.decode`.  Defaults to
+            ``"replace"`` so corrupted bytes never raise.
+        as_type:
+            Explicit target type.  Supported values:
+
+            ``str``
+                Decode the raw bytes as a text string using *encoding*.
+            ``bytes``
+                Return the raw bytes unchanged (equivalent to
+                :meth:`to_bytes`).
+            ``dict`` / ``list``
+                Parse as JSON and assert the root type matches.  Raises
+                :class:`TypeError` if the decoded JSON root is the wrong
+                container.
+            ``int`` / ``float``
+                Decode as text, then cast via the constructor.
+            ``None`` *(default)*
+                Auto-detect: try JSON first; fall back to plain string.
+
+        chunk_size:
+            Read chunk size used when streaming from a spilled file for
+            hashing or large reads.  Has no effect on in-memory buffers.
+
+        Returns
+        -------
+        Any
+            Decoded value.  Type matches *as_type* when specified.
+
+        Raises
+        ------
+        TypeError
+            When *as_type* is specified and the decoded value is the wrong
+            type, or no coercion path exists.
+        json.JSONDecodeError
+            When ``dict`` / ``list`` coercion is requested but the content
+            is not valid JSON.
+        UnicodeDecodeError
+            Only when *errors* is ``"strict"`` and the bytes are not valid
+            *encoding*.
+
+        Examples
+        --------
+        >>> buf = BytesIO(b'{"price": 42.5, "symbol": "TTF"}')
+        >>> buf.decode()
+        {'price': 42.5, 'symbol': 'TTF'}
+
+        >>> buf.decode(as_type=str)
+        '{"price": 42.5, "symbol": "TTF"}'
+
+        >>> BytesIO(b"3.14").decode(as_type=float)
+        3.14
+        """
+        if not self:
+            # empty buffer — return the "zero" for the requested type
+            if as_type is None or as_type is str:
+                return ""
+            if as_type is bytes:
+                return b""
+            if as_type is dict:
+                return {}
+            if as_type is list:
+                return []
+            if as_type in (int, float):
+                return as_type(0)
+            return None
+
+        # ── bytes: skip all text decoding ─────────────────────────────────────
+        if as_type is bytes:
+            return self.to_bytes()
+
+        # ── decode to text once; all remaining paths work on the string ───────
+        raw: bytes = self.to_bytes()
+        text: str = raw.decode(encoding, errors=errors)
+
+        if as_type is str:
+            return text
+
+        # ── numeric ───────────────────────────────────────────────────────────
+        if as_type in (int, float):
+            stripped = text.strip()
+            try:
+                return as_type(stripped)
+            except (ValueError, TypeError) as exc:
+                raise TypeError(
+                    f"Cannot coerce buffer content {stripped!r} to {as_type.__name__}."
+                ) from exc
+
+        # ── dict / list: must be JSON ──────────────────────────────────────────
+        if as_type in (dict, list):
+            parsed = json.loads(text)
+            if not isinstance(parsed, as_type):
+                raise TypeError(
+                    f"JSON decoded to {type(parsed).__name__!r}, expected {as_type.__name__!r}."
+                )
+            return parsed
+
+        # ── as_type=None: auto-detect ──────────────────────────────────────────
+        if as_type is None:
+            stripped = text.strip()
+            if stripped and stripped[0] in ("{", "["):
+                try:
+                    return json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+            return text
+
+        # ── unknown as_type: attempt direct constructor ────────────────────────
+        try:
+            return as_type(raw)
+        except Exception as exc:
+            raise TypeError(
+                f"No decode path from BytesIO to {as_type.__name__!r}."
+            ) from exc
 
     def getvalue(self) -> bytes:
         """

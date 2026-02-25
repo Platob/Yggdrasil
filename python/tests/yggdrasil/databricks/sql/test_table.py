@@ -22,7 +22,7 @@ class TestSQLEngine(unittest.TestCase):
         cls.workspace = Workspace().connect()
         cls.engine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
 
-        cls.table = cls.engine.table("test_table_crud").create(cls.arrow_data)
+        cls.table = cls.engine.table("test_table_crud").create(cls.arrow_data, if_not_exists=True)
         cls.table.insert(cls.arrow_data)
 
     @classmethod
