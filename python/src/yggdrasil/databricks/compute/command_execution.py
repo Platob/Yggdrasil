@@ -130,9 +130,6 @@ class CommandExecution:
 
         assert self.command, "Cannot call %s, missing command" % self
 
-        args_blob = dill.dumps([self.encode_object(_) for _ in args])
-        kwargs_blob = dill.dumps({k: self.encode_object(v) for k, v in kwargs.items()})
-
         if self.environ:
             env_blob = {
                 k: os.getenv(k) or v
@@ -142,31 +139,37 @@ class CommandExecution:
         else:
             env_blob = {}
 
+        temp = self.create(
+            context=self.context.create(language=self.language),
+            command="temp",
+            language=self.language or Language.PYTHON,
+            environ=env_blob
+        )
+
+        args_blob = dill.dumps([temp.encode_object(_) for _ in args])
+        kwargs_blob = dill.dumps({k: temp.encode_object(v) for k, v in kwargs.items()})
+
         args_b64 = base64.b64encode(args_blob).decode("ascii")
         kwargs_b64 = base64.b64encode(kwargs_blob).decode("ascii")
         major, minor, _ = PyEnv.current().version_info
-        pyversion = f"{major}.{minor}"
-
-        command = (
+        temp.command = (
             self.command
             .replace("__ARGS__", repr(args_b64))
             .replace("__KWARGS__", repr(kwargs_b64))
             .replace("__ENVIRON__", repr(env_blob))
-            .replace("__CTX_KEY__", repr(self.context.context_key))
-            .replace("__PYVERSION__", repr(pyversion))
+            .replace("__CTX_KEY__", repr(temp.context.context_key))
+            .replace("__PYVERSION__", repr(f"{major}.{minor}"))
         )
 
-        with self.context as temporary:
-            run = (
-                self.create(
-                    context=temporary,
-                    command=command,
-                    language=self.language
-                )
+        try:
+            return (
+                temp
                 .start()
+                .wait(raise_error=True)
+                .result(raise_error=True)
             )
-
-            return run.wait(raise_error=True).result(raise_error=True)
+        finally:
+            temp.context.close(wait=False, raise_error=False)
 
     def __repr__(self):
         return "%s(url=%s)" % (
@@ -835,7 +838,7 @@ if env:
                     wait=WaitingConfig(timeout=60),
                     raise_error=False
                 )
-                installed_modules.add(module_name)
+                # installed_modules.add(module_name)
                 self.start(reset=True)
 
         if last_exc is None:

@@ -9,13 +9,13 @@ import posixpath
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from threading import Thread
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple, Literal
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
 
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
 from ...concurrent.threading import Job
@@ -24,7 +24,6 @@ from ...environ import PyEnv, UserInfo
 from ...environ.modules import resolve_local_lib_path
 from ...io.url import URL
 from ...pyutils.exceptions import raise_parsed_traceback
-from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -155,10 +154,12 @@ class ExecutionContext:
 
     def __enter__(self) -> "ExecutionContext":
         """Enter a context manager, opening a remote execution context."""
-        return self.create(
-            language=self.language,
-            context_key=self.context_key
-        )
+        if self.context_id is None:
+            return self.create(
+                language=self.language,
+                context_key=self.context_key
+            )
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context manager and close the remote context if created."""
@@ -264,6 +265,9 @@ class ExecutionContext:
         Returns:
             The created command execution context response.
         """
+        if self.context_id and self.language == language:
+            return self
+
         client = self.workspace_client().command_execution
 
         try:
