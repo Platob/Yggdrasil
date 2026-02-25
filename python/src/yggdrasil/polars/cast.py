@@ -575,6 +575,11 @@ def cast_polars_array_to_list(
     options: "CastOptions",
 ) -> Union[pl.Series, pl.Expr]:
     is_expr = isinstance(array, pl.Expr)
+
+    from yggdrasil.arrow.cast import cast_arrow_array
+    arr = cast_arrow_array(array.to_arrow(), options)
+    return pl.from_arrow(arr)
+
     saf, taf = options.source_arrow_field, options.target_arrow_field
     spf, tpf = options.source_polars_field, options.target_polars_field
     series_name = saf.name if saf is not None else "" if is_expr else array.name
