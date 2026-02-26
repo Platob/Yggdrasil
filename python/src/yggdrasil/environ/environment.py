@@ -50,6 +50,7 @@ from .userinfo import UserInfo
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 __all__ = [
+    "runtime_import_module",
     "PyEnv",
     "PIP_MODULE_NAME_MAPPINGS",
     "CURRENT_PYENV",
@@ -1621,3 +1622,41 @@ class PyEnv:
         if os.name == "nt" and len(s) >= 2 and s[1] == ":":
             return True
         return "/" in s or "\\" in s
+
+
+def runtime_import_module(
+    module_name: str | None = None,
+    *,
+    install: bool = True,
+    pip_name: str | None = None,
+    upgrade: bool = False,
+):
+    """
+    Class-level convenience wrapper for :meth:`import_module`.
+
+    Delegates to ``PyEnv.current().import_module(...)`` so callers don't
+    need to obtain a :class:`PyEnv` instance first.
+
+    Parameters
+    ----------
+    module_name:
+        Name used in ``import``.  Derived from *pip_name* if omitted.
+    install:
+        Auto-install via pip when the module is not found.
+    pip_name:
+        Distribution name for pip.  Defaults to the mapping in
+        :data:`PIP_MODULE_NAME_MAPPINGS` or *module_name* as-is.
+    upgrade:
+        Force a pip upgrade even if the import already succeeds.
+
+    Returns
+    -------
+    types.ModuleType
+        The imported module object.
+    """
+    return PyEnv.runtime_import_module(
+        module_name=module_name,
+        install=install,
+        pip_name=pip_name,
+        upgrade=upgrade,
+    )

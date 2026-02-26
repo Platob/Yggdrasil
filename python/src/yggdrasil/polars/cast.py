@@ -107,7 +107,7 @@ def _eval_expr_on_series(
     series: pl.Series,
     expr: pl.Expr,
     *,
-    col_name: str = "__cast_input__",
+    col_name: str,
     out_name: str | None = None,
 ) -> pl.Series:
     """Evaluate an expression against a concrete Series while preserving shape."""
@@ -281,8 +281,9 @@ def cast_polars_array_to_temporal(
     is_expr = isinstance(array, pl.Expr)
     series_name = "" if is_expr else array.name  # type: ignore[union-attr]
 
-    _col = "__cast_input__"
-    working: pl.Expr = array if is_expr else pl.col(_col)  # type: ignore[assignment]
+    # Use the actual series name as the column reference — no sentinel strings.
+    col_name = series_name or "_col_"
+    working: pl.Expr = array if is_expr else pl.col(col_name)  # type: ignore[assignment]
 
     src_cls = source.__class__
     tgt_cls = target.__class__
@@ -429,7 +430,7 @@ def cast_polars_array_to_temporal(
     if is_expr or to_expr:
         return working
 
-    return _eval_expr_on_series(array, working, col_name=_col, out_name=series_name)
+    return _eval_expr_on_series(array, working, col_name=col_name, out_name=series_name)
 
 
 def cast_polars_array_to_bool(
@@ -443,8 +444,8 @@ def cast_polars_array_to_bool(
     spf = options.source_polars_field
     src_cls = spf.dtype.__class__
 
-    _col = "__cast_input__"
-    working: pl.Expr = array if is_expr else pl.col(_col)
+    col_name = series_name or "_col_"
+    working: pl.Expr = array if is_expr else pl.col(col_name)
 
     # ── Already bool ──────────────────────────────────────────────────────────
     if src_cls is pl.Boolean:
@@ -452,7 +453,6 @@ def cast_polars_array_to_bool(
 
     # ── Numeric: non-zero → True ──────────────────────────────────────────────
     elif src_cls in _NUMERIC_CLASSES:
-        # Keep original semantics; replace with working.ne(0) if you want max speed.
         result = working.cast(pl.Int64, strict=options.safe).ne(0)
 
     # ── String: keyword mapping ───────────────────────────────────────────────
@@ -484,7 +484,6 @@ def cast_polars_array_to_bool(
 
     # ── Null source ───────────────────────────────────────────────────────────
     elif src_cls is pl.Null:
-        # preserve input shape for Series path
         result = working.cast(pl.Boolean, strict=False)
 
     # ── Fallback ──────────────────────────────────────────────────────────────
@@ -496,7 +495,7 @@ def cast_polars_array_to_bool(
     if is_expr or to_expr:
         return result
 
-    return _eval_expr_on_series(array, result, col_name=_col, out_name=series_name)
+    return _eval_expr_on_series(array, result, col_name=col_name, out_name=series_name)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +523,16 @@ def _resolve_source_field(
 def cast_polars_array_to_struct(
     array: Union[pl.Series, pl.Expr],
     options: "CastOptions",
+    to_expr: bool = False,
 ) -> Union[pl.Series, pl.Expr]:
+    """Cast *array* to a Struct Polars dtype.
+
+    Returns Expr when:
+      - input is Expr, or
+      - input is Series and to_expr=True
+
+    Returns Series when input is Series and to_expr=False.
+    """
     is_expr = isinstance(array, pl.Expr)
     spf, tpf = options.source_polars_field, options.target_polars_field
     series_name = array.name if not is_expr else options.source_arrow_field.name
@@ -533,9 +541,15 @@ def cast_polars_array_to_struct(
     if not spf.dtype.__class__ is pl.Struct:
         if spf.dtype.__class__ in (pl.String, pl.Utf8, pl.Object):
             array = array.str.json_decode(dtype=tpf.dtype)
-        return array.cast(tpf.dtype, strict=options.safe).alias(series_name)
+        result = array.cast(tpf.dtype, strict=options.safe).alias(series_name)
+        if is_expr or to_expr:
+            return result
+        # result is already a Series here (json_decode / cast on Series returns Series)
+        return result if isinstance(result, pl.Series) else (
+            _eval_expr_on_series(array, result, col_name=series_name, out_name=series_name)
+        )
 
-    out: list[pl.Expr | pl.Series] = []
+    out: list[pl.Expr] = []
 
     for i, (tgt_arrow_child, tgt_pl_child) in enumerate(
         zip(options.target_arrow_field.type, tpf.dtype.fields)
@@ -543,19 +557,25 @@ def cast_polars_array_to_struct(
         src: Optional[pl.Field] = options.source_child_polars_field(
             index=i,
             name=tgt_pl_child.name,
-            raise_error=options.add_missing_columns,
+            raise_error=not options.add_missing_columns
         )
 
         if src is None:
             out.append(default_polars_array(
-                is_expr=is_expr,
-                num_rows=0 if is_expr else array.shape[0],
+                is_expr=True,  # always build Expr for pl.struct()
+                num_rows=0,
                 arrow_field=tgt_arrow_child,
                 dtype=tgt_pl_child.dtype,
             ))
         else:
+            # Extract the child — always as Expr so pl.struct() can compose them.
+            child_src: pl.Expr = (
+                array.struct.field(src.name)
+                if is_expr
+                else pl.col(series_name).struct.field(src.name)
+            )
             out.append(cast_polars_array(
-                array.struct.field(src.name),
+                child_src,
                 options.copy(
                     source_field=polars_field_to_arrow_field(src),
                     target_field=tgt_arrow_child,
@@ -565,9 +585,12 @@ def cast_polars_array_to_struct(
 
     struct_expr = pl.struct(out).alias(series_name)
 
-    if is_expr:
+    if is_expr or to_expr:
         return struct_expr
-    return pl.select(struct_expr).to_series()
+
+    # Evaluate against a DataFrame built from the source series so all
+    # .struct.field(...) references resolve correctly.
+    return array.to_frame(name=series_name).select(struct_expr).to_series()
 
 
 # ---------------------------------------------------------------------------
@@ -577,19 +600,29 @@ def cast_polars_array_to_struct(
 def cast_polars_array_to_list(
     array: Union[pl.Series, pl.Expr],
     options: "CastOptions",
+    to_expr: bool = False,
 ) -> Union[pl.Series, pl.Expr]:
+    """Cast *array* to a List / Array Polars dtype.
+
+    Returns Expr when:
+      - input is Expr, or
+      - input is Series and to_expr=True
+
+    Returns Series when input is Series and to_expr=False.
+    """
     is_expr = isinstance(array, pl.Expr)
 
     saf, taf = options.source_arrow_field, options.target_arrow_field
     spf, tpf = options.source_polars_field, options.target_polars_field
     series_name = saf.name if saf is not None else "" if is_expr else array.name
 
-    base = array if is_expr else pl.col("__s__")
+    col_name = series_name or "_col_"
+    base: pl.Expr = array if is_expr else pl.col(col_name)
 
     def _eval(result: pl.Expr) -> pl.Expr | pl.Series:
-        if is_expr:
+        if is_expr or to_expr:
             return result
-        return pl.DataFrame({"__s__": array}).select(result).to_series()
+        return _eval_expr_on_series(array, result, col_name=col_name, out_name=series_name)
 
     def _child_options(src_arrow_inner: pa.Field, tgt_arrow_inner: pa.Field) -> "CastOptions":
         return options.copy(
@@ -699,6 +732,10 @@ def cast_polars_array(
     is_series = isinstance(array, pl.Series)
     is_expr = isinstance(array, pl.Expr)
 
+    # Column name used to frame the series — derived from the actual series name,
+    # never a hardcoded sentinel.
+    col_name: str = (array.name if is_series else tpf.name) or "_col_"
+
     # ── Null source ───────────────────────────────────────────────────────────
     if spdt.__class__ is pl.Null:
         if is_expr:
@@ -707,11 +744,11 @@ def cast_polars_array(
             else:
                 dv = default_arrow_scalar(options.target_field.type, nullable=tpf.nullable).as_py()
                 out = pl.lit(dv, dtype=tpdt)
-            return out.alias(tpf.name)  # Expr path only here
+            return out.alias(tpf.name)
 
         # Series input
         if to_expr:
-            base = pl.col("__cast_input__")
+            base = pl.col(col_name)
             if tpf.nullable:
                 out = base.cast(tpdt, strict=False).alias(tpf.name)
             else:
@@ -741,13 +778,11 @@ def cast_polars_array(
 
     # ── Struct target ─────────────────────────────────────────────────────────
     elif tpdt.__class__ is pl.Struct:
-        # Existing function may still materialize Series eagerly; okay for now.
-        array = cast_polars_array_to_struct(array, options)
+        array = cast_polars_array_to_struct(array, options, to_expr=to_expr)
 
     # ── List / Array target ───────────────────────────────────────────────────
     elif tpdt.__class__ in (pl.List, pl.Array):
-        # Existing function already returns Expr for Expr inputs and Series otherwise.
-        array = cast_polars_array_to_list(array, options)
+        array = cast_polars_array_to_list(array, options, to_expr=to_expr)
 
     # ── Boolean target ────────────────────────────────────────────────────────
     elif tpdt.__class__ is pl.Boolean:
@@ -758,7 +793,7 @@ def cast_polars_array(
         if is_expr:
             array = array.cast(tpdt, strict=options.safe)
         elif to_expr:
-            array = pl.col("__cast_input__").cast(tpdt, strict=options.safe)
+            array = pl.col(col_name).cast(tpdt, strict=options.safe)
         else:
             array = array.cast(tpdt, strict=options.safe)
 

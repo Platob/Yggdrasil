@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from yggdrasil.io.buffer import BytesIO, BufferConfig
+from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.config import BufferConfig
 
 
 def _try_import_internal_xxhash():

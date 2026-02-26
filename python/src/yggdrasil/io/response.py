@@ -3,11 +3,12 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, is_dataclass, replace
-from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator, TYPE_CHECKING
+from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator, TYPE_CHECKING, MutableMapping
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pyarrow as pa
 
+from yggdrasil.io import MediaType
 from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
@@ -255,7 +256,7 @@ class Response:
 
     # Core HTTP bits
     status_code: int
-    headers: Mapping[str, str]
+    headers: MutableMapping[str, str]
     buffer: BytesIO
 
     received_at_timestamp: int   # µs since epoch (time.time_ns() // 1000)
@@ -345,6 +346,25 @@ class Response:
     # ------------------------------------------------------------------
     # Core properties
     # ------------------------------------------------------------------
+    @property
+    def content_type(self):
+        hdr = self.headers.get("Content-Type")
+
+        if hdr:
+            return MediaType(hdr)
+
+        mt = self.buffer.content_type
+
+        if not self.headers:
+            self.headers = {}
+
+        self.headers["Content-Type"] = mt.mime
+
+        return mt
+
+    @property
+    def codec(self):
+        return self.content_type.codec
 
     @property
     def content(self) -> bytes:
@@ -423,7 +443,7 @@ class Response:
         from yggdrasil.polars.lib import polars as pl
 
         if not parse:
-            return pl.from_arrow(self.to_arrow_batch(parse=False))
+            return self.buffer
 
         content_type = _detect_content_type(self.headers)
         body = self.buffer

@@ -31,7 +31,6 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 import pyarrow as pa
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import Disposition
-
 from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.cast.registry import convert
@@ -39,6 +38,7 @@ from yggdrasil.data.engine import SQLEngine as BaseSQLEngine
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
+
 from .exceptions import SqlStatementError
 from .statement_result import StatementResult
 from .table import Table
@@ -1012,7 +1012,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
-        from ...spark.cast import any_to_spark_dataframe
+        from yggdrasil.spark.cast import any_to_spark_dataframe
         from pyspark.sql import DataFrame
         import pyspark.sql.functions as F
 

@@ -30,7 +30,7 @@ class HTTPResponse(Response):
 
         try:
             if stream:
-                for batch in response.stream(amt=4 * 1024 * 1024):
+                for batch in response.stream(amt=1024 * 1024):
                     buffer.write(batch)
             else:
                 buffer.write(response.data)

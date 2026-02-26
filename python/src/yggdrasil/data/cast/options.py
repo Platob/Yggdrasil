@@ -385,6 +385,9 @@ class CastOptions:
         from yggdrasil.polars.cast import arrow_field_to_polars_field
 
         arrow = self.source_child_arrow_field(index=index, name=name, raise_error=raise_error)
+
+        if arrow is None:
+            return arrow
         return arrow_field_to_polars_field(arrow)
 
     # ------------------------------------------------------------------
@@ -415,6 +418,8 @@ class CastOptions:
         from yggdrasil.polars.cast import arrow_field_to_polars_field
 
         arrow = self.target_child_arrow_field(index=index, name=name, raise_error=raise_error)
+        if arrow is None:
+            return arrow
         return arrow_field_to_polars_field(arrow)
 
     # ------------------------------------------------------------------
