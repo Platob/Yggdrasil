@@ -356,7 +356,7 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        sniff: bool = True
     ) -> PreparedRequest:
         full_url = url
         if self.base_url:
@@ -371,19 +371,20 @@ class Session(ABC):
             items.extend((k, v) for k, v in params.items())
             full_url = u.with_query_items(tuple(items))
 
-        if headers is None:
-            headers = {}
+        if sniff:
+            if headers is None:
+                headers = {}
+                
+            usr = UserInfo.current()
 
-        usr = UserInfo.current()
+            if YGG_VERSION:
+                headers["X-YGG-Version"] = YGG_VERSION
 
-        if YGG_VERSION:
-            headers["X-YGG-Version"] = YGG_VERSION
+            if usr.email:
+                headers["X-YGG-User-Mail"] = usr.email
 
-        if usr.email:
-            headers["X-YGG-User-Mail"] = usr.email
-
-        if usr.hostname:
-            headers["X-YGG-User-Host"] = usr.email
+            if usr.hostname:
+                headers["X-YGG-User-Host"] = usr.hostname
 
         return PreparedRequest.prepare(
             method=method,
