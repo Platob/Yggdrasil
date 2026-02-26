@@ -595,14 +595,6 @@ class LocationParseError(LocationError, _u3.LocationParseError):  # type: ignore
 # Security / SSL
 # ---------------------------------------------------------------------------
 
-class SecurityWarning(Warning, _u3.SecurityWarning):  # type: ignore[misc]
-    """Issued for insecure connections or weak TLS configurations."""
-
-
-class InsecureRequestWarning(SecurityWarning, _u3.InsecureRequestWarning):  # type: ignore[misc]
-    """Issued when a request is made to an HTTPS URL without cert verification."""
-
-
 class SSLError(ResponseError, _u3.SSLError):  # type: ignore[misc]
     """TLS/SSL handshake or certificate validation failure."""
 
@@ -610,6 +602,17 @@ class SSLError(ResponseError, _u3.SSLError):  # type: ignore[misc]
         _u3.SSLError.__init__(self, message)
         ResponseError.__init__(self, message, response=response)
 
+
+try:
+    class SecurityWarning(Warning, _u3.SecurityWarning):  # type: ignore[misc]
+        """Issued for insecure connections or weak TLS configurations."""
+except TypeError:
+    class SecurityWarning(Warning):  # type: ignore[misc]
+        """Issued for insecure connections or weak TLS configurations."""
+
+
+class InsecureRequestWarning(SecurityWarning, _u3.InsecureRequestWarning):  # type: ignore[misc]
+    """Issued when a request is made to an HTTPS URL without cert verification."""
 
 # ---------------------------------------------------------------------------
 # Cache errors (no urllib3 equivalent)
