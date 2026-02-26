@@ -303,22 +303,22 @@ class TestMediaTypeFactoryHelpers:
         assert mt.codec is None
 
     def test_from_extension_parquet(self):
-        mt = MediaType.from_extension(".parquet")
+        mt = MediaType.parse_extension(".parquet")
         assert mt.mime == MediaType.PARQUET
         assert mt.codec is None
 
     def test_from_extension_parquet_zst(self):
-        mt = MediaType.from_extension(".parquet.zst")
+        mt = MediaType.parse_extension(".parquet.zst")
         assert mt.mime == MediaType.PARQUET
         assert mt.codec is Codec.ZSTD
 
     def test_from_extension_csv_gz(self):
-        mt = MediaType.from_extension("csv.gz")
+        mt = MediaType.parse_extension("csv.gz")
         assert mt.mime == MediaType.CSV
         assert mt.codec is Codec.GZIP
 
     def test_from_extension_unknown(self):
-        mt = MediaType.from_extension(".xyz123")
+        mt = MediaType.parse_extension(".xyz123")
         assert mt.mime == MediaType.OCTET_STREAM
 
     @pytest.mark.parametrize("ext,expected_mime", [
@@ -329,7 +329,7 @@ class TestMediaTypeFactoryHelpers:
         ("yml",     MediaType.YAML),
     ])
     def test_from_extension_aliases(self, ext, expected_mime):
-        assert MediaType.from_extension(ext).mime == expected_mime
+        assert MediaType.parse_extension(ext).mime == expected_mime
 
 
 # ===========================================================================

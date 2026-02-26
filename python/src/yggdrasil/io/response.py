@@ -351,14 +351,14 @@ class Response:
         hdr = self.headers.get("Content-Type")
 
         if hdr:
-            return MediaType(hdr)
+            return MediaType.parse_mime(hdr)
 
         mt = self.buffer.content_type
 
         if not self.headers:
             self.headers = {}
 
-        self.headers["Content-Type"] = mt.mime
+        self.headers["Content-Type"] = mt.full_mime
 
         return mt
 
@@ -436,51 +436,17 @@ class Response:
         self,
         parse: bool = True,
         *,
-        infer_schema_length: int | None = 100,
         lazy: bool = False,
-        add_metadata: bool = False,
     ) -> "pl.DataFrame | pl.LazyFrame":
         from yggdrasil.polars.lib import polars as pl
 
-        if not parse:
-            return self.buffer
-
-        content_type = _detect_content_type(self.headers)
-        body = self.buffer
-        body.seek(0)
-
-        meta: dict[str, Any] = {
-            "request_method": self.request.method,
-            "request_url": self.request.url.to_string(),
-            "response_status_code": self.status_code,
-            "response_received_at": self.received_at_timestamp,
-            "response_content_type": content_type or "",
-        }
-
-        family = _content_type_family(content_type)
-
-        if family == "json":
-            df = _polars_from_json(body, meta if add_metadata else {}, self.headers, pl)
-        elif family == "ndjson":
-            df = pl.read_ndjson(body)
-        elif family == "csv":
-            df = pl.read_csv(body, infer_schema_length=infer_schema_length)
-        elif family == "arrow":
-            import pyarrow as _pa
-            reader = (
-                _pa.ipc.open_stream
-                if "stream" in (content_type or "")
-                else _pa.ipc.open_file
+        if parse:
+            return self.buffer.read_polars(
+                content_type=self.content_type,
+                lazy=lazy
             )
-            df = pl.from_arrow(reader(body).read_all())
-        else:
-            df = _polars_fallback(self, meta, body, pl)
-            return df.lazy() if lazy else df
 
-        if add_metadata:
-            df = _attach_meta(df, meta, pl)
-
-        return df.lazy() if lazy else df
+        return pl.from_arrow(self.to_arrow_batch(parse=False))
 
     def to_pandas(self, parse: bool = True) -> "pd.DataFrame":
         from yggdrasil.pandas.lib import pandas  # type: ignore

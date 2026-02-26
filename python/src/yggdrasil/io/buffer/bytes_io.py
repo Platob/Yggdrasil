@@ -31,7 +31,7 @@ Initialise from bytes or a file::
 Polars integration::
 
     df = buf.read_polars()              # auto-detects format + codec
-    buf.write_polars(df, MediaType.PARQUET)
+    buf.write_polars(df, MediaTypes.PARQUET)
 
 Hashing::
 
@@ -59,7 +59,7 @@ from typing import Any, IO, TYPE_CHECKING, Optional
 
 from yggdrasil.io.config import BufferConfig, DEFAULT_CONFIG
 from yggdrasil.io.enums.codec import Codec
-from yggdrasil.io.enums.media_type import MediaType
+from yggdrasil.io.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.path import AbstractDataPath
 from yggdrasil.io.types import BytesLike
 
@@ -516,7 +516,7 @@ class BytesIO(io.RawIOBase):
     def content_type(self) -> MediaType:
         """MIME type inferred from the buffer's magic bytes.
 
-        Delegates to :meth:`MediaType.from_io`.  The buffer's cursor is not
+        Delegates to :meth:`MediaTypes.from_io`.  The buffer's cursor is not
         moved.
 
         Returns
@@ -528,7 +528,7 @@ class BytesIO(io.RawIOBase):
         Examples
         --------
         >>> buf = BytesIO(b"PAR1" + b"\\x00" * 100 + b"PAR1")
-        >>> buf.content_type.is_parquet
+        >>> buf.content_type == MediaTypes.PARQUET
         True
         >>> buf2 = BytesIO(b'{"symbol": "TTF", "price": 42.5}')
         >>> buf2.content_type.mime
@@ -935,8 +935,9 @@ class BytesIO(io.RawIOBase):
 
     def read_polars(
         self,
-        content_type: Optional[MediaType] = None,
+        content_type: "MediaType | str | None" = None,
         *,
+        raise_error: bool = True,
         lazy: bool = False,
     ) -> "polars.DataFrame | polars.LazyFrame":
         """Deserialise the buffer into a Polars DataFrame (or LazyFrame).
@@ -951,6 +952,8 @@ class BytesIO(io.RawIOBase):
         content_type:
             Override automatic format detection.  Useful when the buffer
             contains raw CSV or JSON without a recognisable magic header.
+        raise_error:
+            Raise error on reading content
         lazy:
             When ``True`` return a :class:`polars.LazyFrame` instead of a
             :class:`polars.DataFrame`.  Parquet and IPC/Arrow use
@@ -970,13 +973,12 @@ class BytesIO(io.RawIOBase):
         Examples
         --------
         >>> buf = BytesIO(b"a,b\\n1,2\\n3,4")
-        >>> buf.read_polars(MediaType.CSV)
+        >>> buf.read_polars(MediaTypes.CSV)
         shape: (2, 2) ...
         """
         from yggdrasil.polars.lib import polars as pl
 
-        self.seek(0)
-        ct = content_type if content_type is not None else self.content_type
+        ct = MediaType.parse_any(content_type, default=self.content_type)
 
         # Decompress outer codec wrapper so every format branch gets a plain
         # uncompressed IO[bytes] — codec awareness lives here, not in each branch.
@@ -989,44 +991,57 @@ class BytesIO(io.RawIOBase):
         try:
             fmt = ct.without_codec()   # strip codec for format comparison
 
-            if fmt == MediaType.PARQUET:
+            if fmt == MediaTypes.PARQUET:
                 if lazy:
                     if self._path is not None and ct.codec is None:
                         return pl.scan_parquet(self._path)
                     return pl.read_parquet(src).lazy()
                 return pl.read_parquet(src)
 
-            if fmt in (MediaType.IPC, MediaType.FEATHER):
+            if fmt in (MediaTypes.IPC, MediaTypes.FEATHER):
                 if lazy:
                     if self._path is not None and ct.codec is None:
                         return pl.scan_ipc(self._path)
                     return pl.read_ipc(src).lazy()
                 return pl.read_ipc(src)
 
-            if fmt == MediaType.CSV:
+            if fmt == MediaTypes.CSV:
                 df = pl.read_csv(src)
                 return df.lazy() if lazy else df
 
-            if fmt == MediaType.JSON:
+            if fmt == MediaTypes.JSON:
                 df = pl.read_json(src)
                 return df.lazy() if lazy else df
 
-            if fmt == MediaType.NDJSON:
+            if fmt == MediaTypes.NDJSON:
                 df = pl.read_ndjson(src)
                 return df.lazy() if lazy else df
 
-            if fmt == MediaType.AVRO:
+            if fmt == MediaTypes.AVRO:
                 df = pl.read_avro(src)
                 return df.lazy() if lazy else df
 
-            if fmt == MediaType.ZIP:
+            if fmt == MediaTypes.ZIP:
                 import zipfile
                 with zipfile.ZipFile(src) as zf:
-                    names = zf.namelist()
-                    if not names:
-                        raise ValueError("ZIP archive is empty")
-                    with zf.open(names[0]) as entry:
-                        return BytesIO(entry.read()).read_polars(lazy=lazy)
+                    if not (names := zf.namelist()):
+                        if raise_error:
+                            raise ValueError("ZIP archive is empty")
+                        return pl.DataFrame([], schema={})
+
+                    frames = [
+                        BytesIO(zf.read(name)).read_polars(
+                            raise_error=raise_error,
+                            lazy=lazy
+                        )
+                        for name in names
+                    ]
+
+                    return pl.concat(
+                        frames,
+                        rechunk=False,
+                        how="diagonal_relaxed"
+                    )
 
             raise ValueError(
                 f"read_polars: unsupported MediaType {ct!r}. "
@@ -1038,7 +1053,7 @@ class BytesIO(io.RawIOBase):
     def write_polars(
         self,
         df: "polars.DataFrame | polars.LazyFrame",
-        media_type: Optional[MediaType] = None,
+        content_type: "MediaType | str | None" = None,
         *,
         codec: Optional[Codec] = None,
         compression: str = "zstd",
@@ -1053,7 +1068,7 @@ class BytesIO(io.RawIOBase):
         ----------
         df:
             DataFrame or LazyFrame to serialise.
-        media_type:
+        content_type:
             Target format.  Defaults to :attr:`MediaType.PARQUET`.
         codec:
             Optional outer compression wrapper applied **after** internal
@@ -1091,29 +1106,29 @@ class BytesIO(io.RawIOBase):
         if isinstance(df, pl.LazyFrame):
             df = df.collect()
 
-        mt = media_type if media_type is not None else MediaType.PARQUET
+        mt = MediaType.parse_any(content_type, default=MediaTypes.PARQUET)
         fmt = mt.without_codec()
         sink = io.BytesIO()
 
-        if fmt == MediaType.PARQUET:
+        if fmt == MediaTypes.PARQUET:
             kw: dict[str, Any] = {"compression": compression}
             if row_group_size is not None:
                 kw["row_group_size"] = row_group_size
             df.write_parquet(sink, **kw)
 
-        elif fmt in (MediaType.IPC, MediaType.FEATHER):
+        elif fmt in (MediaTypes.IPC, MediaTypes.FEATHER):
             df.write_ipc(sink, compression=compression)
 
-        elif fmt == MediaType.CSV:
+        elif fmt == MediaTypes.CSV:
             df.write_csv(sink)
 
-        elif fmt == MediaType.JSON:
+        elif fmt == MediaTypes.JSON:
             df.write_json(sink)
 
-        elif fmt == MediaType.NDJSON:
+        elif fmt == MediaTypes.NDJSON:
             df.write_ndjson(sink)
 
-        elif fmt == MediaType.AVRO:
+        elif fmt == MediaTypes.AVRO:
             df.write_avro(sink)
 
         else:

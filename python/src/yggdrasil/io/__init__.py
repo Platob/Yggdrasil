@@ -35,7 +35,7 @@ from __future__ import annotations
 from .buffer import BytesIO
 from .config import BufferConfig, DEFAULT_CONFIG
 from .enums.codec import Codec
-from .enums.media_type import MediaType
+from .enums.media_type import MediaType, MimeType
 from .types import BytesLike
 
 __all__ = [
