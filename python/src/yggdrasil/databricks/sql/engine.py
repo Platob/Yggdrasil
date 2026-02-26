@@ -1389,8 +1389,8 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
 
         try:
             res = self.execute(statement, wait=wait_result)
-        except SqlStatementError as e:
-            if "SCHEMA_NOT_FOUND" in e.message:
+        except Exception as e:
+            if "SCHEMA_NOT_FOUND" in str(e):
                 self.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema_name)}", wait=True)
                 res = self.execute(statement, wait=wait_result)
             else:
