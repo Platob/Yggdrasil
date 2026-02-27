@@ -1,44 +1,32 @@
-# Python modules documentation index
+# Module index
 
-This folder documents the Python modules shipped with Yggdrasil.
+## Core
 
-If you are building data products on Databricks, start with the Databricks section below. If you are integrating with mixed local + cloud runtimes, combine `types`, `pyutils`, and the Databricks modules.
+- [arrow](arrow/README.md) — `arrow_field_from_hint`, Python→Arrow type map
+- [data.cast](types/README.md) — `CastOptions`, `convert`, `register_converter`
+- [arrow.cast](types/cast/README.md) — `cast_arrow_tabular`, per-engine casting
+- [dataclasses](dataclasses/README.md) — `dataclass_to_arrow_field`
+- [pyutils](pyutils/README.md) — `retry`, `parallelize`
+- [concurrent](concurrent/README.md) — `JobPoolExecutor`, `Job`
+- [requests](requests/README.md) — `YGGSession`
+- [io](io/README.md) — `BytesIO`, `Codec`, `MediaType`
+- [deltalake](deltalake/README.md) — `DeltaTable`
 
-## Core modules
+## Databricks
 
-- [yggdrasil.types](types/README.md)
-  Type defaults, Arrow inference, and casting interoperability.
-- [yggdrasil.pyutils](pyutils/README.md)
-  Retry, waiting, parallel operations, module loading, serialization helpers.
-- [yggdrasil.requests](requests/README.md)
-  Session wrappers and auth-ready request workflows.
+- [databricks](databricks/README.md) — overview
+- [databricks.workspaces](databricks/workspaces/README.md) — paths and file IO
+- [databricks.sql](databricks/sql/README.md) — SQL execution and results
+- [databricks.compute](databricks/compute/README.md) — cluster lifecycle
+- [databricks.compute.remote](databricks/compute/remote/README.md) — remote decorator
+- [databricks.jobs](databricks/jobs/README.md) — typed notebook config
 
-## Databricks modules
+## Reading order
 
-- [yggdrasil.databricks](databricks/README.md)
-  Databricks integration entrypoint.
-- [yggdrasil.databricks.workspaces](databricks/workspaces/README.md)
-  Path and file operations across DBFS / Workspace / Volumes.
-- [yggdrasil.databricks.sql](databricks/sql/README.md)
-  Statement execution, Spark fallback, and structured result handling.
-- [yggdrasil.databricks.compute](databricks/compute/README.md)
-  Cluster management and command execution contexts.
-- [yggdrasil.databricks.compute.remote](databricks/compute/remote/README.md)
-  Decorator-based remote execution for local function code.
-- [yggdrasil.databricks.jobs](databricks/jobs/README.md)
-  Typed config ingestion via widgets and job parameters.
-
-## Optional ecosystem helpers
-
-- [yggdrasil.libs](libs/README.md)
-- [yggdrasil.libs.extensions](libs/extensions/README.md)
-- [yggdrasil.types.cast](types/cast/README.md)
-
-## Suggested reading order for new users
-
-1. `types`
-2. `pyutils`
-3. `databricks.workspaces`
-4. `databricks.sql`
-5. `databricks.jobs`
-6. `databricks.compute` / `compute.remote`
+1. `data.cast` → understand the casting model
+2. `arrow` → schema inference from type hints
+3. `arrow.cast` → apply schemas to real tables
+4. `pyutils` → retries and parallelism
+5. `databricks.workspaces` + `databricks.sql` → Databricks integration
+6. `databricks.jobs` → typed job parameters
+7. `concurrent` / `io` → advanced use cases

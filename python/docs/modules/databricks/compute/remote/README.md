@@ -1,36 +1,25 @@
 # yggdrasil.databricks.compute.remote
 
-`databricks_remote_compute` enables decorator-based remote execution, so you can keep local Python functions and run them on Databricks when configured.
+`@databricks_remote_compute` — run a local Python function on a Databricks cluster with no business-logic changes.
 
-This is especially useful for teams that want:
-- local development ergonomics
-- remote execution in CI/prod
-- minimal branching in business logic
+## Key export
 
----
-
-## Core API
-
-- `databricks_remote_compute(...)`: decorator factory with cluster/workspace controls.
-
-Key options include:
-- `cluster_id` / `cluster_name`
-- `workspace` (host string or workspace object)
-- `env_keys` (forward selected environment variables)
-- `force_local` (always execute locally)
+```python
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
+```
 
 ---
 
-## Bootstrap: basic remote decoration
+## Bootstrap: decorate a function for remote execution
 
 ```python
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
-@databricks_remote_compute(cluster_name="shared-etl-cluster")
+@databricks_remote_compute(cluster_name="shared-etl")
 def add(x: int, y: int) -> int:
     return x + y
 
-print(add(2, 3))
+result = add(2, 3)   # executes on cluster, returns 5
 ```
 
 ---
@@ -41,7 +30,7 @@ print(add(2, 3))
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
 @databricks_remote_compute(
-    workspace="https://<workspace-host>",
+    workspace="https://<workspace>.azuredatabricks.net",
     cluster_name="analytics-jobs",
 )
 def normalize(name: str) -> str:
@@ -50,37 +39,49 @@ def normalize(name: str) -> str:
 
 ---
 
-## Bootstrap: local-safe fallback for tests
-
-```python
-from yggdrasil.databricks.compute.remote import databricks_remote_compute
-
-@databricks_remote_compute(force_local=True)
-def deterministic_logic(value: str) -> str:
-    return value.upper()
-
-assert deterministic_logic("ok") == "OK"
-```
-
----
-
-## Bootstrap: environment key forwarding
+## Bootstrap: forward environment variables
 
 ```python
 from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
 @databricks_remote_compute(
-    cluster_name="shared-etl-cluster",
+    cluster_name="shared-etl",
     env_keys=["ENV", "LOG_LEVEL", "FEATURE_FLAG_X"],
 )
-def run_with_runtime_flags() -> str:
-    return "done"
+def pipeline_step() -> dict:
+    import os
+    return {"env": os.getenv("ENV"), "log": os.getenv("LOG_LEVEL")}
 ```
 
 ---
 
-## Behavior notes
+## Bootstrap: local-safe fallback (tests / CI without cluster)
 
-- If Databricks host information is unavailable, decorator behavior may remain local.
-- In Databricks runtime environments, local execution can be preferred automatically.
-- For deterministic CI tests, use `force_local=True`.
+```python
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
+
+@databricks_remote_compute(force_local=True)
+def transform(value: str) -> str:
+    return value.strip().upper()
+
+assert transform("  hello  ") == "HELLO"
+```
+
+---
+
+## Decorator options
+
+```python
+@databricks_remote_compute(
+    cluster_name=None,      # cluster resolved by name
+    cluster_id=None,        # cluster resolved by ID
+    workspace=None,         # host string or Workspace instance
+    env_keys=None,          # list[str] — env vars to forward
+    force_local=False,      # True: always execute locally (for tests)
+)
+```
+
+**Execution rules:**
+- If `force_local=True` → always local.
+- If running inside a Databricks notebook → local (cluster already available).
+- Otherwise → serializes and executes on the specified cluster.

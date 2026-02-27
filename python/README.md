@@ -1,100 +1,115 @@
 # Yggdrasil (Python)
 
-Type-friendly utilities for moving data between Python objects, Arrow, Polars, pandas, Spark, and Databricks. The package bundles enhanced dataclasses, casting utilities, and lightweight wrappers around Databricks and HTTP clients so Python/data engineers can focus on schemas instead of plumbing.
+Schema-aware utilities for moving data between Python objects, Arrow, Polars, pandas, Spark, and Databricks. Define types once — cast everywhere.
 
-## When to use this package
-Use Yggdrasil when you need to:
-- Convert payloads across dataframe engines without rewriting type logic for each backend.
-- Define dataclasses that auto-coerce inputs, expose defaults, and surface Arrow schemas.
-- Run Databricks SQL jobs or manage clusters with minimal boilerplate.
-- Add resilient retries, concurrency helpers, and dependency guards to data pipelines.
-
-## Prerequisites
-- Python **3.10+**
-- [uv](https://docs.astral.sh/uv/) for virtualenv and dependency management.
-
-Optional extras:
-- `polars`, `pandas`, `pyarrow`, and `pyspark` for engine-specific conversions.
-- `databricks-sdk` for workspace, SQL, jobs, and compute helpers.
-- `msal` for Azure AD authentication when using `MSALSession`.
-
-## Installation
-From the `python/` directory:
+## Install
 
 ```bash
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e .[dev]
+pip install ygg                           # core (Arrow, requests, pyutils)
+pip install "ygg[polars]"                # + Polars
+pip install "ygg[pandas]"                # + pandas
+pip install "ygg[spark]"                 # + PySpark
+pip install "ygg[databricks]"            # + Databricks SDK
 ```
 
-Extras are grouped by engine:
-- `.[polars]`, `.[pandas]`, `.[spark]`, `.[databricks]` – install only the integrations you need.
-- `.[dev]` – adds testing, linting, and typing tools (`pytest`, `ruff`, `black`, `mypy`).
+From source (dev):
 
-### Databricks example
-Install the `databricks` extra and run SQL with typed results:
+```bash
+cd python/
+uv venv .venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+## Quickstart
+
+### Infer Arrow schema from a dataclass
+
+```python
+from dataclasses import dataclass
+from yggdrasil.dataclasses import dataclass_to_arrow_field
+
+@dataclass
+class Order:
+    id: int
+    amount: float
+    country: str | None = None
+
+field = dataclass_to_arrow_field(Order)
+print(field.type)           # struct<id: int64, amount: double, country: string>
+schema = field.type.to_schema()
+```
+
+### Cast any table to an Arrow schema
+
+```python
+import pyarrow as pa
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions
+
+target = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("amount", pa.float64()),
+])
+raw = pa.table({"id": ["1", "2"], "amount": ["10.5", "20.0"]})
+out = cast_arrow_tabular(raw, CastOptions(target_field=target))
+```
+
+### Retry + parallel
+
+```python
+from yggdrasil.pyutils import retry, parallelize
+
+@retry(tries=5, delay=0.5, backoff=2.0)
+def fetch(url: str) -> bytes: ...
+
+@parallelize(max_workers=8)
+def process(item: str) -> dict:
+    return {"result": item.upper()}
+
+results = list(process(["a", "b", "c"]))
+```
+
+### Databricks — SQL with typed results
 
 ```python
 from yggdrasil.databricks.workspaces import Workspace
 from yggdrasil.databricks.sql import SQLEngine
 
-ws = Workspace(host="https://<workspace-url>", token="<token>")
-engine = SQLEngine(workspace=ws)
+ws = Workspace(host="https://<workspace>", token="<pat>").connect()
+engine = SQLEngine(catalog_name="main", schema_name="analytics", workspace=ws)
 
-stmt = engine.execute("SELECT 1 AS value")
-result = stmt.wait(engine)
-tbl = result.arrow_table()
-print(tbl.to_pandas())
+result = engine.execute("SELECT id, amount FROM transactions LIMIT 100")
+df = result.to_pandas()
+arrow_table = result.to_arrow_table()
 ```
 
-### Parallel processing and retries
+## Module map
 
-```python
-from yggdrasil.pyutils import parallelize, retry
+| Module | Key exports |
+|---|---|
+| `yggdrasil.arrow` | `arrow_field_from_hint` |
+| `yggdrasil.arrow.cast` | `cast_arrow_tabular`, `cast_arrow_array` |
+| `yggdrasil.data.cast` | `CastOptions`, `convert`, `register_converter` |
+| `yggdrasil.dataclasses` | `dataclass_to_arrow_field` |
+| `yggdrasil.pandas.cast` | `cast_pandas_dataframe` |
+| `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe` |
+| `yggdrasil.spark.cast` | `cast_spark_dataframe` |
+| `yggdrasil.pyutils` | `retry`, `parallelize` |
+| `yggdrasil.concurrent` | `JobPoolExecutor`, `Job` |
+| `yggdrasil.requests` | `YGGSession` |
+| `yggdrasil.io` | `BytesIO`, `Codec`, `MediaType` |
+| `yggdrasil.deltalake` | `DeltaTable` |
+| `yggdrasil.databricks` | `Workspace`, `SQLEngine`, `Cluster`, `NotebookConfig` |
 
-@parallelize(max_workers=4)
-def square(x):
-    return x * x
+## Docs
 
-@retry(tries=5, delay=0.2, backoff=2)
-def sometimes_fails(value: int) -> int:
-    ...
+[Module reference →](docs/modules/README.md)
 
-print(list(square(range(5))))
-```
-
-## Project layout
-- `yggdrasil/dataclasses` – `yggdataclass` decorator plus Arrow schema helpers.
-- `yggdrasil/types` – casting registry (`convert`, `register_converter`), Arrow inference, and default generators.
-- `yggdrasil/libs` – optional bridges to Polars, pandas, Spark, and Databricks SDK types.
-- `yggdrasil/databricks` – workspace, SQL, jobs, and compute helpers built on the Databricks SDK.
-- `yggdrasil/requests` – retry-capable HTTP sessions and Azure MSAL auth helpers.
-- `yggdrasil/pyutils` – concurrency and retry decorators.
-- `yggdrasil/ser` – serialization helpers and dependency inspection utilities.
-- `tests/` – pytest-based coverage for conversions, dataclasses, requests, and platform helpers.
-
-## Testing
-From `python/`:
+## Test
 
 ```bash
+cd python/
 pytest
-```
-
-Optional checks when developing:
-
-```bash
-ruff check
-black .
+ruff check .
 mypy
 ```
-
-## Troubleshooting and common pitfalls
-- **Missing optional dependency**: Install the matching extra (e.g., `uv pip install -e .[polars]`) or wrap calls with `require_polars`/`require_pyspark` from `yggdrasil.libs`.
-- **Schema mismatches**: Use `arrow_field_from_hint` and `CastOptions` to enforce expected Arrow metadata when casting.
-- **Databricks auth**: Provide `host` and `token` to `Workspace`. For Azure, ensure environment variables align with your workspace deployment.
-
-## Contributing
-1. Fork and branch.
-2. Install with `uv pip install -e .[dev]`.
-3. Run tests and linters.
-4. Submit a PR describing the change and any new examples added to the docs.
