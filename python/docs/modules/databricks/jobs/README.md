@@ -1,19 +1,18 @@
 # yggdrasil.databricks.jobs
 
-This module helps you build **typed notebook/job configuration contracts**.
+`NotebookConfig` — typed dataclass for Databricks notebook widgets and job parameters.
 
-Instead of manually reading strings from widgets and converting them in ad hoc code, you define dataclasses once and load values consistently.
+Define fields once; values are read from widgets (interactive notebooks), job parameters (scheduled jobs), or environment variables — and cast to the correct Python types automatically.
+
+## Key export
+
+```python
+from yggdrasil.databricks.jobs import NotebookConfig
+```
 
 ---
 
-## Core APIs
-
-- `NotebookConfig`: base dataclass for widget and environment-driven config.
-- `WidgetType`: enum describing widget rendering semantics.
-
----
-
-## Bootstrap: strongly-typed job arguments
+## Bootstrap: basic typed config
 
 ```python
 from dataclasses import dataclass
@@ -28,11 +27,12 @@ class IngestConfig(NotebookConfig):
 
 cfg = IngestConfig.from_environment()
 print(cfg)
+# IngestConfig(catalog='main', schema='analytics', source_path='...', dry_run=False)
 ```
 
 ---
 
-## Bootstrap: list and datetime values
+## Bootstrap: dates and lists
 
 ```python
 from dataclasses import dataclass
@@ -41,36 +41,43 @@ from yggdrasil.databricks.jobs import NotebookConfig
 
 @dataclass
 class ReportConfig(NotebookConfig):
-    markets: list[str]
-    run_date: dt.date
+    run_date: dt.date          # parsed from "2024-01-15"
+    markets: list[str]         # parsed from "US,FR,DE" (comma-separated widget)
+    lookback_days: int = 7
 
 cfg = ReportConfig.from_environment()
+print(cfg.run_date)    # datetime.date(2024, 1, 15)
+print(cfg.markets)     # ['US', 'FR', 'DE']
 ```
 
 ---
 
-## Bootstrap: enums for controlled inputs
+## Bootstrap: enum for controlled choices
 
 ```python
 from dataclasses import dataclass
 from enum import Enum
 from yggdrasil.databricks.jobs import NotebookConfig
 
-class Mode(Enum):
+class RunMode(Enum):
     FULL = "full"
     INCREMENTAL = "incremental"
 
 @dataclass
 class PipelineConfig(NotebookConfig):
-    mode: Mode
+    mode: RunMode
     target_table: str
 
 cfg = PipelineConfig.from_environment()
+if cfg.mode == RunMode.FULL:
+    rebuild_table(cfg.target_table)
 ```
 
 ---
 
-## Bootstrap: generate widgets from dataclass schema
+## Bootstrap: initialize notebook widgets
+
+Call at the top of a notebook cell to create widgets for interactive use:
 
 ```python
 from dataclasses import dataclass
@@ -80,16 +87,57 @@ from yggdrasil.databricks.jobs import NotebookConfig
 class FeatureConfig(NotebookConfig):
     lookback_days: int = 7
     include_debug: bool = False
+    env: str = "prod"
 
-# In notebook setup cell (where dbutils is available)
+# Creates text/dropdown widgets in the notebook UI
 FeatureConfig.init_widgets()
+```
+
+Widgets are skipped if they already exist (`skip_existing=True` by default).
+
+---
+
+## Bootstrap: production entrypoint pattern
+
+`init_job()` = `init_widgets()` + Spark session tuning + `from_environment()` in one call:
+
+```python
+from dataclasses import dataclass
+from yggdrasil.databricks.jobs import NotebookConfig
+from yggdrasil.databricks.sql import SQLEngine
+
+@dataclass
+class JobConfig(NotebookConfig):
+    catalog: str
+    schema: str
+    table: str
+    days_back: int = 1
+
+cfg = JobConfig.init_job()   # recommended for scheduled Databricks jobs
+
+engine = SQLEngine(catalog_name=cfg.catalog, schema_name=cfg.schema)
+engine.execute(f"""
+    DELETE FROM {cfg.catalog}.{cfg.schema}.{cfg.table}
+    WHERE event_date >= date_sub(current_date(), {cfg.days_back})
+""")
 ```
 
 ---
 
-## Best practices
+## `NotebookConfig` class methods
 
-- Keep one config dataclass per notebook entrypoint.
-- Use defaults for safe reruns and local notebook testing.
-- Prefer enums for finite-mode choices.
-- Validate config once, then pass object through all business functions.
+| Method | When to use |
+|---|---|
+| `MyConfig.from_environment()` | Load from widgets / job params / env vars |
+| `MyConfig.init_widgets()` | Create notebook widgets (interactive notebooks) |
+| `MyConfig.init_job()` | Full job bootstrap: widgets + Spark tuning + load |
+
+## Widget type mapping
+
+| Field type | Widget created |
+|---|---|
+| `str`, `int`, `float` | Text widget |
+| `bool` | Dropdown: `true` / `false` |
+| `Enum` subclass | Dropdown with enum values |
+| `list[str]` / `set[str]` | Multiselect |
+| `datetime.date` / `datetime.datetime` | Text (ISO format) |

@@ -1,31 +1,46 @@
 # yggdrasil.databricks.workspaces
 
-This module standardizes Databricks filesystem interactions across different storage domains:
-- DBFS (`dbfs:/...`)
-- Workspace files (`/Workspace/...`)
-- Unity Catalog volumes (`/Volumes/...`)
+Unified path abstraction for DBFS, Workspace files, and Unity Catalog Volumes.
 
-It provides a single API surface for parsing, opening, and transferring files across those domains.
+## Key exports
+
+```python
+from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
+```
+
+## Supported path schemes
+
+| Scheme | Example |
+|---|---|
+| DBFS | `dbfs:/tmp/data.parquet` |
+| Workspace | `/Workspace/Users/me/file.txt` |
+| Unity Catalog Volume | `/Volumes/main/analytics/bronze/data.parquet` |
 
 ---
 
-## Core components
-
-- `Workspace`: wraps workspace client configuration and access.
-- `DatabricksPath`: path abstraction with parse + operation helpers.
-- `DatabricksIO`: file-like operations on Databricks paths.
-
----
-
-## Bootstrap: connect once, reuse everywhere
+## Bootstrap: connect and parse a path
 
 ```python
 from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
 
-workspace = Workspace(host="https://<workspace-host>").connect()
+ws = Workspace(host="https://<workspace>.azuredatabricks.net", token="<pat>").connect()
+# or: ws = Workspace().connect()  # uses DATABRICKS_HOST + DATABRICKS_TOKEN
 
-path = DatabricksPath.parse("dbfs:/tmp/demo.csv", workspace=workspace)
-print(path)
+path = DatabricksPath.parse("dbfs:/tmp/orders.parquet", workspace=ws)
+```
+
+---
+
+## Bootstrap: read into dataframes
+
+```python
+from yggdrasil.databricks.workspaces import DatabricksPath
+
+path = DatabricksPath.parse("dbfs:/curated/users.parquet")
+
+arrow_tbl = path.read_arrow()    # pyarrow.Table
+pandas_df = path.read_pandas()   # pandas.DataFrame
+polars_df = path.read_polars()   # polars.DataFrame
 ```
 
 ---
@@ -35,51 +50,75 @@ print(path)
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
 
-path = DatabricksPath.parse("dbfs:/tmp/bootstrap/hello.txt")
+path = DatabricksPath.parse("dbfs:/tmp/hello.txt")
 
-with path.open("w") as handle:
-    handle.write("hello from yggdrasil")
+with path.open("w") as f:
+    f.write("hello from yggdrasil")
 
-with path.open("r") as handle:
-    text = handle.read()
-
-print(text)
+with path.open("r") as f:
+    print(f.read())
 ```
 
 ---
 
-## Bootstrap: transfer data between domains
+## Bootstrap: copy between storage domains
 
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
 
-src = DatabricksPath.parse("dbfs:/tmp/raw/events.parquet")
+src  = DatabricksPath.parse("dbfs:/tmp/raw/events.parquet")
 dest = DatabricksPath.parse("/Volumes/main/analytics/bronze/events.parquet")
 
-src.copy_to(dest)
+src.copy_to(dest)    # copy, source remains
+# src.move_to(dest)  # move, source is deleted
 ```
 
 ---
 
-## Bootstrap: DataFrame-friendly usage
+## Bootstrap: Unity Catalog Volume read
 
 ```python
 from yggdrasil.databricks.workspaces import DatabricksPath
 
-# Read parquet into pandas
-pdf = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_pandas()
-
-# Read parquet into polars
-pl_df = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_polars()
-
-# Read parquet into pyarrow
-arrow_tbl = DatabricksPath.parse("dbfs:/tmp/curated/users.parquet").read_arrow()
+path = DatabricksPath.parse("/Volumes/main/analytics/bronze/trades.parquet")
+table = path.read_arrow()
 ```
 
 ---
 
-## Operational recommendations
+## Bootstrap: Workspace file write
 
-- Prefer explicit `DatabricksPath.parse(...)` over string concatenation.
-- Centralize workspace initialization and inject it where possible.
-- Keep file movement operations (`copy_to`, `move_to`) idempotent in jobs.
+```python
+from yggdrasil.databricks.workspaces import DatabricksPath
+
+path = DatabricksPath.parse("/Workspace/Users/me@corp.com/outputs/report.json")
+
+with path.open("w") as f:
+    import json
+    json.dump({"status": "ok", "rows": 1000}, f)
+```
+
+---
+
+## `Workspace` API
+
+```python
+ws = Workspace(host=None, token=None)
+ws.connect()          # authenticate, returns self
+ws.connected          # bool
+ws.safe_host          # sanitized host URL
+ws.sdk()              # databricks.sdk.WorkspaceClient
+```
+
+## `DatabricksPath` API
+
+```python
+path = DatabricksPath.parse(uri, workspace=None)
+
+path.open(mode)        # context manager ("r", "w", "rb", "wb")
+path.read_arrow()      # → pa.Table
+path.read_pandas()     # → pandas.DataFrame
+path.read_polars()     # → polars.DataFrame
+path.copy_to(dest)     # copy to DatabricksPath
+path.move_to(dest)     # move to DatabricksPath
+```

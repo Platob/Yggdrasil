@@ -1,37 +1,32 @@
 # yggdrasil.databricks.compute
 
-This module focuses on remote compute operations for Databricks clusters.
+Cluster lifecycle management and remote command execution for Databricks.
 
-Use it when your code runs outside notebooks (CI/CD, services, local scripts) and still needs to:
-- Resolve or manage target clusters
-- Execute commands in cluster contexts
-- Reuse cluster connection patterns across pipelines
+Use from CI/CD, local scripts, or orchestration services that need to target a running cluster.
 
----
-
-## Core APIs
-
-- `Cluster`: cluster selection, lifecycle control, command execution.
-- `ExecutionContext`: scoped remote execution context.
-- `databricks_remote_compute`: decorator for function-level remote execution.
-
----
-
-## Bootstrap: basic cluster command execution
+## Key exports
 
 ```python
-from yggdrasil.databricks.compute import Cluster
-
-cluster = Cluster(cluster_name="shared-etl-cluster")
-cluster.ensure_running()
-
-result = cluster.execute("print('hello from databricks cluster')")
-print(result)
+from yggdrasil.databricks.compute import Cluster, ExecutionContext
 ```
 
 ---
 
-## Bootstrap: context-managed remote session
+## Bootstrap: start a cluster and run a command
+
+```python
+from yggdrasil.databricks.compute import Cluster
+
+cluster = Cluster(cluster_name="shared-etl")
+cluster.ensure_running()   # starts cluster if stopped, waits until ready
+
+output = cluster.execute("print('hello from cluster')")
+print(output)
+```
+
+---
+
+## Bootstrap: context-managed multi-step execution
 
 ```python
 from yggdrasil.databricks.compute import Cluster, ExecutionContext
@@ -39,41 +34,70 @@ from yggdrasil.databricks.compute import Cluster, ExecutionContext
 cluster = Cluster(cluster_name="analytics-jobs")
 cluster.ensure_running()
 
-with ExecutionContext(cluster=cluster) as context:
-    output = context.execute("spark.range(10).count()")
-    print(output)
+with ExecutionContext(cluster=cluster) as ctx:
+    ctx.execute("import pandas as pd; print(pd.__version__)")
+    count = ctx.execute("spark.range(10).count()")
+    print(count)
+# context is closed automatically
 ```
 
 ---
 
-## Bootstrap: cluster bootstrap in automation script
+## Bootstrap: Spark SQL via remote cluster
 
 ```python
 from yggdrasil.databricks.compute import Cluster
 
-cluster = Cluster(cluster_name="nightly-maintenance")
-
-# Ensure availability before running batch logic
+cluster = Cluster(cluster_name="prod-etl")
 cluster.ensure_running()
 
-# Run remote administrative script
-cluster.execute(
-    """
-from pyspark.sql import SparkSession
+cluster.execute("""
 spark = SparkSession.getActiveSession()
-print(spark.sql('SELECT current_date()').collect())
-"""
-)
+result = spark.sql("SELECT count(*) FROM main.analytics.events").collect()
+print(result)
+""")
 ```
 
 ---
 
-## Related submodule
+## Bootstrap: automation / nightly script
 
-- [compute.remote](remote/README.md): function decorators for remote dispatch.
+```python
+from yggdrasil.databricks.workspaces import Workspace
+from yggdrasil.databricks.compute import Cluster
 
-## Recommendations
+ws = Workspace().connect()
+cluster = Cluster(cluster_name="nightly-maintenance", workspace=ws)
+cluster.ensure_running()
 
-- Keep cluster naming conventions deterministic (`env-purpose-size`).
-- Prefer context managers for multi-step command execution workflows.
-- Add retry and timeout controls in surrounding orchestration logic.
+cluster.execute("spark.sql('OPTIMIZE main.analytics.events ZORDER BY (user_id)')")
+```
+
+---
+
+## `Cluster` API
+
+```python
+Cluster(
+    cluster_name=None,    # resolve by name
+    cluster_id=None,      # resolve by ID
+    workspace=None,       # Workspace instance
+)
+
+cluster.ensure_running()          # start + wait if not running
+cluster.execute(command: str)     # run Python/Spark code string on cluster
+```
+
+## `ExecutionContext` API
+
+```python
+with ExecutionContext(cluster=cluster) as ctx:
+    ctx.execute(command: str)   # run command in the context
+# context destroyed on exit
+```
+
+---
+
+## Related
+
+- [compute.remote](remote/README.md) — decorator-based remote dispatch
