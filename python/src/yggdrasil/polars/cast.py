@@ -16,7 +16,7 @@ from yggdrasil.arrow.cast import (
 )
 from yggdrasil.data.cast import CastOptions, register_converter
 from yggdrasil.io.path import LocalDataPath, SystemPath
-from yggdrasil.pyutils.serde import ObjectSerde
+from yggdrasil.pickle.serde import ObjectSerde
 
 __all__ = [
     "register_converter",

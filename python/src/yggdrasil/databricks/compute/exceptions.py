@@ -3,7 +3,8 @@ from ..lib import DatabricksError
 __all__ = [
     "ComputeException",
     "ClientTerminatedSession",
-    "CommandExecutionException"
+    "CommandExecutionException",
+    "CommandExecutionError"
 ]
 
 
@@ -16,4 +17,8 @@ class CommandExecutionException(ComputeException):
 
 
 class ClientTerminatedSession(CommandExecutionException):
+    pass
+
+
+class CommandExecutionError(ComputeException):
     pass

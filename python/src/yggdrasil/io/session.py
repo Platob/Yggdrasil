@@ -1,16 +1,17 @@
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator
+from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable
 
+from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
+from yggdrasil.environ import UserInfo
+from yggdrasil.version import __version__ as YGG_VERSION
+
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import Response
 from .url import URL
-from ..concurrent.threading import JobPoolExecutor
-from ..environ import UserInfo
-from yggdrasil.version import __version__ as YGG_VERSION
 
 if TYPE_CHECKING:
     from ..databricks.sql.table import Table
@@ -25,13 +26,12 @@ class Session(ABC):
     verify: bool = True
 
     waiting: WaitingConfig = field(default_factory=lambda: DEFAULT_WAITING_CONFIG, repr=False, compare=False, hash=False)
-    cache: Optional["Table"] = field(default=None, repr=False, compare=False, hash=False)
 
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.base_url:
-            self.base_url = URL.parse_any(self.base_url)
+            self.base_url = URL.parse(self.base_url)
 
         if self._lock is None:
             self._lock = threading.RLock()
@@ -45,7 +45,7 @@ class Session(ABC):
 
     def __setstate__(self, state: dict) -> None:
         base_url_s = state.get("base_url")
-        self.base_url = URL.parse_any(base_url_s) if base_url_s else None
+        self.base_url = URL.parse(base_url_s) if base_url_s else None
         self.verify = bool(state.get("verify", True))
         self.waiting = state.get("waiting") or DEFAULT_WAITING_CONFIG
         self._lock = threading.RLock()
@@ -57,9 +57,9 @@ class Session(ABC):
         *,
         verify: bool = True,
         normalize: bool = True,
-        waiting: Optional[WaitingConfigArg] = True,
+        waiting: WaitingConfigArg = True,
     ):
-        url = URL.parse_any(url, normalize=normalize)
+        url = URL.parse(url, normalize=normalize)
 
         if url.scheme.startswith("http"):
             from .http_ import HTTPSession
@@ -79,7 +79,7 @@ class Session(ABC):
         *,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         cache: Optional["Table"] = None
     ) -> Response:
         raise NotImplementedError
@@ -91,7 +91,7 @@ class Session(ABC):
         *,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         cache: Optional["Table"] = None,
         pool: Optional[JobPoolExecutor | int] = None
     ):
@@ -109,9 +109,10 @@ class Session(ABC):
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "GET",
@@ -125,6 +126,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def post(
@@ -138,9 +140,10 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "POST",
@@ -155,6 +158,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def put(
@@ -168,9 +172,10 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "PUT",
@@ -185,6 +190,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def patch(
@@ -198,9 +204,10 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "PATCH",
@@ -215,6 +222,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def delete(
@@ -228,9 +236,10 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "DELETE",
@@ -245,6 +254,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def head(
@@ -257,9 +267,10 @@ class Session(ABC):
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
         stream: bool = False,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "HEAD",
@@ -273,6 +284,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     def options(
@@ -286,9 +298,10 @@ class Session(ABC):
         tags: Optional[Mapping[str, str]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        **kwargs
     ) -> Response:
         return self.request(
             "OPTIONS",
@@ -303,6 +316,7 @@ class Session(ABC):
             wait=wait,
             normalize=normalize,
             cache=cache,
+            **kwargs
         )
 
     # --- Request Orchestration ---
@@ -316,12 +330,13 @@ class Session(ABC):
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
+        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
         add_statistics: Optional[bool] = None,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         normalize: bool = True,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
     ) -> Response:
         if add_statistics is None:
             add_statistics = cache is not None
@@ -335,6 +350,7 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
+            before_send=before_send
         )
 
         return self.send(
@@ -349,11 +365,12 @@ class Session(ABC):
         self,
         method: str,
         url: Optional[Union[URL, str]] = None,
-        *,
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
+        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
+        *,
         json: Optional[Any] = None,
         normalize: bool = True,
         sniff: bool = True
@@ -366,7 +383,7 @@ class Session(ABC):
 
         # Apply params (merge with existing query)
         if params:
-            u = URL.parse_any(full_url, normalize=normalize)
+            u = URL.parse(full_url, normalize=normalize)
             items = list(u.query_items(keep_blank_values=True))
             items.extend((k, v) for k, v in params.items())
             full_url = u.with_query_items(tuple(items))
@@ -374,17 +391,26 @@ class Session(ABC):
         if sniff:
             if headers is None:
                 headers = {}
-                
+
             usr = UserInfo.current()
 
             if YGG_VERSION:
                 headers["X-YGG-Version"] = YGG_VERSION
+
+            if usr.product:
+                headers["X-YGG-Product"] = usr.product
+
+            if usr.product_version:
+                headers["X-YGG-Product-Version"] = usr.product_version
 
             if usr.email:
                 headers["X-YGG-User-Mail"] = usr.email
 
             if usr.hostname:
                 headers["X-YGG-User-Host"] = usr.hostname
+
+            if usr.git_url:
+                headers["X-YGG-Git-URL"] = usr.git_url.to_string()
 
         return PreparedRequest.prepare(
             method=method,
@@ -394,4 +420,5 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
+            before_send=before_send
         )

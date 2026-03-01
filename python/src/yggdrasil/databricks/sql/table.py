@@ -518,8 +518,7 @@ class Table(WorkspaceService):
         *,
         row_limit: Optional[int] = None,
         wait: WaitingConfigArg = True,
-        cache_for: Optional[WaitingConfigArg] = None,
-        arrow_schema: Optional[pa.Schema] = None
+        cache_for: WaitingConfigArg = None,
     ):
         return self.workspace.sql().execute(
             statement=statement,
@@ -528,7 +527,6 @@ class Table(WorkspaceService):
             cache_for=cache_for,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
-            arrow_schema=arrow_schema
         )
 
     def to_arrow_dataset(
@@ -537,7 +535,7 @@ class Table(WorkspaceService):
         filters: Optional[list[tuple[str, str, str]]] = None,
         row_limit: Optional[int] = None,
         wait: WaitingConfigArg = True,
-        cache_for: Optional[WaitingConfigArg] = None
+        cache_for: WaitingConfigArg = None
     ):
         statement = f"SELECT * FROM {self.full_name(safe=True)}"
 
@@ -557,9 +555,11 @@ class Table(WorkspaceService):
         data: Any,
         *,
         mode: SaveMode | str = None,
-        match_by: Optional[list[str]] = None
+        match_by: Optional[list[str]] = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True
     ):
-        mode = SaveMode.parse_any(mode, SaveMode.AUTO)
+        mode = SaveMode.parse(mode, SaveMode.AUTO)
         engine = self.workspace.sql()
 
         return engine.insert_into(
@@ -570,6 +570,8 @@ class Table(WorkspaceService):
             table_name=self.table_name,
             existing_schema=self.arrow_schema,
             match_by=match_by,
+            wait=wait,
+            raise_error=raise_error
         )
 
 

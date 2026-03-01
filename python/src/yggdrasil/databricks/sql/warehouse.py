@@ -15,7 +15,6 @@ from databricks.sdk.service.sql import (
     WarehouseAccessControlRequest, WarehousePermissionLevel
 )
 
-import yggdrasil.arrow as pa
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
@@ -199,7 +198,7 @@ class SQLWarehouse(WorkspaceService):
 
     def wait_for_status(
         self,
-        wait: Optional[WaitingConfigArg] = None
+        wait: WaitingConfigArg = None
     ):
         """
         Polls until not pending, using wait.sleep(iteration, start).
@@ -526,7 +525,7 @@ class SQLWarehouse(WorkspaceService):
         name: Optional[str] = None,
         *,
         permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         **warehouse_specs
     ):
         name = name or self.warehouse_name
@@ -571,7 +570,7 @@ class SQLWarehouse(WorkspaceService):
 
     def update(
         self,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
         **warehouse_specs
     ):
@@ -714,7 +713,7 @@ class SQLWarehouse(WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         wait: WaitingConfigArg = True,
-        arrow_schema: Optional[pa.Schema] = None
+        raise_error: bool = True,
     ) -> StatementResult:
         """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
 
@@ -788,7 +787,7 @@ class SQLWarehouse(WorkspaceService):
             execution
         )
 
-        return execution.wait(wait=wait)
+        return execution.wait(wait=wait, raise_error=raise_error)
 
 
 DEFAULT_ALL_PURPOSE_CLASSIC_NAME = "Yggdrasil All Purpose"

@@ -22,12 +22,13 @@ from databricks.sdk.errors import ResourceDoesNotExist, NotFound, InternalError
 from databricks.sdk.service.files import DirectoryEntry
 from databricks.sdk.service.iam import User, ComplexValue
 from databricks.sdk.service.workspace import ExportFormat, ObjectInfo
-
+from yggdrasil.dataclasses.expiring import ExpiringDict, Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.environ import UserInfo
+from yggdrasil.io.url import URL
+from yggdrasil.version import __version__ as YGGDRASIL_VERSION
+
 from .path import DatabricksPath, DatabricksPathKind
-from ...dataclasses.expiring import ExpiringDict, Expiring, RefreshResult
-from ...environ import UserInfo
-from ...version import __version__ as YGGDRASIL_VERSION
 
 if TYPE_CHECKING:
     from ..sql.engine import SQLEngine
@@ -37,7 +38,6 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "DBXWorkspace",
     "Workspace",
     "WorkspaceService",
 ]
@@ -157,6 +157,12 @@ class Workspace:
     # -------------------------
     # Python methods
     # -------------------------
+    def __str__(self):
+        return self.url.to_string()
+
+    def __repr__(self):
+        return f"Workspace(url={self.url.to_string()!r}, auth_type={self.auth_type!r})"
+
     def __getstate__(self) -> dict:
         """Serialize the workspace state for pickling.
 
@@ -340,8 +346,12 @@ class Workspace:
         if not instance.product:
             current_user = UserInfo.current()
 
-            instance.product = current_user.email or current_user.hostname or "yggdrasil"
-            instance.product_version = YGGDRASIL_VERSION
+            if current_user.product:
+                instance.product = current_user.product
+                instance.product_version = current_user.product_version
+            elif current_user.email:
+                instance.product = "yggdrasil"
+                instance.product_version = YGGDRASIL_VERSION
 
         # Build Config from config_dict if available, else from fields.
         kwargs = {
@@ -378,21 +388,14 @@ class Workspace:
         except ValueError as e:
             if "cannot configure default credentials" in str(e) and instance.auth_type is None:
                 last_error = e
+                auth_type = "runtime" if instance.is_in_databricks_environment() else "external-browser"
+                build_kwargs["auth_type"] = auth_type
 
-                if instance.is_in_databricks_environment():
-                    auth_types = ["runtime"]
-                else:
-                    auth_types = ["external-browser"]
-
-                for auth_type in auth_types:
-                    build_kwargs["auth_type"] = auth_type
-
-                    try:
-                        instance._sdk = WorkspaceClient(**build_kwargs)
-                        break
-                    except Exception as se:
-                        last_error = se
-                        build_kwargs.pop("auth_type")
+                try:
+                    instance._sdk = WorkspaceClient(**build_kwargs)
+                except Exception as se:
+                    last_error = se
+                    build_kwargs.pop("auth_type")
 
                 if instance._sdk is None:
                     if instance.is_in_databricks_environment() and instance._cached_token:
@@ -456,6 +459,10 @@ class Workspace:
             os.remove(local_cache)
 
     @property
+    def url(self) -> URL:
+        return URL.parse_str(self.sdk().config.host)
+
+    @property
     def safe_host(self):
         return self.sdk().config.host
 
@@ -501,15 +508,12 @@ class Workspace:
         try:
             found = self.sdk().current_user.me()
         except:
-            if self.auth_type == "runtime":
-                found = User(
-                    display_name="Databricks Runtime",
-                    user_name="databricks-runtime",
-                    name="Runtime",
-                    groups=[]
-                )
-            else:
-                raise
+            found = User(
+                display_name="Databricks Runtime",
+                user_name="runtime@%s" % self.url.host,
+                name="Databricks Runtime",
+                groups=[]
+            )
 
         if found is None:
             if self.auth_type == "external-browser":
@@ -1052,8 +1056,6 @@ class Workspace:
 # Workspace-bound base class
 # ---------------------------------------------------------------------------
 
-DBXWorkspace = Workspace
-
 
 @dataclass
 class WorkspaceService(ABC):
@@ -1128,15 +1130,6 @@ class WorkspaceService(ABC):
             The WorkspaceClient instance.
         """
         return self.workspace.sdk()
-
-    @property
-    def current_user(self):
-        """Return the current Databricks user.
-
-        Returns:
-            The current user object from the SDK.
-        """
-        return self.workspace.current_user
 
     def current_user_groups(
         self,

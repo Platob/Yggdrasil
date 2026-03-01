@@ -4,8 +4,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Union
 
-import urllib3
-
 __all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG"]
 
 
@@ -61,6 +59,8 @@ class WaitingConfig:
 
     @property
     def timeout_urllib3(self):
+        import urllib3
+
         if not self.timeout:
             return urllib3.Timeout(
                 total=None,
@@ -98,7 +98,7 @@ class WaitingConfig:
     @classmethod
     def check_arg(
         cls,
-        arg: Optional[WaitingConfigArg] = None,
+        arg: WaitingConfigArg = None,
         timeout: Optional[Union[int, float, dt.timedelta]] = None,
         interval: Optional[Union[int, float, dt.timedelta]] = None,
         backoff: Optional[Union[int, float, dt.timedelta]] = None,
@@ -196,9 +196,6 @@ class WaitingConfig:
             return False
 
         return time.time() - start > self.timeout_total_seconds
-
-    import math
-    import time
 
     def sleep(
         self,

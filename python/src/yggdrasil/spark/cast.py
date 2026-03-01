@@ -52,7 +52,7 @@ from yggdrasil.arrow.cast import (
 )
 from yggdrasil.arrow.python_defaults import default_arrow_scalar, default_python_scalar
 from yggdrasil.data.cast import CastOptions, CastOptionsArg, register_converter
-from yggdrasil.pyutils.serde import ObjectSerde
+from yggdrasil.pickle.serde import ObjectSerde
 from yggdrasil.spark.lib import pyspark_sql
 
 __all__ = [
@@ -90,31 +90,31 @@ ARROW_TO_SPARK: dict[pa.DataType, T.DataType] = {
     pa.null():    T.NullType(),
     pa.bool_():   T.BooleanType(),
 
-    pa.int8():    T.ByteType(),
-    pa.int16():   T.ShortType(),
-    pa.int32():   T.IntegerType(),
-    pa.int64():   T.LongType(),
-
     # Spark has no unsigned integer types; widen to the next signed type.
     pa.uint8():   T.ShortType(),
     pa.uint16():  T.IntegerType(),
     pa.uint32():  T.LongType(),
     pa.uint64():  T.LongType(),   # risk of overflow; DecimalType is safer
 
+    pa.int8():    T.ByteType(),
+    pa.int16():   T.ShortType(),
+    pa.int32():   T.IntegerType(),
+    pa.int64():   T.LongType(),
+
     pa.float16(): T.FloatType(),  # best-effort: Spark has no float16
     pa.float32(): T.FloatType(),
     pa.float64(): T.DoubleType(),
 
-    pa.string():  T.StringType(),
     getattr(pa, "string_view",  pa.string)():  T.StringType(),
     getattr(pa, "large_string", pa.string)():  T.StringType(),
+    pa.string():  T.StringType(),
 
-    pa.binary():  T.BinaryType(),
     getattr(pa, "binary_view",  pa.binary)():  T.BinaryType(),
     getattr(pa, "large_binary", pa.binary)():  T.BinaryType(),
+    pa.binary():  T.BinaryType(),
 
-    pa.date32():  T.DateType(),
     pa.date64():  T.DateType(),   # time-of-day component is silently dropped
+    pa.date32():  T.DateType(),
 
     # Canonical UTC microsecond timestamp maps to Spark TimestampType.
     pa.timestamp("us", "UTC"): T.TimestampType(),
@@ -238,7 +238,11 @@ def spark_type_to_arrow_type(
         TypeError: If no mapping exists for *spark_type*.
     """
     # Primitive fast path
-    arrow_type = SPARK_TO_ARROW.get(spark_type)
+    try:
+        arrow_type = SPARK_TO_ARROW.get(spark_type)
+    except TypeError:
+        arrow_type = None
+
     if arrow_type is not None:
         return arrow_type
 

@@ -20,10 +20,10 @@ from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
 from ...concurrent.threading import Job
 from ...dataclasses.expiring import ExpiringDict
-from ...environ import PyEnv, UserInfo
-from ...environ.modules import resolve_local_lib_path
-from ...io.url import URL
-from ...pyutils.exceptions import raise_parsed_traceback
+from yggdrasil.environ import PyEnv, UserInfo
+from yggdrasil.environ.modules import resolve_local_lib_path
+from yggdrasil.io.url import URL
+from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -260,6 +260,7 @@ class ExecutionContext:
 
         Args:
             language: The Databricks command language to use.
+            context_key: Constant string key value
             wait: Waiting config to update
 
         Returns:
@@ -395,7 +396,6 @@ class ExecutionContext:
         func: Optional[Callable] = None,
         command_id: Optional[str] = None,
         environ: Optional[Dict[str, str]] = None,
-        packages: list[str] | None = None,
         include_libs: bool = False
     ) -> "CommandExecution":
         context = self if context is None else context
@@ -437,7 +437,6 @@ if p.returncode != 0:
             command=command,
             func=func,
             environ=environ,
-            packages=packages,
         )
 
     def decorate(
@@ -447,7 +446,6 @@ if p.returncode != 0:
         language: Optional[Language] = None,
         command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
-        packages: list[str] | None = None
     ) -> Callable:
         language = Language.PYTHON if language is None else language
 
@@ -469,7 +467,6 @@ if p.returncode != 0:
                 command=cmd,
                 language=l,
                 environ=env,
-                packages=packages
             )
 
         if func is not None and callable(func):
@@ -755,23 +752,20 @@ p = run(cmd_all)
 if p.returncode == 0:
     print("[ok] installed all")
     sys.exit(0)
-
-print("[warn] bulk install failed, falling back to per-package installs")
-print(p.stderr.strip() or p.stdout.strip())
-
-# 2) per-item fallback (ignore errors)
-failed = []
-for it in items:
-    p2 = run(["uv","pip","install", it, "--update", "--target", str(tgt)])
-    if p2.returncode != 0:
-        failed.append(it)
-        msg = (p2.stderr.strip() or p2.stdout.strip())
-        print(f"[fail] {{it}} -> {{msg}}")
-
-if failed:
-    raise RuntimeError(f"Failed to install {{failed}}")
-print("[done] fallback complete. failed:", failed)
-sys.exit(0)
+else:
+    print("[warn] bulk install failed, falling back to per-package installs")
+    print(p.stderr.strip() or p.stdout.strip())
+    
+    # 2) per-item fallback (ignore errors)
+    failed = []
+    for it in items:
+        p2 = run(["uv","pip","install", it, "--update", "--target", str(tgt)])
+        if p2.returncode != 0:
+            failed.append(it)
+            msg = (p2.stderr.strip() or p2.stdout.strip())
+            print(f"[fail] {{it}} -> {{msg}}")
+    print("[done] fallback complete. failed:", failed)
+    sys.exit(0)
 """
             ).start().wait(wait=wait, raise_error=raise_error)
         else:
@@ -801,7 +795,7 @@ sys.exit(0)
         diffs = [
             "%s==%s" % (name, meta["current"])
             for name, meta in diffs.items()
-            if meta and meta["current"] and not name.startswith("ygg")
+            if meta and meta["current"] and _valid_install_package(name)
         ]
 
         if diffs:
@@ -814,6 +808,12 @@ sys.exit(0)
             self._requirements = None
 
         return self
+
+def _valid_install_package(name: str):
+    for prefix in ("pyspark", "pywin32"):
+        if name.startswith(prefix):
+            return False
+    return True
 
 def _decode_result(
     result: CommandStatusResponse,

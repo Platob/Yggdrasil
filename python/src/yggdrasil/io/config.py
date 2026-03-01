@@ -34,10 +34,10 @@ class BufferConfig:
         default temp directory is used (e.g. ``/tmp`` on Linux).
     """
 
-    spill_bytes: int = 128 * 1024 * 1024  # 128 MiB
+    spill_bytes: int = 128 * 1024 * 1024
+    keep_spilled_file: bool = False
     prefix: str = "tmp-"
     suffix: str = ".bin"
-    keep_spilled_file: bool = False
     tmp_dir: Optional["AbstractDataPath"] = None
 
     @classmethod
@@ -46,4 +46,10 @@ class BufferConfig:
         return DEFAULT_CONFIG
 
 
-DEFAULT_CONFIG = BufferConfig()
+DEFAULT_CONFIG = BufferConfig(
+    spill_bytes=128 * 1024 * 1024, # 128 MiB
+    prefix="tmp-",
+    suffix=".bin",
+    keep_spilled_file=False,
+    tmp_dir=None
+)

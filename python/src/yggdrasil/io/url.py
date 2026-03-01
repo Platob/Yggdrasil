@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping, Tuple, Union, Any, Literal
 from urllib.parse import (
     parse_qsl,
@@ -116,6 +117,63 @@ def _p(x: int | None) -> int:
     return x or _NO_PORT
 
 
+def _looks_like_local_path(raw: str) -> bool:
+    if not raw:
+        return False
+
+    s = raw.strip()
+
+    # If it has a scheme, it's not a local path.
+    # Note: urlsplit("C:\\x") sees scheme="c" sometimes if you don't normalize,
+    # so we handle Windows drive letters explicitly below.
+    sp = urlsplit(s)
+    if sp.scheme:
+        # Windows drive letter false-positive: "C:\x" -> scheme "c"
+        # Accept single-letter "scheme" followed by :\ or :/
+        if len(sp.scheme) == 1 and len(s) >= 3 and s[1] == ":" and s[2] in ("\\", "/"):
+            return True
+        return False
+
+    if s.startswith(("/", "~", "./", "../")):
+        return True
+    if "/" in s or "\\" in s:
+        return True
+    return False
+
+
+def _pathlike_to_file_parts(raw: str | Path) -> tuple[str, str]:
+    """
+    Return (scheme, path) for a local file target.
+    Path is absolute, forward-slash normalized.
+    """
+    p = raw if isinstance(raw, Path) else Path(raw)
+    p = p.expanduser().resolve(strict=False)
+
+    # Path on Windows: as_posix() yields 'C:/x' (good for URL path component)
+    return "file", p.as_posix()
+
+
+def _coerce_raw_to_file_url(raw: str) -> str | None:
+    """
+    If raw is a local path, return a canonical file:// URL string.
+    Otherwise return None.
+    """
+    if not _looks_like_local_path(raw):
+        return None
+
+    scheme, path = _pathlike_to_file_parts(raw)
+
+    # Build a proper file URL string (no netloc). Encoding is handled later by URL.to_string().
+    # Use urlunsplit so we get 'file:///abs/path' behavior with empty netloc.
+    # Note: urlunsplit wants path already with leading '/' for absolute paths.
+    # On Windows, path like 'C:/x' is not leading '/', but file URIs are 'file:///C:/x'.
+    # We fix that by prefixing '/' when it looks like a drive path.
+    if len(path) >= 2 and path[1] == ":":
+        path = "/" + path
+
+    return urlunsplit((scheme, "", path, "", ""))
+
+
 @dataclass(frozen=True, slots=True)
 class URL:
     scheme: str | None = None
@@ -126,8 +184,12 @@ class URL:
     query: str | None = None
     fragment: str | None = None
 
+    # caches (not part of repr/eq)
+    _str_enc: str | None = field(default=None, init=False, repr=False, compare=False)
+    _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
+
     @classmethod
-    def parse_any(
+    def parse(
         cls,
         obj: Any,
         *,
@@ -140,16 +202,32 @@ class URL:
         if isinstance(obj, dict):
             return cls.parse_dict(obj, decode=decode, normalize=normalize)
 
-        return cls.parse(raw=str(obj), decode=decode, normalize=normalize)
+        if isinstance(obj, Path):
+            scheme, path = _pathlike_to_file_parts(obj)
+            # We keep path unencoded; to_string(encode=True) will encode.
+            return cls.parse_dict(
+                {"scheme": scheme, "path": path},
+                decode=decode,
+                normalize=normalize,
+            )
+
+        return cls.parse_str(raw=str(obj), decode=decode, normalize=normalize)
 
     @classmethod
-    def parse(
+    def parse_str(
         cls,
         raw: str,
         *,
         decode: bool = False,
         normalize: bool = True,
     ) -> "URL":
+        # If it's a local path (or looks like one), coerce to file:// first.
+        # This avoids urlsplit weirdness (esp. Windows drive letters).
+        if normalize:
+            coerced = _coerce_raw_to_file_url(raw)
+            if coerced is not None:
+                raw = coerced
+
         sp = urlsplit(raw)
 
         scheme = sp.scheme or ""
@@ -174,6 +252,12 @@ class URL:
         host_n = _strip_trailing_dot(_lower_if(host))
         path_n = _normalize_path(path)
         port_n = _remove_default_port(scheme_n, host_n, port)
+
+        # Canonicalize file:// paths a bit:
+        # - ensure absolute Windows drive paths stay as /C:/...
+        if scheme_n == "file" and path_n:
+            if len(path_n) >= 2 and path_n[1] == ":":
+                path_n = "/" + path_n
 
         query_n = query
         if query_n:
@@ -204,7 +288,7 @@ class URL:
 
         raw = d.get("url") or d.get("raw")
         if raw is not None:
-            return cls.parse(str(raw), decode=decode, normalize=normalize)
+            return cls.parse_str(str(raw), decode=decode, normalize=normalize)
 
         scheme = str(d.get("scheme") or "")
         path = str(d.get("path") or "")
@@ -301,6 +385,16 @@ class URL:
         return bool(_s(self.scheme)) and bool(_s(self.host))
 
     def to_string(self, *, encode: bool = True) -> str:
+        # fast path
+        if encode:
+            cached = self._str_enc
+            if cached is not None:
+                return cached
+        else:
+            cached = self._str_raw
+            if cached is not None:
+                return cached
+
         scheme = _s(self.scheme)
         host = _s(self.host)
         userinfo = _s(self.userinfo)
@@ -329,7 +423,15 @@ class URL:
             if userinfo:
                 netloc = f"{userinfo}@{netloc}"
 
-        return urlunsplit((scheme, netloc, path, query, fragment))
+        s = urlunsplit((scheme, netloc, path, query, fragment))
+
+        # store
+        if encode:
+            object.__setattr__(self, "_str_enc", s)
+        else:
+            object.__setattr__(self, "_str_raw", s)
+
+        return s
 
     @property
     def authority(self) -> str:
@@ -354,7 +456,7 @@ class URL:
     def join(self, ref: Union[str, "URL"]) -> "URL":
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
-        return URL.parse(urljoin(base, target), normalize=True)
+        return URL.parse_str(urljoin(base, target), normalize=True)
 
     # Immutable edits (nullable in, nullable out)
     def with_scheme(self, scheme: str | None) -> "URL":
@@ -436,6 +538,27 @@ class URL:
         if not q:
             return ()
         return tuple(parse_qsl(q, keep_blank_values=keep_blank_values))
+
+    def add_query_item(self, key: str, value: str, replace: bool = True) -> "URL":
+        """
+        Return a new URL with query param `key` set to `value`.
+
+        - If `key` exists (possibly multiple times), all existing entries are removed.
+        - Then a single (`key`, `value`) is added.
+        - Keeps blank values.
+        - Normalizes to canonical form (sorted by (key, value)).
+        """
+        if key is None:
+            raise ValueError("key cannot be None")
+
+        k = str(key)
+        v = "" if value is None else str(value)
+
+        items = [(kk, vv) for (kk, vv) in self.query_items(keep_blank_values=True) if kk != k]
+        items.append((k, v))
+        items.sort(key=lambda kv: (kv[0], kv[1]))
+
+        return self.with_query(urlencode(items, doseq=True))
 
     def with_query_items(
         self,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import time
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Mapping, Union, Any, Literal, Iterator
+from typing import Optional, TYPE_CHECKING, Union, Literal, Iterator
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -22,12 +22,10 @@ import yggdrasil.arrow as pa
 from yggdrasil.concurrent.threading import JobPoolExecutor, Job
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from .response import HTTPResponse
-from ..buffer import BytesIO
 from ..enums import SaveMode
 from ..request import PreparedRequest
 from ..response import RESPONSE_ARROW_SCHEMA
 from ..session import Session
-from ..url import URL
 
 if TYPE_CHECKING:
     from ...databricks.sql.table import Table
@@ -88,43 +86,13 @@ class HTTPSession(Session):
         super().__setstate__(state)
         self._http_pool = self._build_pool()
 
-    def request(
-        self,
-        method: str,
-        url: Optional[Union[URL, str]] = None,
-        *,
-        params: Optional[Mapping[str, str]] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        body: Optional[Union[BytesIO, bytes]] = None,
-        tags: Optional[Mapping[str, str]] = None,
-        json: Optional[Any] = None,
-        stream: bool = True,
-        add_statistics: Optional[bool] = None,
-        wait: Optional[WaitingConfigArg] = None,
-        normalize: bool = True,
-        cache: Optional["Table"] = None
-    ) -> HTTPResponse:
-        if add_statistics is None:
-            add_statistics = cache is not None
-
-        request = self.prepare_request(
-            method=method,
-            url=url,
-            params=params,
-            headers=headers,
-            body=body,
-            tags=tags,
-            json=json,
-            normalize=normalize,
-        )
-
-        return self.send(
-            request=request,
-            add_statistics=add_statistics,
-            stream=stream,
-            wait=wait,
-            cache=cache
-        )
+    @property
+    def http_pool(self):
+        if self._http_pool is None:
+            with self._lock:
+                if self._http_pool is None:
+                    self._http_pool = self._build_pool()
+        return self._http_pool
 
     @staticmethod
     def _sql_match_clause(request: PreparedRequest):
@@ -149,7 +117,7 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
         *,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         raise_error: bool = True,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
@@ -185,7 +153,7 @@ where {self._sql_match_clause(anon)}"""
             if responses:
                 return responses[-1]
 
-        http_pool = self._http_pool
+        http_pool = self.http_pool
         wait_cfg = self.waiting if wait is None else WaitingConfig.check_arg(wait)
 
         start = time.time()
@@ -195,7 +163,7 @@ where {self._sql_match_clause(anon)}"""
 
         for iteration in range(num_tries):
             resp: BaseHTTPResponse | None = None
-            request.sent_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
+            request = request.prepare_to_send(add_statistics=add_statistics)
 
             try:
                 resp = http_pool.request(
@@ -245,6 +213,9 @@ where {self._sql_match_clause(anon)}"""
                 raise RuntimeError("Retry loop exited unexpectedly")
             return None
 
+        if raise_error:
+            result.raise_for_status()
+
         if cache is not None and result.ok:
             # insert
             batch = result.anonymize(mode=anonymize).to_arrow_batch(parse=False)
@@ -259,11 +230,12 @@ where {self._sql_match_clause(anon)}"""
         self,
         requests: Iterator[PreparedRequest],
         *,
-        wait: Optional[WaitingConfigArg] = None,
+        wait: WaitingConfigArg = None,
         raise_error: bool = True,
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         cache: Optional["Table"] = None,
+        wait_cache: WaitingConfigArg = False,
         ordered: bool = False,
         batch_size: Optional[int] = None,
         pool: Optional[JobPoolExecutor | int] = None,
@@ -397,11 +369,17 @@ where {self._sql_match_clause(anon)}"""
                         max_in_flight=max_in_flight,
                         cancel_on_exit=True,
                         shutdown_on_exit=False,  # pool is shared across batches
-                        raise_error=raise_error,
+                        raise_error=False,
                     ):
-                        if resp is not None and resp.ok:
-                            to_insert.append(resp)
-                        yield resp
+                        if resp is not None:
+                            if resp.ok:
+                                to_insert.append(resp)
+
+                            if raise_error:
+                                resp.raise_for_status()
+                                yield resp
+                            elif resp.ok:
+                                yield resp
 
                     # ── Bulk insert successful responses ─────────────────────────
                     if to_insert:
@@ -418,5 +396,6 @@ where {self._sql_match_clause(anon)}"""
                                 "request_url_path",
                                 "request_url_query",
                                 "request_body_hash",
-                            ]
+                            ],
+                            wait=wait_cache
                         )

@@ -24,19 +24,6 @@ _SENSITIVE_KEYS = {
     "x-xsrf-token",
     "x-amz-security-token",
     "x-amz-access-token",
-    "x-ygg-version",
-    "x-ygg-user-mail",
-    "x-ygg-user-host",
-}
-
-# Often sensitive, but sometimes useful. We’ll partially mask.
-_PARTIAL_KEYS = {
-    "user-agent",
-    "referer",
-    "origin",
-    "x-forwarded-for",
-    "forwarded",
-    "x-real-ip",
 }
 
 _BEARER_RE = re.compile(r"^\s*Bearer\s+(.+)\s*$", re.IGNORECASE)
@@ -144,20 +131,6 @@ def anonymize_headers(
 
             # Unknown auth scheme -> treat as sensitive
             _handle_sensitive_value(out_key, v)
-            continue
-
-        # Partially sensitive: mask a bit (IPs, full URLs, UA entropy)
-        if k_lc in _PARTIAL_KEYS:
-            # In remove mode, we still keep these but masked (useful for debugging).
-            # If you want these dropped too, add: `if mode == "remove": continue`
-            vv = _mask_ip_like(v)
-
-            if k_lc == "user-agent":
-                vv = vv[:60] + ("…" if len(vv) > 60 else "")
-            if k_lc in {"referer", "origin"}:
-                vv = vv.split("?", 1)[0]
-
-            _emit(out_key, vv)
             continue
 
         # Generic token-ish detection: redact/hash/remove

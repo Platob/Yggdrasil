@@ -46,7 +46,7 @@ from yggdrasil.arrow.cast import cast_arrow_tabular
 from yggdrasil.data.cast import CastOptions, CastOptionsArg
 from yggdrasil.io.enums import SaveMode
 from yggdrasil.io.enums.file_format import FileFormat
-from yggdrasil.pyutils.serde import ObjectSerde
+from yggdrasil.pickle.serde import ObjectSerde
 
 if TYPE_CHECKING:
     import pyarrow.dataset
@@ -330,7 +330,7 @@ class AbstractDataPath(ABC):
         allow_not_found:
             When ``True``, silently return *other* if the source is absent.
         """
-        mode = SaveMode.parse_any(mode)
+        mode = SaveMode.parse(mode)
 
         if not isinstance(other, AbstractDataPath):
             from .local import LocalDataPath
@@ -384,7 +384,7 @@ class AbstractDataPath(ABC):
         FileExistsError
             If ``SaveMode.ERROR_IF_EXISTS`` and *other* already exists.
         """
-        mode = SaveMode.parse_any(mode)
+        mode = SaveMode.parse(mode)
 
         if not self.exists():
             if allow_not_found:
@@ -453,7 +453,7 @@ class AbstractDataPath(ABC):
             Number of worker threads (``int``) or an existing executor.
             ``None`` runs copies sequentially in the calling thread.
         """
-        mode = SaveMode.parse_any(mode)
+        mode = SaveMode.parse(mode)
 
         if not self.exists():
             if allow_not_found:
@@ -895,7 +895,9 @@ class AbstractDataPath(ABC):
     def write_table(
         self,
         table: Union[
-            pa.Table, pa.RecordBatch, "polars.DataFrame", "pandas.DataFrame", Any
+            pa.Table, pa.RecordBatch,
+            "polars.DataFrame", "pandas.DataFrame",
+            Any
         ],
         file_format: Union[FileFormat, str, None] = None,
         mode: Union[SaveMode, str, None] = None,
@@ -1040,7 +1042,7 @@ class AbstractDataPath(ABC):
         batch_size:
             Maximum rows per part-file (default: 1 048 576).
         """
-        mode = SaveMode.parse_any(mode)
+        mode = SaveMode.parse(mode)
         fmt = self.check_file_format_arg(file_format)
         table = cast_arrow_tabular(table, cast_options)
 
@@ -1311,7 +1313,7 @@ class AbstractDataPath(ABC):
         """
         from ...polars.cast import cast_polars_dataframe
 
-        mode = SaveMode.parse_any(mode)
+        mode = SaveMode.parse(mode)
         fmt = self.check_file_format_arg(file_format)
 
         if cast_options is not None:

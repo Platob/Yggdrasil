@@ -1,64 +1,31 @@
 # yggdrasil/io/enums/codec.py
-"""Compression codec detection, compression, and decompression from magic bytes.
-
-This module provides :class:`Codec`, an enum whose members represent the
-compression codecs supported by the yggdrasil I/O layer.  Each member exposes
-a symmetric compress / decompress API that operates on either raw :class:`bytes`
-or seekable binary streams (:class:`~yggdrasil.pyutils.dynamic_buffer.BytesIO`
-/ :class:`io.BytesIO`).
-
-Supported codecs
-----------------
-+----------+------------------------------------------+------------+
-| Member   | Magic bytes                              | Dependency |
-+==========+==========================================+============+
-| GZIP     | ``\\x1f\\x8b``                           | stdlib     |
-| ZSTD     | ``\\x28\\xb5\\x2f\\xfd``                 | zstandard  |
-| LZ4      | ``\\x04\\x22\\x4d\\x18`` /               | lz4        |
-|          | ``\\x02\\x21\\x4c\\x18``                 |            |
-| BZIP2    | ``BZh``                                  | stdlib     |
-| XZ       | ``\\xfd7zXZ\\x00``                       | stdlib     |
-| SNAPPY   | ``\\xff\\x06\\x00\\x00sNaPpY``           | cramjam    |
-+----------+------------------------------------------+------------+
-
-Third-party dependencies (``zstandard``, ``lz4``, ``cramjam``) are imported
-lazily and installed automatically at runtime via
-:func:`~yggdrasil.environ.runtime_import_module` if they are not already
-present in the active environment.
-
-Typical usage
--------------
-Detection::
-
-    codec = Codec.from_io(stream)          # None if uncompressed
-    codec = Codec.from_bytes(raw_bytes)
-
-Compression / decompression (stream API)::
-
-    compressed_buf = Codec.ZSTD.compress(my_bytesio)
-    decompressed_buf = Codec.ZSTD.open(compressed_bytesio)
-
-Compression / decompression (bytes API)::
-
-    blob = Codec.ZSTD.compress_bytes(raw)
-    raw  = Codec.ZSTD.decompress_bytes(blob)
-
-Conditional helpers (codec may be ``None``)::
-
-    out = Codec.compress_with(raw, user_codec)    # passthrough when None
-    out = Codec.decompress_with(blob, user_codec)
-"""
-
 from __future__ import annotations
 
+import abc
 import importlib
-from enum import Enum
-from typing import IO, TYPE_CHECKING
+from typing import IO, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..buffer import BytesIO
+    from .mime_type import MimeType
 
-__all__ = ["Codec", "_peek", "_peek_buf"]
+__all__ = [
+    "Codec",
+    "detect",
+    "detect_bytes",
+    "GZIP",
+    "ZSTD",
+    "LZ4",
+    "BZIP2",
+    "XZ",
+    "SNAPPY",
+    "BROTLI",
+    "ZLIB",
+    "LZMA",
+    "_drain",
+]
+
+_CHUNK = 256 * 1024  # 256 KiB streaming chunk size
 
 
 # ---------------------------------------------------------------------------
@@ -66,27 +33,6 @@ __all__ = ["Codec", "_peek", "_peek_buf"]
 # ---------------------------------------------------------------------------
 
 def _runtime_import(module_name: str, pip_name: str):
-    """Import *module_name*, installing *pip_name* on first-time miss.
-
-    Uses :func:`importlib.import_module` as the hot path (no exception on
-    cache hit) and delegates to
-    :func:`~yggdrasil.environ.runtime_import_module` only when the package is
-    genuinely absent.
-
-    Parameters
-    ----------
-    module_name:
-        Fully qualified module name passed to :func:`importlib.import_module`
-        (e.g. ``"lz4.frame"``).
-    pip_name:
-        PyPI distribution name used for the ``pip install`` fallback
-        (e.g. ``"lz4"``).
-
-    Returns
-    -------
-    types.ModuleType
-        The imported module.
-    """
     try:
         return importlib.import_module(module_name)
     except ImportError:
@@ -98,69 +44,8 @@ def _runtime_import(module_name: str, pip_name: str):
         )
 
 
-def _peek(src: IO[bytes], n: int) -> bytes:
-    """Read up to *n* bytes from *src* at its current position, then seek back.
-
-    The caller's cursor is always restored, even when fewer than *n* bytes are
-    available (short stream, EOF, etc.).
-
-    Parameters
-    ----------
-    src:
-        Any seekable binary stream.
-    n:
-        Maximum number of bytes to read.
-
-    Returns
-    -------
-    bytes
-        Between 0 and *n* bytes starting at the original cursor position.
-    """
-    pos = src.tell()
-    try:
-        return src.read(n)
-    finally:
-        src.seek(pos)
-
-
-def _peek_buf(buf: "BytesIO", n: int) -> bytes:
-    """Cursor-safe peek for a :class:`~dynamic_buffer.BytesIO` instance.
-
-    Delegates to :func:`_peek` on the underlying :meth:`~BytesIO.buffer`.
-
-    Parameters
-    ----------
-    buf:
-        A :class:`~yggdrasil.pyutils.dynamic_buffer.BytesIO` instance.
-    n:
-        Maximum number of bytes to read.
-
-    Returns
-    -------
-    bytes
-        Between 0 and *n* bytes starting at the current cursor position.
-    """
-    return _peek(buf.buffer(), n)
-
-
-def _drain(src: "IO[bytes] | BytesIO") -> bytes:
-    """Read the entire contents of *src* from its current position.
-
-    Works for both plain :class:`io.BytesIO` and yggdrasil
-    :class:`~dynamic_buffer.BytesIO` (duck-typed via ``.buffer()``).  The
-    caller's cursor position is **preserved**.
-
-    Parameters
-    ----------
-    src:
-        Any seekable binary stream or :class:`~dynamic_buffer.BytesIO`.
-
-    Returns
-    -------
-    bytes
-        All bytes from the current position to EOF.
-    """
-    fh: IO[bytes] = src.buffer() if hasattr(src, "buffer") else src  # type: ignore[union-attr]
+def _drain(fh: "IO[bytes]") -> bytes:
+    """Read all remaining bytes from *fh*, cursor preserved."""
     pos = fh.tell()
     try:
         return fh.read()
@@ -168,403 +53,511 @@ def _drain(src: "IO[bytes] | BytesIO") -> bytes:
         fh.seek(pos)
 
 
-# ---------------------------------------------------------------------------
-# Codec
-# ---------------------------------------------------------------------------
-
-class Codec(str, Enum):
-    """Compression codec with symmetric compress / decompress operations.
-
-    Each member's value is a canonical lowercase string usable as a file
-    extension or protocol label (e.g. ``"zstd"``, ``"gzip"``).
-
-    The class exposes four levels of API, ordered from highest to lowest
-    abstraction:
-
-    1. **Stream API** — :meth:`compress` / :meth:`open`
-       Accept and return :class:`~dynamic_buffer.BytesIO` instances.
-       Cursor positions are preserved on both input and output.
-
-    2. **Bytes API** — :meth:`compress_bytes` / :meth:`decompress_bytes`
-       Accept and return plain :class:`bytes`.  No I/O overhead.
-
-    3. **Conditional classmethods** — :meth:`compress_with` / :meth:`decompress_with`
-       Accept an ``Optional[Codec]`` and pass data through unchanged when the
-       codec is ``None``.  Ideal for configurable pipelines.
-
-    4. **Detection classmethods** — :meth:`from_io` / :meth:`from_bytes`
-       Infer the codec from magic bytes without consuming the stream.
-
-    Members
-    -------
-    GZIP   : stdlib ``gzip``
-    ZSTD   : ``zstandard`` (auto-installed)
-    LZ4    : ``lz4`` (auto-installed)
-    BZIP2  : stdlib ``bz2``
-    XZ     : stdlib ``lzma``
-    SNAPPY : ``cramjam`` (auto-installed) — framed format only
+def _peek_from_start(fh: "IO[bytes]", n: int) -> bytes:
     """
+    Read n bytes from fh starting at offset 0, and restore cursor.
 
-    GZIP   = "gzip"
-    ZSTD   = "zstd"
-    LZ4    = "lz4"
-    BZIP2  = "bzip2"
-    XZ     = "xz"
-    SNAPPY = "snappy"
+    This is the behavior we want for sniff/detect APIs: independent of current cursor.
+    """
+    pos = fh.tell()
+    try:
+        fh.seek(0)
+        return fh.read(n)
+    finally:
+        fh.seek(pos)
 
-    # Populated after the class body; defined here for type-checker visibility.
-    _MAGIC: "list[tuple[bytes, Codec]]"
 
-    # ------------------------------------------------------------------
-    # Detection
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_io(cls, src: "IO[bytes] | BytesIO") -> "Codec | None":
-        """Detect the compression codec by inspecting *src*'s magic bytes.
-
-        Reads up to 16 bytes from the current cursor position without
-        consuming the stream (cursor is always restored).
-
-        Parameters
-        ----------
-        src:
-            Any seekable binary stream or
-            :class:`~dynamic_buffer.BytesIO` instance.
-
-        Returns
-        -------
-        Codec | None
-            The matched :class:`Codec`, or ``None`` when no known magic
-            sequence is present (uncompressed or unknown format).
-
-        Examples
-        --------
-        >>> import io
-        >>> Codec.from_io(io.BytesIO(b"\\x1f\\x8b" + b"\\x00" * 20))
-        <Codec.GZIP: 'gzip'>
-        >>> Codec.from_io(io.BytesIO(b"PAR1")) is None
-        True
-        """
-        # Duck-type .buffer() to avoid a circular import (BytesIO imports Codec).
-        fh: IO[bytes] = src.buffer() if hasattr(src, "buffer") else src  # type: ignore[union-attr]
-        header = _peek(fh, 16)
-        for magic, codec in cls._MAGIC:
-            if header[: len(magic)] == magic:
-                return codec
+def _codec_from_mime(mt: "MimeType | None") -> "Codec | None":
+    if mt is None or not mt.is_codec:
         return None
+    return _CODEC_BY_MIME.get(mt)
 
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "Codec | None":
-        """Detect the compression codec from a raw *data* bytes object.
 
-        No I/O involved; operates purely on the leading bytes of *data*.
+# ---------------------------------------------------------------------------
+# Abstract base class
+# ---------------------------------------------------------------------------
 
-        Parameters
-        ----------
-        data:
-            Bytes whose leading bytes may contain a compression magic
-            sequence.
+class Codec(abc.ABC):
+    """Abstract compression codec."""
 
-        Returns
-        -------
-        Codec | None
-            The matched :class:`Codec`, or ``None`` for uncompressed data.
+    @property
+    @abc.abstractmethod
+    def name(self) -> str: ...
 
-        Examples
-        --------
-        >>> import gzip
-        >>> Codec.from_bytes(gzip.compress(b"hello"))
-        <Codec.GZIP: 'gzip'>
-        >>> Codec.from_bytes(b"PAR1") is None
-        True
-        """
-        for magic, codec in cls._MAGIC:
-            if data[: len(magic)] == magic:
-                return codec
-        return None
+    @property
+    @abc.abstractmethod
+    def mime_type(self) -> "MimeType": ...
+
+    @property
+    def extensions(self) -> list[str]:
+        return list(self.mime_type.extensions)
+
+    @property
+    def extension(self) -> str:
+        return self.mime_type.extension
+
+    @abc.abstractmethod
+    def compress_bytes(self, data: bytes) -> bytes: ...
+
+    @abc.abstractmethod
+    def decompress_bytes(self, data: bytes) -> bytes: ...
 
     # ------------------------------------------------------------------
-    # Stream API  (BytesIO ↔ BytesIO)
+    # Streaming API (default: bytes round-trip)
     # ------------------------------------------------------------------
 
     def compress(self, src: "IO[bytes] | BytesIO") -> "BytesIO":
-        """Compress *src* with this codec and return a new seekable buffer.
+        from ..buffer.bytes_io import BytesIO
 
-        The caller's cursor on *src* is **preserved**.  The returned buffer
-        is positioned at offset 0 and fully supports random access.
-
-        Parameters
-        ----------
-        src:
-            Seekable binary stream or :class:`~dynamic_buffer.BytesIO`
-            holding uncompressed data.
-
-        Returns
-        -------
-        BytesIO
-            A seekable buffer containing the compressed payload.
-
-        Examples
-        --------
-        >>> import io
-        >>> buf = io.BytesIO(b"TTF front-month price series" * 500)
-        >>> out = Codec.ZSTD.compress(buf)
-        >>> Codec.from_io(out)
-        <Codec.ZSTD: 'zstd'>
-        >>> out.tell()
-        0
-        """
-        from ..buffer import BytesIO as _BytesIO
-        result = _BytesIO(self.compress_bytes(_drain(src)))
-        result.seek(0)
-        return result
+        fh = BytesIO.parse(src)
+        saved = fh.tell()
+        try:
+            fh.seek(0)
+            out = BytesIO(self.compress_bytes(_drain(fh)))
+            out.seek(0)
+            return out  # type: ignore[return-value]
+        finally:
+            fh.seek(saved)
 
     def open(self, src: "IO[bytes] | BytesIO") -> "BytesIO":
-        """Decompress *src* with this codec and return a new seekable buffer.
+        from ..buffer.bytes_io import BytesIO
 
-        The caller's cursor on *src* is **preserved**.  The returned buffer
-        is positioned at offset 0 and fully supports random access.
-
-        Parameters
-        ----------
-        src:
-            Seekable binary stream or :class:`~dynamic_buffer.BytesIO`
-            holding compressed data produced by this codec.
-
-        Returns
-        -------
-        BytesIO
-            A seekable buffer containing the decompressed payload.
-
-        Raises
-        ------
-        ValueError
-            If *self* is not a recognised codec (future-proofing for
-            subclasses / dynamic enum extension).
-
-        Examples
-        --------
-        >>> import io, gzip
-        >>> compressed = io.BytesIO(gzip.compress(b"Brent prompt close"))
-        >>> buf = Codec.GZIP.open(compressed)
-        >>> buf.read()
-        b'Brent prompt close'
-        >>> buf.seek(0); buf.read(5)
-        b'Brent'
-        """
-        from ..buffer import BytesIO as _BytesIO
-        result = _BytesIO(self.decompress_bytes(_drain(src)))
-        result.seek(0)
-        return result
-
-    # ------------------------------------------------------------------
-    # Bytes API  (bytes ↔ bytes)
-    # ------------------------------------------------------------------
-
-    def compress_bytes(self, data: bytes) -> bytes:
-        """Compress *data* with this codec and return the compressed bytes.
-
-        No I/O or cursor management.  Use :meth:`compress` when working with
-        streams.
-
-        Parameters
-        ----------
-        data:
-            Raw uncompressed bytes.
-
-        Returns
-        -------
-        bytes
-            Compressed payload whose leading magic bytes identify this codec.
-
-        Examples
-        --------
-        >>> payload = b"Henry Hub daily settle" * 2000
-        >>> blob = Codec.LZ4.compress_bytes(payload)
-        >>> Codec.from_bytes(blob)
-        <Codec.LZ4: 'lz4'>
-        >>> len(blob) < len(payload)
-        True
-        """
-        match self:
-            case Codec.GZIP:
-                import gzip
-                return gzip.compress(data)
-            case Codec.ZSTD:
-                return _runtime_import("zstandard", "zstandard").ZstdCompressor().compress(data)
-            case Codec.LZ4:
-                return _runtime_import("lz4.frame", "lz4").compress(data)
-            case Codec.BZIP2:
-                import bz2
-                return bz2.compress(data)
-            case Codec.XZ:
-                import lzma
-                return lzma.compress(data)
-            case Codec.SNAPPY:
-                return bytes(_runtime_import("cramjam", "cramjam").snappy.compress(data))
-            case _:
-                raise ValueError(f"compress_bytes: unhandled codec {self!r}")
-
-    def decompress_bytes(self, data: bytes) -> bytes:
-        """Decompress *data* with this codec and return the raw bytes.
-
-        No I/O or cursor management.  Use :meth:`open` when working with
-        streams.
-
-        Parameters
-        ----------
-        data:
-            Compressed bytes produced by this codec.
-
-        Returns
-        -------
-        bytes
-            Decompressed payload.
-
-        Examples
-        --------
-        >>> raw = b"WTI calendar spread"
-        >>> Codec.BZIP2.decompress_bytes(Codec.BZIP2.compress_bytes(raw)) == raw
-        True
-        """
-        match self:
-            case Codec.GZIP:
-                import gzip
-                return gzip.decompress(data)
-            case Codec.ZSTD:
-                return _runtime_import("zstandard", "zstandard").ZstdDecompressor().decompress(data)
-            case Codec.LZ4:
-                return _runtime_import("lz4.frame", "lz4").decompress(data)
-            case Codec.BZIP2:
-                import bz2
-                return bz2.decompress(data)
-            case Codec.XZ:
-                import lzma
-                return lzma.decompress(data)
-            case Codec.SNAPPY:
-                return bytes(_runtime_import("cramjam", "cramjam").snappy.decompress(data))
-            case _:
-                raise ValueError(f"decompress_bytes: unhandled codec {self!r}")
-
-    # ------------------------------------------------------------------
-    # Conditional classmethods  (Optional[Codec] passthrough)
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def compress_with(
-        cls,
-        data: bytes,
-        codec: "Codec | str | None",
-    ) -> bytes:
-        """Compress *data* with *codec*, or return it unchanged when *codec* is ``None``.
-
-        Eliminates boilerplate ``if codec: ... else: data`` branches in
-        configurable serialisation pipelines.
-
-        Parameters
-        ----------
-        data:
-            Raw uncompressed bytes.
-        codec:
-            A :class:`Codec` member, its string value (e.g. ``"zstd"``), or
-            ``None`` to pass through without modification.
-
-        Returns
-        -------
-        bytes
-
-        Examples
-        --------
-        >>> Codec.compress_with(b"raw", None) == b"raw"
-        True
-        >>> Codec.compress_with(b"raw", "gzip") == Codec.GZIP.compress_bytes(b"raw")
-        True
-        """
-        if codec is None:
-            return data
-        if isinstance(codec, str):
-            codec = cls(codec)
-        return codec.compress_bytes(data)
-
-    @classmethod
-    def decompress_with(
-        cls,
-        data: bytes,
-        codec: "Codec | str | None",
-    ) -> bytes:
-        """Decompress *data* with *codec*, or return it unchanged when *codec* is ``None``.
-
-        Symmetric counterpart to :meth:`compress_with` for encode / decode
-        pipelines that share the same ``Optional[Codec]`` configuration value.
-
-        Parameters
-        ----------
-        data:
-            Compressed bytes, or raw bytes when *codec* is ``None``.
-        codec:
-            A :class:`Codec` member, its string value, or ``None``.
-
-        Returns
-        -------
-        bytes
-
-        Examples
-        --------
-        >>> raw = b"nat gas prompt settle"
-        >>> Codec.decompress_with(Codec.compress_with(raw, "zstd"), "zstd") == raw
-        True
-        >>> Codec.decompress_with(raw, None) == raw
-        True
-        """
-        if codec is None:
-            return data
-        if isinstance(codec, str):
-            codec = cls(codec)
-        return codec.decompress_bytes(data)
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
+        fh = BytesIO.parse(src)
+        saved = fh.tell()
+        try:
+            fh.seek(0)
+            out = BytesIO(self.decompress_bytes(_drain(fh)))
+            out.seek(0)
+            return out  # type: ignore[return-value]
+        finally:
+            fh.seek(saved)
 
     def roundtrip(self, data: bytes) -> bool:
-        """Verify compress → decompress identity for *data*.
-
-        Useful in tests and startup probes to confirm a runtime-installed
-        library produces a lossless round-trip before trusting it with real
-        tick or settlement data.
-
-        Parameters
-        ----------
-        data:
-            Arbitrary bytes to compress and decompress.
-
-        Returns
-        -------
-        bool
-            ``True`` iff ``decompress(compress(data)) == data``.
-
-        Examples
-        --------
-        >>> Codec.ZSTD.roundtrip(b"Brent ICE close" * 1000)
-        True
-        """
         return self.decompress_bytes(self.compress_bytes(data)) == data
 
+    # ------------------------------------------------------------------
+    # Partial uncompressed read (head/tail)
+    # ------------------------------------------------------------------
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        """Return a streaming decompressor over fh (fh positioned at stream start)."""
+        return None
+
+    def read_start_end(
+        self,
+        src: "IO[bytes] | BytesIO | bytes | bytearray | memoryview",
+        *,
+        n_start: int = 64,
+        n_end: int = 64,
+        chunk_size: int = _CHUNK,
+    ) -> tuple[bytes, bytes]:
+        if n_start < 0 or n_end < 0:
+            raise ValueError("n_start and n_end must be >= 0")
+
+        is_bytes = isinstance(src, (bytes, bytearray, memoryview))
+        if is_bytes:
+            import io as _io
+            fh: IO[bytes] = _io.BytesIO(bytes(src))
+            saved = 0
+        else:
+            fh = BytesIO.wrap(src)
+            saved = fh.tell()
+
+        reader: IO[bytes] | None = None
+        try:
+            # critical fix: always decode from start of compressed stream
+            fh.seek(0)
+
+            reader = self._open_decompress_reader(fh)
+            if reader is None:
+                data = self.decompress_bytes(_drain(fh))
+                return data[:n_start], (data[-n_end:] if n_end else b"")
+
+            start = bytearray()
+            tail = bytearray()
+
+            while True:
+                chunk = reader.read(chunk_size)
+                if not chunk:
+                    break
+
+                if n_start and len(start) < n_start:
+                    need = n_start - len(start)
+                    start += chunk[:need]
+
+                if n_end:
+                    tail += chunk
+                    if len(tail) > n_end:
+                        del tail[:-n_end]
+
+            return bytes(start), (bytes(tail) if n_end else b"")
+        finally:
+            try:
+                if reader is not None:
+                    reader.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if not is_bytes:
+                fh.seek(saved)
+
+    # ------------------------------------------------------------------
+    # Lookup
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def parse(cls, obj: Any, default: "Codec | None" = None) -> "Codec | None":
+        if isinstance(obj, cls):
+            return obj
+
+        if obj is None:
+            return default
+
+        from .mime_type import MimeType as _MimeType
+
+        if isinstance(obj, str):
+            mt = _MimeType.parse_str(obj, default=None)
+            hit = _codec_from_mime(mt)
+            if hit is not None:
+                return hit
+            return _CODEC_BY_NAME.get(obj.strip().lower(), default)
+
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return detect_bytes(obj) or default
+
+        if hasattr(obj, "read"):
+            return detect(obj) or default
+
+        return default
+
+    @classmethod
+    def from_mime(cls, mime: "MimeType | str") -> "Codec | None":
+        from .mime_type import MimeType as _MimeType
+        mt = mime if isinstance(mime, _MimeType) else _MimeType.parse_str(mime)
+        return _codec_from_mime(mt)
+
+    @classmethod
+    def all(cls) -> list["Codec"]:
+        return list(_ALL_CODECS)
+
+    def __repr__(self) -> str:
+        return f"<Codec:{self.name}>"
+
 
 # ---------------------------------------------------------------------------
-# Magic-byte table
+# Concrete implementations
 # ---------------------------------------------------------------------------
-# Populated after the class body so all Codec members are available.
-# Entries are sorted longest-first so more-specific prefixes win over shorter
-# ones (e.g. XZ's 6-byte magic beats GZIP's 2-byte magic on any prefix clash).
 
-Codec._MAGIC = [
-    (b"\xfd7zXZ\x00",           Codec.XZ),      # 6 bytes — most specific
-    (b"\xff\x06\x00\x00sNaPpY", Codec.SNAPPY),  # 10 bytes framed
-    (b"\x28\xb5\x2f\xfd",       Codec.ZSTD),    # 4 bytes
-    (b"\x04\x22\x4d\x18",       Codec.LZ4),     # LZ4 frame magic v1
-    (b"\x02\x21\x4c\x18",       Codec.LZ4),     # LZ4 frame magic v0
-    (b"\x1f\x8b",               Codec.GZIP),    # 2 bytes
-    (b"BZh",                    Codec.BZIP2),   # 3 bytes
-]
+class _GzipCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "gzip"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.GZIP
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        import gzip
+        return gzip.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        import gzip
+        return gzip.decompress(data)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        import gzip
+        return gzip.GzipFile(fileobj=fh, mode="rb")
+
+
+class _ZstdCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "zstd"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.ZSTD
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        zstd = _runtime_import("zstandard", "zstandard")
+        return zstd.ZstdCompressor().compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        zstd = _runtime_import("zstandard", "zstandard")
+        return zstd.ZstdDecompressor().decompress(data)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        zstd = _runtime_import("zstandard", "zstandard")
+        return zstd.ZstdDecompressor().stream_reader(fh, closefd=False)
+
+
+class _Lz4Codec(Codec):
+    @property
+    def name(self) -> str:
+        return "lz4"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.LZ4
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        lz4 = _runtime_import("lz4.frame", "lz4")
+        return lz4.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        lz4 = _runtime_import("lz4.frame", "lz4")
+        return lz4.decompress(data)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        lz4 = _runtime_import("lz4.frame", "lz4")
+        return lz4.open(fh, mode="rb")
+
+
+class _Bzip2Codec(Codec):
+    @property
+    def name(self) -> str:
+        return "bzip2"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.BZ2
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        import bz2
+        return bz2.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        import bz2
+        return bz2.decompress(data)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        import bz2
+        return bz2.BZ2File(fh, mode="rb")
+
+
+class _XzCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "xz"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.XZ
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        import lzma
+        return lzma.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        import lzma
+        return lzma.decompress(data)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        import lzma
+        return lzma.LZMAFile(fh, mode="rb")
+
+
+class _SnappyCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "snappy"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.SNAPPY
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        cj = _runtime_import("cramjam", "cramjam")
+        return bytes(cj.snappy.compress(data))
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        cj = _runtime_import("cramjam", "cramjam")
+        return bytes(cj.snappy.decompress(data))
+    # no streaming reader; base read_start_end falls back (but now from start)
+
+
+class _BrotliCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "brotli"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.BROTLI
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        brotli = _runtime_import("brotli", "brotli")
+        return brotli.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        brotli = _runtime_import("brotli", "brotli")
+        return brotli.decompress(data)
+    # no streaming reader; base read_start_end falls back (but now from start)
+
+
+class _ZlibCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "zlib"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.ZLIB
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        import zlib
+        return zlib.compress(data)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        import zlib
+        return zlib.decompress(data)
+
+    def read_start_end(
+        self,
+        src: "IO[bytes] | BytesIO | bytes | bytearray | memoryview",
+        *,
+        n_start: int = 64,
+        n_end: int = 64,
+        chunk_size: int = _CHUNK,
+    ) -> tuple[bytes, bytes]:
+        import zlib
+        import io as _io
+
+        if n_start < 0 or n_end < 0:
+            raise ValueError("n_start and n_end must be >= 0")
+
+        is_bytes = isinstance(src, (bytes, bytearray, memoryview))
+        if is_bytes:
+            fh: IO[bytes] = _io.BytesIO(bytes(src))
+            saved = 0
+        else:
+            fh = BytesIO.wrap(src)
+            saved = fh.tell()
+
+        try:
+            # critical fix: always decode from start of compressed stream
+            fh.seek(0)
+
+            decomp = zlib.decompressobj()
+            start = bytearray()
+            tail = bytearray()
+
+            while True:
+                comp = fh.read(chunk_size)
+                if not comp:
+                    break
+
+                out = decomp.decompress(comp)
+                if out:
+                    if n_start and len(start) < n_start:
+                        need = n_start - len(start)
+                        start += out[:need]
+
+                    if n_end:
+                        tail += out
+                        if len(tail) > n_end:
+                            del tail[:-n_end]
+
+            out = decomp.flush()
+            if out:
+                if n_start and len(start) < n_start:
+                    need = n_start - len(start)
+                    start += out[:need]
+                if n_end:
+                    tail += out
+                    if len(tail) > n_end:
+                        del tail[:-n_end]
+
+            return bytes(start), (bytes(tail) if n_end else b"")
+        finally:
+            if not is_bytes:
+                fh.seek(saved)
+
+
+class _LzmaCodec(Codec):
+    @property
+    def name(self) -> str:
+        return "lzma"
+
+    @property
+    def mime_type(self) -> "MimeType":
+        from .mime_type import MimeType
+        return MimeType.LZMA
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        import lzma
+        return lzma.compress(data, format=lzma.FORMAT_ALONE)
+
+    def decompress_bytes(self, data: bytes) -> bytes:
+        import lzma
+        return lzma.decompress(data, format=lzma.FORMAT_ALONE)
+
+    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        import lzma
+        return lzma.LZMAFile(fh, mode="rb", format=lzma.FORMAT_ALONE)
+
+
+# ---------------------------------------------------------------------------
+# Singletons + maps
+# ---------------------------------------------------------------------------
+
+GZIP: Codec = _GzipCodec()
+ZSTD: Codec = _ZstdCodec()
+LZ4: Codec = _Lz4Codec()
+BZIP2: Codec = _Bzip2Codec()
+XZ: Codec = _XzCodec()
+SNAPPY: Codec = _SnappyCodec()
+BROTLI: Codec = _BrotliCodec()
+ZLIB: Codec = _ZlibCodec()
+LZMA: Codec = _LzmaCodec()
+
+_ALL_CODECS: list[Codec] = [GZIP, ZSTD, LZ4, BZIP2, XZ, SNAPPY, BROTLI, ZLIB, LZMA]
+_CODEC_BY_NAME: dict[str, Codec] = {c.name: c for c in _ALL_CODECS}
+
+
+def _build_codec_by_mime() -> dict["MimeType", Codec]:
+    from .mime_type import MimeType as _MimeType
+
+    out: dict[_MimeType, Codec] = {}
+    for c in _ALL_CODECS:
+        mt = c.mime_type
+        out[mt] = c
+
+        by_value = _MimeType.get(mt.value)
+        if by_value is not None:
+            out[by_value] = c
+    return out
+
+
+_CODEC_BY_MIME = _build_codec_by_mime()
+
+
+# ---------------------------------------------------------------------------
+# Detection helpers
+# ---------------------------------------------------------------------------
+
+def detect(src: "IO[bytes] | BytesIO") -> "Codec | None":
+    """
+    Detect codec from magic bytes of *src*.
+    Detection is independent of current cursor; cursor is preserved.
+    """
+    from ..buffer.bytes_io import BytesIO
+    from .mime_type import MimeType
+
+    fh = BytesIO.wrap(src)
+    header = fh.head(64)
+    return _codec_from_mime(MimeType.parse_magic(header))
+
+
+def detect_bytes(b: bytes) -> "Codec | None":
+    """Detect codec from leading bytes of *b*."""
+    from .mime_type import MimeType
+    return _codec_from_mime(MimeType.parse_magic(b))

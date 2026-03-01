@@ -45,9 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+
 from .system_command import SystemCommand
 from .userinfo import UserInfo
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 __all__ = [
     "runtime_import_module",
@@ -932,10 +933,9 @@ class PyEnv:
         if str(self.python_path) == sys.executable:
             try:
                 import uv
+                self._uv_bin = uv.find_uv_bin()
             except ImportError:
-                uv = self.import_module("uv", install=True)
-
-            self._uv_bin = uv.find_uv_bin()
+                self._uv_bin = shutil.which("uv")
         else:
             # Auto-install uv using the plain pip fallback to avoid recursion
             self._uv_bin = shutil.which("uv")
@@ -1078,9 +1078,7 @@ class PyEnv:
             uv = [_ for _ in packages if _.startswith("uv")]
 
             if uv:
-                subprocess.run([str(self.python_path), "-m", "pip", "install", "uv"], check=True, timeout=30)
-
-                self._uv_bin = None
+                self._uv_bin = self.uv_path
 
                 packages = [_ for _ in packages if not _.startswith("uv")]
 
@@ -1395,6 +1393,7 @@ class PyEnv:
         install: bool = True,
         pip_name: str | None = None,
         upgrade: bool = False,
+        warn: bool = True
     ):
         """
         Class-level convenience wrapper for :meth:`import_module`.
@@ -1424,6 +1423,7 @@ class PyEnv:
             install=install,
             pip_name=pip_name,
             upgrade=upgrade,
+            warn=warn
         )
 
     def import_module(
@@ -1434,6 +1434,7 @@ class PyEnv:
         install: bool = True,
         pip_name: str | None = None,
         upgrade: bool = False,
+        warn: bool = False
     ):
         """
         Import a module into the current interpreter, installing it if missing.
@@ -1489,6 +1490,13 @@ class PyEnv:
 
         pip_name = pip_name or safe_pip_name(module_name)
 
+        if warn:
+            print(
+                f"Auto-installing '{pip_name}' into environment {self.python_path} "
+                f"because module '{module_name}' was not found. "
+                "Set install=False or warn=False to suppress this behaviour.",
+                file=sys.stderr,
+            )
         self.install(pip_name, wait=wait, raise_error=True)
 
         importlib.invalidate_caches()
@@ -1630,6 +1638,7 @@ def runtime_import_module(
     install: bool = True,
     pip_name: str | None = None,
     upgrade: bool = False,
+    warn: bool = True
 ):
     """
     Class-level convenience wrapper for :meth:`import_module`.
@@ -1659,4 +1668,5 @@ def runtime_import_module(
         install=install,
         pip_name=pip_name,
         upgrade=upgrade,
+        warn=warn
     )

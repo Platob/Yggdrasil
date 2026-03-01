@@ -31,6 +31,7 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 import pyarrow as pa
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import Disposition
+
 from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.cast.registry import convert
@@ -38,8 +39,6 @@ from yggdrasil.data.engine import SQLEngine as BaseSQLEngine
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
-
-from .exceptions import SqlStatementError
 from .statement_result import StatementResult
 from .table import Table
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
@@ -347,7 +346,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         if catalog_name and schema_name:
             for table in client.list_tables(catalog_name, schema_name):
                 session.register_schema(
-                    alias=table.safe_full_name(),
+                    alias=table.full_name(safe=True),
                     schema=table.arrow_schema
                 )
 
@@ -365,12 +364,12 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         wait: WaitingConfigArg = True,
+        raise_error: bool = True,
         engine: Optional[Literal["spark", "api"]] = None,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         byte_limit: Optional[int] = None,
-        cache_for: Optional[WaitingConfigArg] = None,
-        arrow_schema: Optional[pa.Schema] = None
+        cache_for: WaitingConfigArg = None,
     ) -> StatementResult:
         """
         Execute a SQL statement using either Spark SQL or the Databricks SQL Statement Execution API.
@@ -467,8 +466,8 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 wait=wait,
+                raise_error=raise_error,
                 row_limit=row_limit,
-                arrow_schema=arrow_schema
             )
 
         if cache_for is not None:
@@ -515,7 +514,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         try:
             from delta.tables import DeltaTable
         except ImportError:
-            from ...environ import PyEnv
+            from yggdrasil.environ import PyEnv
 
             m = PyEnv.runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
             DeltaTable = m.DeltaTable
@@ -581,6 +580,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
+        raise_error: bool = True,
         ## Databricks specific
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
@@ -674,6 +674,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 overwrite_schema=overwrite_schema,
                 match_by=match_by,
                 wait=wait,
+                raise_error=raise_error,
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
@@ -704,6 +705,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
+        raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
@@ -818,7 +820,10 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                             connected.drop_table(location=location, wait=True)
                         except Exception as e:
                             logger.exception("Failed to drop table %s after auto creation error: %s", location, e)
-                        raise
+
+                        if raise_error:
+                            raise
+                        return None
 
             cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
 
@@ -842,7 +847,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 cast_options=cast_options,
             )
 
-            mode = SaveMode.parse_any(mode, default=SaveMode.AUTO)
+            mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
             columns = list(existing_schema.names)
             cols_quoted = ", ".join([_quote_ident(c) for c in columns])
@@ -920,7 +925,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
 
             try:
                 for stmt in statements:
-                    connected.execute(stmt, wait=wait)
+                    connected.execute(stmt, wait=wait, raise_error=raise_error)
             finally:
                 try:
                     Thread(target=temp_volume_path.remove, kwargs={"recursive": True}).start()
@@ -1062,7 +1067,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
             logger.debug("Filtered null keys for match_by=%s", match_by)
 
         target = self.spark_table(full_name=location)
-        mode = SaveMode.parse_any(mode, default=SaveMode.AUTO)
+        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
         if match_by:
             cond = " AND ".join([f"t.{_quote_ident(k)} <=> s.{_quote_ident(k)}" for k in match_by])

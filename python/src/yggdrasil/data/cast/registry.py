@@ -33,7 +33,7 @@ from typing import (
 
 import pyarrow as pa
 
-from ...pyutils.serde import ObjectSerde
+from yggdrasil.pickle.serde import ObjectSerde
 
 if TYPE_CHECKING:
     from .options import CastOptions

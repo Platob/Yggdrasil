@@ -2,18 +2,19 @@
 
 import dataclasses
 from inspect import isclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-import pyarrow as pa
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 __all__ = [
     "dataclass_to_arrow_field"
 ]
 
-DATACLASS_ARROW_FIELD_CACHE: dict[type, pa.Field] = {}
+DATACLASS_ARROW_FIELD_CACHE: dict[type, "pa.Field"] = {}
 
 
-def dataclass_to_arrow_field(cls_or_instance: Any) -> pa.Field:
+def dataclass_to_arrow_field(cls_or_instance: Any) -> "pa.Field":
     """Return a cached Arrow Field describing the dataclass type.
 
     Args:

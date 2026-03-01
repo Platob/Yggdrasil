@@ -1,1 +1,1 @@
-from .bytes_io import *
+from .bytes_io import BytesIO

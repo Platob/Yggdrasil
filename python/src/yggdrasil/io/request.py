@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json as json_module
+import time
 from dataclasses import dataclass, replace
-from typing import Mapping, Any, Optional, MutableMapping, Literal
+from typing import Mapping, Any, Optional, MutableMapping, Literal, Callable
 
-import pyarrow as pa
-
+from yggdrasil.arrow.lib import pyarrow as pa
+from yggdrasil.io.enums.media_type import MimeType
 from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .url import URL
@@ -128,6 +129,56 @@ class PreparedRequest:
     tags: Optional[Mapping[str, str]]
     sent_at_timestamp: int = 0  # time.time_ns() // 1000
 
+    before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None
+
+    def copy(
+        self,
+        *,
+        method: Optional[str] = None,
+        url: URL | str | None = None,
+        headers: Optional[Mapping[str, str]] = None,
+        buffer: Optional[BytesIO] = ...,
+        tags: Optional[Mapping[str, str]] = None,
+        sent_at_timestamp: Optional[int] = None,
+        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
+        normalize: bool = True,
+        copy_buffer: bool = False,
+    ) -> "PreparedRequest":
+        """
+        Copy this PreparedRequest with optional overrides.
+
+        Notes:
+        - headers are copied into a new dict (safe to mutate).
+        - url override is parsed/normalized by default.
+        - buffer default is "keep as-is". Pass buffer=None to drop it.
+        - copy_buffer=True forces a deep copy of BytesIO content.
+        - before_send default is "keep as-is". Pass before_send=None to remove it.
+        """
+        new_url = self.url if url is None else URL.parse(url, normalize=normalize)
+
+        new_headers = dict(self.headers) if self.headers else {}
+        if headers is not None:
+            new_headers = {str(k): str(v) for k, v in headers.items()}
+
+        if buffer is ...:
+            new_buf = self.buffer
+            if copy_buffer and new_buf is not None:
+                new_buf = BytesIO.parse(new_buf.to_bytes())
+        else:
+            new_buf = buffer
+
+        new_before_send = self.before_send if before_send is ... else before_send
+
+        return self.__class__(
+            method=self.method if method is None else str(method),
+            url=new_url,
+            headers=new_headers,
+            buffer=new_buf,
+            tags=self.tags if tags is None else tags,
+            sent_at_timestamp=self.sent_at_timestamp if sent_at_timestamp is None else int(sent_at_timestamp),
+            before_send=new_before_send,
+        )
+
     @classmethod
     def prepare(
         cls,
@@ -136,23 +187,24 @@ class PreparedRequest:
         headers: Optional[MutableMapping[str, str]] = None,
         body: Optional[Any] = None,
         tags: Optional[Mapping[str, str]] = None,
+        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True,
     ) -> "PreparedRequest":
-        url = URL.parse_any(url, normalize=normalize)
+        url = URL.parse(url, normalize=normalize)
 
         if body is not None:
-            body = BytesIO.parse_any(obj=body)
+            body = BytesIO.parse(body)
         elif json is not None:
             body = BytesIO()
             json_module.dump(json, body)
             body.seek(0)
 
             if not headers:
-                headers = {"Content-Type": "application/json"}
+                headers = {"Content-Type": MimeType.JSON.value}
             else:
-                headers["Content-Type"] = "application/json"
+                headers["Content-Type"] = MimeType.JSON.value
 
         if not headers:
             headers = {}
@@ -161,10 +213,27 @@ class PreparedRequest:
             headers["Content-Length"] = body.size
 
         return cls(
-            method=method, url=url, headers=headers, buffer=body,
+            method=method,
+            url=url,
+            headers=headers,
+            buffer=body,
             tags=tags,
-            sent_at_timestamp=0
+            sent_at_timestamp=0,
+            before_send=before_send
         )
+
+    def prepare_to_send(
+        self,
+        add_statistics: bool
+    ):
+        if self.before_send is not None:
+            instance = self.before_send(self)
+        else:
+            instance = self
+
+        instance.sent_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
+
+        return instance
 
     @classmethod
     def parse_any(
@@ -283,7 +352,7 @@ class PreparedRequest:
             else:
                 raise ValueError("PreparedRequest.parse_dict: missing url")
 
-        url = URL.parse_any(url_obj, normalize=normalize)
+        url = URL.parse(url_obj, normalize=normalize)
 
         # headers
         headers_obj = d.get("headers") or d.get("header") or d.get("hdrs") or {}
@@ -302,7 +371,7 @@ class PreparedRequest:
 
         buffer: Optional[BytesIO] = None
         if body_obj is not None:
-            buffer = BytesIO.parse_any(obj=body_obj)
+            buffer = BytesIO.parse(obj=body_obj)
 
         # sent_at timestamp (ns)
         sent_at = (

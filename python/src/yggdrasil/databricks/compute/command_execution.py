@@ -9,18 +9,16 @@ from dataclasses import dataclass, field
 from json import JSONDecodeError
 from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Iterable, Union, Generator, Iterator
 
-import dill
-import pyarrow
 from databricks.sdk.errors import InternalError
 from databricks.sdk.service.compute import (
     Language, CommandExecutionAPI, CommandStatusResponse, CommandStatus, ResultType
 )
-
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from .exceptions import ClientTerminatedSession
-from ...environ import PyEnv
-from ...io.url import URL
-from ...pyutils.exceptions import raise_parsed_traceback
+from yggdrasil.environ import PyEnv
+from yggdrasil.io.url import URL
+from yggdrasil.pyutils.exceptions import raise_parsed_traceback
+
+from .exceptions import ClientTerminatedSession, CommandExecutionError
 
 DONE_STATES = {
     CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
@@ -128,6 +126,8 @@ class CommandExecution:
 
             return self._pyfunc(*args, **kwargs)
 
+        import yggdrasil.pickle.dill as pkl
+
         assert self.command, "Cannot call %s, missing command" % self
 
         if self.environ:
@@ -146,8 +146,8 @@ class CommandExecution:
             environ=env_blob
         )
 
-        args_blob = dill.dumps([temp.encode_object(_) for _ in args])
-        kwargs_blob = dill.dumps({k: temp.encode_object(v) for k, v in kwargs.items()})
+        args_blob = pkl.dumps([temp.encode_object(_) for _ in args])
+        kwargs_blob = pkl.dumps({k: temp.encode_object(v) for k, v in kwargs.items()})
 
         args_b64 = base64.b64encode(args_blob).decode("ascii")
         kwargs_b64 = base64.b64encode(kwargs_blob).decode("ascii")
@@ -196,7 +196,6 @@ class CommandExecution:
         language: Optional[Language] = None,
         command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
-        packages: list[str] | None = None
     ):
         context = self.context if context is None else context
         command = self.command if command is None else command
@@ -218,7 +217,6 @@ class CommandExecution:
             if callable(func):
                 command = self.make_python_function_command(
                     func=func,
-                    packages=packages
                 )
 
         if language is None:
@@ -449,8 +447,10 @@ class CommandExecution:
         """
         buffer = io.BytesIO()
 
-        from ...polars.lib import polars
-        from ...pandas.lib import pandas
+        from yggdrasil.arrow.lib import pyarrow
+        from yggdrasil.polars.lib import polars
+        from yggdrasil.pandas.lib import pandas
+        import yggdrasil.pickle.dill as pkl
 
         if isinstance(obj, pyarrow.Table):
             import pyarrow.parquet as pq
@@ -536,7 +536,7 @@ class CommandExecution:
                 ]
             })
 
-        dill.dump(obj, buffer, byref=byref, recurse=recurse)
+        pkl.dump(obj, buffer, byref=byref, protocol=5)
 
         raw = buffer.getvalue()
 
@@ -600,6 +600,8 @@ class CommandExecution:
             The reconstructed Python object, or *payload* unchanged if it does
             not match any known envelope schema.
         """
+        import yggdrasil.pickle.dill as pkl
+
         if isinstance(payload, (str, bytes)):
             try:
                 payload = json.loads(payload)
@@ -625,7 +627,7 @@ class CommandExecution:
                         import gzip
                         blob = gzip.decompress(blob)
 
-                    return dill.loads(blob)
+                    return pkl.loads(blob)
 
                 elif func.startswith("pyarrow."):
                     import pyarrow.parquet as pq
@@ -693,46 +695,78 @@ class CommandExecution:
         tag: str = "__CALL_RESULT__",
         byref: Any = None,
         recurse: Any = None,
-        packages: list[str] | None = None,
     ) -> str:
+        """
+        Build a remote Python snippet that:
+          - loads a CommandExecution proxy
+          - loads args/kwargs
+          - decodes the function payload + args/kwargs payloads
+          - executes
+          - ALWAYS prints a tagged payload (success or error)
+          - restores environment variables afterwards
+
+        Notes:
+          - protocol=5 for perf + modern compatibility
+          - strongly prefer byref=True for cross Python minor stability
+        """
+        import yggdrasil.pickle.dill as pkl
+
         proxy = CommandExecution(
             context=self.context,
             language=self.language,
             environ=self.environ,
         )
 
-        command_b64: str = base64.b64encode(dill.dumps(proxy)).decode("ascii")
+        # Keep pickle protocol explicit and stable
+        b = pkl.dumps(
+            proxy,
+            byref=True
+        )
+        command_b64: str = base64.b64encode(b).decode("ascii")
+
         serialized_func: str = self.encode_object(
-            func, byte_limit=64 * 1024, byref=byref, recurse=recurse
+            func,
+            byte_limit=64 * 1024,
+            byref=True,
+            recurse=False,
         )
 
         syspath_lines = self.context.syspath_lines()
 
-        inner_code = "\n".join([
-            "import base64, dill",
-            f"command = dill.loads(base64.b64decode({command_b64!r}.encode('ascii')))",
-            "args    = dill.loads(base64.b64decode(__ARGS__.encode('ascii')))",
-            "kwargs  = dill.loads(base64.b64decode(__KWARGS__.encode('ascii')))",
-            f"f  = command.decode_payload({serialized_func!r}, temporary=False)",
-            "a  = [command.decode_payload(x) for x in args]",
-            "kw = {k: command.decode_payload(v) for k, v in kwargs.items()}",
-            "r  = f(*a, **kw)",
-            f"print({tag!r} + command.encode_object(r))",
-        ])
-
         cmd = f"""\
 {syspath_lines}
 
-import base64, dill, os
+import base64
+import yggdrasil.pickle.dill as dill
+import os
+import traceback
 
-env = __ENVIRON__
-if env:
-    for k, v in env.items():
-        os.environ[k] = v
+# --- decode proxy and inputs ---
+_cmd = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
+_args = dill.loads(base64.b64decode(__ARGS__.encode("ascii")))
+_kwargs = dill.loads(base64.b64decode(__KWARGS__.encode("ascii")))
+_env = __ENVIRON__ or {{}}
+_old_env = {{}}
+for _k, _v in _env.items():
+    _old_env[_k] = os.environ.get(_k)
+    os.environ[_k] = _v
 
-{inner_code}
+try:
+    _f = _cmd.decode_payload({serialized_func!r}, temporary=False)
+    _a = [_cmd.decode_payload(x) for x in _args]
+    _kw = {{k: _cmd.decode_payload(v) for k, v in _kwargs.items()}}
+    _r = _f(*_a, **_kw)
+    _out = _cmd.encode_object(_r)
+    print({tag!r} + _out, flush=True)
+
+finally:
+    # --- restore environment ---
+    for _k, _prev in _old_env.items():
+        if _prev is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _prev
 """
-
         return cmd
 
     def decode_response(
@@ -835,7 +869,7 @@ if env:
                 )
                 self.context.check_with_env(
                     env=PyEnv.current(),
-                    wait=WaitingConfig(timeout=60),
+                    wait=WaitingConfig(timeout=480),
                     raise_error=False
                 )
                 # installed_modules.add(module_name)
@@ -866,4 +900,6 @@ def raise_error_from_response(
             if language == Language.PYTHON:
                 raise_parsed_traceback(message)
 
-            raise RuntimeError(str(response))
+            raise CommandExecutionError(
+                message=str(response)
+            )

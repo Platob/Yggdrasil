@@ -53,32 +53,6 @@ def _detect_content_type(headers: Mapping[str, str]) -> str | None:
     return None
 
 
-def _content_type_family(ct: str | None) -> str:
-    """Map a bare content-type string to a broad parsing family."""
-    if not ct:
-        return "unknown"
-    if ct == "application/json" or ct.endswith("+json"):
-        return "json"
-    if ct in (
-        "application/x-ndjson",
-        "application/jsonlines",
-        "application/x-jsonlines",
-        "text/x-ndjson",
-    ):
-        return "ndjson"
-    if ct in ("text/csv", "application/csv", "text/tab-separated-values"):
-        return "csv"
-    if ct == "text/plain":
-        return "text"
-    if ct in (
-        "application/vnd.apache.arrow.stream",
-        "application/vnd.apache.arrow.file",
-        "application/x-arrow",
-    ):
-        return "arrow"
-    return "unknown"
-
-
 # ---------------------------------------------------------------------------
 # Arrow schemas
 # ---------------------------------------------------------------------------
@@ -319,7 +293,7 @@ class Response:
             or d.get("content")
             or d.get("data")
         )
-        buffer = BytesIO.parse_any(obj=body_obj) if body_obj is not None else BytesIO()
+        buffer = BytesIO.parse(obj=body_obj) if body_obj is not None else BytesIO()
 
         ts_obj = (
             d.get("received_at_timestamp")
@@ -347,24 +321,24 @@ class Response:
     # Core properties
     # ------------------------------------------------------------------
     @property
-    def content_type(self):
+    def media_type(self):
         hdr = self.headers.get("Content-Type")
 
         if hdr:
-            return MediaType.parse_mime(hdr)
+            return MediaType.parse_str(hdr)
 
-        mt = self.buffer.content_type
+        mt = self.buffer.media_type
 
         if not self.headers:
             self.headers = {}
 
-        self.headers["Content-Type"] = mt.full_mime
+        self.headers["Content-Type"] = mt.full_mime_type().value
 
         return mt
 
     @property
     def codec(self):
-        return self.content_type.codec
+        return self.media_type.codec
 
     @property
     def content(self) -> bytes:
@@ -441,10 +415,8 @@ class Response:
         from yggdrasil.polars.lib import polars as pl
 
         if parse:
-            return self.buffer.read_polars(
-                content_type=self.content_type,
-                lazy=lazy
-            )
+            mio = self.buffer.media_io(media=self.media_type)
+            return mio.read_polars_frame(lazy=lazy)
 
         return pl.from_arrow(self.to_arrow_batch(parse=False))
 
@@ -539,7 +511,7 @@ class Response:
                 headers      = _headers_from_map(cols["response_headers"][i].as_py()) if "response_headers" in cols else {}
                 tags         = _headers_from_map(cols["response_tags"][i].as_py())    if "response_tags"    in cols else {}
                 body_bytes   = cols["response_body"][i].as_py()                       if "response_body"    in cols else None
-                buffer       = BytesIO.parse_any(obj=body_bytes) if body_bytes is not None else BytesIO()
+                buffer       = BytesIO.parse(obj=body_bytes) if body_bytes is not None else BytesIO()
                 received_at  = _arrow_ts_col_to_us(cols["response_received_at"], i)  if "response_received_at" in cols else 0
 
                 yield cls(
