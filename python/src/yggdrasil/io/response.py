@@ -508,6 +508,12 @@ class Response:
             for rb in obj.to_batches():
                 yield rb
 
+        def _first_present(cols: Mapping[str, Any], i: int, *names: str) -> Any:
+            for n in names:
+                if n in cols:
+                    return cols[n][i].as_py()
+            return None
+
         req_cols: Sequence[str] = [f.name for f in REQUEST_ARROW_SCHEMA]
         resp_cols: Sequence[str] = [f.name for f in ARROW_SCHEMA]
 
@@ -517,13 +523,58 @@ class Response:
                 for name in list(req_cols) + list(resp_cols)
                 if name in rb.schema.names
             }
+
             for i in range(rb.num_rows):
+                # -----------------------------
+                # Request (new flattened schema)
+                # -----------------------------
+                method = _first_present(cols, i, "request_method") or "GET"
+
+                # Prefer full deterministic string first
+                url_str = _first_present(cols, i, "request_url_str")
+                if url_str not in (None, ""):
+                    url_str_out: str | None = str(url_str)
+                    url_out: Any | None = None
+                else:
+                    # Rebuild from exploded columns if present
+                    scheme = _first_present(cols, i, "request_url_scheme")
+                    userinfo = _first_present(cols, i, "request_url_userinfo")
+                    host = _first_present(cols, i, "request_url_host")
+                    port = _first_present(cols, i, "request_url_port")
+                    path = _first_present(cols, i, "request_url_path")
+                    query = _first_present(cols, i, "request_url_query")
+                    fragment = _first_present(cols, i, "request_url_fragment")
+
+                    has_exploded = any(
+                        x not in (None, "", 0)
+                        for x in (scheme, userinfo, host, port, path, query, fragment)
+                    )
+
+                    if has_exploded:
+                        url_str_out = None
+                        url_out = {
+                            "scheme": scheme or "",
+                            "userinfo": userinfo or "",
+                            "host": host or "",
+                            "port": 0 if port in (None, "") else int(port),
+                            "path": path or "",
+                            "query": query or "",
+                            "fragment": fragment or "",
+                        }
+                    else:
+                        # Legacy support: older schema had request_url struct
+                        legacy_struct = _first_present(cols, i, "request_url")
+                        url_str_out = None
+                        url_out = legacy_struct if isinstance(legacy_struct, Mapping) else ""
+
                 req_d: dict[str, Any] = {
-                    "method": cols["request_method"][i].as_py() if "request_method" in cols else "GET",
-                    "url":    cols["request_url"][i].as_py()    if "request_url"    in cols else "",
-                    "headers": _headers_from_map(cols["request_headers"][i].as_py()) if "request_headers" in cols else {},
-                    "tags":    _headers_from_map(cols["request_tags"][i].as_py())    if "request_tags"    in cols else {},
-                    "buffer":  cols["request_body"][i].as_py()                       if "request_body"    in cols else None,
+                    "method": method,
+                    # PreparedRequest.parse_dict prefers url_str if present, else url struct/dict
+                    "url_str": url_str_out,
+                    "url": url_out,
+                    "headers": _headers_from_map(_first_present(cols, i, "request_headers") or {}),
+                    "tags": _headers_from_map(_first_present(cols, i, "request_tags") or {}),
+                    "buffer": _first_present(cols, i, "request_body"),
                     "sent_at_timestamp": (
                         _arrow_ts_col_to_us(cols["request_sent_at"], i)
                         if "request_sent_at" in cols else 0
@@ -531,12 +582,18 @@ class Response:
                 }
                 request = PreparedRequest.parse_dict(req_d, normalize=normalize)
 
-                status_code  = int(cols["response_status_code"][i].as_py()) if "response_status_code" in cols else 0
-                headers      = _headers_from_map(cols["response_headers"][i].as_py()) if "response_headers" in cols else {}
-                tags         = _headers_from_map(cols["response_tags"][i].as_py())    if "response_tags"    in cols else {}
-                body_bytes   = cols["response_body"][i].as_py()                       if "response_body"    in cols else None
-                buffer       = BytesIO.parse(obj=body_bytes) if body_bytes is not None else BytesIO()
-                received_at  = _arrow_ts_col_to_us(cols["response_received_at"], i)  if "response_received_at" in cols else 0
+                # -----------------------------
+                # Response
+                # -----------------------------
+                status_code = int(_first_present(cols, i, "response_status_code") or 0)
+                headers = _headers_from_map(_first_present(cols, i, "response_headers") or {})
+                tags = _headers_from_map(_first_present(cols, i, "response_tags") or {})
+                body_bytes = _first_present(cols, i, "response_body")
+                buffer = BytesIO.parse(obj=body_bytes) if body_bytes is not None else BytesIO()
+                received_at = (
+                    _arrow_ts_col_to_us(cols["response_received_at"], i)
+                    if "response_received_at" in cols else 0
+                )
 
                 yield cls(
                     request=request,
