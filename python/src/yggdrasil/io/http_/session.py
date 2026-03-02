@@ -260,7 +260,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
             cache.insert(
                 batch,
                 mode=SaveMode.AUTO,
-                match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash"]
+                match_by=["request_url.host", "request_url.path", "request_url.query", "request_body_hash"]
             )
         return result
 
