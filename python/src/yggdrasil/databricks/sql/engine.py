@@ -29,7 +29,7 @@ from threading import Thread
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import NotFound
 from databricks.sdk.service.sql import Disposition
 
 from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
@@ -779,8 +779,8 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                         schema_name=schema_name,
                         table_name=table_name,
                     ).arrow_schema
-                except ResourceDoesNotExist as exc:
-                    if isinstance(data, (list, dict)):
+                except NotFound as exc:
+                    if not hasattr(data, "columns") and not hasattr(data, "schema"):
                         from ...polars.cast import any_to_polars_dataframe
 
                         data = any_to_polars_dataframe(data, cast_options)
@@ -1047,11 +1047,10 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
                 schema_name=schema_name,
                 table_name=table_name,
             ).arrow_field
-        except ValueError:
-            logger.warning("Destination table missing; creating table %s via overwrite write", location)
+        except NotFound:
             data_df = convert(data, DataFrame)
             data_df.write.mode("overwrite").options(**spark_options).saveAsTable(location)
-            return
+            return None
 
         cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
         data_df = any_to_spark_dataframe(data, cast_options)

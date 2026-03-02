@@ -80,10 +80,8 @@ class Table(WorkspaceService):
     def infos(self) -> TableInfo:
         if self._infos is not None:
             return self._infos
-        try:
-            self._infos = self.workspace.sdk().tables.get(self.full_name())
-        except Exception as e:
-            raise ResourceDoesNotExist(f"Table {self.full_name()} not found") from e
+
+        self._infos = self.workspace.sdk().tables.get(self.full_name())
         return self._infos
 
     def find_table(
