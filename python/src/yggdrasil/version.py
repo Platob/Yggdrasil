@@ -26,5 +26,5 @@ class VersionInfo(NamedTuple):
 
 
 # module-level constant (PEP 440-ish / semver-ish hybrid)
-__version_info__ = VersionInfo(0, 4, 0)
+__version_info__ = VersionInfo(0, 4, 1)
 __version__ = str(__version_info__)

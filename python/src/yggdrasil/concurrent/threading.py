@@ -82,7 +82,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         return self.submit_job(job)
 
     @classmethod
-    def parse_any(
+    def parse(
         cls,
         obj: Any,
         *,

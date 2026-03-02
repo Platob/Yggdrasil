@@ -341,8 +341,8 @@ class Cluster(WorkspaceService):
 
         if not name:
             if not python_version:
-                major, minor, _ = PyEnv.current().version_info
-                python_version = f"{major}.{minor}"
+                vinfo = PyEnv.current().version_info
+                python_version = f"{vinfo.major}.{vinfo.minor}"
             name = f"Yggdrasil {YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor} All Purpose py{python_version}"
 
         ALL_PURPOSE_CLUSTER = self.find_cluster(cluster_name=name, raise_error=False)
@@ -770,8 +770,8 @@ class Cluster(WorkspaceService):
 
         if not context_key:
             usr, env = UserInfo.current(), PyEnv.current()
-            major, minor, _ = env.version_info
-            context_key = f"{usr.hostname}-py{major}.{minor}"
+            vinfo = env.version_info
+            context_key = f"{usr.hostname}-py{vinfo.major}.{vinfo.minor}"
 
         context = self.context(language=language, context_key=context_key)
 

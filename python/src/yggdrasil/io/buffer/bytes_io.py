@@ -507,8 +507,11 @@ class BytesIO(io.RawIOBase):
             b._pos = 0
             return b
 
-        if isinstance(obj, (str, Path)):
-            return cls(Path(obj), config=config)
+        if isinstance(obj, str):
+            return cls(obj.encode("utf-8"), config=config)
+
+        if isinstance(obj, Path):
+            return cls(obj, config=config, auto_close=False)
 
         # bytes-like fallback
         b = cls(config=config)

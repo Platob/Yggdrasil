@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, is_dataclass, replace
+from dataclasses import dataclass, is_dataclass, replace, MISSING
 from typing import Mapping, Any, Iterable, Literal, Sequence, Iterator, TYPE_CHECKING, MutableMapping
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -12,6 +12,7 @@ from yggdrasil.io import MediaType
 from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
+from ..dataclasses.dataclass import get_from_dict
 
 if TYPE_CHECKING:
     import polars as pl
@@ -98,6 +99,16 @@ ARROW_SCHEMA = pa.schema(
             nullable=False,
             metadata={
                 "comment": "UTC timestamp when the response was captured",
+                "unit": "us",
+                "tz": "UTC",
+            },
+        ),
+        pa.field(
+            name="response_received_at_epoch",
+            type=pa.int64(),
+            nullable=False,
+            metadata={
+                "comment": "UTC epoch timestamp when the response was captured",
                 "unit": "us",
                 "tz": "UTC",
             },
@@ -241,7 +252,7 @@ class Response:
     # ------------------------------------------------------------------
 
     @classmethod
-    def parse_any(cls, obj: Any, *, normalize: bool = True) -> "Response":
+    def parse(cls, obj: Any, *, normalize: bool = True) -> "Response":
         if isinstance(obj, cls):
             return obj
         if isinstance(obj, str):
@@ -264,49 +275,61 @@ class Response:
         return cls.parse_dict(d, normalize=normalize)
 
     @classmethod
-    def parse_dict(cls, d: Mapping[str, Any], *, normalize: bool = True) -> "Response":
-        if not d:
+    def parse_dict(cls, obj: Mapping[str, Any], *, normalize: bool = True, prefix: str = "response_") -> "Response":
+        if not obj:
             raise ValueError("Response.parse_dict: empty mapping")
 
-        req_obj = d.get("request") or d
-        request = PreparedRequest.parse_any(req_obj, normalize=normalize)
+        # request
+        req_obj = get_from_dict(obj, keys=("request",), prefix="")
+        if req_obj is MISSING or req_obj in (None, ""):
+            req_obj = obj
+        request = PreparedRequest.parse(req_obj, normalize=normalize)
 
-        status = (
-            d.get("status_code")
-            if "status_code" in d
-            else d.get("status")
-            if "status" in d
-            else d.get("code")
-        )
-        if status is None or status == "":
+        # status (prefixed first, then unprefixed)
+        status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix=prefix)
+        if status is MISSING:
+            status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix="")
+        if status is MISSING or status in (None, ""):
             raise ValueError("Response.parse_dict: missing status_code/status/code")
         status_code = int(status) if isinstance(status, int) else int(float(str(status).strip()))
 
-        headers_obj = d.get("headers") or d.get("header") or d.get("hdrs") or {}
-        if not isinstance(headers_obj, Mapping):
-            raise ValueError("Response.parse_dict: headers must be a mapping")
-        headers: dict[str, str] = {str(k): str(v) for k, v in headers_obj.items()}
+        # headers
+        headers_obj = get_from_dict(obj, keys=("headers", "header", "hdrs", "response_headers"), prefix=prefix)
+        if headers_obj is MISSING:
+            headers_obj = get_from_dict(obj, keys=("headers", "header", "hdrs", "response_headers"), prefix="")
+        headers_obj = headers_obj if isinstance(headers_obj, Mapping) else {}
+        headers = {str(k): str(v) for k, v in headers_obj.items()}
 
-        body_obj = (
-            d.get("buffer")
-            or d.get("body")
-            or d.get("content")
-            or d.get("data")
-        )
-        buffer = BytesIO.parse(obj=body_obj) if body_obj is not None else BytesIO()
+        # body
+        body_obj = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix=prefix)
+        if body_obj is MISSING:
+            body_obj = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix="")
+        buffer = BytesIO.parse(obj=body_obj) if body_obj is not MISSING and body_obj is not None else BytesIO()
 
-        ts_obj = (
-            d.get("received_at_timestamp")
-            or d.get("received_at")
-            or d.get("time_us")
-            or d.get("timestamp")
-            or d.get("time_ns")
+        # received_at_timestamp
+        ts_obj = get_from_dict(
+            obj,
+            keys=("received_at_timestamp", "received_at", "time_us", "timestamp", "time_ns", "received_at_epoch",
+                  "response_received_at_epoch"),
+            prefix=prefix,
         )
+        if ts_obj is MISSING:
+            ts_obj = get_from_dict(
+                obj,
+                keys=("received_at_timestamp", "received_at", "time_us", "timestamp", "time_ns", "received_at_epoch",
+                      "response_received_at_epoch"),
+                prefix="",
+            )
         received_at_ts = 0
-        if ts_obj is not None and ts_obj != "":
-            received_at_ts = int(ts_obj) if isinstance(ts_obj, int) else 0
+        if ts_obj is not MISSING and ts_obj not in (None, ""):
+            received_at_ts = int(ts_obj) if isinstance(ts_obj, int) else int(float(str(ts_obj).strip()))
 
-        tags = d.get("tags") or None
+        # tags
+        tags_obj = get_from_dict(obj, keys=("tags", "response_tags"), prefix=prefix)
+        if tags_obj is MISSING:
+            tags_obj = get_from_dict(obj, keys=("tags", "response_tags"), prefix="")
+        tags_obj = tags_obj if isinstance(tags_obj, Mapping) else {}
+        tags = {str(k): str(v) for k, v in tags_obj.items()}
 
         return cls(
             request=request,
@@ -449,6 +472,7 @@ class Response:
             pa.array([body_bytes],              type=ARROW_SCHEMA.field("response_body").type),
             pa.array([body_blake3_32],          type=ARROW_SCHEMA.field("response_body_hash").type),
             pa.array([self.received_at_timestamp], type=ARROW_SCHEMA.field("response_received_at").type),
+            pa.array([self.received_at_timestamp], type=ARROW_SCHEMA.field("response_received_at_epoch").type),
         ]
 
         return pa.RecordBatch.from_arrays(

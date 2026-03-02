@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 import time
+import datetime as dt
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Union, Literal, Iterator
+from typing import Optional, TYPE_CHECKING, Union, Literal, Iterator, Any
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -26,6 +27,7 @@ from ..enums import SaveMode
 from ..request import PreparedRequest
 from ..response import RESPONSE_ARROW_SCHEMA
 from ..session import Session
+from ...data import any_to_datetime
 
 if TYPE_CHECKING:
     from ...databricks.sql.table import Table
@@ -47,8 +49,8 @@ RETRYABLE_EXC = (
 
 @dataclass
 class HTTPSession(Session):
-    pool_connections: int = 10  # number of hosts to keep pools for
-    pool_maxsize: int = 10  # max connections per host
+    pool_connections: int = 8  # number of hosts to keep pools for
+    pool_maxsize: int = 8  # max connections per host
     pool_block: bool = False  # block when pool is full instead of discarding
 
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
@@ -95,23 +97,56 @@ class HTTPSession(Session):
         return self._http_pool
 
     @staticmethod
-    def _sql_match_clause(request: PreparedRequest):
-        def fmt(key, value):
+    def _sql_match_clause(
+        request: PreparedRequest,
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
+    ):
+        def fmt(key: str, op: str, value: Any) -> str:
             if value is None:
                 return f"{key} is null"
+
             if isinstance(value, bytes):
                 value = base64.b64encode(value).decode("ascii")
-            return f"{key} = '{value}'"
 
-        return " AND ".join(
-            fmt(k, v)
-            for k, v in (
-                ("request_url_host", request.url.host),
-                ("request_url_path", request.url.path),
-                ("request_url_query", request.url.query),
-                ("request_body_hash", request.body.blake3().digest() if request.body else None),
-            )
-        )
+            return f"{key} {op} '{value}'"
+
+        def to_utc_epoch_us(x: dt.datetime | dt.date | str) -> int:
+            """
+            Convert input to UTC epoch microseconds.
+
+            - dt.datetime with tzinfo: converted to UTC
+            - dt.datetime naive: treated as UTC (no implicit local shift)
+            - dt.date: promoted to midnight UTC
+            - str: parsed by any_to_datetime (string parser may attach CURRENT_TZINFO),
+                   then converted to UTC
+            """
+            if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
+                v = dt.datetime(x.year, x.month, x.day, tzinfo=dt.timezone.utc)
+            else:
+                v = any_to_datetime(x)
+
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=dt.timezone.utc)
+
+            v = v.astimezone(dt.timezone.utc)
+            # epoch microseconds
+            return int(v.timestamp() * 1_000_000)
+
+        clauses: list[str] = [
+            fmt("request_url_host", "=", request.url.host),
+            fmt("request_url_path", "=", request.url.path),
+            fmt("request_url_query", "=", request.url.query),
+            fmt("request_body_hash", "=", request.body.blake3().digest() if request.body else None),
+        ]
+
+        # ✅ filter on epoch micros field
+        if received_from is not None and received_from != "":
+            clauses.append(f"response_received_at_epoch >= {to_utc_epoch_us(received_from)}")
+        if received_to is not None and received_to != "":
+            clauses.append(f"response_received_at_epoch <= {to_utc_epoch_us(received_to)}")
+
+        return " AND ".join(clauses)
 
     def send(
         self,
@@ -122,6 +157,8 @@ class HTTPSession(Session):
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         cache: Optional[Union["Table", bool]] = None,
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
         anonymize: Literal["remove", "redact", "hash"] = "remove",
     ) -> HTTPResponse:
         """
@@ -134,7 +171,7 @@ class HTTPSession(Session):
         if cache is not None:
             anon = request.anonymize(mode=anonymize)
             query = f"""select * from {cache.full_name(safe=True)}
-where {self._sql_match_clause(anon)}"""
+where {self._sql_match_clause(anon, received_from=received_from, received_to=received_to)}"""
 
             try:
                 sql_cache_statement = cache.sql(query)
@@ -235,6 +272,8 @@ where {self._sql_match_clause(anon)}"""
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         cache: Optional["Table"] = None,
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
         wait_cache: WaitingConfigArg = False,
         ordered: bool = False,
         batch_size: Optional[int] = None,
@@ -250,9 +289,9 @@ where {self._sql_match_clause(anon)}"""
         if pool is None:
             pool = self.pool_maxsize
 
-        with JobPoolExecutor.parse_any(pool) as pool:
+        with JobPoolExecutor.parse(pool) as pool:
             if not batch_size:
-                batch_size: int = pool.max_workers * 10
+                batch_size: int = pool.max_workers * 100
 
             if cache is None:
                 def jobs():
@@ -289,7 +328,7 @@ where {self._sql_match_clause(anon)}"""
                     anon_batch = [req.anonymize(mode="remove") for req in batch]
 
                     clauses = " OR ".join(
-                        f"({self._sql_match_clause(a)})" for a in anon_batch
+                        f"({self._sql_match_clause(a, received_from=received_from, received_to=received_to)})" for a in anon_batch
                     )
                     query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {clauses}"
 
@@ -390,7 +429,7 @@ where {self._sql_match_clause(anon)}"""
                         combined = pa.Table.from_batches(batches).combine_chunks()
                         cache.insert(
                             combined,
-                            mode=SaveMode.AUTO,
+                            mode=SaveMode.APPEND,
                             match_by=[
                                 "request_url_host",
                                 "request_url_path",

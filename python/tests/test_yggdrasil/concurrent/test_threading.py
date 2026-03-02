@@ -189,8 +189,8 @@ def test_shutdown_on_exit_shuts_down_executor():
 def test_parse_any_returns_cls_for_instance_and_executor_for_other():
     ex = JobPoolExecutor(max_workers=1)
     try:
-        assert JobPoolExecutor.parse_any(ex) is JobPoolExecutor
-        other = JobPoolExecutor.parse_any(object(), max_workers=3)
+        assert JobPoolExecutor.parse(ex) is JobPoolExecutor
+        other = JobPoolExecutor.parse(object(), max_workers=3)
         assert isinstance(other, JobPoolExecutor)
         assert other.max_workers == 3
         other.shutdown(wait=True, cancel_futures=True)

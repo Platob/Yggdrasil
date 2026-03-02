@@ -128,6 +128,27 @@ class CommandExecution:
 
         import yggdrasil.pickle.dill as pkl
 
+        current_version = PyEnv.current().version_info
+        target_version = self.context.cluster.python_version_info
+
+        cur = (current_version.major, current_version.minor)
+        tgt = (target_version.major, target_version.minor)
+
+        if cur != tgt:
+            raise RuntimeError(
+                "Python version mismatch.\n"
+                f"  Local interpreter:  Python {current_version.major}.{current_version.minor}.{getattr(current_version, 'micro', '?')}\n"
+                f"  Cluster runtime:     Python {target_version.major}.{target_version.minor}.{getattr(target_version, 'micro', '?')}\n"
+                "\n"
+                "Fix: use a matching Python minor version locally (major.minor must match).\n"
+                "\n"
+                "Quick setup with uv:\n"
+                f"  uv venv --python {target_version.major}.{target_version.minor} --seed\n"
+                "  source .venv/bin/activate        # macOS/Linux\n"
+                "  .venv\\Scripts\\activate           # Windows\n"
+                "  uv pip install ygg\n"
+            )
+
         assert self.command, "Cannot call %s, missing command" % self
 
         if self.environ:
@@ -151,14 +172,13 @@ class CommandExecution:
 
         args_b64 = base64.b64encode(args_blob).decode("ascii")
         kwargs_b64 = base64.b64encode(kwargs_blob).decode("ascii")
-        major, minor, _ = PyEnv.current().version_info
+
         temp.command = (
             self.command
             .replace("__ARGS__", repr(args_b64))
             .replace("__KWARGS__", repr(kwargs_b64))
             .replace("__ENVIRON__", repr(env_blob))
             .replace("__CTX_KEY__", repr(temp.context.context_key))
-            .replace("__PYVERSION__", repr(f"{major}.{minor}"))
         )
 
         try:

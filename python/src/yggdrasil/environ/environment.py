@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-
+from yggdrasil.version import VersionInfo
 from .system_command import SystemCommand
 from .userinfo import UserInfo
 
@@ -57,6 +57,7 @@ __all__ = [
     "CURRENT_PYENV",
     "SYSTEM_LIBS"
 ]
+
 
 logger = logging.getLogger(__name__)
 
@@ -809,8 +810,8 @@ class PyEnv:
             if linked:
                 version = anchor.python_path
             else:
-                major, minor, patch = anchor.version_info[:3]
-                version = "%s.%s.%s" % (major, minor, patch)
+                vinfo = anchor.version_info
+                version = str(vinfo)
 
         cmd = [
             str(anchor.uv_path), "venv", str(folder),
@@ -859,7 +860,7 @@ class PyEnv:
         return UserInfo.current()
 
     @property
-    def version_info(self) -> tuple[int, int, int]:
+    def version_info(self) -> VersionInfo:
         """
         Return the interpreter's version as ``(major, minor, micro)``.
 
@@ -898,7 +899,7 @@ class PyEnv:
             check=True,
         )
         major, minor, micro = json.loads(res.stdout.strip())
-        self._version_info = int(major), int(minor), int(micro)
+        self._version_info = VersionInfo(int(major), int(minor), int(micro))
 
         return self._version_info
 

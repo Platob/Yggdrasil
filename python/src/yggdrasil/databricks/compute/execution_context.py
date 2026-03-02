@@ -198,9 +198,9 @@ class ExecutionContext:
 
         if not self.context_key:
             usr, env = UserInfo.current(), PyEnv.current()
-            major, minor, _ = env.version_info
+            vinfo = env.version_info
 
-            self.context_key = f"{usr.hostname}-py{major}.{minor}"
+            self.context_key = f"{usr.hostname}-py{vinfo.major}.{vinfo.minor}"
 
         context_path = f"~/.ygg/dbx-ctx/{self.context_key}"
         tmp_path = context_path + "/tmp/"

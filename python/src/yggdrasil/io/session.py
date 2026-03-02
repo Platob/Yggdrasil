@@ -1,4 +1,5 @@
 import threading
+import datetime as dt
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable
@@ -80,7 +81,9 @@ class Session(ABC):
         add_statistics: Optional[bool] = None,
         stream: bool = True,
         wait: WaitingConfigArg = None,
-        cache: Optional["Table"] = None
+        cache: Optional["Table"] = None,
+        cached_from: Optional[dt.datetime | dt.date | str] = None,
+        cached_to: Optional[dt.datetime | dt.date | str] = None,
     ) -> Response:
         raise NotImplementedError
 
@@ -93,6 +96,8 @@ class Session(ABC):
         stream: bool = True,
         wait: WaitingConfigArg = None,
         cache: Optional["Table"] = None,
+        cached_from: Optional[dt.datetime | dt.date | str] = None,
+        cached_to: Optional[dt.datetime | dt.date | str] = None,
         pool: Optional[JobPoolExecutor | int] = None
     ):
         raise NotImplementedError

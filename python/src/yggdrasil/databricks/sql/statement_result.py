@@ -350,7 +350,7 @@ class StatementResult(BaseStatementResult):
                 if link.external_link:
                     yield Job.make(extract_batches, link.external_link)
 
-        with JobPoolExecutor.parse_any(max_workers or 4) as ex:
+        with JobPoolExecutor.parse(max_workers or 4) as ex:
             for f in ex.as_completed(
                 jobs(),
                 ordered=maintain_order,

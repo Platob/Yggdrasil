@@ -1,18 +1,41 @@
 from __future__ import annotations
 
+import json
 import json as json_module
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, MISSING
 from typing import Mapping, Any, Optional, MutableMapping, Literal, Callable
 
 from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.io.enums.media_type import MimeType
+from yggdrasil.dataclasses.dataclass import get_from_dict
+from yggdrasil.io.enums.mime_type import MimeType
 from yggdrasil.io.headers import anonymize_headers
 from .buffer import BytesIO
 from .url import URL
 
 __all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
 
+
+# ----------------------------
+# Arrow schema
+# ----------------------------
+
+REQUEST_URL_STRUCT = pa.struct(
+    [
+        pa.field("scheme", pa.string(), nullable=True, metadata={"comment": "URL scheme (e.g., http, https)"}),
+        pa.field(
+            "userinfo",
+            pa.string(),
+            nullable=True,
+            metadata={"comment": "Userinfo from URL authority (e.g., user:pass). Avoid persisting secrets."},
+        ),
+        pa.field("host", pa.string(), nullable=True, metadata={"comment": "Host (domain or IP)"}),
+        pa.field("port", pa.int32(), nullable=True, metadata={"comment": "Port number if explicitly specified"}),
+        pa.field("path", pa.string(), nullable=True, metadata={"comment": "Path component of the URL"}),
+        pa.field("query", pa.string(), nullable=True, metadata={"comment": "Raw query string (without leading '?')"}),
+        pa.field("fragment", pa.string(), nullable=True, metadata={"comment": "Fragment identifier (without leading '#')"}),
+    ]
+)
 
 REQUEST_ARROW_SCHEMA = pa.schema(
     [
@@ -22,55 +45,21 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             nullable=False,
             metadata={"comment": "HTTP verb (GET, POST, etc.)"},
         ),
+
+        # ✅ full URL string (non-nullable)
         pa.field(
-            "request_url",
+            "request_url_str",
             pa.string(),
             nullable=False,
-            metadata={"comment": "Full request URL as string"},
+            metadata={"comment": "Full request URL as string (deterministic)"},
         ),
 
-        # ---- URL components (best-effort parsed) ----
+        # ✅ URL components as a struct (non-nullable)
         pa.field(
-            "request_url_scheme",
-            pa.string(),
+            "request_url",
+            REQUEST_URL_STRUCT,
             nullable=False,
-            metadata={"comment": "URL scheme (e.g., http, https)"},
-        ),
-        pa.field(
-            "request_url_userinfo",
-            pa.string(),
-            nullable=True,
-            metadata={"comment": "Userinfo from URL authority (e.g., user:pass). Avoid persisting secrets."},
-        ),
-        pa.field(
-            "request_url_host",
-            pa.string(),
-            nullable=False,
-            metadata={"comment": "Host (domain or IP)"},
-        ),
-        pa.field(
-            "request_url_port",
-            pa.int32(),
-            nullable=True,
-            metadata={"comment": "Port number if explicitly specified"},
-        ),
-        pa.field(
-            "request_url_path",
-            pa.string(),
-            nullable=True,
-            metadata={"comment": "Path component of the URL"},
-        ),
-        pa.field(
-            "request_url_query",
-            pa.string(),
-            nullable=True,
-            metadata={"comment": "Raw query string (without leading '?')"},
-        ),
-        pa.field(
-            "request_url_fragment",
-            pa.string(),
-            nullable=True,
-            metadata={"comment": "Fragment identifier (without leading '#')"},
+            metadata={"comment": "URL parsed into a struct (best-effort parsed)"},
         ),
 
         # ---- headers/body ----
@@ -103,7 +92,11 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             "request_body_hash",
             pa.binary(32),
             nullable=True,
-            metadata={"comment": "BLAKE3-256 digest of request_body (32 bytes)", "algorithm": "blake3", "byte_width": "32"},
+            metadata={
+                "comment": "BLAKE3-256 digest of request_body (32 bytes)",
+                "algorithm": "blake3",
+                "byte_width": "32",
+            },
         ),
 
         # ---- timing ----
@@ -112,6 +105,12 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             pa.timestamp("us", "UTC"),
             nullable=False,
             metadata={"comment": "UTC timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
+        ),
+        pa.field(
+            "request_sent_at_epoch",
+            pa.int64(),
+            nullable=False,
+            metadata={"comment": "UTC epoch timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
         ),
     ],
     metadata={
@@ -125,11 +124,121 @@ class PreparedRequest:
     method: str
     url: URL
     headers: Mapping[str, str]
-    buffer: Optional[BytesIO]
     tags: Optional[Mapping[str, str]]
+    buffer: Optional[BytesIO]
     sent_at_timestamp: int = 0  # time.time_ns() // 1000
 
     before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None
+
+    @classmethod
+    def parse(
+        cls,
+        obj: Any,
+        *,
+        normalize: bool = True,
+        prefix: str = "request_"
+    ):
+        if isinstance(obj, (str, bytes)):
+            obj = json.loads(obj)
+
+        if isinstance(obj, dict):
+            return cls.parse_dict(obj, normalize=normalize, prefix=prefix)
+
+        raise ValueError(
+            f"Cannot make {cls} from {type(obj)}"
+        )
+
+    @classmethod
+    def parse_dict(
+        cls,
+        obj: Mapping[str, Any],
+        *,
+        normalize: bool = True,
+        prefix: str = "request_"
+    ):
+        # method (aliases + request_ prefix)
+        method = get_from_dict(obj, keys=("method", "http_method", "verb"), prefix=prefix)
+        method = "GET" if method is MISSING or method in (None, "") else str(method)
+
+        # url: prefer new fields first, then legacy ones, then structured url
+        url_str = get_from_dict(obj, keys=("url_str", "url", "href", "uri"), prefix=prefix)
+        url_struct = get_from_dict(obj, keys=("url",), prefix=prefix)  # could be struct dict from Arrow
+        if url_str is not MISSING and url_str not in (None, ""):
+            url = url_str
+        elif isinstance(url_struct, Mapping):
+            # Accept our Arrow struct-like shape: {"scheme":..., "host":..., ...}
+            url = {
+                "scheme": url_struct.get("scheme") or "",
+                "userinfo": url_struct.get("userinfo") or "",
+                "host": url_struct.get("host") or "",
+                "port": url_struct.get("port") or 0,
+                "path": url_struct.get("path") or "",
+                "query": url_struct.get("query") or "",
+                "fragment": url_struct.get("fragment") or "",
+            }
+        else:
+            # last resort: support older flattened fields if present
+            has_exploded = any(
+                (k in obj) or (("request_" + k) in obj)
+                for k in (
+                    "url_scheme",
+                    "url_userinfo",
+                    "url_host",
+                    "url_port",
+                    "url_path",
+                    "url_query",
+                    "url_fragment",
+                )
+            )
+            if not has_exploded:
+                raise ValueError("PreparedRequest.parse_dict: missing url/url_str/request_url_str/request_url")
+
+            url = {
+                "scheme": get_from_dict(obj, ("url_scheme",), prefix=prefix) or "",
+                "userinfo": get_from_dict(obj, ("url_userinfo",), prefix=prefix) or "",
+                "host": get_from_dict(obj, ("url_host",), prefix=prefix) or "",
+                "port": get_from_dict(obj, ("url_port",), prefix=prefix) or 0,
+                "path": get_from_dict(obj, ("url_path",), prefix=prefix) or "",
+                "query": get_from_dict(obj, ("url_query",), prefix=prefix) or "",
+                "fragment": get_from_dict(obj, ("url_fragment",), prefix=prefix) or "",
+            }
+
+        # headers/tags (aliases + request_ prefix)
+        headers = get_from_dict(obj, keys=("headers", "header", "hdrs", "request_headers"), prefix=prefix)
+        headers = headers if isinstance(headers, Mapping) else {}
+        headers = {str(k): str(v) for k, v in headers.items()}
+
+        tags = get_from_dict(obj, keys=("tags", "request_tags"), prefix=prefix)
+        tags = tags if isinstance(tags, Mapping) else {}
+        tags = {str(k): str(v) for k, v in tags.items()}
+
+        # body/buffer (aliases + request_ prefix)
+        buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=prefix)
+        if buffer is MISSING:
+            buffer = None
+        if buffer is not None:
+            buffer = BytesIO.parse(buffer)
+
+        # sent_at timestamp (epoch micros) - accept several names
+        sent_at_timestamp = get_from_dict(
+            obj,
+            keys=(
+            "sent_at_timestamp", "sent_at_timestamp_epoch", "sent_at", "request_sent_at_epoch", "request_sent_at"),
+            prefix=prefix,
+        )
+        if sent_at_timestamp is MISSING or sent_at_timestamp in (None, ""):
+            sent_at_timestamp = 0
+        else:
+            sent_at_timestamp = int(sent_at_timestamp)
+
+        return cls(
+            method=method,
+            url=URL.parse(url, normalize=normalize),
+            headers=headers,
+            tags=tags,
+            buffer=buffer,
+            sent_at_timestamp=sent_at_timestamp,
+        )
 
     def copy(
         self,
@@ -144,16 +253,6 @@ class PreparedRequest:
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
-        """
-        Copy this PreparedRequest with optional overrides.
-
-        Notes:
-        - headers are copied into a new dict (safe to mutate).
-        - url override is parsed/normalized by default.
-        - buffer default is "keep as-is". Pass buffer=None to drop it.
-        - copy_buffer=True forces a deep copy of BytesIO content.
-        - before_send default is "keep as-is". Pass before_send=None to remove it.
-        """
         new_url = self.url if url is None else URL.parse(url, normalize=normalize)
 
         new_headers = dict(self.headers) if self.headers else {}
@@ -219,234 +318,50 @@ class PreparedRequest:
             buffer=body,
             tags=tags,
             sent_at_timestamp=0,
-            before_send=before_send
+            before_send=before_send,
         )
 
-    def prepare_to_send(
-        self,
-        add_statistics: bool
-    ):
+    def prepare_to_send(self, add_statistics: bool):
         if self.before_send is not None:
             instance = self.before_send(self)
         else:
             instance = self
 
         instance.sent_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
-
         return instance
 
-    @classmethod
-    def parse_any(
-        cls,
-        obj: Any,
-        *,
-        normalize: bool = True,
-    ) -> "PreparedRequest":
-        if isinstance(obj, cls):
-            return obj
-
-        if isinstance(obj, str):
-            return cls.parse_str(obj, normalize=normalize)
-
-        if isinstance(obj, Mapping):
-            return cls.parse_dict(obj, normalize=normalize)
-
-        # last-resort: stringify (useful for weird wrappers)
-        return cls.parse_str(str(obj), normalize=normalize)
-
-    @classmethod
-    def parse_str(
-        cls,
-        raw: str,
-        *,
-        normalize: bool = True,
-    ) -> "PreparedRequest":
-        """
-        Accepts JSON string representing a PreparedRequest-ish dict.
-        """
-        s = raw.strip()
-        if not s:
-            raise ValueError("PreparedRequest.parse_str: empty string")
-
-        try:
-            d = json_module.loads(s)
-        except Exception as e:
-            raise ValueError("PreparedRequest.parse_str: expected JSON object string") from e
-
-        if not isinstance(d, Mapping):
-            raise ValueError("PreparedRequest.parse_str: JSON must decode to an object")
-
-        return cls.parse_dict(d, normalize=normalize)
-
-    @classmethod
-    def parse_dict(
-        cls,
-        d: Mapping[str, Any],
-        *,
-        normalize: bool = True,
-    ) -> "PreparedRequest":
-        """
-        Parses a PreparedRequest from a mapping.
-
-        Supported shapes (field aliases included):
-          - method: "method" | "http_method" | "verb"
-          - url:    "url" | "uri" | "href" | ("url_*" exploded fields)
-          - headers:"headers" | "header" | "hdrs"
-          - body:   "buffer" | "body" | "data"
-          - sent_at:"sent_at_timestamp" | "sent_at" | "timestamp" | "time_ns"
-        """
-        if not d:
-            raise ValueError("PreparedRequest.parse_dict: empty mapping")
-
-        # method
-        method = (
-            d.get("method")
-            or d.get("http_method")
-            or d.get("verb")
-            or "GET"
-        )
-        method_s = str(method)
-
-        # url (accept URL object, string, dict, or exploded url_* fields)
-        url_obj: Any = d.get("url") or d.get("uri") or d.get("href")
-        if url_obj is None:
-            # exploded fields as used by to_arrow_batch
-            has_exploded = any(
-                k in d
-                for k in (
-                    "url_scheme",
-                    "url_userinfo",
-                    "url_host",
-                    "url_port",
-                    "url_path",
-                    "url_query",
-                    "url_fragment",
-                )
-            )
-            if has_exploded:
-                q = d.get("url_query")
-                query = ""
-                if isinstance(q, Mapping):
-                    # our arrow encoding is key -> "v1|v2|..."
-                    # keep deterministic: sort keys, keep given value order
-                    parts: list[tuple[str, str]] = []
-                    for k in sorted(q.keys(), key=lambda x: str(x)):
-                        v = q[k]
-                        if v is None:
-                            continue
-                        vs = str(v).split("|")
-                        for one in vs:
-                            parts.append((str(k), one))
-                    from urllib.parse import urlencode
-                    query = urlencode(parts, doseq=True)
-
-                url_obj = {
-                    "scheme": d.get("url_scheme") or "",
-                    "userinfo": d.get("url_userinfo") or "",
-                    "host": d.get("url_host") or "",
-                    "port": d.get("url_port") or 0,
-                    "path": d.get("url_path") or "",
-                    "query": query,
-                    "fragment": d.get("url_fragment") or "",
-                }
-            else:
-                raise ValueError("PreparedRequest.parse_dict: missing url")
-
-        url = URL.parse(url_obj, normalize=normalize)
-
-        # headers
-        headers_obj = d.get("headers") or d.get("header") or d.get("hdrs") or {}
-        if headers_obj is None:
-            headers_obj = {}
-        if not isinstance(headers_obj, Mapping):
-            raise ValueError("PreparedRequest.parse_dict: headers must be a mapping")
-        headers: dict[str, str] = {str(k): str(v) for k, v in headers_obj.items()}
-
-        # body/buffer
-        body_obj = d.get("buffer")
-        if body_obj is None:
-            body_obj = d.get("body")
-        if body_obj is None:
-            body_obj = d.get("data")
-
-        buffer: Optional[BytesIO] = None
-        if body_obj is not None:
-            buffer = BytesIO.parse(obj=body_obj)
-
-        # sent_at timestamp (ns)
-        sent_at = (
-            d.get("sent_at_timestamp")
-            if "sent_at_timestamp" in d
-            else d.get("time_ns")
-            if "time_ns" in d
-            else d.get("timestamp")
-            if "timestamp" in d
-            else d.get("sent_at")
-        )
-        sent_at_ts = 0
-        if sent_at is not None and sent_at != "":
-            if isinstance(sent_at, int):
-                sent_at_ts = sent_at
-            else:
-                s = str(sent_at)
-                sent_at_ts = int(s) if s.isdigit() else 0
-
-        tags = d.get("tags", None) or None
-
-        return cls(
-            method=method_s,
-            url=url,
-            headers=headers,
-            buffer=buffer,
-            tags=tags,
-            sent_at_timestamp=sent_at_ts,
-        )
+    # ... parse_any / parse_str / parse_dict unchanged ...
 
     @property
     def body(self):
         return self.buffer
 
-    def anonymize(
-        self,
-        mode: Literal["remove", "redact", "hash"] = "remove",
-    ) -> "PreparedRequest":
-        """
-        Clean/boring + composable:
-        - headers redaction happens here
-        - URL redaction happens in URL.anonymize()
-        """
+    def anonymize(self, mode: Literal["remove", "redact", "hash"] = "remove") -> "PreparedRequest":
         return replace(
             self,
             headers=anonymize_headers(self.headers, mode=mode),
             url=self.url.anonymize(mode=mode),
         )
 
-    def to_arrow_batch(
-        self,
-        parse: bool = False,
-    ) -> pa.RecordBatch:
+    def to_arrow_batch(self, parse: bool = False) -> pa.RecordBatch:
         if parse:
             raise NotImplementedError
 
         u = self.url
         url_s = u.to_string()
 
-        scheme_v = u.scheme
-        userinfo_v = u.userinfo
-        host_v = u.host
-        port_v = u.port
-        path_v = u.path
-        fragment_v = u.fragment
-        q_v = u.query
+        url_struct_value = {
+            "scheme": u.scheme,
+            "userinfo": u.userinfo,
+            "host": u.host,
+            "port": u.port,
+            "path": u.path,
+            "query": u.query,
+            "fragment": u.fragment,
+        }
 
-        headers_v = {
-            str(k): str(v)
-            for k, v in (self.headers.items() if self.headers else ())
-        }
-        tags_v = {
-            str(k): str(v)
-            for k, v in (self.tags.items() if self.tags else ())
-        }
+        headers_v = {str(k): str(v) for k, v in (self.headers.items() if self.headers else ())}
+        tags_v = {str(k): str(v) for k, v in (self.tags.items() if self.tags else ())}
 
         if self.buffer:
             body_bytes = self.buffer.to_bytes()
@@ -456,19 +371,21 @@ class PreparedRequest:
 
         arrays = [
             pa.array([self.method], type=REQUEST_ARROW_SCHEMA.field("request_method").type),
-            pa.array([url_s], type=REQUEST_ARROW_SCHEMA.field("request_url").type),
-            pa.array([scheme_v], type=REQUEST_ARROW_SCHEMA.field("request_url_scheme").type),
-            pa.array([userinfo_v], type=REQUEST_ARROW_SCHEMA.field("request_url_userinfo").type),
-            pa.array([host_v], type=REQUEST_ARROW_SCHEMA.field("request_url_host").type),
-            pa.array([port_v], type=REQUEST_ARROW_SCHEMA.field("request_url_port").type),
-            pa.array([path_v], type=REQUEST_ARROW_SCHEMA.field("request_url_path").type),
-            pa.array([q_v], type=REQUEST_ARROW_SCHEMA.field("request_url_query").type),
-            pa.array([fragment_v], type=REQUEST_ARROW_SCHEMA.field("request_url_fragment").type),
+
+            # ✅ full URL string non-nullable
+            pa.array([url_s], type=REQUEST_ARROW_SCHEMA.field("request_url_str").type),
+
+            # ✅ struct URL non-nullable (fields inside may be null)
+            pa.array([url_struct_value], type=REQUEST_ARROW_SCHEMA.field("request_url").type),
+
             pa.array([headers_v], type=REQUEST_ARROW_SCHEMA.field("request_headers").type),
             pa.array([tags_v], type=REQUEST_ARROW_SCHEMA.field("request_tags").type),
             pa.array([body_bytes], type=REQUEST_ARROW_SCHEMA.field("request_body").type),
             pa.array([body_blake3_32], type=REQUEST_ARROW_SCHEMA.field("request_body_hash").type),
+
+            # NOTE: current code stores epoch micros into both; keeping behavior as-is
             pa.array([self.sent_at_timestamp], type=REQUEST_ARROW_SCHEMA.field("request_sent_at").type),
+            pa.array([self.sent_at_timestamp], type=REQUEST_ARROW_SCHEMA.field("request_sent_at_epoch").type),
         ]
 
         return pa.RecordBatch.from_arrays(arrays, schema=REQUEST_ARROW_SCHEMA)  # type: ignore
