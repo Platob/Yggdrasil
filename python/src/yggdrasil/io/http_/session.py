@@ -135,9 +135,9 @@ class HTTPSession(Session):
             return int(v.timestamp() * 1_000_000)
 
         clauses: list[str] = [
-            fmt("request_url.host", "=", request.url.host),
-            fmt("request_url.path", "=", request.url.path),
-            fmt("request_url.query", "=", request.url.query),
+            fmt("request_url_host", "=", request.url.host),
+            fmt("request_url_path", "=", request.url.path),
+            fmt("request_url_query", "=", request.url.query),
             fmt("request_body_hash", "=", request.body.blake3().digest() if request.body else None),
         ]
 
@@ -260,7 +260,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
             cache.insert(
                 batch,
                 mode=SaveMode.AUTO,
-                match_by=["request_url.host", "request_url.path", "request_url.query", "request_body_hash"]
+                match_by=["request_url_host", "request_url_path", "request_url_query", "request_body_hash"]
             )
         return result
 

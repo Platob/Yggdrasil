@@ -16,27 +16,9 @@ from .url import URL
 __all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
 
 from ..environ import UserInfo
-
 # ----------------------------
-# Arrow schema
+# Arrow schema (FLATTENED)
 # ----------------------------
-
-REQUEST_URL_STRUCT = pa.struct(
-    [
-        pa.field("scheme", pa.string(), nullable=True, metadata={"comment": "URL scheme (e.g., http, https)"}),
-        pa.field(
-            "userinfo",
-            pa.string(),
-            nullable=True,
-            metadata={"comment": "Userinfo from URL authority (e.g., user:pass). Avoid persisting secrets."},
-        ),
-        pa.field("host", pa.string(), nullable=True, metadata={"comment": "Host (domain or IP)"}),
-        pa.field("port", pa.int32(), nullable=True, metadata={"comment": "Port number if explicitly specified"}),
-        pa.field("path", pa.string(), nullable=True, metadata={"comment": "Path component of the URL"}),
-        pa.field("query", pa.string(), nullable=True, metadata={"comment": "Raw query string (without leading '?')"}),
-        pa.field("fragment", pa.string(), nullable=True, metadata={"comment": "Fragment identifier (without leading '#')"}),
-    ]
-)
 
 REQUEST_ARROW_SCHEMA = pa.schema(
     [
@@ -55,13 +37,14 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             metadata={"comment": "Full request URL as string (deterministic)"},
         ),
 
-        # ✅ URL components as a struct (non-nullable)
-        pa.field(
-            "request_url",
-            REQUEST_URL_STRUCT,
-            nullable=False,
-            metadata={"comment": "URL parsed into a struct (best-effort parsed)"},
-        ),
+        # ✅ flattened URL components (nullable)
+        pa.field("request_url_scheme",   pa.string(), nullable=True, metadata={"comment": "URL scheme (e.g., http, https)"}),
+        pa.field("request_url_userinfo", pa.string(), nullable=True, metadata={"comment": "Userinfo from URL authority (e.g., user:pass). Avoid persisting secrets."}),
+        pa.field("request_url_host",     pa.string(), nullable=True, metadata={"comment": "Host (domain or IP)"}),
+        pa.field("request_url_port",     pa.int32(),  nullable=True, metadata={"comment": "Port number if explicitly specified"}),
+        pa.field("request_url_path",     pa.string(), nullable=True, metadata={"comment": "Path component of the URL"}),
+        pa.field("request_url_query",    pa.string(), nullable=True, metadata={"comment": "Raw query string (without leading '?')"}),
+        pa.field("request_url_fragment", pa.string(), nullable=True, metadata={"comment": "Fragment identifier (without leading '#')"}),
 
         # ---- headers/body ----
         pa.field(
@@ -77,9 +60,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             "request_tags",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
-            metadata={
-                "comment": "Raw HTTP request tags as ordered key/value pairs",
-            },
+            metadata={"comment": "Raw HTTP request tags as ordered key/value pairs"},
         ),
         pa.field(
             "request_body",
@@ -114,9 +95,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             metadata={"comment": "UTC epoch timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
         ),
     ],
-    metadata={
-        "comment": "HTTP prepared request flattened into deterministic columns for logging/replay.",
-    },
+    metadata={"comment": "HTTP prepared request flattened into deterministic columns for logging/replay."},
 )
 
 
@@ -157,17 +136,21 @@ class PreparedRequest:
         normalize: bool = True,
         prefix: str = "request_"
     ):
-        # method (aliases + request_ prefix)
+        # method
         method = get_from_dict(obj, keys=("method", "http_method", "verb"), prefix=prefix)
         method = "GET" if method is MISSING or method in (None, "") else str(method)
 
-        # url: prefer new fields first, then legacy ones, then structured url
-        url_str = get_from_dict(obj, keys=("url_str", "url", "href", "uri"), prefix=prefix)
-        url_struct = get_from_dict(obj, keys=("url",), prefix=prefix)  # could be struct dict from Arrow
+        # url: prefer url_str/url first
+        url_str = get_from_dict(obj, keys=("url_str", "url", "href", "uri", "request_url_str"), prefix=prefix)
+
+        # legacy struct support (if someone still passes request_url as dict)
+        url_struct = get_from_dict(obj, keys=("url", "request_url"), prefix=prefix)
+
         if url_str is not MISSING and url_str not in (None, ""):
             url = url_str
+
         elif isinstance(url_struct, Mapping):
-            # Accept our Arrow struct-like shape: {"scheme":..., "host":..., ...}
+            # Accept {"scheme":..., "host":...} etc
             url = {
                 "scheme": url_struct.get("scheme") or "",
                 "userinfo": url_struct.get("userinfo") or "",
@@ -177,54 +160,54 @@ class PreparedRequest:
                 "query": url_struct.get("query") or "",
                 "fragment": url_struct.get("fragment") or "",
             }
+
         else:
-            # last resort: support older flattened fields if present
-            has_exploded = any(
-                (k in obj) or (("request_" + k) in obj)
-                for k in (
-                    "url_scheme",
-                    "url_userinfo",
-                    "url_host",
-                    "url_port",
-                    "url_path",
-                    "url_query",
-                    "url_fragment",
-                )
-            )
+            # flat exploded fields (new canonical shape)
+            scheme = get_from_dict(obj, ("url_scheme",), prefix=prefix)
+            userinfo = get_from_dict(obj, ("url_userinfo",), prefix=prefix)
+            host = get_from_dict(obj, ("url_host",), prefix=prefix)
+            port = get_from_dict(obj, ("url_port",), prefix=prefix)
+            path = get_from_dict(obj, ("url_path",), prefix=prefix)
+            query = get_from_dict(obj, ("url_query",), prefix=prefix)
+            fragment = get_from_dict(obj, ("url_fragment",), prefix=prefix)
+
+            has_exploded = any(x is not MISSING for x in (scheme, userinfo, host, port, path, query, fragment))
             if not has_exploded:
-                raise ValueError("PreparedRequest.parse_dict: missing url/url_str/request_url_str/request_url")
+                raise ValueError(
+                    "PreparedRequest.parse_dict: missing url/url_str/request_url_str or exploded url fields")
 
             url = {
-                "scheme": get_from_dict(obj, ("url_scheme",), prefix=prefix) or "",
-                "userinfo": get_from_dict(obj, ("url_userinfo",), prefix=prefix) or "",
-                "host": get_from_dict(obj, ("url_host",), prefix=prefix) or "",
-                "port": get_from_dict(obj, ("url_port",), prefix=prefix) or 0,
-                "path": get_from_dict(obj, ("url_path",), prefix=prefix) or "",
-                "query": get_from_dict(obj, ("url_query",), prefix=prefix) or "",
-                "fragment": get_from_dict(obj, ("url_fragment",), prefix=prefix) or "",
+                "scheme": "" if scheme is MISSING or scheme is None else str(scheme),
+                "userinfo": "" if userinfo is MISSING or userinfo is None else str(userinfo),
+                "host": "" if host is MISSING or host is None else str(host),
+                "port": 0 if port is MISSING or port in (None, "") else int(port),
+                "path": "" if path is MISSING or path is None else str(path),
+                "query": "" if query is MISSING or query is None else str(query),
+                "fragment": "" if fragment is MISSING or fragment is None else str(fragment),
             }
 
-        # headers/tags (aliases + request_ prefix)
+        # headers
         headers = get_from_dict(obj, keys=("headers", "header", "hdrs", "request_headers"), prefix=prefix)
         headers = headers if isinstance(headers, Mapping) else {}
         headers = {str(k): str(v) for k, v in headers.items()}
 
+        # tags
         tags = get_from_dict(obj, keys=("tags", "request_tags"), prefix=prefix)
         tags = tags if isinstance(tags, Mapping) else {}
         tags = {str(k): str(v) for k, v in tags.items()}
 
-        # body/buffer (aliases + request_ prefix)
+        # body/buffer
         buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=prefix)
         if buffer is MISSING:
             buffer = None
         if buffer is not None:
             buffer = BytesIO.parse(buffer)
 
-        # sent_at timestamp (epoch micros) - accept several names
+        # sent_at timestamp
         sent_at_timestamp = get_from_dict(
             obj,
-            keys=(
-            "sent_at_timestamp", "sent_at_timestamp_epoch", "sent_at", "request_sent_at_epoch", "request_sent_at"),
+            keys=("sent_at_timestamp", "sent_at_timestamp_epoch", "sent_at", "request_sent_at_epoch",
+                  "request_sent_at"),
             prefix=prefix,
         )
         if sent_at_timestamp is MISSING or sent_at_timestamp in (None, ""):
@@ -378,16 +361,6 @@ class PreparedRequest:
         u = self.url
         url_s = u.to_string()
 
-        url_struct_value = {
-            "scheme": u.scheme,
-            "userinfo": u.userinfo,
-            "host": u.host,
-            "port": u.port,
-            "path": u.path,
-            "query": u.query,
-            "fragment": u.fragment,
-        }
-
         headers_v = {str(k): str(v) for k, v in (self.headers.items() if self.headers else ())}
         tags_v = {str(k): str(v) for k, v in (self.tags.items() if self.tags else ())}
 
@@ -400,11 +373,17 @@ class PreparedRequest:
         arrays = [
             pa.array([self.method], type=REQUEST_ARROW_SCHEMA.field("request_method").type),
 
-            # ✅ full URL string non-nullable
+            # ✅ full URL string (non-nullable)
             pa.array([url_s], type=REQUEST_ARROW_SCHEMA.field("request_url_str").type),
 
-            # ✅ struct URL non-nullable (fields inside may be null)
-            pa.array([url_struct_value], type=REQUEST_ARROW_SCHEMA.field("request_url").type),
+            # ✅ flattened URL components
+            pa.array([u.scheme], type=REQUEST_ARROW_SCHEMA.field("request_url_scheme").type),
+            pa.array([u.userinfo], type=REQUEST_ARROW_SCHEMA.field("request_url_userinfo").type),
+            pa.array([u.host], type=REQUEST_ARROW_SCHEMA.field("request_url_host").type),
+            pa.array([u.port], type=REQUEST_ARROW_SCHEMA.field("request_url_port").type),
+            pa.array([u.path], type=REQUEST_ARROW_SCHEMA.field("request_url_path").type),
+            pa.array([u.query], type=REQUEST_ARROW_SCHEMA.field("request_url_query").type),
+            pa.array([u.fragment], type=REQUEST_ARROW_SCHEMA.field("request_url_fragment").type),
 
             pa.array([headers_v], type=REQUEST_ARROW_SCHEMA.field("request_headers").type),
             pa.array([tags_v], type=REQUEST_ARROW_SCHEMA.field("request_tags").type),

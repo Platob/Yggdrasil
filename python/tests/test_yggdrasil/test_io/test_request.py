@@ -113,6 +113,7 @@ def test_parse_dict_prefers_url_str_over_struct(sample_url_str):
 
 
 def test_parse_dict_accepts_url_struct_when_no_url_str():
+    # still supported as legacy input even though Arrow output is flat
     obj = {
         "method": "GET",
         "url": {
@@ -290,9 +291,14 @@ def test_to_arrow_batch_schema_and_values(sample_url_str):
     assert cols["request_method"][0].as_py() == "POST"
     assert cols["request_url_str"][0].as_py() == req.url.to_string()
 
-    url_struct = cols["request_url"][0].as_py()
-    assert isinstance(url_struct, dict)
-    assert url_struct.get("host") is not None
+    # ✅ flattened URL columns (no request_url struct anymore)
+    assert cols["request_url_scheme"][0].as_py() == req.url.scheme
+    assert cols["request_url_userinfo"][0].as_py() == req.url.userinfo
+    assert cols["request_url_host"][0].as_py() == req.url.host
+    assert cols["request_url_port"][0].as_py() == req.url.port
+    assert cols["request_url_path"][0].as_py() == req.url.path
+    assert cols["request_url_query"][0].as_py() == req.url.query
+    assert cols["request_url_fragment"][0].as_py() == req.url.fragment
 
     headers_map = map_as_dict(cols["request_headers"][0].as_py())
     assert headers_map["A"] == "1"
@@ -307,7 +313,9 @@ def test_to_arrow_batch_schema_and_values(sample_url_str):
     assert isinstance(body_hash, (bytes, bytearray))
     assert len(body_hash) == 32
 
-    assert cols["request_sent_at"][0].as_py() == datetime.datetime(1970, 1, 1, 0, 0, 0, 123, tzinfo=datetime.timezone.utc)
+    assert cols["request_sent_at"][0].as_py() == datetime.datetime(
+        1970, 1, 1, 0, 0, 0, 123, tzinfo=datetime.timezone.utc
+    )
     assert cols["request_sent_at_epoch"][0].as_py() == 123
 
 

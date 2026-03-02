@@ -1055,17 +1055,6 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
 
         cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
         data_df = any_to_spark_dataframe(data, cast_options)
-
-        if match_by:
-            notnull = None
-            for k in match_by:
-                if k not in data_df.columns:
-                    raise ValueError(f"Missing match key '{k}' in DataFrame columns: {data_df.columns}")
-                notnull = data_df[k].isNotNull() if notnull is None else notnull & data_df[k].isNotNull()
-
-            data_df = data_df.filter(notnull)
-            logger.debug("Filtered null keys for match_by=%s", match_by)
-
         target = self.spark_table(full_name=location)
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
