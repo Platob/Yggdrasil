@@ -1,10 +1,8 @@
 # test_infinite_threadpool.py
 from __future__ import annotations
 
-import time
 import threading
-import logging
-from collections import deque
+import time
 
 import pytest
 
@@ -46,7 +44,7 @@ def test_as_completed_unordered_yields_all_results():
     jobs = [mk(i) for i in range(20)]
 
     with JobPoolExecutor(max_workers=4, max_in_flight=8) as ex:
-        out = list(ex.as_completed(jobs, ordered=False))
+        out = list(_.result for _ in ex.as_completed(jobs, ordered=False))
         assert set(out) == {i + 1 for i in range(20)}
         assert len(out) == 20
 
@@ -65,7 +63,7 @@ def test_as_completed_ordered_yields_submission_order_even_if_slow_head():
     ]
 
     with JobPoolExecutor(max_workers=4, max_in_flight=4) as ex:
-        out = list(ex.as_completed(jobs, ordered=True))
+        out = list(_.result for _ in ex.as_completed(jobs, ordered=True))
         assert out == [0, 1, 2, 3]
 
 
@@ -82,7 +80,7 @@ def test_as_completed_unordered_completes_fast_jobs_first_typically():
     ]
 
     with JobPoolExecutor(max_workers=2, max_in_flight=2) as ex:
-        out = list(ex.as_completed(jobs, ordered=False))
+        out = list(_.result for _ in ex.as_completed(jobs, ordered=False))
         assert set(out) == {"slow", "fast"}
         # Most of the time, "fast" will appear first; allow rare scheduling weirdness:
         assert out[0] in {"slow", "fast"}
@@ -139,7 +137,7 @@ def test_max_in_flight_bounds_in_unordered_mode():
     jobs = [Job.make(work, i) for i in range(50)]
 
     with JobPoolExecutor(max_workers=32, max_in_flight=5) as ex:
-        it = ex.as_completed(jobs, ordered=False)
+        it = (_.result for _ in ex.as_completed(jobs, ordered=False))
         # allow executor to start submitting/running
         time.sleep(0.05)
         release.set()
@@ -165,7 +163,7 @@ def test_cancel_on_exit_cancels_not_done_futures_best_effort():
     # Consume just one result (none will complete until release, so we need to release briefly)
     release.set()
     first = next(gen)
-    assert isinstance(first, int)
+    assert isinstance(first.result, int)
 
     # Stop consuming: trigger generator finalizer by closing it.
     gen.close()
@@ -179,7 +177,7 @@ def test_shutdown_on_exit_shuts_down_executor():
     jobs = [Job.make(lambda i=i: i) for i in range(5)]
 
     ex = JobPoolExecutor(max_workers=2, max_in_flight=2)
-    out = list(ex.as_completed(jobs, ordered=False, shutdown_on_exit=True, shutdown_wait=True))
+    out = list(_.result for _ in ex.as_completed(jobs, ordered=False, shutdown_on_exit=True, shutdown_wait=True))
     assert set(out) == set(range(5))
 
     with pytest.raises(RuntimeError):
@@ -226,5 +224,5 @@ def test_ordered_mode_uses_deque_inflight_and_yields_all():
     jobs = [Job.make(f, i) for i in range(15)]
 
     with JobPoolExecutor(max_workers=3, max_in_flight=4) as ex:
-        out = list(ex.as_completed(jobs, ordered=True))
+        out = list(_.result for _ in ex.as_completed(jobs, ordered=True))
         assert out == [i * i for i in range(15)]

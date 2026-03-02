@@ -236,10 +236,10 @@ def test_prepare_with_body_sets_content_length(sample_url_str):
 def test_prepare_to_send_sets_timestamp_only_when_requested(sample_url_str):
     req = PreparedRequest.prepare(method="GET", url=sample_url_str)
 
-    out = req.prepare_to_send(add_statistics=True)
+    out = req.prepare_to_send(sniff=True)
     assert out.sent_at_timestamp > 0
 
-    out2 = req.prepare_to_send(add_statistics=False)
+    out2 = req.prepare_to_send(sniff=False)
     assert out2.sent_at_timestamp == 0
 
 
@@ -251,7 +251,7 @@ def test_prepare_to_send_applies_before_send(sample_url_str):
 
     req.before_send = before_send
 
-    out = req.prepare_to_send(add_statistics=True)
+    out = req.prepare_to_send(sniff=True)
     assert out.headers == {"X": "y"}
     assert out.sent_at_timestamp > 0
 

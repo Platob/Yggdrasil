@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import json as json_module
 import time
 from dataclasses import dataclass, replace, MISSING
@@ -10,11 +9,13 @@ from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.enums.mime_type import MimeType
 from yggdrasil.io.headers import anonymize_headers
+from yggdrasil.version import __version__ as YGG_VERSION
 from .buffer import BytesIO
 from .url import URL
 
 __all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
 
+from ..environ import UserInfo
 
 # ----------------------------
 # Arrow schema
@@ -123,7 +124,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
 class PreparedRequest:
     method: str
     url: URL
-    headers: Mapping[str, str]
+    headers: MutableMapping[str, str]
     tags: Optional[Mapping[str, str]]
     buffer: Optional[BytesIO]
     sent_at_timestamp: int = 0  # time.time_ns() // 1000
@@ -139,7 +140,7 @@ class PreparedRequest:
         prefix: str = "request_"
     ):
         if isinstance(obj, (str, bytes)):
-            obj = json.loads(obj)
+            obj = json_module.loads(obj)
 
         if isinstance(obj, dict):
             return cls.parse_dict(obj, normalize=normalize, prefix=prefix)
@@ -321,13 +322,40 @@ class PreparedRequest:
             before_send=before_send,
         )
 
-    def prepare_to_send(self, add_statistics: bool):
+    def prepare_to_send(self, sniff: bool):
         if self.before_send is not None:
             instance = self.before_send(self)
         else:
             instance = self
 
-        instance.sent_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
+        if sniff:
+            if self.headers is None:
+                self.headers = {}
+
+            usr = UserInfo.current()
+
+            if YGG_VERSION:
+                self.headers["X-YGG-Version"] = YGG_VERSION
+
+            if usr.product:
+                self.headers["X-YGG-Product"] = usr.product
+
+            if usr.product_version:
+                self.headers["X-YGG-Product-Version"] = usr.product_version
+
+            if usr.email:
+                self.headers["X-YGG-User-Mail"] = usr.email
+
+            if usr.hostname:
+                self.headers["X-YGG-User-Host"] = usr.hostname
+
+            if usr.url:
+                self.headers["X-YGG-User-URL"] = usr.url.to_string()
+
+            if usr.git_url:
+                self.headers["X-YGG-Git-URL"] = usr.git_url.to_string()
+
+        instance.sent_at_timestamp = time.time_ns() // 1000 if sniff else 0
         return instance
 
     # ... parse_any / parse_str / parse_dict unchanged ...

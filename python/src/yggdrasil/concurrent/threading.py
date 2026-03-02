@@ -13,25 +13,28 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import Any, Callable, Deque, Dict, Generator, Iterable, Iterator, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Optional, Set, Tuple, Generic, TypeVar
 
-__all__ = ["Job", "JobPoolExecutor"]
+__all__ = ["Job", "JobResult", "JobPoolExecutor"]
 
 
 LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
-class Job:
+class Job(Generic[T]):
     """Immutable bundle describing a unit of work."""
-
-    @classmethod
-    def make(cls, func: Callable[..., Any], *args: Any, **kwargs: Any) -> "Job":
-        return cls(func=func, args=args, kwargs=kwargs)
-
-    func: Callable[..., Any]
+    func: Callable[..., T]
     args: Tuple[Any, ...] = field(default_factory=tuple)
     kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> T:
+        return self.func(*args, **kwargs)
+
+    @classmethod
+    def make(cls, func: Callable[..., T], *args: Any, **kwargs: Any) -> "Job[T]":
+        return cls(func=func, args=args, kwargs=kwargs)
 
     def run(self) -> Any:
         return self.func(*self.args, **self.kwargs)
@@ -44,6 +47,13 @@ class Job:
         )
 
         t.start()
+
+
+@dataclass(frozen=True, slots=True)
+class JobResult(Generic[T]):
+    """Immutable bundle describing a unit of work."""
+    result: Any
+    exception: Optional[BaseException]
 
 
 class JobPoolExecutor(ThreadPoolExecutor):
@@ -110,7 +120,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         fut: Future,
         raise_error: bool,
         pending: list
-    ) -> Tuple[Future, Any, Optional[BaseException]]:
+    ) -> JobResult:
         exc = fut.exception()
         if exc is not None:
             if raise_error:
@@ -119,12 +129,12 @@ class JobPoolExecutor(ThreadPoolExecutor):
 
             LOGGER.exception(exc)
 
-            return fut, None, exc
-        return fut, fut.result(), None
+            return JobResult(None, exc)
+        return JobResult(fut.result(), None)
 
     def as_completed(
         self,
-        job_generator: Iterable[Job],
+        jobs: Iterable[Job[T]],
         *,
         ordered: bool = False,
         max_in_flight: Optional[int] = None,
@@ -132,7 +142,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         shutdown_on_exit: bool = False,
         shutdown_wait: bool = False,
         raise_error: bool = True,
-    ) -> Generator[Tuple[Future, Any, Optional[BaseException]], None, None]:
+    ) -> Iterator[JobResult[T]]:
         """
         Consume a (possibly infinite) Job iterable and yield (future, result, exc) triples.
 
@@ -145,7 +155,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         being returned as the third element.
         """
         max_in_flight = max_in_flight or self.max_in_flight
-        it = iter(job_generator)
+        it = iter(jobs)
 
         if ordered:
             inflight: Deque[Future] = deque()
@@ -162,14 +172,16 @@ class JobPoolExecutor(ThreadPoolExecutor):
                     if not head.done():
                         wait({head}, return_when=FIRST_COMPLETED)
 
-                    f, result, exc = self._unpack(
+                    job_result = self._unpack(
                         inflight.popleft(),
                         raise_error=raise_error,
                         pending=inflight,
                     )
 
-                    if exc is None:
-                        yield result
+                    if job_result.exception is None:
+                        yield job_result
+                    elif raise_error:
+                        raise job_result.exception
 
                     fut = self._try_submit_next(it)
                     if fut is not None:
@@ -197,14 +209,16 @@ class JobPoolExecutor(ThreadPoolExecutor):
                     for fut in done:
                         pending.discard(fut)
 
-                        f, result, exc = self._unpack(
+                        job_result = self._unpack(
                             fut,
                             raise_error=raise_error,
                             pending=pending,
                         )
 
-                        if exc is None:
-                            yield result
+                        if job_result.exception is None:
+                            yield job_result
+                        elif raise_error:
+                            raise job_result.exception
 
                         new_fut = self._try_submit_next(it)
                         if new_fut is not None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-
 __all__ = [
     "VersionInfo",
     "__version_info__",
@@ -25,6 +24,5 @@ class VersionInfo(NamedTuple):
         return base
 
 
-# module-level constant (PEP 440-ish / semver-ish hybrid)
-__version_info__ = VersionInfo(0, 4, 1)
+__version_info__ = VersionInfo(0, 4, 2)
 __version__ = str(__version_info__)

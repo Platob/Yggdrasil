@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import base64
-import time
 import datetime as dt
+import itertools
+import time
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Union, Literal, Iterator, Any
+from typing import Optional, TYPE_CHECKING, Literal, Iterator, Any
 
 import urllib3
 from urllib3 import BaseHTTPResponse
@@ -134,9 +135,9 @@ class HTTPSession(Session):
             return int(v.timestamp() * 1_000_000)
 
         clauses: list[str] = [
-            fmt("request_url_host", "=", request.url.host),
-            fmt("request_url_path", "=", request.url.path),
-            fmt("request_url_query", "=", request.url.query),
+            fmt("request_url.host", "=", request.url.host),
+            fmt("request_url.path", "=", request.url.path),
+            fmt("request_url.query", "=", request.url.query),
             fmt("request_body_hash", "=", request.body.blake3().digest() if request.body else None),
         ]
 
@@ -154,9 +155,9 @@ class HTTPSession(Session):
         *,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
-        add_statistics: Optional[bool] = None,
+        sniff: Optional[bool] = None,
         stream: bool = True,
-        cache: Optional[Union["Table", bool]] = None,
+        cache: Optional["Table"] = None,
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
         anonymize: Literal["remove", "redact", "hash"] = "remove",
@@ -165,8 +166,8 @@ class HTTPSession(Session):
         Implementation of the abstract send method.
         Handles the actual urllib3 network call and custom retry logic.
         """
-        if add_statistics is None:
-            add_statistics = cache is not None
+        if sniff is None:
+            sniff = cache is not None
 
         if cache is not None:
             anon = request.anonymize(mode=anonymize)
@@ -200,7 +201,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
 
         for iteration in range(num_tries):
             resp: BaseHTTPResponse | None = None
-            request = request.prepare_to_send(add_statistics=add_statistics)
+            request = request.prepare_to_send(sniff=sniff)
 
             try:
                 resp = http_pool.request(
@@ -214,7 +215,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                     redirect=True,
                 )
 
-                received_at_timestamp = time.time_ns() // 1000 if add_statistics else 0
+                received_at_timestamp = time.time_ns() // 1000 if sniff else 0
 
                 # Custom handling for retryable status codes
                 if resp.status in RETRYABLE_STATUS:
@@ -269,19 +270,22 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
         *,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
-        add_statistics: Optional[bool] = None,
+        sniff: Optional[bool] = None,
         stream: bool = True,
         cache: Optional["Table"] = None,
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
         wait_cache: WaitingConfigArg = False,
-        ordered: bool = False,
+        pool: Optional[JobPoolExecutor, int] = None,
         batch_size: Optional[int] = None,
-        pool: Optional[JobPoolExecutor | int] = None,
-        max_in_flight: Optional[int] = None
-    ):
-        if add_statistics is None:
-            add_statistics = cache is not None
+        ordered: bool = False,
+        max_in_flight: Optional[int] = None,
+        cancel_on_exit: bool = False,
+        shutdown_on_exit: bool = False,
+        shutdown_wait: bool = False,
+    ) -> Iterator[HTTPResponse]:
+        if sniff is None:
+            sniff = cache is not None
 
         # Default worker count to pool_maxsize so the thread pool and the
         # connection pool are naturally matched — no thread ever waits on a
@@ -299,22 +303,28 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                         yield Job.make(
                             self.send,
                             req,
-                            wait=wait, raise_error=raise_error,
-                            add_statistics=add_statistics,
+                            wait=wait,
+                            raise_error=raise_error,
+                            sniff=sniff,
                             stream=stream
                         )
 
-                yield from pool.as_completed(
+                for result in pool.as_completed(
                     jobs(),
                     ordered=ordered,
                     max_in_flight=max_in_flight,
                     cancel_on_exit=True,
                     shutdown_on_exit=True,
-                    raise_error=raise_error
-                )
-            else:
-                import itertools
+                    raise_error=True
+                ):
+                    resp = result.result
 
+                    if raise_error:
+                        resp.raise_for_status()
+                        yield resp
+                    elif resp.ok:
+                        yield resp
+            else:
                 def _batched(it: Iterator, n: int) -> Iterator[list]:
                     it = iter(it)
                     while True:
@@ -362,7 +372,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                             anon.url.host,
                             anon.url.path,
                             anon.url.query,
-                            base64.b64encode(req.body.blake3().digest()) if req.body else None,
+                            req.body.blake3().digest() if req.body else None,
                         )
 
                     cache_map: dict[tuple, HTTPResponse] = {}
@@ -392,33 +402,33 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                     def miss_jobs():
                         for req in misses:
                             yield Job.make(
-                                self.send, req,
+                                self.send,
+                                req,
                                 wait=wait,
                                 raise_error=raise_error,
-                                add_statistics=add_statistics,
+                                add_statistics=sniff,
                                 stream=stream,
                                 cache=None,  # avoid double-caching inside send()
                             )
 
                     to_insert: list[HTTPResponse] = []
+                    failed: list[HTTPResponse] = []
 
-                    for resp in pool.as_completed(
+                    for result in pool.as_completed(
                         miss_jobs(),
                         ordered=ordered,
                         max_in_flight=max_in_flight,
                         cancel_on_exit=True,
                         shutdown_on_exit=False,  # pool is shared across batches
-                        raise_error=False,
+                        raise_error=True,
                     ):
-                        if resp is not None:
-                            if resp.ok:
-                                to_insert.append(resp)
+                        resp = result.result
 
-                            if raise_error:
-                                resp.raise_for_status()
-                                yield resp
-                            elif resp.ok:
-                                yield resp
+                        if resp.ok:
+                            to_insert.append(resp)
+                            yield resp
+                        else:
+                            failed.append(resp)
 
                     # ── Bulk insert successful responses ─────────────────────────
                     if to_insert:
@@ -438,3 +448,6 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                             ],
                             wait=wait_cache
                         )
+
+                    if raise_error and failed:
+                        failed[-1].raise_for_status()

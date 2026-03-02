@@ -1166,7 +1166,6 @@ class PyEnv:
         if not packages:
             return None
         cmd = self._pip_cmd_args() + ["install", "--upgrade", *packages, *extra_args]
-        logger.info("update: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
 
     def uninstall(
@@ -1197,7 +1196,6 @@ class PyEnv:
         if not packages:
             return None
         cmd = self._pip_cmd_args() + ["uninstall", *packages, *extra_args]
-        logger.info("uninstall: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
 
     def pip(

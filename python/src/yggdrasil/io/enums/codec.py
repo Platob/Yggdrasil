@@ -160,6 +160,7 @@ class Codec(abc.ABC):
             fh: IO[bytes] = _io.BytesIO(bytes(src))
             saved = 0
         else:
+            from ..buffer.bytes_io import BytesIO
             fh = BytesIO.wrap(src)
             saved = fh.tell()
 
@@ -439,6 +440,7 @@ class _ZlibCodec(Codec):
             fh: IO[bytes] = _io.BytesIO(bytes(src))
             saved = 0
         else:
+            from ..buffer.bytes_io import BytesIO
             fh = BytesIO.wrap(src)
             saved = fh.tell()
 

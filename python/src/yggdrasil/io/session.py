@@ -1,14 +1,11 @@
-import threading
 import datetime as dt
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable
 
 from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
-from yggdrasil.environ import UserInfo
-from yggdrasil.version import __version__ as YGG_VERSION
-
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import Response
@@ -377,8 +374,7 @@ class Session(ABC):
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
         *,
         json: Optional[Any] = None,
-        normalize: bool = True,
-        sniff: bool = True
+        normalize: bool = True
     ) -> PreparedRequest:
         full_url = url
         if self.base_url:
@@ -392,30 +388,6 @@ class Session(ABC):
             items = list(u.query_items(keep_blank_values=True))
             items.extend((k, v) for k, v in params.items())
             full_url = u.with_query_items(tuple(items))
-
-        if sniff:
-            if headers is None:
-                headers = {}
-
-            usr = UserInfo.current()
-
-            if YGG_VERSION:
-                headers["X-YGG-Version"] = YGG_VERSION
-
-            if usr.product:
-                headers["X-YGG-Product"] = usr.product
-
-            if usr.product_version:
-                headers["X-YGG-Product-Version"] = usr.product_version
-
-            if usr.email:
-                headers["X-YGG-User-Mail"] = usr.email
-
-            if usr.hostname:
-                headers["X-YGG-User-Host"] = usr.hostname
-
-            if usr.git_url:
-                headers["X-YGG-Git-URL"] = usr.git_url.to_string()
 
         return PreparedRequest.prepare(
             method=method,

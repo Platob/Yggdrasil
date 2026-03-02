@@ -351,7 +351,7 @@ class StatementResult(BaseStatementResult):
                     yield Job.make(extract_batches, link.external_link)
 
         with JobPoolExecutor.parse(max_workers or 4) as ex:
-            for f in ex.as_completed(
+            for result in ex.as_completed(
                 jobs(),
                 ordered=maintain_order,
                 max_in_flight=max_in_flight,
@@ -359,7 +359,7 @@ class StatementResult(BaseStatementResult):
                 shutdown_on_exit=True,
                 shutdown_wait=False,
             ):
-                for batch in f:
+                for batch in result.result:
                     yield batch
 
     def to_arrow_reader(
