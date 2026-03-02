@@ -406,7 +406,7 @@ where {self._sql_match_clause(anon, received_from=received_from, received_to=rec
                                 req,
                                 wait=wait,
                                 raise_error=raise_error,
-                                add_statistics=sniff,
+                                sniff=sniff,
                                 stream=stream,
                                 cache=None,  # avoid double-caching inside send()
                             )
