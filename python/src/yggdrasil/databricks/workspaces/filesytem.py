@@ -59,7 +59,7 @@ class DatabricksFileSystemHandler(FileSystemHandler):
         """
         from .path import DatabricksPath
 
-        return DatabricksPath.parse(obj, workspace=self.workspace)
+        return DatabricksPath.parse(obj, client=self.workspace)
 
     def connect(self, clone: bool = True):
         """Connect the workspace and optionally return a cloned handler.

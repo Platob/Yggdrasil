@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Mapping, Tuple, Union, Any, Literal
+from typing import Any, Dict, Iterable, Literal, Mapping, Sequence, Type, TypeVar, Optional
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -15,6 +17,16 @@ from urllib.parse import (
 
 from yggdrasil.io.parameters import anonymize_parameters
 
+__all__ = [
+    "URL",
+    "URLResource",
+    "get_registered_url_resource",
+    "register_url_resource",
+    "registered_url_schemes",
+    "url_resource_class",
+]
+T = TypeVar("T", bound="URLResource")
+
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 _SAFE_PATH = "/:@-._~!$&'()*+,;="
@@ -23,31 +35,36 @@ _SAFE_FRAGMENT = "-._~!$&'()*+,;=:@/?"
 
 _NO_PORT = 0
 
+_REGISTRY: Dict[str, Type["URLResource"]] = {}
 
-def _lower_if(s: str) -> str:
-    return s.lower() if s else ""
+
+def _lower_if(value: str) -> str:
+    return value.lower() if value else ""
 
 
 def _strip_trailing_dot(host: str) -> str:
-    if not host:
-        return host
     return host[:-1] if host.endswith(".") else host
 
 
 def _normalize_path(path: str) -> str:
     if not path:
-        return ""
-    if path != "/" and "//" in path:
-        while "//" in path:
-            path = path.replace("//", "/")
+        return "/"
+
+    if path == "/":
+        return path
+
+    if not path.startswith("/"):
+        path = "/" + os.path.realpath(path).replace("\\", "/")
+
+    while "//" in path:
+        path = path.replace("//", "/")
     return path
 
 
 def _remove_default_port(scheme: str, host: str, port: int) -> int:
     if not scheme or not host or port <= 0:
         return _NO_PORT
-    default = _DEFAULT_PORTS.get(scheme)
-    return _NO_PORT if default == port else port
+    return _NO_PORT if _DEFAULT_PORTS.get(scheme) == port else port
 
 
 def _encode_userinfo(userinfo: str) -> str:
@@ -66,8 +83,34 @@ def _encode_fragment(fragment: str) -> str:
     return quote(fragment, safe=_SAFE_FRAGMENT + "%")
 
 
-def _decode_maybe(s: str, decode: bool) -> str:
-    return unquote(s) if decode and s else s
+def _decode_maybe(value: str, decode: bool) -> str:
+    return unquote(value) if decode and value else value
+
+
+def _s(value: str | None) -> str:
+    return value or ""
+
+
+def _p(value: int | None) -> int:
+    return value or _NO_PORT
+
+
+def _normalize_query(query: str) -> str:
+    query = query.lstrip("?")
+    if not query:
+        return ""
+    items = parse_qsl(query, keep_blank_values=True)
+    items.sort(key=lambda item: (item[0], item[1]))
+    return urlencode(items, doseq=True)
+
+
+def _parse_port(value: Any) -> int:
+    if value in (None, "", 0):
+        return _NO_PORT
+    if isinstance(value, int):
+        return value if value > 0 else _NO_PORT
+    text = str(value)
+    return int(text) if text.isdigit() and int(text) > 0 else _NO_PORT
 
 
 def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
@@ -81,341 +124,308 @@ def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
         userinfo, hostport = netloc.rsplit("@", 1)
         userinfo = _decode_maybe(userinfo, decode)
 
-    host = ""
     port = _NO_PORT
 
     if hostport.startswith("["):
         rb = hostport.find("]")
         if rb == -1:
             return userinfo, hostport, _NO_PORT
+
         host = hostport[1:rb]
         rest = hostport[rb + 1 :]
         if rest.startswith(":") and len(rest) > 1:
-            p = rest[1:]
-            if p.isdigit():
-                port = int(p)
+            port = _parse_port(rest[1:])
         return userinfo, host, port
 
     if ":" in hostport:
-        h, p = hostport.rsplit(":", 1)
-        host = h
-        if p.isdigit():
-            port = int(p)
-    else:
-        host = hostport
+        host, port_text = hostport.rsplit(":", 1)
+        port = _parse_port(port_text)
+        return userinfo, host, port
 
-    return userinfo, host, port
-
-
-def _s(x: str | None) -> str:
-    """None-safe string: None -> ''."""
-    return x or ""
-
-
-def _p(x: int | None) -> int:
-    """None-safe port: None -> 0 (absent)."""
-    return x or _NO_PORT
+    return userinfo, hostport, _NO_PORT
 
 
 def _looks_like_local_path(raw: str) -> bool:
     if not raw:
         return False
 
-    s = raw.strip()
+    stripped = raw.strip()
+    split = urlsplit(stripped)
 
-    # If it has a scheme, it's not a local path.
-    # Note: urlsplit("C:\\x") sees scheme="c" sometimes if you don't normalize,
-    # so we handle Windows drive letters explicitly below.
-    sp = urlsplit(s)
-    if sp.scheme:
-        # Windows drive letter false-positive: "C:\x" -> scheme "c"
-        # Accept single-letter "scheme" followed by :\ or :/
-        if len(sp.scheme) == 1 and len(s) >= 3 and s[1] == ":" and s[2] in ("\\", "/"):
+    if split.scheme:
+        if len(split.scheme) == 1 and len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in ("\\", "/"):
             return True
         return False
 
-    if s.startswith(("/", "~", "./", "../")):
-        return True
-    if "/" in s or "\\" in s:
-        return True
-    return False
+    return stripped.startswith(("/", "~", "./", "../")) or "/" in stripped or "\\" in stripped
 
 
 def _pathlike_to_file_parts(raw: str | Path) -> tuple[str, str]:
-    """
-    Return (scheme, path) for a local file target.
-    Path is absolute, forward-slash normalized.
-    """
-    p = raw if isinstance(raw, Path) else Path(raw)
-    p = p.expanduser().resolve(strict=False)
-
-    # Path on Windows: as_posix() yields 'C:/x' (good for URL path component)
-    return "file", p.as_posix()
+    path = raw if isinstance(raw, Path) else Path(raw)
+    path = path.expanduser().resolve(strict=False)
+    return "file", path.as_posix()
 
 
-def _coerce_raw_to_file_url(raw: str) -> str | None:
-    """
-    If raw is a local path, return a canonical file:// URL string.
-    Otherwise return None.
-    """
-    if not _looks_like_local_path(raw):
-        return None
+def _normalize_components(
+    *,
+    scheme: str,
+    userinfo: str,
+    host: str,
+    port: int,
+    path: str,
+    query: str,
+    fragment: str,
+) -> tuple[str, str, int, str, str, str]:
+    scheme_n = _lower_if(scheme)
+    host_n = _strip_trailing_dot(_lower_if(host))
+    port_n = _remove_default_port(scheme_n, host_n, port)
+    path_n = _normalize_path(path)
+    query_n = _normalize_query(query)
+    fragment_n = fragment.lstrip("#")
 
-    scheme, path = _pathlike_to_file_parts(raw)
-
-    # Build a proper file URL string (no netloc). Encoding is handled later by URL.to_string().
-    # Use urlunsplit so we get 'file:///abs/path' behavior with empty netloc.
-    # Note: urlunsplit wants path already with leading '/' for absolute paths.
-    # On Windows, path like 'C:/x' is not leading '/', but file URIs are 'file:///C:/x'.
-    # We fix that by prefixing '/' when it looks like a drive path.
-    if len(path) >= 2 and path[1] == ":":
-        path = "/" + path
-
-    return urlunsplit((scheme, "", path, "", ""))
+    return scheme_n, host_n, port_n, path_n, query_n, fragment_n
 
 
 @dataclass(frozen=True, slots=True)
 class URL:
-    scheme: str | None = None
+    scheme: str = ""
     userinfo: str | None = None
-    host: str | None = None
-    port: int | None = None  # None/0 means absent
-    path: str | None = None
+    host: str = ""
+    port: int | None = None
+    path: str = "/"
     query: str | None = None
     fragment: str | None = None
 
-    # caches (not part of repr/eq)
     _str_enc: str | None = field(default=None, init=False, repr=False, compare=False)
     _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
+
+    @classmethod
+    def empty(cls) -> "URL":
+        return _EMPTY_URL
 
     @classmethod
     def parse(
         cls,
         obj: Any,
         *,
+        default_scheme: Optional[str] = None,
         decode: bool = False,
         normalize: bool = True,
-    ):
+    ) -> URL:
         if isinstance(obj, cls):
             return obj
 
-        if isinstance(obj, dict):
+        if isinstance(obj, Mapping):
             return cls.parse_dict(obj, decode=decode, normalize=normalize)
 
         if isinstance(obj, Path):
             scheme, path = _pathlike_to_file_parts(obj)
-            # We keep path unencoded; to_string(encode=True) will encode.
             return cls.parse_dict(
-                {"scheme": scheme, "path": path},
+                {"scheme": default_scheme or scheme, "path": path},
                 decode=decode,
                 normalize=normalize,
             )
 
-        return cls.parse_str(raw=str(obj), decode=decode, normalize=normalize)
+        return cls.parse_str(
+            str(obj),
+            default_scheme=default_scheme,
+            decode=decode,
+            normalize=normalize
+        )
 
     @classmethod
     def parse_str(
         cls,
         raw: str,
         *,
+        default_scheme: Optional[str] = None,
         decode: bool = False,
         normalize: bool = True,
-    ) -> "URL":
-        # If it's a local path (or looks like one), coerce to file:// first.
-        # This avoids urlsplit weirdness (esp. Windows drive letters).
+    ) -> URL:
+        split = urlsplit(raw)
+        userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
+
+        scheme = default_scheme or split.scheme
+        path = _decode_maybe(split.path, decode)
+        query = _decode_maybe(split.query, decode)
+        fragment = _decode_maybe(split.fragment, decode)
+
+        if scheme not in ("file", None) and not host and path:
+            if "/" in path:
+                host, path = path.split("/", 1)
+                path = "/" + path.lstrip("/")
+            else:
+                host = path
+                path = "/"
+
         if normalize:
-            coerced = _coerce_raw_to_file_url(raw)
-            if coerced is not None:
-                raw = coerced
-
-        sp = urlsplit(raw)
-
-        scheme = sp.scheme or ""
-        userinfo, host, port = _parse_netloc(sp.netloc, decode=decode)
-
-        path = _decode_maybe(sp.path, decode)
-        query = _decode_maybe(sp.query, decode)
-        fragment = _decode_maybe(sp.fragment, decode)
-
-        if not normalize:
-            return URL(
-                scheme=scheme or None,
-                userinfo=userinfo or None,
-                host=host or None,
-                port=port or None,
-                path=path or None,
-                query=query or None,
-                fragment=fragment or None,
+            scheme, host, port, path, query, fragment = _normalize_components(
+                scheme=scheme,
+                userinfo=userinfo,
+                host=host,
+                port=port,
+                path=path,
+                query=query,
+                fragment=fragment,
             )
 
-        scheme_n = _lower_if(scheme)
-        host_n = _strip_trailing_dot(_lower_if(host))
-        path_n = _normalize_path(path)
-        port_n = _remove_default_port(scheme_n, host_n, port)
-
-        # Canonicalize file:// paths a bit:
-        # - ensure absolute Windows drive paths stay as /C:/...
-        if scheme_n == "file" and path_n:
-            if len(path_n) >= 2 and path_n[1] == ":":
-                path_n = "/" + path_n
-
-        query_n = query
-        if query_n:
-            items = parse_qsl(query_n, keep_blank_values=True)
-            items.sort(key=lambda kv: (kv[0], kv[1]))
-            query_n = urlencode(items, doseq=True)
-
         return cls(
-            scheme=scheme_n or None,
+            scheme=scheme,
             userinfo=userinfo or None,
-            host=host_n or None,
-            port=port_n or None,
-            path=path_n or None,
-            query=query_n or None,
+            host=host,
+            port=port or None,
+            path=path or "/",
+            query=query or None,
             fragment=fragment or None,
         )
 
     @classmethod
     def parse_dict(
         cls,
-        d: Mapping[str, Any],
+        data: Mapping[str, Any],
         *,
         decode: bool = False,
         normalize: bool = True,
-    ) -> "URL":
-        if not d:
+    ) -> URL:
+        if not data:
             return cls()
 
-        raw = d.get("url") or d.get("raw")
+        raw = data.get("url") or data.get("raw")
         if raw is not None:
             return cls.parse_str(str(raw), decode=decode, normalize=normalize)
 
-        scheme = str(d.get("scheme") or "")
-        path = str(d.get("path") or "")
-        query = str(d.get("query") or "")
-        fragment = str(d.get("fragment") or "")
+        scheme = str(data.get("scheme") or "")
+        path = str(data.get("path") or "")
+        query = str(data.get("query") or "")
+        fragment = str(data.get("fragment") or "")
 
-        netloc = d.get("netloc")
+        netloc = data.get("netloc")
         if netloc is None:
-            netloc = d.get("authority")
-        netloc_s = str(netloc) if netloc is not None else ""
+            netloc = data.get("authority")
 
         userinfo = ""
         host = ""
         port = _NO_PORT
-        if netloc_s:
-            userinfo, host, port = _parse_netloc(netloc_s, decode=decode)
 
-        if "userinfo" in d and d["userinfo"] is not None:
-            userinfo = _decode_maybe(str(d["userinfo"]), decode)
+        if netloc is not None:
+            userinfo, host, port = _parse_netloc(str(netloc), decode=decode)
 
-        if "host" in d and d["host"] is not None:
-            host = _decode_maybe(str(d["host"]), decode)
+        if data.get("userinfo") is not None:
+            userinfo = _decode_maybe(str(data["userinfo"]), decode)
 
-        if "port" in d:
-            p = d.get("port")
-            if p is None or p == "" or p == 0:
-                port = _NO_PORT
-            elif isinstance(p, int):
-                port = p if p > 0 else _NO_PORT
-            else:
-                ps = str(p)
-                port = int(ps) if ps.isdigit() and int(ps) > 0 else _NO_PORT
+        if data.get("host") is not None:
+            host = _decode_maybe(str(data["host"]), decode)
+
+        if "port" in data:
+            port = _parse_port(data.get("port"))
 
         path = _decode_maybe(path, decode)
         query = _decode_maybe(query, decode)
         fragment = _decode_maybe(fragment, decode)
 
-        if not normalize:
-            return cls(
-                scheme=scheme or None,
-                userinfo=userinfo or None,
-                host=host or None,
-                port=port or None,
-                path=path or None,
-                query=(query.lstrip("?") or None),
-                fragment=(fragment.lstrip("#") or None),
+        if normalize:
+            scheme, host, port, path, query, fragment = _normalize_components(
+                scheme=scheme,
+                userinfo=userinfo,
+                host=host,
+                port=port,
+                path=path,
+                query=query,
+                fragment=fragment,
             )
-
-        scheme_n = _lower_if(scheme)
-        host_n = _strip_trailing_dot(_lower_if(host))
-        path_n = _normalize_path(path)
-        port_n = _remove_default_port(scheme_n, host_n, port)
-
-        query_n = query.lstrip("?")
-        if query_n:
-            items = parse_qsl(query_n, keep_blank_values=True)
-            items.sort(key=lambda kv: (kv[0], kv[1]))
-            query_n = urlencode(items, doseq=True)
-
-        fragment_n = fragment.lstrip("#")
+        else:
+            query = query.lstrip("?")
+            fragment = fragment.lstrip("#")
 
         return cls(
-            scheme=scheme_n or None,
+            scheme=scheme,
             userinfo=userinfo or None,
-            host=host_n or None,
-            port=port_n or None,
-            path=path_n or None,
-            query=query_n or None,
-            fragment=fragment_n or None,
+            host=host,
+            port=port or None,
+            path=path or "",
+            query=query or None,
+            fragment=fragment or None,
         )
 
     def __str__(self) -> str:
         return self.to_string()
 
-    def __truediv__(self, other):
-        if isinstance(other, str):
-            return self.with_path(path=other)
-        raise ValueError("Cannot join %s with %s" % (self, type(other)))
+    def __truediv__(self, other: object) -> URL:
+        if not isinstance(other, str):
+            raise ValueError(f"Cannot join {self} with {type(other)}")
+        return self.with_path(other)
+
+    def _replace(self, **changes: Any) -> URL:
+        return replace(self, **changes)
 
     @property
-    def query_dict(self) -> Mapping[str, Tuple[str, ...]]:
-        q = _s(self.query)
-        if not q:
+    def user(self) -> str | None:
+        ui = self.userinfo
+        if ui is None:
+            return None
+        if ":" in ui:
+            return unquote(ui.split(":", 1)[0])
+        return unquote(ui)
+
+    @property
+    def password(self) -> str | None:
+        ui = self.userinfo
+        if ui is None or ":" not in ui:
+            return None
+        return unquote(ui.split(":", 1)[1])
+
+    def with_user_password(self, user: str | None, password: str | None = None) -> URL:
+        if user is None and password is None:
+            if self.userinfo:
+                return self.with_userinfo(None)
+            return self
+
+        user_encoded = "" if user is None else quote(str(user), safe="")
+        if password is None:
+            return self.with_userinfo(user_encoded)
+
+        password_encoded = quote(str(password), safe="")
+        return self.with_userinfo(f"{user_encoded}:{password_encoded}")
+
+    @property
+    def query_dict(self) -> Mapping[str, tuple[str, ...]]:
+        if not self.query:
             return {}
 
         out: dict[str, list[str]] = {}
-        for k, v in parse_qsl(q, keep_blank_values=True):
-            out.setdefault(k, []).append(v)
+        for key, value in parse_qsl(self.query, keep_blank_values=True):
+            out.setdefault(key, []).append(value)
 
-        return {k: tuple(vs) for k, vs in out.items()}
+        return {key: tuple(values) for key, values in out.items()}
 
     @property
-    def is_absolute(self):
-        return bool(_s(self.scheme)) and bool(_s(self.host))
+    def is_absolute(self) -> bool:
+        return bool(self.scheme) and bool(self.host)
 
     def to_string(self, *, encode: bool = True) -> str:
-        # fast path
-        if encode:
-            cached = self._str_enc
-            if cached is not None:
-                return cached
-        else:
-            cached = self._str_raw
-            if cached is not None:
-                return cached
+        cache_name = "_str_enc" if encode else "_str_raw"
+        cached = getattr(self, cache_name)
+        if cached is not None:
+            return cached
 
-        scheme = _s(self.scheme)
-        host = _s(self.host)
+        scheme = self.scheme
+        host = self.host
         userinfo = _s(self.userinfo)
-        path = _s(self.path)
+        path = self.path
         query = _s(self.query)
         fragment = _s(self.fragment)
         port = _p(self.port)
 
         if encode:
-            if userinfo:
-                userinfo = _encode_userinfo(userinfo)
+            userinfo = _encode_userinfo(userinfo)
             path = _encode_path(path)
             query = _encode_query(query)
             fragment = _encode_fragment(fragment)
 
         netloc = ""
         if host:
-            out_host = host
-            if ":" in out_host and not out_host.startswith("["):
-                out_host = f"[{out_host}]"
-            netloc = out_host
+            host_text = f"[{host}]" if ":" in host and not host.startswith("[") else host
+            netloc = host_text
 
             if port > 0:
                 netloc = f"{netloc}:{port}"
@@ -423,171 +433,119 @@ class URL:
             if userinfo:
                 netloc = f"{userinfo}@{netloc}"
 
-        s = urlunsplit((scheme, netloc, path, query, fragment))
-
-        # store
-        if encode:
-            object.__setattr__(self, "_str_enc", s)
-        else:
-            object.__setattr__(self, "_str_raw", s)
-
-        return s
+        rendered = urlunsplit((scheme, netloc, path, query, fragment))
+        object.__setattr__(self, cache_name, rendered)
+        return rendered
 
     @property
     def authority(self) -> str:
-        host = _s(self.host)
-        if not host:
+        if not self.host:
             return ""
-        out_host = host
-        if ":" in out_host and not out_host.startswith("["):
-            out_host = f"[{out_host}]"
-        netloc = out_host
 
-        port = _p(self.port)
-        if port > 0:
-            netloc = f"{netloc}:{port}"
+        host_text = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
+        authority = host_text
 
-        userinfo = _s(self.userinfo)
-        if userinfo:
-            netloc = f"{userinfo}@{netloc}"
+        if _p(self.port) > 0:
+            authority = f"{authority}:{self.port}"
 
-        return netloc
+        if self.userinfo:
+            authority = f"{self.userinfo}@{authority}"
 
-    def join(self, ref: Union[str, "URL"]) -> "URL":
+        return authority
+
+    def join(self, ref: str | URL) -> URL:
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
         return URL.parse_str(urljoin(base, target), normalize=True)
 
-    # Immutable edits (nullable in, nullable out)
-    def with_scheme(self, scheme: str | None) -> "URL":
-        scheme_n = _lower_if(_s(scheme))
-        host = _s(self.host)
-        port_n = _remove_default_port(scheme_n, _strip_trailing_dot(_lower_if(host)), _p(self.port))
-        return URL(
-            scheme=scheme_n or None,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=port_n or None,
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
+    def with_scheme(self, scheme: str | None) -> URL:
+        scheme_text = _lower_if(_s(scheme))
+        port = _remove_default_port(scheme_text, _strip_trailing_dot(_lower_if(self.host)), _p(self.port))
+        return self._replace(scheme=scheme_text, port=port or None)
 
-    def with_userinfo(self, userinfo: str | None) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=(userinfo or None),
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
+    def with_userinfo(self, userinfo: str | None) -> URL:
+        return self._replace(userinfo=userinfo or None)
 
-    def with_host(self, host: str | None) -> "URL":
-        host_n = _strip_trailing_dot(_lower_if(_s(host)))
-        port_n = _remove_default_port(_s(self.scheme), host_n, _p(self.port))
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=host_n or None,
-            port=port_n or None,
-            path=self.path,
-            query=self.query,
-            fragment=self.fragment,
-        )
+    def with_host(self, host: str | None) -> URL:
+        host_text = _strip_trailing_dot(_lower_if(_s(host)))
+        port = _remove_default_port(self.scheme, host_text, _p(self.port))
+        return self._replace(host=host_text, port=port or None)
 
-    def with_path(self, path: str | None) -> "URL":
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=(_normalize_path(_s(path)) or None),
-            query=self.query,
-            fragment=self.fragment,
-        )
+    def with_path(self, path: str | None) -> URL:
+        return self._replace(path=_normalize_path(_s(path)))
 
-    def with_query(self, query: str | None) -> "URL":
-        q = _s(query).lstrip("?")
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=q or None,
-            fragment=self.fragment,
-        )
+    def with_query(self, query: str | None) -> URL:
+        query_text = _s(query).lstrip("?")
+        return self._replace(query=query_text or None)
 
-    def with_fragment(self, fragment: str | None) -> "URL":
-        f = _s(fragment).lstrip("#")
-        return URL(
-            scheme=self.scheme,
-            userinfo=self.userinfo,
-            host=self.host,
-            port=self.port,
-            path=self.path,
-            query=self.query,
-            fragment=f or None,
-        )
+    def with_fragment(self, fragment: str | None) -> URL:
+        fragment_text = _s(fragment).lstrip("#")
+        return self._replace(fragment=fragment_text or None)
 
-    # Query helpers
-    def query_items(self, *, keep_blank_values: bool = True) -> Tuple[Tuple[str, str], ...]:
-        q = _s(self.query)
-        if not q:
+    def query_items(self, *, keep_blank_values: bool = True) -> tuple[tuple[str, str], ...]:
+        if not self.query:
             return ()
-        return tuple(parse_qsl(q, keep_blank_values=keep_blank_values))
+        return tuple(parse_qsl(self.query, keep_blank_values=keep_blank_values))
 
-    def add_query_item(self, key: str, value: str, replace: bool = True) -> "URL":
-        """
-        Return a new URL with query param `key` set to `value`.
+    def query_mapping(self, *, keep_blank_values: bool = True) -> Mapping[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for key, value in self.query_items(keep_blank_values=keep_blank_values):
+            out.setdefault(key, []).append(value)
+        return out
 
-        - If `key` exists (possibly multiple times), all existing entries are removed.
-        - Then a single (`key`, `value`) is added.
-        - Keeps blank values.
-        - Normalizes to canonical form (sorted by (key, value)).
-        """
+    def add_query_item(self, key: str, value: str | None, replace: bool = True) -> URL:
         if key is None:
             raise ValueError("key cannot be None")
 
-        k = str(key)
-        v = "" if value is None else str(value)
+        key_text = str(key)
+        value_text = "" if value is None else str(value)
 
-        items = [(kk, vv) for (kk, vv) in self.query_items(keep_blank_values=True) if kk != k]
-        items.append((k, v))
-        items.sort(key=lambda kv: (kv[0], kv[1]))
+        items = list(self.query_items(keep_blank_values=True))
+        if replace:
+            items = [(k, v) for k, v in items if k != key_text]
 
+        items.append((key_text, value_text))
+        items.sort(key=lambda item: (item[0], item[1]))
         return self.with_query(urlencode(items, doseq=True))
 
     def with_query_items(
         self,
-        items: Mapping[str, str] | Tuple[Tuple[str, str], ...],
+        items: Mapping[str, str | Sequence[str]] | Iterable[tuple[str, str]],
         *,
         sort_keys: bool = True,
-    ) -> "URL":
-        seq = items if isinstance(items, tuple) else list(items.items())
+    ) -> URL:
+        pairs: list[tuple[str, str]] = []
+
+        if isinstance(items, Mapping):
+            for key, value in items.items():
+                if isinstance(value, (list, tuple)):
+                    pairs.extend((str(key), str(v)) for v in value)
+                else:
+                    pairs.append((str(key), str(value)))
+        else:
+            pairs.extend((str(key), str(value)) for key, value in items)
+
         if sort_keys:
-            seq = sorted(seq, key=lambda kv: kv[0])
-        q = urlencode(seq, doseq=True)
-        return self.with_query(q)
+            pairs.sort(key=lambda item: (item[0], item[1]))
+
+        return self.with_query(urlencode(pairs, doseq=True))
 
     def anonymize(
         self,
         mode: Literal["remove", "redact", "hash"] = "remove",
         *,
-        sort_keys: bool = True
-    ) -> "URL":
+        sort_keys: bool = True,
+    ) -> URL:
         result = self
 
-        if _s(self.query):
-            params = self.query_dict
-            anon = anonymize_parameters(params, mode=mode)
-            if params != anon:
-                result = self.with_query_items(anon, sort_keys=sort_keys)
+        if self.query:
+            current = self.query_dict
+            anonymized = anonymize_parameters(current, mode=mode)
+            if anonymized != current:
+                result = result.with_query_items(anonymized, sort_keys=sort_keys)
 
-        if _s(self.userinfo):
-            result = result.with_userinfo(userinfo="<redacted>" if mode == "redact" else None)
+        if self.userinfo:
+            result = result.with_userinfo("<redacted>" if mode == "redact" else None)
 
         return result
 
@@ -595,11 +553,9 @@ class URL:
     def is_databricks(self) -> bool:
         return self.scheme == "dbfs"
 
-    def to_databricks_table(self):
+    def to_databricks_table(self) -> Any:
         if not self.is_databricks:
-            raise ValueError(
-                f"Expected Databricks URI with scheme 'dbfs', got scheme={self.scheme!r}"
-            )
+            raise ValueError(f"Expected Databricks URI with scheme 'dbfs', got scheme={self.scheme!r}")
 
         if not self.query:
             raise ValueError(
@@ -610,15 +566,13 @@ class URL:
         from yggdrasil.databricks.sql.table import Table
         from yggdrasil.databricks.workspaces import Workspace
 
-        # query_dict is assumed to be like: {"catalog_name": ["x"], ...}
-        items: dict[str, Any] = {
-            k: (v[0] if isinstance(v, (list, tuple)) and v else v)
-            for k, v in self.query_dict.items()
+        items = {
+            key: values[0] if isinstance(values, tuple) and values else values
+            for key, values in self.query_dict.items()
         }
 
         required = ("catalog_name", "schema_name", "table_name")
         missing = [key for key in required if not items.get(key)]
-
         if missing:
             raise ValueError(
                 "Missing required Databricks table query params: "
@@ -626,16 +580,151 @@ class URL:
                 "Expected query params: catalog_name, schema_name, table_name"
             )
 
-        catalog_name = items["catalog_name"]
-        schema_name = items["schema_name"]
-        table_name = items["table_name"]
-
         if not self.host:
             raise ValueError("Databricks URI is missing host")
 
         return Table(
             workspace=Workspace(host=self.host),
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
+            catalog_name=items["catalog_name"],
+            schema_name=items["schema_name"],
+            table_name=items["table_name"],
         )
+
+
+class URLResource(ABC):
+    @classmethod
+    @abstractmethod
+    def url_scheme(cls) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_url(self, scheme: str | None = None) -> URL:
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def from_parsed_url(cls: Type[T], url: URL) -> T:
+        raise NotImplementedError
+
+    @classmethod
+    def from_url(cls: Type[T], url: URL | str | Any) -> T:
+        default_scheme = None if cls is URLResource else cls.url_scheme()
+        parsed = URL.parse(url, default_scheme=default_scheme)
+        scheme = parsed.scheme.strip().lower()
+
+        if cls is URLResource:
+            if not scheme:
+                raise ValueError(
+                    "Cannot dispatch URLResource.from_url() without a scheme. "
+                    f"Got url={parsed.to_string(encode=False)!r}"
+                )
+
+            impl = _REGISTRY.get(scheme)
+            if impl is None:
+                registered = ", ".join(registered_url_schemes()) or "(none)"
+                raise ValueError(
+                    f"No URLResource registered for scheme {scheme!r}. "
+                    f"Registered schemes: {registered}"
+                )
+
+            return impl.from_parsed_url(parsed)  # type: ignore[return-value]
+
+        return cls.from_parsed_url(parsed)
+
+
+def get_registered_url_resource(scheme: str) -> Type["URLResource"] | None:
+    return _REGISTRY.get((scheme or "").strip().lower())
+
+
+def registered_url_schemes() -> tuple[str, ...]:
+    return tuple(sorted(_REGISTRY))
+
+
+def url_resource_class(
+    cls: Type[T] | None = None,
+    *,
+    overwrite: bool = False,
+):
+    def decorator(resource_cls: Type[T]) -> Type[T]:
+        return register_url_resource(resource_cls, overwrite=overwrite)
+
+    return decorator if cls is None else decorator(cls)
+
+
+def register_url_resource(resource_cls: Type[T], *, overwrite: bool = False) -> Type[T]:
+    if not issubclass(resource_cls, URLResource):
+        raise TypeError(f"Can only register URLResource subclasses, got {resource_cls!r}")
+
+    scheme = resource_cls.url_scheme().strip().lower()
+    if not scheme:
+        raise ValueError(f"{resource_cls.__name__}.url_scheme() must return a non-empty scheme")
+
+    _REGISTRY[scheme] = resource_cls
+    return resource_cls
+
+
+@url_resource_class
+@dataclass(frozen=True, slots=True)
+class FileResource(URLResource):
+    path: Path
+
+    @classmethod
+    def url_scheme(cls) -> str:
+        return "file"
+
+    def to_url(self, scheme: str | None = None) -> URL:
+        target_scheme = (scheme or self.url_scheme()).strip().lower()
+        if target_scheme != "file":
+            raise ValueError(f"{self.__class__.__name__} only supports the 'file' scheme, got {target_scheme!r}")
+
+        normalized = self.path.expanduser().resolve(strict=False).as_posix()
+
+        # Windows drive path must be /C:/... in file URLs
+        if len(normalized) >= 2 and normalized[1] == ":":
+            normalized = "/" + normalized
+
+        return URL(
+            scheme="file",
+            path=normalized,
+        )
+
+    @classmethod
+    def from_parsed_url(cls: Type["FileResource"], url: URL) -> "FileResource":
+        raw_path = url.path or ""
+        if not raw_path:
+            raise ValueError("File URL is missing a path")
+
+        path_str = raw_path
+
+        # file:///C:/x -> Path("C:/x") on Windows-style input
+        if len(path_str) >= 3 and path_str[0] == "/" and path_str[2] == ":":
+            path_str = path_str[1:]
+
+        return cls(path=Path(path_str).expanduser().resolve(strict=False))
+
+    @classmethod
+    def from_path(cls, value: str | Path) -> "FileResource":
+        return cls(path=Path(value).expanduser().resolve(strict=False))
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def suffix(self) -> str:
+        return self.path.suffix
+
+    @property
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def joinpath(self, *parts: str) -> "FileResource":
+        return FileResource(self.path.joinpath(*parts).resolve(strict=False))
+
+    def __truediv__(self, other: str) -> "FileResource":
+        if not isinstance(other, str):
+            raise ValueError(f"Cannot join {self} with {type(other)}")
+        return self.joinpath(other)
+
+
+_EMPTY_URL = URL()

@@ -554,7 +554,7 @@ def detect(src: "IO[bytes] | BytesIO") -> "Codec | None":
     from ..buffer.bytes_io import BytesIO
     from .mime_type import MimeType
 
-    fh = BytesIO.wrap(src)
+    fh = BytesIO(src, copy=False)
     header = fh.head(64)
     return _codec_from_mime(MimeType.parse_magic(header))
 

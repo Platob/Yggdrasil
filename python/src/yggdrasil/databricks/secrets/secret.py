@@ -9,9 +9,10 @@ from typing import Optional, Tuple, Any, Iterator, Union
 
 from databricks.sdk.service.workspace import AclPermission
 
-from ..workspaces import WorkspaceService
+from ..client import DatabricksService
 
-__all__ = ["Secret"]
+__all__ = ["Secrets"]
+
 
 BytesLike = Union[bytes, bytearray, memoryview]
 
@@ -136,8 +137,8 @@ class Signature(bytes, Enum):
         return None, raw
 
 
-@dataclass
-class Secret(WorkspaceService):
+@dataclass(frozen=True)
+class Secrets(DatabricksService):
     scope: Optional[str] = None
     key: Optional[str] = None
     update_timestamp: Optional[float] = None
@@ -145,10 +146,14 @@ class Secret(WorkspaceService):
     # When set, all reads and writes transparently encrypt / decrypt the payload
     # using AES-128-CBC + HMAC-SHA256 (Fernet) with a PBKDF2-derived key.
     # The wire format is: base64( b"ENCR" + 16-byte-salt + fernet-ciphertext ).
-    # Set to None to disable encryption (plain signature-prefixed storage).
+    # Set too None to disable encryption (plain signature-prefixed storage).
     secret_key: Optional[str] = field(default=None, repr=False)
 
     _value: Optional[Any] = field(default=None, repr=False)
+
+    @classmethod
+    def service_name(cls):
+        return "secrets"
 
     # -------------------------
     # Ergonomics
@@ -160,7 +165,7 @@ class Secret(WorkspaceService):
         return self.update(value, full_key=key)
 
     def secrets_client(self):
-        return self.workspace.sdk().secrets
+        return self.client.workspace_client().secrets
 
     # -------------------------
     # Parsing / resolving
@@ -306,7 +311,7 @@ class Secret(WorkspaceService):
                 s = b.decode("utf-8")
             except Exception:
                 return b
-            return Secret._try_parse_value(s, secret_key=secret_key)
+            return Secrets._try_parse_value(s, secret_key=secret_key)
 
         if not isinstance(v, str):
             return v
@@ -329,7 +334,7 @@ class Secret(WorkspaceService):
                 if inner_sig.value == inner_sig_bytes:
                     # Reconstruct a standard prefixed b64 string and recurse
                     reconstructed = base64.b64encode(inner_sig.value + inner_payload).decode("ascii")
-                    return Secret._try_parse_value(reconstructed)
+                    return Secrets._try_parse_value(reconstructed)
             # Unknown inner sig – return raw bytes
             return inner_payload
 
@@ -345,10 +350,10 @@ class Secret(WorkspaceService):
         if sig is Signature.DILL:
             return payload  # raw bytes; caller does dill.loads(...)
 
-        # sig is None -> no recognised prefix, fall through to heuristics
+        # sig is None -> no recognized prefix, fall through to heuristics
 
         # ── heuristic: direct JSON string ─────────────────────────
-        if Secret._looks_like_json(s):
+        if Secrets._looks_like_json(s):
             try:
                 return json.loads(s)
             except Exception:
@@ -367,7 +372,7 @@ class Secret(WorkspaceService):
             return decoded  # opaque binary
 
         dt = decoded_text.strip()
-        if Secret._looks_like_json(dt):
+        if Secrets._looks_like_json(dt):
             try:
                 return json.loads(dt)
             except Exception:
@@ -491,7 +496,7 @@ class Secret(WorkspaceService):
         scope: Optional[str] = None,
         key: Optional[str] = None,
         secret_key: Optional[str] = None,
-    ) -> "Secret":
+    ) -> "Secrets":
         scope, key = self._resolve_scope_key(full_key=full_key, scope=scope, key=key)
         client = self.secrets_client()
 
@@ -501,8 +506,8 @@ class Secret(WorkspaceService):
         effective_key = secret_key or self.secret_key
         parsed = self._try_parse_value(raw, secret_key=effective_key)
 
-        return Secret(
-            workspace=self.workspace,
+        return Secrets(
+            client=self.client,
             scope=scope,
             key=response.key,
             secret_key=effective_key,
@@ -519,7 +524,8 @@ class Secret(WorkspaceService):
         """
         if self._value is None and self.scope and self.key:
             fetched = self.find_secret(scope=self.scope, key=self.key)
-            self._value = fetched._value
+
+            object.__setattr__(self, "_value", fetched._value)  # cache the parsed value for future accesses
         return self._value
 
     def value_text(self, encoding: str = "utf-8", errors: str = "strict") -> Optional[str]:
@@ -561,8 +567,8 @@ class Secret(WorkspaceService):
         string_value: Optional[str] = None,
         create_scope_if_missing: bool = True,
         initial_manage_principal: Optional[str] = None,
-        permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
-    ) -> "Secret":
+        permissions: Optional[list[tuple[str, AclPermission]]] = None,
+    ) -> "Secrets":
         effective_key = secret_key or self.secret_key
         bytes_value, string_value = self.coerce_to_put_payload(
             value,
@@ -598,8 +604,8 @@ class Secret(WorkspaceService):
                 raise
 
         same_identity = (self.scope == target_scope) and (self.key == target_key)
-        out = self if same_identity else Secret(
-            workspace=self.workspace,
+        out = self if same_identity else Secrets(
+            client=self.client,
             scope=target_scope,
             key=target_key,
             secret_key=effective_key,
@@ -611,13 +617,13 @@ class Secret(WorkspaceService):
         if effective_key and value is not None:
             # Re-parse the original (unencrypted) value for the cache
             if bytes_value is not None:
-                out._value = self._try_parse_value(bytes_value, secret_key=effective_key)
+                object.__setattr__(self, "_value", self._try_parse_value(bytes_value, secret_key=effective_key))
             else:
-                out._value = value
+                object.__setattr__(self, "_value", value)
         elif bytes_value is not None:
-            out._value = self._try_parse_value(bytes_value)
+            object.__setattr__(self, "_value", self._try_parse_value(bytes_value))
         elif string_value is not None:
-            out._value = self._try_parse_value(string_value)
+            object.__setattr__(self, "_value", self._try_parse_value(string_value))
 
         if permissions:
             out.put_acl(permissions=permissions, scope=target_scope)
@@ -630,18 +636,18 @@ class Secret(WorkspaceService):
         full_key: Optional[str] = None,
         scope: Optional[str] = None,
         key: Optional[str] = None,
-    ) -> "Secret":
+    ) -> "Secrets":
         scope, key = self._resolve_scope_key(full_key=full_key, scope=scope, key=key)
         client = self.secrets_client()
         client.delete_secret(scope=scope, key=key)
         if self.scope == scope and self.key == key:
-            self._value = None
+            object.__setattr__(self, "_value", None)
         return self
 
     # -------------------------
     # Metadata / listing
     # -------------------------
-    def list_secrets(self, *, scope: Optional[str] = None) -> Iterator["Secret"]:
+    def list_secrets(self, *, scope: Optional[str] = None) -> Iterator["Secrets"]:
         scope = scope or self.scope
         if not scope:
             raise ValueError("'scope' must be provided (or set on self).")
@@ -649,8 +655,8 @@ class Secret(WorkspaceService):
         client = self.secrets_client()
 
         return (
-            Secret(
-                workspace=self.workspace,
+            Secrets(
+                client=self.client,
                 scope=scope,
                 key=info.key,
                 secret_key=self.secret_key,
@@ -673,7 +679,7 @@ class Secret(WorkspaceService):
         initial_manage_principal: Optional[str] = None,
         scope_backend_type: Optional[Any] = None,
         backend_azure_keyvault: Optional[Any] = None,
-    ) -> "Secret":
+    ) -> "Secrets":
         scope = scope or self.scope
         if not scope:
             raise ValueError("'scope' must be provided (or set on self).")
@@ -684,18 +690,17 @@ class Secret(WorkspaceService):
             scope_backend_type=scope_backend_type,
             backend_azure_keyvault=backend_azure_keyvault,
         )
-        self.scope = scope
+        object.__setattr__(self, "scope", scope)
         return self
 
-    def delete_scope(self, *, scope: Optional[str] = None) -> "Secret":
+    def delete_scope(self, *, scope: Optional[str] = None) -> "Secrets":
         scope = scope or self.scope
         if not scope:
             raise ValueError("'scope' must be provided (or set on self).")
         client = self.secrets_client()
         client.delete_scope(scope=scope)
         if self.scope == scope:
-            self.key = None
-            self._value = None
+            object.__setattr__(self, "_value", None)
         return self
 
     # -------------------------
@@ -715,32 +720,20 @@ class Secret(WorkspaceService):
 
     def put_acl(
         self,
-        permissions: Optional[list[tuple[str, AclPermission]] | bool] = True,
+        permissions: Optional[list[tuple[str, AclPermission]]] = None,
         *,
         principal: Optional[str] = None,
         permission: Optional[AclPermission] = None,
         scope: Optional[str] = None,
         strict: bool = True,
-    ) -> "Secret":
+    ) -> "Secrets":
         """
         Put one ACL (principal+permission) or many (acls=[(principal, permission), ...]).
 
         strict=True  -> fail fast on first bad entry
         strict=False -> skip invalid entries (still raises if nothing valid is left)
         """
-        if isinstance(permissions, bool):
-            current_groups = self.current_user_groups(
-                with_public=False,
-                raise_error=False,
-            )
-
-            permissions = [
-                (group.display, AclPermission.MANAGE)
-                for group in current_groups
-                if group.display not in {"users"}
-            ]
-        else:
-            permissions = [self.check_permission(_) for _ in permissions]
+        permissions = [self.check_permission(_) for _ in permissions]
 
         scope = scope or self.scope
         if not scope:
@@ -802,7 +795,7 @@ class Secret(WorkspaceService):
         *,
         principal: str,
         scope: Optional[str] = None,
-    ) -> "Secret":
+    ) -> "Secrets":
         scope = scope or self.scope
         if not scope:
             raise ValueError("'scope' must be provided (or set on self).")

@@ -37,7 +37,7 @@ from yggdrasil.databricks.sql import SQLEngine
 ws = Workspace().connect()
 
 # 1. Read raw source
-source = DatabricksPath.parse("dbfs:/pipelines/raw/orders.parquet", workspace=ws)
+source = DatabricksPath.parse("dbfs:/pipelines/raw/orders.parquet", client=ws)
 orders = source.read_arrow()
 
 # 2. Cast to target schema (optional)

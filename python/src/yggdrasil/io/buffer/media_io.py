@@ -77,6 +77,30 @@ class MediaIO(ABC, Generic[O]):
                 )
         return False
 
+    def read_pylist(self) -> list[dict]:
+        return self.read_arrow_table().to_pylist()
+
+    def write_pylist(
+        self,
+        data: list[dict],
+        *,
+        mode: SaveMode | str | None = None,
+        match_by: list[str] | None = None,
+        options: O | None = None,
+        **option_kwargs,
+    ):
+        resolved = self.check_options(
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            **option_kwargs,
+        )
+        if self.skip_write(mode=resolved.mode):
+            return self
+        tb = pyarrow.Table.from_pylist(data)
+        self._write_arrow_table(table=tb, options=resolved)
+        return None
+
     # --- Arrow (generic public API; concrete classes add typed wrappers) ---
 
     def read_arrow_table(self, *, options: O | None = None, **option_kwargs) -> "pyarrow.Table":
@@ -101,6 +125,7 @@ class MediaIO(ABC, Generic[O]):
         if self.skip_write(mode=resolved.mode):
             return self
         self._write_arrow_table(table=table, options=resolved)
+        return None
 
     @abstractmethod
     def _read_arrow_table(self, *, options: O) -> "pyarrow.Table": ...

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self, Optional
 
-from .media_io import MediaIO, O
+from .media_io import MediaIO
 from .media_options import MediaOptions
 
 if TYPE_CHECKING:
@@ -57,13 +57,17 @@ class ParquetIO(MediaIO[ParquetOptions]):
     """
 
     @classmethod
-    def check_options(cls, options: Optional[O], *args, **kwargs) -> ParquetOptions:
+    def check_options(cls, options: Optional[ParquetOptions], *args, **kwargs) -> ParquetOptions:
         return ParquetOptions.check_parameters(
             options=options,
             **kwargs
         )
 
     def _read_arrow_table(self, *, options: ParquetOptions) -> "pyarrow.Table":
+        if self.buffer.size <= 0:
+            import pyarrow as pa
+            return pa.Table.from_batches([], schema=pa.schema([])) # noqa
+
         import pyarrow.parquet as pq
 
         arrow_io = self.buffer.to_arrow_io("r")
@@ -88,6 +92,8 @@ class ParquetIO(MediaIO[ParquetOptions]):
                 compression_level=options.compression_level,
                 use_dictionary=options.use_dictionary,
                 write_statistics=options.use_statistics,
+                coerce_timestamps="us" if options.allow_truncated_timestamps else None,
+                use_deprecated_int96_timestamps=not options.allow_truncated_timestamps,
                 # If you actually use this option in your project, wire it to pq.write_table params
                 # or to a coercion/normalization step before writing.
             )

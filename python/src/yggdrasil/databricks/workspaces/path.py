@@ -30,7 +30,7 @@ from .volumes_path import get_volume_status, get_volume_metadata
 from ...io.path import AbstractDataPath
 
 if TYPE_CHECKING:
-    from .workspace import Workspace
+    from ..client import DatabricksClient
 
 __all__ = [
     "DatabricksPathKind",
@@ -160,14 +160,14 @@ def _parse_databricks_string(s: str) -> tuple[Optional[str], List[str], Optional
 class DatabricksPath(AbstractDataPath):
     """Path wrapper for Databricks workspace, volumes, and DBFS objects."""
     kind: DatabricksPathKind
-    parts: List[str]
+    parts: List[str] = dc.field(default_factory=list)
     temporary: bool = False
 
     _is_file: Optional[bool] = dc.field(repr=False, hash=False, default=None)
     _is_dir: Optional[bool] = dc.field(repr=False, hash=False, default=None)
     _size: Optional[int] = dc.field(repr=False, hash=False, default=None)
     _mtime: Optional[float] = dc.field(repr=False, hash=False, default=None)
-    _workspace: Optional["Workspace"] = dc.field(repr=False, hash=False, default=None)
+    _client: Optional["DatabricksClient"] = dc.field(repr=False, hash=False, default=None)
     _volume_info: Optional[VolumeInfo] = dc.field(repr=False, hash=False, default=None)
 
     def clone_instance(
@@ -175,7 +175,7 @@ class DatabricksPath(AbstractDataPath):
         *,
         kind: Optional[DatabricksPathKind] = None,
         parts: Optional[List[str]] = None,
-        workspace: Optional["Workspace"] = dc.MISSING,
+        client: Optional["DatabricksClient"] = dc.MISSING,
         is_file: Optional[bool] = dc.MISSING,
         is_dir: Optional[bool] = dc.MISSING,
         size: Optional[int] = dc.MISSING,
@@ -191,7 +191,7 @@ class DatabricksPath(AbstractDataPath):
             self,
             kind=self.kind if kind is None else kind,
             parts=list(self.parts) if parts is None else list(parts),
-            _workspace=self._workspace if workspace is dc.MISSING else workspace,
+            _client=self._client if client is dc.MISSING else client,
             _is_file=self._is_file if is_file is dc.MISSING else is_file,
             _is_dir=self._is_dir if is_dir is dc.MISSING else is_dir,
             _size=self._size if size is dc.MISSING else size,
@@ -200,12 +200,12 @@ class DatabricksPath(AbstractDataPath):
         )
 
     @classmethod
-    def empty_instance(cls, workspace: Optional["Workspace"] = None):
+    def empty_instance(cls, client: Optional["DatabricksClient"] = None):
         return DatabricksPath(
             kind=DatabricksPathKind.DBFS,
             parts=[],
             temporary=False,
-            _workspace=workspace,
+            _client=client,
             _is_file=False,
             _is_dir=False,
             _size=0,
@@ -217,16 +217,16 @@ class DatabricksPath(AbstractDataPath):
     def parse(
         cls,
         obj: Union["DatabricksPath", str, List[str]],
-        workspace: Optional["Workspace"] = None,
+        client: Optional["DatabricksClient"] = None,
         temporary: bool = False
     ) -> "DatabricksPath":
         if not obj:
-            return cls.empty_instance(workspace=workspace)
+            return cls.empty_instance(client=client)
 
         # If DatabricksPath passthrough
         if isinstance(obj, DatabricksPath):
-            if workspace is not None and obj._workspace is None:
-                obj._workspace = workspace
+            if client is not None and obj._client is None:
+                obj._client = client
             if temporary and not obj.temporary:
                 obj.temporary = True
             return obj
@@ -259,7 +259,7 @@ class DatabricksPath(AbstractDataPath):
         if obj and not obj[0]:
             obj = obj[1:]
         if not obj:
-            return cls.empty_instance(workspace=workspace)
+            return cls.empty_instance(client=client)
 
         head, *tail = obj
 
@@ -279,24 +279,15 @@ class DatabricksPath(AbstractDataPath):
             )
 
         if hostname:
-            from .workspace import Workspace
+            from ..client import DatabricksClient
 
-            if workspace is None:
-                workspace = Workspace(
-                    host=hostname
-                )
-            elif workspace.host is None:
-                workspace.host = hostname
-            else:
-                workspace = workspace.clone_instance(
-                    host=hostname
-                )
+            client = DatabricksClient(host=hostname)
 
         return DatabricksPath(
             kind=kind,
             parts=tail,
             temporary=temporary,
-            _workspace=workspace,
+            _client=client,
         )
 
     def __hash__(self):
@@ -318,15 +309,15 @@ class DatabricksPath(AbstractDataPath):
         return DatabricksPath(
             kind=self.kind,
             parts=self.parts + other_parts,
-            _workspace=self._workspace,
+            _client=self._client,
         )
 
     def __enter__(self):
         return self.connect(clone=False)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._workspace is not None:
-            self._workspace.__exit__(exc_type, exc_val, exc_tb)
+        if self._client is not None:
+            self._client.__exit__(exc_type, exc_val, exc_tb)
 
         self.close(wait=False)
 
@@ -346,8 +337,8 @@ class DatabricksPath(AbstractDataPath):
         return self.parts
 
     def url(self):
-        if self._workspace is not None:
-            return self._workspace.safe_host.replace("https://", "dbfs://", 1) + self.full_path()
+        if self._client is not None:
+            return self._client.base_url.to_string().rstrip("/") + self.full_path()
         return "dbfs://%s" % self.full_path()
 
     def full_path(self) -> str:
@@ -366,19 +357,6 @@ class DatabricksPath(AbstractDataPath):
             return self.tables_full_path()
         else:
             raise ValueError(f"Unknown DatabricksPath kind: {self.kind!r}")
-
-    def arrow_filesystem(self, workspace: Optional["Workspace"] = None, **kwargs):
-        """Return a PyArrow filesystem adapter for this workspace.
-
-        Args:
-            workspace: Optional workspace override.
-
-        Returns:
-            A PyArrow FileSystem instance.
-        """
-        workspace = self.workspace if workspace is None else workspace
-
-        return workspace.arrow_filesystem(workspace=workspace)
 
     @property
     def parent(self):
@@ -399,7 +377,7 @@ class DatabricksPath(AbstractDataPath):
             kind=self.kind,
             parts=self.parts[:-1],
             temporary=False,
-            _workspace=self._workspace,
+            _client=self._client,
             _is_file=_is_file,
             _is_dir=_is_dir,
             _size=_size,
@@ -407,17 +385,21 @@ class DatabricksPath(AbstractDataPath):
         )
 
     @property
-    def workspace(self):
-        """Return the associated Workspace instance.
+    def client(self):
+        """Return the associated DatabricksClient instance.
 
         Returns:
-            The Workspace associated with this path.
+            The DatabricksClient associated with this path.
         """
-        if self._workspace is None:
-            from .workspace import Workspace
+        if self._client is None:
+            from ..client import DatabricksClient
 
-            self._workspace = Workspace()
-        return self._workspace
+            self._client = DatabricksClient.current()
+        return self._client
+
+    @property
+    def workspace(self):
+        return self.client.workspace
 
     def sql_engine(self):
         catalog_name, schema_name, _, _ = self.sql_volume_or_table_parts()
@@ -429,7 +411,7 @@ class DatabricksPath(AbstractDataPath):
 
     @workspace.setter
     def workspace(self, value):
-        self._workspace = value
+        self._client = value
 
     @property
     def name(self) -> str:
@@ -514,9 +496,9 @@ class DatabricksPath(AbstractDataPath):
 
     @property
     def connected(self) -> bool:
-        return self._workspace is not None and self._workspace.connected
+        return self._client is not None and self._client.connected
 
-    def connect(self, clone: bool = False) -> "DatabricksPath":
+    def connect(self) -> "DatabricksPath":
         """Connect the path to its workspace, optionally returning a clone.
 
         Args:
@@ -525,14 +507,9 @@ class DatabricksPath(AbstractDataPath):
         Returns:
             The connected DatabricksPath.
         """
-        workspace = self.workspace.connect(clone=clone)
+        workspace = self.workspace.connect()
 
-        if clone:
-            return self.clone_instance(
-                workspace=workspace
-            )
-
-        self._workspace = workspace
+        self._client = workspace
 
         return self
 
@@ -565,7 +542,7 @@ class DatabricksPath(AbstractDataPath):
 
             if catalog and schema and volume:
                 self._volume_info = get_volume_metadata(
-                    sdk=self.workspace.sdk(),
+                    sdk=self.workspace.workspace_client(),
                     full_name="%s.%s.%s" % (catalog, schema, volume)
                 )
         return self._volume_info
@@ -601,7 +578,7 @@ class DatabricksPath(AbstractDataPath):
 
     def _refresh_volume_status(self):
         full_path = self.files_full_path()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         is_file, is_dir, size, mtime = get_volume_status(
             sdk=sdk,
@@ -621,7 +598,7 @@ class DatabricksPath(AbstractDataPath):
         return self
 
     def _refresh_workspace_status(self):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         try:
             info = sdk.workspace.get_status(self.workspace_full_path())
@@ -645,7 +622,7 @@ class DatabricksPath(AbstractDataPath):
         return self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
 
     def _refresh_dbfs_status(self):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         try:
             info = sdk.dbfs.get_status(self.dbfs_full_path())
@@ -773,7 +750,7 @@ class DatabricksPath(AbstractDataPath):
 
     def _ensure_volume(self, exist_ok: bool = True, sdk=None):
         catalog_name, schema_name, volume_name, rel = self.sql_volume_or_table_parts()
-        sdk = self.workspace.sdk() if sdk is None else sdk
+        sdk = self.workspace.workspace_client() if sdk is None else sdk
         default_tags = self.workspace.default_tags()
 
         if catalog_name:
@@ -815,7 +792,7 @@ class DatabricksPath(AbstractDataPath):
 
     def make_volume_dir(self, parents=True, exist_ok=True):
         path = self.files_full_path()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         try:
             sdk.files.create_directory(path)
@@ -836,7 +813,7 @@ class DatabricksPath(AbstractDataPath):
 
     def make_workspace_dir(self, parents=True, exist_ok=True):
         path = self.workspace_full_path()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         try:
             sdk.workspace.mkdirs(path)
@@ -848,7 +825,7 @@ class DatabricksPath(AbstractDataPath):
 
     def make_dbfs_dir(self, parents=True, exist_ok=True):
         path = self.dbfs_full_path()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         try:
             sdk.dbfs.mkdirs(path)
@@ -928,7 +905,7 @@ class DatabricksPath(AbstractDataPath):
         return self
 
     def _remove_volume_file(self, allow_not_found: bool = True):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         try:
             sdk.files.delete(self.files_full_path())
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied, InternalError):
@@ -940,7 +917,7 @@ class DatabricksPath(AbstractDataPath):
         return self
 
     def _remove_workspace_file(self, allow_not_found: bool = True):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         try:
             sdk.workspace.delete(self.workspace_full_path(), recursive=True)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied, InternalError):
@@ -952,7 +929,7 @@ class DatabricksPath(AbstractDataPath):
         return self
 
     def _remove_dbfs_file(self, allow_not_found: bool = True):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         try:
             sdk.dbfs.delete(self.dbfs_full_path(), recursive=True)
         except (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied, InternalError):
@@ -1004,7 +981,7 @@ class DatabricksPath(AbstractDataPath):
         allow_not_found: bool = True,
         with_root: bool = True
     ):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         full_path =self.workspace_full_path()
 
         try:
@@ -1026,7 +1003,7 @@ class DatabricksPath(AbstractDataPath):
         allow_not_found: bool = True,
         with_root: bool = True
     ):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         full_path = self.dbfs_full_path()
 
         try:
@@ -1050,7 +1027,7 @@ class DatabricksPath(AbstractDataPath):
     ):
         full_path = self.files_full_path()
         catalog_name, schema_name, volume_name, rel = self.sql_volume_or_table_parts()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         if rel:
             try:
@@ -1117,7 +1094,7 @@ class DatabricksPath(AbstractDataPath):
 
     def _ls_volume(self, recursive: bool = False, fetch_size: int = None, allow_not_found: bool = True):
         catalog_name, schema_name, volume_name, rel = self.sql_volume_or_table_parts()
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
 
         if rel is None:
             if volume_name is None:
@@ -1126,7 +1103,7 @@ class DatabricksPath(AbstractDataPath):
                         base = DatabricksPath(
                             kind=DatabricksPathKind.VOLUME,
                             parts=[info.catalog_name, info.schema_name, info.name],
-                            _workspace=self.workspace,
+                            _client=self.workspace,
                             _is_file=False,
                             _is_dir=True,
                             _size=0,
@@ -1145,7 +1122,7 @@ class DatabricksPath(AbstractDataPath):
                         base = DatabricksPath(
                             kind=DatabricksPathKind.VOLUME,
                             parts=[info.catalog_name, info.name],
-                            _workspace=self.workspace,
+                            _client=self.workspace,
                             _is_file=False,
                             _is_dir=True,
                             _size=0,
@@ -1163,7 +1140,7 @@ class DatabricksPath(AbstractDataPath):
                         base = DatabricksPath(
                             kind=DatabricksPathKind.VOLUME,
                             parts=[info.name],
-                            _workspace=self.workspace,
+                            _client=self.workspace,
                             _is_file=False,
                             _is_dir=True,
                             _size=0,
@@ -1183,7 +1160,7 @@ class DatabricksPath(AbstractDataPath):
                     base = DatabricksPath(
                         kind=DatabricksPathKind.VOLUME,
                         parts=info.path.split("/")[2:],
-                        _workspace=self.workspace,
+                        _client=self.workspace,
                         _is_file=not info.is_directory,
                         _is_dir=info.is_directory,
                         _size=info.file_size,
@@ -1198,7 +1175,7 @@ class DatabricksPath(AbstractDataPath):
                     raise
 
     def _ls_workspace(self, recursive: bool = True, allow_not_found: bool = True):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         full_path = self.workspace_full_path()
 
         try:
@@ -1207,7 +1184,7 @@ class DatabricksPath(AbstractDataPath):
                 yield DatabricksPath(
                     kind=DatabricksPathKind.WORKSPACE,
                     parts=info.path.split("/")[2:],
-                    _workspace=self.workspace,
+                    _client=self.workspace,
                     _is_file=not is_dir,
                     _is_dir=is_dir,
                     _size=info.size,
@@ -1217,7 +1194,7 @@ class DatabricksPath(AbstractDataPath):
                 raise
 
     def _ls_dbfs(self, recursive: bool = True, allow_not_found: bool = True):
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         full_path = self.dbfs_full_path()
 
         try:
@@ -1225,7 +1202,7 @@ class DatabricksPath(AbstractDataPath):
                 yield DatabricksPath(
                     kind=DatabricksPathKind.DBFS,
                     parts=info.path.split("/")[2:],
-                    _workspace=self.workspace,
+                    _client=self.workspace,
                     _is_file=not info.is_dir,
                     _is_dir=info.is_dir,
                     _size=info.file_size,
@@ -1243,7 +1220,7 @@ class DatabricksPath(AbstractDataPath):
         newline = None,
         clone: bool = False,
     ) -> DatabricksIO:
-        path = self.connect(clone=clone)
+        path = self.connect()
 
         return (
             DatabricksIO
@@ -1270,7 +1247,7 @@ class DatabricksPath(AbstractDataPath):
                 src.copy_to(dest=dest)
 
         elif self.is_dir():
-            dest_base = self.parse(obj=dest, workspace=self.workspace if dest._workspace is None else dest._workspace)
+            dest_base = self.parse(obj=dest, client=self.workspace if dest._client is None else dest._client)
             dest_base.mkdir(parents=True, exist_ok=True)
 
             skip_base_parts = len(self.parts)
@@ -1297,7 +1274,7 @@ class DatabricksPath(AbstractDataPath):
         if self.kind != DatabricksPathKind.VOLUME:
             raise ValueError(f"Cannot generate temporary credentials for {repr(self)}")
 
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.temporary_path_credentials
         url = self.storage_location()
 

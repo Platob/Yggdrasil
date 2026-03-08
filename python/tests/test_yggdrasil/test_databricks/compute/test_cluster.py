@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 from databricks.sdk.service.compute import Language
-from yggdrasil.databricks import Workspace
+from yggdrasil.databricks import Workspace, DatabricksClient
 from yggdrasil.databricks.compute import databricks_remote_compute
 from yggdrasil.pandas.lib import pandas as pd
 
@@ -66,8 +66,8 @@ class TestCluster(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.workspace = Workspace().connect()
-        cls.cluster = cls.workspace.clusters().all_purpose_cluster()
+        cls.client = DatabricksClient().connect()
+        cls.cluster = cls.client.compute.clusters.all_purpose_cluster()
 
     def test_cluster_dyn_properties(self):
         assert self.cluster.details
@@ -85,6 +85,7 @@ class TestCluster(unittest.TestCase):
             environ={"TEST_ENV": "testenv"}
         )
         def decorated(a: int):
+
             env = os.environ["TEST_ENV"]
 
             return {
@@ -112,7 +113,21 @@ class TestCluster(unittest.TestCase):
         self.assertTrue(isinstance(result, pd.DataFrame))
 
     def test_static_decorator(self):
-        os.environ["TEST_ENV"] = "testenv"
+        os.environ["MONGO_URL"] = "testenv"
+
+        @databricks_remote_compute(
+            workspace=Workspace(),
+            env_keys=["MONGO_URL"]
+        )
+        def decorated(a: int):
+            import mongoengine
+            env = mongoengine.connect(host=os.environ["MONGO_URL"])
+
+            return {
+                "os": os.environ,
+                "value": a,
+                "env": env
+            }
 
         result = {}
 
@@ -128,17 +143,3 @@ class TestCluster(unittest.TestCase):
         result = self.cluster.context(language=Language.SQL).command("SELECT 1", language=Language.SQL).start()
 
         self.assertTrue(result)
-
-
-@databricks_remote_compute(
-    workspace=Workspace(),
-    env_keys=["TEST_ENV"]
-)
-def decorated(a: int):
-    env = os.environ["TEST_ENV"]
-
-    return {
-        "os": os.environ,
-        "value": a,
-        "env": env
-    }

@@ -1,5 +1,7 @@
+import os
 import unittest
-from yggdrasil.databricks.workspaces.workspace import Workspace
+
+from yggdrasil.databricks.workspaces import DatabricksPath
 
 
 class DatabricksIntegrationBase(unittest.TestCase):
@@ -25,14 +27,14 @@ class DatabricksIntegrationBase(unittest.TestCase):
 
         # hard gate: if auth/network is broken, skip all tests in this file
         try:
-            cls.workspace.sdk().current_user.me()
+            cls.workspace.workspace_client().current_user.me()
         except Exception as e:
             raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
 
         cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/tmp/yggdrasil_databricks_path_it")
         cls.workspace_root = os.getenv(
             "DATABRICKS_TEST_WORKSPACE_BASE",
-            f"/Users/{cls.workspace.current_user.user_name}/yggdrasil_databricks_path_it",
+            f"/Users/{cls.workspace.iam.users.current_user.email}/yggdrasil_databricks_path_it",
         )
         cls.schema_root = os.getenv(
             "DATABRICKS_TEST_VOLUME_BASE",
@@ -43,9 +45,9 @@ class DatabricksIntegrationBase(unittest.TestCase):
         # Unique per test so parallel runs don’t punch each other
         self.test_id = "unittest"
 
-        self.dbfs_base = DatabricksPath(f"{self.dbfs_root}/{self.test_id}", workspace=self.workspace)
-        self.ws_base = DatabricksPath(f"{self.workspace_root}/{self.test_id}", workspace=self.workspace)
-        self.vol_base = DatabricksPath(f"{self.schema_root}/{self.test_id}", workspace=self.workspace)
+        self.dbfs_base = DatabricksPath(f"{self.dbfs_root}/{self.test_id}", _client=self.workspace)
+        self.ws_base = DatabricksPath(f"{self.workspace_root}/{self.test_id}", _client=self.workspace)
+        self.vol_base = DatabricksPath(f"{self.schema_root}/{self.test_id}", _client=self.workspace)
 
     def tearDown(self):
         # Best-effort cleanup; don’t fail teardown

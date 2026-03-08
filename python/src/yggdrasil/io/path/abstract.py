@@ -101,11 +101,6 @@ class AbstractDataPath(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def __str__(self) -> str:
-        """Return the string representation of the path."""
-        raise NotImplementedError
-
-    @abstractmethod
     def path_parts(self) -> tuple[str, ...]:
         """Return all path components as a tuple of strings."""
         raise NotImplementedError
@@ -218,11 +213,6 @@ class AbstractDataPath(ABC):
         self, data: Union[bytes, bytearray, memoryview, IO[bytes]]
     ) -> None:
         """Write *data* to the file, replacing any existing content."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def arrow_filesystem(self, **configs) -> FileSystem:
-        """Return a PyArrow ``FileSystem`` adapter for this path's backend."""
         raise NotImplementedError
 
     @abstractmethod

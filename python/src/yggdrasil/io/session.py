@@ -372,6 +372,7 @@ class Session(ABC):
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
+        after_received: Optional[Callable[["Response"], "Response"]] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True
@@ -397,5 +398,6 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
-            before_send=before_send
+            before_send=before_send,
+            after_received=after_received
         )

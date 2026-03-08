@@ -8,6 +8,7 @@ import yggdrasil.pickle.json as json_mod
 from .bytes_io import BytesIO
 from .media_io import MediaIO
 from .media_options import MediaOptions
+from ..enums import SaveMode
 
 if TYPE_CHECKING:
     import pyarrow
@@ -70,7 +71,12 @@ class JsonIO(MediaIO[JsonOptions]):
 
     def write_pylist(
         self,
-        data: list,
+        data: list[dict],
+        *,
+        mode: SaveMode | str | None = None,
+        match_by: list[str] | None = None,
+        options: JsonOptions | None = None,
+        **option_kwargs,
     ):
         with self.buffer.view() as f:
             json_mod.dump(data, f)

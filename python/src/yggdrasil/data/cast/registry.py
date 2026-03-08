@@ -67,12 +67,11 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.pickle.serde import ObjectSerde
 
 if TYPE_CHECKING:
     from .options import CastOptions
 
-__all__ = ["register_converter", "convert"]
+__all__ = ["register_converter", "convert", "identity"]
 
 T = TypeVar("T")
 F = TypeVar("F", bound=Callable[..., Any])
@@ -84,7 +83,7 @@ Converter = Callable[[Any, Optional["CastOptions"]], Any]
 RegistryKey = tuple[Any, Any]
 
 
-def identity(x: Any, _opts: Optional["CastOptions"] = None) -> Any:
+def identity(x: Any, *args, **kwargs) -> Any: # type: ignore
     """Return value as-is."""
     return x
 
@@ -209,6 +208,8 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
     # 4) late import side-effect: ensure namespace-specific converters are registered
     if check_namespace:
+        from yggdrasil.pickle.serde import ObjectSerde
+
         from_namespace = ObjectSerde.full_namespace(from_type)
         to_namespace = ObjectSerde.full_namespace(to_hint)
 
@@ -219,6 +220,8 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
             from yggdrasil.pandas import cast as _pandas_cast  # noqa: F401
         elif from_namespace.startswith("pyspark") or to_namespace.startswith("pyspark"):
             from yggdrasil.spark import cast as _spark_cast  # noqa: F401
+        elif from_namespace.startswith("pyarrow") or to_namespace.startswith("pyarrow"):
+            from yggdrasil.arrow import cast as _arrow_cast  # noqa: F401
 
         return find_converter(from_type, to_hint, check_namespace=False)
 

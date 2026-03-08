@@ -12,13 +12,17 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import dataclass
 from types import ModuleType
+from typing import Any, TYPE_CHECKING
 
-from typing import Any, Tuple
+if TYPE_CHECKING:
+    from yggdrasil.io.buffer.bytes_io import BytesIO
 
 __all__ = [
     "ObjectSerde",
 ]
+
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +142,33 @@ class ObjectSerde:
         """
         mod, qual = ObjectSerde.module_and_name(obj, fallback=fallback)
         return f"{mod}.{qual}"
+
+
+_MAGIC: bytes = b"YGGPKL"
+
+@dataclass(frozen=True, slots=True)
+class ObjectHeader:
+    module: str
+    name: str
+    compression: int
+    bytesize: int
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> ObjectHeader:
+        if not data.startswith(_MAGIC):
+            raise ValueError("Invalid header magic")
+        return ObjectHeader()
+
+
+def dump(
+    obj: Any,
+    data: "BytesIO"
+):
+    """
+    Dump *obj* to *data* using pickle.
+
+    Args:
+        obj: Any Python object.
+        data: A BytesIO-like object to write the pickled data to.
+    """
+    pass

@@ -1,7 +1,7 @@
 import base64
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, TYPE_CHECKING, Union, Iterator
+from typing import Any, Optional, Union, Iterator
 
 import pyarrow as pa
 from databricks.sdk.client_types import HostType
@@ -20,23 +20,23 @@ from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.enums import SaveMode
 from .types import arrow_field_to_column_info, column_info_to_arrow_field
-from ..workspaces.workspace import WorkspaceService
-
-if TYPE_CHECKING:
-    from ...deltalake import DeltaTable
-
+from ..client import DatabricksService
 
 __all__ = ["Table"]
 
 
-@dataclass
-class Table(WorkspaceService):
-    catalog_name: str
-    schema_name: str
-    table_name: str
+@dataclass(frozen=True)
+class Table(DatabricksService):
+    catalog_name: Optional[str] = None
+    schema_name: Optional[str] = None
+    table_name: Optional[str] = None
 
     _infos: Optional[TableInfo] = field(default=None, repr=False, compare=False, hash=False)
     _arrow_fields: Optional[list[pa.Field]] = field(default=None, repr=False, compare=False, hash=False)
+
+    @classmethod
+    def service_name(cls):
+        return "uctable"
 
     # -------------------------------------------------------------------------
     # Identity
@@ -69,9 +69,6 @@ class Table(WorkspaceService):
     # Databricks SDK plumbing
     # -------------------------------------------------------------------------
 
-    def client(self):
-        return self.sdk().tables
-
     @property
     def table_id(self) -> str:
         return self.infos.table_id
@@ -81,7 +78,10 @@ class Table(WorkspaceService):
         if self._infos is not None:
             return self._infos
 
-        self._infos = self.workspace.sdk().tables.get(self.full_name())
+        object.__setattr__(
+            self, "_infos",
+            self.client.workspace_client().tables.get(self.full_name())
+        )
         return self._infos
 
     def find_table(
@@ -113,7 +113,7 @@ class Table(WorkspaceService):
         Returns:
             Table instance with _infos populated, or None if not found (raise_error=False).
         """
-        client = self.client()
+        client = self.client.workspace_client().tables
 
         # Defaults
         catalog = catalog_name or self.catalog_name
@@ -122,7 +122,7 @@ class Table(WorkspaceService):
 
         def _return(i: TableInfo) -> "Table":
             return Table(
-                workspace=self.workspace,
+                client=self.client,
                 catalog_name=i.catalog_name,
                 schema_name=i.schema_name,
                 table_name=i.name,
@@ -152,7 +152,6 @@ class Table(WorkspaceService):
         # 2) If provided a full name (a.b.c), use GET directly
         # ------------------------------------------------------------
         # Be conservative: only treat as full name if it has exactly 2 dots.
-        full_name = None
         if isinstance(name, str) and name.count(".") == 2:
             full_name = name
         else:
@@ -193,14 +192,14 @@ class Table(WorkspaceService):
     ) -> Iterator["Table"]:
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
-        client = self.client()
+        client = self.client.workspace_client().tables
 
         for info in client.list(
             catalog_name=catalog_name,
             schema_name=schema_name
         ):
             yield Table(
-                workspace=self.workspace,
+                client=self.client,
                 catalog_name=info.catalog_name,
                 schema_name=info.schema_name,
                 table_name=info.name,
@@ -223,9 +222,10 @@ class Table(WorkspaceService):
     @property
     def arrow_fields(self) -> list[pa.Field]:
         if self._arrow_fields is None:
-            self._arrow_fields = [
+            arrow_fields = [
                 column_info_to_arrow_field(c) for c in self.infos.columns
             ]
+            object.__setattr__(self, "_arrow_fields", arrow_fields)
         return self._arrow_fields
 
     @property
@@ -313,7 +313,7 @@ class Table(WorkspaceService):
             ) + "/tables/%s" % self.table_name
 
         if table_type == TableType.MANAGED:
-            self.workspace.sql().create_table(
+            self.sql.create_table(
                 definition,
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
@@ -322,7 +322,7 @@ class Table(WorkspaceService):
                 if_not_exists=if_not_exists
             )
 
-            self._infos = None
+            object.__setattr__(self, "_infos", None)  # fetch fresh infos on next access
         else:
             if not isinstance(definition, pa.Schema):
                 definition = any_to_arrow_schema(definition)
@@ -357,7 +357,7 @@ class Table(WorkspaceService):
                 "Content-Type": "application/json",
             }
 
-            client = self.client()
+            client = self.client.workspace_client().tables
             cfg = client._api._cfg
             if cfg.host_type == HostType.UNIFIED and cfg.workspace_id:
                 headers["X-Databricks-Org-Id"] = cfg.workspace_id
@@ -368,7 +368,8 @@ class Table(WorkspaceService):
                     body=body, headers=headers,
                 )
 
-                self._infos = TableInfo.from_dict(res)
+                info = TableInfo.from_dict(res)
+                object.__setattr__(self, "_infos", info)
             except DatabricksError as e:
                 if "already exists" in str(e):
                     if not if_not_exists:
@@ -376,7 +377,7 @@ class Table(WorkspaceService):
                 else:
                     raise
 
-        self._arrow_fields = None  # rebuild from API response on next access
+        object.__setattr__(self, "_arrow_fields", None)  # reset cached fields
 
         return self
 
@@ -399,7 +400,7 @@ class Table(WorkspaceService):
         Returns:
             ``self`` with ``_infos`` and ``_arrow_fields`` cleared.
         """
-        client = self.client()
+        client = self.client.workspace_client().tables
 
         if wait:
             try:
@@ -416,8 +417,8 @@ class Table(WorkspaceService):
 
     def clear(self) -> "Table":
         """Evict all cached API state, forcing a fresh fetch on next access."""
-        self._infos = None
-        self._arrow_fields = None
+        object.__setattr__(self, "_infos", None)
+        object.__setattr__(self, "_arrow_fields", None)
         return self
 
     # -------------------------------------------------------------------------
@@ -428,7 +429,7 @@ class Table(WorkspaceService):
         self,
         table_type: Optional[TableType] = None
     ) -> str:
-        infos = self.sdk().schemas.get(full_name=self.schema_full_name())
+        infos = self.client.workspace_client().schemas.get(full_name=self.schema_full_name())
 
         if not infos.storage_location:
             raise NotImplementedError
@@ -449,11 +450,11 @@ class Table(WorkspaceService):
         return self.infos.storage_location
 
     def credentials(self, operation: TableOperation = TableOperation.READ):
-        return self.workspace.sdk().temporary_table_credentials \
-            .generate_temporary_table_credentials(
-                table_id=self.table_id,
-                operation=operation,
-            )
+        client = self.client.workspace_client().temporary_table_credentials
+        return client.generate_temporary_table_credentials(
+            table_id=self.table_id,
+            operation=operation,
+        )
 
     def arrow_filesystem(
         self,
@@ -473,7 +474,7 @@ class Table(WorkspaceService):
             access_key=aws.access_key_id,
             secret_key=aws.secret_access_key,
             session_token=aws.session_token,
-            region=self.workspace.aws_region,
+            region="eu-west-1",  # S3FileSystem requires a region, but it’s not actually used for UC tables
         )
 
         if not expiring:
@@ -490,43 +491,6 @@ class Table(WorkspaceService):
             operation=operation,
         )
 
-    def delta_table(
-        self,
-        *,
-        operation: TableOperation = TableOperation.READ,
-        version: int | None = None
-    ) -> "DeltaTable":
-        from ...deltalake import DeltaTable
-
-        if operation == TableOperation.READ_WRITE and self.infos.table_type ==TableType.MANAGED:
-            pass
-
-        return DeltaTable(
-            fs=self.arrow_filesystem(
-                expiring=True,
-                operation=operation,
-            ),
-            storage_location=self.storage_location,
-            version=version
-        )
-
-    def sql(
-        self,
-        statement: str,
-        *,
-        row_limit: Optional[int] = None,
-        wait: WaitingConfigArg = True,
-        cache_for: WaitingConfigArg = None,
-    ):
-        return self.workspace.sql().execute(
-            statement=statement,
-            row_limit=row_limit,
-            wait=wait,
-            cache_for=cache_for,
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        )
-
     def to_arrow_dataset(
         self,
         *,
@@ -541,12 +505,15 @@ class Table(WorkspaceService):
             predicates = [_build_predicate(c, o, v) for (c, o, v) in filters]
             statement += " WHERE " + " AND ".join(predicates)
 
-        return self.sql(
-            statement=statement,
-            row_limit=row_limit,
+        statement = self.sql.execute(
+            statement,
             wait=wait,
-            cache_for=cache_for
-        ).to_arrow_dataset()
+            cache_for=cache_for,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
+
+        return statement.to_arrow_dataset()
 
     def insert(
         self,
@@ -558,7 +525,7 @@ class Table(WorkspaceService):
         raise_error: bool = True
     ):
         mode = SaveMode.parse(mode, SaveMode.AUTO)
-        engine = self.workspace.sql()
+        engine = self.sql
 
         return engine.insert_into(
             data,

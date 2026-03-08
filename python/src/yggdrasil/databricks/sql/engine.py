@@ -20,11 +20,11 @@ Design goals:
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import random
 import string
 import time
+from dataclasses import dataclass, field
 from threading import Thread
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
@@ -35,14 +35,13 @@ from databricks.sdk.service.sql import Disposition
 from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.cast.registry import convert
-from yggdrasil.data.engine import SQLEngine as BaseSQLEngine
-from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.dataclasses.waiting import WaitingConfigArg, WaitingConfig
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
 from .statement_result import StatementResult
 from .table import Table
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
-from ..workspaces import WorkspaceService, DatabricksPath
+from ..client import DatabricksService
+from ..workspaces import DatabricksPath
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +50,6 @@ if TYPE_CHECKING:
     import delta
     import pandas
     import polars
-
-    from ...ai.sql_session import SQLSession, SQLFlavor
-
 
 __all__ = [
     "SQLEngine",
@@ -106,7 +102,7 @@ def _needs_column_mapping(col_name: str) -> bool:
     return any(ch in _INVALID_COL_CHARS for ch in col_name)
 
 
-@dataclasses.dataclass
+@dataclass
 class CreateTablePlan:
     """
     A plan produced by :meth:`SQLEngine.create_table`.
@@ -144,16 +140,49 @@ class CreateTablePlan:
         return arrow_field_to_schema(self.arrow_field, None)
 
 
-@dataclasses.dataclass
-class SQLEngine(BaseSQLEngine, WorkspaceService):
+@dataclass(frozen=True)
+class SQLEngine(DatabricksService):
     """Execute SQL statements and manage tables via Databricks SQL / Spark."""
     catalog_name: Optional[str] = None
     schema_name: Optional[str] = None
+    default_warehouse: Optional[SQLWarehouse] = field(default=None, repr=False, hash=False, compare=False)
 
-    _warehouse: Optional[SQLWarehouse] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
-    _last_default_wh_check: int = dataclasses.field(default=0, repr=False, hash=False, compare=False)
-    _ai_session: Optional["SQLSession"] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
-    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = dataclasses.field(default=ExpiringDict, repr=False, hash=False, compare=False)
+    _last_default_wh_check: int = field(default=0, init=False, repr=False, hash=False, compare=False)
+    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(default=ExpiringDict, init=False, repr=False, hash=False, compare=False)
+    
+    def __call__(
+        self,
+        *,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        warehouse: Optional[SQLWarehouse | str] = None
+    ):
+        if catalog_name is None and schema_name is None and warehouse is None:
+            return self
+
+        if (
+            catalog_name == self.catalog_name and schema_name == self.schema_name
+            and warehouse == self.default_warehouse
+        ):
+            return self
+
+        if isinstance(warehouse, str):
+            warehouse = self.warehouses.find_warehouse(warehouse_name=warehouse)
+
+        built = SQLEngine(
+            client=self.client,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            default_warehouse= warehouse
+        )
+
+        object.__setattr__(built, "_cached_queries", self._cached_queries)
+
+        return built
+    
+    @classmethod
+    def service_name(cls):
+        return "sql"
 
     # -------------------------------------------------------------------------------------
     # Naming helpers
@@ -269,88 +298,39 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         Returns:
             Resolved :class:`SQLWarehouse`.
         """
-        if self._warehouse is None:
+        if self.default_warehouse is None:
             wh = SQLWarehouse(
-                workspace=self.workspace,
+                client=self.client,
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
             )
 
-            self._warehouse = wh.find_warehouse(
+            object.__setattr__(self, "_last_default_wh_check", time.time())
+            object.__setattr__(self, "default_warehouse", wh.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
-                find_default=True
-            )
+                find_default=True,
+                raise_error=True
+            ))
 
-            self._last_default_wh_check = time.time()
-
-            return self._warehouse.find_warehouse(
+            return self.default_warehouse.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name
             )
 
         if warehouse_id or warehouse_name:
-            return self._warehouse.find_warehouse(
+            return self.default_warehouse.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name
             )
 
-        if self._warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+        if self.default_warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
             now_s = time.time()
             if (now_s - self._last_default_wh_check) > 30:
-                self._warehouse = self._warehouse.find_default()
-                self._last_default_wh_check = now_s
+                object.__setattr__(self, "default_warehouse", self.default_warehouse.find_default())
+                object.__setattr__(self, "_last_default_wh_check", now_s)
 
-        return self._warehouse
-
-    def ai(
-        self,
-        model: str = "databricks-claude-sonnet-4-6",
-        *,
-        flavor: Optional["SQLFlavor"] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None
-    ):
-        """
-        Create a SQL AI session (LLM-assisted SQL).
-
-        Args:
-            model:
-                Serving endpoint/model name.
-            flavor:
-                SQL dialect/flavor. Defaults to Databricks.
-
-        Returns:
-            SQLSession.
-        """
-        from ...ai.sql_session import SQLSession, SQLFlavor
-
-        if flavor is None:
-            flavor = SQLFlavor.DATABRICKS
-
-        session = SQLSession(
-            model=model,
-            api_key=self.workspace.current_token(expiring=False),
-            base_url="%s/serving-endpoints" % self.workspace.safe_host,
-            flavor=flavor,
-        )
-
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
-        client = self.table(
-            catalog_name=catalog_name or "default",
-            schema_name=schema_name or "default",
-            table_name="default"
-        )
-
-        if catalog_name and schema_name:
-            for table in client.list_tables(catalog_name, schema_name):
-                session.register_schema(
-                    alias=table.full_name(safe=True),
-                    schema=table.arrow_schema
-                )
-
-        return session
+        return self.default_warehouse
 
     # -------------------------------------------------------------------------------------
     # Execution
@@ -416,7 +396,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         """
         # --- Engine auto-detection ---
         if not engine:
-            if self.workspace.is_in_databricks_environment():
+            if self.is_in_databricks_environment():
                 engine = "spark"
 
         statement = statement.strip()
@@ -444,13 +424,13 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                 df = df.limit(row_limit)
 
             result = StatementResult(
-                workspace_client=self.workspace.sdk(),
+                client=self.client,
                 warehouse_id="SparkSQL",
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
             )
 
-            result._spark_df = df
+            result.persist(data=df)
         else:
             # --- Warehouse API path ---
             wh = self.warehouse(
@@ -547,7 +527,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
         )
 
         return Table(
-            workspace=self.workspace,
+            client=self.client,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name
@@ -830,7 +810,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
             logger.debug("Inserting %s into %s", data, location)
 
             temp_volume_path = (
-                self.workspace.tmp_path(
+                self.client.tmp_path(
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     volume_name="tmp",
@@ -838,7 +818,7 @@ class SQLEngine(BaseSQLEngine, WorkspaceService):
                     max_lifetime=3600,
                 )
                 if temp_volume_path is None
-                else DatabricksPath.parse(obj=temp_volume_path, workspace=connected.workspace)
+                else DatabricksPath.parse(obj=temp_volume_path, client=connected.workspace)
             )
 
             temp_volume_path.write_table(
@@ -1359,7 +1339,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
                 "This will fail unless you rename/escape columns or enable column mapping."
             )
 
-        default_tags = self.workspace.default_tags()
+        default_tags = self.default_tags()
         for k, v in default_tags.items():
             props[f"tags.{k}"] = v
 

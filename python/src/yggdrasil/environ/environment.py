@@ -34,6 +34,7 @@ PIP_MODULE_NAME_MAPPINGS : dict[str, str]
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -1492,14 +1493,57 @@ class PyEnv:
         if warn:
             print(
                 f"Auto-installing '{pip_name}' into environment {self.python_path} "
-                f"because module '{module_name}' was not found. "
-                "Set install=False or warn=False to suppress this behaviour.",
+                f"because module '{module_name}' was not found.",
                 file=sys.stderr,
             )
         self.install(pip_name, wait=wait, raise_error=True)
 
         importlib.invalidate_caches()
         return importlib.import_module(module_name)
+
+    @staticmethod
+    def get_root_module_directory(module_name: str) -> Path:
+        """
+        Return the filesystem directory of the root package/module for a given module name.
+
+        Examples:
+            "pandas" -> /.../site-packages/pandas
+            "pandas.core.frame" -> /.../site-packages/pandas
+            "json" -> /.../lib/python3.x/json
+            "os" -> may raise if it's a frozen/built-in module with no real directory
+
+        Args:
+            module_name: Dotted module path, e.g. "pandas.core.frame".
+
+        Returns:
+            Path to the root module/package directory.
+
+        Raises:
+            ValueError: If module_name is empty.
+            ModuleNotFoundError: If the root module cannot be found.
+            FileNotFoundError: If the module exists but has no filesystem location.
+        """
+        if not module_name or not module_name.strip():
+            raise ValueError("module_name must be a non-empty string")
+
+        root_module = module_name.split(".", 1)[0]
+        spec = importlib.util.find_spec(root_module)
+
+        if spec is None:
+            raise ModuleNotFoundError(f"Cannot find module '{root_module}'")
+
+        # Package: submodule_search_locations is usually set
+        if spec.submodule_search_locations:
+            return Path(next(iter(spec.submodule_search_locations))).resolve()
+
+        # Single-file module: origin points to the .py file
+        if spec.origin and spec.origin not in {"built-in", "frozen"}:
+            return Path(spec.origin).resolve().parent
+
+        raise FileNotFoundError(
+            f"Module '{root_module}' has no filesystem directory "
+            f"(origin={spec.origin!r})"
+        )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

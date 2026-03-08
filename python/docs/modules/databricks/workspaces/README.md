@@ -26,7 +26,7 @@ from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
 ws = Workspace(host="https://<workspace>.azuredatabricks.net", token="<pat>").connect()
 # or: ws = Workspace().connect()  # uses DATABRICKS_HOST + DATABRICKS_TOKEN
 
-path = DatabricksPath.parse("dbfs:/tmp/orders.parquet", workspace=ws)
+path = DatabricksPath.parse("dbfs:/tmp/orders.parquet", client=ws)
 ```
 
 ---
@@ -107,18 +107,18 @@ ws = Workspace(host=None, token=None)
 ws.connect()          # authenticate, returns self
 ws.connected          # bool
 ws.safe_host          # sanitized host URL
-ws.sdk()              # databricks.sdk.WorkspaceClient
+ws.workspace_client()              # databricks.sdk.WorkspaceClient
 ```
 
 ## `DatabricksPath` API
 
 ```python
-path = DatabricksPath.parse(uri, workspace=None)
+path = DatabricksPath.parse(uri, client=None)
 
-path.open(mode)        # context manager ("r", "w", "rb", "wb")
-path.read_arrow()      # → pa.Table
-path.read_pandas()     # → pandas.DataFrame
-path.read_polars()     # → polars.DataFrame
-path.copy_to(dest)     # copy to DatabricksPath
-path.move_to(dest)     # move to DatabricksPath
+path.open(mode)  # context manager ("r", "w", "rb", "wb")
+path.read_arrow()  # → pa.Table
+path.read_pandas()  # → pandas.DataFrame
+path.read_polars()  # → polars.DataFrame
+path.copy_to(dest)  # copy to DatabricksPath
+path.move_to(dest)  # move to DatabricksPath
 ```

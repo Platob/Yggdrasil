@@ -30,16 +30,16 @@ class DatabricksIntegrationBase(unittest.TestCase):
 
         # hard gate: if auth/network is broken, skip all tests in this file
         try:
-            _ = cls.workspace.current_user
+            _ = cls.workspace.iam.users.current_user
         except Exception as e:
             raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
 
         # Unique per test so parallel runs don’t punch each other
         cls.test_id = "unittest"
 
-        cls.dbfs_base = DatabricksPath.parse(f"/dbfs/tmp/unittest/{cls.test_id}", workspace=cls.workspace)
-        cls.ws_base = DatabricksPath.parse(f"/Workspace/Users/{cls.workspace.current_user.user_name}/unittest/{cls.test_id}", workspace=cls.workspace)
-        cls.vol_base = DatabricksPath.parse(f"/Volumes/trading/unittest/{cls.test_id}", workspace=cls.workspace)
+        cls.dbfs_base = DatabricksPath.parse(f"/dbfs/tmp/unittest/{cls.test_id}", client=cls.workspace)
+        cls.ws_base = DatabricksPath.parse(f"/Workspace/Users/{cls.workspace.iam.users.current_user.email}/unittest/{cls.test_id}", client=cls.workspace)
+        cls.vol_base = DatabricksPath.parse(f"/Volumes/trading/unittest/{cls.test_id}", client=cls.workspace)
 
     @classmethod
     def tearDownClass(cls):

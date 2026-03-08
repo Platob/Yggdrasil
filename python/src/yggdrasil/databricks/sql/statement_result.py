@@ -10,14 +10,12 @@ Design goals:
 - Streaming-friendly APIs (RecordBatch iterator / RecordBatchReader / Dataset)
 - Parallel download of external result chunks with bounded in-flight work
 """
-
-import dataclasses
+from dataclasses import dataclass, field
 from typing import Optional, Iterator, TYPE_CHECKING, Iterable, List
 
 import pyarrow as pa
 import pyarrow.ipc as pipc
 import urllib3
-from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import (
     StatementState,
     StatementResponse,
@@ -32,6 +30,7 @@ from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
 from .exceptions import SqlStatementError
 from .types import column_info_to_arrow_field
+from ..client import DatabricksService
 
 if TYPE_CHECKING:
     pass
@@ -51,15 +50,13 @@ FAILED_STATES = {
 __all__ = ["StatementResult"]
 
 
-@dataclasses.dataclass
-class StatementResult(BaseStatementResult):
-    workspace_client: WorkspaceClient
-    warehouse_id: str
-    statement_id: str
-    disposition: Disposition
+@dataclass(frozen=True)
+class StatementResult(BaseStatementResult, DatabricksService):
+    warehouse_id: Optional[str] = None
+    statement_id: Optional[str] = None
+    disposition: Optional[Disposition] = None
 
-    _arrow_schema: Optional[pa.Schema] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
-    _response: Optional[StatementResponse] = dataclasses.field(default=None, repr=False, compare=False, hash=False)
+    _response: Optional[StatementResponse] = field(default=None, repr=False, compare=False, hash=False)
 
     # ----------------------------
     # Dunder / convenience
@@ -74,8 +71,8 @@ class StatementResult(BaseStatementResult):
     @property
     def monitoring_url(self) -> str:
         """Databricks UI monitoring URL for this statement execution."""
-        return "%s/sql/warehouses/%s/monitoring?queryId=%s" % (
-            self.workspace_client.config.host,
+        return "%ssql/warehouses/%s/monitoring?queryId=%s" % (
+            self.client.base_url.to_string(),
             self.warehouse_id,
             self.statement_id,
         )
@@ -100,7 +97,7 @@ class StatementResult(BaseStatementResult):
 
     def api_result_data_at_index(self, chunk_index: int):
         """Fetch a specific result chunk by chunk index via the Databricks SDK."""
-        return self.workspace_client.statement_execution.get_statement_result_chunk_n(
+        return self.client.workspace_client().statement_execution.get_statement_result_chunk_n(
             statement_id=self.statement_id,
             chunk_index=chunk_index,
         )
@@ -118,12 +115,18 @@ class StatementResult(BaseStatementResult):
                 status=StatementStatus(state=StatementState.PENDING),
             )
 
-        statement_execution = self.workspace_client.statement_execution
+        statement_execution = self.client.workspace_client().statement_execution
 
         if self._response is None:
-            self._response = statement_execution.get_statement(self.statement_id)
+            object.__setattr__(
+                self, "_response",
+                statement_execution.get_statement(self.statement_id)
+            )
         elif self._response.status.state not in DONE_STATES:
-            self._response = statement_execution.get_statement(self.statement_id)
+            object.__setattr__(
+                self, "_response",
+                statement_execution.get_statement(self.statement_id)
+            )
 
         return self
 
@@ -144,7 +147,7 @@ class StatementResult(BaseStatementResult):
 
     @property
     def failed(self) -> bool:
-        """True when the statement failed or was cancelled."""
+        """True when the statement failed or was canceled."""
         return self.state in FAILED_STATES
 
     def raise_for_status(self) -> "StatementResult":
@@ -174,8 +177,7 @@ class StatementResult(BaseStatementResult):
         self.wait()
         return self.response.result
 
-    @property
-    def arrow_schema(self) -> pa.Schema:
+    def make_arrow_schema(self) -> pa.Schema:
         """Return the Arrow schema for the result.
 
         Strategy:
@@ -188,28 +190,14 @@ class StatementResult(BaseStatementResult):
         pyarrow.Schema
             Arrow schema with metadata including source and statement id.
         """
-        if self._arrow_schema is not None:
-            return self._arrow_schema
+        manifest = self.manifest
+        metadata = {"source": "databricks-sql", "statement_id": self.statement_id or ""}
 
-        if self.persisted:
-            if self._arrow_table is not None:
-                self._arrow_schema = self._arrow_table.schema
-            elif self._spark_df is not None:
-                from ...spark.cast import spark_schema_to_arrow_schema
-                self._arrow_schema = spark_schema_to_arrow_schema(self._spark_df.schema, None)
-            else:
-                raise NotImplementedError("Persisted without Arrow table or Spark DF")
-        else:
-            manifest = self.manifest
-            metadata = {"source": "databricks-sql", "statement_id": self.statement_id or ""}
+        if manifest is None:
+            return pa.schema([], metadata=metadata)
 
-            if manifest is None:
-                return pa.schema([], metadata=metadata)
-
-            fields = [column_info_to_arrow_field(c) for c in manifest.schema.columns]
-            self._arrow_schema = pa.schema(fields, metadata=metadata)
-
-        return self._arrow_schema
+        fields = [column_info_to_arrow_field(c) for c in manifest.schema.columns]
+        return pa.schema(fields, metadata=metadata)
 
     # ----------------------------
     # External links
@@ -232,7 +220,7 @@ class StatementResult(BaseStatementResult):
         )
 
         result_data = self.result
-        wsdk = self.workspace_client
+        wsdk = self.client.workspace_client()
 
         while True:
             links = result_data.external_links or []
@@ -389,3 +377,18 @@ class StatementResult(BaseStatementResult):
         )
 
         return pa.RecordBatchReader.from_batches(schema, batches_iter)  # type: ignore[arg-type]
+
+    def to_pylist(
+        self,
+        *,
+        max_workers: int = 4,
+        max_in_flight: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        maintain_order: bool = False,
+    ):
+        return self.to_arrow_reader(
+            max_workers=max_workers,
+            max_in_flight=max_in_flight,
+            batch_size=batch_size,
+            maintain_order=maintain_order,
+        ).read_all().to_pylist()

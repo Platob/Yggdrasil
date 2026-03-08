@@ -30,10 +30,18 @@ class Job(Generic[T]):
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __call__(self, *args: Any, **kwargs: Any) -> T:
-        return self.func(*args, **kwargs)
+        a = self.args + args
+        kw = {**self.kwargs, **kwargs}
+
+        return self.func(*a, **kw)
 
     @classmethod
-    def make(cls, func: Callable[..., T], *args: Any, **kwargs: Any) -> "Job[T]":
+    def make(
+        cls,
+        func: Callable[..., T],
+        *args: Any,
+        **kwargs: Any
+    ) -> "Job[T]":
         return cls(func=func, args=args, kwargs=kwargs)
 
     def run(self) -> Any:

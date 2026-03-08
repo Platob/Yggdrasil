@@ -9,10 +9,12 @@ from typing import (
     List, TYPE_CHECKING, Union,
 )
 
+from yggdrasil.data.cast.registry import identity
+
 if TYPE_CHECKING:
     from .cluster import Cluster
 
-from ..workspaces.workspace import Workspace
+from ..client import DatabricksClient
 
 
 __all__ = [
@@ -25,15 +27,11 @@ ReturnType = TypeVar("ReturnType")
 logger = logging.getLogger(__name__)
 
 
-def identity(x):
-    return x
-
-
 def databricks_remote_compute(
     _func: Optional[Callable] = None,
     cluster_id: Optional[str] = None,
     cluster_name: Optional[str] = None,
-    workspace: Optional[Union[Workspace, str]] = None,
+    workspace: Optional[Union["DatabricksClient", str]] = None,
     cluster: Optional["Cluster"] = None,
     env_keys: Optional[List[str]] = None,
     force_local: bool = False,
@@ -52,7 +50,7 @@ def databricks_remote_compute(
     Returns:
         A decorator that runs functions on the resolved Databricks cluster.
     """
-    if force_local or Workspace.is_in_databricks_environment():
+    if force_local or DatabricksClient.is_in_databricks_environment():
         return identity if _func is None else _func
 
     if workspace is None:
@@ -61,20 +59,16 @@ def databricks_remote_compute(
     if workspace is None:
         return identity if _func is None else _func
 
-    if not isinstance(workspace, Workspace):
-        if isinstance(workspace, str):
-            workspace = Workspace(host=workspace).connect(clone=False)
-        else:
-            raise ValueError("Cannot initialize databricks workspace with %s" % type(workspace))
+    workspace = DatabricksClient.parse(workspace)
 
     if cluster is None:
         if cluster_id or cluster_name:
-            cluster = workspace.clusters(
+            cluster = workspace.compute.clusters.find_cluster(
                 cluster_id=cluster_id,
                 cluster_name=cluster_name
             )
         else:
-            cluster = workspace.clusters().all_purpose_cluster()
+            cluster = workspace.compute.clusters.all_purpose_cluster(wait=False)
 
     return cluster.decorate(
         func=_func,

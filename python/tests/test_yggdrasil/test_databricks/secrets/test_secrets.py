@@ -4,7 +4,7 @@ import unittest
 import uuid
 
 from yggdrasil.databricks import Workspace
-from yggdrasil.databricks.secrets import Secret  # adjust if your import path differs
+from yggdrasil.databricks.secrets import Secrets  # adjust if your import path differs
 
 
 class TestSecrets(unittest.TestCase):
@@ -38,7 +38,7 @@ class TestSecrets(unittest.TestCase):
 
         cls.key = f"test_key_{uuid.uuid4().hex[:8]}"
 
-        cls.secret = Secret(workspace=cls.workspace, scope=cls.scope, key=cls.key)
+        cls.secret = Secrets(client=cls.workspace, scope=cls.scope, key=cls.key)
 
         # Ensure scope exists (create_scope is idempotent-ish if you handle errors in your wrapper;
         # if Databricks throws AlreadyExists, ignore it).
@@ -57,12 +57,12 @@ class TestSecrets(unittest.TestCase):
 
         # Best-effort cleanup: delete secret then scope
         try:
-            Secret(workspace=cls.workspace, scope=cls.scope, key=cls.key).delete_secret()
+            Secrets(workspace=cls.workspace, scope=cls.scope, key=cls.key).delete_secret()
         except Exception:
             pass
 
         try:
-            Secret(workspace=cls.workspace, scope=cls.scope).delete_scope()
+            Secrets(workspace=cls.workspace, scope=cls.scope).delete_scope()
         except Exception:
             pass
 
@@ -70,7 +70,7 @@ class TestSecrets(unittest.TestCase):
         # new isolated scope for this test, to validate "create scope if missing"
         scope = f"yggdrasil_it_autocreate_{uuid.uuid4().hex[:8]}"
         key = f"key_{uuid.uuid4().hex[:8]}"
-        s = Secret(workspace=self.workspace, scope=scope, key=key)
+        s = Secrets(client=self.workspace, scope=scope, key=key)
 
         s.update(
             value={"hello": "world", "n": 1},
@@ -78,7 +78,7 @@ class TestSecrets(unittest.TestCase):
         )
 
         # list scopes should contain it
-        scopes = list(Secret(workspace=self.workspace).list_scopes())
+        scopes = list(Secrets(client=self.workspace).list_scopes())
         scope_names = {getattr(x, "name", None) or getattr(x, "scope", None) or str(x) for x in scopes}
         self.assertIn(scope, scope_names)
 
@@ -110,7 +110,7 @@ class TestSecrets(unittest.TestCase):
         # Your Secret.value property does best-effort parsing
         # BUT: reading requires get_secret access (may be restricted). Handle that.
         try:
-            s2 = Secret(workspace=self.workspace, scope=self.scope, key=self.key).find_secret()
+            s2 = Secrets(client=self.workspace, scope=self.scope, key=self.key).find_secret()
         except Exception as e:
             msg = (getattr(e, "message", None) or str(e) or "").lower()
             # If get_secret is blocked in this environment, skip cleanly.

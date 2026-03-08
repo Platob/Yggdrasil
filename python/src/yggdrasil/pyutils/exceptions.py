@@ -71,6 +71,12 @@ def parse_exception_from_traceback(tb_text: str) -> ParsedException:
         exc_cls = getattr(builtins, name, None)
         if isinstance(exc_cls, type) and issubclass(exc_cls, BaseException):
             return ParsedException(exc_cls, msg, name)
+        if "install pymongo again" in msg:
+            return ParsedException(
+                ModuleNotFoundError,
+                f"No module named 'pymongo' (hint: try installing pymongo again)",
+                "ModuleNotFoundError"
+            )
         return ParsedException(RuntimeError, f"{name}: {msg}", name)
 
     # Try a bare exception name at the end (no message)

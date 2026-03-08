@@ -29,11 +29,16 @@ import socket
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Literal
+from typing import Mapping, Optional, Sequence, Literal, Tuple
 
 from yggdrasil.io.url import URL
 
-__all__ = ["UserInfo", "get_user_info", "normalize_abs_path_for_url"]
+__all__ = [
+    "UserInfo",
+    "get_user_info",
+    "normalize_abs_path_for_url",
+    "parse_name_from_email"
+]
 
 _CURRENT_CACHE: "UserInfo | None" = None
 DatabricksLinkKind = Literal["auto", "job_run", "notebook_id", "workspace_path"]
@@ -216,6 +221,83 @@ def _infer_project(cwd: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+_SPLIT_RE = re.compile(r"[._+]+")
+_LASTNAME_PARTICLES = {
+    "da", "de", "del", "della", "der", "di", "du", "des",
+    "la", "le", "les",
+    "van", "von", "den", "ten", "ter",
+    "st", "st.", "saint",
+    "y",
+}
+
+def parse_name_from_email(email: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse emails like:
+      - prenom.nom@domain
+      - jean-paul.dupont@domain
+      - louis.de.la.fontaine@domain
+      - maria.del-carmen.garcia.lopez@domain
+
+    Returns (first, last, domain) with nice casing, or None if not parseable.
+    """
+    s = (email or "").strip()
+    if "@" not in s:
+        return None
+
+    local, domain = s.rsplit("@", 1)
+    local = local.strip().split("+", 1)[0]  # drop +tag
+    domain = domain.strip().lower()
+    if not local or not domain:
+        return None
+
+    # tokens: keep hyphens/apostrophes inside tokens, split on dot/underscore/etc
+    tokens = [t for t in _SPLIT_RE.split(local) if t]
+    tokens = [re.sub(r"\d+$", "", t) for t in tokens]  # drop trailing digits
+    tokens = [t for t in tokens if t]
+    if len(tokens) < 2:
+        return None
+
+    def smart_title(tok: str) -> str:
+        tok = tok.strip().replace("’", "'")
+        if not tok:
+            return tok
+        out = []
+        for chunk in tok.split("-"):
+            if "'" in chunk:
+                left, right = chunk.split("'", 1)
+                left_low = left.lower()
+                left_fmt = left_low if left_low in _LASTNAME_PARTICLES else (left[:1].upper() + left[1:].lower())
+                right_fmt = right[:1].upper() + right[1:].lower() if right else ""
+                out.append(f"{left_fmt}’{right_fmt}" if right_fmt else f"{left_fmt}’")
+            else:
+                out.append(chunk[:1].upper() + chunk[1:].lower())
+        return "-".join(out)
+
+    # First token = first name
+    first = smart_title(tokens[0])
+
+    # Last name = last token + absorb particles to the left; also allow 2-part last name for 4+ tokens
+    last_parts = [tokens[-1]]
+    i = len(tokens) - 2
+    while i >= 1:
+        base = tokens[i].replace("’", "'").lower().strip(".")
+        if base in _LASTNAME_PARTICLES:
+            last_parts.insert(0, tokens[i])
+            i -= 1
+            continue
+        if len(tokens) >= 4 and len(last_parts) == 1:
+            last_parts.insert(0, tokens[i])  # e.g., "garcia lopez"
+            i -= 1
+            continue
+        break
+
+    last = " ".join(smart_title(p) for p in last_parts)
+
+    # Force particles lowercase inside last name
+    last = " ".join(w.lower() if w.replace("’", "'").lower().strip(".") in _LASTNAME_PARTICLES else w for w in last.split())
+
+    return (first, last, domain)
+
 # ----------------------------
 # UserInfo
 # ----------------------------
@@ -334,11 +416,10 @@ def _guess_email_from_env() -> str | None:
 
 def _get_dbx_user() -> str | None:
     try:
-        from yggdrasil.databricks import Workspace
+        from yggdrasil.databricks import DatabricksClient
 
-        ws = Workspace(product="current", product_version="0.0.0")
-        u = ws.current_user.user_name
-        return u.strip() if u else None
+        client = DatabricksClient(product="current", product_version="0.0.0")
+        return client.iam.users.current_user.email
     except Exception:
         return None
 
@@ -601,9 +682,5 @@ def _git_url_from_info(git: dict[str, str] | None) -> URL | None:
 
     base = _normalize_git_remote(remote)
     u = URL.parse_str(base, normalize=True)
-
-    ref = git.get("git_sha") or git.get("git_branch")
-    if ref:
-        u = u.with_fragment(ref)
 
     return u

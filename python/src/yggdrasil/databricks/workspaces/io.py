@@ -314,7 +314,7 @@ class DatabricksIO(ABC, IO):
         Returns:
             The connected DatabricksIO instance.
         """
-        path = self.path.connect(clone=clone)
+        path = self.path.connect()
 
         if clone:
             return self.clone_instance(path=path)
@@ -679,7 +679,7 @@ class DatabricksIO(ABC, IO):
         else:
             from .path import DatabricksPath
 
-            dest_path = DatabricksPath.parse(dest, workspace=self.workspace)
+            dest_path = DatabricksPath.parse(dest, client=self.workspace)
 
             with dest_path.open(mode="wb") as d:
                 return self.copy_to(dest=d)
@@ -714,7 +714,7 @@ class DatabricksWorkspaceIO(DatabricksIO):
         if length == 0:
             return b""
 
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.workspace
         full_path = self.path.workspace_full_path()
 
@@ -741,7 +741,7 @@ class DatabricksWorkspaceIO(DatabricksIO):
         Returns:
             The DatabricksWorkspaceIO instance.
         """
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         workspace_client = sdk.workspace
         full_path = self.path.workspace_full_path()
 
@@ -814,7 +814,7 @@ class DatabricksVolumeIO(DatabricksIO):
         if length < 0:
             raise ValueError(f"length must be >= 0, got {length}")
 
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.files
         full_path = self.path.files_full_path()
 
@@ -845,7 +845,7 @@ class DatabricksVolumeIO(DatabricksIO):
         parallelism: Optional[int] = None,
     ):
         """Write bytes/stream to a volume file safely (BinaryIO upload)."""
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.files
         full_path = self.path.files_full_path()
 
@@ -910,7 +910,7 @@ class DatabricksDBFSIO(DatabricksIO):
         if length == 0:
             return b""
 
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.dbfs
         full_path = self.path.dbfs_full_path()
 
@@ -950,7 +950,7 @@ class DatabricksDBFSIO(DatabricksIO):
         Returns:
             The DatabricksDBFSIO instance.
         """
-        sdk = self.workspace.sdk()
+        sdk = self.workspace.workspace_client()
         client = sdk.dbfs
         full_path = self.path.dbfs_full_path()
 

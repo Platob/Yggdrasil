@@ -3,6 +3,7 @@ import unittest
 
 import pyarrow as pa
 import pytest
+
 from yggdrasil.databricks.sql.exceptions import SqlStatementError
 from yggdrasil.databricks.workspaces import Workspace
 

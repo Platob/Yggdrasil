@@ -1,243 +1,417 @@
-# test_url_nullable.py
-# Pytest unit tests for the nullable URL dataclass behavior.
+from __future__ import annotations
 
-from yggdrasil.io.url import URL  # adjust import path if your module name differs
+from pathlib import Path
 
+import pytest
 
-def test_default_ctor_all_none_is_empty_string_roundtrip():
-    u = URL()
-    assert u.scheme is None
-    assert u.host is None
-    assert u.userinfo is None
-    assert u.port is None
-    assert u.path is None
-    assert u.query is None
-    assert u.fragment is None
-
-    assert u.to_string() == ""
-    assert str(u) == ""
-    assert u.authority == ""
-    assert u.is_absolute is False
-    assert u.query_dict == {}
+import yggdrasil.io.url as mod
+from yggdrasil.io.url import (
+    URL,
+    URLResource,
+    get_registered_url_resource,
+    register_url_resource,
+    registered_url_schemes,
+    url_resource_class,
+)
 
 
-def test_to_string_none_fields_dont_crash_and_render_empty():
-    u = URL(
-        scheme=None,
-        userinfo=None,
-        host=None,
-        port=None,
-        path=None,
-        query=None,
-        fragment=None,
-    )
-    assert u.to_string() == ""
+def test_parse_str_normalizes_scheme_host_default_port_and_query_sorting():
+    url = URL.parse_str("HTTPS://Example.COM.:443//a//b?z=2&a=3&a=1#frag")
+
+    assert url.scheme == "https"
+    assert url.host == "example.com"
+    assert url.port is None
+    assert url.path == "/a/b"
+    assert url.query == "a=1&a=3&z=2"
+    assert url.fragment == "frag"
 
 
-def test_parse_minimal_url_sets_nones_for_missing_parts():
-    u = URL.parse_str("https://example.com")
-    assert u.scheme == "https"
-    assert u.host == "example.com"
-    assert u.userinfo is None
-    assert u.path is None  # urlsplit gives empty path; we store None
-    assert u.query is None
-    assert u.fragment is None
-    assert u.port is None  # default port removed -> absent (None)
-    assert u.is_absolute is True
-    assert u.to_string() == "https://example.com"
+def test_parse_str_without_normalization_preserves_values():
+    url = URL.parse_str("HTTPS://Example.COM.:443//a//b?z=2&a=3#frag", normalize=False)
+
+    assert url.scheme == "https"
+    assert url.host == "Example.COM."
+    assert url.port == 443
+    assert url.path == "//a//b"
+    assert url.query == "z=2&a=3"
+    assert url.fragment == "frag"
 
 
-def test_parse_keeps_non_default_port():
-    u = URL.parse_str("https://example.com:8443")
-    assert u.scheme == "https"
-    assert u.host == "example.com"
-    assert u.port == 8443
-    assert u.to_string() == "https://example.com:8443"
+def test_parse_dict_empty_returns_default_url():
+    url = URL.parse_dict({})
+
+    assert url == URL()
 
 
-def test_parse_ipv6_bracketing_roundtrip():
-    u = URL.parse_str("http://[::1]:8080/a/b")
-    assert u.scheme == "http"
-    assert u.host == "::1"
-    assert u.port == 8080
-    assert u.path == "/a/b"
-    assert u.to_string() == "http://[::1]:8080/a/b"
-    assert u.authority == "[::1]:8080"
+def test_parse_dict_from_raw_shortcut():
+    url = URL.parse_dict({"raw": "https://example.com/x?a=2&a=1"})
+
+    assert url.scheme == "https"
+    assert url.host == "example.com"
+    assert url.path == "/x"
+    assert url.query == "a=1&a=2"
 
 
-def test_parse_userinfo_roundtrip():
-    u = URL.parse_str("https://user:pass@example.com/path")
-    assert u.userinfo == "user:pass"
-    assert u.host == "example.com"
-    assert u.to_string() == "https://user:pass@example.com/path"
-    assert u.authority == "user:pass@example.com"
-
-
-def test_parse_normalization_host_lower_and_strip_trailing_dot():
-    u = URL.parse_str("HTTPS://EXAMPLE.COM./x")
-    assert u.scheme == "https"
-    assert u.host == "example.com"
-    assert u.to_string() == "https://example.com/x"
-
-
-def test_parse_normalization_collapse_double_slashes():
-    u = URL.parse_str("https://example.com//a///b")
-    assert u.path == "/a/b"
-    assert u.to_string() == "https://example.com/a/b"
-
-
-def test_parse_normalization_sorts_query_pairs():
-    u = URL.parse_str("https://example.com/?b=2&a=2&a=1")
-    # sorted by (k, v) => a=1&a=2&b=2
-    assert u.query == "a=1&a=2&b=2"
-    assert u.to_string() == "https://example.com/?a=1&a=2&b=2"
-
-
-def test_query_dict_groups_values_and_keeps_order_per_key():
-    u = URL.parse_str("https://example.com/?k=2&k=1&x=&y")
-    # parse(normalize=True) sorts query by (k,v), so k becomes 1 then 2
-    assert u.query_dict == {"k": ("1", "2"), "x": ("",), "y": ("",)}
-
-
-def test_parse_dict_empty_mapping_returns_defaults():
-    u = URL.parse_dict({})
-    assert u.to_string() == ""
-
-
-def test_parse_dict_url_shortcut():
-    u = URL.parse_dict({"url": "https://example.com/a?b=1"})
-    assert u.scheme == "https"
-    assert u.host == "example.com"
-    assert u.path == "/a"
-    assert u.query == "b=1"
-    assert u.to_string() == "https://example.com/a?b=1"
-
-
-def test_parse_dict_split_fields_with_netloc():
-    u = URL.parse_dict(
+def test_parse_dict_authority_and_explicit_overrides():
+    url = URL.parse_dict(
         {
             "scheme": "https",
-            "netloc": "User:Pass@Example.com.:443",
-            "path": "/p",
-            "query": "b=2&a=1",
-            "fragment": "frag",
-        },
-        normalize=True,
-        decode=False,
+            "authority": "alice:pw@example.com:443",
+            "host": "OtherHost.COM.",
+            "port": "8443",
+            "path": "//x//y",
+            "query": "?b=2&a=1",
+            "fragment": "#frag",
+        }
     )
-    assert u.scheme == "https"
-    assert u.userinfo == "User:Pass"
-    assert u.host == "example.com"
-    assert u.port is None  # 443 removed
-    assert u.query == "a=1&b=2"
-    assert u.fragment == "frag"
-    assert u.to_string() == "https://User:Pass@example.com/p?a=1&b=2#frag"
+
+    assert url.scheme == "https"
+    assert url.userinfo == "alice:pw"
+    assert url.host == "otherhost.com"
+    assert url.port == 8443
+    assert url.path == "/x/y"
+    assert url.query == "a=1&b=2"
+    assert url.fragment == "frag"
 
 
-def test_parse_dict_explicit_overrides_win_over_netloc():
-    u = URL.parse_dict(
-        {
-            "scheme": "https",
-            "netloc": "u1@wrong.com:123",
-            "userinfo": "u2",
-            "host": "Right.com",
-            "port": 8443,
-            "path": "/x",
-        },
-        normalize=True,
+def test_parse_path_object_to_file_url(tmp_path: Path):
+    file_path = tmp_path / "data.txt"
+    url = URL.parse(file_path)
+
+    assert url.scheme == "file"
+    assert url.host == ""
+    assert url.path.endswith("/data.txt")
+
+
+def test_parse_local_path_string_coerces_to_file_url(tmp_path: Path):
+    file_path = tmp_path / "nested" / "file.txt"
+    url = URL.parse(file_path)
+
+    assert url.scheme == "file"
+    assert url.path.endswith("/nested/file.txt")
+
+def test_parse_ipv6_netloc():
+    url = URL.parse_str("http://user:pw@[2001:db8::1]:8080/a")
+
+    assert url.userinfo == "user:pw"
+    assert url.host == "2001:db8::1"
+    assert url.port == 8080
+    assert url.authority == "user:pw@[2001:db8::1]:8080"
+
+
+def test_parse_invalid_ipv6_keeps_hostport_literal():
+    url = URL.parse_str("http://[2001:db8::1]/a", normalize=False)
+
+    assert url.host == "2001:db8::1"
+    assert url.port is None
+
+
+def test_user_and_password_properties_decode_values():
+    url = URL(userinfo="alice%40corp:p%40ss")
+
+    assert url.user == "alice@corp"
+    assert url.password == "p@ss"
+
+
+def test_user_and_password_edge_cases():
+    assert URL(userinfo=None).user is None
+    assert URL(userinfo=None).password is None
+    assert URL(userinfo="alice").user == "alice"
+    assert URL(userinfo="alice").password is None
+    assert URL(userinfo=":pw").user == ""
+    assert URL(userinfo=":pw").password == "pw"
+    assert URL(userinfo="alice:").user == "alice"
+    assert URL(userinfo="alice:").password == ""
+
+
+def test_with_user_password_user_only():
+    url = URL("https", host="example.com").with_user_password("alice@example.com")
+
+    assert url.userinfo == "alice%40example.com"
+    assert url.user == "alice@example.com"
+    assert url.password is None
+
+
+def test_with_user_password_user_and_password():
+    url = URL("https", host="example.com").with_user_password("alice@example.com", "p@ss")
+
+    assert url.userinfo == "alice%40example.com:p%40ss"
+    assert url.user == "alice@example.com"
+    assert url.password == "p@ss"
+
+
+def test_with_user_password_none_none_removes_userinfo():
+    url = URL("https", userinfo="alice:pw", host="example.com").with_user_password(None, None)
+
+    assert url.userinfo is None
+
+
+def test_query_dict_and_query_mapping():
+    url = URL(query="a=1&a=2&b=")
+
+    assert url.query_dict == {"a": ("1", "2"), "b": ("",)}
+    assert url.query_mapping() == {"a": ["1", "2"], "b": [""]}
+
+
+def test_query_items_respects_blank_values():
+    url = URL(query="a=&b=2")
+
+    assert url.query_items() == (("a", ""), ("b", "2"))
+
+
+def test_to_string_encoded_and_raw_cache_paths():
+    url = URL(
+        scheme="https",
+        userinfo="alice:pw",
+        host="example.com",
+        path="/a b",
+        query="x=hello world",
+        fragment="frag ment",
     )
-    assert u.userinfo == "u2"
-    assert u.host == "right.com"
-    assert u.port == 8443
-    assert u.to_string() == "https://u2@right.com:8443/x"
+
+    encoded_first = url.to_string(encode=True)
+    encoded_second = url.to_string(encode=True)
+    raw_first = url.to_string(encode=False)
+    raw_second = url.to_string(encode=False)
+
+    assert encoded_first == encoded_second
+    assert raw_first == raw_second
+    assert "%20" in encoded_first
+    assert " " in raw_first
 
 
-def test_parse_dict_port_none_or_zero_means_absent():
-    u1 = URL.parse_dict({"scheme": "https", "host": "example.com", "port": None})
-    u2 = URL.parse_dict({"scheme": "https", "host": "example.com", "port": 0})
-    assert u1.port is None
-    assert u2.port is None
-    assert u1.to_string() == "https://example.com"
-    assert u2.to_string() == "https://example.com"
+def test_to_string_wraps_ipv6_host():
+    url = URL(scheme="http", host="2001:db8::1", port=8080, path="/")
+
+    assert url.to_string() == "http://[2001:db8::1]:8080/"
 
 
-def test_with_scheme_accepts_none_and_reapplies_default_port_removal():
-    u = URL.parse_str("http://example.com:80/x")
-    assert u.port is None
-    u2 = u.with_scheme("https")
-    assert u2.scheme == "https"
-    assert u2.port is None
-    assert u2.to_string() == "https://example.com/x"
-
-    u3 = u2.with_scheme(None)
-    assert u3.scheme is None
-    assert u3.to_string() == "//example.com/x"  # urlunsplit behavior for empty scheme
+def test_authority_empty_without_host():
+    assert URL().authority == ""
 
 
-def test_with_host_normalizes_and_recalculates_default_port():
-    u = URL.parse_str("https://example.com:8443/x")
-    u2 = u.with_host("EXAMPLE.com.")
-    assert u2.host == "example.com"
-    assert u2.port == 8443  # still non-default
-    assert u2.to_string() == "https://example.com:8443/x"
-
-    u3 = URL.parse_str("https://example.com:443/x").with_host("Example.com.")
-    assert u3.port is None  # default removed
-    assert u3.to_string() == "https://example.com/x"
+def test_is_absolute_requires_scheme_and_host():
+    assert URL(scheme="https", host="example.com").is_absolute is True
+    assert URL(scheme="https", host="").is_absolute is False
+    assert URL(scheme="", host="example.com").is_absolute is False
 
 
-def test_with_userinfo_none_clears():
-    u = URL.parse_str("https://user@example.com/x")
-    assert u.userinfo == "user"
-    u2 = u.with_userinfo(None)
-    assert u2.userinfo is None
-    assert u2.to_string() == "https://example.com/x"
+def test_join_relative_url():
+    base = URL.parse_str("https://example.com/a/b/")
+    joined = base.join("../c?q=1")
+
+    assert joined.to_string() == "https://example.com/a/c?q=1"
 
 
-def test_with_path_none_clears():
-    u = URL.parse_str("https://example.com/x")
-    u2 = u.with_path(None)
-    assert u2.path is None
-    assert u2.to_string() == "https://example.com"
+def test_truediv_replaces_path():
+    url = URL("https", host="example.com", path="/a") / "/b//c"
+
+    assert url.path == "/b/c"
 
 
-def test_with_query_and_fragment_strip_prefix_and_allow_none():
-    u = URL.parse_str("https://example.com/x")
-    u2 = u.with_query("?a=1").with_fragment("#f")
-    assert u2.query == "a=1"
-    assert u2.fragment == "f"
-    assert u2.to_string() == "https://example.com/x?a=1#f"
-
-    u3 = u2.with_query(None).with_fragment(None)
-    assert u3.query is None
-    assert u3.fragment is None
-    assert u3.to_string() == "https://example.com/x"
+def test_truediv_rejects_non_string():
+    with pytest.raises(ValueError):
+        _ = URL("https", host="example.com") / 123
 
 
-def test_join_works_with_nullable_parts():
-    base = URL.parse_str("https://example.com/base/")
-    out = base.join("child")
-    assert out.to_string() == "https://example.com/base/child"
+def test_with_host_normalizes_and_removes_default_port():
+    url = URL(scheme="https", host="EXAMPLE.COM", port=443).with_host("Other.COM.")
 
-    # join should still work if base has path None (acts like empty)
-    base2 = URL.parse_str("https://example.com").with_path(None)
-    out2 = base2.join("/x")
-    assert out2.to_string() == "https://example.com/x"
+    assert url.host == "other.com"
+    assert url.port is None
 
 
-def test_truediv_calls_with_path_and_normalizes_slashes():
-    u = URL.parse_str("https://example.com/base")
-    out = u / "//x///y"
-    assert out.path == "/x/y"
-    assert out.to_string() == "https://example.com/x/y"
+def test_with_query_and_fragment_strip_prefixes():
+    url = URL().with_query("?a=1").with_fragment("#frag")
+
+    assert url.query == "a=1"
+    assert url.fragment == "frag"
 
 
-def test_anonymize_userinfo_and_query():
-    u = URL.parse_str("https://user:pass@example.com/x?token=abc&ok=1")
-    a = u.anonymize(mode="redact")
-    # userinfo always redacted if present
-    assert a.userinfo == "<redacted>"
-    # query values for sensitive keys depend on your anonymize_parameters implementation.
-    # We at least assert it stays parseable and retains keys.
-    assert "token=" in (a.query or "")
-    assert "ok=" in (a.query or "")
+def test_add_query_item_replace_true():
+    url = URL(query="a=2&a=1&b=3").add_query_item("a", "9", replace=True)
+
+    assert url.query == "a=9&b=3"
+
+
+def test_add_query_item_replace_false():
+    url = URL(query="a=2").add_query_item("a", "1", replace=False)
+
+    assert url.query == "a=1&a=2"
+
+
+def test_add_query_item_none_key_raises():
+    with pytest.raises(ValueError):
+        URL().add_query_item(None, "x")  # type: ignore[arg-type]
+
+
+def test_with_query_items_from_mapping_scalar_and_sequence():
+    url = URL().with_query_items({"b": "2", "a": ("3", "1")})
+
+    assert url.query == "a=1&a=3&b=2"
+
+
+def test_with_query_items_from_iterable_no_sort():
+    url = URL().with_query_items((("b", "2"), ("a", "1")), sort_keys=False)
+
+    assert url.query == "b=2&a=1"
+
+
+def test_anonymize_remove_mode(monkeypatch):
+    def fake_anonymize(params, mode):
+        assert mode == "remove"
+        return {"safe": ("1",)}
+
+    monkeypatch.setattr(mod, "anonymize_parameters", fake_anonymize)
+
+    url = URL(
+        scheme="https",
+        userinfo="alice:pw",
+        host="example.com",
+        query="secret=1&safe=1",
+    )
+
+    out = url.anonymize(mode="remove")
+
+    assert out.userinfo is None
+    assert out.query == "safe=1"
+
+
+def test_anonymize_redact_mode(monkeypatch):
+    def fake_anonymize(params, mode):
+        assert mode == "redact"
+        return params
+
+    monkeypatch.setattr(mod, "anonymize_parameters", fake_anonymize)
+
+    url = URL(
+        scheme="https",
+        userinfo="alice:pw",
+        host="example.com",
+        query="a=1",
+    )
+
+    out = url.anonymize(mode="redact")
+
+    assert out.userinfo == "<redacted>"
+    assert out.query == "a=1"
+
+
+class DemoResource(URLResource):
+    def __init__(self, name: str):
+        self.name = name
+
+    @classmethod
+    def url_scheme(cls) -> str:
+        return "demo"
+
+    def to_url(self, scheme: str | None = None) -> URL:
+        return URL(scheme=scheme or self.url_scheme(), host="example.com", path=f"/{self.name}")
+
+    @classmethod
+    def from_parsed_url(cls, url: URL) -> "DemoResource":
+        return cls(url.path.lstrip("/"))
+
+
+class OtherDemoResource(URLResource):
+    def __init__(self, value: str):
+        self.value = value
+
+    @classmethod
+    def url_scheme(cls) -> str:
+        return "demo"
+
+    def to_url(self, scheme: str | None = None) -> URL:
+        return URL(scheme=scheme or self.url_scheme(), path=f"/{self.value}")
+
+    @classmethod
+    def from_parsed_url(cls, url: URL) -> "OtherDemoResource":
+        return cls(url.path.lstrip("/"))
+
+
+def test_register_url_resource_success():
+    register_url_resource(DemoResource)
+
+    assert get_registered_url_resource("demo") is DemoResource
+    assert registered_url_schemes() == ("demo", "file")
+
+
+def test_register_url_resource_rejects_non_subclass():
+    with pytest.raises(TypeError):
+        register_url_resource(str)  # type: ignore[arg-type]
+
+
+def test_register_url_resource_requires_non_empty_scheme():
+    class BadResource(URLResource):
+        @classmethod
+        def url_scheme(cls) -> str:
+            return ""
+
+        def to_url(self, scheme: str | None = None) -> URL:
+            return URL()
+
+        @classmethod
+        def from_parsed_url(cls, url: URL):
+            return cls()
+
+    with pytest.raises(ValueError, match="must return a non-empty scheme"):
+        register_url_resource(BadResource)
+
+
+def test_register_url_resource_overwrite():
+    register_url_resource(DemoResource)
+    register_url_resource(OtherDemoResource, overwrite=True)
+
+    assert get_registered_url_resource("demo") is OtherDemoResource
+
+
+def test_url_resource_class_decorator():
+    @url_resource_class
+    class DecoratedResource(URLResource):
+        @classmethod
+        def url_scheme(cls) -> str:
+            return "decorated"
+
+        def to_url(self, scheme: str | None = None) -> URL:
+            return URL(scheme=scheme or "decorated", path="/x")
+
+        @classmethod
+        def from_parsed_url(cls, url: URL):
+            return cls()
+
+    assert get_registered_url_resource("decorated") is DecoratedResource
+
+
+def test_url_resource_class_decorator_with_overwrite():
+    register_url_resource(DemoResource)
+
+    @url_resource_class(overwrite=True)
+    class ReplacedDemoResource(URLResource):
+        @classmethod
+        def url_scheme(cls) -> str:
+            return "demo"
+
+        def to_url(self, scheme: str | None = None) -> URL:
+            return URL(scheme=scheme or "demo", path="/y")
+
+        @classmethod
+        def from_parsed_url(cls, url: URL):
+            return cls()
+
+    assert get_registered_url_resource("demo") is ReplacedDemoResource
+
+
+def test_urlresource_from_url_dispatches_from_base_class():
+    register_url_resource(DemoResource)
+
+    resource = URLResource.from_url("demo://example.com/thing")
+
+    assert isinstance(resource, DemoResource)
+    assert resource.name == "thing"
+
+
+def test_urlresource_subclass_from_url_accepts_no_scheme():
+    resource = DemoResource.from_url("/thing")
+
+    assert isinstance(resource, DemoResource)
+    assert resource.name == "thing"

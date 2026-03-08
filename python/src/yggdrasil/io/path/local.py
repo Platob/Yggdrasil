@@ -74,7 +74,7 @@ class LocalDataPath(SystemPath, AbstractDataPath):
 
                 return DatabricksPath.parse(
                     base,
-                    workspace=workspace,
+                    client=workspace,
                     temporary=temporary,
                 )
         elif not args and isinstance(base, AbstractDataPath):

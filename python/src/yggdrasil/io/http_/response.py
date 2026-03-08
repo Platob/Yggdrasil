@@ -40,7 +40,7 @@ class HTTPResponse(Response):
 
         buffer.seek(0)
 
-        return cls(
+        response = cls(
             request=request,
             status_code=response.status,
             headers=dict(response.headers),
@@ -48,3 +48,7 @@ class HTTPResponse(Response):
             tags=tags,
             received_at_timestamp=received_at_timestamp
         )
+
+        if request.prepare_response is not None:
+            return request.prepare_response(response)
+        return response

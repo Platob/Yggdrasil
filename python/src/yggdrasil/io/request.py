@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import json as json_module
 import time
-from dataclasses import dataclass, replace, MISSING
-from typing import Mapping, Any, Optional, MutableMapping, Literal, Callable
+from dataclasses import dataclass, replace, MISSING, field
+from typing import Mapping, Any, Optional, MutableMapping, Literal, Callable, TYPE_CHECKING
 
 from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.dataclasses.dataclass import get_from_dict
+from yggdrasil.environ import UserInfo
 from yggdrasil.io.enums.mime_type import MimeType
 from yggdrasil.io.headers import anonymize_headers
 from yggdrasil.version import __version__ as YGG_VERSION
 from .buffer import BytesIO
 from .url import URL
+from ..data.cast.registry import identity
+
+if TYPE_CHECKING:
+    from .response import Response
+
 
 __all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
 
-from ..environ import UserInfo
+
 # ----------------------------
 # Arrow schema (FLATTENED)
 # ----------------------------
@@ -106,9 +112,10 @@ class PreparedRequest:
     headers: MutableMapping[str, str]
     tags: Optional[Mapping[str, str]]
     buffer: Optional[BytesIO]
-    sent_at_timestamp: int = 0  # time.time_ns() // 1000
+    sent_at_timestamp: int = field(default=0, hash=False, compare=False)  # time.time_ns() // 1000
 
-    before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None
+    before_send: Callable[["PreparedRequest"], "PreparedRequest"] = field(default=identity, hash=False, compare=False)
+    prepare_response: Callable[["Response"], "Response"] = field(default=identity, hash=False, compare=False)
 
     @classmethod
     def parse(
@@ -271,6 +278,7 @@ class PreparedRequest:
         body: Optional[Any] = None,
         tags: Optional[Mapping[str, str]] = None,
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
+        after_received: Optional[Callable[["Response"], "Response"]] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True,
@@ -303,6 +311,7 @@ class PreparedRequest:
             tags=tags,
             sent_at_timestamp=0,
             before_send=before_send,
+            prepare_response=after_received
         )
 
     def prepare_to_send(self, sniff: bool):

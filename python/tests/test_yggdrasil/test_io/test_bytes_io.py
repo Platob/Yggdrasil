@@ -1,412 +1,698 @@
-# tests/test_bytes_io.py
+# tests/io/buffer/test_bytes_io.py
+
 from __future__ import annotations
 
 import io
+import struct
 from pathlib import Path
 
 import pytest
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.config import BufferConfig
+from yggdrasil.io.enums import MediaType, MimeType
 
 
-@pytest.fixture()
-def tmp_cfg(tmp_path: Path) -> BufferConfig:
+@pytest.fixture
+def cfg(tmp_path: Path) -> BufferConfig:
     return BufferConfig(
-        spill_bytes=64,
+        spill_bytes=32,
         tmp_dir=tmp_path,
-        prefix="test_bytesio_",
+        prefix="bytes-io-",
         suffix=".bin",
         keep_spilled_file=False,
     )
 
 
-def _codec_available(name: str) -> bool:
-    from yggdrasil.io.enums.codec import Codec as _Codec
-
-    try:
-        return _Codec.parse(name) is not None
-    except Exception:
-        return False
-
-
-def _detect_name(buf: BytesIO) -> str | None:
-    from yggdrasil.io.enums.codec import detect as _detect
-
-    try:
-        c = _detect(buf)
-        if c is None:
-            return None
-        name = getattr(c, "name", None) or getattr(c, "value", None) or str(c)
-        return str(name).lower()
-    except Exception:
-        return None
+@pytest.fixture
+def keep_cfg(tmp_path: Path) -> BufferConfig:
+    return BufferConfig(
+        spill_bytes=32,
+        tmp_dir=tmp_path,
+        prefix="bytes-io-",
+        suffix=".bin",
+        keep_spilled_file=True,
+    )
 
 
-# -----------------------------------------------------------------------------
-# Core IO + cursor semantics
-# -----------------------------------------------------------------------------
+def test_init_empty(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
 
-def test_empty_buffer_starts_at_zero(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    assert b.tell() == 0
     assert b.size == 0
+    assert b.tell() == 0
+    assert not b.spilled
+    assert b.path is None
     assert b.read() == b""
+    assert b.exists() is False
+
+
+def test_init_from_bytes_memory(cfg: BufferConfig) -> None:
+    payload = b"hello world"
+    b = BytesIO(payload, config=cfg)
+
+    assert b.size == len(payload)
+    assert not b.spilled
+    assert b.path is None
+    assert bytes(b) == payload
+    assert b.to_bytes() == payload
+    assert b.getvalue() == payload
+    assert len(b) == len(payload)
+    assert bool(b) is True
+
+
+def test_init_from_large_bytes_spills(cfg: BufferConfig) -> None:
+    payload = b"x" * 128
+    b = BytesIO(payload, config=cfg)
+
+    assert b.spilled
+    assert b.path is not None
+    assert b.path.exists()
+    assert b.size == len(payload)
+    assert b.to_bytes() == payload
+
+
+def test_init_from_stdlib_bytesio_memory(cfg: BufferConfig) -> None:
+    src = io.BytesIO(b"abcdef")
+    src.seek(3)
+
+    b = BytesIO(src, config=cfg)
+
+    assert not b.spilled
+    assert b.to_bytes() == b"abcdef"
+    assert src.tell() == 3
     assert b.tell() == 0
 
 
-def test_write_read_progress_cursor(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    assert b.write_bytes(b"hello") == 5
-    assert b.tell() == 5
-    assert b.size == 5
+def test_init_from_stdlib_bytesio_spill(cfg: BufferConfig) -> None:
+    payload = b"a" * 100
+    src = io.BytesIO(payload)
+    src.seek(10)
 
-    b.seek(0)
-    assert b.read(2) == b"he"
+    b = BytesIO(src, config=cfg)
+
+    assert b.spilled
+    assert b.to_bytes() == payload
+    assert src.tell() == 10
+    assert b.tell() == 0
+
+
+def test_init_from_path_existing_file(cfg: BufferConfig, tmp_path: Path) -> None:
+    path = tmp_path / "data.bin"
+    path.write_bytes(b"abc123")
+
+    b = BytesIO(path, config=cfg, copy=False)
+
+    assert b.spilled
+    assert b.path == path
+    assert b.size == 6
+    assert b.to_bytes() == b"abc123"
+
+
+def test_init_from_path_creates_file_if_missing(cfg: BufferConfig, tmp_path: Path) -> None:
+    path = tmp_path / "missing.bin"
+    assert not path.exists()
+
+    b = BytesIO(path, config=cfg, copy=False)
+
+    assert b.spilled
+    assert b.path == path
+    assert path.exists()
+    assert b.size == 0
+
+
+def test_init_from_bytesio_instance_copies_memory(cfg: BufferConfig) -> None:
+    src = BytesIO(b"abcdef", config=cfg)
+    dst = BytesIO(src, config=cfg)
+
+    assert dst.to_bytes() == b"abcdef"
+    assert dst.tell() == 0
+
+    src.seek(0)
+    src.write(b"ZZ")
+    assert src.to_bytes() == b"ZZcdef"
+    assert dst.to_bytes() == b"abcdef"
+
+
+def test_init_from_bytesio_instance_copies_spilled(cfg: BufferConfig) -> None:
+    src = BytesIO(b"x" * 100, config=cfg)
+    assert src.spilled
+
+    dst = BytesIO(src, config=cfg)
+
+    assert dst.to_bytes() == b"x" * 100
+    assert dst.tell() == 0
+    assert src.path != dst.path
+
+
+def test_init_from_seekable_filelike_uses_remaining_bytes(cfg: BufferConfig) -> None:
+    src = io.BytesIO(b"0123456789")
+    src.seek(4)
+
+    b = BytesIO(src, config=cfg)
+
+    assert b.to_bytes() == b"0123456789"
+
+
+def test_init_from_non_seekable_filelike(cfg: BufferConfig) -> None:
+    class NonSeekable:
+        def __init__(self, payload: bytes) -> None:
+            self._bio = io.BytesIO(payload)
+
+        def read(self, n: int = -1) -> bytes:
+            return self._bio.read(n)
+
+    b = BytesIO(NonSeekable(b"payload"), config=cfg)
+    assert b.to_bytes() == b"payload"
+    assert not b.spilled
+
+
+def test_parse_passthrough_instance(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+    out = BytesIO.parse(b, config=cfg)
+    assert out is b
+
+
+def test_parse_other_types(cfg: BufferConfig, tmp_path: Path) -> None:
+    assert BytesIO.parse(b"abc", config=cfg).to_bytes() == b"abc"
+
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"xyz")
+    parsed = BytesIO.parse(path, config=cfg)
+    assert parsed.to_bytes() == b"xyz"
+
+
+def test_repr_memory_and_spilled(cfg: BufferConfig) -> None:
+    a = BytesIO(b"abc", config=cfg)
+    b = BytesIO(b"x" * 100, config=cfg)
+
+    assert "memory" in repr(a)
+    assert "spilled" in repr(b)
+
+
+def test_seek_and_tell(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+
+    assert b.seek(2) == 2
     assert b.tell() == 2
-    assert b.read(10) == b"llo"
+    assert b.seek(2, io.SEEK_CUR) == 4
+    assert b.tell() == 4
+    assert b.seek(-1, io.SEEK_END) == 5
     assert b.tell() == 5
-    assert b.read(1) == b""
+
+    with pytest.raises(ValueError):
+        b.seek(-1)
+
+    with pytest.raises(ValueError):
+        b.seek(0, 999)
 
 
-def test_seek_whence_and_bounds(tmp_cfg: BufferConfig):
-    b = BytesIO(b"abcdef", config=tmp_cfg)
+def test_read_respects_cursor(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
 
+    assert b.read(2) == b"ab"
+    assert b.tell() == 2
+    assert b.read(3) == b"cde"
+    assert b.tell() == 5
+    assert b.read(99) == b"f"
+    assert b.tell() == 6
+    assert b.read() == b""
+
+
+def test_read_negative_reads_to_end(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
     b.seek(2)
-    assert b.tell() == 2
+    assert b.read(-1) == b"cdef"
 
-    b.seek(2, io.SEEK_CUR)
+
+def test_head_does_not_move_cursor(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+    b.seek(3)
+
+    head = b.head(4)
+
+    assert bytes(head) == b"abcd"
+    assert b.tell() == 3
+
+
+def test_head_zero_and_empty(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+
+    assert bytes(b.head(10)) == b""
+    assert bytes(BytesIO(b"abc", config=cfg).head(0)) == b""
+
+
+def test_write_bytes_memory(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+
+    n = b.write_bytes(b"abc")
+    assert n == 3
+    assert b.tell() == 3
+    assert b.size == 3
+    assert b.to_bytes() == b"abc"
+
+
+def test_write_string(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+
+    n = b.write("hé")
+    assert n == len("hé".encode("utf-8"))
+    assert b.to_bytes() == "hé".encode("utf-8")
+
+
+def test_write_stream(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+    src = io.BytesIO(b"abcdef")
+
+    n = b.write(src, batch_size=2)
+
+    assert n == 6
+    assert b.to_bytes() == b"abcdef"
+
+
+def test_write_none_is_noop(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+    b.seek(1)
+
+    assert b.write(None) == 0
+    assert b.tell() == 1
+    assert b.to_bytes() == b"abc"
+
+
+def test_write_overwrite_in_place(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+    b.seek(2)
+
+    b.write(b"ZZ")
+
+    assert b.to_bytes() == b"abZZef"
     assert b.tell() == 4
 
-    b.seek(-1, io.SEEK_END)
-    assert b.tell() == 5
-    assert b.read() == b"f"
 
-    with pytest.raises(ValueError):
-        b.seek(-1, io.SEEK_SET)
+def test_write_beyond_eof_zero_fills_gap_memory(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+    b.seek(5)
 
-    with pytest.raises(ValueError):
-        b.seek(0, 9999)
+    b.write(b"Z")
 
-
-def test_head_does_not_move_cursor(tmp_cfg: BufferConfig):
-    b = BytesIO(b"0123456789", config=tmp_cfg)
-    assert bytes(b.head(4)) == b"0123"
-    assert b.tell() == 0
-
-    b.read(3)
-    assert b.tell() == 3
-    assert bytes(b.head(2)) == b"01"
-    assert b.tell() == 3
+    assert b.size == 6
+    assert b.to_bytes() == b"abc\x00\x00Z"
 
 
-def test_to_bytes_does_not_move_cursor(tmp_cfg: BufferConfig):
-    b = BytesIO(b"abc", config=tmp_cfg)
-    b.seek(2)
-    assert b.to_bytes() == b"abc"
-    assert b.tell() == 2
+def test_write_beyond_eof_zero_fills_gap_spilled(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+    assert b.spilled
+
+    b.seek(105)
+    b.write(b"Q")
+
+    assert b.size == 106
+    data = b.to_bytes()
+    assert data[:100] == b"x" * 100
+    assert data[100:105] == b"\x00" * 5
+    assert data[105:] == b"Q"
 
 
-def test_gap_zero_fill_memory(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    b.seek(10)
-    b.write_bytes(b"X")
-    assert b.size == 11
-    b.seek(0)
-    assert b.read() == (b"\x00" * 10) + b"X"
+def test_write_triggers_spill(cfg: BufferConfig) -> None:
+    b = BytesIO(b"a" * 16, config=cfg)
+    assert not b.spilled
+
+    b.seek(16)
+    b.write(b"b" * 20)
+
+    assert b.spilled
+    assert b.size == 36
+    assert b.to_bytes() == b"a" * 16 + b"b" * 20
 
 
-def test_spill_threshold_trigger(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    assert b.spilled is False
-
-    b.write_bytes(b"A" * 60)
-    assert b.spilled is False
-
-    b.write_bytes(b"B" * 10)
-    assert b.spilled is True
-    assert b.path is not None
-    assert b.size == 70
-
-
-def test_spill_preserves_logical_cursor(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    b.write_bytes(b"A" * 32)
-    b.seek(10)
-    pos = b.tell()
+def test_spill_to_file_preserves_content_and_cursor(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdefghij", config=cfg)
+    b.seek(4)
 
     b.spill_to_file()
-    assert b.spilled is True
-    assert b.tell() == pos
 
-    b.write_bytes(b"Z")
-    b.seek(0)
-    out = b.read()
-    assert out[:10] == b"A" * 10
-    assert out[10:11] == b"Z"
+    assert b.spilled
+    assert b.tell() == 4
+    assert b.to_bytes() == b"abcdefghij"
 
 
-def test_memoryview_memory_and_spilled(tmp_cfg: BufferConfig):
-    b = BytesIO(b"hello", config=tmp_cfg)
+def test_truncate_smaller_memory(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+    b.seek(5)
+
+    out = b.truncate(3)
+
+    assert out == 3
+    assert b.size == 3
+    assert b.tell() == 3
+    assert b.to_bytes() == b"abc"
+
+
+def test_truncate_larger_memory_zero_fills(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+
+    out = b.truncate(6)
+
+    assert out == 6
+    assert b.size == 6
+    assert b.to_bytes() == b"abc\x00\x00\x00"
+
+
+def test_truncate_none_uses_cursor(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+    b.seek(2)
+
+    out = b.truncate()
+
+    assert out == 2
+    assert b.to_bytes() == b"ab"
+
+
+def test_truncate_spilled(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+    assert b.spilled
+
+    out = b.truncate(10)
+
+    assert out == 10
+    assert b.size == 10
+    assert b.to_bytes() == b"x" * 10
+
+
+def test_truncate_negative_raises(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+
+    with pytest.raises(ValueError):
+        b.truncate(-1)
+
+
+def test_memoryview_memory_mode_is_zero_copyish(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
     mv = b.memoryview()
-    assert bytes(mv) == b"hello"
-    assert len(mv) == 5
 
-    s = BytesIO(config=tmp_cfg)
-    s.write_bytes(b"A" * 100)
-    assert s.spilled is True
-    mv2 = s.memoryview()
-    assert bytes(mv2[:3]) == b"AAA"
-    assert len(mv2) == s.size
+    assert bytes(mv) == b"abcdef"
+    assert len(mv) == 6
 
 
-# -----------------------------------------------------------------------------
-# Structured IO
-# -----------------------------------------------------------------------------
+def test_memoryview_spilled_mode(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+    mv = b.memoryview()
 
-def test_structured_roundtrip(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
+    assert bytes(mv) == b"x" * 100
+    assert len(mv) == 100
 
-    b.write_int8(-3)
+
+def test_to_bytes_empty(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+    assert b.to_bytes() == b""
+
+
+def test_decode(cfg: BufferConfig) -> None:
+    b = BytesIO("hé".encode("utf-8"), config=cfg)
+    assert b.decode() == "hé"
+
+
+def test_open_reader_memory(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abcdef", config=cfg)
+
+    with b.open_reader() as fh:
+        assert fh.read() == b"abcdef"
+
+
+def test_open_reader_spilled(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+
+    with b.open_reader() as fh:
+        assert fh.read() == b"x" * 100
+
+
+def test_exists_bool_len(cfg: BufferConfig) -> None:
+    empty = BytesIO(config=cfg)
+    full = BytesIO(b"a", config=cfg)
+
+    assert empty.exists() is False
+    assert bool(empty) is False
+    assert len(empty) == 0
+
+    assert full.exists() is True
+    assert bool(full) is True
+    assert len(full) == 1
+
+
+def test_iter_yields_ints_like_bytes(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+    assert list(b) == list(b"abc")
+
+
+def test_media_type_property_returns_media_type(cfg: BufferConfig) -> None:
+    b = BytesIO(b"{}", config=cfg)
+    mt = b.media_type
+
+    assert isinstance(mt, MediaType)
+
+
+def test_media_io_delegates(cfg: BufferConfig) -> None:
+    b = BytesIO(b"{}", config=cfg)
+    media = MediaType(MimeType.JSON)
+
+    io_obj = b.media_io(media)
+
+    assert io_obj.buffer is b
+
+
+def test_structured_roundtrip(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+
+    b.write_int8(-5)
     b.write_uint8(250)
-    b.write_int16(-32000)
-    b.write_uint16(65000)
+    b.write_int16(-1234)
+    b.write_uint16(54321)
     b.write_int32(-123456)
-    b.write_uint32(4000000000)
-    b.write_int64(-1234567890123)
-    b.write_uint64(12345678901234567890)
+    b.write_uint32(123456)
+    b.write_int64(-123456789)
+    b.write_uint64(123456789)
     b.write_f32(1.25)
-    b.write_f64(2.5)
+    b.write_f64(3.5)
     b.write_bool(True)
     b.write_bool(False)
-    b.write_str_u32("yo")
+    b.write_bytes_u32(b"hello")
+    b.write_str_u32("world")
 
     b.seek(0)
-    assert b.read_int8() == -3
+
+    assert b.read_int8() == -5
     assert b.read_uint8() == 250
-    assert b.read_int16() == -32000
-    assert b.read_uint16() == 65000
+    assert b.read_int16() == -1234
+    assert b.read_uint16() == 54321
     assert b.read_int32() == -123456
-    assert b.read_uint32() == 4000000000
-    assert b.read_int64() == -1234567890123
-    assert b.read_uint64() == 12345678901234567890
+    assert b.read_uint32() == 123456
+    assert b.read_int64() == -123456789
+    assert b.read_uint64() == 123456789
     assert b.read_f32() == pytest.approx(1.25)
-    assert b.read_f64() == pytest.approx(2.5)
+    assert b.read_f64() == pytest.approx(3.5)
     assert b.read_bool() is True
     assert b.read_bool() is False
-    assert b.read_str_u32() == "yo"
+    assert b.read_bytes_u32() == b"hello"
+    assert b.read_str_u32() == "world"
 
 
-# -----------------------------------------------------------------------------
-# Parse / wrap / close
-# -----------------------------------------------------------------------------
-
-def test_parse_from_path(tmp_cfg: BufferConfig, tmp_path: Path):
-    p = tmp_path / "x.bin"
-    p.write_bytes(b"abc")
-
-    b = BytesIO.parse(p, config=tmp_cfg)
-    assert b.spilled is True
-    assert b.size == 3
-    assert b.read(3) == b"abc"
+def test_read_exact_eof(cfg: BufferConfig) -> None:
+    b = BytesIO(b"ab", config=cfg)
+    with pytest.raises(EOFError):
+        b.read_uint32()
 
 
-def test_wrap_filelike_readable(tmp_cfg: BufferConfig, tmp_path: Path):
-    p = tmp_path / "y.bin"
-    with p.open("w+b") as fh:
-        fh.write(b"12345")
-        fh.flush()
-
-        b = BytesIO.wrap(fh, auto_close=False, config=tmp_cfg)
-        b.seek(0)
-        assert b.read(2) == b"12"
+def test_write_bytes_u32_matches_struct_layout(cfg: BufferConfig) -> None:
+    b = BytesIO(config=cfg)
+    b.write_bytes_u32(b"abc")
+    assert b.to_bytes() == struct.pack("<I", 3) + b"abc"
 
 
-def test_close_removes_spill_file_when_configured(tmp_cfg: BufferConfig):
-    b = BytesIO(config=tmp_cfg)
-    b.write_bytes(b"A" * 100)
-    assert b.spilled is True
+def test_xxh3_64_consistent(cfg: BufferConfig) -> None:
+    a = BytesIO(b"abcdef", config=cfg)
+    b = BytesIO(b"abcdef", config=cfg)
+
+    assert a.xxh3_64().hexdigest() == b.xxh3_64().hexdigest()
+
+
+def test_blake3_consistent_memory(cfg: BufferConfig) -> None:
+    a = BytesIO(b"abcdef", config=cfg)
+    b = BytesIO(b"abcdef", config=cfg)
+
+    assert a.blake3().hexdigest() == b.blake3().hexdigest()
+
+
+def test_blake3_consistent_spilled(cfg: BufferConfig) -> None:
+    a = BytesIO(b"x" * 100, config=cfg)
+    b = BytesIO(b"x" * 100, config=cfg)
+
+    assert a.blake3().hexdigest() == b.blake3().hexdigest()
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd", "lz4"])
+def test_compress_copy_roundtrip(cfg: BufferConfig, codec: str) -> None:
+    src = BytesIO(b"hello world" * 20, config=cfg)
+    out = src.compress(codec, copy=True)
+
+    assert out is not src
+    assert src.to_bytes() == b"hello world" * 20
+    assert out.tell() == 0
+
+    dec = out.decompress(codec, copy=True)
+    assert dec.to_bytes() == src.to_bytes()
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd", "lz4"])
+def test_compress_in_place_roundtrip(cfg: BufferConfig, codec: str) -> None:
+    src = BytesIO(b"hello world" * 20, config=cfg)
+    original = src.to_bytes()
+
+    src.compress(codec, copy=False)
+    assert src.tell() == 0
+    assert src.to_bytes() != original
+
+    src.decompress(codec, copy=False)
+    assert src.tell() == 0
+    assert src.to_bytes() == original
+
+
+def test_decompress_infer_noop_copy(cfg: BufferConfig) -> None:
+    src = BytesIO(b"plain-bytes", config=cfg)
+    out = src.decompress("infer", copy=True)
+
+    assert out is not src
+    assert out.to_bytes() == b"plain-bytes"
+    assert out.tell() == 0
+    assert src.to_bytes() == b"plain-bytes"
+
+
+def test_decompress_infer_noop_in_place(cfg: BufferConfig) -> None:
+    src = BytesIO(b"plain-bytes", config=cfg)
+    out = src.decompress("infer", copy=False)
+
+    assert out is src
+    assert src.to_bytes() == b"plain-bytes"
+    assert src.tell() == 0
+
+
+def test_unknown_codec_raises(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
+
+    with pytest.raises(ValueError):
+        b.compress("definitely-not-a-codec")
+
+    with pytest.raises(ValueError):
+        b.decompress("definitely-not-a-codec")
+
+
+def test_view_binary_window(cfg: BufferConfig) -> None:
+    b = BytesIO(b"0123456789", config=cfg)
+
+    with b.view(start=2, length=4) as fh:
+        assert fh.read() == b"2345"
+
+    assert b.tell() == 0
+
+
+def test_view_text_window(cfg: BufferConfig) -> None:
+    b = BytesIO("hello world".encode(), config=cfg)
+
+    with b.view(text=True, start=6, length=5) as fh:
+        assert fh.read() == "world"
+
+    assert b.tell() == 0
+
+
+def test_close_removes_spill_file_by_default(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
     path = b.path
     assert path is not None and path.exists()
 
     b.close()
+
+    assert not path.exists()
+    assert b.closed
+
+
+def test_close_keeps_spill_file_when_configured(keep_cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=keep_cfg)
+    path = b.path
+    assert path is not None and path.exists()
+
+    b.close()
+
+    assert path.exists()
+    path.unlink()
+
+
+def test_cleanup_aliases_close(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+    path = b.path
+    assert path is not None and path.exists()
+
+    b.cleanup()
+
+    assert not path.exists()
+    assert b.closed
+
+
+def test_context_manager_closes(cfg: BufferConfig) -> None:
+    path: Path | None = None
+    with BytesIO(b"x" * 100, config=cfg) as b:
+        path = b.path
+        assert path is not None and path.exists()
+
+    assert path is not None
     assert not path.exists()
 
 
-def test_closed_operations_raise(tmp_cfg: BufferConfig):
-    b = BytesIO(b"abc", config=tmp_cfg)
+def test_operations_on_closed_raise(cfg: BufferConfig) -> None:
+    b = BytesIO(b"abc", config=cfg)
     b.close()
+
     with pytest.raises(ValueError):
-        b.read(1)
+        b.read()
+
     with pytest.raises(ValueError):
-        b.write_bytes(b"x")
-    with pytest.raises(ValueError):
-        b.seek(0)
+        b.write(b"x")
+
     with pytest.raises(ValueError):
         b.tell()
 
+    with pytest.raises(ValueError):
+        b.seek(0)
 
-# -----------------------------------------------------------------------------
-# Compression copy semantics (THE POINT)
-# -----------------------------------------------------------------------------
-
-@pytest.mark.parametrize("codec", ["gzip"])
-def test_compress_copy_true_new_buffer_source_unchanged(tmp_cfg: BufferConfig, codec: str):
-    if not _codec_available(codec):
-        pytest.skip(f"{codec} codec not available")
-
-    payload = (b"abc123" * 2048) + b"tail"
-    src = BytesIO(payload, config=tmp_cfg)
-
-    src.seek(123)
-    src_pos = src.tell()
-    src_bytes = src.to_bytes()
-    src_size = src.size
-    src_spilled = src.spilled
-
-    out = src.compress(codec, copy=True)
-
-    assert out is not src
-    assert src.tell() == src_pos
-    assert src.size == src_size
-    assert src.to_bytes() == src_bytes
-    assert src.spilled == src_spilled
-
-    assert out.tell() == 0
-    if payload:
-        assert out.to_bytes() != payload
+    with pytest.raises(ValueError):
+        b.head()
 
 
-@pytest.mark.parametrize("codec", ["gzip"])
-def test_compress_copy_false_inplace_replaces_self(tmp_cfg: BufferConfig, codec: str):
-    if not _codec_available(codec):
-        pytest.skip(f"{codec} codec not available")
-
-    payload = (b"abc123" * 2048) + b"tail"
-    src = BytesIO(payload, config=tmp_cfg)
-
-    src.seek(10)
-    out = src.compress(codec, copy=False)
-
-    assert out is src
-    assert src.tell() == 0
-    assert src.to_bytes() != payload
-
-    # sanity: explicit restore works
-    restored = src.decompress(codec, copy=True)
-    assert restored.to_bytes() == payload
+def test_close_is_idempotent(cfg: BufferConfig) -> None:
+    b = BytesIO(b"x" * 100, config=cfg)
+    b.close()
+    b.close()
+    assert b.closed
 
 
-@pytest.mark.parametrize("codec", ["gzip"])
-def test_decompress_copy_true_new_buffer_source_unchanged(tmp_cfg: BufferConfig, codec: str):
-    if not _codec_available(codec):
-        pytest.skip(f"{codec} codec not available")
+def test_path_backed_writes_modify_original_file(cfg: BufferConfig, tmp_path: Path) -> None:
+    path = tmp_path / "shared.bin"
+    path.write_bytes(b"abcdef")
 
-    payload = (b"Z" * 4096) + b"tail"
-    raw = BytesIO(payload, config=tmp_cfg)
-    comp = raw.compress(codec, copy=True)
+    b = BytesIO(path, config=cfg, copy=False)
+    b.seek(2)
+    b.write(b"ZZ")
 
-    comp.seek(7)
-    comp_pos = comp.tell()
-    comp_bytes = comp.to_bytes()
-    comp_size = comp.size
-
-    out = comp.decompress(codec, copy=True)
-
-    assert out is not comp
-    assert comp.tell() == comp_pos
-    assert comp.size == comp_size
-    assert comp.to_bytes() == comp_bytes
-
-    assert out.tell() == 0
-    assert out.to_bytes() == payload
+    assert path.read_bytes() == b"abZZef"
 
 
-@pytest.mark.parametrize("codec", ["gzip"])
-def test_decompress_copy_false_inplace_replaces_self(tmp_cfg: BufferConfig, codec: str):
-    if not _codec_available(codec):
-        pytest.skip(f"{codec} codec not available")
+def test_path_backed_truncate_modifies_original_file(cfg: BufferConfig, tmp_path: Path) -> None:
+    path = tmp_path / "shared.bin"
+    path.write_bytes(b"abcdef")
 
-    payload = (b"Z" * 4096) + b"tail"
-    raw = BytesIO(payload, config=tmp_cfg)
-    comp = raw.compress(codec, copy=True)
+    b = BytesIO(path, config=cfg, copy=False)
+    b.truncate(3)
 
-    comp.seek(12)
-    out = comp.decompress(codec, copy=False)
-
-    assert out is comp
-    assert comp.tell() == 0
-    assert comp.to_bytes() == payload
+    assert path.read_bytes() == b"abc"
 
 
-def test_decompress_infer_copy_false_inplace_when_detectable(tmp_cfg: BufferConfig):
-    if not _codec_available("gzip"):
-        pytest.skip("gzip codec not available")
-
-    payload = b"A" * 2048 + b"tail"
-    raw = BytesIO(payload, config=tmp_cfg)
-    comp = raw.compress("gzip", copy=True)
-
-    if _detect_name(comp) is None:
-        pytest.skip("detect() does not recognize gzip here; infer not testable")
-
-    comp.seek(5)
-    out = comp.decompress("infer", copy=False)
-    assert out is comp
-    assert comp.tell() == 0
-    assert comp.to_bytes() == payload
-
-
-def test_inplace_roundtrip_spilled_source(tmp_cfg: BufferConfig):
-    if not _codec_available("gzip"):
-        pytest.skip("gzip codec not available")
-
-    payload = b"A" * 256  # force spill
-    src = BytesIO(config=tmp_cfg)
-    src.write_bytes(payload)
-    assert src.spilled is True
-    old_path = src.path
-    assert old_path is not None and old_path.exists()
-
-    src.seek(11)
-    src.compress("gzip", copy=False)
-
-    # should have replaced content, reset cursor
-    assert src.tell() == 0
-    assert src.to_bytes() != payload
-
-    # old spill file should be gone (copy=False replacement resets backing)
-    assert old_path.exists() is False
-
-    # restore
-    src.decompress("gzip", copy=False)
-    assert src.tell() == 0
-    assert src.to_bytes() == payload
-
-
-@pytest.mark.parametrize("codec", ["zstd", "lz4", "bz2", "xz", "brotli", "snappy"])
-def test_optional_codecs_copy_semantics_best_effort(tmp_cfg: BufferConfig, codec: str):
-    if not _codec_available(codec):
-        pytest.skip(f"{codec} codec not available")
-
-    payload = (b"abc123" * 4096) + b"tail"
-    src = BytesIO(payload, config=tmp_cfg)
-
-    # copy=True: unchanged
-    src.seek(17)
-    pos = src.tell()
-    snap = src.to_bytes()
-    comp = src.compress(codec, copy=True)
-    assert src.tell() == pos
-    assert src.to_bytes() == snap
-    assert comp.tell() == 0
-
-    # copy=False: in-place
-    src.compress(codec, copy=False)
-    assert src.tell() == 0
-    assert src.to_bytes() != payload
-
-    # explicit restore (infer not guaranteed for brotli/raw-snappy)
-    src.decompress(codec, copy=False)
-    assert src.tell() == 0
-    assert src.to_bytes() == payload
+def test_init_from_invalid_type_raises(cfg: BufferConfig) -> None:
+    with pytest.raises(TypeError):
+        BytesIO(123, config=cfg)  # type: ignore[arg-type]

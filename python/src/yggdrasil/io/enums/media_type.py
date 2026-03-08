@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, IO
+from typing import IO, Union
 
 from .codec import Codec
 from .mime_type import MimeType
@@ -30,7 +30,19 @@ class MediaType:
         return f"<MediaType {self.mime_type.value} + {self.codec.name}>"
 
     @classmethod
-    def parse(cls, obj: Any, default: "MediaType | None" = None) -> "MediaType":
+    def parse(
+        cls,
+        obj: Union[
+            "MediaType", MimeType, Codec,
+            tuple[str, str],
+            str,
+            bytes, bytearray, memoryview,
+            Path,
+            IO[bytes]
+        ],
+        *,
+        default: "MediaType | None" = None
+    ) -> "MediaType":
         if isinstance(obj, cls):
             return obj
 
@@ -42,8 +54,11 @@ class MediaType:
             c = Codec.parse(codec) if codec is not None else None
             return cls(mime_type=mt, codec=c)
 
-        if obj is None:
-            return default or cls(mime_type=MimeType.OCTET_STREAM)
+        if isinstance(obj, MimeType):
+            return cls(mime_type=obj, codec=None)
+
+        if isinstance(obj, Codec):
+            return cls(mime_type=MimeType.OCTET_STREAM, codec=obj)
 
         if isinstance(obj, str):
             return cls.parse_str(obj, default=default)

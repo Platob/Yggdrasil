@@ -2,28 +2,26 @@
 
 import base64
 import dataclasses as dc
+import gzip
 import io
 import logging
 import os
-import posixpath
 import threading
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Any, Callable, List, Dict, Union, Iterable, Tuple, Literal
+from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Tuple, Literal, TypeVar, \
+    Mapping, Generator, Iterator
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
 
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.environ import PyEnv, UserInfo
+from yggdrasil.io.url import URL
+from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 from .command_execution import CommandExecution
 from .exceptions import ClientTerminatedSession
 from ...concurrent.threading import Job
 from ...dataclasses.expiring import ExpiringDict
-from yggdrasil.environ import PyEnv, UserInfo
-from yggdrasil.environ.modules import resolve_local_lib_path
-from yggdrasil.io.url import URL
-from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -36,15 +34,10 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
 BytesLike = Union[bytes, bytearray, memoryview]
-# Module-level constants
-_CTX_RUNTIME_FIELDS = frozenset({
-    "_lock",           # threading.RLock — never picklable
-})
+F = TypeVar("F", bound=Callable[..., Any])
 
-_CTX_RESET_FIELDS = frozenset({
-    "_remote_metadata",  # temp_path is remote-process-local; zero on restore
-                         # caller re-fetches lazily on first access
-})
+_CTX_RUNTIME_FIELDS = frozenset({"_lock",})
+_CTX_RESET_FIELDS = frozenset({"_remote_metadata"})
 
 
 @dc.dataclass(frozen=True)
@@ -147,8 +140,6 @@ class ExecutionContext:
             state: Serialized state dictionary.
         """
         state["_lock"] = threading.RLock()  # always fresh
-        state.setdefault("_remote_metadata", None)
-        state.setdefault("_uploaded_package_roots", ExpiringDict())
 
         self.__dict__.update(state)
 
@@ -182,8 +173,8 @@ class ExecutionContext:
         })
 
     @property
-    def workspace(self):
-        return self.cluster.workspace
+    def client(self):
+        return self.cluster.client
 
     @property
     def cluster_id(self):
@@ -202,7 +193,7 @@ class ExecutionContext:
 
             self.context_key = f"{usr.hostname}-py{vinfo.major}.{vinfo.minor}"
 
-        context_path = f"~/.ygg/dbx-ctx/{self.context_key}"
+        context_path = f"/local_disk0/.ephemeral_nfs/context/{self.context_key}"
         tmp_path = context_path + "/tmp/"
         libs_path = context_path + "/python/lib/site-packages"
 
@@ -223,9 +214,8 @@ class ExecutionContext:
 
         try:
             reqs = self.command(
-                command=command,
+                command_str=command,
                 language="shell",
-                include_libs=True
             ).start().result()
 
             self._requirements = [
@@ -241,19 +231,11 @@ class ExecutionContext:
         return self._requirements
 
     # ------------ internal helpers ------------
-    def workspace_client(self):
-        """Return the Databricks SDK client for command execution.
-
-        Returns:
-            The underlying WorkspaceClient instance.
-        """
-        return self.cluster.workspace.sdk()
-
     def create(
         self,
+        *,
         language: "Language",
         context_key: Optional[str] = None,
-        *,
         wait: WaitingConfigArg = True,
     ) -> "ExecutionContext":
         """Create a command execution context, retrying if needed.
@@ -269,7 +251,7 @@ class ExecutionContext:
         if self.context_id and self.language == language:
             return self
 
-        client = self.workspace_client().command_execution
+        client = self.client.workspace_client().command_execution
 
         try:
             with ThreadPoolExecutor(max_workers=1) as ex:
@@ -309,6 +291,7 @@ class ExecutionContext:
 
     def connect(
         self,
+        *,
         language: Optional[Language] = None,
         wait: WaitingConfigArg = True,
         reset: bool = False,
@@ -358,7 +341,7 @@ class ExecutionContext:
         if not self.context_id:
             return
 
-        client = self.workspace_client()
+        client = self.client.workspace_client()
 
         try:
             if wait:
@@ -389,25 +372,28 @@ class ExecutionContext:
     
     def command(
         self,
-        command: Optional[str] = None,
-        language: Optional[Language | Literal["python", "r", "sql", "scala", "shell"]] = None,
+        command: Optional[str | Callable] = None,
         *,
+        command_str: Optional[str] = None,
+        language: Optional[Language | Literal["python", "r", "sql", "scala", "shell"]] = None,
         context: Optional["ExecutionContext"] = None,
-        func: Optional[Callable] = None,
         command_id: Optional[str] = None,
-        environ: Optional[Dict[str, str]] = None,
-        include_libs: bool = False
+        func: Optional[Callable] = None,
+        environ: Optional[Mapping] = None
     ) -> "CommandExecution":
         context = self if context is None else context
-        
-        if command:
-            if language == "shell":
-                language = Language.PYTHON
 
-                command = f"""
+        if isinstance(command, str):
+            command_str = command
+        elif callable(command):
+            func = command
+
+        if language == "shell":
+            language = Language.PYTHON
+            command_str = f"""
 import subprocess, sys, shlex, pathlib
 
-cmd = shlex.split({str(command)!r})
+cmd = shlex.split({str(command_str)!r})
 cmd = [str(pathlib.Path(arg).expanduser()) if arg.startswith("~/") else arg for arg in cmd]
 
 p = subprocess.run(cmd, text=True, capture_output=True)
@@ -420,368 +406,376 @@ if p.returncode != 0:
         f"stderr: {{p.stderr.strip()}}"
     )
 """
-            if include_libs:
-                command = self.syspath_lines() + "\n" + command
-        else:
-            if isinstance(language, str):
-                language = Language[language]
+        elif isinstance(language, str):
+            language = Language[language]
+
+        if language == Language.PYTHON and command_str:
+            command_str = self.syspath_lines() + "\n" + command_str
+
+        if environ:
+            if not isinstance(environ, Mapping):
+                environ = {
+                    k: os.environ.get(k)
+                    for k in environ
+                    if k
+                }
 
         return CommandExecution(
             context=context,
             command_id=command_id,
             language=language,
-            command=command,
-        ).create(
-            context=context,
-            language=language,
-            command=command,
-            func=func,
-            environ=environ,
+            command=command_str,
+            pyfunc=func,
+            environ=environ
         )
 
-    def decorate(
+    def make_python_function_command(
         self,
-        func: Optional[Callable] = None,
-        command: Optional[str] = None,
-        language: Optional[Language] = None,
-        command_id: Optional[str] = None,
-        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
-    ) -> Callable:
-        language = Language.PYTHON if language is None else language
+        job: Job,
+        tag: str = "__CALL_RESULT__",
+        environ: Optional[Mapping] = None
+    ) -> str:
+        """
+        Build a remote Python snippet that:
+          - loads a CommandExecution proxy
+          - loads args/kwargs
+          - decodes the function payload + args/kwargs payloads
+          - executes
+          - ALWAYS prints a tagged payload (success or error)
+          - restores environment variables afterwards
 
-        def decorator(
-            f: Callable,
-            c: ExecutionContext = self,
-            cmd: Optional[str] = command,
-            l: Optional[Language] = language,
-            cid: Optional[str] = command_id,
-            env: Optional[Union[Iterable[str], Dict[str, str]]] = environ,
-        ):
-            if c.is_in_databricks_environment():
-                return func
+        Notes:
+          - protocol=5 for perf + modern compatibility
+          - strongly prefer byref=True for cross Python minor stability
+        """
+        import yggdrasil.pickle.dill as pkl
 
-            return c.command(
-                context=c,
-                func=f,
-                command_id=cid,
-                command=cmd,
-                language=l,
-                environ=env,
+        command_b64: str = base64.b64encode(pkl.dumps(self, byref=True)).decode("ascii")
+        job_b64: str = self.encode_object(job)
+        environ = environ or {}
+        if not isinstance(environ, Mapping):
+            environ = {
+                k: os.getenv(k)
+                for k in environ
+                if k and os.getenv(k)
+            }
+
+        cmd = f"""\
+{self.syspath_lines()}
+
+import base64, os, traceback, json
+import yggdrasil.pickle.dill as dill
+
+_ctx = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
+_job = _ctx.decode_payload({job_b64!r})
+_env = {environ!r}
+for k, v in _env.items():
+    os.environ[k] = v
+_out = _ctx.encode_object(_job())
+if not isinstance(_out, str):
+    _out = _out.decode()
+
+print({tag!r} + _out, flush=True)
+"""
+        return cmd
+
+    def encode_object(
+        self,
+        obj: Any,
+        byte_limit: int = 32 * 1024,
+        byref: Any = None,
+        recurse: Any = None,
+        compression: Optional[str] = None
+    ) -> str:
+        """Serialize *obj* to a JSON envelope that ``decode_payload`` can reconstruct.
+
+        Dispatch table (checked in order):
+
+        +-----------------------+------------------------------------------+
+        | Type                  | Strategy                                 |
+        +=======================+==========================================+
+        | ``pyarrow.Table``     | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``polars.DataFrame``  | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``pandas.DataFrame``  | Parquet → DBFS temp file                 |
+        +-----------------------+------------------------------------------+
+        | ``pandas.Series``     | Parquet via single-column DataFrame →    |
+        |                       | DBFS temp file; index and name preserved |
+        +-----------------------+------------------------------------------+
+        | ``Generator`` /       | Each item encoded recursively            |
+        | ``Iterator``          |                                          |
+        +-----------------------+------------------------------------------+
+        | Anything else         | ``dill`` → optional gzip → inline b64    |
+        |                       | or DBFS temp file if > *byte_limit*      |
+        +-----------------------+------------------------------------------+
+
+        Args:
+            obj: Object to encode.
+            byte_limit: Maximum inline payload size in bytes before spilling to
+                a DBFS temporary file (default 32 KiB).
+            byref: Passed through to ``dill.dump`` — serialize by reference when
+                ``True`` (useful for large closures that reference module-level
+                objects).
+            recurse: Passed through to ``dill.dump`` — recursively serialise
+                referenced objects.
+            compression: Force ``"gzip"`` compression regardless of size.
+                Defaults to auto-compress when the raw payload exceeds
+                *byte_limit*.
+
+        Returns:
+            A JSON string describing how to reconstruct the object on the remote
+            side.  See ``decode_payload`` for the envelope schema.
+        """
+        buffer = io.BytesIO()
+
+        from yggdrasil.arrow.lib import pyarrow
+        from yggdrasil.polars.lib import polars
+        from yggdrasil.pandas.lib import pandas
+        import yggdrasil.pickle.dill as pkl
+        import yggdrasil.pickle.json as json_mod
+
+        if isinstance(obj, pyarrow.Table):
+            import pyarrow.parquet as pq
+
+            func = "pyarrow.parquet.read_table"
+            extension = "parquet"
+            pq.write_table(obj, buffer)
+
+            buffer.seek(0)
+            dbx_path = self.client.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json_mod.dumps({
+                "func": func,
+                "file": dbx_path.full_path()
+            })
+
+        if isinstance(obj, polars.DataFrame):
+            func = "polars.read_parquet"
+            extension = "parquet"
+            obj.write_parquet(buffer)
+
+            buffer.seek(0)
+            dbx_path = self.client.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json_mod.dumps({
+                "func": func,
+                "file": dbx_path.full_path()
+            })
+
+        # --- pandas.Series ---
+        # Encode as a single-column Parquet file.  The series name (or a
+        # synthetic "__series__" fallback) becomes the column name, and the
+        # index is written as a named reset column so it survives the
+        # round-trip through Parquet without loss.
+        if isinstance(obj, pandas.Series):
+            func = "pandas.read_parquet_series"
+            extension = "parquet"
+
+            series_name = obj.name if obj.name is not None else "__series__"
+            index_name  = obj.index.name if obj.index.name is not None else "__index__"
+
+            # Reset the index into a regular column so Parquet preserves it.
+            df = obj.rename(series_name).reset_index()
+            df.columns = [index_name] + [series_name]
+            df.to_parquet(path=buffer, index=False)
+
+            buffer.seek(0)
+            dbx_path = self.client.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json_mod.dumps({
+                "func": func,
+                "file": dbx_path.full_path(),
+                "series_name": series_name,
+                "index_name": index_name,
+                # Preserve the original name exactly (None is meaningful).
+                "original_name": obj.name,
+            })
+
+        elif isinstance(obj, pandas.DataFrame):
+            func = "pandas.read_parquet"
+            extension = "parquet"
+            obj.to_parquet(path=buffer)
+
+            buffer.seek(0)
+            dbx_path = self.client.tmp_path(extension=extension)
+            dbx_path.write_bytes(buffer)
+
+            return json_mod.dumps({
+                "func": func,
+                "cpr": compression,
+                "file": dbx_path.full_path()
+            })
+
+        elif isinstance(obj, (Generator, Iterator)):
+            return json_mod.dumps({
+                "func": "generator",
+                "items": [
+                    self.encode_object(_, byte_limit=byte_limit, byref=byref, recurse=recurse, compression=compression)
+                    for _ in obj
+                ]
+            })
+
+        pkl.dump(obj, buffer, byref=byref, protocol=5)
+
+        raw = buffer.getvalue()
+
+        if compression or len(raw) > byte_limit:
+            compression = compression or "gzip"
+            if compression != "gzip":
+                raise ValueError(f"Unsupported compression: {compression}")
+            raw = gzip.compress(raw)
+
+        if len(raw) > byte_limit:
+            dbx_path = self.client.tmp_path(extension="bin")
+            dbx_path.write_bytes(raw)
+            return json_mod.dumps({
+                "func": "dill.load",
+                "cpr": compression,
+                "file": dbx_path.full_path(),
+            })
+
+        return json_mod.dumps({
+            "func": "dill.load",
+            "cpr": compression,
+            "b64": base64.b64encode(raw).decode("ascii"),
+        })
+
+    def decode_payload(
+        self,
+        payload: Union[str, bytes, dict, list],
+        temporary: bool = True
+    ):
+        """Reconstruct an object from a JSON envelope produced by ``encode_object``.
+
+        Recognised ``func`` values:
+
+        +---------------------------------+------------------------------------------+
+        | ``func``                        | Action                                   |
+        +=================================+==========================================+
+        | ``"dill.load"``                 | dill-deserialise from inline b64 or file |
+        +---------------------------------+------------------------------------------+
+        | ``"pyarrow.parquet.read_table"``| Read Parquet file → ``pyarrow.Table``    |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_parquet"``       | Read Parquet file → ``pandas.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_parquet_series"``| Read Parquet file → ``pandas.Series``   |
+        |                                 | (restores name and index)                |
+        +---------------------------------+------------------------------------------+
+        | ``"pandas.read_pickle"``        | Read pickle file → ``pandas.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"polars.read_parquet"``       | Read Parquet file → ``polars.DataFrame`` |
+        +---------------------------------+------------------------------------------+
+        | ``"generator"``                 | Lazy generator over recursively decoded  |
+        |                                 | items                                    |
+        +---------------------------------+------------------------------------------+
+
+        Args:
+            payload: JSON string, bytes, pre-parsed dict, or list.  Non-JSON
+                strings are returned as-is.
+            temporary: When ``True``, DBFS paths are treated as temporary files
+                and may be cleaned up after reading.
+
+        Returns:
+            The reconstructed Python object, or *payload* unchanged if it does
+            not match any known envelope schema.
+        """
+        import yggdrasil.pickle.dill as pkl
+        import yggdrasil.pickle.json as json_mod
+
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json_mod.loads(payload)
+            except Exception:
+                return payload
+
+        if isinstance(payload, dict):
+            func, compression, b64, databricks_path = (
+                payload.get("func"), payload.get("cpr"),
+                payload.get("b64"), payload.get("file")
             )
 
-        if func is not None and callable(func):
-            return decorator(f=func)
-        return decorator
+            if isinstance(func, str) and func:
+                if b64:
+                    blob = base64.b64decode(b64.encode("ascii"))
+                elif databricks_path:
+                    blob = self.client.dbfs_path(databricks_path, temporary=temporary).read_bytes()
+                else:
+                    blob = None
+
+                if func == "dill.load":
+                    if compression == "gzip":
+                        import gzip
+                        blob = gzip.decompress(blob)
+
+                    return pkl.loads(blob)
+
+                elif func.startswith("pyarrow."):
+                    import pyarrow.parquet as pq
+
+                    buff = io.BytesIO(blob)
+                    return pq.read_table(buff)
+
+                elif func == "pandas.read_parquet_series":
+                    # Reconstruct a pandas.Series from the single-column
+                    # Parquet file written by encode_object.
+                    import pandas
+
+                    series_name   = payload.get("series_name", "__series__")
+                    index_name    = payload.get("index_name",  "__index__")
+                    original_name = payload.get("original_name")  # may be None
+
+                    buff = io.BytesIO(blob)
+                    df   = pandas.read_parquet(buff)
+
+                    # Restore the index from its saved column, then extract
+                    # the value column as a Series with the original name.
+                    if index_name in df.columns:
+                        df = df.set_index(index_name)
+                        df.index.name = None if index_name == "__index__" else index_name
+
+                    series = df[series_name].rename(original_name)
+                    return series
+
+                elif func.startswith("pandas."):
+                    import pandas
+
+                    buff = io.BytesIO(blob)
+
+                    if func == "pandas.read_parquet":
+                        return pandas.read_parquet(buff)
+                    elif func == "pandas.read_pickle":
+                        return pandas.read_pickle(buff, compression=compression)
+                    else:
+                        raise NotImplementedError
+
+                elif func == "generator":
+                    items = payload.get("items")
+
+                    def gen(it: Iterator = items):
+                        if it:
+                            for item in it:
+                                yield self.decode_payload(item)
+
+                    return gen()
+
+                elif func.startswith("polars."):
+                    import polars
+
+                    buff = io.BytesIO(blob)
+                    return polars.read_parquet(buff)
+
+                else:
+                    raise NotImplementedError
+
+        return payload
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
-        return self.cluster.is_in_databricks_environment()
-
-    # ------------------------------------------------------------------
-    # generic local → remote uploader, via remote python
-    # ------------------------------------------------------------------
-    def upload_local_path(
-        self,
-        paths: Union[Iterable[Tuple[LocalSpec, str]], Dict[LocalSpec, str]],
-        byte_limit: int = 64 * 1024,
-        wait: WaitingConfigArg | None = None
-    ) -> None:
-        """
-        One-shot uploader. Sends exactly ONE remote command.
-
-        paths: dict[local_spec -> remote_target]
-
-        local_spec can be:
-          - str | PathLike: local file or directory
-          - bytes/bytearray/memoryview: raw content (remote_target must be a file path)
-          - BytesSource(name, data): raw content with a name
-          - (name, bytes-like): raw content with a name
-
-        remote_target:
-          - if local_spec is file: full remote file path
-          - if local_spec is dir:  remote directory root
-          - if local_spec is bytes: full remote file path
-        """
-        if isinstance(paths, dict):
-            paths = paths.items()
-
-        def _to_bytes(x: BytesLike) -> bytes:
-            if isinstance(x, bytes):
-                return x
-            if isinstance(x, bytearray):
-                return bytes(x)
-            if isinstance(x, memoryview):
-                return x.tobytes()
-            elif isinstance(x, io.BytesIO):
-                return x.getvalue()
-            raise TypeError(f"Unsupported bytes-like: {type(x)!r}")
-
-        # normalize + validate + build a unified "work list"
-        work: list[dict[str, Any]] = []
-        for local_spec, remote in paths:
-            if not isinstance(remote, str) or not remote:
-                raise TypeError("remote_target must be a non-empty string")
-
-            remote_posix = remote.replace("\\", "/")
-
-            # --- bytes payloads ---
-            if isinstance(local_spec, BytesSource):
-                work.append({
-                    "kind": "bytes",
-                    "name": local_spec.name,
-                    "data": local_spec.data,
-                    "remote": remote_posix,
-                })
-                continue
-
-            if isinstance(local_spec, tuple) and len(local_spec) == 2 and isinstance(local_spec[0], str):
-                name, data = local_spec
-                work.append({
-                    "kind": "bytes",
-                    "name": name,
-                    "data": _to_bytes(data),
-                    "remote": remote_posix,
-                })
-                continue
-
-            if isinstance(local_spec, (bytes, bytearray, memoryview, io.BytesIO)):
-                work.append({
-                    "kind": "bytes",
-                    "name": "blob",
-                    "data": _to_bytes(local_spec),
-                    "remote": remote_posix,
-                })
-                continue
-
-            # --- filesystem payloads ---
-            if isinstance(local_spec, os.PathLike):
-                local_spec = os.fspath(local_spec)
-
-            if isinstance(local_spec, str):
-                local_abs = os.path.abspath(local_spec)
-                if not os.path.exists(local_abs):
-                    raise FileNotFoundError(f"Local path not found: {local_spec}")
-
-                if os.path.isfile(local_abs):
-                    work.append({
-                        "kind": "file",
-                        "local": local_abs,
-                        "remote": remote_posix,
-                    })
-                else:
-                    work.append({
-                        "kind": "dir",
-                        "local": local_abs,
-                        "remote_root": remote_posix.rstrip("/"),
-                        "top": os.path.basename(local_abs.rstrip(os.sep)) or "dir",
-                    })
-                continue
-
-            raise TypeError(f"Unsupported local_spec type: {type(local_spec)!r}")
-
-        # build one zip containing all content
-        manifest: list[dict[str, Any]] = []
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for idx, item in enumerate(work):
-                kind = item["kind"]
-
-                if kind == "bytes":
-                    zip_name = f"BYTES/{idx}"
-                    zf.writestr(zip_name, item["data"])
-                    manifest.append({
-                        "kind": "bytes",
-                        "zip": zip_name,
-                        "remote": item["remote"],
-                    })
-
-                elif kind == "file":
-                    zip_name = f"FILE/{idx}"
-                    zf.write(item["local"], arcname=zip_name)
-                    manifest.append({
-                        "kind": "file",
-                        "zip": zip_name,
-                        "remote": item["remote"],
-                    })
-
-                elif kind == "dir":
-                    local_root = item["local"]
-                    top = item["top"]
-                    prefix = f"DIR/{idx}/{top}"
-
-                    for root, dirs, files in os.walk(local_root):
-                        dirs[:] = [d for d in dirs if d != "__pycache__"]
-
-                        rel_root = os.path.relpath(root, local_root)
-                        rel_root = "" if rel_root == "." else rel_root
-
-                        for name in files:
-                            if name.endswith((".pyc", ".pyo")):
-                                continue
-                            full = os.path.join(root, name)
-                            rel_path = os.path.join(rel_root, name) if rel_root else name
-                            zip_name = f"{prefix}/{rel_path}".replace("\\", "/")
-                            zf.write(full, arcname=zip_name)
-
-                    manifest.append({
-                        "kind": "dir",
-                        "zip_prefix": f"{prefix}/",
-                        "remote_root": item["remote_root"],
-                    })
-
-                else:
-                    raise ValueError(f"Unknown kind in work list: {kind}")
-
-        raw = buf.getvalue()
-
-        # optional zlib on top of zip
-        algo = "none"
-        payload = raw
-        if len(raw) > byte_limit:
-            import zlib
-            compressed = zlib.compress(raw, level=9)
-            if len(compressed) < int(len(raw) * 0.95):
-                algo = "zlib"
-                payload = compressed
-
-        packed = b"ALG:" + algo.encode("ascii") + b"\n" + payload
-        data_b64 = base64.b64encode(packed).decode("ascii")
-
-        cmd = f"""import base64, io, os, zipfile, zlib
-
-def _ep(p):
-    \"\"\"Expand ~ and normalise path on the remote host.\"\"\"
-    return os.path.expanduser(p)
-
-packed_b64 = {data_b64!r}
-manifest = {manifest!r}
-
-packed = base64.b64decode(packed_b64)
-nl = packed.find(b"\\n")
-if nl == -1 or not packed.startswith(b"ALG:"):
-    raise ValueError("Bad payload header")
-
-algo = packed[4:nl].decode("ascii")
-payload = packed[nl+1:]
-
-if algo == "none":
-    raw = payload
-elif algo == "zlib":
-    raw = zlib.decompress(payload)
-else:
-    raise ValueError(f"Unknown compression algo: {{algo}}")
-
-buf = io.BytesIO(raw)
-with zipfile.ZipFile(buf, "r") as zf:
-    names = set(zf.namelist())
-
-    for item in manifest:
-        kind = item["kind"]
-
-        if kind in ("file", "bytes"):
-            zip_name = item["zip"]
-            remote_file = _ep(item["remote"])          # ← expanded
-            if zip_name not in names:
-                raise FileNotFoundError(f"Missing in zip: {{zip_name}}")
-
-            parent = os.path.dirname(remote_file)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-
-            with zf.open(zip_name, "r") as src, open(remote_file, "wb") as dst:
-                dst.write(src.read())
-
-        elif kind == "dir":
-            prefix = item["zip_prefix"]
-            remote_root = _ep(item["remote_root"])     # ← expanded
-
-            os.makedirs(remote_root, exist_ok=True)
-
-            for n in names:
-                if not n.startswith(prefix):
-                    continue
-                rel = n[len(prefix):]
-                if not rel or rel.endswith("/"):
-                    continue
-
-                target = os.path.join(remote_root, rel)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                print(target)
-                with zf.open(n, "r") as src, open(target, "wb") as dst:
-                    dst.write(src.read())
-
-        else:
-            raise ValueError(f"Unknown manifest kind: {{kind}}")
-"""
-        self.command(command=cmd).start().wait(wait=wait)
-
-    # ------------------------------------------------------------------
-    # upload local lib into remote site-packages
-    # ------------------------------------------------------------------
-    def install_temporary_libraries(
-        self,
-        libraries: str | ModuleType | List[str | ModuleType],
-        *,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        pip_install: bool = False
-    ) -> Union[str, ModuleType, List[str | ModuleType]]:
-        connected = self.connect()
-
-        is_collection = isinstance(libraries, (list, tuple, set))
-        items = list(libraries) if is_collection else [libraries]
-        libs_path = connected.remote_metadata.libs_path
-
-        if pip_install:
-            items = [str(x) for x in items]
-
-            self.command(
-                command=f"""import subprocess, pathlib, shlex, sys
-tgt = pathlib.Path({str(self.remote_metadata.libs_path)!r}).expanduser()
-tgt.mkdir(parents=True, exist_ok=True)
-
-items = {items!r}
-
-def run(cmd):
-    return subprocess.run(cmd, text=True, capture_output=True)
-
-# 1) global attempt
-cmd_all = ["uv","pip","install", *items, "--update", "--target", str(tgt)]
-p = run(cmd_all)
-
-if p.returncode == 0:
-    print("[ok] installed all")
-    sys.exit(0)
-else:
-    print("[warn] bulk install failed, falling back to per-package installs")
-    print(p.stderr.strip() or p.stdout.strip())
-    
-    # 2) per-item fallback (ignore errors)
-    failed = []
-    for it in items:
-        p2 = run(["uv","pip","install", it, "--update", "--target", str(tgt)])
-        if p2.returncode != 0:
-            failed.append(it)
-            msg = (p2.stderr.strip() or p2.stdout.strip())
-            print(f"[fail] {{it}} -> {{msg}}")
-    print("[done] fallback complete. failed:", failed)
-    sys.exit(0)
-"""
-            ).start().wait(wait=wait, raise_error=raise_error)
-        else:
-            upload_map = {
-                str(resolved): posixpath.join(libs_path, resolved.name)
-                for lib in items
-                if not connected._uploaded_package_roots.get(str(resolved := resolve_local_lib_path(lib)))
-            }
-
-            if upload_map:
-                connected.upload_local_path(upload_map)
-                connected._uploaded_package_roots.update(upload_map)
-                for str_resolved, remote_target in upload_map.items():
-                    LOGGER.info("Installed temporary lib '%s' → %s on %s", str_resolved, remote_target, connected)
-
-        return libraries
+        return self.cluster.client.is_in_databricks_environment()
 
     def check_with_env(
         self,
@@ -793,7 +787,7 @@ else:
         remote_reqs = self.requirements
         diffs = diff_installed_libraries(local_reqs, remote_reqs)
         diffs = [
-            "%s==%s" % (name, meta["current"])
+            name # "%s==%s" % (name, meta["current"])
             for name, meta in diffs.items()
             if meta and meta["current"] and _valid_install_package(name)
         ]
@@ -801,7 +795,7 @@ else:
         if diffs:
             self.install_temporary_libraries(
                 libraries=diffs,
-                pip_install=True,
+                pip_install=False,
                 wait=wait,
                 raise_error=raise_error
             )
@@ -810,7 +804,10 @@ else:
         return self
 
 def _valid_install_package(name: str):
-    for prefix in ("pyspark", "pywin32"):
+    for prefix in (
+        "pyspark", "pywin32", "ygg", "pip", "setuptools", "wheel",
+        ""
+    ):
         if name.startswith(prefix):
             return False
     return True
