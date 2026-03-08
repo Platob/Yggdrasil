@@ -1,6 +1,4 @@
-from mongoengine import *
-
-from yggdrasil.mongoengine import with_mongo_connection, connect
+from yggdrasil.mongoengine import *
 
 
 class Cities(Document):
@@ -36,11 +34,9 @@ connect(
     aliases="GenCast",
     databricks="xxx"
 )
-def decorated(a: int):
-    import pandas as pd
+def decorated():
     result = Cities.objects().first()
-    data = pd.DataFrame(result).drop(columns=['_id'])
-    return data
+    return result.to_pandas()
 
 
 class TestDecorator:

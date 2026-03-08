@@ -20,7 +20,7 @@ without modification.
 
 Typical usage::
 
-    from yggdrasil.pyutils.dynamic_buffer import BytesIO, BufferConfig
+    from yggdrasil.io import BytesIO, BufferConfig
 
     buf = BytesIO()
     buf.write(payload)
@@ -43,5 +43,6 @@ __all__ = [
     "DEFAULT_CONFIG",
     "Codec",
     "MediaType",
+    "MimeType",
     "BytesIO",
 ]
