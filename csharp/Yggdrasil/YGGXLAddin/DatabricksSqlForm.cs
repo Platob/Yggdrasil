@@ -171,7 +171,7 @@ namespace YGGXLAddin
             return $@"from yggdrasil.databricks.workspaces import Workspace
 
 workspace = Workspace(host=""dbc-e646c5f9-8a44.cloud.databricks.com"")
-engine = workspace.sql()
+engine = workspace.sql
 __tempfile__ = {tempFileLiteral}
 statement = {statementLiteral}
 result = engine.execute(statement=statement)

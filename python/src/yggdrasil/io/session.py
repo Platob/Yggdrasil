@@ -2,7 +2,7 @@ import datetime as dt
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable
+from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable, Literal
 
 from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
@@ -75,12 +75,16 @@ class Session(ABC):
         self,
         request: PreparedRequest,
         *,
-        sniff: Optional[bool] = None,
-        stream: bool = True,
         wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: Optional[bool] = None,
+        stream: bool = True,
         cache: Optional["Table"] = None,
-        cached_from: Optional[dt.datetime | dt.date | str] = None,
-        cached_to: Optional[dt.datetime | dt.date | str] = None,
+        cache_by: Optional[list[str]] = None,
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
+        anonymize: Literal["remove", "redact", "hash"] = "remove",
+        wait_cache: WaitingConfigArg = False,
     ) -> Response:
         raise NotImplementedError
 
@@ -89,13 +93,24 @@ class Session(ABC):
         self,
         requests: Iterator[PreparedRequest],
         *,
-        sniff: Optional[bool] = None,
-        stream: bool = True,
         wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: Optional[bool] = None,
+        stream: bool = True,
         cache: Optional["Table"] = None,
-        cached_from: Optional[dt.datetime | dt.date | str] = None,
-        cached_to: Optional[dt.datetime | dt.date | str] = None,
-        pool: Optional[JobPoolExecutor | int] = None
+        cache_by: Optional[list[str]] = None,
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
+        anonymize: Literal["remove", "redact", "hash"] = "remove",
+        wait_cache: WaitingConfigArg = False,
+        # Pooling options
+        pool: Optional[JobPoolExecutor | int] = None,
+        batch_size: Optional[int] = None,
+        ordered: bool = False,
+        max_in_flight: Optional[int] = None,
+        cancel_on_exit: bool = False,
+        shutdown_on_exit: bool = False,
+        shutdown_wait: bool = False,
     ):
         raise NotImplementedError
 
@@ -120,7 +135,6 @@ class Session(ABC):
             "GET",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -151,7 +165,6 @@ class Session(ABC):
             "POST",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -183,7 +196,6 @@ class Session(ABC):
             "PUT",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -215,7 +227,6 @@ class Session(ABC):
             "PATCH",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -247,7 +258,6 @@ class Session(ABC):
             "DELETE",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -278,7 +288,6 @@ class Session(ABC):
             "HEAD",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -309,7 +318,6 @@ class Session(ABC):
             "OPTIONS",
             url,
             params=params,
-            sniff=sniff,
             headers=headers,
             body=body,
             tags=tags,
@@ -335,13 +343,12 @@ class Session(ABC):
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
         json: Optional[Any] = None,
         stream: bool = True,
-        sniff: Optional[bool] = None,
         wait: WaitingConfigArg = None,
         normalize: bool = True,
         cache: Optional["Table"] = None,
     ) -> Response:
-        if sniff is None:
-            sniff = cache is not None
+        if normalize is None:
+            normalize = cache is not None
 
         request = self.prepare_request(
             method=method,
@@ -357,7 +364,6 @@ class Session(ABC):
 
         return self.send(
             request=request,
-            sniff=sniff,
             stream=stream,
             wait=wait,
             cache=cache

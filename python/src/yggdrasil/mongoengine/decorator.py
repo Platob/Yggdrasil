@@ -4,11 +4,11 @@ import functools
 import os
 from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar, Union, TYPE_CHECKING
 
+from yggdrasil.io.url import URL
 from .lib import (
     mongoengine,
     get_connection_settings,
 )
-from ..io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
@@ -127,18 +127,20 @@ def with_mongo_connection(
         databricks = DatabricksClient.parse(databricks)
 
         try:
-            mongo_url = URL.parse_str(configs[0]["host"][0], default_scheme="https")
+            mongo_url = URL.parse_str(configs[0]["host"], default_scheme="https")
 
             if not mongo_url.host:
                 raise MongoHostResolutionError(
                     f"Failed to extract host from MongoDB connection URL: {configs[0]['host'][0]!r}"
                 )
 
+            key = mongo_url.host
+
             cl = databricks.compute.clusters.all_purpose_cluster(
-                key=mongo_url.host,
-                single_user_name=mongo_url.host,
+                key=key,
+                single_user_name=key,
                 libraries=["mongoengine", "sqlalchemy"],
-                permissions=[mongo_url.host],
+                permissions=[key],
                 custom_tags={"MongoHost": mongo_url.host},
             )
 

@@ -75,14 +75,20 @@ class MediaType:
         return default or cls(mime_type=MimeType.OCTET_STREAM)
 
     @classmethod
-    def parse_str(cls, s: str, default: "MediaType | None" = None) -> "MediaType":
+    def parse_str(
+        cls,
+        s: str,
+        *,
+        codec: "Codec | None" = None,
+        default: "MediaType | None" = None
+    ) -> "MediaType":
         if not s:
-            return default or cls(mime_type=MimeType.OCTET_STREAM)
+            return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
 
         raw = s.strip()
 
         # compound first
-        outer: Codec | None = None
+        outer: Codec | None = codec
         inner_str = raw
 
         if "+" in raw:
@@ -92,7 +98,7 @@ class MediaType:
                 outer = maybe
                 inner_str = left.strip()
 
-        if outer is None:
+        if outer is None and len(raw) < 8 * 1024:
             p = Path(raw)
             if p.suffixes:
                 last = p.suffixes[-1].lstrip(".").lower()
@@ -111,12 +117,12 @@ class MediaType:
         # plain
         mt = MimeType.parse_str(raw, default=None)
         if mt is None:
-            return default or cls(mime_type=MimeType.OCTET_STREAM)
+            return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
 
         if mt.is_codec:
             return cls(mime_type=mt, codec=Codec.from_mime(mt))
 
-        return cls(mime_type=mt, codec=None)
+        return cls(mime_type=mt, codec=codec)
 
     @classmethod
     def _sniff_inner_from_codec_bytes(cls, codec: Codec, data: bytes) -> MimeType | None:
@@ -177,8 +183,8 @@ class MediaType:
     def is_octet(self):
         return self.mime_type == MimeType.OCTET_STREAM
 
-    def full_mime_type(self):
-        if self.codec is None:
+    def full_mime_type(self, concat_codec: bool = True) -> MimeType:
+        if not concat_codec or self.codec is None:
             return self.mime_type
 
         return MimeType(

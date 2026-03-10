@@ -50,13 +50,21 @@ def get_connection_settings(
     if not jsonable:
         return dict(infos)
 
-    return {
-        "db": infos.get("db"),
+    base = {
+        "db": infos.get("db") or alias,
         "alias": infos.get("alias") or alias,
         "host": _first_host(infos.get("host")),
         "port": infos.get("port"),
         "username": infos.get("username"),
         "password": infos.get("password"),
+        "serverSelectionTimeoutMS": infos.get("serverSelectionTimeoutMS"),
+        "uuidRepresentation": infos.get("uuidRepresentation"),
+    }
+
+    return {
+        k: v
+        for k, v in base.items()
+        if v
     }
 
 
@@ -110,8 +118,12 @@ def register_connection(
     alias: str,
     db: str = None,
     host: str | list[str] | None = None,
+    server_selection_timeout_ms: int = 5000,
     **kwargs,
 ):
+    if server_selection_timeout_ms:
+        kwargs.setdefault("serverSelectionTimeoutMS", server_selection_timeout_ms)
+
     _base_register_connection(
         db=db,
         alias=alias,

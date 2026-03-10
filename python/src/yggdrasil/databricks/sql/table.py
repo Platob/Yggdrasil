@@ -78,10 +78,9 @@ class Table(DatabricksService):
         if self._infos is not None:
             return self._infos
 
-        object.__setattr__(
-            self, "_infos",
-            self.client.workspace_client().tables.get(self.full_name())
-        )
+        infos = self.client.workspace_client().tables.get(self.full_name())
+
+        object.__setattr__(self, "_infos", infos)
         return self._infos
 
     def find_table(
@@ -495,7 +494,6 @@ class Table(DatabricksService):
         self,
         *,
         filters: Optional[list[tuple[str, str, str]]] = None,
-        row_limit: Optional[int] = None,
         wait: WaitingConfigArg = True,
         cache_for: WaitingConfigArg = None
     ):
@@ -533,7 +531,7 @@ class Table(DatabricksService):
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
             table_name=self.table_name,
-            existing_schema=self.arrow_schema,
+            table=self,
             match_by=match_by,
             wait=wait,
             raise_error=raise_error

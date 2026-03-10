@@ -162,7 +162,7 @@ class Clusters(DatabricksService):
         )
 
         libraries = (libraries or []) + [
-            f"ygg[data,databricks]~={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}",
+            f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
             "uv",
             "dill",
         ]

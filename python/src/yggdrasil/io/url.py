@@ -50,14 +50,12 @@ def _normalize_path(path: str) -> str:
     if not path:
         return "/"
 
-    if path == "/":
+    elif path == "/":
         return path
 
-    if not path.startswith("/"):
+    elif not path.startswith("/"):
         path = "/" + os.path.realpath(path).replace("\\", "/")
 
-    while "//" in path:
-        path = path.replace("//", "/")
     return path
 
 
@@ -225,6 +223,9 @@ class URL:
                 decode=decode,
                 normalize=normalize,
             )
+
+        if obj is None:
+            raise ValueError("Cannot parse URL from None")
 
         return cls.parse_str(
             str(obj),

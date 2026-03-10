@@ -11,6 +11,7 @@ from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callab
 from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
+from databricks.sdk.errors import DatabricksError
 
 from yggdrasil.environ import UserInfo
 from yggdrasil.io.url import URL, URLResource, url_resource_class
@@ -163,6 +164,8 @@ class DatabricksClient(URLResource):
 
     @property
     def base_url(self):
+        if not self.host:
+            return URL.parse_str(self.make_config().host)
         return URL.parse_str(self.host)
 
     def to_url(self, scheme: str | None = None) -> URL:
@@ -357,9 +360,9 @@ class DatabricksClient(URLResource):
             product_version=self.product_version,
         )
 
-        if client_type is not None:
-            if config.client_type != client_type:
-                raise ValueError(f"Config client_type {config.client_type} does not match expected {client_type}")
+        # if client_type is not None:
+        #     if config.client_type != client_type:
+        #         raise ValueError(f"Config client_type {config.client_type} does not match expected {client_type}")
 
         return config
 
@@ -514,8 +517,8 @@ class DatabricksClient(URLResource):
                     ("ProductVersion", self.product_version),
                     ("UserMail", userinfo.email),
                     ("UserHost", userinfo.hostname),
-                    ("UserURL", userinfo.url.to_string()),
-                    ("GitURL", userinfo.git_url.to_string()),
+                    ("UserURL", userinfo.url),
+                    ("GitURL", userinfo.git_url),
                 )
                 if v
             }

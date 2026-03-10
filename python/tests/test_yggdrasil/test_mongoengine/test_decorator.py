@@ -17,7 +17,7 @@ class Cities(Document):
         return f'{self.city_name} {self.country_name} {self.population_tot} {self.population_perc} ({self.location["coordinates"][1]}, {self.location["coordinates"][0]})'
 
     meta = {
-        'db_alias': 'GenCast',
+        'db_alias': 'test_connection',
         'indexes': [
             {'fields': ['-city_name', '-country_iso', 'population_perc'],
              'unique': True}
@@ -35,9 +35,7 @@ connect(
     databricks="xxx"
 )
 def decorated():
-    result = Cities.objects().first()
-    return result.to_pandas()
-
+    return Cities.objects().first().to_pandas()
 
 class TestDecorator:
 

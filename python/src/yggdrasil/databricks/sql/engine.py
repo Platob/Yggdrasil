@@ -25,20 +25,21 @@ import random
 import string
 import time
 from dataclasses import dataclass, field
-from threading import Thread
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
 from databricks.sdk.errors import NotFound
 from databricks.sdk.service.sql import Disposition
 
-from yggdrasil.arrow.cast import is_arrow_type_string_like, is_arrow_type_binary_like, arrow_field_to_schema
+from yggdrasil.arrow.cast import arrow_field_to_schema
+from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.cast.registry import convert
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
 from .statement_result import StatementResult
 from .table import Table
+from .types import quote_ident, escape_sql_string, arrow_field_to_ddl
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
 from ..workspaces import DatabricksPath
@@ -61,33 +62,6 @@ __all__ = [
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
 
 
-def _escape_sql_string(s: str) -> str:
-    """
-    Escape a Python string for safe embedding in a single-quoted SQL literal.
-
-    Args:
-        s: Input string.
-
-    Returns:
-        SQL-escaped string where single quotes are doubled.
-    """
-    return s.replace("'", "''")
-
-
-def _quote_ident(ident: str) -> str:
-    """
-    Quote a SQL identifier using backticks, escaping embedded backticks.
-
-    Args:
-        ident: Identifier to quote (catalog/schema/table/column/etc).
-
-    Returns:
-        Backtick-quoted identifier with embedded backticks doubled.
-    """
-    escaped = ident.replace("`", "``")
-    return f"`{escaped}`"
-
-
 def _needs_column_mapping(col_name: str) -> bool:
     """
     Heuristic: return True if a column name has characters that commonly break without
@@ -100,6 +74,37 @@ def _needs_column_mapping(col_name: str) -> bool:
         True if column name includes invalid/awkward characters.
     """
     return any(ch in _INVALID_COL_CHARS for ch in col_name)
+
+
+def _build_match_condition(
+    match_by: list[str],
+    *,
+    left_alias: str,
+    right_alias: str,
+    null_safe: bool = True,
+) -> str:
+    """
+    Build a join/match condition for merge keys.
+
+    Args:
+        match_by:
+            Key columns used for matching.
+        left_alias:
+            SQL alias for the target/left side.
+        right_alias:
+            SQL alias for the source/right side.
+        null_safe:
+            If True, use Databricks SQL null-safe equality (<=>), so NULL matches NULL.
+
+    Returns:
+        SQL condition string like:
+            t.`id` <=> s.`id` AND t.`ts` <=> s.`ts`
+    """
+    op = "<=>" if null_safe else "="
+    return " AND ".join(
+        f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
+        for k in match_by
+    )
 
 
 @dataclass
@@ -179,10 +184,6 @@ class SQLEngine(DatabricksService):
         object.__setattr__(built, "_cached_queries", self._cached_queries)
 
         return built
-    
-    @classmethod
-    def service_name(cls):
-        return "sql"
 
     # -------------------------------------------------------------------------------------
     # Naming helpers
@@ -222,7 +223,7 @@ class SQLEngine(DatabricksService):
         assert table_name, "No table name given"
 
         if safe_chars:
-            return f"{_quote_ident(catalog_name)}.{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
+            return f"{quote_ident(catalog_name)}.{quote_ident(schema_name)}.{quote_ident(table_name)}"
         return f"{catalog_name}.{schema_name}.{table_name}"
 
     def _catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -313,13 +314,10 @@ class SQLEngine(DatabricksService):
                 raise_error=True
             ))
 
-            return self.default_warehouse.find_warehouse(
-                warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name
-            )
+            return self.default_warehouse
 
         if warehouse_id or warehouse_name:
-            return self.default_warehouse.find_warehouse(
+            return self.warehouses.find_warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name
             )
@@ -567,7 +565,7 @@ class SQLEngine(DatabricksService):
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        existing_schema: pa.Schema | None = None,
+        table: Optional["Table"] = None,
     ) -> None:
         """
         Insert data into a Delta table.
@@ -641,6 +639,7 @@ class SQLEngine(DatabricksService):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 spark_options=spark_options,
+                table=table
             )
         else:
             return self.arrow_insert_into(
@@ -658,7 +657,7 @@ class SQLEngine(DatabricksService):
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                existing_schema=existing_schema
+                table=table
             )
 
     # -------------------------------------------------------------------------------------
@@ -689,7 +688,7 @@ class SQLEngine(DatabricksService):
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
-        existing_schema: pa.Schema | None = None,
+        table: Optional["Table"] = None,
         temp_volume_path: Optional[Union[str, DatabricksPath]] = None,
     ) -> None:
         """
@@ -734,8 +733,6 @@ class SQLEngine(DatabricksService):
                 If True and `match_by` is set, runs `OPTIMIZE <table>` after merge (in addition to ZORDER).
             vacuum_hours:
                 If set, runs `VACUUM <table> RETAIN <hours> HOURS`.
-            existing_schema:
-                Optional destination schema (Arrow) to avoid an extra schema fetch.
             temp_volume_path:
                 Optional staging path override. If not provided, a temp volume path is allocated.
 
@@ -751,14 +748,23 @@ class SQLEngine(DatabricksService):
         )
 
         with self.connect() as connected:
-            if existing_schema is None:
+            if table is not None:
                 try:
-                    existing_schema = connected.table(
+                    # Fail fast
+                    _ = table.arrow_schema
+                except NotFound:
+                    table = None
+
+            if table is None:
+                try:
+                    table = connected.table(
                         location=location,
                         catalog_name=catalog_name,
                         schema_name=schema_name,
                         table_name=table_name,
-                    ).arrow_schema
+                    )
+
+                    _ = table.arrow_schema
                 except NotFound as exc:
                     if not hasattr(data, "columns") and not hasattr(data, "schema"):
                         from ...polars.cast import any_to_polars_dataframe
@@ -776,36 +782,20 @@ class SQLEngine(DatabricksService):
                         execute=True,
                     )
 
-                    try:
-                        return connected.arrow_insert_into(
-                            data=data,
-                            location=location,
-                            catalog_name=catalog_name,
-                            schema_name=schema_name,
-                            table_name=table_name,
-                            mode="overwrite",
-                            cast_options=cast_options,
-                            overwrite_schema=overwrite_schema,
-                            match_by=match_by,
-                            wait=wait,
-                            zorder_by=zorder_by,
-                            optimize_after_merge=optimize_after_merge,
-                            vacuum_hours=vacuum_hours,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Arrow insert failed after auto-creating %s; attempting cleanup (DROP TABLE)", location
-                        )
-                        try:
-                            connected.drop_table(location=location, wait=True)
-                        except Exception as e:
-                            logger.exception("Failed to drop table %s after auto creation error: %s", location, e)
+                    table = connected.table(
+                        location=location,
+                        catalog_name=catalog_name,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                    )
 
-                        if raise_error:
-                            raise
-                        return None
+                    mode = SaveMode.APPEND
 
-            cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
+            existing_schema = table.arrow_schema
+            cast_options = CastOptions.check_arg(
+                options=cast_options,
+                target_field=existing_schema
+            )
 
             logger.debug("Inserting %s into %s", data, location)
 
@@ -830,21 +820,26 @@ class SQLEngine(DatabricksService):
             mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
             columns = list(existing_schema.names)
-            cols_quoted = ", ".join([_quote_ident(c) for c in columns])
+            cols_quoted = ", ".join([quote_ident(c) for c in columns])
 
             statements: list[str] = []
 
             if match_by:
-                source_sql = f"SELECT {cols_quoted} FROM parquet.{_quote_ident(str(temp_volume_path))}"
-                on_condition = " AND ".join([f"T.{_quote_ident(k)} = S.{_quote_ident(k)}" for k in match_by])
+                source_sql = f"SELECT {cols_quoted} FROM parquet.{quote_ident(str(temp_volume_path))}"
+                on_condition = _build_match_condition(
+                    match_by,
+                    left_alias="T",
+                    right_alias="S",
+                    null_safe=True,
+                )
 
                 if mode == SaveMode.OVERWRITE:
-                    key_cols = ", ".join([_quote_ident(k) for k in match_by])
+                    key_cols = ", ".join([quote_ident(k) for k in match_by])
 
                     delete_sql = f"""DELETE FROM {location} AS T
 USING (
   SELECT DISTINCT {key_cols}
-  FROM parquet.{_quote_ident(str(temp_volume_path))}
+  FROM parquet.{quote_ident(str(temp_volume_path))}
 ) AS S
 ON {on_condition}""".strip()
 
@@ -858,7 +853,7 @@ ON {on_condition}""".strip()
                 elif mode == SaveMode.APPEND:
                     insert_clause = (
                         f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                        f"VALUES ({', '.join([f'S.{_quote_ident(c)}' for c in columns])})"
+                        f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
                     )
 
                     merge_sql = f"""MERGE INTO {location} AS T
@@ -874,12 +869,12 @@ ON {on_condition}
                     update_cols = [c for c in columns if c not in match_by]
                     update_clause = ""
                     if update_cols:
-                        update_set = ", ".join([f"T.{_quote_ident(c)} = S.{_quote_ident(c)}" for c in update_cols])
+                        update_set = ", ".join([f"T.{quote_ident(c)} = S.{quote_ident(c)}" for c in update_cols])
                         update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
 
                     insert_clause = (
                         f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                        f"VALUES ({', '.join([f'S.{_quote_ident(c)}' for c in columns])})"
+                        f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
                     )
 
                     merge_sql = f"""MERGE INTO {location} AS T
@@ -896,26 +891,27 @@ ON {on_condition}
                 if mode == SaveMode.OVERWRITE:
                     insert_sql = f"""INSERT OVERWRITE {location}
 SELECT {cols_quoted}
-FROM parquet.{_quote_ident(str(temp_volume_path))}"""
+FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 else:
                     insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 SELECT {cols_quoted}
-FROM parquet.{_quote_ident(str(temp_volume_path))}"""
+FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 statements.append(insert_sql)
 
             try:
                 for stmt in statements:
                     connected.execute(stmt, wait=wait, raise_error=raise_error)
             finally:
-                try:
-                    Thread(target=temp_volume_path.remove, kwargs={"recursive": True}).start()
-                except Exception:
-                    logger.exception("Failed cleaning temp volume: %s", temp_volume_path)
+                if wait:
+                    Job.make(
+                        temp_volume_path.remove,
+                        recursive=True,
+                    ).fire_and_forget()
 
             logger.info("Arrow inserted into %s", location)
 
             if zorder_by:
-                zorder_cols = ", ".join([_quote_ident(c) for c in zorder_by])
+                zorder_cols = ", ".join([quote_ident(c) for c in zorder_by])
                 connected.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
 
             if optimize_after_merge and match_by:
@@ -946,6 +942,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_options: Optional[Dict[str, Any]] = None,
+        table: Optional["Table"] = None,
     ) -> None:
         """
         Insert data into a Delta table using Spark.
@@ -1001,14 +998,6 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         from pyspark.sql import DataFrame
         import pyspark.sql.functions as F
 
-        location, catalog_name, schema_name, table_name = self._check_location_params(
-            location=location,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=True,
-        )
-
         logger.info(
             "Spark insert into %s (mode=%s, match_by=%s, overwrite_schema=%s)",
             location,
@@ -1021,28 +1010,49 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         if overwrite_schema:
             spark_options["overwriteSchema"] = "true"
 
-        try:
-            existing_schema = self.table(
+        if table is not None:
+            try:
+                _ = table.arrow_schema
+            except:
+                table = None
+
+        if table is None:
+            location, catalog_name, schema_name, table_name = self._check_location_params(
+                location=location,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name,
-            ).arrow_field
-        except NotFound:
-            data_df = convert(data, DataFrame)
-            data_df.write.mode("overwrite").options(**spark_options).saveAsTable(location)
-            return None
+                safe_chars=True,
+            )
 
+            try:
+                table = self.table(
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                )
+            except NotFound:
+                data_df = convert(data, DataFrame)
+                data_df.write.mode("overwrite").options(**spark_options).saveAsTable(location)
+                return None
+
+        existing_schema = table.arrow_schema
         cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
         data_df = any_to_spark_dataframe(data, cast_options)
         target = self.spark_table(full_name=location)
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
         if match_by:
-            cond = " AND ".join([f"t.{_quote_ident(k)} <=> s.{_quote_ident(k)}" for k in match_by])
+            cond = _build_match_condition(
+                match_by,
+                left_alias="t",
+                right_alias="s",
+                null_safe=True,
+            )
 
             if mode == SaveMode.OVERWRITE:
                 data_df = data_df.cache()
-                distinct_keys = data_df.select([f"{_quote_ident(k)}" for k in match_by]).distinct()
+                distinct_keys = data_df.select([f"{quote_ident(k)}" for k in match_by]).distinct()
 
                 (
                     target.alias("t")
@@ -1068,7 +1078,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
 
             else:
                 update_cols = [c for c in data_df.columns if c not in match_by]
-                set_expr = {c: F.expr(f"s.{_quote_ident(c)}") for c in update_cols}
+                set_expr = {c: F.expr(f"s.{quote_ident(c)}") for c in update_cols}
 
                 (
                     target.alias("t")
@@ -1280,7 +1290,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
             if missing:
                 raise ValueError(f"cluster_by contains unknown columns: {missing}")
 
-        column_definitions = [self._field_to_ddl(child) for child in arrow_fields]
+        column_definitions = [arrow_field_to_ddl(child) for child in arrow_fields]
 
         if or_replace and if_not_exists:
             raise ValueError("Use either or_replace or if_not_exists, not both.")
@@ -1297,19 +1307,19 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         ]
 
         if partition_by:
-            sql_parts.append("PARTITIONED BY (" + ", ".join(_quote_ident(c) for c in partition_by) + ")")
+            sql_parts.append("PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")")
         elif cluster_by:
             if isinstance(cluster_by, bool):
                 if cluster_by:
                     sql_parts.append("CLUSTER BY AUTO")
             else:
-                sql_parts.append("CLUSTER BY (" + ", ".join(_quote_ident(c) for c in cluster_by) + ")")
+                sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
 
         if comment:
-            sql_parts.append(f"COMMENT '{_escape_sql_string(comment)}'")
+            sql_parts.append(f"COMMENT '{escape_sql_string(comment)}'")
 
         if storage_location:
-            sql_parts.append(f"LOCATION '{_escape_sql_string(storage_location)}'")
+            sql_parts.append(f"LOCATION '{escape_sql_string(storage_location)}'")
 
         props: dict[str, Any] = {
             "delta.autoOptimize.optimizeWrite": bool(optimize_write),
@@ -1347,7 +1357,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
 
             def fmt(_key: str, _value: Any) -> str:
                 if isinstance(_value, str):
-                    return f"'{_key}' = '{_escape_sql_string(_value)}'"
+                    return f"'{_key}' = '{escape_sql_string(_value)}'"
                 if isinstance(_value, bool):
                     return f"'{_key}' = '{'true' if _value else 'false'}'"
                 return f"'{_key}' = {_value}"
@@ -1364,7 +1374,7 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
             res = self.execute(statement, wait=wait_result)
         except Exception as e:
             if "SCHEMA_NOT_FOUND" in str(e):
-                self.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema_name)}", wait=True)
+                self.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema_name)}", wait=True)
                 res = self.execute(statement, wait=wait_result)
             else:
                 raise
@@ -1415,128 +1425,3 @@ FROM parquet.{_quote_ident(str(temp_volume_path))}"""
         )
 
         return location, catalog_name or self.catalog_name, schema_name or self.schema_name, table_name
-
-    @staticmethod
-    def _field_to_ddl(
-        field: pa.Field,
-        put_name: bool = True,
-        put_not_null: bool = True,
-        put_comment: bool = True,
-    ) -> str:
-        """
-        Convert an Arrow field to a Databricks SQL column DDL fragment.
-
-        Supports primitives plus nested types:
-        - STRUCT<...>
-        - MAP<k,v>
-        - ARRAY<elem>
-
-        Args:
-            field:
-                Arrow field to convert.
-            put_name:
-                If True, include the column name.
-            put_not_null:
-                If True, emit NOT NULL when `field.nullable` is False.
-            put_comment:
-                If True, emit COMMENT when field metadata contains b"comment".
-
-        Returns:
-            SQL fragment for a column definition.
-
-        Raises:
-            TypeError:
-                If a nested Arrow type cannot be represented.
-            ValueError:
-                If a primitive Arrow type cannot be mapped to a SQL type.
-        """
-        name = field.name
-        nullable_str = " NOT NULL" if put_not_null and not field.nullable else ""
-        name_str = f"{_quote_ident(name)} " if put_name else ""
-
-        comment_str = ""
-        if put_comment and field.metadata and b"comment" in field.metadata:
-            comment = field.metadata[b"comment"].decode("utf-8")
-            comment_str = f" COMMENT '{_escape_sql_string(comment)}'"
-
-        if not pa.types.is_nested(field.type):
-            sql_type = SQLEngine._arrow_to_sql_type(field.type)
-            return f"{name_str}{sql_type}{nullable_str}{comment_str}"
-
-        if pa.types.is_struct(field.type):
-            struct_body = ", ".join([SQLEngine._field_to_ddl(child) for child in field.type])
-            return f"{name_str}STRUCT<{struct_body}>{nullable_str}{comment_str}"
-
-        if pa.types.is_map(field.type):
-            map_type: pa.MapType = field.type
-            key_type = SQLEngine._field_to_ddl(
-                map_type.key_field,
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
-            )
-            val_type = SQLEngine._field_to_ddl(
-                map_type.item_field,
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
-            )
-            return f"{name_str}MAP<{key_type}, {val_type}>{nullable_str}{comment_str}"
-
-        if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
-            list_type: pa.ListType = field.type
-            elem_type = SQLEngine._field_to_ddl(
-                list_type.value_field,
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
-            )
-            return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
-
-        raise TypeError(f"Cannot make ddl field from {field}")
-
-    @staticmethod
-    def _arrow_to_sql_type(arrow_type: Union[pa.DataType, pa.Decimal128Type]) -> str:
-        """
-        Convert an Arrow data type to a Databricks SQL type string.
-
-        Args:
-            arrow_type:
-                Arrow type instance to convert.
-
-        Returns:
-            Databricks SQL type string.
-
-        Raises:
-            ValueError:
-                If the Arrow type is unsupported.
-        """
-        if pa.types.is_boolean(arrow_type):
-            return "BOOLEAN"
-        if pa.types.is_int8(arrow_type):
-            return "TINYINT"
-        if pa.types.is_int16(arrow_type):
-            return "SMALLINT"
-        if pa.types.is_int32(arrow_type):
-            return "INT"
-        if pa.types.is_int64(arrow_type):
-            return "BIGINT"
-        if pa.types.is_float32(arrow_type):
-            return "FLOAT"
-        if pa.types.is_float64(arrow_type):
-            return "DOUBLE"
-        if is_arrow_type_string_like(arrow_type):
-            return "STRING"
-        if is_arrow_type_binary_like(arrow_type):
-            return "BINARY"
-        if pa.types.is_timestamp(arrow_type):
-            tz = getattr(arrow_type, "tz", None)
-            return "TIMESTAMP" if tz else "TIMESTAMP_NTZ"
-        if pa.types.is_date(arrow_type):
-            return "DATE"
-        if pa.types.is_decimal(arrow_type):
-            return f"DECIMAL({arrow_type.precision}, {arrow_type.scale})"
-        if pa.types.is_null(arrow_type):
-            # Pragmatic fallback: Delta doesn't support a dedicated NULL column type.
-            return "STRING"
-        raise ValueError(f"Cannot make ddl type for {arrow_type}")

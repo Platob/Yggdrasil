@@ -34,7 +34,7 @@ class DatabricksIntegrationBase(unittest.TestCase):
         cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/tmp/yggdrasil_databricks_path_it")
         cls.workspace_root = os.getenv(
             "DATABRICKS_TEST_WORKSPACE_BASE",
-            f"/Users/{cls.workspace.iam.users.current_user.email}/yggdrasil_databricks_path_it",
+            f"/Users/{cls.workspace.iam.users.current_user.username}/yggdrasil_databricks_path_it",
         )
         cls.schema_root = os.getenv(
             "DATABRICKS_TEST_VOLUME_BASE",

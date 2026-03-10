@@ -483,8 +483,8 @@ print({tag!r} + _out, flush=True)
         self,
         obj: Any,
         byte_limit: int = 32 * 1024,
-        byref: Any = None,
-        recurse: Any = None,
+        byref: Any = True,
+        recurse: Any = True,
         compression: Optional[str] = None
     ) -> str:
         """Serialize *obj* to a JSON envelope that ``decode_payload`` can reconstruct.
@@ -534,6 +534,9 @@ print({tag!r} + _out, flush=True)
         from yggdrasil.pandas.lib import pandas
         import yggdrasil.pickle.dill as pkl
         import yggdrasil.pickle.json as json_mod
+
+        if hasattr(obj, "to_arrow_table"):
+            obj = obj.to_arrow_table()
 
         if isinstance(obj, pyarrow.Table):
             import pyarrow.parquet as pq
@@ -619,7 +622,7 @@ print({tag!r} + _out, flush=True)
                 ]
             })
 
-        pkl.dump(obj, buffer, byref=byref, protocol=5)
+        pkl.dump(obj, buffer, byref=byref, recurse=recurse, protocol=5)
 
         raw = buffer.getvalue()
 
@@ -776,100 +779,3 @@ print({tag!r} + _out, flush=True)
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
         return self.cluster.client.is_in_databricks_environment()
-
-    def check_with_env(
-        self,
-        env: PyEnv,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True
-    ):
-        local_reqs = env.requirements(with_system=False)
-        remote_reqs = self.requirements
-        diffs = diff_installed_libraries(local_reqs, remote_reqs)
-        diffs = [
-            name # "%s==%s" % (name, meta["current"])
-            for name, meta in diffs.items()
-            if meta and meta["current"] and _valid_install_package(name)
-        ]
-
-        if diffs:
-            self.install_temporary_libraries(
-                libraries=diffs,
-                pip_install=False,
-                wait=wait,
-                raise_error=raise_error
-            )
-            self._requirements = None
-
-        return self
-
-def _valid_install_package(name: str):
-    for prefix in (
-        "pyspark", "pywin32", "ygg", "pip", "setuptools", "wheel",
-        ""
-    ):
-        if name.startswith(prefix):
-            return False
-    return True
-
-def _decode_result(
-    result: CommandStatusResponse,
-    language: Language
-) -> str:
-    """Mirror the old Cluster.execute_command result handling.
-
-    Args:
-        result: Raw command execution response.
-
-    Returns:
-        The decoded output string.
-    """
-    res = result.results
-
-    # error handling
-    if res.result_type == ResultType.ERROR:
-        message = res.cause or "Command execution failed"
-
-        if "client terminated the session" in message:
-            raise ClientTerminatedSession(message)
-
-        if language == Language.PYTHON:
-            raise_parsed_traceback(message)
-
-        raise RuntimeError(message)
-
-    # normal output
-    if res.result_type == ResultType.TEXT:
-        output = res.data or ""
-    elif res.data is not None:
-        output = str(res.data)
-    else:
-        output = ""
-
-    return output
-
-
-def diff_installed_libraries(
-    current: list[tuple[str, str]],
-    target: list[tuple[str, str]],
-) -> dict[str, dict[str, str | None]]:
-    """
-    Compare two package lists by name + major.minor version.
-    Returns packages that differ, with exact full versions.
-    """
-    def to_major_minor(version: str) -> str:
-        return ".".join(version.split(".")[:2])
-
-    current_map = {name: ver for name, ver in current}
-    target_map  = {name: ver for name, ver in target}
-
-    all_names = current_map.keys() | target_map.keys()
-
-    return {
-        name: {
-            "current": current_map.get(name),
-            "target":  target_map.get(name),
-        }
-        for name in all_names
-        if to_major_minor(current_map.get(name) or "0.0") != to_major_minor(target_map.get(name) or "0.0")
-    }

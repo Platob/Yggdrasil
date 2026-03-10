@@ -32,8 +32,9 @@ class IAMGroup(DatabricksResource):
     name: Optional[str] = None
     account_id: Optional[str] = None
     external_id: Optional[str] = None
-    client_type: ClientType = ClientType.ACCOUNT
-    members: list["IAMUser"] = field(default_factory=list)
+    client_type: Optional[ClientType] = None
+    entitlements: Optional[list[str]] = None
+    members: Optional[list["IAMUser"]] = None
 
     def __str__(self):
         return self.name
@@ -41,9 +42,6 @@ class IAMGroup(DatabricksResource):
     def __post_init__(self):
         if self.service is None:
             object.__setattr__(self, "service", IAMGroups.current())
-
-        if self.client_type is None:
-            object.__setattr__(self, "client_type", ClientType.ACCOUNT)
 
         super().__post_init__()
 
@@ -59,12 +57,10 @@ class IAMGroup(DatabricksResource):
             return obj
 
         if isinstance(obj, (GroupV1, GroupV2, ComplexValue)):
-            group = IAMGroup(
+            return IAMGroup(
                 service=service,
                 client_type=client_type
-            )
-            group.set_details(obj)
-            return group
+            ).set_details(obj)
 
         elif isinstance(obj, Mapping):
             return cls.parse_mapping(obj, service=service, client_type=client_type)
@@ -135,11 +131,11 @@ class IAMGroup(DatabricksResource):
         self.members.append(user)
 
         if commit:
-            self.commit()
+            self.sync()
 
         return self
 
-    def commit(self) -> "IAMGroup":
+    def sync(self) -> "IAMGroup":
         assert self.id, "Group must have an ID to be committed"
 
         if self.client_type == ClientType.WORKSPACE:
@@ -164,44 +160,52 @@ class IAMGroup(DatabricksResource):
         else:
             raise ValueError(f"Unsupported client type: {self.client_type}")
 
-        self.set_details(details)
+        return self.set_details(details)
 
-        return self
-
-    def set_details(self, details: GroupV1 | GroupV2):
+    def set_details(self, details: Union[GroupV1, GroupV2, "IAMGroup"]) -> "IAMGroup":
         if isinstance(details, GroupV1):
-            object.__setattr__(self, "id", details.id)
-            object.__setattr__(self, "name", details.display_name)
-            object.__setattr__(self, "external_id", details.external_id)
-            object.__setattr__(self, "account_id", self.client.config.account_id)
+            self.id = details.id
+            self.name = details.display_name
+            self.external_id = details.external_id
+            self.account_id = self.client.config.account_id
+            self.entitlements = [_.value for _ in details.entitlements or ()]
 
-            members = [
+            if details.meta:
+                if details.meta.resource_type:
+                    self.client_type = ClientType.ACCOUNT if details.meta.resource_type == "Group" else ClientType.WORKSPACE
+
+            self.members = [
                 IAMUser.parse(
                     member,
                     service=self.service.users,
-                    client_type=self.client_type
                 )
                 for member in details.members or []
             ]
-            object.__setattr__(self, "members", members)
 
         elif isinstance(details, GroupV2):
-            object.__setattr__(self, "id", details.internal_id)
-            object.__setattr__(self, "name", details.group_name)
-            object.__setattr__(self, "external_id", details.external_id)
-            object.__setattr__(self, "account_id", details.account_id)
-
-            if self.id and details.internal_id != self.id:
-                object.__setattr__(self, "members", [])
+            self.id = details.internal_id
+            self.name = details.group_name
+            self.external_id = details.external_id
+            self.account_id = details.account_id
+            self.members = None
+            self.entitlements = None
 
         elif isinstance(details, ComplexValue):
-            object.__setattr__(self, "id", details.value)
-            object.__setattr__(self, "name", details.display)
-            object.__setattr__(self, "account_id", self.client.config.account_id)
+            self.id = details.value
+            self.name = details.display
+            self.external_id = None
+            self.account_id = None
+            self.members = None
+            self.entitlements = None
 
-            if self.id and details.value != self.id:
-                object.__setattr__(self, "external_id", None)
-                object.__setattr__(self, "members", [])
+        elif isinstance(details, IAMGroup):
+            self.id = details.id
+            self.name = details.name
+            self.external_id = details.external_id
+            self.account_id = details.account_id
+            self.client_type = details.client_type
+            self.entitlements = details.entitlements
+            self.members = details.members
 
         else:
             raise ValueError(f"Unsupported group details type: {type(details)}")
@@ -218,8 +222,10 @@ class IAMUser(DatabricksResource):
     )
     id: Optional[str] = None
     name: Optional[str] = None
-    email: Optional[str] = None
+    username: Optional[str] = None
+    emails: Optional[list[str]] = None
     external_id: Optional[str] = None
+    active: bool = True
     client_type: ClientType = ClientType.ACCOUNT
 
     def __post_init__(self):
@@ -236,7 +242,9 @@ class IAMUser(DatabricksResource):
         return cls(
             id="databricks-runtime",
             name="Databricks Runtime",
-            email=""
+            username="databricks-runtime",
+            client_type=ClientType.ACCOUNT,
+            active=True
         )
 
     @classmethod
@@ -276,17 +284,15 @@ class IAMUser(DatabricksResource):
             raise ValueError("Value cannot be empty for parsing IAMUser from string")
 
         if "@" in value:
-            email = value
-            name = value.split("@")[0]
+            emails = [value]
         else:
-            email = None
-            name = value
+            emails = None
 
         return cls(
             service=service,
             id=None,
-            name=name,
-            email=email,
+            name=None,
+            emails=emails,
             client_type=client_type or ClientType.ACCOUNT
         )
 
@@ -297,10 +303,14 @@ class IAMUser(DatabricksResource):
         *,
         service: IAMUsers | None = None,
         client_type: Optional[ClientType] = None,
+        **kwargs
     ):
-        group_id = data.get("id") or data.get("internal_id") or data.get("value")
-        name = data.get("display_name") or data.get("name") or data.get("display")
-        external_id = data.get("external_id")
+        if data:
+            kwargs.update(data)
+
+        group_id = kwargs.get("id") or kwargs.get("internal_id") or kwargs.get("value")
+        name = kwargs.get("display_name") or kwargs.get("name") or kwargs.get("display")
+        external_id = kwargs.get("external_id")
 
         user = cls(
             service=service,
@@ -312,36 +322,51 @@ class IAMUser(DatabricksResource):
 
         return user
 
-    def set_details(self, details: UserV1 | UserV2 | ComplexValue):
+    def set_details(self, details: UserV1 | UserV2 | ComplexValue) -> "IAMUser":
         if isinstance(details, UserV1):
-            object.__setattr__(self, "id", details.id)
-            object.__setattr__(self, "name", details.display_name)
-            object.__setattr__(self, "external_id", details.external_id)
-
-            email = details.emails[0].value if details.emails else None
-            if not self.email:
-                object.__setattr__(self, "email", email)
-            elif email and email != self.email:
-                object.__setattr__(self, "email", email)
+            self.id = details.id
+            self.name = details.display_name
+            self.external_id = details.external_id
+            self.emails = [_.value for _ in details.emails] if details.emails else None
+            self.active = True if details.active is None else details.active
 
         elif isinstance(details, UserV2):
-            object.__setattr__(self, "id", details.internal_id)
-            object.__setattr__(self, "name", details.name)
-            object.__setattr__(self, "external_id", details.external_id)
-            object.__setattr__(self, "email", details.username)
+            self.id = details.internal_id
+            self.external_id = details.external_id
+            self.name = None
+            self.username = details.username
+            self.active = True
+
+            if "@" in details.username:
+                self.emails = [details.username]
+            else:
+                self.emails = None
 
         elif isinstance(details, ComplexValue):
-            object.__setattr__(self, "id", details.value)
-            object.__setattr__(self, "name", details.display)
-            object.__setattr__(self, "external_id", None)
+            self.id = details.value
+            self.name = details.display
+            self.username = details.display
+            self.active = True
 
-            if self.id and details.value != self.id:
-                object.__setattr__(self, "email", None)
+            if "@" in details.display:
+                self.emails = [details.display]
+            else:
+                self.emails = None
+
+        elif isinstance(details, IAMUser):
+            self.id = details.id
+            self.name = details.name
+            self.username = details.username
+            self.emails = details.emails
+            self.external_id = details.external_id
+            self.active = details.active
 
         else:
             raise ValueError(f"Unsupported user details type: {type(details)}")
 
-    def sync(self):
+        return self
+
+    def sync(self) -> "IAMUser":
         if not self.id:
             if self.username:
                 found = next(self.service.list(user_name=self.username), None)
@@ -350,7 +375,8 @@ class IAMUser(DatabricksResource):
                     raise ResourceDoesNotExist(
                         f"User with username '{self.username}' not found for syncing"
                     )
-                return found
+
+                return self.set_details(details=found)
             else:
                 raise ValueError("User must have an ID to be synced")
 
@@ -361,12 +387,7 @@ class IAMUser(DatabricksResource):
         else:
             raise ValueError(f"Unsupported client type: {self.client_type}")
 
-        self.set_details(details)
-        return self
-
-    @property
-    def username(self):
-        return self.email
+        return self.set_details(details)
 
     @property
     def complex_value(self) -> ComplexValue:

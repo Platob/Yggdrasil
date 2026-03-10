@@ -461,12 +461,11 @@ MimeType.DELTA = MimeType.define(
 
 # --- Text / semi-structured ---
 MimeType.JSON = MimeType.define(MimeType("JSON", "application/json", extensions=("json",)))
-MimeType.JSON_GZIP = MimeType.define(MimeType("JSON_GZIP", "application/json+gzip"))
 MimeType.NDJSON = MimeType.define(
     MimeType(
         "NDJSON",
-        "application/x-ndjson",
-        extensions=("ndjson", "jsonl", "ldjson"),
+        "application/ld+json",
+        extensions=("jsonld", "ldjson"),
         is_tabular=True,
     )
 )

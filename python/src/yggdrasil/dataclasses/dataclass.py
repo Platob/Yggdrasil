@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, Field, fields, is_dataclass
 from inspect import isclass
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -51,7 +51,7 @@ def dataclass_to_arrow_field(cls_or_instance: Any) -> "pa.Field":
 def get_from_dict(
     obj: Mapping[str, Any],
     keys: Sequence[str],
-    prefix: str,
+    prefix: Optional[str],
 ) -> Any:
     """Best-effort field lookup with optional prefix support.
 
@@ -68,9 +68,10 @@ def get_from_dict(
         if found is not MISSING:
             return found
 
-        found = obj.get(prefix + key, MISSING)
-        if found is not MISSING:
-            return found
+        if prefix:
+            found = obj.get(prefix + key, MISSING)
+            if found is not MISSING:
+                return found
 
     return MISSING
 

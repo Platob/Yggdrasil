@@ -61,8 +61,9 @@ class BytesIO(io.RawIOBase):
         self,
         data: IO[bytes] | bytes | bytearray | memoryview | str | Path | None = None,
         *,
+        media_type: Optional["MediaType"] = None,
         config: BufferConfig | None = None,
-        copy: bool = True,
+        copy: bool = False,
     ) -> None:
         super().__init__()
         self._cfg: BufferConfig = config or DEFAULT_CONFIG
@@ -74,6 +75,8 @@ class BytesIO(io.RawIOBase):
         self._path: Path | None = None
         self._mmap: mmap.mmap | None = None
         self._owns_path: bool = False
+
+        self._media_type = media_type
 
         self._closed: bool = False
         self._init_from(data, copy=copy)
@@ -234,9 +237,11 @@ class BytesIO(io.RawIOBase):
     # ------------------------------------------------------------------
 
     def _create_spill_path(self) -> Path:
-        tmp_dir = self._cfg.tmp_dir
-        name = f"{self._cfg.prefix}{uuid.uuid4().hex}{self._cfg.suffix}"
-        return (tmp_dir / name) if tmp_dir is not None else (Path(tempfile.gettempdir()) / name)
+        if self._path is None:
+            tmp_dir = self._cfg.tmp_dir
+            name = f"{self._cfg.prefix}{uuid.uuid4().hex}{self._cfg.suffix}"
+            self._path = (tmp_dir / name) if tmp_dir is not None else (Path(tempfile.gettempdir()) / name)
+        return self._path
 
     def _invalidate_mmap(self) -> None:
         if self._mmap is not None:
@@ -447,7 +452,14 @@ class BytesIO(io.RawIOBase):
 
     @property
     def media_type(self) -> MediaType:
-        return MediaType.parse_io(self, MediaType(MimeType.OCTET_STREAM))
+        if self._media_type is None:
+            self._media_type = MediaType.parse_io(self, MediaType(MimeType.OCTET_STREAM))
+        return self._media_type
+
+    @media_type.setter
+    def media_type(self, value: "MediaType"):
+        from ..enums import MediaType
+        self._media_type = MediaType.parse(value)
 
     def media_io(
         self,
@@ -528,6 +540,7 @@ class BytesIO(io.RawIOBase):
     def write(self, b: Any, *, batch_size: int = 1024 * 1024) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
+
         if b is None:
             return 0
 

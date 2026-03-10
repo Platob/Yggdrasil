@@ -69,12 +69,7 @@ class CommandExecution:
                 }
 
         if self.language is None:
-            if self.pyfunc is not None:
-                self.language = Language.PYTHON
-            elif self.command is not None:
-                self.language = self.context.language
-            else:
-                raise ValueError("Either pyfunc or command must be provided in %s" % self)
+            self.language = Language.PYTHON if self.pyfunc is not None else self.context.language
 
     def __getstate__(self):
         return serialize_dataclass_state(self)
@@ -112,12 +107,14 @@ class CommandExecution:
     ):
         self._check_py_versions()
         install_modules = kwargs.pop("__install_modules", None) or []
+        force_local = kwargs.pop("__force_local", False)
+
         environ = {
             k: v for k, v in (self.environ.items() if self.environ else {})
         }
 
         if self.pyfunc is not None:
-            if self.context.is_in_databricks_environment():
+            if force_local or self.context.is_in_databricks_environment():
                 for k, v in environ.items():
                     if v:
                         os.environ[str(k)] = str(v)
@@ -137,7 +134,7 @@ class CommandExecution:
             # Create command
             language_to_execute = Language.PYTHON
             command_to_execute = self.context.make_python_function_command(
-                job=Job.make(self.pyfunc, *args, **kwargs),
+                job=Job.make(self.pyfunc, *args, **kwargs) if args or kwargs else self.pyfunc,
                 environ=environ
             )
         else:

@@ -1448,7 +1448,7 @@ class AbstractDataPath(ABC):
             polars_result = self.read_polars().sql(
                 query=rewritten, table_name=table_name
             )
-            # read_polars().sql() returns a polars.DataFrame; convert to Arrow.
+            # read_polars().sql returns a polars.DataFrame; convert to Arrow.
             from polars import CompatLevel
             return polars_result.to_arrow(compat_level=CompatLevel.newest())
 

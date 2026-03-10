@@ -26,7 +26,9 @@ _CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).paramete
 _EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
 
 __all__ = [
-    "SQLWarehouse"
+    "SQLWarehouse",
+    "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
+    "DEFAULT_ALL_PURPOSE_CLASSIC_NAME"
 ]
 
 

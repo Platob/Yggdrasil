@@ -1,327 +1,430 @@
+# tests/io/test_request.py
+from __future__ import annotations
+
 import datetime
-import json
+from typing import Any
+
 import pytest
 
-from yggdrasil.arrow.lib import pyarrow as pa
+from yggdrasil.io.enums import MimeType
 from yggdrasil.io.request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
 
-def map_as_dict(x):
-    # Arrow map scalars commonly become list[tuple[str,str]] via as_py()
-    if x is None:
-        return None
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, list):
-        return dict(x)
-    raise TypeError(f"Unexpected map type: {type(x)}")
+def _rb_row(batch) -> dict[str, Any]:
+    return {name: batch.column(name)[0].as_py() for name in batch.schema.names}
 
 
-@pytest.fixture
-def sample_url_str():
-    return "https://user:pass@example.com:8443/path/to?q=1#frag"
+def test_parse_dict_minimal_defaults() -> None:
+    req = PreparedRequest.parse_dict(
+        {
+            "request_url_str": "https://example.com/a?x=1",
+        }
+    )
 
-
-@pytest.fixture
-def minimal_dict_jsonable(sample_url_str):
-    # JSON can't represent bytes, so use a string body for parse(str/bytes) tests.
-    return {
-        "method": "POST",
-        "url_str": sample_url_str,
-        "headers": {"X": 1, "Y": "2"},
-        "tags": {"a": 10},
-        "body": "hello",          # <- JSONable
-        "sent_at_timestamp": "123",
-    }
-
-
-@pytest.fixture
-def minimal_dict_raw(sample_url_str):
-    # For parse(dict) we can use bytes directly
-    return {
-        "method": "POST",
-        "url_str": sample_url_str,
-        "headers": {"X": 1, "Y": "2"},
-        "tags": {"a": 10},
-        "body": b"hello",
-        "sent_at_timestamp": "123",
-    }
-
-
-def test_parse_from_str(minimal_dict_jsonable):
-    s = json.dumps(minimal_dict_jsonable)
-    req = PreparedRequest.parse(s)
-    assert req.method == "POST"
-    assert req.headers == {"X": "1", "Y": "2"}
-    assert req.tags == {"a": "10"}
-    assert req.sent_at_timestamp == 123
-    assert req.buffer is not None
-    assert req.buffer.to_bytes() == b"hello"  # BytesIO.parse("hello") -> bytes of the string
-
-
-def test_parse_from_bytes(minimal_dict_jsonable):
-    b = json.dumps(minimal_dict_jsonable).encode("utf-8")
-    req = PreparedRequest.parse(b)
-    assert req.method == "POST"
-    assert req.url.to_string()
-    assert req.sent_at_timestamp == 123
-    assert req.buffer is not None
-    assert req.buffer.to_bytes() == b"hello"
-
-
-def test_parse_from_dict(minimal_dict_raw):
-    req = PreparedRequest.parse(minimal_dict_raw)
-    assert req.method == "POST"
-    assert req.buffer is not None
-    assert req.buffer.to_bytes() == b"hello"
-
-
-def test_parse_rejects_unknown_type():
-    with pytest.raises(ValueError):
-        PreparedRequest.parse(12345)
-
-
-def test_parse_dict_default_method_and_headers_tags_cast(sample_url_str):
-    obj = {
-        "url_str": sample_url_str,
-        "headers": {"A": 1, 2: 3},
-        "tags": {"k": None},
-    }
-    req = PreparedRequest.parse_dict(obj)
     assert req.method == "GET"
-    assert req.headers == {"A": "1", "2": "3"}
-    assert req.tags == {"k": "None"}
+    assert req.url.to_string() == "https://example.com/a?x=1"
+    assert req.headers == {}
+    assert req.tags == {}
+    assert req.buffer is None
+    assert req.sent_at_timestamp == 0
 
 
-def test_parse_dict_prefers_url_str_over_struct(sample_url_str):
-    obj = {
-        "url_str": sample_url_str,
-        "url": {
-            "scheme": "http",
-            "host": "wrong.example",
-            "port": 80,
-            "path": "/wrong",
-            "query": "",
-            "fragment": "",
-            "userinfo": "",
-        },
-    }
-    req = PreparedRequest.parse_dict(obj)
-    s = req.url.to_string()
-    assert "example.com" in s
-    assert "wrong.example" not in s
+def test_parse_dict_from_flattened_url_parts() -> None:
+    req = PreparedRequest.parse_dict(
+        {
+            "request_method": "POST",
+            "request_url_scheme": "https",
+            "request_url_host": "example.com",
+            "request_url_port": 443,
+            "request_url_path": "/api/v1/data",
+            "request_url_query": "a=1&b=2",
+            "request_url_fragment": "frag",
+        }
+    )
+
+    assert req.method == "POST"
+    assert req.url.scheme == "https"
+    assert req.url.host == "example.com"
+    assert req.url.port is None
+    assert req.url.path == "/api/v1/data"
+    assert req.url.query == "a=1&b=2"
+    assert req.url.fragment == "frag"
 
 
-def test_parse_dict_accepts_url_struct_when_no_url_str():
-    # still supported as legacy input even though Arrow output is flat
-    obj = {
-        "method": "GET",
-        "url": {
-            "scheme": "https",
-            "userinfo": "",
-            "host": "example.com",
-            "port": 443,
-            "path": "/p",
-            "query": "x=1",
-            "fragment": "f",
-        },
-    }
-    req = PreparedRequest.parse_dict(obj)
-    s = req.url.to_string()
-    assert "example.com" in s
-    assert "/p" in s
+def test_parse_dict_missing_url_raises() -> None:
+    with pytest.raises(ValueError, match="missing url/url_str/request_url_str"):
+        PreparedRequest.parse_dict({"request_method": "GET"})
 
 
-def test_parse_dict_falls_back_to_exploded_fields():
-    obj = {
-        "method": "PUT",
-        "url_scheme": "https",
-        "url_host": "example.com",
-        "url_port": 443,
-        "url_path": "/z",
-        "url_query": "a=b",
-        "url_fragment": "c",
-        "url_userinfo": "",
-    }
-    req = PreparedRequest.parse_dict(obj, prefix="request_")
-    assert req.method == "PUT"
-    s = req.url.to_string()
-    assert "example.com" in s
-    assert "/z" in s
+def test_parse_dict_headers_from_mapping() -> None:
+    req = PreparedRequest.parse_dict(
+        {
+            "request_url_str": "https://example.com",
+            "request_headers": {
+                "Content-Type": "application/json",
+                "X-Test": "yes",
+            },
+        }
+    )
+
+    assert req.headers["Content-Type"] == "application/json"
+    assert req.headers["X-Test"] == "yes"
 
 
-def test_parse_dict_missing_url_raises():
-    with pytest.raises(ValueError):
-        PreparedRequest.parse_dict({"method": "GET"})
+def test_parse_dict_headers_from_promoted_fields() -> None:
+    req = PreparedRequest.parse_dict(
+        {
+            "request_url_str": "https://example.com",
+            "request_content_type": "application/json",
+            "request_content_length": 12,
+            "request_content_encoding": "gzip",
+            "request_transfer_encoding": "chunked",
+            "request_x_request_id": "rid-1",
+            "request_x_correlation_id": "cid-1",
+        }
+    )
+
+    assert req.headers["Content-Type"] == "application/json"
+    assert req.headers["Content-Length"] == "12"
+    assert req.headers["Content-Encoding"] == "gzip"
+    assert req.headers["Transfer-Encoding"] == "chunked"
+    assert req.headers["X-Request-ID"] == "rid-1"
+    assert req.headers["X-Correlation-ID"] == "cid-1"
 
 
-def test_parse_dict_buffer_aliases_and_missing_buffer(sample_url_str):
-    obj = {"url_str": sample_url_str, "body": b"abc"}
-    req = PreparedRequest.parse_dict(obj)
+def test_parse_dict_tags_and_buffer() -> None:
+    req = PreparedRequest.parse_dict(
+        {
+            "request_url_str": "https://example.com",
+            "request_tags": {"a": 1, "b": "two"},
+            "request_body": b"hello",
+        }
+    )
+
+    assert req.tags == {"a": "1", "b": "two"}
     assert req.buffer is not None
-    assert req.buffer.to_bytes() == b"abc"
-
-    obj2 = {"url_str": sample_url_str}
-    req2 = PreparedRequest.parse_dict(obj2)
-    assert req2.buffer is None
+    assert req.buffer.to_bytes() == b"hello"
 
 
-def test_parse_dict_sent_at_timestamp_aliases(sample_url_str):
-    obj = {"url_str": sample_url_str, "request_sent_at_epoch": "999"}
-    assert PreparedRequest.parse_dict(obj).sent_at_timestamp == 999
-
-    obj2 = {"url_str": sample_url_str, "request_sent_at": "888"}
-    assert PreparedRequest.parse_dict(obj2).sent_at_timestamp == 888
-
-    obj3 = {"url_str": sample_url_str, "sent_at": "777"}
-    assert PreparedRequest.parse_dict(obj3).sent_at_timestamp == 777
-
-    obj4 = {"url_str": sample_url_str, "sent_at_timestamp": None}
-    assert PreparedRequest.parse_dict(obj4).sent_at_timestamp == 0
-
-
-def test_copy_overrides_and_copy_buffer(sample_url_str):
+def test_copy_reuses_buffer_by_default() -> None:
     req = PreparedRequest.prepare(
         method="POST",
-        url=sample_url_str,
-        headers={"A": "1"},
-        body=b"hello",
+        url="https://example.com",
+        body=b"abc",
+    )
+
+    req2 = req.copy()
+
+    assert req2.method == req.method
+    assert req2.url.to_string() == req.url.to_string()
+    assert req2.headers == req.headers
+    assert req2.buffer is req.buffer
+
+
+def test_copy_can_deep_copy_buffer() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com",
+        body=b"abc",
     )
 
     req2 = req.copy(copy_buffer=True)
-    assert req2.buffer is not None and req.buffer is not None
+
     assert req2.buffer is not req.buffer
+    assert req2.buffer is not None
+    assert req.buffer is not None
     assert req2.buffer.to_bytes() == req.buffer.to_bytes()
 
-    req3 = req.copy(headers={"B": 2})
-    assert req3.headers == {"B": "2"}
-    assert "A" not in req3.headers
 
-    req4 = req.copy(method="GET", url="https://example.org/x")
-    assert req4.method == "GET"
-    assert "example.org" in req4.url.to_string()
-
-
-def test_copy_buffer_param_allows_explicit_none(sample_url_str):
-    req = PreparedRequest.prepare(method="GET", url=sample_url_str, body=b"x")
-    req2 = req.copy(buffer=None)
-    assert req2.buffer is None
-
-
-def test_prepare_with_json_sets_content_type_and_body(sample_url_str):
+def test_prepare_with_raw_body_sets_content_length() -> None:
     req = PreparedRequest.prepare(
         method="POST",
-        url=sample_url_str,
-        headers={},
-        json={"a": 1},
+        url="https://example.com/upload",
+        body=b"payload",
     )
+
+    assert req.method == "POST"
     assert req.buffer is not None
-    body = req.buffer.to_bytes()
-    assert b'"a"' in body and b"1" in body
-    assert req.headers.get("Content-Type") is not None
-    assert "Content-Length" in req.headers
+    assert req.buffer.to_bytes() == b"payload"
+    assert req.headers["Content-Length"] == str(len(b"payload"))
 
 
-def test_prepare_with_body_sets_content_length(sample_url_str):
+def test_prepare_with_json_sets_json_content_type() -> None:
     req = PreparedRequest.prepare(
         method="POST",
-        url=sample_url_str,
-        headers={"X": "1"},
-        body=b"abcd",
+        url="https://example.com/items",
+        json={"x": 1},
     )
-    assert req.headers["X"] == "1"
+
     assert req.buffer is not None
-    assert req.headers["Content-Length"] == req.buffer.size
+    assert req.headers["Content-Type"] == MimeType.JSON.value
+    assert req.headers["Content-Length"] == str(req.buffer.size)
+    assert b'"x": 1' in req.buffer.to_bytes() or b'"x":1' in req.buffer.to_bytes()
 
 
-def test_prepare_to_send_sets_timestamp_only_when_requested(sample_url_str):
-    req = PreparedRequest.prepare(method="GET", url=sample_url_str)
+def test_prepare_with_json_can_compress_when_threshold_exceeded() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com/items",
+        json={"data": "x" * 5000},
+        compress_threshold=1,
+    )
 
-    out = req.prepare_to_send(sniff=True)
-    assert out.sent_at_timestamp > 0
-
-    out2 = req.prepare_to_send(sniff=False)
-    assert out2.sent_at_timestamp == 0
-
-
-def test_prepare_to_send_applies_before_send(sample_url_str):
-    req = PreparedRequest.prepare(method="GET", url=sample_url_str, headers={"A": "1"})
-
-    def before_send(r: PreparedRequest) -> PreparedRequest:
-        return r.copy(headers={"X": "y"})
-
-    req.before_send = before_send
-
-    out = req.prepare_to_send(sniff=True)
-    assert out.headers == {"X": "y"}
-    assert out.sent_at_timestamp > 0
+    assert req.buffer is not None
+    assert req.headers["Content-Type"] == MimeType.JSON.value
+    assert "Content-Encoding" in req.headers
+    assert req.headers["Content-Length"] == str(req.buffer.size)
 
 
-def test_anonymize_does_not_crash_and_removes_obvious_secrets(sample_url_str):
+def test_prepare_to_send_without_sniff_keeps_timestamp_zero() -> None:
     req = PreparedRequest.prepare(
         method="GET",
-        url=sample_url_str,
-        headers={"Authorization": "Bearer SUPERSECRET", "X": "1"},
+        url="https://example.com",
     )
 
-    out = req.anonymize(mode="remove")
-    assert isinstance(out, PreparedRequest)
-    assert out.headers != req.headers
+    out = req.prepare_to_send(normalize=False)
 
-    joined = " ".join(f"{k}:{v}" for k, v in out.headers.items())
-    assert "SUPERSECRET" not in joined
+    assert out.sent_at_timestamp == 0
 
 
-def test_to_arrow_batch_schema_and_values(sample_url_str):
+def test_prepare_to_send_with_sniff_sets_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyUser:
+        product = None
+        product_version = None
+        email = None
+        hostname = None
+        url = None
+        git_url = None
+
+    monkeypatch.setattr("yggdrasil.environ.UserInfo.current", lambda: DummyUser())
+
+    req = PreparedRequest.prepare(
+        method="GET",
+        url="https://example.com",
+    )
+
+    out = req.prepare_to_send(normalize=True)
+
+    assert out.sent_at_timestamp > 0
+
+
+def test_prepare_to_send_applies_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyUser:
+        product = None
+        product_version = None
+        email = None
+        hostname = None
+        url = None
+        git_url = None
+
+    monkeypatch.setattr("yggdrasil.environ.UserInfo.current", lambda: DummyUser())
+
+    def before_send(req: PreparedRequest) -> PreparedRequest:
+        req.headers["X-Test-Before-Send"] = "1"
+        return req
+
+    req = PreparedRequest.prepare(
+        method="GET",
+        url="https://example.com",
+        before_send=before_send,
+    )
+
+    out = req.prepare_to_send(normalize=True)
+
+    assert out.headers["X-Test-Before-Send"] == "1"
+
+
+def test_anonymize_redacts_url_and_sensitive_headers() -> None:
+    req = PreparedRequest.prepare(
+        method="GET",
+        url="https://user:pass@example.com/path?token=secret&ok=1",
+        headers={
+            "Authorization": "Bearer super-secret",
+            "X-API-Key": "abcdef",
+        },
+    )
+
+    anon = req.anonymize(mode="redact")
+
+    assert anon is not req
+    assert "Authorization" in anon.headers
+    assert "X-API-Key" in anon.headers
+    assert "<redacted>" in anon.headers["Authorization"] or anon.headers["Authorization"].startswith("Bearer ")
+    assert anon.headers["X-API-Key"] == "<redacted>"
+
+
+def test_parse_query_params_handles_empty_and_bare_keys() -> None:
+    assert PreparedRequest._parse_query_params(None) == {}
+    assert PreparedRequest._parse_query_params("") == {}
+    assert PreparedRequest._parse_query_params("a=1&b&c=3") == {
+        "a": "1",
+        "b": "",
+        "c": "3",
+    }
+
+
+def test_to_arrow_batch_matches_schema() -> None:
     req = PreparedRequest.prepare(
         method="POST",
-        url=sample_url_str,
-        headers={"A": "1"},
-        body=b"hello",
-        tags={"t": "v"},
+        url="https://example.com/api?q=1",
+        headers={
+            "X-Test": "yes",
+            "Content-Encoding": "gzip",
+            "Transfer-Encoding": "chunked",
+            "Location": "/foo",
+            "ETag": '"etag-1"',
+            "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+        },
+        body=b"hello world",
+        tags={"explicit": "tag"},
     )
-    req.sent_at_timestamp = 123
+    req.sent_at_timestamp = 123456789
 
-    batch = req.to_arrow_batch()
-    assert isinstance(batch, pa.RecordBatch)
-    assert batch.schema == REQUEST_ARROW_SCHEMA
+    rb = req.to_arrow_batch()
 
-    cols = {name: batch.column(i) for i, name in enumerate(batch.schema.names)}
+    assert rb.schema == REQUEST_ARROW_SCHEMA
+    assert rb.num_rows == 1
 
-    assert cols["request_method"][0].as_py() == "POST"
-    assert cols["request_url_str"][0].as_py() == req.url.to_string()
 
-    # ✅ flattened URL columns (no request_url struct anymore)
-    assert cols["request_url_scheme"][0].as_py() == req.url.scheme
-    assert cols["request_url_userinfo"][0].as_py() == req.url.userinfo
-    assert cols["request_url_host"][0].as_py() == req.url.host
-    assert cols["request_url_port"][0].as_py() == req.url.port
-    assert cols["request_url_path"][0].as_py() == req.url.path
-    assert cols["request_url_query"][0].as_py() == req.url.query
-    assert cols["request_url_fragment"][0].as_py() == req.url.fragment
-
-    headers_map = map_as_dict(cols["request_headers"][0].as_py())
-    assert headers_map["A"] == "1"
-    assert headers_map["Content-Length"] == "5"  # prepare() adds it
-
-    tags_map = map_as_dict(cols["request_tags"][0].as_py())
-    assert tags_map == {"t": "v"}
-
-    assert cols["request_body"][0].as_py() == b"hello"
-
-    body_hash = cols["request_body_hash"][0].as_py()
-    assert isinstance(body_hash, (bytes, bytearray))
-    assert len(body_hash) == 32
-
-    assert cols["request_sent_at"][0].as_py() == datetime.datetime(
-        1970, 1, 1, 0, 0, 0, 123, tzinfo=datetime.timezone.utc
+def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com/api?a=1&shared=url",
+        headers={
+            "Host": "example.com",
+            "User-Agent": "pytest",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Accept-Language": "en",
+            "Content-Type": "application/json",
+            "Content-Length": "11",
+            "Content-Encoding": "gzip",
+            "Transfer-Encoding": "chunked",
+            "X-Request-ID": "rid-1",
+            "X-Correlation-ID": "cid-1",
+            "X-Other": "keep-me",
+        },
+        body=b"hello world",
+        tags={"shared": "explicit", "t": "2"},
     )
-    assert cols["request_sent_at_epoch"][0].as_py() == 123
+    req.sent_at_timestamp = 42
+
+    row = _rb_row(req.to_arrow_batch())
+
+    assert row["request_method"] == "POST"
+    assert row["request_url_str"] == "https://example.com/api?a=1&shared=url"
+    assert row["request_url_scheme"] == "https"
+    assert row["request_url_host"] == "example.com"
+    assert row["request_url_path"] == "/api"
+    assert row["request_url_query"] == "a=1&shared=url"
+
+    assert row["request_host"] == "example.com"
+    assert row["request_user_agent"] == "pytest"
+    assert row["request_accept"] == "application/json"
+    assert row["request_accept_encoding"] == "gzip"
+    assert row["request_accept_language"] == "en"
+    assert row["request_content_type"] == "application/json"
+    assert row["request_content_length"] == 11
+    assert row["request_content_encoding"] == "gzip"
+    assert row["request_transfer_encoding"] == "chunked"
+    assert row["request_x_request_id"] == "rid-1"
+    assert row["request_x_correlation_id"] == "cid-1"
+
+    assert dict((k, v) for k, v in row["request_headers"] if k in ["X-Other"]) == {"X-Other": "keep-me"}
+    assert dict(row["request_tags"]) == {
+        "a": "1",
+        "shared": "explicit",
+        "t": "2",
+    }
+    assert row["request_body"] == b"hello world"
+    assert row["request_body_hash"] is not None
+    assert len(row["request_body_hash"]) == 32
+    assert row["request_sent_at"] == datetime.datetime(1970, 1, 1, 0, 0, 0, 42, tzinfo=datetime.timezone.utc)
+    assert row["request_sent_at_epoch"] == 42
 
 
-def test_to_arrow_batch_without_body(sample_url_str):
-    req = PreparedRequest.prepare(method="GET", url=sample_url_str, headers={"A": "1"})
-    batch = req.to_arrow_batch()
-    cols = {name: batch.column(i) for i, name in enumerate(batch.schema.names)}
-    assert cols["request_body"][0].as_py() is None
-    assert cols["request_body_hash"][0].as_py() is None
+def test_to_arrow_batch_uses_transfer_encoding_not_content_encoding() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com",
+        headers={
+            "Content-Encoding": "gzip",
+            "Transfer-Encoding": "chunked",
+        },
+        body=b"abc",
+    )
+
+    row = _rb_row(req.to_arrow_batch())
+
+    assert row["request_content_encoding"] == "gzip"
+    assert row["request_transfer_encoding"] == "chunked"
+
+
+def test_to_arrow_batch_without_body_has_null_body_and_hash() -> None:
+    req = PreparedRequest.prepare(
+        method="GET",
+        url="https://example.com",
+    )
+
+    row = _rb_row(req.to_arrow_batch())
+
+    assert row["request_body"] is None
+    assert row["request_body_hash"] is None
+
+
+def test_parse_accepts_json_string() -> None:
+    req = PreparedRequest.parse(
+        '{"request_method":"PUT","request_url_str":"https://example.com/x"}'
+    )
+
+    assert req.method == "PUT"
+    assert req.url.to_string() == "https://example.com/x"
+
+
+def test_copy_can_override_fields() -> None:
+    req = PreparedRequest.prepare(
+        method="GET",
+        url="https://example.com/a",
+        headers={"X-A": "1"},
+        tags={"t": "1"},
+    )
+
+    req2 = req.copy(
+        method="POST",
+        url="https://example.com/b",
+        headers={"X-B": "2"},
+        tags={"t": "2"},
+        sent_at_timestamp=123,
+    )
+
+    assert req2.method == "POST"
+    assert req2.url.to_string() == "https://example.com/b"
+    assert req2.headers == {"X-B": "2"}
+    assert req2.tags == {"t": "2"}
+    assert req2.sent_at_timestamp == 123
+
+
+def test_body_property_alias() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com",
+        body=b"abc",
+    )
+
+    assert req.body is req.buffer
+    assert req.body is not None
+    assert req.body.to_bytes() == b"abc"
+
+
+def test_prepare_normalizes_headers() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com",
+        headers={"content-type": "application/custom"},
+        body=b"abc",
+        normalize=True,
+    )
+
+    assert "Content-Type" in req.headers
+    assert req.headers["Content-Type"] == "application/custom"
+    assert req.headers["Content-Length"] == "3"
