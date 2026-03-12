@@ -63,6 +63,14 @@ def get_connection_settings(
                         alias=alias,
                         host=resolved,
                     )
+                elif isinstance(resolved, dict):
+                    db = resolved.pop("db", db)
+                    alias = resolved.pop("alias", alias)
+                    register_connection(
+                        db=db,
+                        alias=alias,
+                        **resolved,
+                    )
 
             return get_connection_settings(alias=alias, db=db, jsonable=jsonable, resolver=None)
 

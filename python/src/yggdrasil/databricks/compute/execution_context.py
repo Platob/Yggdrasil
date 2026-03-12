@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Tuple, L
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
+from yggdrasil.concurrent.threading import Job
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv, UserInfo
 from yggdrasil.io.url import URL
 
 from .command_execution import CommandExecution
-from ...concurrent.threading import Job
-from ...dataclasses.expiring import ExpiringDict
 
 if TYPE_CHECKING:
     from .cluster import Cluster

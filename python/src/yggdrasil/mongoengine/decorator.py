@@ -5,6 +5,7 @@ import os
 from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar, Union, TYPE_CHECKING
 
 from yggdrasil.io.url import URL
+
 from .lib import (
     mongoengine,
     get_connection_settings,
@@ -74,11 +75,11 @@ def with_mongo_connection(
     func: Optional[F] = None,
     *,
     aliases: AliasLike = None,
-    databricks: Optional["DatabricksClient"] = None,
-    cluster: Optional["Cluster"] = None,
+    databricks: Union["DatabricksClient", str, None] = "DATABRICKS_HOST",
+    cluster: Union["Cluster", str, None] = None,
     force_local: bool = False,
     environ: EnvironLike = None,
-    resolver: Optional[Callable[[], None] | str] = None,
+    resolver: Optional[Callable[[], Any] | str | dict] = None,
 ) -> Callable[[F], F]:
     force_local = force_local or bool(os.getenv("DATABRICKS_RUNTIME_VERSION"))
     aliases = _normalize_aliases(aliases)
@@ -93,6 +94,9 @@ def with_mongo_connection(
             "Please specify at least one valid alias or ensure that default connection settings are configured."
             "Using mongoengine.register_connection or mongoengine.connect with appropriate aliases can help set up the connections."
         )
+
+    if isinstance(databricks, str):
+        databricks = os.getenv(databricks, databricks)
 
     if databricks is None and cluster is not None:
         if isinstance(cluster, str):
@@ -124,6 +128,7 @@ def with_mongo_connection(
 
     if not force_local and databricks is not None:
         from yggdrasil.databricks import DatabricksClient
+        from yggdrasil.databricks.compute import Cluster
 
         databricks = DatabricksClient.parse(databricks)
 
@@ -137,13 +142,18 @@ def with_mongo_connection(
 
             key = mongo_url.host
 
-            cl = databricks.compute.clusters.all_purpose_cluster(
-                key=key,
-                single_user_name=key,
-                libraries=["mongoengine", "sqlalchemy"],
-                permissions=[key],
-                custom_tags={"MongoHost": mongo_url.host},
-            )
+            if cluster is None:
+                cl = databricks.compute.clusters.all_purpose_cluster(
+                    key=key,
+                    single_user_name=key,
+                    libraries=["mongoengine", "sqlalchemy"],
+                    permissions=[key],
+                    custom_tags={"MongoHost": mongo_url.host},
+                )
+            elif not isinstance(cluster, Cluster):
+                cl = databricks.compute.clusters.find_cluster(cluster_name=str(cluster))
+            else:
+                cl = cluster
 
             final_decorator = cl.command(func=decorator, environ=environ)
         except Exception as e:
