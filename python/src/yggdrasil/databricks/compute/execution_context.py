@@ -12,14 +12,12 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Tuple, L
     Mapping, Generator, Iterator
 
 from databricks.sdk.errors import DatabricksError
-from databricks.sdk.service.compute import Language, ResultType, CommandStatusResponse
-
+from databricks.sdk.service.compute import Language
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv, UserInfo
 from yggdrasil.io.url import URL
-from yggdrasil.pyutils.exceptions import raise_parsed_traceback
+
 from .command_execution import CommandExecution
-from .exceptions import ClientTerminatedSession
 from ...concurrent.threading import Job
 from ...dataclasses.expiring import ExpiringDict
 
@@ -463,14 +461,15 @@ if p.returncode != 0:
         cmd = f"""\
 {self.syspath_lines()}
 
+_env = {environ!r}
+for k, v in _env.items():
+    os.environ[k] = v
+    
 import base64, os, traceback, json
 import yggdrasil.pickle.dill as dill
 
 _ctx = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
 _job = _ctx.decode_payload({job_b64!r})
-_env = {environ!r}
-for k, v in _env.items():
-    os.environ[k] = v
 _out = _ctx.encode_object(_job())
 if not isinstance(_out, str):
     _out = _out.decode()

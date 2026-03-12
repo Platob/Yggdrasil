@@ -607,6 +607,14 @@ class PyEnv:
         py = cls.resolve_python_executable(python)
         CURRENT_PYENV = cls.instance(py, prefer_uv=prefer_uv)
 
+        vinfo = sys.version_info
+        version_info = VersionInfo(
+            major=vinfo.major,
+            minor=vinfo.minor,
+            patch=vinfo.micro
+        )
+        object.__setattr__(CURRENT_PYENV, "_version_info", version_info)
+
         return CURRENT_PYENV
 
     def get_or_create(
@@ -882,25 +890,28 @@ class PyEnv:
         if self._version_info:
             return self._version_info
 
-        code = (
-            "import sys, json; "
-            "print(json.dumps([sys.version_info.major, sys.version_info.minor, sys.version_info.micro]))"
-        )
-        cmd = (
-            self._uv_run_prefix() + ["python", "-c", code]
-            if self.prefer_uv
-            else [str(self.python_path), "-c", code]
-        )
-        res = subprocess.run(
-            cmd,
-            cwd=str(self.cwd),
-            env=dict(os.environ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        major, minor, micro = json.loads(res.stdout.strip())
-        self._version_info = VersionInfo(int(major), int(minor), int(micro))
+        try:
+            code = (
+                "import sys, json; "
+                "print(json.dumps([sys.version_info.major, sys.version_info.minor, sys.version_info.micro]))"
+            )
+            cmd = (
+                self._uv_run_prefix() + ["python", "-c", code]
+                if self.prefer_uv
+                else [str(self.python_path), "-c", code]
+            )
+            res = subprocess.run(
+                cmd,
+                cwd=str(self.cwd),
+                env=dict(os.environ),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            major, minor, micro = json.loads(res.stdout.strip())
+            self._version_info = VersionInfo(int(major), int(minor), int(micro))
+        except Exception as e:
+            raise RuntimeError(f"Failed to get version info for Python at {self.python_path}: {e}") from e
 
         return self._version_info
 
@@ -941,6 +952,12 @@ class PyEnv:
         else:
             # Auto-install uv using the plain pip fallback to avoid recursion
             self._uv_bin = shutil.which("uv")
+
+        if not self._uv_bin:
+            raise FileNotFoundError(
+                "uv not found in PATH and not installed in the current environment. "
+                "Install uv with `pip install uv` or ensure it is available on PATH."
+            )
 
         self._uv_bin = Path(self._uv_bin)
 
@@ -1488,18 +1505,24 @@ class PyEnv:
                 if not install:
                     raise
 
-        pip_name = pip_name or safe_pip_name(module_name)
+        try:
+            pip_name = pip_name or safe_pip_name(module_name)
 
-        if warn:
-            print(
-                f"Auto-installing '{pip_name}' into environment {self.python_path} "
-                f"because module '{module_name}' was not found.",
-                file=sys.stderr,
-            )
-        self.install(pip_name, wait=wait, raise_error=True)
+            if warn:
+                print(
+                    f"Auto-installing '{pip_name}' into environment {self.python_path} "
+                    f"because module '{module_name}' was not found.",
+                    file=sys.stderr,
+                )
+            self.install(pip_name, wait=wait, raise_error=True)
 
-        importlib.invalidate_caches()
-        return importlib.import_module(module_name)
+            importlib.invalidate_caches()
+            return importlib.import_module(module_name)
+        except Exception as e:
+            raise ModuleNotFoundError(
+                f"Failed to import module '{module_name}' and auto-install package '{pip_name}'",
+                name=module_name,
+            ) from e
 
     @staticmethod
     def get_root_module_directory(module_name: str) -> Path:

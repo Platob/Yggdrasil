@@ -208,3 +208,9 @@ class MediaType:
             self.mime_type.extension,
             self.codec.extension
         )
+
+    def with_codec(self, codec: Codec) -> "MediaType":
+        return MediaType(mime_type=self.mime_type, codec=codec)
+
+    def without_codec(self) -> "MediaType":
+        return MediaType(mime_type=self.mime_type, codec=None)

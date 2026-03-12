@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, replace
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, MutableMapping, Callable
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, MutableMapping, Callable, Literal, Optional
 
 import pyarrow as pa
 
@@ -563,7 +563,8 @@ class Response:
         codec = self.codec
 
         if codec is not None:
-            return self.buffer.decompress(codec=codec, copy=True).to_bytes()
+            with self.buffer.decompress(codec=codec, copy=True) as b:
+                return b.to_bytes()
 
         return self.buffer.to_bytes()
 
@@ -571,14 +572,31 @@ class Response:
     def text(self) -> str:
         return self.content.decode(_get_charset(self.headers), errors="replace")
 
-    def json(self) -> Any:
+    def json(
+        self,
+        orient: Literal["records", "columns"] = "records",
+    ) -> Any:
         media_type = self.media_type
 
         if media_type.codec:
-            decompressed = self.buffer.decompress(codec=media_type.codec, copy=True)
-            return json_module.load(decompressed)
+            with self.buffer.decompress(codec=media_type.codec, copy=True) as b:
+                mio = b.media_io(media_type.without_codec())
+
+                if orient == "records":
+                    return mio.read_pylist()
+                elif orient == "columns":
+                    return mio.read_pydict()
+                else:
+                    raise ValueError(f"Unsupported orient: {orient!r}")
+
+        mio = self.buffer.media_io(media_type)
+
+        if orient == "records":
+            return mio.read_pylist()
+        elif orient == "columns":
+            return mio.read_pydict()
         else:
-            return json_module.load(self.buffer)
+            raise ValueError(f"Unsupported orient: {orient!r}")
 
     @property
     def ok(self) -> bool:

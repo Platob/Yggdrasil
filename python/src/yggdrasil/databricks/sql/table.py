@@ -305,7 +305,7 @@ class Table(DatabricksService):
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
-        if_not_exists: bool = False
+        if_not_exists: bool = True
     ) -> "Table":
         """Create this table in Unity Catalog via the Databricks Tables API.
 

@@ -8,7 +8,7 @@ from typing import Optional, TYPE_CHECKING, Literal
 import urllib3
 
 from yggdrasil.concurrent.threading import JobPoolExecutor, Job
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.io import MediaType, MimeType, BytesIO
 from .response import HTTPResponse
 from ..enums import SaveMode
@@ -24,13 +24,9 @@ __all__ = ["HTTPSession"]
 
 @dataclass
 class HTTPSession(Session):
-    pool_connections: int = 8
-    pool_maxsize: int = 8
-    pool_block: bool = False
-
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
 
-    def _build_pool(self) -> urllib3.PoolManager:
+    def _build_http_pool(self) -> urllib3.PoolManager:
         num_tries = max(self.waiting.retries, 0) + 1
         retries = urllib3.Retry(
             total=num_tries * 2,
@@ -40,35 +36,27 @@ class HTTPSession(Session):
             status_forcelist=(429, 500, 502, 503, 504),
             raise_on_status=False,
         )
+
         return urllib3.PoolManager(
-            num_pools=self.pool_connections,
+            num_pools=self.pool_maxsize,
             maxsize=self.pool_maxsize,
-            block=self.pool_block,
+            block=True,
             retries=retries,
             cert_reqs="CERT_REQUIRED" if self.verify else "CERT_NONE",
             ca_certs=None,
         )
 
     def __post_init__(self):
+        super().__post_init__()
         if self._http_pool is None:
-            self._http_pool = self._build_pool()
-
-    def __getstate__(self) -> dict:
-        state = super().__getstate__()
-        state.pop("_http", None)
-        state.pop("_http_pool", None)
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        super().__setstate__(state)
-        self._http_pool = self._build_pool()
+            self._build_http_pool()
 
     @property
     def http_pool(self):
         if self._http_pool is None:
             with self._lock:
                 if self._http_pool is None:
-                    self._http_pool = self._build_pool()
+                    self._http_pool = self._build_http_pool()
         return self._http_pool
 
     def send(
@@ -84,7 +72,6 @@ class HTTPSession(Session):
         received_to: Optional[dt.datetime | dt.date | str] = None,
         anonymize: Literal["remove", "redact"] = "remove",
         wait_cache: WaitingConfigArg = False,
-        pool: Optional[JobPoolExecutor | int] = None,
     ) -> HTTPResponse:
         if cache is not None:
             cache_by = self._cache_by_keys(cache_by)
@@ -158,7 +145,6 @@ limit 1"""
                 wait_cfg=wait_cfg,
                 stream=stream,
                 raise_error=raise_error,
-                pool=pool,
             )
 
         if raise_error:
@@ -280,11 +266,11 @@ limit 1"""
 
             result.buffer.truncate(size=0)
 
+            arr = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
             mt = MediaType(MimeType.ARROW_IPC)
             mio = result.buffer.media_io(mt)
-            mio.write_arrow_table(
-                final_df.to_arrow(compat_level=pl.CompatLevel.newest())
-            )
+            mio.write_arrow_table(arr)
+            result.set_media_type(mt, safe=False)
 
             result.update_tags({
                 "start_page": str(current_page),

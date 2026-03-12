@@ -6,12 +6,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable, Literal
 
-from yggdrasil.io import SaveMode
-
-from yggdrasil.data import any_to_datetime
-
 from yggdrasil.concurrent.threading import JobPoolExecutor, Job
+from yggdrasil.data import any_to_datetime
+from yggdrasil.dataclasses import serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
+from yggdrasil.io import SaveMode
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import Response, RESPONSE_ARROW_SCHEMA
@@ -46,7 +45,11 @@ class Session(ABC):
     send_headers: Optional[dict[str, str]] = field(default=None, repr=False)
     waiting: WaitingConfig = field(default_factory=lambda: DEFAULT_WAITING_CONFIG, repr=False, compare=False, hash=False)
 
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
+    _lock: threading.RLock = field(default=None, init=False, repr=False, compare=False)
+    _job_pool: JobPoolExecutor = field(default=None, init=False, repr=False, compare=False)
+
+    def _build_job_pool(self) -> JobPoolExecutor:
+        return JobPoolExecutor(max_workers=self.pool_maxsize)
 
     def __post_init__(self) -> None:
         if self.base_url:
@@ -56,18 +59,27 @@ class Session(ABC):
             self._lock = threading.RLock()
 
     def __getstate__(self) -> dict:
-        return {
-            "base_url": None if self.base_url is None else self.base_url.to_string(),
-            "verify": bool(self.verify),
-            "waiting": self.waiting,
-        }
+        return serialize_dataclass_state(self)
 
     def __setstate__(self, state: dict) -> None:
-        base_url_s = state.get("base_url")
-        self.base_url = URL.parse(base_url_s) if base_url_s else None
-        self.verify = bool(state.get("verify", True))
-        self.waiting = state.get("waiting") or DEFAULT_WAITING_CONFIG
-        self._lock = threading.RLock()
+        restore_dataclass_state(self, state)
+        self.__post_init__()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._job_pool:
+            self._job_pool.shutdown(wait=True)
+            self._job_pool = None
+
+    @property
+    def job_pool(self) -> JobPoolExecutor:
+        if self._job_pool is None:
+            with self._lock:
+                if self._job_pool is None:
+                    self._job_pool = self._build_job_pool()
+        return self._job_pool
 
     @classmethod
     def from_url(
@@ -105,7 +117,6 @@ class Session(ABC):
         received_to: Optional[dt.datetime | dt.date | str] = None,
         anonymize: Literal["remove", "redact"] = "remove",
         wait_cache: WaitingConfigArg = False,
-        pool: Optional[JobPoolExecutor | int] = None,
     ) -> Response:
         raise NotImplementedError
 
@@ -247,10 +258,8 @@ class Session(ABC):
         cache_by: Optional[list[str]] = None,
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
-        anonymize: Literal["remove", "redact"] = "remove",
         wait_cache: WaitingConfigArg = False,
         # Pooling options
-        pool: Optional[JobPoolExecutor | int] = None,
         batch_size: Optional[int] = None,
         ordered: bool = False,
         max_in_flight: Optional[int] = None,
@@ -258,154 +267,149 @@ class Session(ABC):
         if normalize is None:
             normalize = cache is not None
 
-        if pool is None:
-            pool = self.pool_maxsize
-        close_on_exit = not isinstance(pool, JobPoolExecutor)
-
         if cache is not None:
             cache_by = self._cache_by_keys(cache_by)
             cache_request_by = [_ for _ in cache_by if _.startswith("request")]
         else:
             cache_request_by = []
 
-        with JobPoolExecutor.parse(pool) as pool:
-            if not batch_size:
-                batch_size = pool.max_workers * 100
+        pool = self.job_pool
+        if not batch_size:
+            batch_size = pool.max_workers * 100
 
-            if cache is None:
-                def jobs():
-                    for req in requests:
+        if cache is None:
+            def jobs():
+                for req in requests:
+                    yield Job.make(
+                        self.send,
+                        req,
+                        wait=wait,
+                        raise_error=raise_error,
+                        normalize=normalize,
+                        stream=stream,
+                    )
+
+            for result in pool.as_completed(
+                jobs(),
+                ordered=ordered,
+                max_in_flight=self.pool_maxsize,
+                cancel_on_exit=True,
+                shutdown_on_exit=True,
+                raise_error=True,
+            ):
+                resp = result.result
+
+                if raise_error:
+                    resp.raise_for_status()
+                    yield resp
+                elif resp.ok:
+                    yield resp
+        else:
+            def _batched(it: Iterator, n: int) -> Iterator[list]:
+                it = iter(it)
+                while True:
+                    b = list(itertools.islice(it, n))
+                    if not b:
+                        break
+                    yield b
+
+            for batch in _batched(requests, batch_size):
+                anon_batch = [
+                    req.anonymize(mode="remove")
+                    for req in batch
+                ]
+
+                time_filter = self._sql_match_clause(
+                    None, keys=[],
+                    received_from=received_from,
+                    received_to=received_to,
+                )
+                clauses = " OR ".join(
+                    "(%s)" % self._sql_match_clause(req, keys=cache_request_by)
+                    for req in anon_batch
+                )
+                query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {time_filter} AND ({clauses})"
+
+                try:
+                    sql_cache_statement = cache.sql.execute(query)
+                except Exception as e:
+                    if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
+                        cache.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                        sql_cache_statement = cache.sql.execute(query)
+                    else:
+                        raise
+
+                arrow_batch = sql_cache_statement.to_arrow_table()
+                cached_responses = list(Response.from_arrow(arrow_batch))
+
+                cache_map: dict[tuple, Response] = {}
+                for resp in cached_responses:
+                    cache_map[self._cache_tuple_from_response(resp, cache_request_by)] = resp
+
+                hits: list[Response] = []
+                misses: list[PreparedRequest] = []
+
+                for req in batch:
+                    anon_req = req.anonymize(mode="remove")
+                    key = self._cache_tuple_from_request(anon_req, cache_request_by)
+                    if key in cache_map:
+                        hits.append(cache_map[key])
+                    else:
+                        misses.append(req)
+
+                for resp in hits:
+                    yield resp
+
+                if not misses:
+                    continue
+
+                def miss_jobs():
+                    for req in misses:
                         yield Job.make(
                             self.send,
-                            req,
+                            req.update_headers(self.send_headers, normalize=False),
                             wait=wait,
                             raise_error=raise_error,
                             normalize=normalize,
                             stream=stream,
+                            cache=None,
                         )
 
+                to_insert: list[Response] = []
+                failed: list[Response] = []
+
                 for result in pool.as_completed(
-                    jobs(),
+                    miss_jobs(),
                     ordered=ordered,
                     max_in_flight=max_in_flight,
-                    cancel_on_exit=True,
-                    shutdown_on_exit=True,
+                    cancel_on_exit=False,
+                    shutdown_on_exit=False,
                     raise_error=True,
                 ):
                     resp = result.result
 
-                    if raise_error:
-                        resp.raise_for_status()
+                    if resp.ok:
+                        to_insert.append(resp)
                         yield resp
-                    elif resp.ok:
-                        yield resp
-            else:
-                def _batched(it: Iterator, n: int) -> Iterator[list]:
-                    it = iter(it)
-                    while True:
-                        b = list(itertools.islice(it, n))
-                        if not b:
-                            break
-                        yield b
+                    elif raise_error:
+                        failed.append(resp)
 
-                for batch in _batched(requests, batch_size):
-                    anon_batch = [
-                        req.anonymize(mode="remove")
-                        for req in batch
+                if to_insert:
+                    import pyarrow as pa
+                    batches = [
+                        r.anonymize(mode="remove").to_arrow_batch(parse=False)
+                        for r in to_insert
                     ]
-
-                    time_filter = self._sql_match_clause(
-                        None, keys=[],
-                        received_from=received_from,
-                        received_to=received_to,
+                    combined = pa.Table.from_batches(batches).combine_chunks()
+                    cache.insert(
+                        combined,
+                        mode=SaveMode.APPEND,
+                        match_by=cache_by,
+                        wait=wait_cache,
                     )
-                    clauses = " OR ".join(
-                        "(%s)" % self._sql_match_clause(req, keys=cache_request_by)
-                        for req in anon_batch
-                    )
-                    query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {time_filter} AND ({clauses})"
 
-                    try:
-                        sql_cache_statement = cache.sql.execute(query)
-                    except Exception as e:
-                        if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
-                            cache.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                            sql_cache_statement = cache.sql.execute(query)
-                        else:
-                            raise
-
-                    arrow_batch = sql_cache_statement.to_arrow_table()
-                    cached_responses = list(Response.from_arrow(arrow_batch))
-
-                    cache_map: dict[tuple, Response] = {}
-                    for resp in cached_responses:
-                        cache_map[self._cache_tuple_from_response(resp, cache_request_by)] = resp
-
-                    hits: list[Response] = []
-                    misses: list[PreparedRequest] = []
-
-                    for req in batch:
-                        anon_req = req.anonymize(mode="remove")
-                        key = self._cache_tuple_from_request(anon_req, cache_request_by)
-                        if key in cache_map:
-                            hits.append(cache_map[key])
-                        else:
-                            misses.append(req)
-
-                    for resp in hits:
-                        yield resp
-
-                    if not misses:
-                        continue
-
-                    def miss_jobs():
-                        for req in misses:
-                            yield Job.make(
-                                self.send,
-                                req.update_headers(self.send_headers, normalize=False),
-                                wait=wait,
-                                raise_error=raise_error,
-                                normalize=normalize,
-                                stream=stream,
-                                cache=None,
-                                pool=pool
-                            )
-
-                    to_insert: list[Response] = []
-                    failed: list[Response] = []
-
-                    for result in pool.as_completed(
-                        miss_jobs(),
-                        ordered=ordered,
-                        max_in_flight=max_in_flight,
-                        cancel_on_exit=close_on_exit,
-                        shutdown_on_exit=close_on_exit,
-                        raise_error=True,
-                    ):
-                        resp = result.result
-
-                        if resp.ok:
-                            to_insert.append(resp)
-                            yield resp
-                        elif raise_error:
-                            failed.append(resp)
-
-                    if to_insert:
-                        import pyarrow as pa
-                        batches = [
-                            r.anonymize(mode="remove").to_arrow_batch(parse=False)
-                            for r in to_insert
-                        ]
-                        combined = pa.Table.from_batches(batches).combine_chunks()
-                        cache.insert(
-                            combined,
-                            mode=SaveMode.APPEND,
-                            match_by=cache_by,
-                            wait=wait_cache,
-                        )
-
-                    if raise_error and failed:
-                        failed[-1].raise_for_status()
+                if raise_error and failed:
+                    failed[-1].raise_for_status()
 
     # --- Convenience HTTP Methods ---
 

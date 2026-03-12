@@ -78,11 +78,12 @@ def with_mongo_connection(
     cluster: Optional["Cluster"] = None,
     force_local: bool = False,
     environ: EnvironLike = None,
+    resolver: Optional[Callable[[], None] | str] = None,
 ) -> Callable[[F], F]:
     force_local = force_local or bool(os.getenv("DATABRICKS_RUNTIME_VERSION"))
     aliases = _normalize_aliases(aliases)
     configs = [
-        get_connection_settings(alias=alias, jsonable=True)
+        get_connection_settings(alias=alias, jsonable=True, resolver=resolver)
         for alias in aliases
     ]
 
