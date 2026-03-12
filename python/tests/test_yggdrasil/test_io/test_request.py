@@ -79,8 +79,6 @@ def test_parse_dict_headers_from_promoted_fields() -> None:
             "request_content_length": 12,
             "request_content_encoding": "gzip",
             "request_transfer_encoding": "chunked",
-            "request_x_request_id": "rid-1",
-            "request_x_correlation_id": "cid-1",
         }
     )
 
@@ -88,8 +86,6 @@ def test_parse_dict_headers_from_promoted_fields() -> None:
     assert req.headers["Content-Length"] == "12"
     assert req.headers["Content-Encoding"] == "gzip"
     assert req.headers["Transfer-Encoding"] == "chunked"
-    assert req.headers["X-Request-ID"] == "rid-1"
-    assert req.headers["X-Correlation-ID"] == "cid-1"
 
 
 def test_parse_dict_tags_and_buffer() -> None:
@@ -253,16 +249,6 @@ def test_anonymize_redacts_url_and_sensitive_headers() -> None:
     assert anon.headers["X-API-Key"] == "<redacted>"
 
 
-def test_parse_query_params_handles_empty_and_bare_keys() -> None:
-    assert PreparedRequest._parse_query_params(None) == {}
-    assert PreparedRequest._parse_query_params("") == {}
-    assert PreparedRequest._parse_query_params("a=1&b&c=3") == {
-        "a": "1",
-        "b": "",
-        "c": "3",
-    }
-
-
 def test_to_arrow_batch_matches_schema() -> None:
     req = PreparedRequest.prepare(
         method="POST",
@@ -327,8 +313,6 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
     assert row["request_content_length"] == 11
     assert row["request_content_encoding"] == "gzip"
     assert row["request_transfer_encoding"] == "chunked"
-    assert row["request_x_request_id"] == "rid-1"
-    assert row["request_x_correlation_id"] == "cid-1"
 
     assert dict((k, v) for k, v in row["request_headers"] if k in ["X-Other"]) == {"X-Other": "keep-me"}
     assert dict(row["request_tags"]) == {

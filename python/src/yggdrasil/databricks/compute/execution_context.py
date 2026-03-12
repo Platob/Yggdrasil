@@ -721,7 +721,7 @@ print({tag!r} + _out, flush=True)
                     import pyarrow.parquet as pq
 
                     if not blob:
-                        return pyarrow.Table.from_batches([], pyarrow.schema([]))  # empty Table if no data
+                        return pyarrow.Table([], pyarrow.schema([]))
 
                     buff = io.BytesIO(blob)
                     return pq.read_table(buff)
@@ -731,12 +731,12 @@ print({tag!r} + _out, flush=True)
                     # Parquet file written by encode_object.
                     import pandas
 
-                    if not blob:
-                        return pandas.Series(name=payload.get("original_name"))  # empty Series with preserved name
-
                     series_name   = payload.get("series_name", "__series__")
                     index_name    = payload.get("index_name",  "__index__")
                     original_name = payload.get("original_name")  # may be None
+
+                    if not blob:
+                        return pandas.Series(name=original_name)
 
                     buff = io.BytesIO(blob)
                     df   = pandas.read_parquet(buff)
@@ -754,7 +754,7 @@ print({tag!r} + _out, flush=True)
                     import pandas
 
                     if not blob:
-                        return pandas.DataFrame()  # empty DataFrame if no data
+                        return pandas.DataFrame()
 
                     buff = io.BytesIO(blob)
 
@@ -777,9 +777,6 @@ print({tag!r} + _out, flush=True)
 
                 elif func.startswith("polars."):
                     import polars
-
-                    if not blob:
-                        return polars.DataFrame()  # empty DataFrame if no data
 
                     buff = io.BytesIO(blob)
                     return polars.read_parquet(buff)

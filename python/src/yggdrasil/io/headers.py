@@ -7,6 +7,8 @@ import socket
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 
+from yggdrasil.io import MimeType
+
 from yggdrasil.version import __version_info__, __version__
 from .buffer import BytesIO
 from .enums import Codec, MediaType
@@ -16,22 +18,64 @@ __all__ = [
     "HeaderValue",
     "PromotedHeaders",
     "normalize_headers",
+    "DEFAULT_HOSTNAME",
+    "get_default_user_agent",
+    "get_default_headers",
 ]
 
 HeaderValue = Union[str, bytes]
 
 
 PYVERSION = str(platform.python_version())
-DEFAULT_USER_AGENT: str = (
-    f"yggdrasil/{__version_info__} "
-    f"os/{platform.system().lower()} "
-    f"py/{PYVERSION}"
-)
+DEFAULT_USER_AGENT: str = ""
 
 try:
     DEFAULT_HOSTNAME = socket.gethostname()
 except Exception:
     DEFAULT_HOSTNAME = "localhost"
+
+DEFAULT_HEADERS = {}
+
+def get_default_headers() -> dict[str, str]:
+    global DEFAULT_HEADERS
+
+    if not DEFAULT_HEADERS:
+        DEFAULT_HEADERS = {
+            "X-Ygg-Version": __version__,
+            "X-Py-Version": PYVERSION,
+            "X-Host": DEFAULT_HOSTNAME,
+        }
+
+        current = UserInfo.current()
+        pv = current.product_version or "0.0.0"
+
+        if current.product:
+            DEFAULT_HEADERS["X-Product"] = current.product
+            DEFAULT_HEADERS["X-Product-Version"] = pv
+
+        if current.git_url:
+            DEFAULT_HEADERS["X-Git-Url"] = current.git_url.to_string()
+
+    return DEFAULT_HEADERS
+
+
+def get_default_user_agent() -> str:
+    global DEFAULT_USER_AGENT
+
+    if not DEFAULT_USER_AGENT:
+        current = UserInfo.current()
+
+        DEFAULT_USER_AGENT = (
+            f"yggdrasil/{__version_info__} "
+            f"os/{platform.system().lower()} "
+            f"py/{PYVERSION}"
+        )
+
+        if current.product:
+            DEFAULT_USER_AGENT = f"{current.product}/{current.product_version or '0.0.0'} {DEFAULT_USER_AGENT}"
+
+    return DEFAULT_USER_AGENT
+
 
 SENSITIVE_HEADER_KEYS = {
     "authorization",
@@ -118,11 +162,9 @@ class PromotedHeaders:
     accept_encoding: Optional[str] = None
     accept_language: Optional[str] = None
     content_type: Optional[str] = None
-    content_length: Optional[int] = None
+    content_length: int = 0
     content_encoding: Optional[str] = None
     transfer_encoding: Optional[str] = None
-    x_request_id: Optional[str] = None
-    x_correlation_id: Optional[str] = None
     remaining: dict[str, str] = field(default_factory=dict)
 
     HEADER_TO_ATTR: ClassVar[dict[str, str]] = {
@@ -135,8 +177,6 @@ class PromotedHeaders:
         "content-length": "content_length",
         "content-encoding": "content_encoding",
         "transfer-encoding": "transfer_encoding",
-        "x-request-id": "x_request_id",
-        "x-correlation-id": "x_correlation_id",
     }
 
     @classmethod
@@ -145,6 +185,7 @@ class PromotedHeaders:
         headers: Mapping[HeaderValue, HeaderValue],
         *,
         normalize: bool = True,
+        host: Optional[str] = None,
     ) -> "PromotedHeaders":
         """
         Extract common headers into typed attributes.
@@ -154,6 +195,10 @@ class PromotedHeaders:
         """
         normalized: dict[str, str] = {}
         lower_to_actual: dict[str, str] = {}
+
+        if host:
+            normalized["Host"] = host
+            lower_to_actual["host"] = "Host"
 
         for raw_name, raw_value in headers.items():
             if normalize:
@@ -183,7 +228,12 @@ class PromotedHeaders:
             if name.lower() not in promoted_lowers
         }
 
-        return cls(**kwargs)
+        built = cls(**kwargs)
+
+        if not built.content_length:
+            object.__setattr__(built, "content_length", 0)
+
+        return built
 
     @property
     def values(self) -> dict[str, object]:
@@ -197,15 +247,13 @@ class PromotedHeaders:
             "content_length": self.content_length,
             "content_encoding": self.content_encoding,
             "transfer_encoding": self.transfer_encoding,
-            "x_request_id": self.x_request_id,
-            "x_correlation_id": self.x_correlation_id,
         }
 
 
 def _sanitize_sensitive_value(
     value: str,
     *,
-    mode: Literal["remove", "redact", "hash"],
+    mode: Literal["remove", "redact"],
     anonymize: bool,
 ) -> Optional[str]:
     if not anonymize:
@@ -218,7 +266,7 @@ def _sanitize_sensitive_value(
 def _sanitize_authorization_value(
     value: str,
     *,
-    mode: Literal["remove", "redact", "hash"],
+    mode: Literal["remove", "redact"],
     anonymize: bool,
 ) -> Optional[str]:
     if not anonymize:
@@ -241,7 +289,8 @@ def normalize_headers(
     headers: Mapping[HeaderValue, HeaderValue],
     *,
     is_request: bool,
-    mode: Literal["remove", "redact", "hash"] = "remove",
+    add_missing: bool = True,
+    mode: Literal["remove", "redact"] = "remove",
     anonymize: bool = False,
     body: Optional[BytesIO] = None,
 ) -> MutableMapping[str, str]:
@@ -260,6 +309,9 @@ def normalize_headers(
     has_content_length = False
     has_content_encoding = False
     has_user_agent = False
+    has_host = False
+    accept_value = ""
+    accept_encoding_value = ""
 
     for raw_name, raw_value in headers.items():
         name, name_lower = _normalize_header_name(raw_name)
@@ -273,6 +325,12 @@ def normalize_headers(
             has_content_encoding = True
         elif name_lower == "user-agent":
             has_user_agent = True
+        elif name_lower == "host":
+            has_host = True
+        elif name_lower == "accept":
+            accept_value = value
+        elif name_lower == "accept-encoding":
+            accept_encoding_value = value
 
         if name_lower == "authorization":
             sanitized = _sanitize_authorization_value(
@@ -298,42 +356,51 @@ def normalize_headers(
         if sanitized is not None:
             out[name] = sanitized
 
-    if body is not None:
-        media_type: Optional[MediaType] = None
+    if add_missing:
+        if body is not None:
+            media_type: Optional[MediaType] = None
 
-        if not has_content_type:
-            media_type = media_type or body.media_type
-            out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
+            if not has_content_type:
+                media_type = media_type or body.media_type
+                out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
 
-            if not has_content_encoding:
-                codec: Optional[Codec] = media_type.codec
-                if codec is not None:
-                    out["Content-Encoding"] = codec.name
+                if not has_content_encoding:
+                    codec: Optional[Codec] = media_type.codec
+                    if codec is not None:
+                        out["Content-Encoding"] = codec.name
 
-        if not has_content_length:
-            out["Content-Length"] = str(body.size)
+            if not has_content_length:
+                out["Content-Length"] = str(body.size)
 
-    if is_request:
-        current = UserInfo.current()
+        if is_request:
+            if not has_user_agent:
+                out["User-Agent"] = get_default_user_agent()
 
-        pv = current.product_version or "0.0.0"
+            out.update(DEFAULT_HEADERS)
 
-        if current.product:
-            out["X-Product"] = current.product
-            out["X-Product-Version"] = pv
+            if accept_value:
+                codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
+                media_type = MediaType.parse_str(accept_value, codec=codec) if accept_value else None
 
-        if not has_user_agent:
-            if current.product:
-                out["User-Agent"] = f"{current.product}/{pv} {DEFAULT_USER_AGENT}"
+                out["Accept"] = "*/*" if media_type.mime_type == MimeType.OCTET_STREAM else media_type.mime_type.value
+
+                if media_type.codec:
+                    out["Accept-Encoding"] = codec.name
+
+            elif accept_encoding_value:
+                out["Accept"] = "*/*"
+
+                codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
+
+                if codec is None:
+                    raise ValueError(f"Invalid Accept-Encoding value: {accept_encoding_value}")
+
+                out["Accept-Encoding"] = codec.name
+
             else:
-                out["User-Agent"] = DEFAULT_USER_AGENT
+                out["Accept"] = "*/*"
 
-        if current.git_url:
-            out["X-Git-Url"] = current.git_url.to_string()
-
-        out["Host"] = out.get("Host", DEFAULT_HOSTNAME)
-
-        out["X-Ygg-Version"] = __version__
-        out["X-Py-Version"] = PYVERSION
+    if has_host:
+        del out["Host"]
 
     return out

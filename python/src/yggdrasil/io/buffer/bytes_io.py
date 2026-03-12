@@ -25,7 +25,7 @@ import struct
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, IO, Optional, TYPE_CHECKING
+from typing import Any, IO, Optional, TYPE_CHECKING, Union
 
 from yggdrasil.io.config import BufferConfig, DEFAULT_CONFIG
 from yggdrasil.io.enums import MediaType, MimeType
@@ -38,8 +38,11 @@ if TYPE_CHECKING:
     from .media_io import MediaIO
     from ..enums import Codec
 
-__all__ = ["BytesIO"]
+__all__ = ["BytesIO", "BufferLike"]
 
+BufferLike = Union[
+    bytes, bytearray, memoryview, io.BytesIO, "BytesIO", str, Path, IO[bytes]
+]
 _HEAD_DEFAULT = 128
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
 _HAS_PREAD = hasattr(os, "pread")
@@ -329,7 +332,7 @@ class BytesIO(io.RawIOBase):
     # Cursorless IO primitives
     # ------------------------------------------------------------------
 
-    def _pread(self, n: int, pos: int) -> bytes:
+    def pread(self, n: int, pos: int) -> bytes:
         if n <= 0:
             return b""
 
@@ -349,7 +352,7 @@ class BytesIO(io.RawIOBase):
             fh.seek(pos)
             return fh.read(n)
 
-    def _pwrite(self, mv: memoryview, pos: int) -> int:
+    def pwrite(self, mv: memoryview, pos: int) -> int:
         if len(mv) == 0:
             return 0
 
@@ -458,6 +461,14 @@ class BytesIO(io.RawIOBase):
 
     @media_type.setter
     def media_type(self, value: "MediaType"):
+        self.set_media_type(value, safe=True)
+
+    def set_media_type(
+        self,
+        value: MediaType,
+        *,
+        safe: bool
+    ) -> "BytesIO":
         from ..enums import MediaType
         self._media_type = MediaType.parse(value)
 
@@ -468,8 +479,6 @@ class BytesIO(io.RawIOBase):
         from .media_io import MediaIO
 
         media = MediaType.parse(media)
-        if media.is_octet:
-            media = self.media_type
         return MediaIO.make(buffer=self, media=media)
 
     # ------------------------------------------------------------------
@@ -500,7 +509,7 @@ class BytesIO(io.RawIOBase):
         if self._buf is not None:
             return memoryview(self._buf)[: min(n, self._size)]
 
-        return memoryview(self._pread(n, 0))
+        return memoryview(self.pread(n, 0))
 
     def tell(self) -> int:
         if self._closed:
@@ -533,7 +542,7 @@ class BytesIO(io.RawIOBase):
         if size is None or size < 0:
             size = max(0, self.size - self._pos)
 
-        out = self._pread(size, self._pos)
+        out = self.pread(size, self._pos)
         self._pos += len(out)
         return out
 
@@ -561,6 +570,9 @@ class BytesIO(io.RawIOBase):
 
         return self.write_bytes(bytes(b))
 
+    def write_linebreak(self, newline: str = "\n") -> int:
+        return self.write(newline)
+
     def write_bytes(self, b: bytes | bytearray | memoryview) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
@@ -570,7 +582,7 @@ class BytesIO(io.RawIOBase):
             return 0
 
         self._ensure_spill_for_growth(len(mv))
-        n = self._pwrite(mv, self._pos)
+        n = self.pwrite(mv, self._pos)
         self._pos += n
 
         if self._buf is None:
@@ -717,6 +729,10 @@ class BytesIO(io.RawIOBase):
         h.update(self.memoryview())
         return h
 
+    def xxh3_int64(self) -> int:
+        u = self.xxh3_64().intdigest()
+        return u if u < 2 ** 63 else u - 2 ** 64
+
     def blake3(self) -> "blake3.blake3":
         from yggdrasil.blake3 import blake3
 
@@ -789,7 +805,7 @@ class BytesIO(io.RawIOBase):
             return bytes(memoryview(self._buf)[: self._size])
         if self.size == 0:
             return b""
-        return self._pread(self.size, 0)
+        return self.pread(self.size, 0)
 
     def open_reader(self) -> IO[bytes]:
         if self._buf is not None:

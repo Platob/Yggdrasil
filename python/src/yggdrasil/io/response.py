@@ -1,17 +1,16 @@
 # yggdrasil.io.response
 from __future__ import annotations
 
-import json
 from dataclasses import MISSING, dataclass, replace
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, MutableMapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, MutableMapping, Callable
 
 import pyarrow as pa
 
+import yggdrasil.pickle.json as json_module
 from yggdrasil.dataclasses.dataclass import get_from_dict
-from . import Codec, MimeType
 from .buffer import BytesIO
-from .enums import MediaType
-from .headers import PromotedHeaders, normalize_headers
+from .enums import MediaType, Codec, MimeType
+from .headers import PromotedHeaders, normalize_headers, DEFAULT_HOSTNAME
 from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
 if TYPE_CHECKING:
@@ -46,27 +45,6 @@ def _get_header(headers: Mapping[str, str] | None, name: str) -> str | None:
             return str(value)
 
     return None
-
-
-def _set_header(headers: MutableMapping[str, str], name: str, value: str) -> None:
-    if name in headers:
-        headers[name] = value
-        return
-
-    target = name.lower()
-    for key in headers.keys():
-        if isinstance(key, str):
-            if key == name:
-                headers[key] = value
-                return
-            if key.lower() == target:
-                headers[key] = value
-                return
-        elif str(key).lower() == target:
-            headers[key] = value
-            return
-
-    headers[name] = value
 
 
 def _pop_header(headers: MutableMapping[str, str], name: str) -> str | None:
@@ -182,13 +160,13 @@ def _ensure_media_headers(
     )
 
     if _is_probably_placeholder_content_type(declared_type):
-        _set_header(headers, "Content-Type", media.mime_type.value)
+        headers["Content-Type"] = media.mime_type.value
 
     if not declared_encoding and media.codec is not None:
-        _set_header(headers, "Content-Encoding", media.codec.name)
+        headers["Content-Encoding"] = media.codec.name
 
     if _parse_content_length(headers) is None:
-        _set_header(headers, "Content-Length", str(body.size))
+        headers["Content-Length"] = str(body.size)
 
     return media
 
@@ -216,8 +194,6 @@ def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str
         "Location": get_from_dict(obj, keys=("location",), prefix=prefix),
         "ETag": get_from_dict(obj, keys=("etag",), prefix=prefix),
         "Last-Modified": get_from_dict(obj, keys=("last_modified",), prefix=prefix),
-        "X-Request-ID": get_from_dict(obj, keys=("x_request_id",), prefix=prefix),
-        "X-Correlation-ID": get_from_dict(obj, keys=("x_correlation_id",), prefix=prefix),
     }
 
     out: MutableMapping[str, str] = {}
@@ -354,7 +330,7 @@ ARROW_SCHEMA = pa.schema(
             "response_status_code",
             pa.int32(),
             nullable=False,
-            metadata={"comment": "HTTP status code returned by the server"},
+            metadata={"comment": "Status code returned by the server"},
         ),
         pa.field("response_host", pa.string(), nullable=True, metadata={"comment": "Host header"}),
         pa.field("response_user_agent", pa.string(), nullable=True, metadata={"comment": "User-Agent header"}),
@@ -365,19 +341,17 @@ ARROW_SCHEMA = pa.schema(
         pa.field(
             "response_content_length",
             pa.int64(),
-            nullable=True,
+            nullable=False,
             metadata={"comment": "Content-Length header parsed as integer when possible"},
         ),
         pa.field("response_content_encoding", pa.string(), nullable=True, metadata={"comment": "Content-Encoding header"}),
         pa.field("response_transfer_encoding", pa.string(), nullable=True, metadata={"comment": "Transfer-Encoding header"}),
-        pa.field("response_x_request_id", pa.string(), nullable=True, metadata={"comment": "X-Request-ID header"}),
-        pa.field("response_x_correlation_id", pa.string(), nullable=True, metadata={"comment": "X-Correlation-ID header"}),
         pa.field(
             "response_headers",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
             metadata={
-                "comment": "HTTP response headers excluding promoted common headers",
+                "comment": "Response headers excluding promoted common headers",
                 "keys_sorted": "false",
             },
         ),
@@ -395,12 +369,11 @@ ARROW_SCHEMA = pa.schema(
         ),
         pa.field(
             "response_body_hash",
-            pa.binary(32),
+            pa.int64(),
             nullable=True,
             metadata={
-                "comment": "256-bit BLAKE3 digest of response_body (32 bytes)",
-                "algorithm": "blake3",
-                "byte_width": "32",
+                "comment": "Signed Int64 XXH3 digest of response_body",
+                "algorithm": "xxh3_64",
             },
         ),
         pa.field(
@@ -425,14 +398,14 @@ ARROW_SCHEMA = pa.schema(
         ),
     ],
     metadata={
-        "comment": "HTTP response record (single row), designed for deterministic logging + replay.",
+        "comment": "Response record (single row), designed for deterministic logging + replay.",
     },
 )
 
 RESPONSE_ARROW_SCHEMA = pa.schema(
     list(REQUEST_ARROW_SCHEMA) + list(ARROW_SCHEMA),
     metadata={
-        "comment": "HTTP prepared request and response flattened into columns for single-row logging batches.",
+        "comment": "Prepared request and response flattened into columns for single-row logging batches.",
     },
 )
 
@@ -442,9 +415,9 @@ class Response:
     request: PreparedRequest
     status_code: int
     headers: MutableMapping[str, str]
+    tags: MutableMapping[str, str]
     buffer: BytesIO
     received_at_timestamp: int
-    tags: Mapping[str, str]
 
     @classmethod
     def parse(cls, obj: Any, *, normalize: bool = True) -> "Response":
@@ -463,7 +436,7 @@ class Response:
             raise ValueError("Response.parse_str: empty string")
 
         try:
-            d = json.loads(s)
+            d = json_module.loads(s)
         except Exception as e:
             raise ValueError("Response.parse_str: expected JSON object string") from e
 
@@ -508,12 +481,74 @@ class Response:
             tags=tags,
         )
 
+    def update_headers(
+        self,
+        headers: MutableMapping[str, str],
+        normalize: bool = True,
+    ) -> "PreparedRequest":
+        if not headers:
+            return self
+
+        if not self.headers:
+            self.headers = dict(headers)
+            if normalize:
+                _ensure_media_headers(self.headers, self.buffer)
+            return self
+
+        for k, v in headers.items():
+            self.headers[str(k)] = str(v)
+
+        if normalize:
+            _ensure_media_headers(self.headers, self.buffer)
+
+        return self
+
+    def update_tags(
+        self,
+        tags: MutableMapping[str, str],
+    ) -> "PreparedRequest":
+        if not tags:
+            return self
+
+        if not self.tags:
+            self.tags = tags
+            return self
+
+        self.tags.update(tags)
+
+        return self
+
     @property
     def media_type(self) -> MediaType:
         if self.headers is None:
             self.headers = {}
 
         return _ensure_media_headers(self.headers, self.buffer)
+
+    @media_type.setter
+    def media_type(self, value: MediaType) -> None:
+        self.set_media_type(value, safe=True)
+
+    def set_media_type(
+        self,
+        value: MediaType,
+        *,
+        safe: bool = True
+    ) -> "Response":
+        if self.headers is None:
+            self.headers = {}
+
+        self.request.accept_media_type = value
+        self.buffer.set_media_type(value, safe=safe)
+
+        self.headers["Content-Type"] = value.mime_type.value
+
+        if value.codec is not None:
+            self.headers["Content-Encoding"] = value.codec.name
+        else:
+            del self.headers["Content-Encoding"]
+
+        self.headers["Content-Length"] = str(self.buffer.size)
 
     @property
     def body(self) -> BytesIO:
@@ -525,6 +560,11 @@ class Response:
 
     @property
     def content(self) -> bytes:
+        codec = self.codec
+
+        if codec is not None:
+            return self.buffer.decompress(codec=codec, copy=True).to_bytes()
+
         return self.buffer.to_bytes()
 
     @property
@@ -532,7 +572,13 @@ class Response:
         return self.content.decode(_get_charset(self.headers), errors="replace")
 
     def json(self) -> Any:
-        return json.loads(self.content)
+        media_type = self.media_type
+
+        if media_type.codec:
+            decompressed = self.buffer.decompress(codec=media_type.codec, copy=True)
+            return json_module.load(decompressed)
+        else:
+            return json_module.load(self.buffer)
 
     @property
     def ok(self) -> bool:
@@ -567,7 +613,15 @@ class Response:
         from yggdrasil.polars.lib import polars as _pl
 
         if parse:
-            mio = self.buffer.media_io(media=self.media_type)
+            mt = self.media_type
+
+            if mt.codec:
+                with self.buffer.decompress(mt.codec, copy=True) as b:
+                    mio = b.media_io(media=mt)
+                    df = mio.read_polars_frame(lazy=False)
+                return df.lazy() if lazy else df
+
+            mio = self.buffer.media_io(media=mt)
             return mio.read_polars_frame(lazy=lazy)
 
         return _pl.from_arrow(self.to_arrow_batch(parse=False))
@@ -584,12 +638,12 @@ class Response:
             ).to_batches()[0]
 
         req_rb = self.request.to_arrow_batch(parse=False)
-        promoted = PromotedHeaders.extract(self.headers or {})
+        promoted = PromotedHeaders.extract(self.headers or {}, host=DEFAULT_HOSTNAME)
         tags_v = {str(k): str(v) for k, v in (self.tags or {}).items()}
 
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.blake3().digest()
+            body_hash = self.buffer.xxh3_int64()
         else:
             body_bytes = None
             body_hash = None
@@ -605,8 +659,6 @@ class Response:
             "response_content_length": promoted.content_length,
             "response_content_encoding": promoted.content_encoding,
             "response_transfer_encoding": promoted.transfer_encoding,
-            "response_x_request_id": promoted.x_request_id,
-            "response_x_correlation_id": promoted.x_correlation_id,
             "response_headers": promoted.remaining,
             "response_tags": tags_v,
             "response_body": body_bytes,
@@ -701,8 +753,6 @@ class Response:
                     "Content-Length": _first_present(cols, i, "request_content_length"),
                     "Content-Encoding": _first_present(cols, i, "request_content_encoding"),
                     "Transfer-Encoding": _first_present(cols, i, "request_transfer_encoding"),
-                    "X-Request-ID": _first_present(cols, i, "request_x_request_id"),
-                    "X-Correlation-ID": _first_present(cols, i, "request_x_correlation_id"),
                 }
                 for hk, hv in request_promoted_pairs.items():
                     if hv not in (None, ""):
@@ -735,15 +785,13 @@ class Response:
                     "Content-Length": _first_present(cols, i, "response_content_length"),
                     "Content-Encoding": _first_present(cols, i, "response_content_encoding"),
                     "Transfer-Encoding": _first_present(cols, i, "response_transfer_encoding"),
-                    "X-Request-ID": _first_present(cols, i, "response_x_request_id"),
-                    "X-Correlation-ID": _first_present(cols, i, "response_x_correlation_id"),
                 }
                 for hk, hv in response_promoted_pairs.items():
                     if hv not in (None, ""):
                         response_headers[hk] = str(hv)
 
                 body_bytes = _first_present(cols, i, "response_body")
-                buffer = BytesIO.parse(obj=body_bytes) if body_bytes is not None else BytesIO()
+                buffer = BytesIO(body_bytes) if body_bytes is not None else BytesIO()
 
                 if normalize:
                     response_headers = normalize_headers(
@@ -784,8 +832,7 @@ class Response:
         if media.codec is not None and _parse_content_encoding(headers) is None:
             headers["Content-Encoding"] = media.codec.name
 
-        media_type = media.mime_type.value if media.mime_type else "application/octet-stream"
-        return body, headers, media_type
+        return body, headers, media.mime_type.value
 
     def to_starlette(self) -> "StarletteResponse":
         from starlette.responses import Response as _StarletteResponse
@@ -813,3 +860,9 @@ class Response:
             headers=headers,
             media_type=media_type,
         )
+
+    def apply(
+        self,
+        func: Callable[["Response"], "Response"]
+    ) -> "Response":
+        return func(self)

@@ -1,1 +1,1 @@
-from .bytes_io import BytesIO
+from .bytes_io import BytesIO, BufferLike

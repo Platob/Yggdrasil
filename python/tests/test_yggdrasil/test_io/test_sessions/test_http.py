@@ -8,6 +8,7 @@ import ssl
 import time
 
 import pytest
+from yggdrasil.io import URL
 
 # Adjust these imports to match your project structure
 from yggdrasil.io.http_ import HTTPSession
@@ -62,7 +63,7 @@ def test_send_get_stream_true_reads_bytes():
 def test_send_get_stream_false_preloads_content():
     s = HTTPSession()
     req = s.prepare_request("GET", "https://example.com", headers={"User-Agent": "real-http-test"})
-    resp = s.send(req, stream=False)
+    resp = s.send(req, stream=False, raise_error=False)
 
     assert 200 <= resp.status_code < 400
     # non-stream: should have content available immediately

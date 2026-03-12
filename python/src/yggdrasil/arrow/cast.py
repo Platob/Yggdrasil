@@ -690,12 +690,17 @@ def cast_primitive_array(
     ):
         return arrow_strptime(array, options)
     else:
-        casted = pc.cast(
-            array,
-            target_type=target_field.type,
-            safe=options.safe,
-            memory_pool=options.arrow_memory_pool,
-        )
+        try:
+            casted = pc.cast(
+                array,
+                target_type=target_field.type,
+                safe=options.safe,
+                memory_pool=options.arrow_memory_pool,
+            )
+        except pa.ArrowNotImplementedError as e:
+            raise pa.ArrowInvalid(
+                f"Unsupported cast from {source_field} to {target_field}"
+            ) from e
         return check_arrow_array_nullability(casted, options)
 
 

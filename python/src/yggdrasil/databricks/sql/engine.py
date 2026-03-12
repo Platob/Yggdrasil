@@ -28,18 +28,16 @@ from dataclasses import dataclass, field
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
-from databricks.sdk.errors import NotFound
 from databricks.sdk.service.sql import Disposition
 
 from yggdrasil.arrow.cast import arrow_field_to_schema
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.cast.registry import convert
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.io.enums import SaveMode, FileFormat
 from .statement_result import StatementResult
 from .table import Table
-from .types import quote_ident, escape_sql_string, arrow_field_to_ddl
+from .types import quote_ident
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
 from ..workspaces import DatabricksPath
@@ -48,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pyspark
-    import delta
     import pandas
     import polars
 
@@ -57,23 +54,6 @@ __all__ = [
     "StatementResult",
     "CreateTablePlan",
 ]
-
-
-_INVALID_COL_CHARS = set(" ,;{}()\n\t=")
-
-
-def _needs_column_mapping(col_name: str) -> bool:
-    """
-    Heuristic: return True if a column name has characters that commonly break without
-    Delta column mapping / strict quoting.
-
-    Args:
-        col_name: Column name.
-
-    Returns:
-        True if column name includes invalid/awkward characters.
-    """
-    return any(ch in _INVALID_COL_CHARS for ch in col_name)
 
 
 def _build_match_condition(
@@ -188,44 +168,6 @@ class SQLEngine(DatabricksService):
     # -------------------------------------------------------------------------------------
     # Naming helpers
     # -------------------------------------------------------------------------------------
-
-    def table_full_name(
-        self,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        safe_chars: bool = True,
-    ) -> str:
-        """
-        Build a fully qualified table name (catalog.schema.table).
-
-        Args:
-            catalog_name:
-                Optional catalog override (defaults to ``self.catalog_name``).
-            schema_name:
-                Optional schema override (defaults to ``self.schema_name``).
-            table_name:
-                Table name to qualify.
-            safe_chars:
-                If True, wraps each identifier in backticks.
-
-        Returns:
-            Fully qualified table name string.
-
-        Raises:
-            AssertionError: If any of catalog/schema/table is missing after defaults.
-        """
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
-
-        assert catalog_name, "No catalog name given"
-        assert schema_name, "No schema name given"
-        assert table_name, "No table name given"
-
-        if safe_chars:
-            return f"{quote_ident(catalog_name)}.{quote_ident(schema_name)}.{quote_ident(table_name)}"
-        return f"{catalog_name}.{schema_name}.{table_name}"
-
     def _catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """
         Parse a catalog.schema.table string into components.
@@ -460,55 +402,6 @@ class SQLEngine(DatabricksService):
     # Delta table handle (Spark required)
     # -------------------------------------------------------------------------------------
 
-    def spark_table(
-        self,
-        full_name: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-    ) -> "delta.tables.DeltaTable":
-        """
-        Return a DeltaTable handle for a given table name (Spark context required).
-
-        Args:
-            full_name:
-                Fully qualified table name (catalog.schema.table). If provided, takes precedence.
-            catalog_name:
-                Catalog name used when `full_name` is not provided.
-            schema_name:
-                Schema name used when `full_name` is not provided.
-            table_name:
-                Table name used when `full_name` is not provided.
-
-        Returns:
-            delta.tables.DeltaTable.
-
-        Raises:
-            ImportError:
-                If delta-spark cannot be imported and runtime install fails.
-        """
-        from ...spark.lib import pyspark_sql
-
-        try:
-            from delta.tables import DeltaTable
-        except ImportError:
-            from yggdrasil.environ import PyEnv
-
-            m = PyEnv.runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
-            DeltaTable = m.DeltaTable
-
-        if not full_name:
-            full_name = self.table_full_name(
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name,
-            )
-
-        return DeltaTable.forName(
-            sparkSession=pyspark_sql.SparkSession.getActiveSession(),
-            tableOrViewName=full_name,
-        )
-
     def table(
         self,
         location: Optional[str] = None,
@@ -739,186 +632,149 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        location, catalog_name, schema_name, table_name = self._check_location_params(
-            location=location,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=True,
+        if table is None:
+            table = self.table(
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+
+        table = table.ensure_created(data)
+        location = table.full_name(safe=True)
+        catalog_name, schema_name = table.catalog_name, table.schema_name
+        existing_schema = table.arrow_schema
+        cast_options = CastOptions.check_arg(
+            options=cast_options,
+            target_field=existing_schema
         )
 
-        with self.connect() as connected:
-            if table is not None:
-                try:
-                    # Fail fast
-                    _ = table.arrow_schema
-                except NotFound:
-                    table = None
+        logger.debug("Inserting %s into %s", data, location)
 
-            if table is None:
-                try:
-                    table = connected.table(
-                        location=location,
-                        catalog_name=catalog_name,
-                        schema_name=schema_name,
-                        table_name=table_name,
-                    )
+        temp_volume_path = (
+            self.client.tmp_path(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                volume_name="tmp",
+                extension="parquet",
+                max_lifetime=3600,
+            )
+            if temp_volume_path is None
+            else DatabricksPath.parse(obj=temp_volume_path, client=self.client)
+        )
 
-                    _ = table.arrow_schema
-                except NotFound as exc:
-                    if not hasattr(data, "columns") and not hasattr(data, "schema"):
-                        from ...polars.cast import any_to_polars_dataframe
+        temp_volume_path.write_table(
+            data,
+            file_format=FileFormat.PARQUET,
+            cast_options=cast_options,
+        )
 
-                        data = any_to_polars_dataframe(data, cast_options)
+        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
-                    logger.warning("%s, creating it from input schema %s", exc, repr(data))
+        columns = list(existing_schema.names)
+        cols_quoted = ", ".join([quote_ident(c) for c in columns])
 
-                    connected.create_table(
-                        field=data,  # convertible to pa.Field via convert() in create_table
-                        catalog_name=catalog_name,
-                        schema_name=schema_name,
-                        table_name=table_name,
-                        if_not_exists=True,
-                        execute=True,
-                    )
+        statements: list[str] = []
 
-                    table = connected.table(
-                        location=location,
-                        catalog_name=catalog_name,
-                        schema_name=schema_name,
-                        table_name=table_name,
-                    )
-
-                    mode = SaveMode.APPEND
-
-            existing_schema = table.arrow_schema
-            cast_options = CastOptions.check_arg(
-                options=cast_options,
-                target_field=existing_schema
+        if match_by:
+            source_sql = f"SELECT {cols_quoted} FROM parquet.{quote_ident(str(temp_volume_path))}"
+            on_condition = _build_match_condition(
+                match_by,
+                left_alias="T",
+                right_alias="S",
+                null_safe=True,
             )
 
-            logger.debug("Inserting %s into %s", data, location)
+            if mode == SaveMode.OVERWRITE:
+                key_cols = ", ".join([quote_ident(k) for k in match_by])
 
-            temp_volume_path = (
-                self.client.tmp_path(
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    volume_name="tmp",
-                    extension="parquet",
-                    max_lifetime=3600,
-                )
-                if temp_volume_path is None
-                else DatabricksPath.parse(obj=temp_volume_path, client=connected.workspace)
-            )
-
-            temp_volume_path.write_table(
-                data,
-                file_format=FileFormat.PARQUET,
-                cast_options=cast_options,
-            )
-
-            mode = SaveMode.parse(mode, default=SaveMode.AUTO)
-
-            columns = list(existing_schema.names)
-            cols_quoted = ", ".join([quote_ident(c) for c in columns])
-
-            statements: list[str] = []
-
-            if match_by:
-                source_sql = f"SELECT {cols_quoted} FROM parquet.{quote_ident(str(temp_volume_path))}"
-                on_condition = _build_match_condition(
-                    match_by,
-                    left_alias="T",
-                    right_alias="S",
-                    null_safe=True,
-                )
-
-                if mode == SaveMode.OVERWRITE:
-                    key_cols = ", ".join([quote_ident(k) for k in match_by])
-
-                    delete_sql = f"""DELETE FROM {location} AS T
+                delete_sql = f"""DELETE FROM {location} AS T
 USING (
-  SELECT DISTINCT {key_cols}
-  FROM parquet.{quote_ident(str(temp_volume_path))}
+SELECT DISTINCT {key_cols}
+FROM parquet.{quote_ident(str(temp_volume_path))}
 ) AS S
 ON {on_condition}""".strip()
 
-                    insert_sql = f"""INSERT INTO {location} ({cols_quoted})
+                insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 {source_sql}""".strip()
 
-                    # Need consecutive queries
-                    wait = True
-                    statements.extend([delete_sql, insert_sql])
+                statements.extend([delete_sql, insert_sql])
 
-                elif mode == SaveMode.APPEND:
-                    insert_clause = (
-                        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                        f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
-                    )
+            elif mode == SaveMode.APPEND:
+                insert_clause = (
+                    f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                    f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
+                )
 
-                    merge_sql = f"""MERGE INTO {location} AS T
+                merge_sql = f"""MERGE INTO {location} AS T
 USING (
-  {source_sql}
+{source_sql}
 ) AS S
 ON {on_condition}
 {insert_clause}""".strip()
 
-                    statements.append(merge_sql)
+                statements.append(merge_sql)
 
-                else:
-                    update_cols = [c for c in columns if c not in match_by]
-                    update_clause = ""
-                    if update_cols:
-                        update_set = ", ".join([f"T.{quote_ident(c)} = S.{quote_ident(c)}" for c in update_cols])
-                        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
+            else:
+                update_cols = [c for c in columns if c not in match_by]
+                update_clause = ""
+                if update_cols:
+                    update_set = ", ".join([f"T.{quote_ident(c)} = S.{quote_ident(c)}" for c in update_cols])
+                    update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
 
-                    insert_clause = (
-                        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                        f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
-                    )
+                insert_clause = (
+                    f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                    f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
+                )
 
-                    merge_sql = f"""MERGE INTO {location} AS T
+                merge_sql = f"""MERGE INTO {location} AS T
 USING (
-  {source_sql}
+{source_sql}
 ) AS S
 ON {on_condition}
 {update_clause}
 {insert_clause}""".strip()
 
-                    statements.append(merge_sql)
+                statements.append(merge_sql)
 
+        else:
+            if mode == SaveMode.OVERWRITE:
+                insert_sql = f"""INSERT OVERWRITE {location}
+SELECT {cols_quoted}
+FROM parquet.{quote_ident(str(temp_volume_path))}"""
             else:
-                if mode == SaveMode.OVERWRITE:
-                    insert_sql = f"""INSERT OVERWRITE {location}
+                insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 SELECT {cols_quoted}
 FROM parquet.{quote_ident(str(temp_volume_path))}"""
+            statements.append(insert_sql)
+
+        try:
+            if statements:
+                if len(statements) == 1:
+                    self.execute(statements[0], wait=wait, raise_error=raise_error)
                 else:
-                    insert_sql = f"""INSERT INTO {location} ({cols_quoted})
-SELECT {cols_quoted}
-FROM parquet.{quote_ident(str(temp_volume_path))}"""
-                statements.append(insert_sql)
+                    for stmt in statements[:-1]:
+                        self.execute(stmt, wait=True, raise_error=raise_error)
 
-            try:
-                for stmt in statements:
-                    connected.execute(stmt, wait=wait, raise_error=raise_error)
-            finally:
-                if wait:
-                    Job.make(
-                        temp_volume_path.remove,
-                        recursive=True,
-                    ).fire_and_forget()
+                    self.execute(statements[-1], wait=wait, raise_error=raise_error)
+        finally:
+            if wait:
+                Job.make(
+                    temp_volume_path.remove,
+                    recursive=True,
+                ).fire_and_forget()
 
-            logger.info("Arrow inserted into %s", location)
+        logger.info("Arrow inserted into %s", location)
 
-            if zorder_by:
-                zorder_cols = ", ".join([quote_ident(c) for c in zorder_by])
-                connected.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
+        if zorder_by:
+            zorder_cols = ", ".join([quote_ident(c) for c in zorder_by])
+            self.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
 
-            if optimize_after_merge and match_by:
-                connected.execute(f"OPTIMIZE {location}")
+        if optimize_after_merge and match_by:
+            self.execute(f"OPTIMIZE {location}")
 
-            if vacuum_hours is not None:
-                connected.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
+        if vacuum_hours is not None:
+            self.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
 
         return None
 
@@ -995,7 +851,6 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             None.
         """
         from yggdrasil.spark.cast import any_to_spark_dataframe
-        from pyspark.sql import DataFrame
         import pyspark.sql.functions as F
 
         logger.info(
@@ -1006,41 +861,24 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             overwrite_schema,
         )
 
-        spark_options = spark_options if spark_options else {}
-        if overwrite_schema:
-            spark_options["overwriteSchema"] = "true"
-
-        if table is not None:
-            try:
-                _ = table.arrow_schema
-            except:
-                table = None
-
         if table is None:
-            location, catalog_name, schema_name, table_name = self._check_location_params(
+            table = self.table(
                 location=location,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 table_name=table_name,
-                safe_chars=True,
             )
 
-            try:
-                table = self.table(
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                )
-            except NotFound:
-                data_df = convert(data, DataFrame)
-                data_df.write.mode("overwrite").options(**spark_options).saveAsTable(location)
-                return None
+        table = table.ensure_created(data)
 
         existing_schema = table.arrow_schema
         cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
         data_df = any_to_spark_dataframe(data, cast_options)
-        target = self.spark_table(full_name=location)
+        target = table.delta_spark()
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        spark_options = spark_options if spark_options else {}
+        if overwrite_schema:
+            spark_options["overwriteSchema"] = "true"
 
         if match_by:
             cond = _build_match_condition(
@@ -1144,243 +982,26 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
     def create_table(
         self,
-        field: Union[pa.Field, pa.Schema, Any],
+        definition: Union[pa.Field, pa.Schema, Any],
+        *,
         full_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        storage_location: Optional[str] = None,
-        partition_by: Optional[list[str]] = None,
-        cluster_by: Optional[bool | list[str]] = True,
-        comment: Optional[str] = None,
-        properties: Optional[dict[str, Any]] = None,
-        if_not_exists: bool = True,
-        or_replace: bool = False,
-        using: str = "DELTA",
-        optimize_write: bool = True,
-        auto_compact: bool = True,
-        enable_cdf: Optional[bool] = None,
-        enable_deletion_vectors: Optional[bool] = None,
-        target_file_size: Optional[int] = None,
-        column_mapping_mode: Optional[str] = None,
-        execute: bool = True,
-        wait_result: bool = True,
-    ) -> CreateTablePlan:
-        """
-        Generate (and optionally execute) a Databricks/Delta CREATE TABLE statement from an Apache Arrow schema/field,
-        with safety checks and performance-oriented defaults.
-
-        Safety/perf behaviors:
-          - Quotes identifiers to avoid keyword/name edge cases.
-          - Validates `partition_by` / `cluster_by` columns exist in schema.
-          - Supports managed or external tables via `storage_location`.
-          - Optionally enables Delta Column Mapping (name/id) with required protocol props.
-          - Adds workspace default tags into table properties (`tags.<k>`).
-
-        Args:
-            field:
-                Arrow schema/field describing the table, or any object convertible to `pa.Field` via `convert()`.
-                - If `pa.Schema`: all schema fields become columns.
-                - If struct `pa.Field`: its children become columns.
-                - If non-struct `pa.Field`: single-column table.
-            full_name:
-                Fully qualified table name "catalog.schema.table". If provided, takes precedence.
-            catalog_name:
-                Catalog used when `full_name` not provided (or as override for partial `full_name`).
-            schema_name:
-                Schema used when `full_name` not provided (or as override for partial `full_name`).
-            table_name:
-                Table used when `full_name` not provided (or as override for partial `full_name`).
-            storage_location:
-                External storage location path. If set, emits `LOCATION '<path>'` (SQL-escaped).
-            partition_by:
-                Partition column names. Must exist in schema.
-                Note: if set, clustering is not emitted (partition wins).
-            cluster_by:
-                Controls clustering / liquid clustering.
-                - True: emits `CLUSTER BY AUTO`
-                - False: emits nothing
-                - list[str]: emits `CLUSTER BY (<cols...>)` (must exist in schema)
-                Note: only applied when `partition_by` is not set.
-            comment:
-                Table comment. If None and Arrow metadata contains b"comment", that is used.
-            properties:
-                Additional/override Delta table properties (caller wins last).
-            if_not_exists:
-                If True, generates `CREATE TABLE IF NOT EXISTS ...`. Mutually exclusive with `or_replace`.
-            or_replace:
-                If True, generates `CREATE OR REPLACE TABLE ...`. Mutually exclusive with `if_not_exists`.
-            using:
-                Storage format keyword (default "DELTA").
-            optimize_write:
-                Sets `delta.autoOptimize.optimizeWrite`.
-            auto_compact:
-                Sets `delta.autoOptimize.autoCompact`.
-            enable_cdf:
-                If set, sets `delta.enableChangeDataFeed`.
-            enable_deletion_vectors:
-                If set, sets `delta.enableDeletionVectors`.
-            target_file_size:
-                If set, sets `delta.targetFileSize` (bytes).
-            column_mapping_mode:
-                Delta column mapping mode:
-                - None: auto-detect (enable "name" iff invalid column names exist, else "none")
-                - "none": do not enable column mapping
-                - "name": enable name-based column mapping
-                - "id": enable id-based column mapping
-                When enabled (name/id), also sets:
-                - `delta.minReaderVersion = 2`
-                - `delta.minWriterVersion = 5`
-            execute:
-                If True, executes the generated SQL via :meth:`execute`.
-            wait_result:
-                Passed to :meth:`execute` when `execute=True`.
-
-        Returns:
-            CreateTablePlan:
-                Always returns a plan. If `execute=True`, plan.result is populated.
-
-        Raises:
-            ValueError:
-                On invalid naming parameters, conflicting flags, invalid column mapping mode, or missing columns.
-            SqlStatementError:
-                If execution fails and cannot be recovered (e.g., schema creation retry fails).
-        """
-        if not isinstance(field, pa.Field):
-            field = convert(field, pa.Field)
-
-        schema_metadata = field.metadata or {}
-
-        if pa.types.is_struct(field.type):
-            arrow_fields = list(field.type)
-        else:
-            arrow_fields = [field]
-
-        full_name, catalog_name, schema_name, table_name = self._check_location_params(
+        **kwargs
+    ) -> "Table":
+        table = self.table(
             location=full_name,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
-            safe_chars=True,
         )
 
-        if comment is None and schema_metadata:
-            c = schema_metadata.get(b"comment")
-            if isinstance(c, bytes):
-                comment = c.decode("utf-8")
-
-        any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
-        warnings: list[str] = []
-
-        if column_mapping_mode is None:
-            column_mapping_mode = "name" if any_invalid else "none"
-
-        if column_mapping_mode not in ("none", "name", "id"):
-            raise ValueError("column_mapping_mode must be one of: None, 'none', 'name', 'id'.")
-
-        col_names = {f.name for f in arrow_fields}
-
-        if partition_by:
-            missing = [c for c in partition_by if c not in col_names]
-            if missing:
-                raise ValueError(f"partition_by contains unknown columns: {missing}")
-
-        if isinstance(cluster_by, list):
-            missing = [c for c in cluster_by if c not in col_names]
-            if missing:
-                raise ValueError(f"cluster_by contains unknown columns: {missing}")
-
-        column_definitions = [arrow_field_to_ddl(child) for child in arrow_fields]
-
-        if or_replace and if_not_exists:
-            raise ValueError("Use either or_replace or if_not_exists, not both.")
-
-        create_kw = "CREATE OR REPLACE TABLE" if or_replace else "CREATE TABLE"
-        if if_not_exists and not or_replace:
-            create_kw = "CREATE TABLE IF NOT EXISTS"
-
-        sql_parts: list[str] = [
-            f"{create_kw} {full_name} (",
-            "  " + ",\n  ".join(column_definitions),
-            ")",
-            f"USING {using}",
-        ]
-
-        if partition_by:
-            sql_parts.append("PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")")
-        elif cluster_by:
-            if isinstance(cluster_by, bool):
-                if cluster_by:
-                    sql_parts.append("CLUSTER BY AUTO")
-            else:
-                sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
-
-        if comment:
-            sql_parts.append(f"COMMENT '{escape_sql_string(comment)}'")
-
-        if storage_location:
-            sql_parts.append(f"LOCATION '{escape_sql_string(storage_location)}'")
-
-        props: dict[str, Any] = {
-            "delta.autoOptimize.optimizeWrite": bool(optimize_write),
-            "delta.autoOptimize.autoCompact": bool(auto_compact),
-        }
-
-        if enable_cdf is not None:
-            props["delta.enableChangeDataFeed"] = bool(enable_cdf)
-
-        if enable_deletion_vectors is not None:
-            props["delta.enableDeletionVectors"] = bool(enable_deletion_vectors)
-
-        if target_file_size is not None:
-            props["delta.targetFileSize"] = int(target_file_size)
-
-        if column_mapping_mode != "none":
-            props["delta.columnMapping.mode"] = column_mapping_mode
-            props["delta.minReaderVersion"] = 2
-            props["delta.minWriterVersion"] = 5
-
-        if properties:
-            props.update(properties)
-
-        if any_invalid and column_mapping_mode == "none":
-            warnings.append(
-                "Schema has invalid column names but column_mapping_mode='none'. "
-                "This will fail unless you rename/escape columns or enable column mapping."
-            )
-
-        default_tags = self.default_tags()
-        for k, v in default_tags.items():
-            props[f"tags.{k}"] = v
-
-        if props:
-
-            def fmt(_key: str, _value: Any) -> str:
-                if isinstance(_value, str):
-                    return f"'{_key}' = '{escape_sql_string(_value)}'"
-                if isinstance(_value, bool):
-                    return f"'{_key}' = '{'true' if _value else 'false'}'"
-                return f"'{_key}' = {_value}"
-
-            sql_parts.append("TBLPROPERTIES (" + ", ".join(fmt(k, v) for k, v in props.items()) + ")")
-
-        statement = "\n".join(sql_parts)
-        plan = CreateTablePlan(sql=statement, properties=props, warnings=warnings, arrow_field=field)
-
-        if not execute:
-            return plan
-
-        try:
-            res = self.execute(statement, wait=wait_result)
-        except Exception as e:
-            if "SCHEMA_NOT_FOUND" in str(e):
-                self.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema_name)}", wait=True)
-                res = self.execute(statement, wait=wait_result)
-            else:
-                raise
-
-        plan.result = res
-        return plan
+        return table.create(
+            definition=definition,
+            if_not_exists=True,
+            **kwargs
+        )
 
     def _check_location_params(
         self,
@@ -1417,11 +1038,16 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             c, s, t = self._catalog_schema_table_names(location)
             catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
 
-        location = self.table_full_name(
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            safe_chars=safe_chars,
-        )
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
+        assert catalog_name, "No catalog name given"
+        assert schema_name, "No schema name given"
+        assert table_name, "No table name given"
+
+        if safe_chars:
+            location = f"{quote_ident(catalog_name)}.{quote_ident(schema_name)}.{quote_ident(table_name)}"
+        else:
+            location = f"{catalog_name}.{schema_name}.{table_name}"
 
         return location, catalog_name or self.catalog_name, schema_name or self.schema_name, table_name

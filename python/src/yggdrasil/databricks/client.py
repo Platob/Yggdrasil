@@ -11,7 +11,6 @@ from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callab
 from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
-from databricks.sdk.errors import DatabricksError
 
 from yggdrasil.environ import UserInfo
 from yggdrasil.io.url import URL, URLResource, url_resource_class
@@ -25,7 +24,7 @@ if TYPE_CHECKING:
     from .sql.engine import SQLEngine
     from .sql.warehouse import SQLWarehouse
     from .compute.service import Compute
-    from .secrets.secret import Secrets
+    from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace, DatabricksPath
 
 __all__ = [
@@ -778,7 +777,7 @@ class DatabricksClient(URLResource):
     @property
     def secrets(self) -> "Secrets":
         """Default secrets helper for this client."""
-        from .secrets.secret import Secrets
+        from .secrets.service import Secrets
 
         return self.lazy_property(
             self,

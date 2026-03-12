@@ -26,13 +26,13 @@ class Cities(Document):
 
 
 connect(
-    alias="GenCast",
-    host="mongodb+srv://xxx:xxx@xxx/?appName=xxx",
+    alias="test_connection",
+    host="mongodb+srv://xxx:xxx@cassandre-prod-rs0-pl-5.xr9cdx.mongodb.net/?appName=xxx",
 )
 
 @with_mongo_connection(
-    aliases="GenCast",
-    databricks="xxx"
+    aliases="test_connection",
+    databricks="xxx",
 )
 def decorated():
     return Cities.objects().first().to_pandas()

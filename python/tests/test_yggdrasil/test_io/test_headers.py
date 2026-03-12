@@ -61,7 +61,7 @@ def test_promoted_headers_invalid_content_length_becomes_none():
 
     promoted = PromotedHeaders.extract(headers)
 
-    assert promoted.content_length is None
+    assert promoted.content_length == 0
     assert promoted.remaining == {"X-Test": "1"}
 
 

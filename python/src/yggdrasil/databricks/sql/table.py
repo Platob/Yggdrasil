@@ -1,11 +1,11 @@
 import base64
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union, Iterator
+from typing import Any, Optional, Union, Iterator, TYPE_CHECKING
 
 import pyarrow as pa
 from databricks.sdk.client_types import HostType
-from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
+from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist, NotFound
 from databricks.sdk.service.catalog import (
     TableInfo,
     TableOperation,
@@ -16,13 +16,24 @@ from pyarrow.fs import FileSystem, S3FileSystem
 
 from yggdrasil.arrow.cast import any_to_arrow_schema
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.data import convert
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.enums import SaveMode
-from .types import arrow_field_to_column_info, column_info_to_arrow_field
+from .types import arrow_field_to_column_info, column_info_to_arrow_field, arrow_field_to_ddl, quote_ident, \
+    escape_sql_string
 from ..client import DatabricksService
 
+if TYPE_CHECKING:
+    import delta
+
 __all__ = ["Table"]
+
+
+_INVALID_COL_CHARS = set(" ,;{}()\n\t=")
+
+def _needs_column_mapping(col_name: str) -> bool:
+    return any(ch in _INVALID_COL_CHARS for ch in col_name)
 
 
 @dataclass(frozen=True)
@@ -68,6 +79,14 @@ class Table(DatabricksService):
     # -------------------------------------------------------------------------
     # Databricks SDK plumbing
     # -------------------------------------------------------------------------
+
+    @property
+    def exists(self):
+        try:
+            _ = self.infos
+            return True
+        except NotFound:
+            return False
 
     @property
     def table_id(self) -> str:
@@ -248,6 +267,35 @@ class Table(DatabricksService):
     # CRUD
     # -------------------------------------------------------------------------
 
+    def ensure_created(
+        self,
+        definition: Union[pa.Schema, Any, None],
+        *,
+        storage_location: Optional[str] = None,
+        comment: Optional[str] = None,
+        properties: Optional[dict[str, str]] = None,
+        table_type: TableType | None = None,
+        data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
+    ):
+        if not self.exists:
+            if definition is None:
+                _ = self.infos  # Trigger fetch to get existing metadata for error context
+
+            self.create(
+                definition=definition,
+                storage_location=storage_location,
+                comment=comment,
+                properties=properties,
+                table_type=table_type,
+                data_source_format=data_source_format,
+                if_not_exists=True
+            )
+        return self
+
+    def _reset_cache(self):
+        object.__setattr__(self, "_infos", None)
+        object.__setattr__(self, "_arrow_fields", None)
+
     def create(
         self,
         definition: Union[pa.Schema, Any],
@@ -306,79 +354,329 @@ class Table(DatabricksService):
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
-        if table_type == TableType.EXTERNAL and not storage_location:
-            storage_location = self.schema_storage_location(
-                table_type=table_type
-            ) + "/tables/%s" % self.table_name
-
         if table_type == TableType.MANAGED:
-            self.sql.create_table(
+            self.sql_create(
                 definition,
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
-                table_name=self.table_name,
                 comment=comment,
                 if_not_exists=if_not_exists
             )
-
-            object.__setattr__(self, "_infos", None)  # fetch fresh infos on next access
         else:
-            if not isinstance(definition, pa.Schema):
-                definition = any_to_arrow_schema(definition)
+            if table_type == TableType.EXTERNAL and not storage_location:
+                storage_location = self.schema_storage_location(
+                    table_type=table_type
+                ) + "/tables/%s" % self.table_name
 
-            # Resolve comment: explicit arg > schema metadata > None
-            if not comment and definition.metadata:
-                raw = definition.metadata.get(b"comment") or definition.metadata.get(b"description")
-                comment = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            return self.api_create(
+                definition=definition,
+                storage_location=storage_location,
+                comment=comment,
+                properties=properties,
+                table_type=table_type,
+                data_source_format=data_source_format,
+                if_not_exists=if_not_exists
+            )
 
-            columns = [
-                arrow_field_to_column_info(field=f, position=pos)
-                for pos, f in enumerate(definition)
-            ]
-
-            body: dict[str, Any] = {
-                "catalog_name":      self.catalog_name,
-                "schema_name":       self.schema_name,
-                "name":              self.table_name,
-                "table_type":        table_type.value,
-                "data_source_format": data_source_format.value,
-                "columns":           [c.as_dict() for c in columns],
-            }
-            if storage_location is not None:
-                body["storage_location"] = storage_location
-            if comment is not None:
-                body["comment"] = comment
-            if properties:
-                body["properties"] = properties
-
-            headers = {
-                "Accept":       "application/json",
-                "Content-Type": "application/json",
-            }
-
-            client = self.client.workspace_client().tables
-            cfg = client._api._cfg
-            if cfg.host_type == HostType.UNIFIED and cfg.workspace_id:
-                headers["X-Databricks-Org-Id"] = cfg.workspace_id
-
-            try:
-                res = client._api.do(
-                    "POST", "/api/2.1/unity-catalog/tables",
-                    body=body, headers=headers,
-                )
-
-                info = TableInfo.from_dict(res)
-                object.__setattr__(self, "_infos", info)
-            except DatabricksError as e:
-                if "already exists" in str(e):
-                    if not if_not_exists:
-                        raise
-                else:
-                    raise
-
-        object.__setattr__(self, "_arrow_fields", None)  # reset cached fields
+        self._reset_cache()
 
         return self
+
+    def sql_create(
+        self,
+        description: Union[pa.Field, pa.Schema, Any],
+        *,
+        storage_location: Optional[str] = None,
+        partition_by: Optional[list[str]] = None,
+        cluster_by: Optional[bool | list[str]] = True,
+        comment: Optional[str] = None,
+        properties: Optional[dict[str, Any]] = None,
+        if_not_exists: bool = True,
+        or_replace: bool = False,
+        using: str = "DELTA",
+        optimize_write: bool = True,
+        auto_compact: bool = True,
+        enable_cdf: Optional[bool] = None,
+        enable_deletion_vectors: Optional[bool] = None,
+        target_file_size: Optional[int] = None,
+        column_mapping_mode: Optional[str] = None,
+        wait_result: bool = True,
+    ) -> "Table":
+        """
+        Generate (and optionally execute) a Databricks/Delta CREATE TABLE statement from an Apache Arrow schema/field,
+        with safety checks and performance-oriented defaults.
+
+        Safety/perf behaviors:
+          - Quotes identifiers to avoid keyword/name edge cases.
+          - Validates `partition_by` / `cluster_by` columns exist in schema.
+          - Supports managed or external tables via `storage_location`.
+          - Optionally enables Delta Column Mapping (name/id) with required protocol props.
+          - Adds workspace default tags into table properties (`tags.<k>`).
+
+        Args:
+            description:
+                Arrow schema/field describing the table, or any object convertible to `pa.Field` via `convert()`.
+                - If `pa.Schema`: all schema fields become columns.
+                - If struct `pa.Field`: its children become columns.
+                - If non-struct `pa.Field`: single-column table.
+            storage_location:
+                External storage location path. If set, emits `LOCATION '<path>'` (SQL-escaped).
+            partition_by:
+                Partition column names. Must exist in schema.
+                Note: if set, clustering is not emitted (partition wins).
+            cluster_by:
+                Controls clustering / liquid clustering.
+                - True: emits `CLUSTER BY AUTO`
+                - False: emits nothing
+                - list[str]: emits `CLUSTER BY (<cols...>)` (must exist in schema)
+                Note: only applied when `partition_by` is not set.
+            comment:
+                Table comment. If None and Arrow metadata contains "comment", that is used.
+            properties:
+                Additional/override Delta table properties (caller wins last).
+            if_not_exists:
+                If True, generates `CREATE TABLE IF NOT EXISTS ...`. Mutually exclusive with `or_replace`.
+            or_replace:
+                If True, generates `CREATE OR REPLACE TABLE ...`. Mutually exclusive with `if_not_exists`.
+            using:
+                Storage format keyword (default "DELTA").
+            optimize_write:
+                Sets `delta.autoOptimize.optimizeWrite`.
+            auto_compact:
+                Sets `delta.autoOptimize.autoCompact`.
+            enable_cdf:
+                If set, sets `delta.enableChangeDataFeed`.
+            enable_deletion_vectors:
+                If set, sets `delta.enableDeletionVectors`.
+            target_file_size:
+                If set, sets `delta.targetFileSize` (bytes).
+            column_mapping_mode:
+                Delta column mapping mode:
+                - None: auto-detect (enable "name" iff invalid column names exist, else "none")
+                - "none": do not enable column mapping
+                - "name": enable name-based column mapping
+                - "id": enable id-based column mapping
+                When enabled (name/id), also sets:
+                - `delta.minReaderVersion = 2`
+                - `delta.minWriterVersion = 5`
+            wait_result:
+                Passed to :meth:`execute` when `execute=True`.
+
+        Returns:
+            CreateTablePlan:
+                Always returns a plan. If `execute=True`, plan.result is populated.
+
+        Raises:
+            ValueError:
+                On invalid naming parameters, conflicting flags, invalid column mapping mode, or missing columns.
+            SqlStatementError:
+                If execution fails and cannot be recovered (e.g., schema creation retry fails).
+        """
+        if not isinstance(description, pa.Field):
+            description = convert(description, pa.Field)
+
+        schema_metadata = description.metadata or {}
+
+        if pa.types.is_struct(description.type):
+            arrow_fields = list(description.type)
+        else:
+            arrow_fields = [field]
+
+        if comment is None and schema_metadata:
+            c = schema_metadata.get(b"comment")
+            if isinstance(c, bytes):
+                comment = c.decode("utf-8")
+
+        any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
+        warnings: list[str] = []
+
+        if column_mapping_mode is None:
+            column_mapping_mode = "name" if any_invalid else "none"
+
+        if column_mapping_mode not in ("none", "name", "id"):
+            raise ValueError("column_mapping_mode must be one of: None, 'none', 'name', 'id'.")
+
+        col_names = {f.name for f in arrow_fields}
+
+        if partition_by:
+            missing = [c for c in partition_by if c not in col_names]
+            if missing:
+                raise ValueError(f"partition_by contains unknown columns: {missing}")
+
+        if isinstance(cluster_by, list):
+            missing = [c for c in cluster_by if c not in col_names]
+            if missing:
+                raise ValueError(f"cluster_by contains unknown columns: {missing}")
+
+        column_definitions = [arrow_field_to_ddl(child) for child in arrow_fields]
+
+        if or_replace and if_not_exists:
+            raise ValueError("Use either or_replace or if_not_exists, not both.")
+
+        create_kw = "CREATE OR REPLACE TABLE" if or_replace else "CREATE TABLE"
+        if if_not_exists and not or_replace:
+            create_kw = "CREATE TABLE IF NOT EXISTS"
+
+        sql_parts: list[str] = [
+            f"{create_kw} {self.full_name(safe=True)} (",
+            "  " + ",\n  ".join(column_definitions),
+            ")",
+            f"USING {using}",
+        ]
+
+        if partition_by:
+            sql_parts.append("PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")")
+        elif cluster_by:
+            if isinstance(cluster_by, bool):
+                if cluster_by:
+                    sql_parts.append("CLUSTER BY AUTO")
+            else:
+                sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
+
+        if comment:
+            sql_parts.append(f"COMMENT '{escape_sql_string(comment)}'")
+
+        if storage_location:
+            sql_parts.append(f"LOCATION '{escape_sql_string(storage_location)}'")
+
+        props: dict[str, Any] = {
+            "delta.autoOptimize.optimizeWrite": bool(optimize_write),
+            "delta.autoOptimize.autoCompact": bool(auto_compact),
+        }
+
+        if enable_cdf is not None:
+            props["delta.enableChangeDataFeed"] = bool(enable_cdf)
+
+        if enable_deletion_vectors is not None:
+            props["delta.enableDeletionVectors"] = bool(enable_deletion_vectors)
+
+        if target_file_size is not None:
+            props["delta.targetFileSize"] = int(target_file_size)
+
+        if column_mapping_mode != "none":
+            props["delta.columnMapping.mode"] = column_mapping_mode
+            props["delta.minReaderVersion"] = 2
+            props["delta.minWriterVersion"] = 5
+
+        if properties:
+            props.update(properties)
+
+        if any_invalid and column_mapping_mode == "none":
+            warnings.append(
+                "Schema has invalid column names but column_mapping_mode='none'. "
+                "This will fail unless you rename/escape columns or enable column mapping."
+            )
+
+        default_tags = self.default_tags()
+        for k, v in default_tags.items():
+            props[f"tags.{k}"] = v
+
+        if props:
+
+            def fmt(_key: str, _value: Any) -> str:
+                if isinstance(_value, str):
+                    return f"'{_key}' = '{escape_sql_string(_value)}'"
+                if isinstance(_value, bool):
+                    return f"'{_key}' = '{'true' if _value else 'false'}'"
+                return f"'{_key}' = {_value}"
+
+            sql_parts.append("TBLPROPERTIES (" + ", ".join(fmt(k, v) for k, v in props.items()) + ")")
+
+        statement = "\n".join(sql_parts)
+
+        try:
+            self.sql.execute(statement, wait=wait_result)
+        except Exception as e:
+            if "SCHEMA_NOT_FOUND" in str(e):
+                self.sql.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema_name)}", wait=True)
+                self.sql.execute(statement, wait=wait_result)
+            else:
+                raise
+
+        self._reset_cache()
+        return self
+
+    def api_create(
+        self,
+        definition: Union[pa.Schema, Any],
+        *,
+        storage_location: Optional[str] = None,
+        comment: Optional[str] = None,
+        properties: Optional[dict[str, str]] = None,
+        table_type: TableType | None = None,
+        data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
+        if_not_exists: bool = False
+    ) -> "Table":
+        if not isinstance(definition, pa.Schema):
+            definition = any_to_arrow_schema(definition)
+
+        # Resolve comment: explicit arg > schema metadata > None
+        if not comment and definition.metadata:
+            raw = definition.metadata.get(b"comment") or definition.metadata.get(b"description")
+            comment = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+        columns = [
+            arrow_field_to_column_info(field=f, position=pos)
+            for pos, f in enumerate(definition)
+        ]
+
+        body: dict[str, Any] = {
+            "catalog_name": self.catalog_name,
+            "schema_name": self.schema_name,
+            "name": self.table_name,
+            "table_type": table_type.value,
+            "data_source_format": data_source_format.value,
+            "columns": [c.as_dict() for c in columns],
+        }
+        if storage_location is not None:
+            body["storage_location"] = storage_location
+        if comment is not None:
+            body["comment"] = comment
+        if properties:
+            body["properties"] = properties
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        client = self.client.workspace_client().tables
+        cfg = client._api._cfg
+        if cfg.host_type == HostType.UNIFIED and cfg.workspace_id:
+            headers["X-Databricks-Org-Id"] = cfg.workspace_id
+
+        try:
+            res = client._api.do(
+                "POST", "/api/2.1/unity-catalog/tables",
+                body=body, headers=headers,
+            )
+
+            info = TableInfo.from_dict(res)
+            object.__setattr__(self, "_infos", info)
+        except DatabricksError as e:
+            if "already exists" in str(e):
+                if not if_not_exists:
+                    raise
+            else:
+                raise
+
+        self._reset_cache()
+
+        return self
+
+    def delta_spark(self) -> "delta.tables.DeltaTable":
+        from yggdrasil.spark.lib import pyspark_sql
+
+        try:
+            from delta.tables import DeltaTable
+        except ImportError:
+            from yggdrasil.environ import runtime_import_module
+
+            m = runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
+            DeltaTable = m.DeltaTable
+
+        return DeltaTable.forName(
+            sparkSession=pyspark_sql.SparkSession.getActiveSession(),
+            tableOrViewName=self.full_name(safe=True),
+        )
 
     def delete(
         self,
@@ -566,6 +864,7 @@ def _quote_ident(name: str) -> str:
     parts = [p.strip() for p in name.split(".") if p.strip()]
     return ".".join(f"`{p.replace('`','``')}`" for p in parts)
 
+
 def _sql_literal(v) -> str:
     # bytes -> base64 string literal
     if isinstance(v, (bytes, bytearray, memoryview)):
@@ -590,6 +889,7 @@ def _sql_literal(v) -> str:
         pass
 
     return "'" + s.replace("'", "''") + "'"
+
 
 def _build_predicate(col: str, op: str, val: str) -> str:
     op_norm = op.strip().upper()

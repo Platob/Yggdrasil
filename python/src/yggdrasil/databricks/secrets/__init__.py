@@ -1,1 +1,1 @@
-from .secret import *
+from .service import *

@@ -82,7 +82,7 @@ class MediaType:
         codec: "Codec | None" = None,
         default: "MediaType | None" = None
     ) -> "MediaType":
-        if not s:
+        if not s or "*" in s:
             return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
 
         raw = s.strip()
@@ -182,6 +182,10 @@ class MediaType:
     @property
     def is_octet(self):
         return self.mime_type == MimeType.OCTET_STREAM
+
+    @property
+    def is_json(self):
+        return self.mime_type == MimeType.JSON
 
     def full_mime_type(self, concat_codec: bool = True) -> MimeType:
         if not concat_codec or self.codec is None:

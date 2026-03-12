@@ -73,7 +73,7 @@ def sanitize_mapping(mode: str, m: Mapping[Any, Any]) -> MutableMapping[str, Any
 def anonymize_parameters(
     params: Any,
     *,
-    mode: Literal["remove", "redact", "hash"] = "remove",
+    mode: Literal["remove", "redact"] = "remove",
     salt: str = "",
     preserve_keys: bool = True,
 ) -> Any:

@@ -1,9 +1,9 @@
 try:
     import pyspark
 except ImportError:
-    from ..environ import PyEnv
+    from yggdrasil.environ import runtime_import_module
 
-    pyspark = PyEnv.runtime_import_module(module_name="pyspark", pip_name="pyspark")
+    pyspark = runtime_import_module(module_name="pyspark", pip_name="pyspark", install=True)
 
 pyspark_sql = pyspark.sql
 

@@ -101,7 +101,7 @@ class BytesIOView(io.RawIOBase):
             n = min(int(size), avail)
 
         abs_pos = self._start + int(self._pos)
-        out = self._parent._pread(n, abs_pos)
+        out = self._parent.pread(n, abs_pos)
         self._pos += len(out)
         return out
 
@@ -113,7 +113,7 @@ class BytesIOView(io.RawIOBase):
 
         n = min(len(mv), avail)
         abs_pos = self._start + int(self._pos)
-        chunk = self._parent._pread(n, abs_pos)
+        chunk = self._parent.pread(n, abs_pos)
         mv[: len(chunk)] = chunk
         self._pos += len(chunk)
         return len(chunk)
@@ -141,7 +141,7 @@ class BytesIOView(io.RawIOBase):
             mv = mv[:remaining]
 
         abs_pos = self._start + int(self._pos)
-        n = self._parent._pwrite(mv, abs_pos)
+        n = self._parent.pwrite(mv, abs_pos)
         self._pos += int(n)
 
         # Update end if we grew (only possible when _max_len is None or writing within window end)

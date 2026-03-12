@@ -62,9 +62,9 @@ def test_get_non_string_returns_none():
         ("PQ", MimeType.PARQUET),
         ("/tmp/file.parquet", MimeType.PARQUET),
         ("C:\\tmp\\file.parquet", MimeType.PARQUET),
-        (".ipc", MimeType.IPC),
-        ("feather", MimeType.IPC),
-        ("/tmp/x.feather", MimeType.IPC),
+        (".ipc", MimeType.ARROW_IPC),
+        ("feather", MimeType.ARROW_IPC),
+        ("/tmp/x.feather", MimeType.ARROW_IPC),
         (".orc", MimeType.ORC),
         ("avro", MimeType.AVRO),
         (".json", MimeType.JSON),
@@ -122,7 +122,7 @@ def test_parse_str_default_when_unknown():
         (b"PAR1" + b"x" * 20, MimeType.PARQUET),
         (b"ORC" + b"x" * 20, MimeType.ORC),
         (b"Obj\x01" + b"x" * 20, MimeType.AVRO),
-        (b"ARROW1" + b"x" * 20, MimeType.IPC),
+        (b"ARROW1" + b"x" * 20, MimeType.ARROW_IPC),
         (b"\x89PNG\r\n\x1a\n" + b"x" * 20, MimeType.PNG),
         (b"\xff\xd8\xff" + b"x" * 20, MimeType.JPEG),
         (b"GIF89a" + b"x" * 20, MimeType.GIF),
@@ -182,7 +182,7 @@ def test_is_tabular_true_for_rowish(mt: MimeType):
     assert mt.is_tabular is True
 
 
-@pytest.mark.parametrize("mt", [MimeType.PARQUET, MimeType.IPC, MimeType.PNG, MimeType.PDF])
+@pytest.mark.parametrize("mt", [MimeType.PARQUET, MimeType.ARROW_IPC, MimeType.PNG, MimeType.PDF])
 def test_is_tabular_false_for_non_rowish(mt: MimeType):
     assert mt.is_tabular is False
 

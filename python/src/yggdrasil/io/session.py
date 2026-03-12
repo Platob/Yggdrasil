@@ -1,14 +1,20 @@
+import base64
 import datetime as dt
+import itertools
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable, Literal
 
-from yggdrasil.concurrent.threading import JobPoolExecutor
+from yggdrasil.io import SaveMode
+
+from yggdrasil.data import any_to_datetime
+
+from yggdrasil.concurrent.threading import JobPoolExecutor, Job
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
 from .buffer import BytesIO
 from .request import PreparedRequest
-from .response import Response
+from .response import Response, RESPONSE_ARROW_SCHEMA
 from .url import URL
 
 if TYPE_CHECKING:
@@ -18,11 +24,26 @@ if TYPE_CHECKING:
 __all__ = ["Session"]
 
 
+def to_utc_epoch_us(x: dt.datetime | dt.date | str) -> int:
+    if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
+        v = dt.datetime(x.year, x.month, x.day, tzinfo=dt.timezone.utc)
+    else:
+        v = any_to_datetime(x)
+
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=dt.timezone.utc)
+
+    v = v.astimezone(dt.timezone.utc)
+    return int(v.timestamp() * 1_000_000)
+
+
 @dataclass
 class Session(ABC):
     base_url: Optional[URL] = None
     verify: bool = True
+    pool_maxsize: int = 10
 
+    send_headers: Optional[dict[str, str]] = field(default=None, repr=False)
     waiting: WaitingConfig = field(default_factory=lambda: DEFAULT_WAITING_CONFIG, repr=False, compare=False, hash=False)
 
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
@@ -77,18 +98,143 @@ class Session(ABC):
         *,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
-        normalize: Optional[bool] = None,
         stream: bool = True,
         cache: Optional["Table"] = None,
         cache_by: Optional[list[str]] = None,
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
-        anonymize: Literal["remove", "redact", "hash"] = "remove",
+        anonymize: Literal["remove", "redact"] = "remove",
         wait_cache: WaitingConfigArg = False,
+        pool: Optional[JobPoolExecutor | int] = None,
     ) -> Response:
         raise NotImplementedError
 
-    @abstractmethod
+
+    @staticmethod
+    def _cache_by_keys(arg: Optional[list[str]] = None) -> list[str]:
+        if not arg:
+            arg = [
+                "request_method",
+                "request_url_host",
+                "request_url_path",
+                "request_url_query",
+                "request_content_length",
+                "request_body_hash",
+                "response_content_length",
+                "response_body_hash"
+            ]
+
+        invalid = [key for key in arg if key not in RESPONSE_ARROW_SCHEMA.names]
+        if invalid:
+            raise ValueError(
+                f"Invalid cache_by key(s): {invalid}, must be within {RESPONSE_ARROW_SCHEMA.names}"
+            )
+
+        return arg
+
+    @staticmethod
+    def _cache_value_from_request(request: PreparedRequest, key: str) -> Any:
+        if key == "request_method":
+            return request.method
+        if key == "request_url":
+            return request.url.to_string()
+        if key == "request_url_scheme":
+            return request.url.scheme
+        if key == "request_url_host":
+            return request.url.host
+        if key == "request_url_port":
+            return request.url.port
+        if key == "request_url_path":
+            return request.url.path
+        if key == "request_url_query":
+            return request.url.query
+        if key == "request_body_hash":
+            return request.body.xxh3_int64() if request.body else None
+        if key == "request_content_length":
+            return request.content_length
+
+        # fallback for future extension if PreparedRequest exposes same-name attrs
+        if hasattr(request, key):
+            return getattr(request, key)
+
+        raise ValueError(f"Unsupported request cache_by key: {key}")
+
+    @classmethod
+    def _cache_values_from_request(
+        cls,
+        request: PreparedRequest,
+        keys: list[str],
+    ) -> dict[str, Any]:
+        return {key: cls._cache_value_from_request(request, key) for key in keys}
+
+    @staticmethod
+    def _cache_value_from_response(response: Response, key: str) -> Any:
+        if hasattr(response, key):
+            return getattr(response, key)
+
+        raise ValueError(f"Unsupported response cache_by key: {key}")
+
+    @classmethod
+    def _cache_tuple_from_request(
+        cls,
+        request: PreparedRequest,
+        keys: list[str],
+    ) -> tuple:
+        values = cls._cache_values_from_request(request, keys)
+        return tuple(values[key] for key in keys)
+
+    @classmethod
+    def _cache_tuple_from_response(
+        cls,
+        response: Response,
+        keys: list[str],
+    ) -> tuple:
+        return tuple(cls._cache_value_from_response(response, key) for key in keys)
+
+    @staticmethod
+    def _sql_literal(value: Any) -> str:
+        if value is None:
+            return "null"
+
+        if isinstance(value, bytes):
+            value = base64.b64encode(value).decode("ascii")
+        elif isinstance(value, (int, float)):
+            return str(value)
+        elif isinstance(value, dt.datetime):
+            return f"timestamp '{value.isoformat(sep=' ', timespec='microseconds')}'"
+        else:
+            value = str(value)
+
+        value = value.replace("'", "''")
+        return f"'{value}'"
+
+    @classmethod
+    def _sql_match_clause(
+        cls,
+        request: PreparedRequest | None,
+        keys: list[str],
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
+    ) -> str:
+        clauses: list[str] = []
+
+        if request is not None and keys:
+            values = cls._cache_values_from_request(request, keys)
+
+            for key in keys:
+                value = values[key]
+                if value is None:
+                    clauses.append(f"{key} IS NULL")
+                else:
+                    clauses.append(f"{key} = {cls._sql_literal(value)}")
+
+        if received_from is not None and received_from != "":
+            clauses.append(f"response_received_at_epoch >= {to_utc_epoch_us(received_from)}")
+        if received_to is not None and received_to != "":
+            clauses.append(f"response_received_at_epoch <= {to_utc_epoch_us(received_to)}")
+
+        return " AND ".join(clauses)
+
     def send_many(
         self,
         requests: Iterator[PreparedRequest],
@@ -101,18 +247,165 @@ class Session(ABC):
         cache_by: Optional[list[str]] = None,
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
-        anonymize: Literal["remove", "redact", "hash"] = "remove",
+        anonymize: Literal["remove", "redact"] = "remove",
         wait_cache: WaitingConfigArg = False,
         # Pooling options
         pool: Optional[JobPoolExecutor | int] = None,
         batch_size: Optional[int] = None,
         ordered: bool = False,
         max_in_flight: Optional[int] = None,
-        cancel_on_exit: bool = False,
-        shutdown_on_exit: bool = False,
-        shutdown_wait: bool = False,
-    ):
-        raise NotImplementedError
+    ) -> Iterator[Response]:
+        if normalize is None:
+            normalize = cache is not None
+
+        if pool is None:
+            pool = self.pool_maxsize
+        close_on_exit = not isinstance(pool, JobPoolExecutor)
+
+        if cache is not None:
+            cache_by = self._cache_by_keys(cache_by)
+            cache_request_by = [_ for _ in cache_by if _.startswith("request")]
+        else:
+            cache_request_by = []
+
+        with JobPoolExecutor.parse(pool) as pool:
+            if not batch_size:
+                batch_size = pool.max_workers * 100
+
+            if cache is None:
+                def jobs():
+                    for req in requests:
+                        yield Job.make(
+                            self.send,
+                            req,
+                            wait=wait,
+                            raise_error=raise_error,
+                            normalize=normalize,
+                            stream=stream,
+                        )
+
+                for result in pool.as_completed(
+                    jobs(),
+                    ordered=ordered,
+                    max_in_flight=max_in_flight,
+                    cancel_on_exit=True,
+                    shutdown_on_exit=True,
+                    raise_error=True,
+                ):
+                    resp = result.result
+
+                    if raise_error:
+                        resp.raise_for_status()
+                        yield resp
+                    elif resp.ok:
+                        yield resp
+            else:
+                def _batched(it: Iterator, n: int) -> Iterator[list]:
+                    it = iter(it)
+                    while True:
+                        b = list(itertools.islice(it, n))
+                        if not b:
+                            break
+                        yield b
+
+                for batch in _batched(requests, batch_size):
+                    anon_batch = [
+                        req.anonymize(mode="remove")
+                        for req in batch
+                    ]
+
+                    time_filter = self._sql_match_clause(
+                        None, keys=[],
+                        received_from=received_from,
+                        received_to=received_to,
+                    )
+                    clauses = " OR ".join(
+                        "(%s)" % self._sql_match_clause(req, keys=cache_request_by)
+                        for req in anon_batch
+                    )
+                    query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {time_filter} AND ({clauses})"
+
+                    try:
+                        sql_cache_statement = cache.sql.execute(query)
+                    except Exception as e:
+                        if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
+                            cache.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                            sql_cache_statement = cache.sql.execute(query)
+                        else:
+                            raise
+
+                    arrow_batch = sql_cache_statement.to_arrow_table()
+                    cached_responses = list(Response.from_arrow(arrow_batch))
+
+                    cache_map: dict[tuple, Response] = {}
+                    for resp in cached_responses:
+                        cache_map[self._cache_tuple_from_response(resp, cache_request_by)] = resp
+
+                    hits: list[Response] = []
+                    misses: list[PreparedRequest] = []
+
+                    for req in batch:
+                        anon_req = req.anonymize(mode="remove")
+                        key = self._cache_tuple_from_request(anon_req, cache_request_by)
+                        if key in cache_map:
+                            hits.append(cache_map[key])
+                        else:
+                            misses.append(req)
+
+                    for resp in hits:
+                        yield resp
+
+                    if not misses:
+                        continue
+
+                    def miss_jobs():
+                        for req in misses:
+                            yield Job.make(
+                                self.send,
+                                req.update_headers(self.send_headers, normalize=False),
+                                wait=wait,
+                                raise_error=raise_error,
+                                normalize=normalize,
+                                stream=stream,
+                                cache=None,
+                                pool=pool
+                            )
+
+                    to_insert: list[Response] = []
+                    failed: list[Response] = []
+
+                    for result in pool.as_completed(
+                        miss_jobs(),
+                        ordered=ordered,
+                        max_in_flight=max_in_flight,
+                        cancel_on_exit=close_on_exit,
+                        shutdown_on_exit=close_on_exit,
+                        raise_error=True,
+                    ):
+                        resp = result.result
+
+                        if resp.ok:
+                            to_insert.append(resp)
+                            yield resp
+                        elif raise_error:
+                            failed.append(resp)
+
+                    if to_insert:
+                        import pyarrow as pa
+                        batches = [
+                            r.anonymize(mode="remove").to_arrow_batch(parse=False)
+                            for r in to_insert
+                        ]
+                        combined = pa.Table.from_batches(batches).combine_chunks()
+                        cache.insert(
+                            combined,
+                            mode=SaveMode.APPEND,
+                            match_by=cache_by,
+                            wait=wait_cache,
+                        )
+
+                    if raise_error and failed:
+                        failed[-1].raise_for_status()
 
     # --- Convenience HTTP Methods ---
 
@@ -121,7 +414,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -150,7 +442,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -181,7 +472,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -212,7 +502,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -243,7 +532,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -274,7 +562,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,
@@ -303,7 +590,6 @@ class Session(ABC):
         url: Optional[Union[URL, str]] = None,
         *,
         params: Optional[Mapping[str, str]] = None,
-        sniff: Optional[bool] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[Union[BytesIO, bytes]] = None,
         tags: Optional[Mapping[str, str]] = None,

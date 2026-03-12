@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json as _json
 import re
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, fields
 from datetime import date, datetime, time, timezone, tzinfo
 from functools import lru_cache
 from typing import Any, IO, Iterable, overload
@@ -328,6 +328,13 @@ def dumps(
     # default compact output (no whitespace)
     if separators is None and indent is None:
         separators = (",", ":")
+
+    if is_dataclass(obj):
+        f = [f for f in fields(obj) if f.init]
+        obj = {
+            f.name: getattr(obj, f.name)
+            for f in f
+        }
 
     text = _json.dumps(
         obj,

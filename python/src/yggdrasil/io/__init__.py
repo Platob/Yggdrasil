@@ -32,7 +32,7 @@ Typical usage::
 
 from __future__ import annotations
 
-from .buffer import BytesIO
+from .buffer import BytesIO, BufferLike
 from .config import BufferConfig, DEFAULT_CONFIG
 from .enums import *
 from .types import BytesLike

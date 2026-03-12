@@ -33,11 +33,15 @@ class TestSQLEngine(unittest.TestCase):
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
         ], names=["c1", "c2", "c3", "map column"])
 
-        self.engine.insert_into(data, table_name="test_insert", mode="append")
+        self.engine.insert_into(
+            data,
+            table_name="test_insert",
+            mode="append"
+        )
 
-        n = self.engine.table_full_name(table_name="test_insert")
+        n = self.engine.table(table_name="test_insert")
 
-        result = self.engine.execute(f"SELECT * from {n}")
+        result = self.engine.execute(f"SELECT * from {n.full_name(safe=True)}")
 
         read = result.to_arrow_dataset()
 
@@ -67,13 +71,10 @@ class TestSQLEngine(unittest.TestCase):
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
         ], names=["c0", "c1", "c2", "c3", "map column"])
 
-        query = self.engine.create_table(
+        self.engine.create_table(
             data,
             table_name="test_warehouse_api",
-            execute=False
         )
-
-        self.engine.execute(query.sql)
 
         self.engine.drop_table(table_name="test_warehouse_api")
 

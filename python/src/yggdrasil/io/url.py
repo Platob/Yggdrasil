@@ -533,7 +533,7 @@ class URL:
 
     def anonymize(
         self,
-        mode: Literal["remove", "redact", "hash"] = "remove",
+        mode: Literal["remove", "redact"] = "remove",
         *,
         sort_keys: bool = True,
     ) -> URL:

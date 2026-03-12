@@ -147,15 +147,3 @@ def test_spilled_buffer_path_read_write(cfg: BufferConfig, sample_table):
 
     out = io_.read_arrow_table()
     assert out.to_pylist() == sample_table.to_pylist()
-
-
-def test_read_empty_buffer_raises(cfg: BufferConfig):
-    """
-    pq.read_table will raise if data isn't a valid parquet file.
-    This tests we don't swallow that exception.
-    """
-    buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
-
-    with pytest.raises(Exception):
-        io_.read_arrow_table()

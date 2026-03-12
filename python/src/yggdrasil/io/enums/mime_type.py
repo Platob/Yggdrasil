@@ -420,7 +420,7 @@ MimeType.PARQUET = MimeType.define(
 MimeType.PARQUET_DELTA = MimeType.define(
     MimeType("PARQUET_DELTA", "application/vnd.apache.parquet+delta")
 )
-MimeType.IPC = MimeType.define(
+MimeType.ARROW_IPC = MimeType.define(
     MimeType(
         "ARROW_IPC",
         "application/vnd.apache.arrow.file",
@@ -428,7 +428,7 @@ MimeType.IPC = MimeType.define(
         magics=(magic_prefix(b"ARROW1"),),
     )
 )
-MimeType.IPC_STREAM = MimeType.define(
+MimeType.ARROW_IPC_STREAM = MimeType.define(
     MimeType(
         "ARROW_IPC_STREAM",
         "application/vnd.apache.arrow.stream",

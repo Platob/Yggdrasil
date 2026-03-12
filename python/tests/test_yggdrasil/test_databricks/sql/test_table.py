@@ -2,7 +2,6 @@ import datetime as dt
 import unittest
 
 import pyarrow as pa
-from databricks.sdk.service.catalog import TableType
 
 from yggdrasil.databricks.workspaces import Workspace
 
@@ -33,6 +32,6 @@ class TestSQLEngine(unittest.TestCase):
         assert isinstance(self.table.arrow_schema, pa.Schema)
 
     def test_arrow_dataset(self):
-        arrow_table = self.table.to_arrow_dataset(row_limit=2).to_table()
+        arrow_table = self.table.to_arrow_dataset().to_table()
 
-        assert arrow_table.num_rows == 2
+        assert arrow_table.num_rows == 3

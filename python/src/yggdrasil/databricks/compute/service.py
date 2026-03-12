@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional, MutableMapping, Sequence, Union, Any, TYPE_CHECKING, Iterator
 
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import ResourceDoesNotExist, PermissionDenied
 from databricks.sdk.service.compute import ClusterAccessControlRequest, Library, ClustersAPI, ClusterDetails, \
     DataSecurityMode, RuntimeEngine, Kind, SparkVersion, ListClustersFilterBy, ClusterSource
 
@@ -389,7 +389,15 @@ class Clusters(DatabricksService):
         LOGGER.debug("Creating Databricks cluster %s with %s", update_details.get("cluster_name"), update_details)
 
         client = self.client.workspace_client().clusters
-        details = client.create(**update_details)
+
+        try:
+            details = client.create(**update_details)
+        except PermissionDenied as e:
+            raise PermissionDenied(
+                f"Permission denied when creating cluster {cluster_spec.get('cluster_name')!r}. "
+                "Ensure that you have the rights to do it."
+            ) from e
+
         instance = Cluster(service=self).set_details(details=details)
 
         LOGGER.info("Created %s", instance)

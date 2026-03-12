@@ -22,33 +22,40 @@ class HTTPResponse(Response):
         cls,
         request: "PreparedRequest",
         response: BaseHTTPResponse,
-        stream: bool,
         tags: Optional[Mapping[str, str]],
         received_at_timestamp: int
-    ) -> "Response":
-        buffer = BytesIO()
-
-        try:
-            if stream:
-                for batch in response.stream(amt=1024 * 1024):
-                    buffer.write(batch)
-            else:
-                buffer.write(response.data)
-        finally:
-            # important when streaming / pooling
-            response.release_conn()
-
-        buffer.seek(0)
-
+    ) -> "HTTPResponse":
         response = cls(
             request=request,
             status_code=response.status,
             headers=dict(response.headers),
-            buffer=buffer,
+            buffer=BytesIO(),
             tags=tags,
             received_at_timestamp=received_at_timestamp
         )
 
         if request.prepare_response is not None:
             return request.prepare_response(response)
+
         return response
+
+    def drain_urllib3(
+        self,
+        response: BaseHTTPResponse,
+        stream: bool,
+        *,
+        amt: int = 512 * 1024,
+        release_conn: bool = True
+    ) -> BytesIO:
+        buffer = self.buffer
+
+        try:
+            if stream:
+                for chunk in response.stream(amt=amt):
+                    buffer.write(chunk)
+            else:
+                buffer.write(response.read())
+        finally:
+            response.release_conn()
+
+        return self

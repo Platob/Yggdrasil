@@ -47,16 +47,21 @@ class MediaIO(ABC, Generic[O]):
     def make(cls, buffer: BytesIO, media: MimeType.ZIP) -> "ZipIO": ...
     @overload
     @classmethod
+    def make(cls, buffer: BytesIO, media: MimeType.ARROW_IPC) -> "IPCIO": ...
+    @overload
+    @classmethod
     def make(cls, buffer: BytesIO, media: MediaType | str) -> "MediaIO[MediaOptions]": ...
 
     @classmethod
     def make(cls, buffer: BytesIO, media: MediaType | MimeType | str) -> "MediaIO[MediaOptions]":
         media = MediaType.parse(media)
         mt = media.mime_type
+        buffer.set_media_type(media, safe=False)
 
         from .parquet_io import ParquetIO
         from .json_io import JsonIO
         from .zip_io import ZipIO
+        from .arrow_ipc_io import IPCIO
 
         if mt is MimeType.PARQUET:
             return ParquetIO(buffer=buffer)
@@ -64,6 +69,8 @@ class MediaIO(ABC, Generic[O]):
             return JsonIO(buffer=buffer)
         if mt is MimeType.ZIP:
             return ZipIO(buffer=buffer)
+        if mt is MimeType.ARROW_IPC:
+            return IPCIO(buffer=buffer)
 
         raise NotImplementedError(f"Cannot create media IO for {media!r}")
 
@@ -97,7 +104,31 @@ class MediaIO(ABC, Generic[O]):
         )
         if self.skip_write(mode=resolved.mode):
             return self
-        tb = pyarrow.Table.from_pylist(data)
+        tb = pyarrow.Table.from_pylist(data) # noqa
+        self._write_arrow_table(table=tb, options=resolved)
+        return None
+
+    def read_pydict(self) -> dict[str, list]:
+        return self.read_arrow_table().to_pydict()
+
+    def write_pydict(
+        self,
+        data: dict[str, list],
+        *,
+        mode: SaveMode | str | None = None,
+        match_by: list[str] | None = None,
+        options: O | None = None,
+        **option_kwargs,
+    ):
+        resolved = self.check_options(
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            **option_kwargs,
+        )
+        if self.skip_write(mode=resolved.mode):
+            return self
+        tb = pyarrow.Table.from_pydict(data) # noqa
         self._write_arrow_table(table=tb, options=resolved)
         return None
 
@@ -138,7 +169,32 @@ class MediaIO(ABC, Generic[O]):
     def read_pandas_frame(self, *, options: O | None = None, **option_kwargs) -> "pandas.DataFrame":
         return self.read_arrow_table(options=options, **option_kwargs).to_pandas()
 
+    def write_pandas_frame(
+        self,
+        frame: "pandas.DataFrame",
+        *,
+        mode: SaveMode | str | None = None,
+        match_by: list[str] | None = None,
+        options: O | None = None,
+        **option_kwargs,
+    ) -> None:
+        tb = pyarrow.Table.from_pandas(frame) # noqa
+        self.write_arrow_table(table=tb, mode=mode, match_by=match_by, options=options, **option_kwargs)
+
     def read_polars_frame(self, *, options: O | None = None, **option_kwargs) -> "polars.DataFrame":
         from yggdrasil.polars.lib import polars as _pl
         tb = self.read_arrow_table(options=options, **option_kwargs)
-        return _pl.from_arrow(tb)
+        return _pl.from_arrow(tb, rechunk=False)
+
+    def write_polars_frame(
+        self,
+        frame: "polars.DataFrame",
+        *,
+        mode: SaveMode | str | None = None,
+        match_by: list[str] | None = None,
+        options: O | None = None,
+        **option_kwargs,
+    ) -> None:
+        from yggdrasil.polars.lib import polars as _pl
+        tb = _pl.from_polars(frame, rechunk=False).to_arrow()
+        self.write_arrow_table(table=tb, mode=mode, match_by=match_by, options=options, **option_kwargs)

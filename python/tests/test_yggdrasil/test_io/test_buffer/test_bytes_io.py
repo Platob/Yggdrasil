@@ -122,7 +122,7 @@ def test_init_from_path_creates_file_if_missing(cfg: BufferConfig, tmp_path: Pat
 
 def test_init_from_bytesio_instance_copies_memory(cfg: BufferConfig) -> None:
     src = BytesIO(b"abcdef", config=cfg)
-    dst = BytesIO(src, config=cfg)
+    dst = BytesIO(src, config=cfg, copy=True)
 
     assert dst.to_bytes() == b"abcdef"
     assert dst.tell() == 0
@@ -137,7 +137,7 @@ def test_init_from_bytesio_instance_copies_spilled(cfg: BufferConfig) -> None:
     src = BytesIO(b"x" * 100, config=cfg)
     assert src.spilled
 
-    dst = BytesIO(src, config=cfg)
+    dst = BytesIO(src, config=cfg, copy=True)
 
     assert dst.to_bytes() == b"x" * 100
     assert dst.tell() == 0

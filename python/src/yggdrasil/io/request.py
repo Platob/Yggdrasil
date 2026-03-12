@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import json as json_module
-import time
 from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.data.cast.registry import identity
 from yggdrasil.dataclasses.dataclass import get_from_dict
+from yggdrasil.io import MediaType
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
 from .headers import PromotedHeaders, normalize_headers
@@ -27,7 +27,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             "request_method",
             pa.string(),
             nullable=False,
-            metadata={"comment": "HTTP verb (GET, POST, etc.)"},
+            metadata={"comment": "Method (GET, POST, etc.)"},
         ),
         pa.field(
             "request_url_str",
@@ -49,18 +49,16 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         pa.field("request_accept_encoding", pa.string(), nullable=True, metadata={"comment": "Accept-Encoding header"}),
         pa.field("request_accept_language", pa.string(), nullable=True, metadata={"comment": "Accept-Language header"}),
         pa.field("request_content_type", pa.string(), nullable=True, metadata={"comment": "Content-Type header"}),
-        pa.field("request_content_length", pa.int64(), nullable=True, metadata={"comment": "Content-Length header parsed as integer when possible"}),
+        pa.field("request_content_length", pa.int64(), nullable=False, metadata={"comment": "Content-Length header parsed as integer when possible"}),
         pa.field("request_content_encoding", pa.string(), nullable=True, metadata={"comment": "Content-Encoding header"}),
         pa.field("request_transfer_encoding", pa.string(), nullable=True, metadata={"comment": "Transfer-Encoding header"}),
-        pa.field("request_x_request_id", pa.string(), nullable=True, metadata={"comment": "X-Request-ID header"}),
-        pa.field("request_x_correlation_id", pa.string(), nullable=True, metadata={"comment": "X-Correlation-ID header"}),
 
         pa.field(
             "request_headers",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
             metadata={
-                "comment": "HTTP request headers excluding promoted common headers",
+                "comment": "Request headers excluding promoted common headers",
                 "keys_sorted": "false",
             },
         ),
@@ -68,7 +66,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             "request_tags",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
-            metadata={"comment": "HTTP request tags merged with URL query params; explicit tags win on conflict"},
+            metadata={"comment": "Request tags merged with URL query params; explicit tags win on conflict"},
         ),
         pa.field(
             "request_body",
@@ -78,12 +76,11 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         ),
         pa.field(
             "request_body_hash",
-            pa.binary(32),
+            pa.int64(),
             nullable=True,
             metadata={
-                "comment": "BLAKE3-256 digest of request_body (32 bytes)",
-                "algorithm": "blake3",
-                "byte_width": "32",
+                "comment": "Signed Int64 XXH3 digest of response_body",
+                "algorithm": "xxh3_64",
             },
         ),
         pa.field(
@@ -99,7 +96,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             metadata={"comment": "UTC epoch timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
         ),
     ],
-    metadata={"comment": "HTTP prepared request flattened into deterministic columns for logging/replay."},
+    metadata={"comment": "Prepared request flattened into deterministic columns for logging/replay."},
 )
 
 
@@ -108,7 +105,7 @@ class PreparedRequest:
     method: str
     url: URL
     headers: MutableMapping[str, str]
-    tags: Optional[Mapping[str, str]]
+    tags: Optional[MutableMapping[str, str]]
     buffer: Optional[BytesIO]
     sent_at_timestamp: int = field(default=0, hash=False, compare=False)
 
@@ -165,7 +162,7 @@ class PreparedRequest:
 
     @staticmethod
     def _parse_method(obj: Mapping[str, Any], *, prefix: str) -> str:
-        method = get_from_dict(obj, keys=("method", "http_method", "verb"), prefix=prefix)
+        method = get_from_dict(obj, keys=("method",), prefix=prefix)
         return "GET" if method is MISSING or method in (None, "") else str(method)
 
     @classmethod
@@ -245,8 +242,6 @@ class PreparedRequest:
             "Location": get_from_dict(obj, keys=("location",), prefix=prefix),
             "ETag": get_from_dict(obj, keys=("etag",), prefix=prefix),
             "Last-Modified": get_from_dict(obj, keys=("last_modified",), prefix=prefix),
-            "X-Request-ID": get_from_dict(obj, keys=("x_request_id",), prefix=prefix),
-            "X-Correlation-ID": get_from_dict(obj, keys=("x_correlation_id",), prefix=prefix),
         }
 
         out: MutableMapping[str, str] = {}
@@ -374,25 +369,118 @@ class PreparedRequest:
             prepare_response=after_received or identity,
         )
 
-    def prepare_to_send(self, normalize: bool) -> "PreparedRequest":
+    def prepare_to_send(
+        self,
+        sent_at_timestamp: int,
+        headers: Optional[Mapping[str, str]],
+    ) -> "PreparedRequest":
         instance = self.before_send(self) if self.before_send else self
 
         if instance.headers is None:
             instance.headers = {}
 
-        if normalize:
-            instance.headers = normalize_headers(
-                instance.headers, is_request=True, body=instance.buffer, anonymize=False
-            )
+        if headers:
+            instance.headers.update(headers)
 
-        instance.sent_at_timestamp = time.time_ns() // 1000 if normalize else 0
+        instance.sent_at_timestamp = sent_at_timestamp
+
         return instance
 
     @property
     def body(self) -> Optional[BytesIO]:
         return self.buffer
 
-    def anonymize(self, mode: Literal["remove", "redact", "hash"] = "remove") -> "PreparedRequest":
+    @property
+    def content_length(self) -> int:
+        if self.buffer is not None:
+            return self.buffer.size
+        return 0
+
+    @property
+    def authorization(self) -> Optional[str]:
+        return self.headers.get("Authorization") if self.headers else None
+
+    @property
+    def accept_media_type(self):
+        if not self.headers:
+            return MediaType(MimeType.OCTET_STREAM, None)
+
+        accept = MimeType.parse(self.headers.get("Accept"), default=MimeType.OCTET_STREAM)
+        codec = Codec.parse(self.headers.get("Accept-Encoding"), default=None)
+
+        return MediaType(accept, codec)
+
+    @accept_media_type.setter
+    def accept_media_type(self, value: MediaType):
+        if self.headers is None:
+            self.headers = {}
+        self.headers["Accept"] = value.mime_type.value
+        if value.codec:
+            self.headers["Accept-Encoding"] = value.codec.name
+        else:
+            self.headers.pop("Accept-Encoding", None)
+
+    @authorization.setter
+    def authorization(self, value: Optional[str]):
+        if self.headers is None:
+            self.headers = {}
+        if value is not None:
+            self.headers["Authorization"] = value
+        else:
+            self.headers.pop("Authorization", None)
+
+    @property
+    def x_api_key(self) -> Optional[str]:
+        return self.headers.get("X-API-Key") if self.headers else None
+
+    @x_api_key.setter
+    def x_api_key(self, value: Optional[str]):
+        if self.headers is None:
+            self.headers = {}
+        if value is not None:
+            self.headers["X-API-Key"] = value
+        else:
+            self.headers.pop("X-API-Key", None)
+
+    def update_headers(
+        self,
+        headers: Mapping[str, str],
+        *,
+        normalize: bool = True,
+    ) -> "PreparedRequest":
+        if not headers:
+            return self
+
+        if normalize:
+            headers = normalize_headers(
+                headers,
+                is_request=True, anonymize=False, add_missing=False
+            )
+
+        if not self.headers:
+            self.headers = headers
+            return self
+
+        self.headers.update(headers)
+
+        return self
+
+    def update_tags(
+        self,
+        tags: MutableMapping[str, str],
+    ) -> "PreparedRequest":
+        if not tags:
+            return self
+
+        if not self.tags:
+            self.tags = tags
+            return self
+
+        self.tags.update(tags)
+
+        return self
+
+    def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "PreparedRequest":
         return replace(
             self,
             headers=normalize_headers(
@@ -401,29 +489,6 @@ class PreparedRequest:
             ),
             url=self.url.anonymize(mode=mode),
         )
-
-    @staticmethod
-    def _parse_query_params(query: Optional[str]) -> dict[str, str]:
-        if not query:
-            return {}
-
-        out: dict[str, str] = {}
-        for chunk in str(query).split("&"):
-            if not chunk:
-                continue
-
-            if "=" in chunk:
-                key, value = chunk.split("=", 1)
-            else:
-                key, value = chunk, ""
-
-            key = key.strip()
-            if not key:
-                continue
-
-            out[str(key)] = str(value)
-
-        return out
 
     def to_arrow_batch(self, parse: bool = False) -> pa.RecordBatch:
         if parse:
@@ -434,13 +499,13 @@ class PreparedRequest:
 
         promoted = PromotedHeaders.extract(self.headers or {})
 
-        tags_v = self._parse_query_params(u.query)
+        tags_v = dict(u.query_items())
         if self.tags:
             tags_v.update({str(k): str(v) for k, v in self.tags.items()})
 
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.blake3().digest()
+            body_hash = self.buffer.xxh3_int64()
         else:
             body_bytes = None
             body_hash = None
@@ -462,11 +527,9 @@ class PreparedRequest:
             "request_accept_encoding": promoted.accept_encoding,
             "request_accept_language": promoted.accept_language,
             "request_content_type": promoted.content_type,
-            "request_content_length": promoted.content_length,
+            "request_content_length": promoted.content_length or 0,
             "request_content_encoding": promoted.content_encoding,
             "request_transfer_encoding": promoted.transfer_encoding,
-            "request_x_request_id": promoted.x_request_id,
-            "request_x_correlation_id": promoted.x_correlation_id,
 
             "request_headers": promoted.remaining,
             "request_tags": tags_v,
@@ -483,3 +546,9 @@ class PreparedRequest:
         ]
 
         return pa.RecordBatch.from_arrays(arrays, schema=REQUEST_ARROW_SCHEMA)  # type: ignore[arg-type]
+
+    def apply(
+        self,
+        func: Callable[["PreparedRequest"], "PreparedRequest"],
+    ):
+        return func(self)
