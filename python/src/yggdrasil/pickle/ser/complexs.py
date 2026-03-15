@@ -25,9 +25,15 @@ __all__ = [
     "DataclassSerialized",
 ]
 
+
+# ============================================================================
+# Runtime constants / caches
+# ============================================================================
+
 _BUILTINS_KEY = "__builtins__"
 _FORMAT_VERSION = FORMAT_VERSION
 _PYTHON_VERSION = tuple(sys.version_info[:3])
+
 _MODULE_CACHE: dict[str, ModuleType] = {}
 _CLASS_CACHE: dict[tuple[str, str], type[object]] = {}
 _FUNCTION_CACHE: dict[tuple[object, ...], Callable[..., object]] = {}
@@ -35,10 +41,159 @@ _REFERENCE_FUNCTION_CACHE: dict[tuple[str, str], Callable[..., object]] = {}
 _LOCAL_DATACLASS_CACHE: dict[tuple[object, ...], type[object]] = {}
 
 
+# ============================================================================
+# Payload tags / compact schemas
+# ============================================================================
+
 # ---------------------------------------------------------------------------
-# basic validators
+# Generic small tags
 # ---------------------------------------------------------------------------
 
+# object state payload: (tag, value)
+# - ("d", mapping) => default extracted object state
+# - ("c", value)   => custom __getstate__() result
+_STATE_DEFAULT = "d"
+_STATE_CUSTOM = "c"
+
+# annotation payload: (tag, value)
+# - ("v", bytes) => nested serialized annotation object
+# - ("r", str)   => repr(annotation)
+_ANN_VALUE = "v"
+_ANN_REPR = "r"
+
+# function payload kind
+_FN_REF = 0
+_FN_FULL = 1
+
+# dataclass class payload kind
+_DC_CLASS_REF = 0
+_DC_CLASS_LOCAL = 1
+
+
+# ---------------------------------------------------------------------------
+# Dataclass flags
+# ---------------------------------------------------------------------------
+
+# Dataclass class flags
+_DC_REPR = 1 << 0
+_DC_EQ = 1 << 1
+_DC_ORDER = 1 << 2
+_DC_UNSAFE_HASH = 1 << 3
+_DC_FROZEN = 1 << 4
+_DC_SLOTS = 1 << 5
+
+# Dataclass field flags
+_DCF_INIT = 1 << 0
+_DCF_REPR = 1 << 1
+_DCF_COMPARE = 1 << 2
+_DCF_KW_ONLY = 1 << 3
+
+
+# ---------------------------------------------------------------------------
+# Tuple index helpers
+# ---------------------------------------------------------------------------
+
+# class ref payload = (module_name, qualname)
+_CLASS_REF_MODULE = 0
+_CLASS_REF_QUALNAME = 1
+
+# reference function payload = (version, kind, module_name, qualname)
+_FN_REF_VERSION = 0
+_FN_REF_KIND = 1
+_FN_REF_MODULE = 2
+_FN_REF_QUALNAME = 3
+
+# full function payload =
+# (
+#   version,
+#   kind,
+#   module_name,
+#   name,
+#   qualname,
+#   defaults,
+#   kwdefaults,
+#   annotations,
+#   globals_dict,
+#   definition_globals_dict,
+#   nonlocals_dict,
+#   python_version,
+#   marshal_code,
+#   source_code,
+# )
+_FN_FULL_VERSION = 0
+_FN_FULL_KIND = 1
+_FN_FULL_MODULE = 2
+_FN_FULL_NAME = 3
+_FN_FULL_QUALNAME = 4
+_FN_FULL_DEFAULTS = 5
+_FN_FULL_KWDEFAULTS = 6
+_FN_FULL_ANNOTATIONS = 7
+_FN_FULL_GLOBALS = 8
+_FN_FULL_DEFINITION_GLOBALS = 9
+_FN_FULL_NONLOCALS = 10
+_FN_FULL_PY_VERSION = 11
+_FN_FULL_MARSHAL = 12
+_FN_FULL_SOURCE = 13
+
+# exception payload = (version, exc_cls, args_tuple, state_payload)
+_EXC_VERSION = 0
+_EXC_CLASS = 1
+_EXC_ARGS = 2
+_EXC_STATE = 3
+
+# dataclass class ref payload = (kind, module_name, qualname)
+_DC_REF_KIND = 0
+_DC_REF_MODULE = 1
+_DC_REF_QUALNAME = 2
+
+# dataclass local class payload =
+# (
+#   kind,
+#   cls_name,
+#   qualname,
+#   module_name,
+#   flags,
+#   field_records,
+# )
+_DC_LOCAL_KIND = 0
+_DC_LOCAL_NAME = 1
+_DC_LOCAL_QUALNAME = 2
+_DC_LOCAL_MODULE = 3
+_DC_LOCAL_FLAGS = 4
+_DC_LOCAL_FIELDS = 5
+
+# dataclass field record =
+# (
+#   field_name,
+#   annotation_payload,
+#   field_flags,
+#   hash_value,
+#   metadata_mapping_or_none,
+# )
+_DCF_NAME = 0
+_DCF_ANNOTATION = 1
+_DCF_FLAGS = 2
+_DCF_HASH = 3
+_DCF_METADATA = 4
+
+# dataclass instance payload =
+# (
+#   version,
+#   class_payload,
+#   init_values,
+#   non_init_values,
+#   extra_state,
+# )
+_DC_PAYLOAD_VERSION = 0
+_DC_PAYLOAD_CLASS = 1
+_DC_PAYLOAD_INIT_VALUES = 2
+_DC_PAYLOAD_NON_INIT_VALUES = 3
+_DC_PAYLOAD_EXTRA_STATE = 4
+
+
+# ============================================================================
+# Validators
+# ============================================================================
 
 def _require_dict(obj: object, *, name: str) -> dict[object, object]:
     if not isinstance(obj, dict):
@@ -49,6 +204,12 @@ def _require_dict(obj: object, *, name: str) -> dict[object, object]:
 def _require_tuple(obj: object, *, name: str) -> tuple[object, ...]:
     if not isinstance(obj, tuple):
         raise TypeError(f"{name} must be tuple")
+    return obj
+
+
+def _require_list(obj: object, *, name: str) -> list[object]:
+    if not isinstance(obj, list):
+        raise TypeError(f"{name} must be list")
     return obj
 
 
@@ -64,18 +225,29 @@ def _require_bytes(obj: object, *, name: str) -> bytes:
     return bytes(obj)
 
 
-def _require_list(obj: object, *, name: str) -> list[object]:
-    if not isinstance(obj, list):
-        raise TypeError(f"{name} must be list")
-    return obj
+def _require_tuple_len(
+    obj: object,
+    *,
+    name: str,
+    expected: int,
+) -> tuple[object, ...]:
+    out = _require_tuple(obj, name=name)
+    if len(out) != expected:
+        raise ValueError(f"{name} must have length {expected}, got {len(out)}")
+    return out
 
 
-# ---------------------------------------------------------------------------
-# generic helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Generic helpers
+# ============================================================================
 
 def _resolve_qualname(root: object, qualname: str) -> object:
+    """
+    Resolve a dotted __qualname__ path from a root object.
+
+    This intentionally rejects '<locals>' because local objects are not
+    import-resolvable.
+    """
     obj = root
     for part in qualname.split("."):
         if part == "<locals>":
@@ -85,10 +257,21 @@ def _resolve_qualname(root: object, qualname: str) -> object:
 
 
 def _make_cell(value: object):
+    """
+    Build a closure cell containing `value`.
+
+    Python does not expose a public cell constructor, so this is the classic
+    tiny cursed trick.
+    """
     return (lambda x: lambda: x)(value).__closure__[0]
 
 
 def _serialize_nested(obj: object) -> bytes:
+    """
+    Serialize a nested object through the existing Serialized framework.
+
+    This keeps nested payloads compatible with the rest of the serializer stack.
+    """
     return Serialized.from_python_object(obj).write_to().to_bytes()
 
 
@@ -97,6 +280,10 @@ def _deserialize_nested(blob: bytes) -> object:
 
 
 def _iter_slots(cls: type[object]) -> tuple[str, ...]:
+    """
+    Yield effective instance slot names across the MRO, excluding __dict__ and
+    __weakref__.
+    """
     out: list[str] = []
     for base in reversed(cls.__mro__):
         slots = getattr(base, "__slots__", ())
@@ -109,6 +296,12 @@ def _iter_slots(cls: type[object]) -> tuple[str, ...]:
 
 
 def _extract_object_state(obj: object) -> dict[str, object]:
+    """
+    Extract default instance state:
+
+    - items in __dict__
+    - slot values that are present
+    """
     state: dict[str, object] = {}
 
     if hasattr(obj, "__dict__"):
@@ -126,6 +319,9 @@ def _extract_object_state(obj: object) -> dict[str, object]:
 
 
 def _get_declared_attr(cls: type[object], name: str) -> object | None:
+    """
+    Return the first directly-declared attribute in the MRO, or None.
+    """
     for base in cls.__mro__:
         if name in base.__dict__:
             return base.__dict__[name]
@@ -148,25 +344,38 @@ def _has_meaningful_custom_setstate(obj: object) -> bool:
     return attr is not object_attr
 
 
-def _dump_object_state(obj: object) -> dict[str, object]:
-    if _has_meaningful_custom_getstate(obj):
-        return {
-            "kind": "custom",
-            "value": obj.__getstate__(),
-        }
+# ============================================================================
+# Object state payloads
+# ============================================================================
 
-    return {
-        "kind": "default",
-        "value": _extract_object_state(obj),
-    }
+def _dump_object_state(obj: object) -> tuple[str, object]:
+    """
+    Compact object-state payload.
+
+    Schema:
+        (_STATE_CUSTOM, custom_state)
+        (_STATE_DEFAULT, extracted_state_mapping)
+    """
+    if _has_meaningful_custom_getstate(obj):
+        return (_STATE_CUSTOM, obj.__getstate__())
+
+    return (_STATE_DEFAULT, _extract_object_state(obj))
 
 
 def _restore_object_state(obj: object, payload: object) -> None:
-    data = _require_dict(payload, name="Object state payload")
-    kind = _require_str(data["kind"], name="Object state payload kind")
-    value = data.get("value")
+    """
+    Restore a state payload created by _dump_object_state().
 
-    if kind == "custom":
+    Rules:
+    - custom state prefers __setstate__ when available
+    - otherwise, dict-compatible state is applied field-by-field
+    - default state always applies field-by-field
+    """
+    tag, value = _require_tuple_len(payload, name="Object state payload", expected=2)
+
+    kind = _require_str(tag, name="Object state payload kind")
+
+    if kind == _STATE_CUSTOM:
         if _has_meaningful_custom_setstate(obj):
             obj.__setstate__(value)
             return
@@ -182,7 +391,7 @@ def _restore_object_state(obj: object, payload: object) -> None:
 
         raise TypeError("Custom object state requires __setstate__ or dict-compatible state")
 
-    if kind == "default":
+    if kind == _STATE_DEFAULT:
         state_obj = _require_dict(value, name="Default object state value")
         for name, item in state_obj.items():
             try:
@@ -195,11 +404,14 @@ def _restore_object_state(obj: object, payload: object) -> None:
     raise ValueError(f"Unsupported object state payload kind: {kind!r}")
 
 
-# ---------------------------------------------------------------------------
-# module / class / callable reference policy
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Reference policy
+# ============================================================================
 
 def _module_file_contains_site_packages(module_name: str | None) -> bool:
+    """
+    Heuristic: treat modules coming from site-packages as stable import references.
+    """
     if not module_name:
         return False
 
@@ -230,6 +442,12 @@ def _should_use_reference_only_for_class(cls: type[object]) -> bool:
 
 
 def _unwrap_method_or_function(obj: object) -> Callable[..., object] | None:
+    """
+    Normalize:
+    - function -> function
+    - bound method -> underlying function
+    - callable object -> __call__ function if that is a plain Python function/method
+    """
     if isinstance(obj, FunctionType):
         return obj
     if isinstance(obj, MethodType):
@@ -259,10 +477,9 @@ def _should_use_reference_only_for_callable(obj: object) -> bool:
     return _should_reference_only_module(module_name)
 
 
-# ---------------------------------------------------------------------------
-# module / class caches
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Caches
+# ============================================================================
 
 def _module_cache_get_or_load(module_name: str) -> ModuleType:
     cached = _MODULE_CACHE.get(module_name)
@@ -290,10 +507,9 @@ def _class_cache_get_or_load(module_name: str, qualname: str) -> type[object]:
     return obj
 
 
-# ---------------------------------------------------------------------------
-# hashing helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Hash helpers
+# ============================================================================
 
 def _hash_bytes(data: bytes | None) -> str | None:
     if data is None:
@@ -307,12 +523,24 @@ def _hash_text(data: str | None) -> str | None:
     return hashlib.blake2b(data.encode("utf-8"), digest_size=16).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# function AST / code helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Function AST / code helpers
+# ============================================================================
 
+def _dump_function_code_payload(fn: Callable[..., object]) -> tuple[
+    tuple[int, int, int],
+    bytes | None,
+    str | None,
+]:
+    """
+    Return the compact function code payload:
 
-def _dump_function_code_payload(fn: Callable[..., object]) -> dict[str, object]:
+        (python_version, marshal_code, source_code)
+
+    We try to store both:
+    - marshal code: fastest path when Python version matches
+    - source code: fallback path across versions / environments
+    """
     marshal_code: bytes | None = None
     source_code: str | None = None
 
@@ -329,11 +557,7 @@ def _dump_function_code_payload(fn: Callable[..., object]) -> dict[str, object]:
     if marshal_code is None and source_code is None:
         raise TypeError(f"Unable to serialize function code for {fn!r}")
 
-    return {
-        "python_version": _PYTHON_VERSION,
-        "marshal_code": marshal_code,
-        "source_code": source_code,
-    }
+    return (_PYTHON_VERSION, marshal_code, source_code)
 
 
 def _find_function_node(
@@ -349,6 +573,12 @@ def _find_function_node(
 
 
 def _strip_function_decorators_from_source(source: str, *, fn_name: str) -> str:
+    """
+    Remove decorators before exec().
+
+    This avoids replaying import-time side effects or requiring decorator
+    symbols to exist during function reconstruction.
+    """
     tree = ast.parse(source)
 
     for node in tree.body:
@@ -415,6 +645,17 @@ def _collect_load_names(node: ast.AST) -> set[str]:
 
 
 def _extract_definition_global_names(source: str, *, fn_name: str) -> set[str]:
+    """
+    Extract names required to *define* a function from source, not names used
+    inside the function body at runtime.
+
+    We intentionally scan:
+    - decorators
+    - annotations
+    - default expressions
+
+    These must exist when exec(source) runs.
+    """
     target = _find_function_node(source, fn_name=fn_name)
     if target is None:
         return set()
@@ -442,6 +683,13 @@ def _drop_function_self_refs(
     *,
     fn: Callable[..., object],
 ) -> dict[str, object]:
+    """
+    Drop:
+    - non-string keys
+    - direct self-references to the function itself
+
+    This avoids recursive payload nonsense.
+    """
     out: dict[str, object] = {}
     for key, value in mapping.items():
         if not isinstance(key, str):
@@ -465,6 +713,12 @@ def _function_cache_key(
     globals_obj: dict[object, object],
     nonlocals_obj: dict[object, object],
 ) -> tuple[object, ...]:
+    """
+    Cache key for reconstructed functions.
+
+    The key intentionally hashes large code blobs and uses repr-stable summaries
+    for defaults / globals / nonlocals. It is not beautiful, but it is practical.
+    """
     marshal_hash = _hash_bytes(bytes(marshal_code) if isinstance(marshal_code, (bytes, bytearray)) else None)
     source_hash = _hash_text(source_code if isinstance(source_code, str) else None)
 
@@ -488,6 +742,9 @@ def _load_function_from_source(
     globals_dict: dict[str, object],
     name: str,
 ) -> Callable[..., object]:
+    """
+    Rebuild a function by exec() of stripped source in a controlled namespace.
+    """
     ns = dict(globals_dict)
     stripped_source = _strip_function_decorators_from_source(source, fn_name=name)
 
@@ -515,6 +772,9 @@ def _build_function_from_code(
     annotations,
     closure,
 ) -> Callable[..., object]:
+    """
+    Rebuild a Python function from a CodeType plus execution context.
+    """
     fn = FunctionType(
         code,
         globals_dict,
@@ -544,6 +804,14 @@ def _load_function_code_payload(
     annotations,
     closure,
 ) -> Callable[..., object]:
+    """
+    Reconstruct a function using two strategies:
+
+    1. marshal => preferred when Python version matches
+    2. source  => safer cross-version fallback
+
+    If one fails, the other gets a shot. Tiny resurrection machine.
+    """
     same_version = python_version == _PYTHON_VERSION
     errors: list[Exception] = []
 
@@ -592,36 +860,37 @@ def _load_function_code_payload(
     ) from errors[-1]
 
 
-# ---------------------------------------------------------------------------
-# class reference helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Class reference payload
+# ============================================================================
 
 def _dump_class_ref(cls: type[object]) -> bytes:
+    """
+    Class reference payload schema:
+        (module_name, qualname)
+    """
     if "<locals>" in cls.__qualname__:
         raise TypeError(f"Cannot serialize non-importable local class reference: {cls!r}")
 
-    return _serialize_nested(
-        {
-            "module": cls.__module__,
-            "qualname": cls.__qualname__,
-        }
-    )
+    return _serialize_nested((cls.__module__, cls.__qualname__))
 
 
 def _load_class_ref(data: bytes) -> type[object]:
-    payload = _require_dict(_deserialize_nested(data), name="Class payload")
-    module_name = _require_str(payload["module"], name="Class payload module")
-    qualname = _require_str(payload["qualname"], name="Class payload qualname")
+    payload = _require_tuple_len(_deserialize_nested(data), name="Class payload", expected=2)
+    module_name = _require_str(payload[_CLASS_REF_MODULE], name="Class payload module")
+    qualname = _require_str(payload[_CLASS_REF_QUALNAME], name="Class payload qualname")
     return _class_cache_get_or_load(module_name, qualname)
 
 
-# ---------------------------------------------------------------------------
-# callable reference-only helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Function reference-only payload
+# ============================================================================
 
 def _dump_reference_function_payload(fn: Callable[..., object]) -> bytes:
+    """
+    Reference-only function payload schema:
+        (version, _FN_REF, module_name, qualname)
+    """
     module_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
 
@@ -630,29 +899,26 @@ def _dump_reference_function_payload(fn: Callable[..., object]) -> bytes:
     if "<locals>" in qualname:
         raise TypeError(f"Callable is local and cannot be reference-serialized: {fn!r}")
 
-    return _serialize_nested(
-        {
-            "version": _FORMAT_VERSION,
-            "kind": "ref",
-            "module": module_name,
-            "qualname": qualname,
-        }
-    )
+    return _serialize_nested((_FORMAT_VERSION, _FN_REF, module_name, qualname))
 
 
 def _load_reference_function_payload(data: bytes) -> Callable[..., object]:
-    payload = _require_dict(_deserialize_nested(data), name="Reference function payload")
+    payload = _require_tuple_len(
+        _deserialize_nested(data),
+        name="Reference function payload",
+        expected=4,
+    )
 
-    version = payload.get("version")
+    version = payload[_FN_REF_VERSION]
     if version != _FORMAT_VERSION:
         raise ValueError(f"Unsupported reference function payload version: {version!r}")
 
-    kind = _require_str(payload["kind"], name="Reference function payload kind")
-    if kind != "ref":
+    kind = payload[_FN_REF_KIND]
+    if kind != _FN_REF:
         raise ValueError(f"Unsupported reference function payload kind: {kind!r}")
 
-    module_name = _require_str(payload["module"], name="Reference function payload module")
-    qualname = _require_str(payload["qualname"], name="Reference function payload qualname")
+    module_name = _require_str(payload[_FN_REF_MODULE], name="Reference function payload module")
+    qualname = _require_str(payload[_FN_REF_QUALNAME], name="Reference function payload qualname")
 
     key = (module_name, qualname)
     cached = _REFERENCE_FUNCTION_CACHE.get(key)
@@ -668,27 +934,49 @@ def _load_reference_function_payload(data: bytes) -> Callable[..., object]:
     return obj
 
 
-# ---------------------------------------------------------------------------
-# full function payload helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Full function payload
+# ============================================================================
 
 def _dump_function_payload(fn: Callable[..., object]) -> bytes:
+    """
+    Full function payload schema:
+
+        (
+            version,
+            _FN_FULL,
+            module_name,
+            name,
+            qualname,
+            defaults,
+            kwdefaults,
+            annotations,
+            globals_dict,
+            definition_globals_dict,
+            nonlocals_dict,
+            python_version,
+            marshal_code,
+            source_code,
+        )
+
+    Why keep both globals and definition_globals?
+    - globals: names captured by inspect.getclosurevars()
+    - definition_globals: names only needed to exec source (decorators/defaults/annotations)
+    """
     if not isinstance(fn, FunctionType):
         raise TypeError(
             f"FunctionSerialized only supports Python functions, got {type(fn)!r}"
         )
 
     closurevars = inspect.getclosurevars(fn)
-    code_payload = _dump_function_code_payload(fn)
+    python_version, marshal_code, source_code = _dump_function_code_payload(fn)
 
     definition_globals: dict[str, object] = {}
-    source_code_obj = code_payload.get("source_code")
 
-    if isinstance(source_code_obj, str):
+    if isinstance(source_code, str):
         try:
             needed_names = _extract_definition_global_names(
-                source_code_obj,
+                source_code,
                 fn_name=fn.__name__,
             )
         except Exception:
@@ -700,61 +988,81 @@ def _dump_function_payload(fn: Callable[..., object]) -> bytes:
             if name in fn.__globals__:
                 definition_globals[name] = fn.__globals__[name]
 
-    payload = {
-        "version": _FORMAT_VERSION,
-        "kind": "full",
-        "module": fn.__module__,
-        "name": fn.__name__,
-        "qualname": fn.__qualname__,
-        "defaults": fn.__defaults__,
-        "kwdefaults": fn.__kwdefaults__,
-        "annotations": fn.__annotations__,
-        "globals": _drop_function_self_refs(closurevars.globals, fn=fn),
-        "definition_globals": _drop_function_self_refs(definition_globals, fn=fn),
-        "nonlocals": _drop_function_self_refs(closurevars.nonlocals, fn=fn),
-        **code_payload,
-    }
+    payload = (
+        _FORMAT_VERSION,
+        _FN_FULL,
+        fn.__module__,
+        fn.__name__,
+        fn.__qualname__,
+        fn.__defaults__,
+        fn.__kwdefaults__,
+        fn.__annotations__,
+        _drop_function_self_refs(closurevars.globals, fn=fn),
+        _drop_function_self_refs(definition_globals, fn=fn),
+        _drop_function_self_refs(closurevars.nonlocals, fn=fn),
+        python_version,
+        marshal_code,
+        source_code,
+    )
 
     return _serialize_nested(payload)
 
 
 def _load_function_payload(data: bytes) -> Callable[..., object]:
-    payload = _require_dict(_deserialize_nested(data), name="Function payload")
+    """
+    Load either a reference-only or full function payload.
+    """
+    payload_obj = _deserialize_nested(data)
 
-    version = payload.get("version")
+    if not isinstance(payload_obj, tuple):
+        raise TypeError("Function payload must be tuple")
+
+    if len(payload_obj) == 4:
+        return _load_reference_function_payload(data)
+
+    payload = _require_tuple_len(payload_obj, name="Function payload", expected=14)
+
+    version = payload[_FN_FULL_VERSION]
     if version != _FORMAT_VERSION:
         raise ValueError(f"Unsupported function payload version: {version!r}")
 
-    kind = _require_str(payload.get("kind", "full"), name="Function payload kind")
-    if kind == "ref":
+    kind = payload[_FN_FULL_KIND]
+    if kind == _FN_REF:
         return _load_reference_function_payload(data)
-    if kind != "full":
+    if kind != _FN_FULL:
         raise ValueError(f"Unsupported function payload kind: {kind!r}")
 
-    module_name = payload["module"]
-    name = _require_str(payload["name"], name="Function payload name")
-    qualname = _require_str(payload["qualname"], name="Function payload qualname")
+    module_name = payload[_FN_FULL_MODULE]
+    name = _require_str(payload[_FN_FULL_NAME], name="Function payload name")
+    qualname = _require_str(payload[_FN_FULL_QUALNAME], name="Function payload qualname")
 
     if not isinstance(module_name, (str, type(None))):
         raise TypeError("Function payload module must be str | None")
 
-    defaults = payload["defaults"]
-    kwdefaults = payload["kwdefaults"]
-    annotations = payload["annotations"]
+    defaults = payload[_FN_FULL_DEFAULTS]
+    kwdefaults = payload[_FN_FULL_KWDEFAULTS]
+    annotations = payload[_FN_FULL_ANNOTATIONS]
 
-    globals_obj = _require_dict(payload["globals"], name="Function payload globals")
+    globals_obj = _require_dict(payload[_FN_FULL_GLOBALS], name="Function payload globals")
     definition_globals_obj = _require_dict(
-        payload.get("definition_globals", {}),
+        payload[_FN_FULL_DEFINITION_GLOBALS],
         name="Function payload definition_globals",
     )
-    nonlocals_obj = _require_dict(payload["nonlocals"], name="Function payload nonlocals")
+    nonlocals_obj = _require_dict(payload[_FN_FULL_NONLOCALS], name="Function payload nonlocals")
+
+    python_version = payload[_FN_FULL_PY_VERSION]
+    if not isinstance(python_version, (tuple, type(None))):
+        raise TypeError("Function payload python_version must be tuple | None")
+
+    marshal_code = payload[_FN_FULL_MARSHAL]
+    source_code = payload[_FN_FULL_SOURCE]
 
     cache_key = _function_cache_key(
         module_name=module_name,
         qualname=qualname,
-        python_version=payload.get("python_version"),
-        marshal_code=payload.get("marshal_code"),
-        source_code=payload.get("source_code"),
+        python_version=python_version,
+        marshal_code=marshal_code if isinstance(marshal_code, (bytes, bytearray)) else None,
+        source_code=source_code if isinstance(source_code, str) else None,
         defaults=defaults,
         kwdefaults=kwdefaults,
         annotations=annotations,
@@ -782,7 +1090,6 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
         glb[key] = value
 
     closure = None
-    marshal_code = payload.get("marshal_code")
     if isinstance(marshal_code, (bytes, bytearray)):
         try:
             code_obj = marshal.loads(bytes(marshal_code))
@@ -799,9 +1106,9 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
             closure = None
 
     fn = _load_function_code_payload(
-        python_version=payload.get("python_version"),
-        marshal_code=payload.get("marshal_code"),
-        source_code=payload.get("source_code"),
+        python_version=python_version,
+        marshal_code=marshal_code if isinstance(marshal_code, (bytes, bytearray)) else None,
+        source_code=source_code if isinstance(source_code, str) else None,
         globals_dict=glb,
         module_name=module_name,
         name=name,
@@ -812,40 +1119,44 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
         closure=closure,
     )
 
+    # Restore self-reference in globals for recursive functions.
     fn.__globals__[name] = fn
     _FUNCTION_CACHE[cache_key] = fn
     return fn
 
 
-# ---------------------------------------------------------------------------
-# exception helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Exception payload
+# ============================================================================
 
 def _dump_exception_payload(exc: BaseException) -> bytes:
+    """
+    Exception payload schema:
+        (version, exc_cls, args_tuple, state_payload)
+    """
     return _serialize_nested(
-        {
-            "version": _FORMAT_VERSION,
-            "class": type(exc),
-            "args": exc.args,
-            "state": _dump_object_state(exc),
-        }
+        (
+            _FORMAT_VERSION,
+            type(exc),
+            exc.args,
+            _dump_object_state(exc),
+        )
     )
 
 
 def _load_exception_payload(data: bytes) -> BaseException:
-    payload = _require_dict(_deserialize_nested(data), name="Exception payload")
+    payload = _require_tuple_len(_deserialize_nested(data), name="Exception payload", expected=4)
 
-    version = payload.get("version")
+    version = payload[_EXC_VERSION]
     if version != _FORMAT_VERSION:
         raise ValueError(f"Unsupported exception payload version: {version!r}")
 
-    exc_cls_obj = payload["class"]
+    exc_cls_obj = payload[_EXC_CLASS]
     if not isinstance(exc_cls_obj, type) or not issubclass(exc_cls_obj, BaseException):
         raise TypeError("Decoded exception class is not a BaseException subclass")
 
-    args_obj = _require_tuple(payload["args"], name="Decoded exception args")
-    state_payload = payload["state"]
+    args_obj = _require_tuple(payload[_EXC_ARGS], name="Decoded exception args")
+    state_payload = payload[_EXC_STATE]
 
     try:
         exc = exc_cls_obj(*args_obj)
@@ -857,108 +1168,178 @@ def _load_exception_payload(data: bytes) -> BaseException:
     return exc
 
 
-# ---------------------------------------------------------------------------
-# dataclass helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Dataclass annotation payload
+# ============================================================================
 
+def _safe_dump_annotation(annotation: object) -> tuple[str, object]:
+    """
+    Compact annotation payload.
 
-def _safe_dump_annotation(annotation: object) -> dict[str, object]:
+    Schema:
+        (_ANN_VALUE, nested_serialized_bytes)
+        (_ANN_REPR, repr_string)
+    """
     try:
-        return {
-            "kind": "value",
-            "value": _serialize_nested(annotation),
-        }
+        return (_ANN_VALUE, _serialize_nested(annotation))
     except Exception:
-        return {
-            "kind": "repr",
-            "value": repr(annotation),
-        }
+        return (_ANN_REPR, repr(annotation))
 
 
 def _safe_load_annotation(payload: object) -> object:
-    data = _require_dict(payload, name="Annotation payload")
-    kind = _require_str(data["kind"], name="Annotation payload kind")
+    tag, value = _require_tuple_len(payload, name="Annotation payload", expected=2)
+    kind = _require_str(tag, name="Annotation payload kind")
 
-    if kind == "value":
-        blob = _require_bytes(data["value"], name="Annotation payload value")
+    if kind == _ANN_VALUE:
+        blob = _require_bytes(value, name="Annotation payload value")
         return _deserialize_nested(blob)
 
-    if kind == "repr":
-        return _require_str(data["value"], name="Annotation payload value")
+    if kind == _ANN_REPR:
+        return _require_str(value, name="Annotation payload value")
 
     raise ValueError(f"Unsupported annotation payload kind: {kind!r}")
 
 
-def _dump_dataclass_class_payload(cls: type[object]) -> dict[str, object]:
+# ============================================================================
+# Dataclass class payload
+# ============================================================================
+
+def _dataclass_param_flags(cls: type[object]) -> int:
+    """
+    Pack dataclass class parameters into a single int.
+    """
+    p = cls.__dataclass_params__
+    flags = 0
+
+    if p.repr:
+        flags |= _DC_REPR
+    if p.eq:
+        flags |= _DC_EQ
+    if p.order:
+        flags |= _DC_ORDER
+    if p.unsafe_hash:
+        flags |= _DC_UNSAFE_HASH
+    if p.frozen:
+        flags |= _DC_FROZEN
+    if "__slots__" in cls.__dict__:
+        flags |= _DC_SLOTS
+
+    return flags
+
+
+def _field_flags(f) -> int:
+    """
+    Pack dataclass field booleans into a single int.
+    """
+    flags = 0
+    if f.init:
+        flags |= _DCF_INIT
+    if f.repr:
+        flags |= _DCF_REPR
+    if f.compare:
+        flags |= _DCF_COMPARE
+    if getattr(f, "kw_only", False):
+        flags |= _DCF_KW_ONLY
+    return flags
+
+
+def _flag_on(flags: int, bit: int) -> bool:
+    return bool(flags & bit)
+
+
+def _dump_dataclass_class_payload(cls: type[object]) -> tuple[object, ...]:
+    """
+    Dataclass class payload schemas:
+
+    Importable dataclass:
+        (_DC_CLASS_REF, module_name, qualname)
+
+    Local/non-importable dataclass:
+        (
+            _DC_CLASS_LOCAL,
+            cls_name,
+            qualname,
+            module_name,
+            class_flags,
+            [
+                (
+                    field_name,
+                    annotation_payload,
+                    field_flags,
+                    hash_value,
+                    metadata_or_none,
+                ),
+                ...
+            ],
+        )
+    """
     if not is_dataclass(cls):
         raise TypeError(f"Expected dataclass type, got {cls!r}")
 
     if _is_importable_class(cls):
-        return {
-            "kind": "ref",
-            "module": cls.__module__,
-            "qualname": cls.__qualname__,
-        }
+        return (
+            _DC_CLASS_REF,
+            cls.__module__,
+            cls.__qualname__,
+        )
 
-    params = cls.__dataclass_params__
-    field_payloads: list[dict[str, object]] = []
+    field_payloads: list[tuple[object, ...]] = []
 
     for f in fields(cls):
         field_payloads.append(
-            {
-                "name": f.name,
-                "annotation": _safe_dump_annotation(f.type),
-                "init": f.init,
-                "repr": f.repr,
-                "hash": f.hash,
-                "compare": f.compare,
-                "kw_only": getattr(f, "kw_only", False),
-                "metadata": dict(f.metadata) if f.metadata else {},
-            }
+            (
+                f.name,
+                _safe_dump_annotation(f.type),
+                _field_flags(f),
+                f.hash,
+                dict(f.metadata) if f.metadata else None,
+            )
         )
 
-    return {
-        "kind": "local",
-        "name": cls.__name__,
-        "qualname": cls.__qualname__,
-        "module": cls.__module__,
-        "params": {
-            "repr": params.repr,
-            "eq": params.eq,
-            "order": params.order,
-            "unsafe_hash": params.unsafe_hash,
-            "frozen": params.frozen,
-            "slots": "__slots__" in cls.__dict__,
-        },
-        "fields": field_payloads,
-    }
+    return (
+        _DC_CLASS_LOCAL,
+        cls.__name__,
+        cls.__qualname__,
+        cls.__module__,
+        _dataclass_param_flags(cls),
+        field_payloads,
+    )
 
 
 def _load_dataclass_class_payload(payload: object) -> type[object]:
-    data = _require_dict(payload, name="Dataclass class payload")
-    kind = _require_str(data["kind"], name="Dataclass class payload kind")
+    data = _require_tuple(payload, name="Dataclass class payload")
+    if not data:
+        raise ValueError("Dataclass class payload must not be empty")
 
-    if kind == "ref":
-        module_name = _require_str(data["module"], name="Dataclass class payload module")
-        qualname = _require_str(data["qualname"], name="Dataclass class payload qualname")
+    kind = data[0]
+
+    if kind == _DC_CLASS_REF:
+        data = _require_tuple_len(data, name="Dataclass class ref payload", expected=3)
+        module_name = _require_str(data[_DC_REF_MODULE], name="Dataclass class payload module")
+        qualname = _require_str(data[_DC_REF_QUALNAME], name="Dataclass class payload qualname")
         cls = _class_cache_get_or_load(module_name, qualname)
         if not is_dataclass(cls):
             raise TypeError(f"Resolved class is not a dataclass: {module_name}.{qualname}")
         return cls
 
-    if kind != "local":
+    if kind != _DC_CLASS_LOCAL:
         raise ValueError(f"Unsupported dataclass class payload kind: {kind!r}")
 
-    name = _require_str(data["name"], name="Dataclass local payload name")
-    qualname = _require_str(data["qualname"], name="Dataclass local payload qualname")
-    module_name = _require_str(data["module"], name="Dataclass local payload module")
-    params = _require_dict(data["params"], name="Dataclass local payload params")
-    fields_payload = _require_list(data["fields"], name="Dataclass local payload fields")
+    data = _require_tuple_len(data, name="Dataclass local class payload", expected=6)
+
+    name = _require_str(data[_DC_LOCAL_NAME], name="Dataclass local payload name")
+    qualname = _require_str(data[_DC_LOCAL_QUALNAME], name="Dataclass local payload qualname")
+    module_name = _require_str(data[_DC_LOCAL_MODULE], name="Dataclass local payload module")
+    flags = data[_DC_LOCAL_FLAGS]
+    if not isinstance(flags, int):
+        raise TypeError("Dataclass local payload flags must be int")
+
+    fields_payload = _require_list(data[_DC_LOCAL_FIELDS], name="Dataclass local payload fields")
 
     cache_key = (
         module_name,
         qualname,
-        repr(params),
+        flags,
         repr(fields_payload),
     )
     cached = _LOCAL_DATACLASS_CACHE.get(cache_key)
@@ -967,23 +1348,29 @@ def _load_dataclass_class_payload(payload: object) -> type[object]:
 
     spec = []
     for item in fields_payload:
-        field_data = _require_dict(item, name="Dataclass field payload")
+        field_data = _require_tuple_len(item, name="Dataclass field payload", expected=5)
 
-        field_name = _require_str(field_data["name"], name="Dataclass field name")
-        annotation = _safe_load_annotation(field_data["annotation"])
-        init = bool(field_data["init"])
-        repr_flag = bool(field_data["repr"])
-        hash_flag = field_data["hash"]
-        compare_flag = bool(field_data["compare"])
-        kw_only = bool(field_data.get("kw_only", False))
-        metadata = _require_dict(field_data.get("metadata", {}), name="Dataclass field metadata")
+        field_name = _require_str(field_data[_DCF_NAME], name="Dataclass field name")
+        annotation = _safe_load_annotation(field_data[_DCF_ANNOTATION])
+
+        field_flags_value = field_data[_DCF_FLAGS]
+        if not isinstance(field_flags_value, int):
+            raise TypeError("Dataclass field flags must be int")
+
+        hash_flag = field_data[_DCF_HASH]
+
+        metadata_obj = field_data[_DCF_METADATA]
+        if metadata_obj is None:
+            metadata = {}
+        else:
+            metadata = _require_dict(metadata_obj, name="Dataclass field metadata")
 
         fld = dataclass_field(
-            init=init,
-            repr=repr_flag,
+            init=_flag_on(field_flags_value, _DCF_INIT),
+            repr=_flag_on(field_flags_value, _DCF_REPR),
             hash=hash_flag,
-            compare=compare_flag,
-            kw_only=kw_only,
+            compare=_flag_on(field_flags_value, _DCF_COMPARE),
+            kw_only=_flag_on(field_flags_value, _DCF_KW_ONLY),
             metadata=metadata,
         )
         spec.append((field_name, annotation, fld))
@@ -997,19 +1384,38 @@ def _load_dataclass_class_payload(payload: object) -> type[object]:
         cls_name=name,
         fields=spec,
         namespace=namespace,
-        repr=bool(params.get("repr", True)),
-        eq=bool(params.get("eq", True)),
-        order=bool(params.get("order", False)),
-        unsafe_hash=bool(params.get("unsafe_hash", False)),
-        frozen=bool(params.get("frozen", False)),
-        slots=bool(params.get("slots", False)),
+        repr=_flag_on(flags, _DC_REPR),
+        eq=_flag_on(flags, _DC_EQ),
+        order=_flag_on(flags, _DC_ORDER),
+        unsafe_hash=_flag_on(flags, _DC_UNSAFE_HASH),
+        frozen=_flag_on(flags, _DC_FROZEN),
+        slots=_flag_on(flags, _DC_SLOTS),
     )
 
     _LOCAL_DATACLASS_CACHE[cache_key] = cls
     return cls
 
 
+# ============================================================================
+# Dataclass instance payload
+# ============================================================================
+
 def _dump_dataclass_payload(obj: object) -> bytes:
+    """
+    Dataclass instance payload schema:
+        (
+            version,
+            class_payload,
+            init_values_dict,
+            non_init_values_dict,
+            extra_state_payload,
+        )
+
+    Why keep init and non-init values separate?
+    - init fields go through __init__
+    - non-init fields are assigned after construction
+    - extra_state holds non-field attributes / custom state leftovers
+    """
     if not is_dataclass(obj) or isinstance(obj, type):
         raise TypeError(f"DataclassSerialized requires a dataclass instance, got {type(obj)!r}")
 
@@ -1017,54 +1423,56 @@ def _dump_dataclass_payload(obj: object) -> bytes:
     init_values: dict[str, object] = {}
     non_init_values: dict[str, object] = {}
 
-    for f in fields(obj):
+    obj_fields = fields(obj)
+    field_names = {f.name for f in obj_fields}
+
+    for f in obj_fields:
         value = getattr(obj, f.name)
         if f.init:
             init_values[f.name] = value
         else:
             non_init_values[f.name] = value
 
-    field_names = {f.name for f in fields(obj)}
     raw_state = _dump_object_state(obj)
 
-    if raw_state["kind"] == "default":
-        default_state = _require_dict(raw_state["value"], name="Dataclass default state")
-        extra_state_payload: dict[str, object] = {
-            "kind": "default",
-            "value": {
+    if raw_state[0] == _STATE_DEFAULT:
+        default_state = _require_dict(raw_state[1], name="Dataclass default state")
+        extra_state_payload: tuple[str, object] = (
+            _STATE_DEFAULT,
+            {
                 key: value
                 for key, value in default_state.items()
                 if key not in field_names
             },
-        }
+        )
     else:
         extra_state_payload = raw_state
 
-    payload = {
-        "version": _FORMAT_VERSION,
-        "class_payload": _dump_dataclass_class_payload(cls),
-        "init_values": init_values,
-        "non_init_values": non_init_values,
-        "extra_state": extra_state_payload,
-    }
+    payload = (
+        _FORMAT_VERSION,
+        _dump_dataclass_class_payload(cls),
+        init_values,
+        non_init_values,
+        extra_state_payload,
+    )
     return _serialize_nested(payload)
 
 
 def _load_dataclass_payload(data: bytes) -> object:
-    payload = _require_dict(_deserialize_nested(data), name="Dataclass payload")
+    payload = _require_tuple_len(_deserialize_nested(data), name="Dataclass payload", expected=5)
 
-    version = payload.get("version")
+    version = payload[_DC_PAYLOAD_VERSION]
     if version != _FORMAT_VERSION:
         raise ValueError(f"Unsupported dataclass payload version: {version!r}")
 
-    class_payload = payload["class_payload"]
+    class_payload = payload[_DC_PAYLOAD_CLASS]
     cls_obj = _load_dataclass_class_payload(class_payload)
     if not isinstance(cls_obj, type) or not is_dataclass(cls_obj):
         raise TypeError("Decoded dataclass class is not a dataclass type")
 
-    init_values = _require_dict(payload["init_values"], name="Dataclass init_values")
-    non_init_values = _require_dict(payload["non_init_values"], name="Dataclass non_init_values")
-    extra_state_payload = payload.get("extra_state", {"kind": "default", "value": {}})
+    init_values = _require_dict(payload[_DC_PAYLOAD_INIT_VALUES], name="Dataclass init_values")
+    non_init_values = _require_dict(payload[_DC_PAYLOAD_NON_INIT_VALUES], name="Dataclass non_init_values")
+    extra_state_payload = payload[_DC_PAYLOAD_EXTRA_STATE]
 
     obj = cls_obj(**init_values)
 
@@ -1075,13 +1483,18 @@ def _load_dataclass_payload(data: bytes) -> object:
     return obj
 
 
-# ---------------------------------------------------------------------------
-# serialized wrappers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Serialized wrappers
+# ============================================================================
 
 @dataclass(frozen=True, slots=True)
 class ComplexSerialized(Serialized[T], Generic[T]):
+    """
+    Base wrapper for "complex" Python objects that need special handling beyond
+    primitive / logical / collection payloads.
+
+    Subclasses only need to implement `value`.
+    """
     TAG: ClassVar[int]
 
     @property
@@ -1099,6 +1512,16 @@ class ComplexSerialized(Serialized[T], Generic[T]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> Serialized[object] | None:
+        """
+        Try to serialize supported complex object kinds.
+
+        Order matters a bit:
+        - functions / methods
+        - dataclass instances
+        - exceptions
+        - classes
+        - modules
+        """
         if isinstance(obj, (FunctionType, MethodType)):
             return FunctionSerialized.build_function(obj, codec=codec)
 
@@ -1119,6 +1542,9 @@ class ComplexSerialized(Serialized[T], Generic[T]):
 
 @dataclass(frozen=True, slots=True)
 class ModuleSerialized(ComplexSerialized[ModuleType]):
+    """
+    Module payload is just the utf-8 encoded module name.
+    """
     TAG: ClassVar[int] = Tags.MODULE
 
     @property
@@ -1142,6 +1568,9 @@ class ModuleSerialized(ComplexSerialized[ModuleType]):
 
 @dataclass(frozen=True, slots=True)
 class ClassSerialized(ComplexSerialized[type[object]]):
+    """
+    Class payload is a nested compact class reference tuple.
+    """
     TAG: ClassVar[int] = Tags.CLASS
 
     @property
@@ -1164,6 +1593,11 @@ class ClassSerialized(ComplexSerialized[type[object]]):
 
 @dataclass(frozen=True, slots=True)
 class FunctionSerialized(ComplexSerialized[Callable[..., object]]):
+    """
+    Function payload uses either:
+    - reference-only tuple
+    - full reconstruction tuple
+    """
     TAG: ClassVar[int] = Tags.FUNCTION
 
     @property
@@ -1195,6 +1629,12 @@ class FunctionSerialized(ComplexSerialized[Callable[..., object]]):
 
 @dataclass(frozen=True, slots=True)
 class BaseExceptionSerialized(ComplexSerialized[BaseException]):
+    """
+    Exception payload stores:
+    - class
+    - args
+    - instance state
+    """
     TAG: ClassVar[int] = Tags.BASE_EXCEPTION
 
     @property
@@ -1217,6 +1657,13 @@ class BaseExceptionSerialized(ComplexSerialized[BaseException]):
 
 @dataclass(frozen=True, slots=True)
 class DataclassSerialized(ComplexSerialized[object]):
+    """
+    Dataclass payload stores:
+    - class schema/reference
+    - init values
+    - non-init values
+    - extra state
+    """
     TAG: ClassVar[int] = Tags.DATACLASS
 
     @property
@@ -1237,5 +1684,6 @@ class DataclassSerialized(ComplexSerialized[object]):
         )
 
 
+# Register all complex serializer subclasses with Tags
 for cls in ComplexSerialized.__subclasses__():
     Tags.register_class(cls)

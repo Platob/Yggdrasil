@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from pathlib import Path
 from typing import Any, Mapping, IO
 
 from yggdrasil.io import BytesIO
@@ -28,21 +29,91 @@ __all__ = [
     "loads",
 ]
 
-def dump(
+
+def _dump(
     obj: Any,
     fp: IO[bytes],
     *,
     metadata: Mapping[bytes, bytes] | None = None,
     codec: int | None = None,
-) -> bytes:
+):
     dumped = Serialized.from_python_object(
         obj,
         metadata=metadata,
-        codec=codec
+        codec=codec,
     )
 
     fp.write(MAGIC)
     fp.write(dumped.data.parent.to_bytes())
+
+
+def _dump_path(
+    obj: Any,
+    path: Path,
+    *,
+    metadata: Mapping[bytes, bytes] | None = None,
+    codec: int | None = None,
+) -> bytes:
+    try:
+        with path.open("wb") as f:
+            return _dump(
+                obj,
+                f,
+                metadata=metadata,
+                codec=codec,
+            )
+    except (OSError, IOError):
+        # likely parent does not exist; create it and retry once
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with path.open("wb") as f:
+            return _dump(
+                obj,
+                f,
+                metadata=metadata,
+                codec=codec,
+            )
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def dump(
+    obj: Any,
+    fp: IO[bytes] | Path | str,
+    *,
+    metadata: Mapping[bytes, bytes] | None = None,
+    codec: int | None = None,
+) -> bytes:
+    if hasattr(fp, "write"):
+        return _dump(
+            obj,
+            fp,  # type: ignore[arg-type]
+            metadata=metadata,
+            codec=codec,
+        )
+
+    if isinstance(fp, Path):
+        return _dump_path(
+            obj,
+            fp,
+            metadata=metadata,
+            codec=codec,
+        )
+
+    if isinstance(fp, str):
+        return _dump_path(
+            obj,
+            Path(fp),
+            metadata=metadata,
+            codec=codec,
+        )
+
+    raise TypeError(
+        f"Cannot write to object of type {type(fp).__name__!r}. "
+        "Expected a file-like object, pathlib.Path, or string path."
+    )
 
 
 def dumps(
@@ -64,7 +135,7 @@ def dumps(
 
 
 def load(
-    fp: IO[bytes],
+    fp: IO[bytes] | Path | str,
     *,
     unpickle: bool = True,
 ) -> Any:
@@ -72,6 +143,12 @@ def load(
 
     mag = buffer.read(len(MAGIC))
     if mag != MAGIC:
+        if isinstance(fp, (str, Path)):
+            # check size 0 and clean
+            p = Path(fp)
+            if p.is_file() and p.stat().st_size == 0:
+                p.unlink(missing_ok=True)
+                raise SerializationError(f"File {fp!r} is empty")
         raise SerializationError("Invalid magic header")
 
     read = Serialized.read_from(buffer)

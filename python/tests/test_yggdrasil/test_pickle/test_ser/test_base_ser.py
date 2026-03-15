@@ -8,7 +8,7 @@ import pytest
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser import dump, dumps, load, loads
 from yggdrasil.pickle.ser.constants import FORMAT_VERSION, MAGIC
-from yggdrasil.pickle.ser.errors import SerializationError
+from yggdrasil.pickle.ser.errors import SerializationError, HeaderDecodeError
 from yggdrasil.pickle.ser.serialized import Serialized
 
 
@@ -199,5 +199,5 @@ def test_loads_accepts_base64_string_from_manual_encoding() -> None:
 
 
 def test_invalid_base64_string_raises_binascii_error() -> None:
-    with pytest.raises(binascii.Error):
+    with pytest.raises(HeaderDecodeError):
         loads("!!! definitely not base64 !!!")

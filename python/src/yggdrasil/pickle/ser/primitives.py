@@ -283,3 +283,13 @@ class Float64Serialized(PrimitiveSerialized[float]):
 
 for cls in PrimitiveSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
+
+for t, cls in (
+    (None, NoneSerialized),
+    (bool, BoolSerialized),
+    (bytes, BytesSerialized),
+    (str, Utf8StringSerialized),
+    (int, Int64Serialized),
+    (float, Float64Serialized),
+):
+    Tags.register_class(cls, pytype=t)

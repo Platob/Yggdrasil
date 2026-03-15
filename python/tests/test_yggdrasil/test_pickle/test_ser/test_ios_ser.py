@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 
-from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser.ios import IOSerialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
@@ -15,15 +14,15 @@ def test_io_bytesio_roundtrip() -> None:
     assert ser is not None
 
     assert isinstance(ser, IOSerialized)
-    assert ser.tag == Tags.IO
+    assert ser.tag == Tags.IO_BYTES_BUFFER
 
     metadata = ser.metadata or {}
-    assert metadata.get(b"io_kind") == b"binary"
+    assert metadata.get(b"k") == b"bb"
 
     out = ser.as_python()
 
-    assert isinstance(out, BytesIO)
-    assert out.to_bytes() == b"hello io serializer"
+    assert isinstance(out, io.BytesIO)
+    assert out.getvalue() == b"hello io serializer"
 
 
 def test_io_preserves_name_and_mode_metadata() -> None:
@@ -37,12 +36,12 @@ def test_io_preserves_name_and_mode_metadata() -> None:
     assert ser is not None
 
     assert isinstance(ser, IOSerialized)
-    assert ser.tag == Tags.IO
+    assert ser.tag == Tags.IO_BYTES_BUFFER
 
     metadata = ser.metadata or {}
-    assert metadata.get(b"io_name") == b"dummy.bin"
-    assert metadata.get(b"io_mode") == b"rb"
-    assert metadata.get(b"io_kind") == b"binary"
+    assert metadata.get(b"n") == b"dummy.bin"
+    assert metadata.get(b"m") == b"rb"
+    assert metadata.get(b"k") == b"bb"
 
 
 def test_io_read_from_seekable_stream_restores_position() -> None:
@@ -55,5 +54,5 @@ def test_io_read_from_seekable_stream_restores_position() -> None:
     assert src.tell() == 3
 
     out = ser.as_python()
-    assert isinstance(out, BytesIO)
-    assert out.to_bytes() == b"abcdef"
+    assert isinstance(out, io.BytesIO)
+    assert out.getvalue() == b"abcdef"

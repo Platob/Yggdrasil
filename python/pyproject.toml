@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.5.1"
+version = "0.5.2"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -69,6 +69,8 @@ databricks = [
 pickle = [
   "cloudpickle",
   "dill>=0.4",
+  "xxhash",
+  "blake3",
 ]
 
 [project.urls]

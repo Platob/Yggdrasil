@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from array import array
+from collections import deque
 from collections.abc import Generator as AbcGenerator
 from collections.abc import Iterator as AbcIterator
+from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass
 from typing import ClassVar, Generic, Iterator, Mapping
 
@@ -21,6 +24,10 @@ __all__ = [
     "LargeTupleSerialized",
     "SetSerialized",
     "LargeSetSerialized",
+    "FrozenSetSerialized",
+    "LargeFrozenSetSerialized",
+    "DequeSerialized",
+    "LargeDequeSerialized",
     "MappingSerialized",
     "LargeMappingSerialized",
     "GeneratorSerialized",
@@ -29,6 +36,12 @@ __all__ = [
     "LargeIteratorSerialized",
 ]
 
+_U32_MAX = 0xFFFFFFFF
+
+
+# ============================================================================
+# low-level count helpers
+# ============================================================================
 
 def _read_u32(buffer: BytesIO) -> int:
     raw = buffer.read(4)
@@ -44,6 +57,18 @@ def _read_u64(buffer: BytesIO) -> int:
     return int.from_bytes(raw, "big", signed=False)
 
 
+def _write_count(buffer: BytesIO, count: int, *, large: bool) -> None:
+    buffer.write(count.to_bytes(8 if large else 4, "big", signed=False))
+
+
+def _is_large_count(count: int) -> bool:
+    return count > _U32_MAX
+
+
+# ============================================================================
+# payload builders / readers
+# ============================================================================
+
 def _iter_items(buffer: BytesIO, count: int) -> Iterator[Serialized[object]]:
     for _ in range(count):
         start = buffer.tell()
@@ -52,8 +77,20 @@ def _iter_items(buffer: BytesIO, count: int) -> Iterator[Serialized[object]]:
         yield item
 
 
-def _write_count(buffer: BytesIO, count: int, *, large: bool) -> None:
-    buffer.write(count.to_bytes(8 if large else 4, "big", signed=False))
+def _iter_entry_pairs(
+    buffer: BytesIO,
+    count: int,
+) -> Iterator[tuple[Serialized[object], Serialized[object]]]:
+    for _ in range(count):
+        key_start = buffer.tell()
+        key = Serialized.read_from(buffer, pos=key_start)
+        buffer.seek(key.head.payload_end)
+
+        value_start = buffer.tell()
+        value = Serialized.read_from(buffer, pos=value_start)
+        buffer.seek(value.head.payload_end)
+
+        yield key, value
 
 
 def _build_collection_payload(
@@ -85,20 +122,60 @@ def _build_mapping_payload(
 
 def _materialize_iterable(obj: AbcIterator[object]) -> tuple[tuple[object, ...], int]:
     """
-    Consume an iterator/generator into an immutable snapshot so we can
-    emit the required count-prefixed wire format.
+    Snapshot a one-shot iterator/generator into an immutable tuple so the wire
+    format can include an upfront count.
     """
     values = tuple(obj)
     return values, len(values)
 
 
+def _build_sequence_serialized(
+    *,
+    tag_small: int,
+    tag_large: int,
+    items: Iterator[object],
+    count: int,
+    metadata: Mapping[bytes, bytes] | None,
+    codec: int | None,
+) -> Serialized[object]:
+    large = _is_large_count(count)
+    payload = _build_collection_payload(items, count=count, large=large)
+    return Serialized.build(
+        tag=tag_large if large else tag_small,
+        data=payload.to_bytes(),
+        metadata=metadata,
+        codec=codec,
+    )
+
+
+def _build_mapping_serialized(
+    *,
+    items: Iterator[tuple[object, object]],
+    count: int,
+    metadata: Mapping[bytes, bytes] | None,
+    codec: int | None,
+) -> Serialized[object]:
+    large = _is_large_count(count)
+    payload = _build_mapping_payload(items, count=count, large=large)
+    return Serialized.build(
+        tag=Tags.LARGE_MAPPING if large else Tags.MAPPING,
+        data=payload.to_bytes(),
+        metadata=metadata,
+        codec=codec,
+    )
+
+
+# ============================================================================
+# base classes
+# ============================================================================
+
 @dataclass(frozen=True, slots=True)
 class CollectionSerialized(Serialized[T], Generic[T]):
     """
-    Base class for standard collection payloads.
+    Base class for count-prefixed collection payloads.
 
-    Standard collection wire format
-    -------------------------------
+    Standard wire format
+    --------------------
     Ordered collections:
         [count:u32][item_0][item_1]...[item_n]
 
@@ -143,94 +220,110 @@ class CollectionSerialized(Serialized[T], Generic[T]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> Serialized[object] | None:
+        # ------------------------------------------------------------------
+        # concrete builtins / stdlib containers with known length
+        # ------------------------------------------------------------------
         if isinstance(obj, list):
-            large = len(obj) > 0xFFFFFFFF
-            tag = Tags.LARGE_LIST if large else Tags.LIST
-            payload = _build_collection_payload(
-                iter(obj),
+            return _build_sequence_serialized(
+                tag_small=Tags.LIST,
+                tag_large=Tags.LARGE_LIST,
+                items=iter(obj),
                 count=len(obj),
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
 
         if isinstance(obj, tuple):
-            large = len(obj) > 0xFFFFFFFF
-            tag = Tags.LARGE_TUPLE if large else Tags.TUPLE
-            payload = _build_collection_payload(
-                iter(obj),
+            return _build_sequence_serialized(
+                tag_small=Tags.TUPLE,
+                tag_large=Tags.LARGE_TUPLE,
+                items=iter(obj),
                 count=len(obj),
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
 
         if isinstance(obj, set):
-            large = len(obj) > 0xFFFFFFFF
-            tag = Tags.LARGE_SET if large else Tags.SET
-            payload = _build_collection_payload(
-                iter(obj),
+            return _build_sequence_serialized(
+                tag_small=Tags.SET,
+                tag_large=Tags.LARGE_SET,
+                items=iter(obj),
                 count=len(obj),
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
 
+        if isinstance(obj, frozenset):
+            return _build_sequence_serialized(
+                tag_small=Tags.FROZENSET,
+                tag_large=Tags.LARGE_FROZENSET,
+                items=iter(obj),
+                count=len(obj),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        if isinstance(obj, deque):
+            return _build_sequence_serialized(
+                tag_small=Tags.DEQUE,
+                tag_large=Tags.LARGE_DEQUE,
+                items=iter(obj),
+                count=len(obj),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        if isinstance(obj, array):
+            return _build_sequence_serialized(
+                tag_small=Tags.ARRAY,
+                tag_large=Tags.LARGE_ARRAY,
+                items=iter(obj),
+                count=len(obj),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        # ------------------------------------------------------------------
+        # mappings
+        # ------------------------------------------------------------------
         if isinstance(obj, dict):
-            large = len(obj) > 0xFFFFFFFF
-            tag = Tags.LARGE_MAPPING if large else Tags.MAPPING
-            payload = _build_mapping_payload(
-                iter(obj.items()),
+            return _build_mapping_serialized(
+                items=iter(obj.items()),
                 count=len(obj),
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
 
+        if isinstance(obj, AbcMapping):
+            items = tuple(obj.items())
+            return _build_mapping_serialized(
+                items=iter(items),
+                count=len(items),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        # ------------------------------------------------------------------
+        # one-shot iterables
+        # ------------------------------------------------------------------
         if isinstance(obj, AbcGenerator):
             values, count = _materialize_iterable(obj)
-            large = count > 0xFFFFFFFF
-            tag = Tags.LARGE_GENERATOR if large else Tags.GENERATOR
-            payload = _build_collection_payload(
-                iter(values),
+            return _build_sequence_serialized(
+                tag_small=Tags.GENERATOR,
+                tag_large=Tags.LARGE_GENERATOR,
+                items=iter(values),
                 count=count,
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
 
         if isinstance(obj, AbcIterator):
             values, count = _materialize_iterable(obj)
-            large = count > 0xFFFFFFFF
-            tag = Tags.LARGE_ITERATOR if large else Tags.ITERATOR
-            payload = _build_collection_payload(
-                iter(values),
+            return _build_sequence_serialized(
+                tag_small=Tags.ITERATOR,
+                tag_large=Tags.LARGE_ITERATOR,
+                items=iter(values),
                 count=count,
-                large=large,
-            )
-            return Serialized.build(
-                tag=tag,
-                data=payload.to_bytes(),
                 metadata=metadata,
                 codec=codec,
             )
@@ -243,6 +336,10 @@ class LargeCollectionSerialized(CollectionSerialized[T], Generic[T]):
     def _read_count(self, buffer: BytesIO) -> int:
         return _read_u64(buffer)
 
+
+# ============================================================================
+# sequence-like concrete serializers
+# ============================================================================
 
 @dataclass(frozen=True, slots=True)
 class ArraySerialized(CollectionSerialized[list[object]]):
@@ -317,6 +414,42 @@ class LargeSetSerialized(LargeCollectionSerialized[set[object]]):
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenSetSerialized(CollectionSerialized[frozenset[object]]):
+    TAG: ClassVar[int] = Tags.FROZENSET
+
+    @property
+    def value(self) -> frozenset[object]:
+        return frozenset(item.as_python() for item in self.iter_())
+
+
+@dataclass(frozen=True, slots=True)
+class LargeFrozenSetSerialized(LargeCollectionSerialized[frozenset[object]]):
+    TAG: ClassVar[int] = Tags.LARGE_FROZENSET
+
+    @property
+    def value(self) -> frozenset[object]:
+        return frozenset(item.as_python() for item in self.iter_())
+
+
+@dataclass(frozen=True, slots=True)
+class DequeSerialized(CollectionSerialized[deque[object]]):
+    TAG: ClassVar[int] = Tags.DEQUE
+
+    @property
+    def value(self) -> deque[object]:
+        return deque(item.as_python() for item in self.iter_())
+
+
+@dataclass(frozen=True, slots=True)
+class LargeDequeSerialized(LargeCollectionSerialized[deque[object]]):
+    TAG: ClassVar[int] = Tags.LARGE_DEQUE
+
+    @property
+    def value(self) -> deque[object]:
+        return deque(item.as_python() for item in self.iter_())
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratorSerialized(CollectionSerialized[Iterator[object]]):
     TAG: ClassVar[int] = Tags.GENERATOR
 
@@ -352,37 +485,24 @@ class LargeIteratorSerialized(LargeCollectionSerialized[Iterator[object]]):
         return (item.as_python() for item in self.iter_())
 
 
+# ============================================================================
+# mapping serializers
+# ============================================================================
+
 @dataclass(frozen=True, slots=True)
 class _BaseMappingSerialized(CollectionSerialized[dict[object, object]]):
-    def iter_(self) -> Iterator[Serialized[object]]:
+    def _iter_entry_pairs(self) -> Iterator[tuple[Serialized[object], Serialized[object]]]:
         buf = self._payload_buffer()
         count = self._read_count(buf)
+        yield from _iter_entry_pairs(buf, count)
 
-        for _ in range(count):
-            key_start = buf.tell()
-            key = Serialized.read_from(buf, pos=key_start)
-            buf.seek(key.head.payload_end)
+    def iter_(self) -> Iterator[Serialized[object]]:
+        for key, value in self._iter_entry_pairs():
             yield key
-
-            value_start = buf.tell()
-            value = Serialized.read_from(buf, pos=value_start)
-            buf.seek(value.head.payload_end)
             yield value
 
     def iter_entries(self) -> Iterator[tuple[Serialized[object], Serialized[object]]]:
-        buf = self._payload_buffer()
-        count = self._read_count(buf)
-
-        for _ in range(count):
-            key_start = buf.tell()
-            key = Serialized.read_from(buf, pos=key_start)
-            buf.seek(key.head.payload_end)
-
-            value_start = buf.tell()
-            value = Serialized.read_from(buf, pos=value_start)
-            buf.seek(value.head.payload_end)
-
-            yield key, value
+        yield from self._iter_entry_pairs()
 
     @property
     def entries(self) -> tuple[tuple[Serialized[object], Serialized[object]], ...]:
@@ -409,6 +529,10 @@ class LargeMappingSerialized(
     TAG: ClassVar[int] = Tags.LARGE_MAPPING
 
 
+# ============================================================================
+# registration
+# ============================================================================
+
 for cls in CollectionSerialized.__subclasses__():
     Tags.register_class(cls)
 
@@ -417,3 +541,14 @@ for cls in LargeCollectionSerialized.__subclasses__():
 
 for cls in _BaseMappingSerialized.__subclasses__():
     Tags.register_class(cls)
+
+for t, cls in (
+    (list, ListSerialized),
+    (tuple, TupleSerialized),
+    (set, SetSerialized),
+    (frozenset, FrozenSetSerialized),
+    (dict, MappingSerialized),
+    (deque, DequeSerialized),
+    (array, ArraySerialized),
+):
+    Tags.register_class(cls, pytype=t)

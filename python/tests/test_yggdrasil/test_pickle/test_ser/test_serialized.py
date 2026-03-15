@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from yggdrasil.pickle.ser import CODEC_ZSTD
-from yggdrasil.pickle.ser.constants import CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD, CODEC_ZLIB
+from yggdrasil.pickle.ser.constants import CODEC_ZSTD, CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD, CODEC_ZLIB
 from yggdrasil.pickle.ser.primitives import BytesSerialized, UInt32Serialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags

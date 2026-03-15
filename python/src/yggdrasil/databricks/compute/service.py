@@ -154,7 +154,7 @@ class Clusters(DatabricksService):
         )
 
         libraries = (libraries or []) + [
-            f"ygg[http,data,databricks,pickle]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
+            f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
             "uv",
             "dill",
         ]

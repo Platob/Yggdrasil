@@ -875,6 +875,9 @@ class BytesIO(io.RawIOBase):
         if pos is None:
             pos = self._pos
 
+            if pos == self.size:
+                pos = 0
+
         pos = int(pos)
         if pos < 0:
             raise ValueError("view pos must be >= 0")

@@ -247,6 +247,8 @@ class Session(ABC):
         if received_to is not None and received_to != "":
             clauses.append(f"response_received_at_epoch <= {to_utc_epoch_us(received_to)}")
 
+        if not clauses:
+            return "1=1"
         return " AND ".join(clauses)
 
     def send_many(
@@ -324,21 +326,45 @@ class Session(ABC):
                 ]
 
                 time_filter = self._sql_match_clause(
-                    None, keys=[],
+                    None,
+                    keys=[],
                     received_from=received_from,
                     received_to=received_to,
                 )
+
                 clauses = " OR ".join(
-                    "(%s)" % self._sql_match_clause(req, keys=cache_request_by)
+                    f"({self._sql_match_clause(req, keys=cache_request_by)})"
                     for req in anon_batch
                 )
-                query = f"SELECT * FROM {cache.full_name(safe=True)}"
-                if clauses and time_filter:
-                    query += f" WHERE ({clauses}) AND ({time_filter})"
-                elif clauses:
-                    query += f" WHERE {clauses}"
-                elif time_filter:
-                    query += f" WHERE {time_filter}"
+
+                where_parts: list[str] = []
+                if clauses:
+                    where_parts.append(f"({clauses})")
+                if time_filter:
+                    where_parts.append(f"({time_filter})")
+
+                base_query = f"SELECT * FROM {cache.full_name(safe=True)}"
+                if where_parts:
+                    base_query += " WHERE " + " AND ".join(where_parts)
+
+                if cache_request_by:
+                    partition_by = ", ".join(cache_request_by)
+                    query = f"""
+SELECT *
+FROM (
+    SELECT
+        t.*,
+        row_number() OVER (
+            PARTITION BY {partition_by}
+            ORDER BY response_received_at_epoch DESC
+        ) AS __rn
+    FROM (
+        {base_query}
+    ) t
+) ranked
+WHERE __rn = 1"""
+                else:
+                    query = base_query
 
                 try:
                     sql_cache_statement = cache.sql.execute(query)

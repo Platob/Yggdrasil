@@ -11,6 +11,7 @@ from yggdrasil.io.buffer.bytes_view import BytesIOView
 from yggdrasil.pickle.ser.codec import DEFAULT_CODEC, codec_name, compress_bytes, decompress_bytes
 from yggdrasil.pickle.ser.constants import CODEC_NONE, COMPRESS_THRESHOLD
 from yggdrasil.pickle.ser.header import Header
+from yggdrasil.pickle.ser.tags import Tags
 
 __all__ = [
     "T",
@@ -159,28 +160,9 @@ class Serialized(ABC, Generic[T]):
         if isinstance(obj, Serialized):
             return obj
 
-        from yggdrasil.pickle.ser.collections import CollectionSerialized
-        from yggdrasil.pickle.ser.complexs import ComplexSerialized
-        from yggdrasil.pickle.ser.logicals import LogicalSerialized
-        from yggdrasil.pickle.ser.primitives import PrimitiveSerialized
-        from yggdrasil.pickle.ser.paths import PathSerialized
-        from yggdrasil.pickle.ser.ios import IOSerialized
-
-        for family in (
-            PrimitiveSerialized,
-            LogicalSerialized,
-            CollectionSerialized,
-            ComplexSerialized,
-            PathSerialized,
-            IOSerialized
-        ):
-            out = family.from_python_object(
-                obj,
-                metadata=metadata,
-                codec=codec,
-            )
-            if out is not None:
-                return out
+        found = Tags.get_class_from_type(type(obj))
+        if found is not None:
+            return found.from_python_object(obj, metadata=metadata, codec=codec)
 
         mod, _ = cls.module_and_name(obj, fallback=type(obj).__name__)
 
@@ -202,10 +184,25 @@ class Serialized(ABC, Generic[T]):
             out = PolarsSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:
                 return out
-        elif mod.startswith("pathlib"):
-            from yggdrasil.pickle.ser.paths import PathSerialized
 
-            out = PathSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+        from yggdrasil.pickle.ser.collections import CollectionSerialized
+        from yggdrasil.pickle.ser.complexs import ComplexSerialized
+        from yggdrasil.pickle.ser.logicals import LogicalSerialized
+        from yggdrasil.pickle.ser.primitives import PrimitiveSerialized
+        from yggdrasil.pickle.ser.ios import IOSerialized
+
+        for family in (
+            PrimitiveSerialized,
+            LogicalSerialized,
+            IOSerialized,
+            ComplexSerialized,
+            CollectionSerialized,
+        ):
+            out = family.from_python_object(
+                obj,
+                metadata=metadata,
+                codec=codec,
+            )
             if out is not None:
                 return out
 

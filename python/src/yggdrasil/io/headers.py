@@ -63,6 +63,7 @@ def get_default_user_agent() -> str:
     global DEFAULT_USER_AGENT
 
     if not DEFAULT_USER_AGENT:
+        from yggdrasil.environ.userinfo import UserInfo
         current = UserInfo.current()
 
         DEFAULT_USER_AGENT = (
