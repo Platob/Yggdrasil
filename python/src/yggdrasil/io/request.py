@@ -11,7 +11,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
-from .headers import PromotedHeaders, normalize_headers
+from .headers import PromotedHeaders, normalize_headers, DEFAULT_HOSTNAME
 from .url import URL
 
 if TYPE_CHECKING:
@@ -521,7 +521,7 @@ class PreparedRequest:
             "request_url_query": u.query,
             "request_url_fragment": u.fragment,
 
-            "request_host": promoted.host,
+            "request_host": promoted.host or DEFAULT_HOSTNAME,
             "request_user_agent": promoted.user_agent,
             "request_accept": promoted.accept,
             "request_accept_encoding": promoted.accept_encoding,

@@ -36,4 +36,4 @@ setup_logging(logging.DEBUG)
 
 
 # Environment variables
-os.environ["DATABRICKS_HOST"] = "https://dbc-e646c5f9-8a44.cloud.databricks.com"
+os.environ["DATABRICKS_HOST"] = "https://xxx.cloud.databricks.com"

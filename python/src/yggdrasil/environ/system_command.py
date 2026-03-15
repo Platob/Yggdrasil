@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, Union, TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
@@ -20,34 +21,35 @@ def _is_windows() -> bool:
 
 
 def _format_cmd(args: Sequence[str]) -> str:
-    return " ".join(map(str, args))
+    """
+    Format a command for human-readable display.
+
+    Uses shell-like quoting on POSIX. On Windows falls back to a simple join
+    because shlex.join() does not reflect cmd.exe quoting rules perfectly.
+    """
+    parts = [str(a) for a in args]
+    if _is_windows():
+        return " ".join(parts)
+    return shlex.join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-# Matches the canonical Python exception line at the start of a line:
-#   ValueError: some message
-#   pkg.mod.MyError: some message
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<etype>(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Warning|Interrupt|Exit))"
     r":\s*(?P<msg>.*)$",
     re.MULTILINE,
 )
 
-# Matches Python traceback header so we can extract the full block
 _TRACEBACK_HEADER_RE = re.compile(r"^Traceback \(most recent call last\):", re.MULTILINE)
 
-# Matches a traceback frame that came from inline -c code:
-#   File "<string>", line 3, in <module>
 _INLINE_FRAME_RE = re.compile(
     r'^(?P<indent>\s*)File "<string>", line (?P<lineno>\d+)(?P<rest>.*)$',
     re.MULTILINE,
 )
 
-# ModuleNotFoundError patterns
 _MOD_NOT_FOUND_QUOTED_RE = re.compile(
     r"ModuleNotFoundError:\s+No module named\s+['\"](?P<name>[^'\"]+)['\"]"
 )
@@ -56,17 +58,21 @@ _MOD_NOT_FOUND_BARE_RE = re.compile(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SystemCommand
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass(slots=True)
 class SystemCommand:
     """
-    Lazy command result:
-    - created with a running Popen
-    - call wait() to collect stdout/stderr and returncode
-    - call raise_on_status() to error if non-zero
+    Wrap a subprocess command and its eventual result.
+
+    The command is created around a live ``subprocess.Popen`` object and becomes
+    complete after :meth:`wait` populates :attr:`completed`.
+
+    Features
+    --------
+    - lazy process launching via :meth:`run_lazy`
+    - synchronous helper via :meth:`run_sync`
+    - Python-aware stderr inspection
+    - optional one-shot auto-install retry for missing Python modules
+    - richer error formatting through :class:`SystemCommandError`
     """
 
     args: tuple[str, ...]
@@ -78,8 +84,12 @@ class SystemCommand:
     completed: subprocess.CompletedProcess[str] | None = field(default=None, init=False, repr=False)
 
     def __getstate__(self) -> dict:
-        # Popen is never picklable — snapshot only the observable state.
-        # If the process hasn't been waited on yet, poll() to grab returncode.
+        """
+        Serialize observable state only.
+
+        ``Popen`` itself is not picklable, so we preserve only the command
+        metadata, completed result, and the latest known return code.
+        """
         popen = self.popen
         returncode = getattr(popen, "returncode", None)
         if returncode is None:
@@ -93,15 +103,17 @@ class SystemCommand:
             "cwd": self.cwd,
             "env": self.env,
             "python": self.python,
-            "installed_modules": self.installed_python_modules,
+            "installed_python_modules": self.installed_python_modules,
             "completed": self.completed,
-            "_popen_returncode": returncode,  # preserved for .returncode property
+            "_popen_returncode": returncode,
         }
 
     def __setstate__(self, state: dict) -> None:
+        """
+        Reconstruct a dead Popen-like stub so read-only state remains usable.
+        """
         import types
 
-        # Reconstruct a dead stub so .returncode / .poll() still work.
         stub = types.SimpleNamespace(returncode=state.pop("_popen_returncode", None))
         stub.poll = lambda: stub.returncode  # type: ignore[attr-defined]
 
@@ -109,7 +121,7 @@ class SystemCommand:
         object.__setattr__(self, "cwd", state["cwd"])
         object.__setattr__(self, "env", state["env"])
         object.__setattr__(self, "python", state["python"])
-        object.__setattr__(self, "installed_modules", state["installed_modules"])
+        object.__setattr__(self, "installed_python_modules", state["installed_python_modules"])
         object.__setattr__(self, "completed", state["completed"])
         object.__setattr__(self, "popen", stub)
 
@@ -123,6 +135,9 @@ class SystemCommand:
         env: dict[str, str] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        """
+        Run a command synchronously and optionally raise a formatted error.
+        """
         proc = subprocess.run(
             list(args),
             cwd=str(cwd) if cwd else None,
@@ -132,9 +147,8 @@ class SystemCommand:
             stderr=subprocess.PIPE,
         )
         if check and proc.returncode != 0:
-            # Build a proper SystemCommand so SystemCommandError.__str__ works.
-            # Popen is already finished; we wrap proc in a minimal stub.
             import types
+
             stub = types.SimpleNamespace(returncode=proc.returncode)
             cmd = SystemCommand(
                 args=tuple(map(str, args)),
@@ -154,6 +168,9 @@ class SystemCommand:
         env: dict[str, str] | None = None,
         python: Optional["PyEnv"] = None,
     ) -> "SystemCommand":
+        """
+        Launch a command and return a lazy wrapper around the live process.
+        """
         popen = subprocess.Popen(
             list(args),
             cwd=str(cwd) if cwd else None,
@@ -174,66 +191,60 @@ class SystemCommand:
     # ── process state ─────────────────────────────────────────────────────────
 
     def poll(self) -> int | None:
+        """Return the current process return code, or ``None`` if still running."""
         return self.popen.poll()
 
     @property
     def returncode(self) -> int | None:
+        """Return the exit status once known."""
         return self.popen.returncode if self.completed is None else self.completed.returncode
 
     @property
     def stdout(self) -> str | None:
+        """Captured stdout, available only after completion."""
         return None if self.completed is None else self.completed.stdout
 
     @property
     def stderr(self) -> str | None:
+        """Captured stderr, available only after completion."""
         return None if self.completed is None else self.completed.stderr
+
+    @property
+    def command_str(self) -> str:
+        """Human-readable command string."""
+        return _format_cmd(self.args)
 
     # ── stderr analysis ───────────────────────────────────────────────────────
 
     def find_module_not_found_error(self) -> Optional[ModuleNotFoundError]:
         """
-        Best-effort extraction of a ModuleNotFoundError from captured stderr.
-
-        Supports common stderr shapes:
-          - Standard Python traceback line:
-              ModuleNotFoundError: No module named 'foo'
-          - With dotted module path:
-              ModuleNotFoundError: No module named 'foo.bar'
-          - Alternative bare phrasing (rare but seen in some tools):
-              No module named foo
-
-        Returns:
-          ModuleNotFoundError(name=<module>) when detected, None otherwise.
+        Best-effort extraction of a ``ModuleNotFoundError`` from stderr.
         """
         err = self.stderr
         if not err:
             return None
 
-        m = _MOD_NOT_FOUND_QUOTED_RE.search(err)
-        if m:
-            name = m.group("name")
+        match = _MOD_NOT_FOUND_QUOTED_RE.search(err)
+        if match:
+            name = match.group("name")
             return ModuleNotFoundError(f"No module named '{name}'", name=name)
 
-        m = _MOD_NOT_FOUND_BARE_RE.search(err)
-        if m:
-            name = m.group("name")
+        match = _MOD_NOT_FOUND_BARE_RE.search(err)
+        if match:
+            name = match.group("name")
             return ModuleNotFoundError(f"No module named '{name}'", name=name)
 
         return None
 
     def parse_python_exception(self) -> Optional[tuple[str, str]]:
         """
-        Best-effort extraction of the terminal Python exception type and message
-        from captured stderr, ignoring the traceback preamble.
+        Extract the last Python exception type and message from stderr.
 
-        Handles:
-          - Standard:    ValueError: invalid literal for int() with base 10
-          - Namespaced:  pkg.errors.MyError: something went wrong
-          - Chained:     returns the *last* exception in the chain
-          - Multi-line:  captures only the header line of the message
-
-        Returns:
-          (exception_type, message) for the last raised exception, or None.
+        Returns
+        -------
+        tuple[str, str] | None
+            ``(exception_type, message)`` for the last detected exception line,
+            or ``None`` when stderr does not appear to contain a Python exception.
         """
         err = self.stderr
         if not err:
@@ -248,13 +259,10 @@ class SystemCommand:
 
     def extract_traceback(self) -> Optional[str]:
         """
-        Extract the last Python traceback block from stderr, including
-        the exception line.  Returns the raw block as a string, or None
-        if no traceback is present.
+        Extract the last Python traceback block from stderr.
 
-        When the command was run with ``python -c <code>``, frames that point
-        to ``File "<string>", line N`` are replaced with the actual source
-        line from the inline code so the error is immediately readable.
+        If the command used ``python -c <code>``, inline ``<string>`` frames are
+        annotated with the actual source line from the ``-c`` payload.
         """
         err = self.stderr
         if not err:
@@ -266,7 +274,6 @@ class SystemCommand:
 
         tb = err[starts[-1]:].rstrip()
 
-        # Check if any frame references inline code
         if _INLINE_FRAME_RE.search(tb):
             tb = self._annotate_inline_frames(tb)
 
@@ -274,17 +281,8 @@ class SystemCommand:
 
     def _annotate_inline_frames(self, tb: str) -> str:
         """
-        Replace ``File "<string>", line N`` traceback frames with:
-
-            File "<string>", line N
-              <source line from the -c argument>
-              ^  (caret pointing at the token, when derivable)
-
-        This mirrors what Python itself prints for file-based tracebacks.
-        The inline source is extracted from the ``-c`` argument in self.args.
-        If no ``-c`` argument is found the traceback is returned unchanged.
+        Expand ``File "<string>", line N`` frames with the matching ``-c`` source line.
         """
-        # Extract the code passed via -c
         args = list(self.args)
         try:
             c_index = args.index("-c")
@@ -294,10 +292,10 @@ class SystemCommand:
 
         source_lines = source.splitlines()
 
-        def _replace_frame(m: re.Match) -> str:
-            indent = m.group("indent")
-            lineno = int(m.group("lineno"))
-            rest = m.group("rest")
+        def _replace_frame(match: re.Match) -> str:
+            indent = match.group("indent")
+            lineno = int(match.group("lineno"))
+            rest = match.group("rest")
             frame = f'{indent}File "<string>", line {lineno}{rest}'
             if 1 <= lineno <= len(source_lines):
                 code_line = source_lines[lineno - 1]
@@ -306,34 +304,109 @@ class SystemCommand:
 
         return _INLINE_FRAME_RE.sub(_replace_frame, tb)
 
+    # ── error presentation ────────────────────────────────────────────────────
+
+    def summary(self) -> str:
+        """
+        Build a short user-friendly summary of the failure.
+
+        Examples
+        --------
+        - ``ModuleNotFoundError: No module named 'pyarrow'``
+        - ``ValueError: invalid literal for int() with base 10: 'abc'``
+        - ``Process exited with status 127``
+        """
+        py_exc = self.parse_python_exception()
+        if py_exc:
+            etype, msg = py_exc
+            return f"{etype}: {msg}" if msg else etype
+
+        if self.returncode is None:
+            return "Process has not completed yet."
+
+        return f"Process exited with status {self.returncode}"
+
+    def render_error_details(self) -> str:
+        """
+        Render the most useful detailed error payload.
+
+        Preference order:
+        1. extracted Python traceback
+        2. raw stderr
+        3. raw stdout
+        """
+        tb = self.extract_traceback()
+        if tb:
+            return tb
+
+        stderr = (self.stderr or "").rstrip()
+        if stderr:
+            return stderr
+
+        stdout = (self.stdout or "").rstrip()
+        if stdout:
+            return stdout
+
+        return ""
+
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def wait(
         self,
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
-        auto_install: bool = False
+        auto_install: bool = False,
     ) -> "SystemCommand":
+        """
+        Wait for process completion, capture outputs, and optionally raise on failure.
+
+        Always returns ``self``.
+        """
         if self.completed is not None:
-            return self.completed  # type: ignore[return-value]
+            if raise_error:
+                self.raise_for_status(
+                    wait=wait,
+                    raise_error=raise_error,
+                    auto_install=auto_install,
+                )
+            return self
 
-        wait = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.check_arg(wait)
 
-        if wait:
-            out, err = self.popen.communicate(timeout=wait.timeout_total_seconds)
+        if wait_cfg:
+            try:
+                out, err = self.popen.communicate(timeout=wait_cfg.timeout_total_seconds)
+            except subprocess.TimeoutExpired as exc:
+                try:
+                    self.popen.kill()
+                    out, err = self.popen.communicate()
+                except Exception:
+                    out, err = "", ""
+                self.completed = subprocess.CompletedProcess(
+                    args=list(self.args),
+                    returncode=self.popen.returncode if self.popen.returncode is not None else -9,
+                    stdout=out,
+                    stderr=err,
+                )
+                raise SystemCommandError(
+                    command=self,
+                    message=(
+                        f"Command timed out after {wait_cfg.timeout_total_seconds} seconds"
+                    ),
+                ) from exc
 
             self.completed = subprocess.CompletedProcess(
                 args=list(self.args),
-                returncode=self.popen.returncode or 0,
+                returncode=self.popen.returncode if self.popen.returncode is not None else 0,
                 stdout=out,
                 stderr=err,
             )
 
         if raise_error:
             self.raise_for_status(
-                wait=wait,
+                wait=wait_cfg,
                 raise_error=raise_error,
-                auto_install=auto_install
+                auto_install=auto_install,
             )
 
         return self
@@ -342,8 +415,11 @@ class SystemCommand:
         self,
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
-    ) -> Union["SystemCommand", "SystemCommandError"]:
-        """Re-launch the same command, replacing internal popen/completed state."""
+        auto_install: bool = False,
+    ) -> "SystemCommand":
+        """
+        Re-launch the same command, replacing internal process/completed state.
+        """
         new_popen = subprocess.Popen(
             list(self.args),
             cwd=str(self.cwd) if self.cwd else None,
@@ -354,38 +430,65 @@ class SystemCommand:
             stderr=subprocess.PIPE,
         )
 
-        # dataclass(slots=True) but not frozen — normal attribute assignment is fine.
         self.popen = new_popen
         self.completed = None
 
-        return self.wait(wait=wait, raise_error=raise_error)
+        return self.wait(wait=wait, raise_error=raise_error, auto_install=auto_install)
+
+    def _maybe_auto_install_missing_module(
+        self,
+        wait: WaitingConfigArg | None = True,
+    ) -> bool:
+        """
+        Attempt a one-shot recovery for ``ModuleNotFoundError``.
+
+        Returns
+        -------
+        bool
+            ``True`` if a missing module was installed and the command retried,
+            ``False`` otherwise.
+        """
+        if self.python is None:
+            return False
+
+        module_err = self.find_module_not_found_error()
+        if not isinstance(module_err, ModuleNotFoundError) or not module_err.name:
+            return False
+
+        if self.installed_python_modules is None:
+            self.installed_python_modules = set()
+
+        if module_err.name in self.installed_python_modules:
+            return False
+
+        # Prefer PyEnv's import/install mapping logic if available.
+        try:
+            self.python.install(module_err.name)
+        except Exception:
+            return False
+
+        self.installed_python_modules.add(module_err.name)
+        self.retry(wait=wait, raise_error=False, auto_install=False)
+        return self.returncode == 0
 
     def exception(
         self,
         wait: WaitingConfigArg | None = True,
         auto_install: bool = True,
     ) -> Optional["SystemCommandError"]:
-        if self.completed and self.returncode != 0:
-            if auto_install:
-                if self.python is not None:
-                    if self.installed_python_modules is None:
-                        self.installed_python_modules = set()
+        """
+        Return a :class:`SystemCommandError` for a failed completed process, or ``None``.
+        """
+        if self.completed is None:
+            self.wait(wait=wait, raise_error=False, auto_install=False)
 
-                    module_err = self.find_module_not_found_error()
+        if self.returncode in (None, 0):
+            return None
 
-                    if isinstance(module_err, ModuleNotFoundError):
-                        if module_err.name in self.installed_python_modules:
-                            raise module_err
+        if auto_install and self._maybe_auto_install_missing_module(wait=wait):
+            return None
 
-                        # Ask the bound PyEnv to pip-install the missing package, then retry once.
-                        self.python.install(module_err.name)
-
-                        self.installed_python_modules.add(module_err.name)
-
-                        return self.retry(wait=wait, raise_error=False)
-
-            return SystemCommandError(command=self)
-        return None
+        return SystemCommandError(command=self)
 
     def raise_for_status(
         self,
@@ -393,45 +496,53 @@ class SystemCommand:
         wait: WaitingConfigArg | None = True,
         raise_error: bool = True,
         auto_install: bool = True,
-    ) -> Union["SystemCommand", "SystemCommandError"]:
+    ) -> "SystemCommand":
+        """
+        Raise :class:`SystemCommandError` if the command failed.
+
+        Returns ``self`` when successful or when ``raise_error=False``.
+        """
         if raise_error:
             error = self.exception(wait=wait, auto_install=auto_install)
-
             if error is not None:
                 raise error
-
         return self
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SystemCommandError
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass(frozen=True, slots=True)
 class SystemCommandError(RuntimeError):
-    """Raised when a subprocess command fails."""
+    """
+    Raised when a subprocess command fails.
+
+    Attributes
+    ----------
+    command:
+        The failing :class:`SystemCommand`.
+    message:
+        Optional high-level override message, used for special cases such as
+        timeouts. When omitted, a summary is derived from stderr / traceback.
+    """
 
     command: SystemCommand
+    message: str | None = None
 
     def __str__(self) -> str:
         cmd = self.command
         lines: list[str] = []
 
-        # ── stdout: emitted as-is, no decoration ─────────────────────────────
-        stdout = (cmd.stdout or "").rstrip()
-        if stdout:
-            lines.append(stdout)
+        headline = self.message or cmd.summary()
+        lines.append(headline)
 
-        # ── stderr: prefer the extracted traceback block so the output looks
-        #    identical to what Python itself would have printed.
-        #    Fall back to raw stderr for non-Python processes (Rust, shell, …).
-        tb = cmd.extract_traceback()
-        if tb:
-            lines.append(tb)
-        else:
-            stderr = (cmd.stderr or "").rstrip()
-            if stderr:
-                lines.append(stderr)
+        lines.append(f"Command: {cmd.command_str}")
+        if cmd.cwd is not None:
+            lines.append(f"Working directory: {cmd.cwd}")
+        if cmd.returncode is not None:
+            lines.append(f"Exit status: {cmd.returncode}")
+
+        details = cmd.render_error_details()
+        if details:
+            lines.append("")
+            lines.append(details)
 
         return "\n".join(lines)
 

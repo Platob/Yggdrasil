@@ -3,9 +3,8 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 
-import mongoengine
-import mongoengine.document as document_mod
-from mongoengine import Document as MongoDocument
+import mongoengine.document
+from mongoengine.document import Document as MongoDocument
 
 __all__ = [
     "Document",
@@ -122,6 +121,11 @@ class Document(MongoDocument):
 
         return df
 
+    @classmethod
+    def _get_db(cls):
+        from yggdrasil.mongoengine.lib import get_db
+        return get_db(cls._meta.get("db_alias", "default"))
+
     # -------------------------
     # class/query implementations
     # -------------------------
@@ -169,5 +173,4 @@ class Document(MongoDocument):
     to_pandas = _DualMethod(_to_pandas_instance, _to_pandas_class)
 
 
-document_mod.Document = Document
-mongoengine.Document = Document
+mongoengine.document.Document = Document

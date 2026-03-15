@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import mongoengine
-import mongoengine.fields as fields_mod
 from mongoengine.fields import *  # noqa: F403
 from mongoengine.fields import (
     BinaryField as MongoBinaryField,
@@ -352,85 +350,3 @@ class MultiLineStringField(_ArrowFieldMixin, MongoMultiLineStringField):
 class MultiPolygonField(_ArrowFieldMixin, MongoMultiPolygonField):
     def arrow_type(self):
         return _pa().string()
-
-
-# patch module exports
-fields_mod.StringField = StringField
-fields_mod.URLField = URLField
-fields_mod.EmailField = EmailField
-fields_mod.IntField = IntField
-fields_mod.LongField = LongField
-fields_mod.FloatField = FloatField
-fields_mod.DecimalField = DecimalField
-fields_mod.BooleanField = BooleanField
-fields_mod.DateTimeField = DateTimeField
-fields_mod.DateField = DateField
-fields_mod.ComplexDateTimeField = ComplexDateTimeField
-fields_mod.EmbeddedDocumentField = EmbeddedDocumentField
-fields_mod.ObjectIdField = ObjectIdField
-fields_mod.GenericEmbeddedDocumentField = GenericEmbeddedDocumentField
-fields_mod.DynamicField = DynamicField
-fields_mod.ListField = ListField
-fields_mod.SortedListField = SortedListField
-fields_mod.EmbeddedDocumentListField = EmbeddedDocumentListField
-fields_mod.DictField = DictField
-fields_mod.MapField = MapField
-fields_mod.ReferenceField = ReferenceField
-fields_mod.CachedReferenceField = CachedReferenceField
-fields_mod.LazyReferenceField = LazyReferenceField
-fields_mod.GenericLazyReferenceField = GenericLazyReferenceField
-fields_mod.GenericReferenceField = GenericReferenceField
-fields_mod.BinaryField = BinaryField
-fields_mod.FileField = FileField
-fields_mod.ImageField = ImageField
-fields_mod.GeoPointField = GeoPointField
-fields_mod.PointField = PointField
-fields_mod.LineStringField = LineStringField
-fields_mod.PolygonField = PolygonField
-fields_mod.SequenceField = SequenceField
-fields_mod.UUIDField = UUIDField
-fields_mod.EnumField = EnumField
-fields_mod.MultiPointField = MultiPointField
-fields_mod.MultiLineStringField = MultiLineStringField
-fields_mod.MultiPolygonField = MultiPolygonField
-fields_mod.Decimal128Field = Decimal128Field
-
-mongoengine.StringField = StringField
-mongoengine.URLField = URLField
-mongoengine.EmailField = EmailField
-mongoengine.IntField = IntField
-mongoengine.LongField = LongField
-mongoengine.FloatField = FloatField
-mongoengine.DecimalField = DecimalField
-mongoengine.BooleanField = BooleanField
-mongoengine.DateTimeField = DateTimeField
-mongoengine.DateField = DateField
-mongoengine.ComplexDateTimeField = ComplexDateTimeField
-mongoengine.EmbeddedDocumentField = EmbeddedDocumentField
-mongoengine.ObjectIdField = ObjectIdField
-mongoengine.GenericEmbeddedDocumentField = GenericEmbeddedDocumentField
-mongoengine.DynamicField = DynamicField
-mongoengine.ListField = ListField
-mongoengine.SortedListField = SortedListField
-mongoengine.EmbeddedDocumentListField = EmbeddedDocumentListField
-mongoengine.DictField = DictField
-mongoengine.MapField = MapField
-mongoengine.ReferenceField = ReferenceField
-mongoengine.CachedReferenceField = CachedReferenceField
-mongoengine.LazyReferenceField = LazyReferenceField
-mongoengine.GenericLazyReferenceField = GenericLazyReferenceField
-mongoengine.GenericReferenceField = GenericReferenceField
-mongoengine.BinaryField = BinaryField
-mongoengine.FileField = FileField
-mongoengine.ImageField = ImageField
-mongoengine.GeoPointField = GeoPointField
-mongoengine.PointField = PointField
-mongoengine.LineStringField = LineStringField
-mongoengine.PolygonField = PolygonField
-mongoengine.SequenceField = SequenceField
-mongoengine.UUIDField = UUIDField
-mongoengine.EnumField = EnumField
-mongoengine.MultiPointField = MultiPointField
-mongoengine.MultiLineStringField = MultiLineStringField
-mongoengine.MultiPolygonField = MultiPolygonField
-mongoengine.Decimal128Field = Decimal128Field

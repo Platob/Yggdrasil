@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-import mongoengine
-import mongoengine.queryset as queryset_pkg
-import mongoengine.queryset.queryset as queryset_mod
 from mongoengine.queryset.queryset import (
     QuerySet as MongoQuerySet,
     QuerySetNoCache as MongoQuerySetNoCache,
@@ -301,13 +298,3 @@ class QuerySet(_PickleArrowCacheMixin, _ArrowMixin, MongoQuerySet):
 class QuerySetNoCache(_PickleArrowCacheMixin, _ArrowMixin, MongoQuerySetNoCache):
     _PICKLE_CACHE_KEY: ClassVar[str] = "__yggdrasil_nocache_result_arrow_ipc__"
     _PICKLE_CACHE_COMPRESSION: ClassVar[str] = "zstd"
-
-
-queryset_mod.QuerySet = QuerySet
-queryset_mod.QuerySetNoCache = QuerySetNoCache
-
-queryset_pkg.QuerySet = QuerySet
-queryset_pkg.QuerySetNoCache = QuerySetNoCache
-
-mongoengine.QuerySet = QuerySet
-mongoengine.QuerySetNoCache = QuerySetNoCache

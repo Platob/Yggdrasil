@@ -587,17 +587,8 @@ def test_unknown_codec_raises(cfg: BufferConfig) -> None:
 def test_view_binary_window(cfg: BufferConfig) -> None:
     b = BytesIO(b"0123456789", config=cfg)
 
-    with b.view(start=2, length=4) as fh:
+    with b.view(pos=2, size=4) as fh:
         assert fh.read() == b"2345"
-
-    assert b.tell() == 0
-
-
-def test_view_text_window(cfg: BufferConfig) -> None:
-    b = BytesIO("hello world".encode(), config=cfg)
-
-    with b.view(text=True, start=6, length=5) as fh:
-        assert fh.read() == "world"
 
     assert b.tell() == 0
 

@@ -351,6 +351,9 @@ class URL:
     def __str__(self) -> str:
         return self.to_string()
 
+    def __repr__(self):
+        return f"URL<{self.to_string()!r}>"
+
     def __truediv__(self, other: object) -> URL:
         if not isinstance(other, str):
             raise ValueError(f"Cannot join {self} with {type(other)}")

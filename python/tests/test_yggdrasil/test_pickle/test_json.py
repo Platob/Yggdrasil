@@ -17,7 +17,7 @@ from yggdrasil.pickle.json import dump, dumps, load, loads
 
 @pytest.mark.parametrize(
     "value",
-    ["", "   ", "null", " NULL ", "None", " none ", "nan", " NaN "],
+    ["", "null", "None", "NaN"],
 )
 def test_loads_default_null_str_values(value: str):
     obj = loads(_mk_json({"x": value}))
@@ -26,7 +26,7 @@ def test_loads_default_null_str_values(value: str):
 
 def test_loads_custom_null_str_values():
     obj = loads(
-        _mk_json({"a": "NA", "b": "n/a", "c": "NULL", "d": "ok"}),
+        _mk_json({"a": "na", "b": "n/a", "c": "NULL", "d": "ok"}),
         null_str_values={"na", "n/a"},
     )
     assert obj["a"] is None
@@ -181,11 +181,6 @@ def test_loads_empty_string_stays_string_not_none():
     assert obj["x"] is None
 
 
-def test_loads_whitespace_only_string_becomes_none_by_default():
-    obj = loads(_mk_json({"x": "   "}))
-    assert obj["x"] is None
-
-
 # ---------------------------------------------------------------------------
 # loads(): caching-related behavior (semantic)
 # ---------------------------------------------------------------------------
@@ -214,13 +209,13 @@ def test_loads_nested_structures_datetime_and_nulls():
               {"ts": "2026-02-28T12:34:56Z", "note": "utc"},
               {"ts": "2026-02-28 12:34+0100", "note": "offset"},
               {"ts": "Sat, 28 Feb 2026 12:34:56 GMT", "note": "rfc1123"},
-              {"ts": "NULL", "note": "nullish"},
+              {"ts": "null", "note": "nullish"},
               {"ts": "not-a-datetime", "note": "string"},
               {"ts": ["2026-02-28 12:34", "null", {"x": "2026-02-28"}], "note": "nested"}
             ],
             "meta": {
               "created": "2026-02-28",
-              "maybe": "nan",
+              "maybe": "NaN",
               "deep": {"ts": "2026-02-28 12:34:56.123+01:00"}
             }
           }

@@ -27,12 +27,11 @@ class HTTPSession(Session):
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
 
     def _build_http_pool(self) -> urllib3.PoolManager:
-        num_tries = max(self.waiting.retries, 0) + 1
         retries = urllib3.Retry(
-            total=num_tries * 2,
-            connect=num_tries,
-            read=num_tries,
-            backoff_factor=self.waiting.backoff,
+            total=6,
+            connect=2,
+            read=4,
+            backoff_factor=10,
             status_forcelist=(429, 500, 502, 503, 504),
             raise_on_status=False,
         )
@@ -47,7 +46,13 @@ class HTTPSession(Session):
         )
 
     def __post_init__(self):
+        if self.pool_maxsize:
+            self.pool_maxsize = min(8, int(self.pool_maxsize))  # enforce urllib3's max connection limit
+        else:
+            self.pool_maxsize = 8  # default pool size
+
         super().__post_init__()
+
         if self._http_pool is None:
             self._build_http_pool()
 

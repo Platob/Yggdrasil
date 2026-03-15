@@ -574,29 +574,14 @@ class Response:
 
     def json(
         self,
-        orient: Literal["records", "columns"] = "records",
+        orient: Optional[Literal["records", "split", "index", "columns", "values"]] = None,
+        *,
+        media_type: Optional["MediaType"] = None
     ) -> Any:
-        media_type = self.media_type
-
-        if media_type.codec:
-            with self.buffer.decompress(codec=media_type.codec, copy=True) as b:
-                mio = b.media_io(media_type.without_codec())
-
-                if orient == "records":
-                    return mio.read_pylist()
-                elif orient == "columns":
-                    return mio.read_pydict()
-                else:
-                    raise ValueError(f"Unsupported orient: {orient!r}")
-
-        mio = self.buffer.media_io(media_type)
-
-        if orient == "records":
-            return mio.read_pylist()
-        elif orient == "columns":
-            return mio.read_pydict()
-        else:
-            raise ValueError(f"Unsupported orient: {orient!r}")
+        return self.buffer.json_load(
+            orient=orient,
+            media_type=media_type or self.media_type
+        )
 
     @property
     def ok(self) -> bool:
@@ -668,7 +653,7 @@ class Response:
 
         values = {
             "response_status_code": self.status_code,
-            "response_host": promoted.host,
+            "response_host": promoted.host or DEFAULT_HOSTNAME,
             "response_user_agent": promoted.user_agent,
             "response_accept": promoted.accept,
             "response_accept_encoding": promoted.accept_encoding,
@@ -751,7 +736,7 @@ class Response:
                             "userinfo": userinfo or "",
                             "host": host or "",
                             "port": 0 if port in (None, "") else int(port),
-                            "path": path or "",
+                            "path": path or "/",
                             "query": query or "",
                             "fragment": fragment or "",
                         }

@@ -8,11 +8,9 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 
 from yggdrasil.io import MimeType
-
 from yggdrasil.version import __version_info__, __version__
 from .buffer import BytesIO
 from .enums import Codec, MediaType
-from ..environ import UserInfo
 
 __all__ = [
     "HeaderValue",
@@ -45,6 +43,8 @@ def get_default_headers() -> dict[str, str]:
             "X-Py-Version": PYVERSION,
             "X-Host": DEFAULT_HOSTNAME,
         }
+
+        from yggdrasil.environ.userinfo import UserInfo
 
         current = UserInfo.current()
         pv = current.product_version or "0.0.0"

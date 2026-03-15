@@ -1,33 +1,70 @@
 """Remote execution helpers for Databricks command contexts."""
 
-import base64
 import dataclasses as dc
-import gzip
-import io
 import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Tuple, Literal, TypeVar, \
-    Mapping, Generator, Iterator
+from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Literal, TypeVar, \
+    Mapping
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.environ import PyEnv, UserInfo
+from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
-
-from .command_execution import CommandExecution
 
 if TYPE_CHECKING:
     from .cluster import Cluster
+    from .command_execution import CommandExecution
 
 
 __all__ = [
-    "ExecutionContext"
+    "ExecutionContext",
+    "EXCLUDED_ENV_KEYS"
 ]
+
+EXCLUDED_ENV_KEYS = frozenset([
+    'ALLUSERSPROFILE', 'APPDATA',
+    'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_ENVIRONMENT', 'ARM_RESOURCE_ID', 'ARM_TENANT_ID',
+    'CLASSPATH', 'CLICOLOR', 'CLICOLOR_FORCE', 'CLUSTER_DB_HOME', 'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)',
+    'COMMONPROGRAMW6432', 'COMPUTERNAME', 'COMSPEC', 'DATABRICKS_CLUSTER_ID', 'DATABRICKS_CLUSTER_LIBS_PYTHON_ROOT_DIR',
+    'DATABRICKS_CLUSTER_LIBS_ROOT_DIR', 'DATABRICKS_CLUSTER_LIBS_R_ROOT_DIR',
+    'DATABRICKS_HOST', 'DATABRICKS_INSTANCE_ID', 'DATABRICKS_LIBS_NFS_ROOT_DIR',
+    'DATABRICKS_LIBS_NFS_ROOT_PATH', 'DATABRICKS_ROOT_VIRTUALENV_ENV', 'DATABRICKS_RUNTIME_VERSION',
+    'DATABRICKS_TOKEN', 'DATA_SECURITY_MODE', 'DBX_WORKSPACE_URL', 'DB_HOME', 'DEBUGINFOD_URLS',
+    'DEFAULT_DATABRICKS_ROOT_VIRTUALENV_ENV', 'DEFAULT_PYTHON_ENVIRONMENT', 'DISABLE_LOCAL_FILESYSTEM',
+    'DRIVERDATA', 'DRIVER_PID_FILE', 'DRIVER_REPL_ID', 'DRIVER_STARTUP_OBSERVABILITY_ENABLED',
+    'EFC_12712_1262719628', 'EFC_12712_1592913036', 'EFC_12712_2283032206', 'EFC_12712_2775293581',
+    'EFC_12712_3789132940', 'ENABLE_APPCDS', 'ENABLE_CLASSLOADING_LOGS', 'ENABLE_COMMAND_OUTPUT_TRUNCATION',
+    'ENABLE_DRIVER_DEVELOPER_MODE', 'ENABLE_IPTABLES', 'ENABLE_KEEPALIVE_COMMAND_CONTEXT', 'ENABLE_REPL_LOGGING',
+    'ENABLE_TRACEPARENT_REPL_PROPAGATION', 'FORCE_COLOR', 'GIT_PAGER', 'GRPC_GATEWAY_TOKEN',
+    'HALT_VARIABLE_RESOLVE_THREADS_ON_STEP_RESUME', 'HF_DATASETS_CACHE', 'HIVE_HOME', 'HOME', 'HOMEDRIVE',
+    'HOMEPATH', 'HTTPS_PROXY', 'HTTP_PROXY', 'ICU_DATA', 'IDE_PROJECT_ROOTS', 'IPYTHONENABLE', 'JAVA_HOME',
+    'JAVA_OPTS', 'JUPYTER_WIDGETS_ECHO', 'KOALAS_USAGE_LOGGER', 'LANG', 'LIBRARY_ROOTS', 'LOCALAPPDATA',
+    'LOGNAME', 'LOGONSERVER', 'MAIL', 'MASTER', 'MEDSITE', 'MLFLOW_CONDA_HOME', 'MLFLOW_DEPLOYMENTS_TARGET',
+    'MLFLOW_GATEWAY_URI', 'MLFLOW_PYTHON_EXECUTABLE', 'MLFLOW_REGISTRY_URI', 'MLFLOW_TRACKING_URI', 'MPLBACKEND',
+    'NEXTHINK', 'NO_PROXY', 'NUMBER_OF_PROCESSORS', 'OLDPWD', 'OMPI_MCA_btl_tcp_if_include', 'ONEDRIVE',
+    'ONEDRIVECOMMERCIAL', 'OPENSSL_FORCE_FIPS_MODE', 'OS', 'PAGER', 'PATH', 'PATHEXT', 'PINNED_THREAD_MODE',
+    'PIPELINE_UDS_CONNECT_MODE', 'PIP_NO_INPUT', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL',
+    'PROCESSOR_REVISION', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'PROJ_DATA', 'PROMPT',
+    'PS1', 'PSMODULEPATH', 'PUBLIC', 'PWD', 'PYCHARM_HELPERS_DIR', 'PYCHARM_HOSTED',
+    'PYDEVD_DISABLE_FILE_VALIDATION', 'PYDEVD_INTERRUPT_THREAD_TIMEOUT', 'PYDEVD_LOAD_VALUES_ASYNC',
+    'PYDEVD_USE_FRAME_EVAL', 'PYENV_ROOT', 'PYSPARK_GATEWAY_PORT', 'PYSPARK_GATEWAY_SECRET', 'PYSPARK_PYTHON',
+    'PYTEST_CURRENT_TEST', 'PYTEST_RUN_CONFIG', 'PYTEST_VERSION', 'PYTHONHASHSEED', 'PYTHONIOENCODING',
+    'PYTHONPATH', 'PYTHONUNBUFFERED', 'PYTHON_REPL_SAFE_CONFIG_MAP', 'RAY_TMPDIR', 'R_LIBS', 'SCALA_VERSION',
+    'SESSIONNAME', 'SHELL', 'SHLVL', 'SPARK_AUTH_SOCKET_TIMEOUT', 'SPARK_BUFFER_SIZE', 'SPARK_CONF_DIR',
+    'SPARK_DIST_CLASSPATH', 'SPARK_ENV_LOADED', 'SPARK_HOME', 'SPARK_LOCAL_DIRS', 'SPARK_LOCAL_IP', 'SPARK_PUBLIC_DNS',
+    'SPARK_SCALA_VERSION', 'SPARK_WORKER_MEMORY', 'SUDO_COMMAND', 'SUDO_GID', 'SUDO_UID', 'SUDO_USER', 'SYSTEMDRIVE',
+    'SYSTEMROOT', 'TEAMCITY_VERSION', 'TEMP', 'TERM', 'TMP', 'TS_ADSITE_DRIVE', 'TS_APP32', 'TS_APP64', 'TS_APPRW',
+    'TS_CONDA', 'TS_DFSN_ROOT', 'TS_IOADDIN', 'TS_PYTHON', 'TZDIR', 'UATDATA', 'USER', 'USERDNSDOMAIN', 'USERDOMAIN',
+    'USERDOMAIN_ROAMINGPROFILE', 'USERNAME', 'USERPROFILE', 'USE_LOW_IMPACT_MONITORING', 'VIRTUAL_ENV',
+    'VIRTUAL_ENV_PROMPT', 'WINDIR', 'ZES_ENABLE_SYSMAN', '_JB_PPRINT_PRIMITIVES', '_OLD_VIRTUAL_PATH',
+    '_OLD_VIRTUAL_PROMPT', '_PIP_USE_IMPORTLIB_METADATA', '_RJEM_MALLOC_CONF', 'container'
+])
 
 LOGGER = logging.getLogger(__name__)
 UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
@@ -37,25 +74,6 @@ F = TypeVar("F", bound=Callable[..., Any])
 _CTX_RUNTIME_FIELDS = frozenset({"_lock",})
 _CTX_RESET_FIELDS = frozenset({"_remote_metadata"})
 
-
-@dc.dataclass(frozen=True)
-class BytesSource:
-    """
-    Hashable wrapper for in-memory content so it can be used as a dict key.
-
-    name: only used for debugging / metadata (not required to match remote basename)
-    data: bytes-like payload
-    """
-    name: str
-    data: bytes
-
-LocalSpec = Union[
-    str,
-    os.PathLike,
-    bytes,                       # raw bytes as key (works, but no name)
-    BytesSource,                 # recommended for buffers
-    Tuple[str, BytesLike],       # (name, data) helper
-]
 
 @dc.dataclass
 class RemoteMetadata:
@@ -85,14 +103,12 @@ class ExecutionContext:
     cluster: "Cluster"
     context_id: Optional[str] = None
     context_key: Optional[str] = None
-
+    ephemeral: bool = dc.field(default=True, repr=False, compare=False, hash=False)
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
 
-    _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, repr=False, compare=False, hash=False)
-    _requirements: Optional[list[tuple[str]]] = dc.field(default=None, repr=False, compare=False, hash=False)
-    _pyenv_check_timestamp: int = dc.field(default=0, repr=False, compare=False, hash=False)
-
-    _uploaded_package_roots: Optional[ExpiringDict] = dc.field(default_factory=ExpiringDict, repr=False, compare=False, hash=False)
+    _remote_metadata: Optional[RemoteMetadata] = dc.field(default=None, init=False, repr=False, compare=False, hash=False)
+    _requirements: Optional[list[tuple[str]]] = dc.field(default=None, init=False, repr=False, compare=False, hash=False)
+    _pyenv_check_timestamp: int = dc.field(default=0, init=False, repr=False, compare=False, hash=False)
     _lock: threading.RLock = dc.field(default_factory=threading.RLock, init=False, repr=False, compare=False, hash=False)
 
     def __getstate__(self) -> dict:
@@ -186,10 +202,7 @@ class ExecutionContext:
             return self._remote_metadata
 
         if not self.context_key:
-            usr, env = UserInfo.current(), PyEnv.current()
-            vinfo = env.version_info
-
-            self.context_key = f"{usr.hostname}-py{vinfo.major}.{vinfo.minor}"
+            self.context_key = DEFAULT_HOSTNAME
 
         context_path = f"/local_disk0/.ephemeral_nfs/context/{self.context_key}"
         tmp_path = context_path + "/tmp/"
@@ -235,6 +248,7 @@ class ExecutionContext:
         language: "Language",
         context_key: Optional[str] = None,
         wait: WaitingConfigArg = True,
+        ephemeral: bool = True
     ) -> "ExecutionContext":
         """Create a command execution context, retrying if needed.
 
@@ -282,7 +296,8 @@ class ExecutionContext:
             cluster=self.cluster,
             context_id=created.id,
             context_key=context_key or self.context_key or os.urandom(8).hex(),
-            language=language
+            language=language,
+            ephemeral=ephemeral
         )
 
         return instance
@@ -360,13 +375,19 @@ class ExecutionContext:
             self.context_id = None
 
     # ------------ public API ------------
-    def syspath_lines(self):
-        return "\n".join([
-            "import os, sys",
-            f"_p = os.path.expanduser({self.remote_metadata.libs_path!r})",
-            "if _p not in sys.path:",
-            "    sys.path.insert(0, _p)",
-        ])
+    def syspath_lines(self, environ: Optional[Mapping[str, str]]) -> str:
+        if environ:
+
+            return f"""import base64, os, traceback, json, sys
+_p = os.path.expanduser({self.remote_metadata.libs_path!r})
+if _p not in sys.path:
+    sys.path.insert(0, _p)
+_env = {environ!r} or {{}}"""
+        else:
+            return f"""import base64, os, traceback, json, sys
+_p = os.path.expanduser({self.remote_metadata.libs_path!r})
+if _p not in sys.path:
+    sys.path.insert(0, _p)"""
     
     def command(
         self,
@@ -379,7 +400,29 @@ class ExecutionContext:
         func: Optional[Callable] = None,
         environ: Optional[Mapping] = None
     ) -> "CommandExecution":
+        from .command_execution import CommandExecution
+
         context = self if context is None else context
+
+        out_environ = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in EXCLUDED_ENV_KEYS
+        }
+
+        if environ:
+            if not isinstance(environ, Mapping):
+                out_environ.update({
+                    k: os.getenv(k)
+                    for k in (str(_) for _ in environ if _)
+                    if k and k not in EXCLUDED_ENV_KEYS and os.getenv(k)
+                })
+            else:
+                out_environ.update({
+                    str(k): str(v)
+                    for k, v in environ.items()
+                    if v is not None and k not in EXCLUDED_ENV_KEYS
+                })
 
         if isinstance(command, str):
             command_str = command
@@ -396,8 +439,6 @@ cmd = [str(pathlib.Path(arg).expanduser()) if arg.startswith("~/") else arg for 
 
 p = subprocess.run(cmd, text=True, capture_output=True)
 
-print(p.stdout)
-
 if p.returncode != 0:
     raise RuntimeError(
         f"Command {{cmd}} failed with exit code {{p.returncode}}:\\n"
@@ -408,15 +449,7 @@ if p.returncode != 0:
             language = Language[language]
 
         if language == Language.PYTHON and command_str:
-            command_str = self.syspath_lines() + "\n" + command_str
-
-        if environ:
-            if not isinstance(environ, Mapping):
-                environ = {
-                    k: os.environ.get(k)
-                    for k in environ
-                    if k
-                }
+            command_str = self.syspath_lines(out_environ) + "\n" + command_str
 
         return CommandExecution(
             context=context,
@@ -424,12 +457,14 @@ if p.returncode != 0:
             language=language,
             command=command_str,
             pyfunc=func,
-            environ=environ
+            environ=out_environ
         )
 
     def make_python_function_command(
         self,
-        job: Job,
+        func: Callable,
+        args: Optional[tuple] = None,
+        kwargs: Optional[dict] = None,
         tag: str = "__CALL_RESULT__",
         environ: Optional[Mapping] = None
     ) -> str:
@@ -446,344 +481,20 @@ if p.returncode != 0:
           - protocol=5 for perf + modern compatibility
           - strongly prefer byref=True for cross Python minor stability
         """
-        import yggdrasil.pickle.dill as pkl
+        from yggdrasil.pickle.ser import dumps
 
-        command_b64: str = base64.b64encode(pkl.dumps(self, byref=True)).decode("ascii")
-        job_b64: str = self.encode_object(job)
-        environ = environ or {}
-        if not isinstance(environ, Mapping):
-            environ = {
-                k: os.getenv(k)
-                for k in environ
-                if k and os.getenv(k)
-            }
+        payload = [func, args or (), kwargs or {}]
+        payload = dumps(payload, b64=True)
 
         cmd = f"""\
-{self.syspath_lines()}
+{self.syspath_lines(environ)}
 
-_env = {environ!r}
-for k, v in _env.items():
-    os.environ[k] = v
-    
-import base64, os, traceback, json
-import yggdrasil.pickle.dill as dill
-
-_ctx = dill.loads(base64.b64decode({command_b64!r}.encode("ascii")))
-_job = _ctx.decode_payload({job_b64!r})
-_out = _ctx.encode_object(_job())
-if not isinstance(_out, str):
-    _out = _out.decode()
-
-print({tag!r} + _out, flush=True)
+from yggdrasil.pickle.ser import loads, dumps
+f,a,k=loads({payload!r})
+r = dumps(f(*a, **k), b64=True)
+print({tag!r} + r, flush=True)
 """
         return cmd
-
-    def encode_object(
-        self,
-        obj: Any,
-        byte_limit: int = 32 * 1024,
-        byref: Any = True,
-        recurse: Any = True,
-        compression: Optional[str] = None
-    ) -> str:
-        """Serialize *obj* to a JSON envelope that ``decode_payload`` can reconstruct.
-
-        Dispatch table (checked in order):
-
-        +-----------------------+------------------------------------------+
-        | Type                  | Strategy                                 |
-        +=======================+==========================================+
-        | ``pyarrow.Table``     | Parquet → DBFS temp file                 |
-        +-----------------------+------------------------------------------+
-        | ``polars.DataFrame``  | Parquet → DBFS temp file                 |
-        +-----------------------+------------------------------------------+
-        | ``pandas.DataFrame``  | Parquet → DBFS temp file                 |
-        +-----------------------+------------------------------------------+
-        | ``pandas.Series``     | Parquet via single-column DataFrame →    |
-        |                       | DBFS temp file; index and name preserved |
-        +-----------------------+------------------------------------------+
-        | ``Generator`` /       | Each item encoded recursively            |
-        | ``Iterator``          |                                          |
-        +-----------------------+------------------------------------------+
-        | Anything else         | ``dill`` → optional gzip → inline b64    |
-        |                       | or DBFS temp file if > *byte_limit*      |
-        +-----------------------+------------------------------------------+
-
-        Args:
-            obj: Object to encode.
-            byte_limit: Maximum inline payload size in bytes before spilling to
-                a DBFS temporary file (default 32 KiB).
-            byref: Passed through to ``dill.dump`` — serialize by reference when
-                ``True`` (useful for large closures that reference module-level
-                objects).
-            recurse: Passed through to ``dill.dump`` — recursively serialise
-                referenced objects.
-            compression: Force ``"gzip"`` compression regardless of size.
-                Defaults to auto-compress when the raw payload exceeds
-                *byte_limit*.
-
-        Returns:
-            A JSON string describing how to reconstruct the object on the remote
-            side.  See ``decode_payload`` for the envelope schema.
-        """
-        buffer = io.BytesIO()
-
-        from yggdrasil.arrow.lib import pyarrow
-        from yggdrasil.polars.lib import polars
-        from yggdrasil.pandas.lib import pandas
-        import yggdrasil.pickle.dill as pkl
-        import yggdrasil.pickle.json as json_mod
-
-        if hasattr(obj, "to_arrow_table"):
-            obj = obj.to_arrow_table()
-
-        if isinstance(obj, pyarrow.Table):
-            import pyarrow.parquet as pq
-
-            func = "pyarrow.parquet.read_table"
-            extension = "parquet"
-            pq.write_table(obj, buffer)
-
-            buffer.seek(0)
-            dbx_path = self.client.tmp_path(extension=extension)
-            dbx_path.write_bytes(buffer)
-
-            return json_mod.dumps({
-                "func": func,
-                "file": dbx_path.full_path()
-            })
-
-        if isinstance(obj, polars.DataFrame):
-            func = "polars.read_parquet"
-            extension = "parquet"
-            obj.write_parquet(buffer)
-
-            buffer.seek(0)
-            dbx_path = self.client.tmp_path(extension=extension)
-            dbx_path.write_bytes(buffer)
-
-            return json_mod.dumps({
-                "func": func,
-                "file": dbx_path.full_path()
-            })
-
-        # --- pandas.Series ---
-        # Encode as a single-column Parquet file.  The series name (or a
-        # synthetic "__series__" fallback) becomes the column name, and the
-        # index is written as a named reset column so it survives the
-        # round-trip through Parquet without loss.
-        if isinstance(obj, pandas.Series):
-            func = "pandas.read_parquet_series"
-            extension = "parquet"
-
-            series_name = obj.name if obj.name is not None else "__series__"
-            index_name  = obj.index.name if obj.index.name is not None else "__index__"
-
-            # Reset the index into a regular column so Parquet preserves it.
-            df = obj.rename(series_name).reset_index()
-            df.columns = [index_name] + [series_name]
-            df.to_parquet(path=buffer, index=False)
-
-            buffer.seek(0)
-            dbx_path = self.client.tmp_path(extension=extension)
-            dbx_path.write_bytes(buffer)
-
-            return json_mod.dumps({
-                "func": func,
-                "file": dbx_path.full_path(),
-                "series_name": series_name,
-                "index_name": index_name,
-                # Preserve the original name exactly (None is meaningful).
-                "original_name": obj.name,
-            })
-
-        elif isinstance(obj, pandas.DataFrame):
-            func = "pandas.read_parquet"
-            extension = "parquet"
-            obj.to_parquet(path=buffer)
-
-            buffer.seek(0)
-            dbx_path = self.client.tmp_path(extension=extension)
-            dbx_path.write_bytes(buffer)
-
-            return json_mod.dumps({
-                "func": func,
-                "cpr": compression,
-                "file": dbx_path.full_path()
-            })
-
-        elif isinstance(obj, (Generator, Iterator)):
-            return json_mod.dumps({
-                "func": "generator",
-                "items": [
-                    self.encode_object(_, byte_limit=byte_limit, byref=byref, recurse=recurse, compression=compression)
-                    for _ in obj
-                ]
-            })
-
-        pkl.dump(obj, buffer, byref=byref, recurse=recurse, protocol=5)
-
-        raw = buffer.getvalue()
-
-        if compression or len(raw) > byte_limit:
-            compression = compression or "gzip"
-            if compression != "gzip":
-                raise ValueError(f"Unsupported compression: {compression}")
-            raw = gzip.compress(raw)
-
-        if len(raw) > byte_limit:
-            dbx_path = self.client.tmp_path(extension="bin")
-            dbx_path.write_bytes(raw)
-            return json_mod.dumps({
-                "func": "dill.load",
-                "cpr": compression,
-                "file": dbx_path.full_path(),
-            })
-
-        return json_mod.dumps({
-            "func": "dill.load",
-            "cpr": compression,
-            "b64": base64.b64encode(raw).decode("ascii"),
-        })
-
-    def decode_payload(
-        self,
-        payload: Union[str, bytes, dict, list],
-        temporary: bool = True
-    ):
-        """Reconstruct an object from a JSON envelope produced by ``encode_object``.
-
-        Recognised ``func`` values:
-
-        +---------------------------------+------------------------------------------+
-        | ``func``                        | Action                                   |
-        +=================================+==========================================+
-        | ``"dill.load"``                 | dill-deserialise from inline b64 or file |
-        +---------------------------------+------------------------------------------+
-        | ``"pyarrow.parquet.read_table"``| Read Parquet file → ``pyarrow.Table``    |
-        +---------------------------------+------------------------------------------+
-        | ``"pandas.read_parquet"``       | Read Parquet file → ``pandas.DataFrame`` |
-        +---------------------------------+------------------------------------------+
-        | ``"pandas.read_parquet_series"``| Read Parquet file → ``pandas.Series``   |
-        |                                 | (restores name and index)                |
-        +---------------------------------+------------------------------------------+
-        | ``"pandas.read_pickle"``        | Read pickle file → ``pandas.DataFrame`` |
-        +---------------------------------+------------------------------------------+
-        | ``"polars.read_parquet"``       | Read Parquet file → ``polars.DataFrame`` |
-        +---------------------------------+------------------------------------------+
-        | ``"generator"``                 | Lazy generator over recursively decoded  |
-        |                                 | items                                    |
-        +---------------------------------+------------------------------------------+
-
-        Args:
-            payload: JSON string, bytes, pre-parsed dict, or list.  Non-JSON
-                strings are returned as-is.
-            temporary: When ``True``, DBFS paths are treated as temporary files
-                and may be cleaned up after reading.
-
-        Returns:
-            The reconstructed Python object, or *payload* unchanged if it does
-            not match any known envelope schema.
-        """
-        import yggdrasil.pickle.dill as pkl
-        import yggdrasil.pickle.json as json_mod
-
-        if isinstance(payload, (str, bytes)):
-            try:
-                payload = json_mod.loads(payload)
-            except Exception:
-                return payload
-
-        if isinstance(payload, dict):
-            func, compression, b64, databricks_path = (
-                payload.get("func"), payload.get("cpr"),
-                payload.get("b64"), payload.get("file")
-            )
-
-            if isinstance(func, str) and func:
-                if b64:
-                    blob = base64.b64decode(b64.encode("ascii"))
-                elif databricks_path:
-                    blob = self.client.dbfs_path(databricks_path, temporary=temporary).read_bytes()
-                else:
-                    blob = None
-
-                if func == "dill.load":
-                    if compression == "gzip":
-                        import gzip
-                        blob = gzip.decompress(blob)
-
-                    return pkl.loads(blob)
-
-                elif func.startswith("pyarrow."):
-                    import pyarrow
-                    import pyarrow.parquet as pq
-
-                    if not blob:
-                        return pyarrow.Table([], pyarrow.schema([]))
-
-                    buff = io.BytesIO(blob)
-                    return pq.read_table(buff)
-
-                elif func == "pandas.read_parquet_series":
-                    # Reconstruct a pandas.Series from the single-column
-                    # Parquet file written by encode_object.
-                    import pandas
-
-                    series_name   = payload.get("series_name", "__series__")
-                    index_name    = payload.get("index_name",  "__index__")
-                    original_name = payload.get("original_name")  # may be None
-
-                    if not blob:
-                        return pandas.Series(name=original_name)
-
-                    buff = io.BytesIO(blob)
-                    df   = pandas.read_parquet(buff)
-
-                    # Restore the index from its saved column, then extract
-                    # the value column as a Series with the original name.
-                    if index_name in df.columns:
-                        df = df.set_index(index_name)
-                        df.index.name = None if index_name == "__index__" else index_name
-
-                    series = df[series_name].rename(original_name)
-                    return series
-
-                elif func.startswith("pandas."):
-                    import pandas
-
-                    if not blob:
-                        return pandas.DataFrame()
-
-                    buff = io.BytesIO(blob)
-
-                    if func == "pandas.read_parquet":
-                        return pandas.read_parquet(buff)
-                    elif func == "pandas.read_pickle":
-                        return pandas.read_pickle(buff, compression=compression)
-                    else:
-                        raise NotImplementedError
-
-                elif func == "generator":
-                    items = payload.get("items")
-
-                    def gen(it: Iterator = items):
-                        if it:
-                            for item in it:
-                                yield self.decode_payload(item)
-
-                    return gen()
-
-                elif func.startswith("polars."):
-                    import polars
-
-                    buff = io.BytesIO(blob)
-                    return polars.read_parquet(buff)
-
-                else:
-                    raise NotImplementedError
-
-        return payload
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""

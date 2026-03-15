@@ -1,5 +1,4 @@
 import datetime as dt
-import math
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -39,7 +38,7 @@ class WaitingConfig:
         object.__setattr__(self, "timeout", state.get("timeout", DEFAULT_TIMEOUT_TICKS))
         object.__setattr__(self, "interval", state.get("interval", 1.5))
         object.__setattr__(self, "backoff", state.get("backoff", 1.0))
-        object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
+        object.__setattr__(self, "max_interval", state.get("max_interval", 15.0))
         object.__setattr__(self, "retries", state.get("retries", 8))
 
     def __bool__(self):
@@ -221,9 +220,9 @@ class WaitingConfig:
 
         # Smooth exponent growth (0, 1, ~1.41, ~1.73, 2, ...)
         # Compared to pure exponential (0,1,2,3,4,...), this grows much less aggressively.
-        growth_exp = math.sqrt(iteration)
+        growth_exp = self.backoff ** 2 * iteration
 
-        sleep_s = self.interval * (self.backoff ** growth_exp)
+        sleep_s = self.interval * growth_exp
 
         if self.max_interval > 0:
             sleep_s = min(sleep_s, self.max_interval)

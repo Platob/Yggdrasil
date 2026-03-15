@@ -105,11 +105,11 @@ def test_bytesio_view_start_length_behavior(start, length, expected):
 
     if expected is None:
         with pytest.raises(Exception):
-            with buf.view(start=start, length=length) as f:
+            with buf.view(pos=start, size=length) as f:
                 json_mod.load(f)
         return
 
-    with buf.view(start=start, length=length) as f:
+    with buf.view(pos=start, size=length) as f:
         parsed = json_mod.load(f)
 
     assert parsed == expected

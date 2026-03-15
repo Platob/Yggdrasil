@@ -58,6 +58,9 @@ class Session(ABC):
         if self._lock is None:
             self._lock = threading.RLock()
 
+        if self.pool_maxsize <= 0:
+            self.pool_maxsize = 8  # default pool size
+
     def __getstate__(self) -> dict:
         return serialize_dataclass_state(self)
 
@@ -256,6 +259,7 @@ class Session(ABC):
         stream: bool = True,
         cache: Optional["Table"] = None,
         cache_by: Optional[list[str]] = None,
+        cache_anonymize: Literal["remove", "redact"] = "remove",
         received_from: Optional[dt.datetime | dt.date | str] = None,
         received_to: Optional[dt.datetime | dt.date | str] = None,
         wait_cache: WaitingConfigArg = False,
@@ -315,7 +319,7 @@ class Session(ABC):
 
             for batch in _batched(requests, batch_size):
                 anon_batch = [
-                    req.anonymize(mode="remove")
+                    req.anonymize(mode=cache_anonymize) if cache_anonymize else req
                     for req in batch
                 ]
 
@@ -328,7 +332,13 @@ class Session(ABC):
                     "(%s)" % self._sql_match_clause(req, keys=cache_request_by)
                     for req in anon_batch
                 )
-                query = f"SELECT * FROM {cache.full_name(safe=True)} WHERE {time_filter} AND ({clauses})"
+                query = f"SELECT * FROM {cache.full_name(safe=True)}"
+                if clauses and time_filter:
+                    query += f" WHERE ({clauses}) AND ({time_filter})"
+                elif clauses:
+                    query += f" WHERE {clauses}"
+                elif time_filter:
+                    query += f" WHERE {time_filter}"
 
                 try:
                     sql_cache_statement = cache.sql.execute(query)
@@ -367,10 +377,9 @@ class Session(ABC):
                     for req in misses:
                         yield Job.make(
                             self.send,
-                            req.update_headers(self.send_headers, normalize=False),
+                            req,
                             wait=wait,
-                            raise_error=raise_error,
-                            normalize=normalize,
+                            raise_error=False,
                             stream=stream,
                             cache=None,
                         )

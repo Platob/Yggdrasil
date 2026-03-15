@@ -8,7 +8,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Any, Callable, Mapping
+from typing import Optional, Any, Callable, Mapping
 
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.errors import InternalError, PermissionDenied, ResourceDoesNotExist
@@ -16,12 +16,12 @@ from databricks.sdk.service.compute import (
     Language, CommandStatusResponse, CommandStatus, ResultType
 )
 
-from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg, serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 from .exceptions import ClientTerminatedSession, CommandExecutionError
+from .execution_context import ExecutionContext, EXCLUDED_ENV_KEYS
 
 DONE_STATES = {
     CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
@@ -34,10 +34,6 @@ FAILED_STATES = {
 }
 
 
-if TYPE_CHECKING:
-    from .execution_context import ExecutionContext
-
-
 __all__ = [
     "CommandExecution"
 ]
@@ -48,28 +44,40 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class CommandExecution:
-    context: "ExecutionContext"
+    context: ExecutionContext
     command_id: Optional[str] = None
 
     language: Optional[Language] = field(default=None, repr=False, compare=False, hash=False)
     command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
+    ephemeral: bool = field(default=True, repr=False, compare=False, hash=False)
 
     pyfunc: Optional[Callable] = field(default=None, repr=False, compare=False, hash=False)
     environ: Optional[Mapping] = field(default=None, repr=False, compare=False, hash=False)
 
-    _details: Optional[CommandStatusResponse] = field(default=None, repr=False, compare=False, hash=False)
+    _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
+    _local_checks: dict[Path, float] = field(default_factory=dict, init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self):
         if self.environ:
             if not isinstance(self.environ, Mapping):
-                self.environ = {
-                    str(k): os.getenv(str(k))
-                    for k in self.environ
-                    if k
-                }
+                try:
+                    self.environ = dict(self.environ)
+                except Exception as e:
+                    raise ValueError(
+                        f"environ must be a mapping or convertible to dict, got {type(self.environ)}"
+                    ) from e
+
+            if any(k in EXCLUDED_ENV_KEYS for k in self.environ.keys()):
+                raise ValueError(
+                    f"Databricks command execution environ cannot contain any of the following reserved keys: {EXCLUDED_ENV_KEYS}. "
+                    f"Found keys: {[k for k in self.environ.keys() if k in EXCLUDED_ENV_KEYS]}"
+                )
 
         if self.language is None:
             self.language = Language.PYTHON if self.pyfunc is not None else self.context.language
+
+        if self._local_checks is None:
+            self._local_checks = {}
 
     def __getstate__(self):
         return serialize_dataclass_state(self)
@@ -121,20 +129,31 @@ class CommandExecution:
                 return self.pyfunc(*args, **kwargs)
 
             if len(args) == 1 and not kwargs:
-                if callable(args[0]):
-                    applied = self.pyfunc(args[0])
+                to_decorate = args[0]
 
-                    return CommandExecution(
+                if callable(to_decorate):
+                    decorated = self.pyfunc(to_decorate)
+
+                    # Add dependency in self._local_checks to trigger re-upload if the decorated function's module file changes on disk
+                    root_module = self._get_local_module_path(to_decorate)
+                    self._local_checks[root_module] = 0
+
+                    built = CommandExecution(
                         context=self.context,
-                        pyfunc=applied,
+                        pyfunc=decorated,
                         environ=self.environ,
                         language=Language.PYTHON
                     )
 
+                    built._local_checks.update(self._local_checks)
+                    return built
+
             # Create command
             language_to_execute = Language.PYTHON
             command_to_execute = self.context.make_python_function_command(
-                job=Job.make(self.pyfunc, *args, **kwargs) if args or kwargs else self.pyfunc,
+                func=self.pyfunc,
+                args=args,
+                kwargs=kwargs,
                 environ=environ
             )
         else:
@@ -143,15 +162,22 @@ class CommandExecution:
 
         assert command_to_execute, "Cannot call %s, missing command" % self
 
-        if install_modules:
-            for m in install_modules:
-                self.install_module(m)
-
         temp = CommandExecution(
             context=self.context.create(language=language_to_execute),
             command=command_to_execute,
             language=language_to_execute,
+            ephemeral=True
         )
+        temp._local_checks = self._local_checks
+
+        if install_modules:
+            for m in install_modules:
+                temp.install_module(m)
+
+        # Check local dependencies
+        for local_root in temp._local_checks.keys():
+            if "site-packages" not in local_root.parts:
+                temp.install_module(local_root=local_root, check_diffs=True)
 
         try:
             return (
@@ -229,12 +255,15 @@ class CommandExecution:
                     raise inner_e from perm_denied
 
                 client = self.client.workspace_client().command_execution  # refresh client
-                details = client.execute(
-                    cluster_id=self.cluster_id,
-                    context_id=self.context_id,
-                    language=self.language,
-                    command=self.command,
-                ).response
+                try:
+                    details = client.execute(
+                        cluster_id=self.cluster_id,
+                        context_id=self.context_id,
+                        language=self.language,
+                        command=self.command,
+                    ).response
+                except Exception as inner_e:
+                    raise inner_e from perm_denied
             else:
                 raise
         except InternalError:
@@ -400,9 +429,7 @@ class CommandExecution:
         language: Language,
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
-        logger: bool = True,
-        unpickle: bool = True
-    ) -> Any:
+    ) -> tuple[str | None, str]:
         """Mirror the old Cluster.execute_command result handling.
 
         Args:
@@ -410,8 +437,6 @@ class CommandExecution:
             language: Language executed
             raise_error: Raise error if response is failed
             tag: Result tag
-            logger: Print logs
-            unpickle: Unpickle
 
         Returns:
             The decoded output string.
@@ -436,30 +461,14 @@ class CommandExecution:
 
         if tag in raw_result:
             logs_text, raw_result = raw_result.split(tag, 1)
+            return logs_text, raw_result
 
-            try:
-                if logger:
-                    for line in logs_text.splitlines():
-                        stripped_log = line.strip()
-
-                        if stripped_log:
-                            print(stripped_log)
-            except Exception as e:
-                LOGGER.warning(
-                    "Cannot print logs from %s: %s",
-                    logs_text,
-                    e
-                )
-
-        if unpickle:
-            return self.context.decode_payload(payload=raw_result)
-        return raw_result
+        return None, raw_result
 
     def result(
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-        unpickle: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> Any:
         wait = WaitingConfig.check_arg(wait)
@@ -469,15 +478,8 @@ class CommandExecution:
         for attempt in range(wait.total_try_count):
             try:
                 self.wait(wait=wait, raise_error=raise_error)
-
-                return self.decode_response(
-                    response=self.details,
-                    language=self.language,
-                    raise_error=raise_error,
-                    unpickle=unpickle,
-                    tag=tag
-                )
-
+                last_exc = None
+                break
             except (InternalError, ClientTerminatedSession) as e:
                 last_exc = e
                 self.context = self.context.connect(reset=True)
@@ -501,26 +503,51 @@ class CommandExecution:
                     root_module,
                 )
 
-                self.install_module(module_name=root_module)
+                self.install_module(local_root=root_module)
                 installed_modules.add(root_module)
 
                 self.start(reset=True)
 
-        if last_exc is None:
-            last_exc = RuntimeError(f"Failed to get result with {wait}")
-
-        if raise_error:
+        if raise_error and last_exc is not None:
             raise last_exc
-        return None
+
+        logs, result = self.decode_response(
+            response=self.details,
+            language=self.language,
+            raise_error=raise_error,
+            tag=tag
+        )
+
+        if logs is not None:
+            from yggdrasil.pickle.ser import loads
+
+            return loads(result)
+        return result
+
 
     @staticmethod
-    def _get_local_module_path(module_name: str) -> Path:
+    def _get_local_module_path(
+        obj: str | Path | Callable,
+    ) -> Path:
         """
         Get the local filesystem path for the root local module/package.
 
         Returns:
             Path to the root module/package.
         """
+        if isinstance(obj, Path):
+            if not obj.exists():
+                raise FileNotFoundError(f"Provided local module path does not exist: {obj}")
+            return obj.resolve()
+
+        if not isinstance(obj, str):
+            module_name = getattr(obj, "__module__", None)
+        else:
+            module_name = obj
+
+        if not module_name:
+            raise ValueError(f"Module name must be a string or a callable with __module__ attribute, got {module_name}")
+
         root_module = module_name.split(".", 1)[0]
         local_root = Path(PyEnv.get_root_module_directory(module_name=root_module)).resolve()
 
@@ -532,15 +559,16 @@ class CommandExecution:
         return local_root
 
     @staticmethod
-    def _zip_local_module(local_root: str | Path) -> tuple[str, bytes]:
+    def _zip_local_module(
+        local_root: str | Path
+    ) -> tuple[str, bytes]:
         """
         Build a zip archive for the root local module/package.
 
         Returns:
             (root_module_name, zip_bytes)
         """
-        if isinstance(local_root, str):
-            local_root = CommandExecution._get_local_module_path(local_root)
+        local_root = CommandExecution._get_local_module_path(local_root)
 
         buf = io.BytesIO()
 
@@ -566,9 +594,14 @@ class CommandExecution:
             else:
                 zf.write(local_root, arcname=local_root.name)
 
-        return local_root, buf.getvalue()
+        return local_root.name, buf.getvalue()
 
-    def install_module(self, module_name: str) -> str:
+    def install_module(
+        self,
+        local_root: str | Path,
+        *,
+        check_diffs: bool = False
+    ) -> str:
         """
         Zip local root module/package, upload via command payload, unzip directly
         into the remote libs path already injected by syspath_lines().
@@ -576,7 +609,19 @@ class CommandExecution:
         Returns:
             Remote libs path.
         """
-        local_root = self._get_local_module_path(module_name=module_name)
+        local_root: Path = self._get_local_module_path(obj=local_root)
+        module_name = local_root.name
+
+        # Check diffs
+        if check_diffs:
+            last_mtime = self._local_checks.get(local_root, 0)
+            current_mtime = _get_tree_mtime(local_root)
+
+            if current_mtime <= last_mtime:
+                # update local check timestamp to avoid redundant checks in the future, but skip upload
+                self._local_checks[local_root] = current_mtime
+
+                return self.context.remote_metadata.libs_path.rstrip("/")
 
         if any(part == "site-packages" for part in local_root.parts):
             spec = _get_local_distribution_compatible_spec(
@@ -594,19 +639,18 @@ class CommandExecution:
         payload_json = json.dumps(payload_b64)
 
         remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
-        remote_zip = f"{remote_libs}/{root_module}.zip"
         remote_pkg_dir = f"{remote_libs}/{root_module}"
 
         bootstrap = f"""
 import base64
 import os
+import io
 import shutil
 import zipfile
 import importlib
 
 root_module = {str(root_module)!r}
 remote_libs = os.path.expanduser({str(self.context.remote_metadata.libs_path)!r})
-remote_zip = os.path.expanduser({remote_zip!r})
 remote_pkg_dir = os.path.expanduser({remote_pkg_dir!r})
 payload_b64 = {payload_json}
 
@@ -615,10 +659,9 @@ os.makedirs(remote_libs, exist_ok=True)
 if os.path.exists(remote_pkg_dir):
     shutil.rmtree(remote_pkg_dir)
 
-with open(remote_zip, "wb") as f:
-    f.write(base64.b64decode(payload_b64.encode("ascii")))
+buf = io.BytesIO(base64.b64decode(payload_b64.encode("ascii")))
 
-with zipfile.ZipFile(remote_zip, "r") as zf:
+with zipfile.ZipFile(buf, "r") as zf:
     zf.extractall(remote_libs)
 
 importlib.invalidate_caches()
@@ -630,12 +673,12 @@ print(remote_libs, flush=True)
                 command=bootstrap
             )
             .start()
-            .result(unpickle=False)
+            .result()
         )
 
         LOGGER.info(
             "Installed local module '%s' to remote libs path '%s'",
-            module_name,
+            local_root,
             remote_libs
         )
 
@@ -743,7 +786,7 @@ print("__CALL_RESULT__" + listed.stdout, flush=True)
             self.context
             .command(language=Language.PYTHON, command=bootstrap)
             .start()
-            .result(unpickle=False)
+            .result()
         )
 
         LOGGER.info(
@@ -778,7 +821,8 @@ def raise_error_from_response(
 
 
 def _get_local_distribution_compatible_spec(
-    module_name: str, raise_error: bool
+    module_name: str,
+    raise_error: bool
 ) -> str:
     """
     Resolve a local import/module name to its installed distribution and
@@ -823,3 +867,19 @@ def _get_local_distribution_compatible_spec(
     raise RuntimeError(
         f"Cannot resolve installed distribution/version for module '{module_name}'"
     )
+
+
+def _get_tree_mtime(root: Path) -> float:
+    root = root.resolve()
+
+    if root.is_file():
+        return root.stat().st_mtime
+
+    latest = root.stat().st_mtime
+    for p in root.rglob("*"):
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except FileNotFoundError:
+            # file vanished during scan
+            continue
+    return latest

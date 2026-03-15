@@ -1,45 +1,50 @@
 from yggdrasil.mongoengine import *
 
 
-class Cities(Document):
-    city_id = IntField(required=True)
-    city_name = StringField(required=True)
-    location = PointField(required=True)
-    country_name = StringField(required=True)
-    country_iso = StringField(required=True)
-    population_tot = FloatField(required=True)
-    population_perc = FloatField(required=True)
+class Plants(Document):
+    plant_name = StringField(required=True)
+    plant_type = StringField(required=True)
+    plant_subtype = StringField(required=True)
+    capacity = FloatField(required=True)
+    lat = FloatField(required=True)
+    lon = FloatField(required=True)
+    country = StringField(required=True)
+    as_of = DateTimeField(required=True)
 
     def __repr__(self):
-        return f'{self.city_name} {self.country_name} {self.population_tot} {self.population_perc} ({self.location["coordinates"][1]}, {self.location["coordinates"][0]})'
+        return f'{self.country} {self.plant_name} {self.plant_type} {self.plant_subtype} {self.capacity} MW ({self.lat} {self.lon})'
 
     def __str__(self):
-        return f'{self.city_name} {self.country_name} {self.population_tot} {self.population_perc} ({self.location["coordinates"][1]}, {self.location["coordinates"][0]})'
+        return f'{self.country} {self.plant_name} {self.plant_type} {self.plant_subtype} {self.capacity} MW ({self.lat} {self.lon})'
 
     meta = {
-        'db_alias': 'test_connection',
+        'db_alias': 'GenCast',
         'indexes': [
-            {'fields': ['-city_name', '-country_iso', 'population_perc'],
+            {'fields': ['-as_of', '-country', '-plant_type', '-plant_subtype', 'lat', 'lon', '-capacity', 'plant_name'],
              'unique': True}
         ]
     }
 
 
-connect(
-    alias="test_connection",
-    host="mongodb+srv://xxx:xxx@cassandre-prod-rs0-pl-5.xr9cdx.mongodb.net/?appName=xxx",
-)
+def resolver():
+    connect(
+        alias="GenCast",
+        db="GenCast",
+        host="mongodb+srv://xxx:xxx@xxx",
+    )
 
 @with_mongo_connection(
-    aliases="test_connection",
-    databricks="xxx",
+    databricks="https://xxx",
+    resolver=resolver,
 )
 def decorated():
-    return Cities.objects().first().to_pandas()
+    import pandas
+    return pandas.DataFrame(Plants.objects())
+
 
 class TestDecorator:
 
     def test_decorator(self):
-        result = decorated(1, __install_modules=["yggdrasil"])
+        result = decorated(__install_modules=["yggdrasil"])
 
         assert result is not None

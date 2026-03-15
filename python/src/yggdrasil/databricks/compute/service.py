@@ -9,7 +9,6 @@ from databricks.sdk.service.compute import ClusterAccessControlRequest, Library,
     DataSecurityMode, RuntimeEngine, Kind, SparkVersion, ListClustersFilterBy, ClusterSource
 
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.environ import PyEnv
 from yggdrasil.version import __version_info__ as YGG_VERSION_INFO, VersionInfo
 from ..client import DatabricksClient
 from ..client import DatabricksService
@@ -30,7 +29,7 @@ _CREATE_ARG_NAMES = set(inspect.signature(ClustersAPI.create).parameters.keys())
 
 # host -> ExpiringDict(cluster_name -> cluster_id)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
-NAMED_CLUSTERS: ExpiringDict[str, "Cluster"] = ExpiringDict(default_ttl=7200)
+NAMED_CLUSTERS: ExpiringDict[str, "Cluster"] = ExpiringDict(default_ttl=7200.0)
 # host -> ExpiringDict("versions" -> list[SparkVersion])
 _SPARK_VERSIONS_CACHE: dict[str, ExpiringDict] = {}
 _DBR_RE = re.compile(r"^(?P<maj>\d+)\.(?P<min>\d+)\.")
@@ -127,7 +126,6 @@ class Clusters(DatabricksService):
         key: Optional[str] = None,
         custom_tags: Optional[MutableMapping[str, str]] = None,
         single_user_name: Optional[str] = None,
-        python_version: Optional[str | tuple[int, ...]] = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         libraries: Optional[Sequence[str]] = None,
         wait: WaitingConfigArg = True,
@@ -136,16 +134,10 @@ class Clusters(DatabricksService):
         global NAMED_CLUSTERS
 
         if not name:
-            if not python_version:
-                vinfo = PyEnv.current().version_info
-                python_version = f"{vinfo.major}.{vinfo.minor}"
-
             if key:
                 key = key.strip()
 
-            key = key or "All Purpose"
-
-            name = f"{key} py{python_version} ygg{YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}"
+            name = key or "All Purpose"
 
         existing = NAMED_CLUSTERS.get(name, None)
 
@@ -162,7 +154,7 @@ class Clusters(DatabricksService):
         )
 
         libraries = (libraries or []) + [
-            f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
+            f"ygg[http,data,databricks,pickle]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
             "uv",
             "dill",
         ]
@@ -171,7 +163,6 @@ class Clusters(DatabricksService):
             existing = self.create(
                 cluster_name=name,
                 single_user_name=single_user_name,
-                python_version=python_version,
                 libraries=libraries,
                 permissions=permissions,
                 wait=wait,
@@ -433,7 +424,7 @@ class Clusters(DatabricksService):
             filter_by=filter_by
         ):
             if name:
-                if name in details.cluster_name:
+                if name == details.cluster_name:
                     cluster = Cluster(service=self).set_details(details=details)
                     yield cluster
                     cnt += 1

@@ -1,9 +1,10 @@
 # yggdrasil/pickle/json.py
 from __future__ import annotations
 
+import base64
 import json as _json
 import re
-from dataclasses import asdict, is_dataclass, fields
+from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time, timezone, tzinfo
 from functools import lru_cache
 from typing import Any, IO, Iterable, overload
@@ -15,7 +16,7 @@ __all__ = ["load", "loads", "dump", "dumps"]
 # Datetime parsing / encoding
 # ---------------------------------------------------------------------------
 
-_NULL_STR_VALUES = frozenset({"", "null", "None", "nan"})
+_NULL_STR_VALUES = frozenset({"", "null", "None", "NaN"})
 _RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RE_TIME = re.compile(r"^\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?$")
 _RE_RFC1123 = re.compile(r"^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$")
@@ -185,24 +186,6 @@ def _try_parse_datetime(s: str, default_tz: tzinfo | None) -> datetime | date | 
 
 # ---- Null normalization caching ------------------------------------------------
 
-@lru_cache(maxsize=64)
-def _normalize_null_str_values_cached(values: tuple[str, ...]) -> frozenset[str]:
-    out: set[str] = set()
-    for v in values:
-        if v is None:
-            continue
-        out.add(str(v).strip().lower())
-    return frozenset(out)
-
-
-def _normalize_null_str_values(null_str_values: Iterable[str] | None) -> set[str]:
-    # case-insensitive + trimmed matching
-    if null_str_values is None:
-        return set()
-    # Make it cacheable (tuple). This is fast + keeps behavior stable.
-    return set(_normalize_null_str_values_cached(tuple(null_str_values)))
-
-
 def _walk_parse_values(
     x: Any,
     *,
@@ -220,12 +203,14 @@ def _walk_parse_values(
     _parse = _try_parse_datetime
 
     if isinstance(x, str):
-        s = x.strip()
-        if nulls and (s.lower() in nulls):
+        if nulls and x in nulls:
             return None
+
         if parse_datetimes:
-            hit = _parse(s, default_tz)
+            hit = _parse(x, default_tz)
+
             return hit if hit is not None else x
+
         return x
 
     if isinstance(x, list):
@@ -239,12 +224,28 @@ def _walk_parse_values(
 
     return x
 
+def _is_json_serializable(obj: Any) -> bool:
+    if isinstance(obj, (str, int, float, bool)):
+        return True
+    if isinstance(obj, (datetime, date, time)):
+        return True
+    if is_dataclass(obj):
+        return True
+    if isinstance(obj, bytes):
+        return True
+    if obj is None:
+        return True
+    return False
 
 def _default_encoder(obj: Any) -> Any:
     if isinstance(obj, (datetime, date, time)):
         return obj.isoformat()
     if is_dataclass(obj):
-        return asdict(obj)
+        return {
+            k: v
+            for k, v in asdict(obj).items()
+            if _is_json_serializable(v)
+        }
     if isinstance(obj, bytes):
         return obj.decode("latin-1")
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
@@ -304,14 +305,16 @@ def loads(
     if not parse_datetimes and not null_str_values:
         return obj
 
-    nulls = _normalize_null_str_values(null_str_values)
-
-    if not parse_datetimes and not nulls:
+    if not parse_datetimes and not null_str_values:
         return obj
 
     # If parse_datetimes is False but we have nulls, we still need a walk.
     # If parse_datetimes is True but nulls empty, still need parse walk.
-    return _walk_parse_values(obj, default_tz=default_tz, nulls=nulls, parse_datetimes=parse_datetimes)
+    return _walk_parse_values(
+        obj,
+        default_tz=default_tz,
+        nulls=null_str_values, parse_datetimes=parse_datetimes
+    )
 
 
 def dumps(
@@ -330,10 +333,10 @@ def dumps(
         separators = (",", ":")
 
     if is_dataclass(obj):
-        f = [f for f in fields(obj) if f.init]
         obj = {
-            f.name: getattr(obj, f.name)
-            for f in f
+            k: v
+            for k, v in asdict(obj)
+            if _is_json_serializable(v)
         }
 
     text = _json.dumps(
