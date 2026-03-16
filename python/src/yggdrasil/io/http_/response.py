@@ -56,6 +56,7 @@ class HTTPResponse(Response):
             else:
                 buffer.write(response.read())
         finally:
-            response.release_conn()
+            if release_conn:
+                response.release_conn()
 
         return self

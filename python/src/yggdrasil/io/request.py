@@ -6,7 +6,6 @@ from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.data.cast.registry import identity
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType
 from .buffer import BytesIO
@@ -109,13 +108,15 @@ class PreparedRequest:
     buffer: Optional[BytesIO]
     sent_at_timestamp: int = field(default=0, hash=False, compare=False)
 
-    before_send: Callable[["PreparedRequest"], "PreparedRequest"] = field(
-        default=identity,
+    before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = field(
+        default=None,
+        init=False,
         hash=False,
         compare=False,
     )
-    prepare_response: Callable[["Response"], "Response"] = field(
-        default=identity,
+    prepare_response: Optional[Callable[["Response"], "Response"]] = field(
+        default=None,
+        init=False,
         hash=False,
         compare=False,
     )
@@ -314,16 +315,19 @@ class PreparedRequest:
         new_before_send = self.before_send if before_send is ... else before_send
         new_prepare_response = self.prepare_response if prepare_response is ... else prepare_response
 
-        return self.__class__(
+        built = self.__class__(
             method=self.method if method is None else str(method),
             url=new_url,
             headers=new_headers,
             buffer=new_buffer,
             tags=self.tags if tags is None else tags,
             sent_at_timestamp=self.sent_at_timestamp if sent_at_timestamp is None else int(sent_at_timestamp),
-            before_send=new_before_send,
-            prepare_response=new_prepare_response,
         )
+
+        built.before_send = new_before_send
+        built.prepare_response = new_prepare_response
+
+        return built
 
     @classmethod
     def prepare(
@@ -358,16 +362,19 @@ class PreparedRequest:
         if request_body is not None:
             out_headers["Content-Length"] = str(request_body.size)
 
-        return cls(
+        built = cls(
             method=str(method),
             url=parsed_url,
             headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
             buffer=request_body,
             tags=tags,
             sent_at_timestamp=0,
-            before_send=before_send or identity,
-            prepare_response=after_received or identity,
         )
+
+        built.before_send = before_send
+        built.prepare_response = after_received
+
+        return built
 
     def prepare_to_send(
         self,

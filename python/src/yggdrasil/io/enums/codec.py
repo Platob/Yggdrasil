@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import abc
 import importlib
+import io as _io
+import zlib
 from typing import IO, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -11,8 +13,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Codec",
-    "detect",
-    "detect_bytes",
     "GZIP",
     "ZSTD",
     "LZ4",
@@ -106,7 +106,10 @@ class Codec(abc.ABC):
     # Streaming API (default: bytes round-trip)
     # ------------------------------------------------------------------
 
-    def compress(self, src: "IO[bytes] | BytesIO") -> "BytesIO":
+    def compress(
+        self,
+        src: "IO[bytes] | BytesIO"
+    ) -> "BytesIO":
         from ..buffer.bytes_io import BytesIO
 
         fh = BytesIO.parse(src)
@@ -151,22 +154,16 @@ class Codec(abc.ABC):
         n_end: int = 64,
         chunk_size: int = _CHUNK,
     ) -> tuple[bytes, bytes]:
+        from ..buffer import BytesIO
         if n_start < 0 or n_end < 0:
-            raise ValueError("n_start and n_end must be >= 0")
+            raise ValueError("start and size must be >= 0")
 
-        is_bytes = isinstance(src, (bytes, bytearray, memoryview))
-        if is_bytes:
-            import io as _io
-            fh: IO[bytes] = _io.BytesIO(bytes(src))
-            saved = 0
-        else:
-            from ..buffer.bytes_io import BytesIO
-            fh = BytesIO.wrap(src)
-            saved = fh.tell()
+        fh = BytesIO(src, copy=False).view(pos=0)
+        saved = fh.tell()
 
         reader: IO[bytes] | None = None
         try:
-            # critical fix: always decode from start of compressed stream
+            # Always decode from the beginning of the compressed stream.
             fh.seek(0)
 
             reader = self._open_decompress_reader(fh)
@@ -174,7 +171,7 @@ class Codec(abc.ABC):
                 data = self.decompress_bytes(_drain(fh))
                 return data[:n_start], (data[-n_end:] if n_end else b"")
 
-            start = bytearray()
+            head = bytearray()
             tail = bytearray()
 
             while True:
@@ -182,24 +179,27 @@ class Codec(abc.ABC):
                 if not chunk:
                     break
 
-                if n_start and len(start) < n_start:
-                    need = n_start - len(start)
-                    start += chunk[:need]
+                if n_start and len(head) < n_start:
+                    need = n_start - len(head)
+                    head += chunk[:need]
 
                 if n_end:
                     tail += chunk
                     if len(tail) > n_end:
                         del tail[:-n_end]
 
-            return bytes(start), (bytes(tail) if n_end else b"")
+            return bytes(head), (bytes(tail) if n_end else b"")
         finally:
             try:
                 if reader is not None:
                     reader.close()  # type: ignore[attr-defined]
             except Exception:
                 pass
-            if not is_bytes:
+
+            try:
                 fh.seek(saved)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Lookup
@@ -215,20 +215,14 @@ class Codec(abc.ABC):
 
         from .mime_type import MimeType as _MimeType
 
-        if isinstance(obj, str):
-            mt = _MimeType.parse_str(obj, default=None)
-            hit = _codec_from_mime(mt)
-            if hit is not None:
-                return hit
-            return _CODEC_BY_NAME.get(obj.strip().lower(), default)
+        mt = _MimeType.parse(obj, default=None)
 
-        if isinstance(obj, (bytes, bytearray, memoryview)):
-            return detect_bytes(obj) or default
+        if mt is None:
+            return default
+        elif not mt.is_codec:
+            return default
 
-        if hasattr(obj, "read"):
-            return detect(obj) or default
-
-        return default
+        return cls.from_mime(mt) or default
 
     @classmethod
     def from_mime(cls, mime: "MimeType | str") -> "Codec | None":
@@ -429,27 +423,30 @@ class _ZlibCodec(Codec):
         n_end: int = 64,
         chunk_size: int = _CHUNK,
     ) -> tuple[bytes, bytes]:
-        import zlib
-        import io as _io
-
         if n_start < 0 or n_end < 0:
-            raise ValueError("n_start and n_end must be >= 0")
+            raise ValueError("start and size must be >= 0")
 
         is_bytes = isinstance(src, (bytes, bytearray, memoryview))
+        saved: int | None = None
+
         if is_bytes:
             fh: IO[bytes] = _io.BytesIO(bytes(src))
-            saved = 0
         else:
-            from ..buffer.bytes_io import BytesIO
-            fh = BytesIO.wrap(src)
-            saved = fh.tell()
+            fh = src
+            try:
+                saved = fh.tell()
+            except Exception:
+                saved = None
 
         try:
-            # critical fix: always decode from start of compressed stream
-            fh.seek(0)
+            # Always decode from the beginning of the compressed stream.
+            try:
+                fh.seek(0)
+            except Exception as e:
+                raise ValueError("src must be seekable to read compressed start/end") from e
 
             decomp = zlib.decompressobj()
-            start = bytearray()
+            head = bytearray()
             tail = bytearray()
 
             while True:
@@ -458,30 +455,36 @@ class _ZlibCodec(Codec):
                     break
 
                 out = decomp.decompress(comp)
-                if out:
-                    if n_start and len(start) < n_start:
-                        need = n_start - len(start)
-                        start += out[:need]
+                if not out:
+                    continue
 
-                    if n_end:
-                        tail += out
-                        if len(tail) > n_end:
-                            del tail[:-n_end]
+                if n_start and len(head) < n_start:
+                    need = n_start - len(head)
+                    head += out[:need]
 
-            out = decomp.flush()
-            if out:
-                if n_start and len(start) < n_start:
-                    need = n_start - len(start)
-                    start += out[:need]
                 if n_end:
                     tail += out
                     if len(tail) > n_end:
                         del tail[:-n_end]
 
-            return bytes(start), (bytes(tail) if n_end else b"")
+            out = decomp.flush()
+            if out:
+                if n_start and len(head) < n_start:
+                    need = n_start - len(head)
+                    head += out[:need]
+
+                if n_end:
+                    tail += out
+                    if len(tail) > n_end:
+                        del tail[:-n_end]
+
+            return bytes(head), (bytes(tail) if n_end else b"")
         finally:
-            if not is_bytes:
-                fh.seek(saved)
+            if not is_bytes and saved is not None:
+                try:
+                    fh.seek(saved)
+                except Exception:
+                    pass
 
 
 class _LzmaCodec(Codec):
@@ -540,26 +543,3 @@ def _build_codec_by_mime() -> dict["MimeType", Codec]:
 
 
 _CODEC_BY_MIME = _build_codec_by_mime()
-
-
-# ---------------------------------------------------------------------------
-# Detection helpers
-# ---------------------------------------------------------------------------
-
-def detect(src: "IO[bytes] | BytesIO") -> "Codec | None":
-    """
-    Detect codec from magic bytes of *src*.
-    Detection is independent of current cursor; cursor is preserved.
-    """
-    from ..buffer.bytes_io import BytesIO
-    from .mime_type import MimeType
-
-    fh = BytesIO(src, copy=False)
-    header = fh.head(64)
-    return _codec_from_mime(MimeType.parse_magic(header))
-
-
-def detect_bytes(b: bytes) -> "Codec | None":
-    """Detect codec from leading bytes of *b*."""
-    from .mime_type import MimeType
-    return _codec_from_mime(MimeType.parse_magic(b))

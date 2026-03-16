@@ -21,8 +21,6 @@ def test_promoted_headers_extract_common_headers():
         "Content-Type": "application/json",
         "Content-Length": "123",
         "Content-Encoding": "gzip",
-        "X-Request-ID": "req-1",
-        "X-Correlation-ID": "corr-1",
         "X-Custom": "value",
     }
 
@@ -36,8 +34,6 @@ def test_promoted_headers_extract_common_headers():
     assert promoted.content_type == "application/json"
     assert promoted.content_length == 123
     assert promoted.content_encoding == "gzip"
-    assert promoted.x_request_id == "req-1"
-    assert promoted.x_correlation_id == "corr-1"
     assert promoted.remaining == {"X-Custom": "value"}
 
 
@@ -86,7 +82,7 @@ def test_normalize_headers_canonicalizes_names_without_anonymizing():
         "user-agent": "pytest",
     }
 
-    out = normalize_headers(headers)
+    out = normalize_headers(headers, is_request=False)
 
     assert out == {
         "Content-Type": "application/json",
@@ -103,7 +99,7 @@ def test_normalize_headers_removes_sensitive_headers_in_remove_mode():
         "X-Test": "ok",
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="remove")
+    out = normalize_headers(headers, anonymize=True, mode="remove", is_request=False)
 
     assert out == {"X-Test": "ok"}
 
@@ -114,7 +110,7 @@ def test_normalize_headers_redacts_bearer_authorization():
         "X-Test": "ok",
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="redact")
+    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=False)
 
     assert out["Authorization"] == "Bearer <redacted>"
     assert out["X-Test"] == "ok"
@@ -125,7 +121,7 @@ def test_normalize_headers_redacts_basic_authorization():
         "Authorization": "Basic dXNlcjpwYXNz",
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="redact")
+    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=False)
 
     assert out["Authorization"] == "Basic <redacted>"
 
@@ -135,7 +131,7 @@ def test_normalize_headers_redacts_unknown_authorization_scheme():
         "Authorization": "Digest something-secret",
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="redact")
+    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=True)
 
     assert out["Authorization"] == "<redacted>"
 
@@ -146,7 +142,7 @@ def test_normalize_headers_redacts_jwt_like_values():
         "X-Custom": jwt_like,
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="redact")
+    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=True)
 
     assert out["X-Custom"] == "<redacted>"
 
@@ -157,7 +153,7 @@ def test_normalize_headers_backfills_body_headers():
         media_type=MediaType.parse("application/json"),
     )
 
-    out = normalize_headers({}, body=body)
+    out = normalize_headers({}, body=body, is_request=True)
 
     assert out["Content-Type"] == "application/json"
     assert out["Content-Length"] == "99"
@@ -173,7 +169,7 @@ def test_normalize_headers_backfills_content_encoding_when_codec_exists():
         media_type=media_type,
     )
 
-    out = normalize_headers({}, body=body)
+    out = normalize_headers({}, body=body, is_request=True)
 
     assert out["Content-Type"] == "application/json"
     assert out["Content-Length"] == "99"
@@ -195,7 +191,7 @@ def test_normalize_headers_does_not_override_existing_body_headers():
             "Content-Length": "7",
             "Content-Encoding": "chunked",
         },
-        body=body,
+        body=body, is_request=True,
     )
 
     assert out["Content-Type"] == "text/plain"
@@ -209,7 +205,7 @@ def test_normalize_headers_bytes_input_is_supported():
         b"user-agent": b"pytest",
     }
 
-    out = normalize_headers(headers)
+    out = normalize_headers(headers, is_request=False)
 
     assert out == {
         "Content-Type": "application/json",
@@ -222,6 +218,6 @@ def test_hash_mode_currently_matches_redact_behavior():
         "Cookie": "secret=1",
     }
 
-    out = normalize_headers(headers, anonymize=True, mode="hash")
+    out = normalize_headers(headers, anonymize=True, mode="hash", is_request=True)
 
     assert out["Cookie"] == "<redacted>"

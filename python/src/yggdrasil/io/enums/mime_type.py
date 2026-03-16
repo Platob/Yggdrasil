@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, ClassVar, IO, Mapping
+from typing import Any, Callable, ClassVar, IO, Mapping, Union
 
 __all__ = ["MimeType"]
 
@@ -71,16 +71,6 @@ class MimeType:
 
         return mt
 
-    # -------- basic helpers --------
-    @staticmethod
-    def peek(fh: IO[bytes], n: int) -> bytes:
-        """Read *n* bytes from *fh* without advancing its cursor."""
-        pos = fh.tell()
-        try:
-            return fh.read(n)
-        finally:
-            fh.seek(pos)
-
     def __str__(self) -> str:
         return self.value
 
@@ -124,26 +114,31 @@ class MimeType:
         if isinstance(obj, str):
             return cls.parse_str(obj, default=default)
 
-        if isinstance(obj, (bytes, bytearray, memoryview)):
-            return cls.parse_magic(obj, default=default)
-
         if isinstance(obj, Path):
             return cls.parse_str(str(obj), default=default)
-
-        if hasattr(obj, "read"):
-            obj = cls.peek(obj, 64)
 
         return cls.parse_magic(obj, default=default)
 
     # -------- magic parsing --------
     @classmethod
-    def parse_magic(cls, magic: bytes, default: "MimeType | None" = None) -> "MimeType | None":
+    def parse_magic(
+        cls,
+        magic: Union[bytes, bytearray, memoryview, IO[bytes], str, Path],
+        default: "MimeType | None" = None
+    ) -> "MimeType | None":
         if not magic:
             return default
 
         # ensure bytes (memoryview-safe)
         if not isinstance(magic, (bytes, bytearray)):
-            magic = bytes(magic)
+            from ..buffer import BytesIO
+
+            if isinstance(magic, BytesIO):
+                # avoid copy for our own buffer type (common in parsing pipelines)
+                magic = bytes(magic.head(64))
+            else:
+                with BytesIO(magic, copy=False).view(pos=0) as b:
+                    magic = bytes(b.read(64))
 
         # ordered scan (define codecs first)
         for mt in cls._MAGIC_ORDER:
@@ -156,10 +151,9 @@ class MimeType:
                     continue
 
         # weak signals (fallback territory)
-        stripped = magic.lstrip()
-        if stripped.startswith(b"{") or stripped.startswith(b"["):
-            return cls.NDJSON if b"\n{" in stripped else cls.JSON
-        if stripped.startswith(b"<"):
+        if magic.startswith(b"{") or magic.startswith(b"["):
+            return cls.NDJSON if b"}\n{" in magic else cls.JSON
+        if magic.startswith(b"<"):
             return cls.XML  # could also be HTML; indistinguishable here
 
         return default

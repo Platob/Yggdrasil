@@ -204,29 +204,14 @@ class BytesIO(io.RawIOBase):
         self._pos = 0
 
     def _init_from_stdlib_bytesio(self, src: io.BytesIO) -> None:
-        saved = src.tell()
-        src.seek(0, io.SEEK_END)
-        end = src.tell()
-        src.seek(saved)
-        remaining = max(0, end - saved)
+        self.pos = src.tell()
 
-        if remaining > self._cfg.spill_bytes:
-            path = self._cfg.create_spill_path()
-            with path.open("w+b") as fh:
-                shutil.copyfileobj(src, fh, length=_COPY_CHUNK_SIZE)
-                fh.flush()
-            self._buf = None
-            self._size = 0
-            self._path = path
-            self._owns_path = True
-        else:
-            payload = src.read()
-            self._buf = bytearray(payload)
-            self._size = len(payload)
-            self._path = None
-            self._owns_path = False
+        self._buf = bytearray(src.getvalue())
+        self._size = len(self._buf)
+        self._path = None
 
-        self._pos = 0
+        if self._size > self._cfg.spill_bytes:
+            self.spill_to_file()
 
     def _init_from_bytesio(self, src: BytesIO, *, copy: bool) -> None:
         if copy:
@@ -278,11 +263,11 @@ class BytesIO(io.RawIOBase):
 
     def _init_from_filelike(self, src: Any) -> None:
         if hasattr(src, "seek") and hasattr(src, "tell"):
-            saved = src.tell()
+            self.pos = src.tell()
             src.seek(0, io.SEEK_END)
             end = src.tell()
-            src.seek(saved)
-            remaining = max(0, end - saved)
+            src.seek(self.pos)
+            remaining = max(0, end - self.pos)
 
             if remaining > self._cfg.spill_bytes:
                 path = self._cfg.create_spill_path()
@@ -302,9 +287,8 @@ class BytesIO(io.RawIOBase):
         else:
             payload = src.read()
             self._init_from_bytes(memoryview(payload))
+            self._pos = 0
             return
-
-        self._pos = 0
 
     # ------------------------------------------------------------------
     # Backing helpers
@@ -378,25 +362,8 @@ class BytesIO(io.RawIOBase):
 
     def _replace_with_payload(self, payload: bytes) -> None:
         self._reset_backing_keep_open()
-        self._init_from_bytes(memoryview(payload))
+        self._init_from(payload, copy=False)
         self._pos = 0
-
-    @staticmethod
-    def _bytes_from_codec_output(out: Any) -> bytes:
-        if out is None:
-            return b""
-        if isinstance(out, (bytes, bytearray, memoryview)):
-            return bytes(out)
-
-        gv = getattr(out, "getvalue", None)
-        if callable(gv):
-            return gv()
-
-        rd = getattr(out, "read", None)
-        if callable(rd):
-            return rd()
-
-        return bytes(out)
 
     def buffer(self) -> IO[bytes]:
         """
@@ -511,7 +478,7 @@ class BytesIO(io.RawIOBase):
     @property
     def media_type(self) -> MediaType:
         if self._media_type is None:
-            self._media_type = MediaType.parse_io(self, MediaType(MimeType.OCTET_STREAM))
+            self._media_type = MediaType.parse(self, default=MediaType(MimeType.OCTET_STREAM))
         return self._media_type
 
     @media_type.setter
@@ -959,58 +926,57 @@ class BytesIO(io.RawIOBase):
     # Compression helpers
     # ------------------------------------------------------------------
 
-    def compress(self, codec: "Codec | str", *, copy: bool = False) -> "BytesIO":
+    def compress(
+        self,
+        codec: "Codec | str",
+        *,
+        copy: bool = False
+    ) -> "BytesIO":
         from ..enums.codec import Codec as _Codec
-
-        if self._closed:
-            raise ValueError("I/O operation on closed BytesIO")
 
         c = _Codec.parse(codec)
         if c is None:
             raise ValueError(f"Unknown codec: {codec!r}")
 
-        out_std = c.compress(self)
-        payload = self._bytes_from_codec_output(out_std)
+        mt = self.media_type.with_codec(c) if self._media_type else None
+        payload = c.compress(self)
+        payload._media_type = mt
 
         if copy:
-            out = BytesIO(payload, config=self._cfg, media_type=self._media_type)
-            out.seek(0)
-            return out
+            return payload
 
         self._replace_with_payload(payload)
         return self
 
-    def decompress(self, codec: "Codec | str | None" = "infer", *, copy: bool = False) -> "BytesIO":
+    def decompress(
+        self,
+        codec: "Codec | str | None" = "infer",
+        *,
+        copy: bool = False
+    ) -> "BytesIO":
         from ..enums.codec import Codec as _Codec
-        from ..enums.codec import detect as _detect
 
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
 
-        if codec is None or (isinstance(codec, str) and codec.strip().lower() == "infer"):
-            c = _detect(self)
-            if c is None:
-                payload = self.to_bytes()
-                if copy:
-                    out = BytesIO(payload, config=self._cfg, media_type=self._media_type)
-                    out.seek(0)
-                    return out
-                self._replace_with_payload(payload)
-                return self
+        if codec == "infer":
+            mt = self.media_type.without_codec()
+            codec = self.media_type.codec
         else:
-            c = _Codec.parse(codec)
-            if c is None:
-                raise ValueError(f"Unknown codec: {codec!r}")
+            mt = self._media_type.without_codec() if self._media_type else None
+            codec = _Codec.parse(codec)
 
-        out_std = c.open(self)
-        payload = self._bytes_from_codec_output(out_std)
+        if codec is None:
+            return self
+
+        raw = codec.decompress_bytes(self.to_bytes())
 
         if copy:
-            out = BytesIO(payload, config=self._cfg, media_type=self._media_type)
-            out.seek(0)
-            return out
+            payload = self.__class__(raw, copy=False, media_type=mt)
+            return payload
 
-        self._replace_with_payload(payload)
+        self._replace_with_payload(raw)
+        self._media_type = mt
         return self
 
     # ------------------------------------------------------------------

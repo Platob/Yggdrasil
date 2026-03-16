@@ -160,57 +160,58 @@ class Serialized(ABC, Generic[T]):
         if isinstance(obj, Serialized):
             return obj
 
-        found = Tags.get_class_from_type(type(obj))
-        if found is not None:
-            return found.from_python_object(obj, metadata=metadata, codec=codec)
+        is_obj = not isinstance(obj, type)
+        if is_obj:
+            found = Tags.get_class_from_type(type(obj))
 
-        mod, _ = cls.module_and_name(obj, fallback=type(obj).__name__)
+            if found is not None:
+                return found.from_python_object(obj, metadata=metadata, codec=codec)
+
+        mod, _ = cls.module_and_name(obj, fallback="unknown")
 
         if mod.startswith("pyarrow"):
             from yggdrasil.pickle.ser.pyarrow import ArrowSerialized
 
             out = ArrowSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
                 return out
         elif mod.startswith("pandas"):
             from yggdrasil.pickle.ser.pandas import PandasSerialized
 
             out = PandasSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
                 return out
         elif mod.startswith("polars"):
             from yggdrasil.pickle.ser.polars import PolarsSerialized
 
             out = PolarsSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
                 return out
 
-        from yggdrasil.pickle.ser.collections import CollectionSerialized
         from yggdrasil.pickle.ser.complexs import ComplexSerialized
-        from yggdrasil.pickle.ser.logicals import LogicalSerialized
-        from yggdrasil.pickle.ser.primitives import PrimitiveSerialized
-        from yggdrasil.pickle.ser.ios import IOSerialized
 
-        for family in (
-            PrimitiveSerialized,
-            LogicalSerialized,
-            IOSerialized,
-            ComplexSerialized,
-            CollectionSerialized,
-        ):
-            out = family.from_python_object(
-                obj,
-                metadata=metadata,
-                codec=codec,
-            )
-            if out is not None:
-                return out
+        out = ComplexSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+        if out is not None:
+            if is_obj:
+                Tags.register_class(out.__class__, pytype=type(obj))
+            return out
 
         from yggdrasil.pickle.ser.pickles import PickleSerialized
 
-        return PickleSerialized.from_python_object(
-            obj, metadata=metadata, codec=codec
-        )
+        out = PickleSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+
+        if out is not None:
+            if is_obj:
+                Tags.register_class(out.__class__, pytype=type(obj))
+            return out
+
+        raise ValueError(f"Cannot serialize object of type {type(obj)} (module: {mod})")
 
     @classmethod
     def build(

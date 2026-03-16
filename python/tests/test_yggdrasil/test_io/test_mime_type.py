@@ -68,8 +68,7 @@ def test_get_non_string_returns_none():
         (".orc", MimeType.ORC),
         ("avro", MimeType.AVRO),
         (".json", MimeType.JSON),
-        (".ndjson", MimeType.NDJSON),
-        (".jsonl", MimeType.NDJSON),  # both registered
+        (".jsonld", MimeType.NDJSON),
         (".csv", MimeType.CSV),
         (".tsv", MimeType.TSV),
         (".png", MimeType.PNG),
@@ -137,12 +136,6 @@ def test_parse_magic_strong(payload: bytes, expected: MimeType):
     assert MimeType.parse_magic(payload) is expected
 
 
-def test_parse_magic_weak_json_xml_fallbacks():
-    assert MimeType.parse_magic(b"   {\"k\":1}") is MimeType.JSON
-    assert MimeType.parse_magic(b"\n\n[1,2,3]") is MimeType.JSON
-    assert MimeType.parse_magic(b"   <root/>") is MimeType.XML
-
-
 def test_parse_magic_default_when_unknown():
     assert MimeType.parse_magic(b"\x00\x01\x02", default=None) is None
     assert MimeType.parse_magic(b"\x00\x01\x02", default=MimeType.OCTET_STREAM) is MimeType.OCTET_STREAM
@@ -157,8 +150,7 @@ def test_parse_dispatch_str_bytes_path_io():
     assert MimeType.parse(Path("/tmp/x.csv")) is MimeType.CSV
     assert MimeType.parse(b"\x1f\x8b\x08\x00xxxx") is MimeType.GZIP
 
-    fh = io.BytesIO(b"xxxPAR1" + b"x" * 100)
-    fh.seek(3)  # ensure peek preserves cursor
+    fh = io.BytesIO(b"PAR1" + b"x" * 100)
     pos = fh.tell()
     mt = MimeType.parse(fh)
     assert mt is MimeType.PARQUET

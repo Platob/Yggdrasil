@@ -597,7 +597,10 @@ class Response:
             return make_for_status(self)
         return None
 
-    def anonymize(self, mode: str = "remove") -> "Response":
+    def anonymize(
+        self,
+        mode: str = "remove"
+    ) -> "Response":
         return replace(
             self,
             request=self.request.anonymize(mode=mode),
@@ -809,14 +812,36 @@ class Response:
                     if "response_received_at" in cols else 0
                 )
 
-                yield cls(
-                    request=request,
-                    status_code=int(_first_present(cols, i, "response_status_code") or 0),
-                    headers=response_headers,
-                    buffer=buffer,
-                    tags=_map_to_str_dict(_first_present(cols, i, "response_tags")),
-                    received_at_timestamp=received_at,
-                )
+                if cls is Response:
+                    if request.url.is_http:
+                        from .http_.response import HTTPResponse
+
+                        yield HTTPResponse(
+                            request=request,
+                            status_code=int(_first_present(cols, i, "response_status_code") or 0),
+                            headers=response_headers,
+                            buffer=buffer,
+                            tags=_map_to_str_dict(_first_present(cols, i, "response_tags")),
+                            received_at_timestamp=received_at,
+                        )
+                    else:
+                        yield cls(
+                            request=request,
+                            status_code=int(_first_present(cols, i, "response_status_code") or 0),
+                            headers=response_headers,
+                            buffer=buffer,
+                            tags=_map_to_str_dict(_first_present(cols, i, "response_tags")),
+                            received_at_timestamp=received_at,
+                        )
+                else:
+                    yield cls(
+                        request=request,
+                        status_code=int(_first_present(cols, i, "response_status_code") or 0),
+                        headers=response_headers,
+                        buffer=buffer,
+                        tags=_map_to_str_dict(_first_present(cols, i, "response_tags")),
+                        received_at_timestamp=received_at,
+                    )
 
     def _to_asgi_payload(self) -> tuple[bytes, dict[str, str], str]:
         body = self.buffer.to_bytes() if self.buffer is not None else b""

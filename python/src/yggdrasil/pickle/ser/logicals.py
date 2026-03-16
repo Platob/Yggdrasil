@@ -17,6 +17,7 @@ from typing import ClassVar, Generic, Mapping
 
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
+from yggdrasil.io.url import URL
 
 try:
     from zoneinfo import ZoneInfo
@@ -813,6 +814,18 @@ class LogicalSerialized(Serialized[T], Generic[T]):
             )
 
         # ------------------------------------------------------------------
+        # url-like
+        # ------------------------------------------------------------------
+
+        if isinstance(obj, URL):
+            return Serialized.build(
+                tag=Tags.URL,
+                data=obj.to_string(encode=True).encode("utf-8"),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        # ------------------------------------------------------------------
         # ipaddress family
         # payload: canonical string
         # meta: k subtype
@@ -1164,6 +1177,13 @@ class PathSerialized(LogicalSerialized[Path]):
                     codec=codec,
                 )
 
+        home = Path.home()
+        try:
+            raw_path = str(path.relative_to(home))
+            raw_path = "~" if not raw_path else f"~/{raw_path}"
+        except ValueError:
+            raw_path = str(path)
+
         merged = _metadata_merge(
             metadata,
             {
@@ -1173,7 +1193,7 @@ class PathSerialized(LogicalSerialized[Path]):
         )
         return cls.build(
             tag=cls.TAG,
-            data=str(path).encode("utf-8"),
+            data=raw_path.encode("utf-8"),
             metadata=merged,
             codec=codec,
         )
@@ -1218,6 +1238,20 @@ class IPAddressSerialized(LogicalSerialized[
         raise ValueError(f"Invalid IPADDRESS metadata kind: {kind!r}")
 
 
+@dataclass(frozen=True, slots=True)
+class URLSerialized(LogicalSerialized[str]):
+    """
+    URL payload:
+        payload = utf-8 URL string
+    """
+
+    TAG: ClassVar[int] = Tags.URL
+
+    @property
+    def value(self) -> str:
+        return self.decode().decode("utf-8")
+
+
 # ============================================================================
 # registration
 # ============================================================================
@@ -1237,6 +1271,7 @@ for t, cls in (
     (bytearray, BytesSerialized),
     (memoryview, BytesSerialized),
     (Path, PathSerialized),
+    (URL, URLSerialized),
     (ipaddress.IPv4Address, IPAddressSerialized),
     (ipaddress.IPv6Address, IPAddressSerialized),
     (ipaddress.IPv4Interface, IPAddressSerialized),

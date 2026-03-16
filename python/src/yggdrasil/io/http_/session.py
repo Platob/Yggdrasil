@@ -120,7 +120,7 @@ limit 1"""
             body=request.buffer,
             headers=request.headers,
             timeout=wait_cfg.timeout_urllib3,
-            preload_content=not stream,
+            preload_content=False,
             decode_content=False,
             redirect=True,
         )
@@ -134,7 +134,7 @@ limit 1"""
             received_at_timestamp=received_at_timestamp,
         )
 
-        result.drain_urllib3(first_resp, stream=stream, release_conn=True)
+        result.drain_urllib3(first_resp, stream=True, release_conn=True)
 
         x_current_page, x_total_pages = (
             first_resp.headers.get("X-Current-Page"),

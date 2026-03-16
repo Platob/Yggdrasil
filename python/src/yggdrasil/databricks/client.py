@@ -129,8 +129,6 @@ class DatabricksClient(URLResource):
     _account_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_client: Optional[DAC] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
-    _cache: ClassVar[dict[str, "DatabricksClient"]] = {}
-
     def __post_init__(self):
         if self.account_id:
             if not self.host:

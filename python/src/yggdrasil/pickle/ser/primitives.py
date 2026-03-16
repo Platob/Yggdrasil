@@ -285,7 +285,7 @@ for cls in PrimitiveSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
 
 for t, cls in (
-    (None, NoneSerialized),
+    (type(None), NoneSerialized),
     (bool, BoolSerialized),
     (bytes, BytesSerialized),
     (str, Utf8StringSerialized),

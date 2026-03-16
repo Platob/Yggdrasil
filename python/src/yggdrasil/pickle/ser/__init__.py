@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from pathlib import Path
 from typing import Any, Mapping, IO
 
@@ -28,6 +29,9 @@ __all__ = [
     "load",
     "loads",
 ]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _dump(
@@ -74,7 +78,7 @@ def _dump_path(
                 metadata=metadata,
                 codec=codec,
             )
-    except Exception:
+    except BaseException:
         path.unlink(missing_ok=True)
         raise
 
@@ -94,21 +98,19 @@ def dump(
             codec=codec,
         )
 
-    if isinstance(fp, Path):
-        return _dump_path(
-            obj,
-            fp,
-            metadata=metadata,
-            codec=codec,
-        )
+    if isinstance(fp, (Path, str)):
+        fp = Path(fp) if isinstance(fp, str) else fp
 
-    if isinstance(fp, str):
-        return _dump_path(
-            obj,
-            Path(fp),
-            metadata=metadata,
-            codec=codec,
-        )
+        try:
+            return _dump_path(
+                obj,
+                fp,
+                metadata=metadata,
+                codec=codec,
+            )
+        except BaseException:
+            fp.unlink(missing_ok=True)
+            raise
 
     raise TypeError(
         f"Cannot write to object of type {type(fp).__name__!r}. "
@@ -138,20 +140,36 @@ def load(
     fp: IO[bytes] | Path | str,
     *,
     unpickle: bool = True,
+    clean_corrupted: bool = False,
+    default: Any = None,
 ) -> Any:
     buffer = BytesIO(fp, copy=False)
 
     mag = buffer.read(len(MAGIC))
     if mag != MAGIC:
         if isinstance(fp, (str, Path)):
-            # check size 0 and clean
-            p = Path(fp)
-            if p.is_file() and p.stat().st_size == 0:
+            if clean_corrupted:
+                LOGGER.warning(
+                    "Invalid magic header in %r; file may be corrupted. Removing file.", fp
+                )
+                p = Path(fp)
                 p.unlink(missing_ok=True)
-                raise SerializationError(f"File {fp!r} is empty")
+                return default
+            raise SerializationError(f"Invalid magic header in file {fp!r}")
         raise SerializationError("Invalid magic header")
 
-    read = Serialized.read_from(buffer)
+    try:
+        read = Serialized.read_from(buffer)
+    except Exception:
+        if clean_corrupted:
+            LOGGER.warning(
+                "Failed to read serialized data from %r; file may be corrupted. Removing file.", fp
+            )
+            if isinstance(fp, (str, Path)):
+                p = Path(fp)
+                p.unlink(missing_ok=True)
+                return default
+        raise
 
     if unpickle:
         return read.as_python()

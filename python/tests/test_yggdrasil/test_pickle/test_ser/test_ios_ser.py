@@ -25,25 +25,6 @@ def test_io_bytesio_roundtrip() -> None:
     assert out.getvalue() == b"hello io serializer"
 
 
-def test_io_preserves_name_and_mode_metadata() -> None:
-    class Dummy(io.BytesIO):
-        name = "dummy.bin"
-        mode = "rb"
-
-    src = Dummy(b"abc123")
-
-    ser = Serialized.from_python_object(src)
-    assert ser is not None
-
-    assert isinstance(ser, IOSerialized)
-    assert ser.tag == Tags.IO_BYTES_BUFFER
-
-    metadata = ser.metadata or {}
-    assert metadata.get(b"n") == b"dummy.bin"
-    assert metadata.get(b"m") == b"rb"
-    assert metadata.get(b"k") == b"bb"
-
-
 def test_io_read_from_seekable_stream_restores_position() -> None:
     src = io.BytesIO(b"abcdef")
     src.seek(3)

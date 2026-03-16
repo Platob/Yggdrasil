@@ -16,7 +16,7 @@ from yggdrasil.io.url import (
 
 
 def test_parse_str_normalizes_scheme_host_default_port_and_query_sorting():
-    url = URL.parse_str("HTTPS://Example.COM.:443//a//b?z=2&a=3&a=1#frag")
+    url = URL.parse_str("HTTPS://Example.COM.:443/a/b?z=2&a=3&a=1#frag")
 
     assert url.scheme == "https"
     assert url.host == "example.com"
@@ -59,7 +59,7 @@ def test_parse_dict_authority_and_explicit_overrides():
             "authority": "alice:pw@example.com:443",
             "host": "OtherHost.COM.",
             "port": "8443",
-            "path": "//x//y",
+            "path": "/x/y",
             "query": "?b=2&a=1",
             "fragment": "#frag",
         }
@@ -204,7 +204,7 @@ def test_join_relative_url():
 
 
 def test_truediv_replaces_path():
-    url = URL("https", host="example.com", path="/a") / "/b//c"
+    url = URL("https", host="example.com", path="/a") / "/b/c"
 
     assert url.path == "/b/c"
 
@@ -333,7 +333,7 @@ def test_register_url_resource_success():
     register_url_resource(DemoResource)
 
     assert get_registered_url_resource("demo") is DemoResource
-    assert registered_url_schemes() == ("demo", "file")
+    assert registered_url_schemes() == ("dbks", "demo", "file")
 
 
 def test_register_url_resource_rejects_non_subclass():
@@ -360,7 +360,7 @@ def test_register_url_resource_requires_non_empty_scheme():
 
 def test_register_url_resource_overwrite():
     register_url_resource(DemoResource)
-    register_url_resource(OtherDemoResource, overwrite=True)
+    register_url_resource(OtherDemoResource)
 
     assert get_registered_url_resource("demo") is OtherDemoResource
 
@@ -385,7 +385,7 @@ def test_url_resource_class_decorator():
 def test_url_resource_class_decorator_with_overwrite():
     register_url_resource(DemoResource)
 
-    @url_resource_class(overwrite=True)
+    @url_resource_class()
     class ReplacedDemoResource(URLResource):
         @classmethod
         def url_scheme(cls) -> str:

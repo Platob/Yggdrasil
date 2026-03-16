@@ -181,10 +181,13 @@ class Session(ABC):
     ) -> dict[str, Any]:
         return {key: cls._cache_value_from_request(request, key) for key in keys}
 
-    @staticmethod
-    def _cache_value_from_response(response: Response, key: str) -> Any:
+    @classmethod
+    def _cache_value_from_response(cls, response: Response, key: str) -> Any:
         if hasattr(response, key):
             return getattr(response, key)
+
+        if key.startswith("request_"):
+            return cls._cache_value_from_request(response.request, key)
 
         raise ValueError(f"Unsupported response cache_by key: {key}")
 

@@ -183,7 +183,7 @@ class ZipIO(MediaIO[ZipOptions]):
         tables: list[_pa.Table] = []
 
         # cursor-safe: view owns its own cursor
-        with self.buffer.view(text=False) as f:
+        with self.buffer.view(pos=0) as f:
             with zipfile.ZipFile(f, mode="r") as zf:
                 members = self._select_members(zf, options=options)
 

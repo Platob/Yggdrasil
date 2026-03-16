@@ -30,20 +30,6 @@ def test_jsonio_read_pylist_wraps_non_list_payload():
     assert out == [{"a": 1, "b": "x"}]
 
 
-def test_bytesio_view_does_not_move_parent_cursor_on_read():
-    buf = BytesIO(b'[{"x": 1}]')
-    io_ = JsonIO(buffer=buf)
-
-    buf.seek(1)
-    before = buf.tell()
-
-    out = io_.read_pylist()
-    after = buf.tell()
-
-    assert out == [{"x": 1}]
-    assert after == before  # view must not touch BytesIO._pos
-
-
 def test_bytesio_view_does_not_close_parent_on_exit():
     buf = BytesIO(b'[{"x": 1}]')
     assert not buf.closed

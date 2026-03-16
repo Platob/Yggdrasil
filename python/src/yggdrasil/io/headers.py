@@ -381,7 +381,7 @@ def normalize_headers(
 
             if accept_value:
                 codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
-                media_type = MediaType.parse_str(accept_value, codec=codec) if accept_value else None
+                media_type = MediaType.parse(accept_value, codec=codec) if accept_value else None
 
                 out["Accept"] = "*/*" if media_type.mime_type == MimeType.OCTET_STREAM else media_type.mime_type.value
 

@@ -41,6 +41,7 @@ class MediaType:
             IO[bytes]
         ],
         *,
+        codec: Codec | None = None,
         default: "MediaType | None" = None
     ) -> "MediaType":
         if isinstance(obj, cls):
@@ -61,123 +62,54 @@ class MediaType:
             return cls(mime_type=MimeType.OCTET_STREAM, codec=obj)
 
         if isinstance(obj, str):
-            return cls.parse_str(obj, default=default)
+            if "+" in obj:
+                # handle MIME type forms like "application/json+gzip"
+                base, _, codec_part = obj.rpartition("+")
+                inner = cls.parse(base)
+                codec = codec or Codec.parse(codec_part)
 
-        if isinstance(obj, (bytes, bytearray, memoryview)):
-            return cls.parse_bytes(bytes(obj), default=default)
+                if codec is not None:
+                    if inner is None:
+                        if default is None:
+                            return cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
+                        return default.with_codec(codec)
+                    return cls(mime_type=inner.mime_type, codec=codec)
 
-        if isinstance(obj, Path):
-            return cls.parse_str(str(obj), default=default)
+                obj = base
 
-        if hasattr(obj, "read"):
-            return cls.parse_io(obj, default=default)  # type: ignore[arg-type]
+        mt = MimeType.parse(obj)
 
-        return default or cls(mime_type=MimeType.OCTET_STREAM)
-
-    @classmethod
-    def parse_str(
-        cls,
-        s: str,
-        *,
-        codec: "Codec | None" = None,
-        default: "MediaType | None" = None
-    ) -> "MediaType":
-        if not s or "*" in s:
-            return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
-
-        raw = s.strip()
-
-        # compound first
-        outer: Codec | None = codec
-        inner_str = raw
-
-        if "+" in raw:
-            left, right = raw.rsplit("+", 1)
-            maybe = Codec.parse(right.strip(), default=None)
-            if maybe is not None:
-                outer = maybe
-                inner_str = left.strip()
-
-        if outer is None and len(raw) < 8 * 1024:
-            p = Path(raw)
-            if p.suffixes:
-                last = p.suffixes[-1].lstrip(".").lower()
-                maybe = Codec.parse(last, default=None)
-                if maybe is not None:
-                    outer = maybe
-                    inner_str = str(p.with_suffix(""))
-
-        if outer is not None:
-            inner = MimeType.parse_str(inner_str, default=None)
-            if inner is None:
-                # if codec exists but inner unknown -> octet-stream
-                return cls(mime_type=MimeType.OCTET_STREAM, codec=outer)
-            return cls(mime_type=inner, codec=outer)
-
-        # plain
-        mt = MimeType.parse_str(raw, default=None)
         if mt is None:
             return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
 
         if mt.is_codec:
-            return cls(mime_type=mt, codec=Codec.from_mime(mt))
+            from ..buffer import BytesIO
+            codec = codec or Codec.from_mime(mt)
+            inner = None
+
+            if isinstance(obj, (str, Path)):
+                obj = str(obj)
+
+                if "." in obj:
+                    for ext in codec.extensions:
+                        if obj.endswith(ext):
+                            skip = 1 + len(ext) # account for the dot before the extension
+                            obj = obj[:-skip]
+                            inner = cls.parse(obj)
+                            break
+            else:
+                buff = BytesIO(obj, copy=False)
+                inner = cls.parse(codec.read_start_end(buff), default=default)
+
+            if inner is None:
+                if default is None:
+                    return cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
+                return default.with_codec(codec)
+
+            assert not inner.mime_type.is_codec, "Inner MIME type cannot be a codec"
+            return cls(mime_type=inner.mime_type, codec=codec)
 
         return cls(mime_type=mt, codec=codec)
-
-    @classmethod
-    def _sniff_inner_from_codec_bytes(cls, codec: Codec, data: bytes) -> MimeType | None:
-        try:
-            head, tail = codec.read_start_end(data, n_start=256, n_end=256)
-        except Exception:
-            return None
-
-        inner = MimeType.parse_magic(head, default=None)
-        if inner is not None:
-            return inner
-        return MimeType.parse_magic(tail, default=None)
-
-    @classmethod
-    def _sniff_inner_from_codec_io(cls, codec: Codec, fh: IO[bytes]) -> MimeType | None:
-        try:
-            head, tail = codec.read_start_end(fh, n_start=256, n_end=256)
-        except Exception:
-            return None
-
-        inner = MimeType.parse_magic(head, default=None)
-        if inner is not None:
-            return inner
-        return MimeType.parse_magic(tail, default=None)
-
-    @classmethod
-    def parse_bytes(cls, data: bytes, default: "MediaType | None" = None) -> "MediaType":
-        c = Codec.parse(data, default=None)
-        if c is not None:
-            inner = cls._sniff_inner_from_codec_bytes(c, data)
-            if inner is None:
-                # NEW: if codec exists but inner unknown -> octet-stream
-                return cls(mime_type=MimeType.OCTET_STREAM, codec=c)
-            return cls(mime_type=inner, codec=c)
-
-        mt = MimeType.parse_magic(data, default=None)
-        if mt is None:
-            return default or cls(mime_type=MimeType.OCTET_STREAM)
-        return cls(mime_type=mt, codec=None)
-
-    @classmethod
-    def parse_io(cls, data: IO[bytes], default: "MediaType | None" = None) -> "MediaType":
-        c = Codec.parse(data, default=None)
-        if c is not None:
-            inner = cls._sniff_inner_from_codec_io(c, data)
-            if inner is None:
-                # NEW: if codec exists but inner unknown -> octet-stream
-                return cls(mime_type=MimeType.OCTET_STREAM, codec=c)
-            return cls(mime_type=inner, codec=c)
-
-        header = MimeType.peek(data, 256)
-        mt = MimeType.parse_magic(header, default=None)
-        if mt is None:
-            return default or cls(mime_type=MimeType.OCTET_STREAM)
-        return cls(mime_type=mt, codec=None)
 
     @property
     def is_octet(self):

@@ -33,8 +33,6 @@ class Tags:
     TYPES: ClassVar[dict[type, type["Serialized[object]"]]] = {}
 
     TAG_TO_NAME: ClassVar[dict[int, str]]
-    _CATEGORY_IMPORTS_DONE: ClassVar[set[int]] = set()
-    _KNOWN_IMPORT_CATEGORY_IDS: ClassVar[tuple[int, ...]] = (0, 1, 2, 4, 5, 6)
 
     # ------------------------------------------------------------------
     # category labels
@@ -134,6 +132,8 @@ class Tags:
     IO_TEXT = 211
     IO_BYTES_BUFFER = 212
     IO_STRING_BUFFER = 213
+    URL: int = 214
+    METHOD: int = 215
 
     # ------------------------------------------------------------------
     # arrow
@@ -250,8 +250,6 @@ class Tags:
         This keeps import graphs lighter and reduces circular import drama.
         """
         cid = cls._category_id(tag)
-        if cid in cls._CATEGORY_IMPORTS_DONE:
-            return
 
         if cid == 0:
             from yggdrasil.pickle.ser.primitives import PrimitiveSerialized  # noqa: F401
@@ -269,8 +267,6 @@ class Tags:
             from yggdrasil.pickle.ser.pandas import PandasSerialized  # noqa: F401
         elif cid == 6:
             from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
-
-        cls._CATEGORY_IMPORTS_DONE.add(cid)
 
     # ------------------------------------------------------------------
     # class resolution
@@ -310,8 +306,8 @@ class Tags:
         if existing is not None:
             return existing
 
-        for cid in cls._KNOWN_IMPORT_CATEGORY_IDS:
-            if cid not in cls._CATEGORY_IMPORTS_DONE:
+        if not cls.TYPES:
+            for cid in (0, 1, 2, 4):
                 cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
 
         return cls.TYPES.get(pytype)
@@ -342,7 +338,10 @@ class Tags:
             cls.CLASSES[tag] = serialized_cls
 
         if pytype is not None:
-            cls.TYPES[pytype] = serialized_cls
+            existing = cls.TYPES.get(pytype)
+
+            if existing is None:
+                cls.TYPES[pytype] = serialized_cls
 
 
 def _build_tag_to_name() -> dict[int, str]:

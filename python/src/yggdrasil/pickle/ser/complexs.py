@@ -6,13 +6,12 @@ import inspect
 import marshal
 import sys
 import textwrap
-from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass, make_dataclass
+from dataclasses import MISSING, dataclass, field as dataclass_field, fields, is_dataclass, make_dataclass
 from types import CodeType, FunctionType, MethodType, ModuleType
 from typing import Callable, ClassVar, Generic, Mapping
 
 from yggdrasil.environ import runtime_import_module
 from yggdrasil.io import BytesIO
-from yggdrasil.pickle.ser.constants import FORMAT_VERSION
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -21,6 +20,7 @@ __all__ = [
     "ModuleSerialized",
     "ClassSerialized",
     "FunctionSerialized",
+    "MethodSerialized",
     "BaseExceptionSerialized",
     "DataclassSerialized",
 ]
@@ -31,12 +31,11 @@ __all__ = [
 # ============================================================================
 
 _BUILTINS_KEY = "__builtins__"
-_FORMAT_VERSION = FORMAT_VERSION
+_FORMAT_VERSION = 1
 _PYTHON_VERSION = tuple(sys.version_info[:3])
 
 _MODULE_CACHE: dict[str, ModuleType] = {}
 _CLASS_CACHE: dict[tuple[str, str], type[object]] = {}
-_FUNCTION_CACHE: dict[tuple[object, ...], Callable[..., object]] = {}
 _REFERENCE_FUNCTION_CACHE: dict[tuple[str, str], Callable[..., object]] = {}
 _LOCAL_DATACLASS_CACHE: dict[tuple[object, ...], type[object]] = {}
 
@@ -134,6 +133,11 @@ _FN_FULL_NONLOCALS = 10
 _FN_FULL_PY_VERSION = 11
 _FN_FULL_MARSHAL = 12
 _FN_FULL_SOURCE = 13
+
+# method payload = (version, function_payload_bytes, self_payload_bytes)
+_METHOD_VERSION = 0
+_METHOD_FUNCTION = 1
+_METHOD_SELF = 2
 
 # exception payload = (version, exc_cls, args_tuple, state_payload)
 _EXC_VERSION = 0
@@ -241,6 +245,28 @@ def _require_tuple_len(
 # Generic helpers
 # ============================================================================
 
+def _field_has_explicit_default(f) -> bool:
+    return getattr(f, "default", MISSING) is not MISSING
+
+
+def _field_value_equals_default(f, value: object) -> bool:
+    """
+    Only compare against explicit default.
+
+    We intentionally do NOT compare against default_factory, because:
+    - calling factories during serialization is gross
+    - comparing factory-produced mutables is ambiguous
+    - it can introduce side effects or fake equality wins
+    """
+    if not _field_has_explicit_default(f):
+        return False
+
+    try:
+        return value == f.default
+    except Exception:
+        return False
+
+
 def _resolve_qualname(root: object, qualname: str) -> object:
     """
     Resolve a dotted __qualname__ path from a root object.
@@ -258,7 +284,7 @@ def _resolve_qualname(root: object, qualname: str) -> object:
 
 def _make_cell(value: object):
     """
-    Build a closure cell containing `value`.
+    Build a closure cell containing value.
 
     Python does not expose a public cell constructor, so this is the classic
     tiny cursed trick.
@@ -272,7 +298,12 @@ def _serialize_nested(obj: object) -> bytes:
 
     This keeps nested payloads compatible with the rest of the serializer stack.
     """
-    return Serialized.from_python_object(obj).write_to().to_bytes()
+    try:
+        return Serialized.from_python_object(obj).write_to().to_bytes()
+    except AttributeError:
+        raise TypeError(
+            f"Object of type {type(obj).__name__} is not serializable as a nested payload"
+        )
 
 
 def _deserialize_nested(blob: bytes) -> object:
@@ -700,42 +731,6 @@ def _drop_function_self_refs(
     return out
 
 
-def _function_cache_key(
-    *,
-    module_name: str | None,
-    qualname: str,
-    python_version: tuple[int, int, int] | None,
-    marshal_code: bytes | None,
-    source_code: str | None,
-    defaults,
-    kwdefaults,
-    annotations,
-    globals_obj: dict[object, object],
-    nonlocals_obj: dict[object, object],
-) -> tuple[object, ...]:
-    """
-    Cache key for reconstructed functions.
-
-    The key intentionally hashes large code blobs and uses repr-stable summaries
-    for defaults / globals / nonlocals. It is not beautiful, but it is practical.
-    """
-    marshal_hash = _hash_bytes(bytes(marshal_code) if isinstance(marshal_code, (bytes, bytearray)) else None)
-    source_hash = _hash_text(source_code if isinstance(source_code, str) else None)
-
-    return (
-        module_name,
-        qualname,
-        python_version,
-        marshal_hash,
-        source_hash,
-        repr(defaults),
-        repr(kwdefaults),
-        repr(annotations),
-        repr(sorted((k, repr(v)) for k, v in globals_obj.items() if isinstance(k, str))),
-        repr(sorted((k, repr(v)) for k, v in nonlocals_obj.items() if isinstance(k, str))),
-    )
-
-
 def _load_function_from_source(
     *,
     source: str,
@@ -1057,22 +1052,6 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
     marshal_code = payload[_FN_FULL_MARSHAL]
     source_code = payload[_FN_FULL_SOURCE]
 
-    cache_key = _function_cache_key(
-        module_name=module_name,
-        qualname=qualname,
-        python_version=python_version,
-        marshal_code=marshal_code if isinstance(marshal_code, (bytes, bytearray)) else None,
-        source_code=source_code if isinstance(source_code, str) else None,
-        defaults=defaults,
-        kwdefaults=kwdefaults,
-        annotations=annotations,
-        globals_obj={**globals_obj, **definition_globals_obj},
-        nonlocals_obj=nonlocals_obj,
-    )
-    cached = _FUNCTION_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     glb: dict[str, object] = {
         _BUILTINS_KEY: __builtins__,
         "__name__": module_name or "__main__",
@@ -1121,8 +1100,61 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
 
     # Restore self-reference in globals for recursive functions.
     fn.__globals__[name] = fn
-    _FUNCTION_CACHE[cache_key] = fn
     return fn
+
+
+# ============================================================================
+# Method payload
+# ============================================================================
+
+def _dump_method_payload(method: MethodType) -> bytes:
+    """
+    Method payload schema:
+        (version, function_payload_bytes, self_payload_bytes)
+
+    Notes:
+    - function payload is the same payload FunctionSerialized uses
+    - self payload is the bound receiver (instance or class)
+    """
+    if not isinstance(method, MethodType):
+        raise TypeError(f"MethodSerialized requires MethodType, got {type(method)!r}")
+
+    fn = method.__func__
+    self_obj = method.__self__
+
+    if _should_use_reference_only_for_callable(fn):
+        fn_payload = _dump_reference_function_payload(fn)
+    else:
+        fn_payload = _dump_function_payload(fn)
+
+    self_payload = _serialize_nested(self_obj)
+
+    return _serialize_nested(
+        (
+            _FORMAT_VERSION,
+            fn_payload,
+            self_payload,
+        )
+    )
+
+
+def _load_method_payload(data: bytes) -> MethodType:
+    payload = _require_tuple_len(_deserialize_nested(data), name="Method payload", expected=3)
+
+    version = payload[_METHOD_VERSION]
+    if version != _FORMAT_VERSION:
+        raise ValueError(f"Unsupported method payload version: {version!r}")
+
+    fn_blob = _require_bytes(payload[_METHOD_FUNCTION], name="Method payload function")
+    self_blob = _require_bytes(payload[_METHOD_SELF], name="Method payload self")
+
+    fn = _load_function_payload(fn_blob)
+    if not isinstance(fn, FunctionType):
+        raise TypeError(f"Decoded method function must be FunctionType, got {type(fn)!r}")
+
+    self_obj = _deserialize_nested(self_blob)
+
+    return MethodType(fn, self_obj)
 
 
 # ============================================================================
@@ -1262,13 +1294,13 @@ def _dump_dataclass_class_payload(cls: type[object]) -> tuple[object, ...]:
             module_name,
             class_flags,
             [
-                (
-                    field_name,
-                    annotation_payload,
-                    field_flags,
-                    hash_value,
-                    metadata_or_none,
-                ),
+                {
+                    "name": field_name,
+                    "annotation": annotation_payload,
+                    "flags": field_flags,
+                    "hash": hash_value,
+                    "metadata": metadata_or_none,
+                },
                 ...
             ],
         )
@@ -1283,17 +1315,17 @@ def _dump_dataclass_class_payload(cls: type[object]) -> tuple[object, ...]:
             cls.__qualname__,
         )
 
-    field_payloads: list[tuple[object, ...]] = []
+    field_payloads: list[dict[str, object]] = []
 
     for f in fields(cls):
         field_payloads.append(
-            (
-                f.name,
-                _safe_dump_annotation(f.type),
-                _field_flags(f),
-                f.hash,
-                dict(f.metadata) if f.metadata else None,
-            )
+            {
+                "name": f.name,
+                "annotation": _safe_dump_annotation(f.type),
+                "flags": _field_flags(f),
+                "hash": f.hash,
+                "metadata": dict(f.metadata) if f.metadata else None,
+            }
         )
 
     return (
@@ -1348,18 +1380,23 @@ def _load_dataclass_class_payload(payload: object) -> type[object]:
 
     spec = []
     for item in fields_payload:
-        field_data = _require_tuple_len(item, name="Dataclass field payload", expected=5)
+        if isinstance(item, dict):
+            field_name = _require_str(item.get("name"), name="Dataclass field name")
+            annotation = _safe_load_annotation(item.get("annotation"))
+            field_flags_value = item.get("flags")
+            hash_flag = item.get("hash")
+            metadata_obj = item.get("metadata")
+        else:
+            field_data = _require_tuple_len(item, name="Dataclass field payload", expected=5)
+            field_name = _require_str(field_data[_DCF_NAME], name="Dataclass field name")
+            annotation = _safe_load_annotation(field_data[_DCF_ANNOTATION])
+            field_flags_value = field_data[_DCF_FLAGS]
+            hash_flag = field_data[_DCF_HASH]
+            metadata_obj = field_data[_DCF_METADATA]
 
-        field_name = _require_str(field_data[_DCF_NAME], name="Dataclass field name")
-        annotation = _safe_load_annotation(field_data[_DCF_ANNOTATION])
-
-        field_flags_value = field_data[_DCF_FLAGS]
         if not isinstance(field_flags_value, int):
             raise TypeError("Dataclass field flags must be int")
 
-        hash_flag = field_data[_DCF_HASH]
-
-        metadata_obj = field_data[_DCF_METADATA]
         if metadata_obj is None:
             metadata = {}
         else:
@@ -1411,23 +1448,32 @@ def _dump_dataclass_payload(obj: object) -> bytes:
             extra_state_payload,
         )
 
-    Why keep init and non-init values separate?
-    - init fields go through __init__
-    - non-init fields are assigned after construction
-    - extra_state holds non-field attributes / custom state leftovers
+    Notes:
+    - field values equal to explicit default are omitted
+    - default_factory is intentionally ignored for filtering
     """
-    if not is_dataclass(obj) or isinstance(obj, type):
-        raise TypeError(f"DataclassSerialized requires a dataclass instance, got {type(obj)!r}")
+    try:
+        obj_fields = fields(obj)
+    except Exception:
+        if not is_dataclass(obj) or isinstance(obj, type):
+            raise TypeError(f"DataclassSerialized requires a dataclass instance, got {type(obj)!r}")
+        raise
 
     cls = type(obj)
     init_values: dict[str, object] = {}
     non_init_values: dict[str, object] = {}
 
-    obj_fields = fields(obj)
     field_names = {f.name for f in obj_fields}
 
     for f in obj_fields:
         value = getattr(obj, f.name)
+
+        # Only filter against explicit default; skip default_factory checks.
+        if _field_value_equals_default(f, value):
+            continue
+        elif not f.init:
+            continue
+
         if f.init:
             init_values[f.name] = value
         else:
@@ -1474,7 +1520,16 @@ def _load_dataclass_payload(data: bytes) -> object:
     non_init_values = _require_dict(payload[_DC_PAYLOAD_NON_INIT_VALUES], name="Dataclass non_init_values")
     extra_state_payload = payload[_DC_PAYLOAD_EXTRA_STATE]
 
-    obj = cls_obj(**init_values)
+    try:
+        obj = cls_obj(**init_values)
+    except Exception:
+        # resolve non-init fields first to improve chances of successful construction
+        init_values = {
+            key: value
+            for key, value in init_values.items()
+            if key in cls_obj.__dataclass_fields__ and cls_obj.__dataclass_fields__[key].init
+        }
+        obj = cls_obj(**init_values)
 
     for name, value in non_init_values.items():
         object.__setattr__(obj, name, value)
@@ -1493,7 +1548,7 @@ class ComplexSerialized(Serialized[T], Generic[T]):
     Base wrapper for "complex" Python objects that need special handling beyond
     primitive / logical / collection payloads.
 
-    Subclasses only need to implement `value`.
+    Subclasses only need to implement value.
     """
     TAG: ClassVar[int]
 
@@ -1516,13 +1571,17 @@ class ComplexSerialized(Serialized[T], Generic[T]):
         Try to serialize supported complex object kinds.
 
         Order matters a bit:
-        - functions / methods
+        - methods
+        - functions
         - dataclass instances
         - exceptions
         - classes
         - modules
         """
-        if isinstance(obj, (FunctionType, MethodType)):
+        if isinstance(obj, MethodType):
+            return MethodSerialized.build_method(obj, codec=codec)
+
+        if isinstance(obj, FunctionType):
             return FunctionSerialized.build_function(obj, codec=codec)
 
         if is_dataclass(obj) and not isinstance(obj, type):
@@ -1597,6 +1656,9 @@ class FunctionSerialized(ComplexSerialized[Callable[..., object]]):
     Function payload uses either:
     - reference-only tuple
     - full reconstruction tuple
+
+    This serializer is for Python functions only.
+    Bound methods use MethodSerialized.
     """
     TAG: ClassVar[int] = Tags.FUNCTION
 
@@ -1607,22 +1669,53 @@ class FunctionSerialized(ComplexSerialized[Callable[..., object]]):
     @classmethod
     def build_function(
         cls,
-        fn: Callable[..., object] | MethodType,
+        fn: Callable[..., object],
         *,
         codec: int | None = None,
     ) -> Serialized[object]:
-        callable_obj = _unwrap_method_or_function(fn)
-        if callable_obj is None:
-            raise TypeError(f"FunctionSerialized requires a Python function or method, got {type(fn)!r}")
+        if not isinstance(fn, FunctionType):
+            raise TypeError(f"FunctionSerialized requires FunctionType, got {type(fn)!r}")
 
-        if _should_use_reference_only_for_callable(callable_obj):
-            payload = _dump_reference_function_payload(callable_obj)
+        if _should_use_reference_only_for_callable(fn):
+            payload = _dump_reference_function_payload(fn)
         else:
-            payload = _dump_function_payload(callable_obj)
+            payload = _dump_function_payload(fn)
 
         return cls.build(
             tag=cls.TAG,
             data=payload,
+            codec=codec,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MethodSerialized(FunctionSerialized):
+    """
+    Method payload stores:
+    - serialized function payload
+    - serialized bound receiver (__self__)
+
+    This preserves bound instance/class semantics explicitly.
+    """
+    TAG: ClassVar[int] = Tags.METHOD
+
+    @property
+    def value(self) -> MethodType:
+        return _load_method_payload(self.decode())
+
+    @classmethod
+    def build_method(
+        cls,
+        method: MethodType,
+        *,
+        codec: int | None = None,
+    ) -> Serialized[object]:
+        if not isinstance(method, MethodType):
+            raise TypeError(f"MethodSerialized requires MethodType, got {type(method)!r}")
+
+        return cls.build(
+            tag=cls.TAG,
+            data=_dump_method_payload(method),
             codec=codec,
         )
 
@@ -1687,3 +1780,12 @@ class DataclassSerialized(ComplexSerialized[object]):
 # Register all complex serializer subclasses with Tags
 for cls in ComplexSerialized.__subclasses__():
     Tags.register_class(cls)
+
+
+for t, cls in (
+    (ModuleType, ModuleSerialized),
+    (FunctionType, FunctionSerialized),
+    (MethodType, MethodSerialized),
+    (BaseException, BaseExceptionSerialized),
+):
+    Tags.register_class(cls, pytype=t)

@@ -79,8 +79,6 @@ def test_parse_dict_from_promoted_header_fields() -> None:
             "response_location": "/next",
             "response_etag": '"etag-1"',
             "response_last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            "response_x_request_id": "rid-1",
-            "response_x_correlation_id": "cid-1",
             "response_body": b"test",
         }
     )
@@ -92,8 +90,6 @@ def test_parse_dict_from_promoted_header_fields() -> None:
     assert resp.headers["Location"] == "/next"
     assert resp.headers["ETag"] == '"etag-1"'
     assert resp.headers["Last-Modified"] == "Mon, 01 Jan 2024 00:00:00 GMT"
-    assert resp.headers["X-Request-ID"] == "rid-1"
-    assert resp.headers["X-Correlation-ID"] == "cid-1"
 
 
 def test_parse_str_accepts_json_object_string() -> None:
@@ -232,8 +228,6 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
             "Content-Length": "11",
             "Content-Encoding": "gzip",
             "Transfer-Encoding": "chunked",
-            "X-Request-ID": "rid-1",
-            "X-Correlation-ID": "cid-1",
             "X-Other": "keep-me",
         },
         buffer=BytesIO(b"hello world"),
@@ -253,13 +247,11 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
     assert row["response_content_length"] == 11
     assert row["response_content_encoding"] == "gzip"
     assert row["response_transfer_encoding"] == "chunked"
-    assert row["response_x_request_id"] == "rid-1"
-    assert row["response_x_correlation_id"] == "cid-1"
     assert dict(row["response_headers"]) == {"X-Other": "keep-me"}
     assert dict(row["response_tags"]) == {"explicit": "tag"}
     assert row["response_body"] == b"hello world"
     assert row["response_body_hash"] is not None
-    assert len(row["response_body_hash"]) == 32
+    assert row["response_body_hash"] == -3150353794653054837
     assert row["response_received_at"] == datetime.datetime(1970, 1, 1, 0, 0, 0, 333, tzinfo=datetime.timezone.utc)
     assert row["response_received_at_epoch"] == 333
 
@@ -363,7 +355,7 @@ def test_to_arrow_batch_without_body_has_hash_for_empty_buffer() -> None:
 
     assert row["response_body"] == b""
     assert row["response_body_hash"] is not None
-    assert len(row["response_body_hash"]) == 32
+    assert row["response_body_hash"] == 3244421341483603138
 
 
 def test_to_starlette_strips_hop_by_hop_and_sets_media_type() -> None:

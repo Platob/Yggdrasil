@@ -406,6 +406,10 @@ class URL:
     def is_absolute(self) -> bool:
         return bool(self.scheme) and bool(self.host)
 
+    @property
+    def is_http(self):
+        return self.scheme in ("http", "https")
+
     def to_string(self, *, encode: bool = True) -> str:
         cache_name = "_str_enc" if encode else "_str_raw"
         cached = getattr(self, cache_name)
@@ -553,47 +557,6 @@ class URL:
 
         return result
 
-    @property
-    def is_databricks(self) -> bool:
-        return self.scheme == "dbfs"
-
-    def to_databricks_table(self) -> Any:
-        if not self.is_databricks:
-            raise ValueError(f"Expected Databricks URI with scheme 'dbfs', got scheme={self.scheme!r}")
-
-        if not self.query:
-            raise ValueError(
-                "Databricks URI is missing query string. "
-                "Expected query params: catalog_name, schema_name, table_name"
-            )
-
-        from yggdrasil.databricks.sql.table import Table
-        from yggdrasil.databricks.workspaces import Workspace
-
-        items = {
-            key: values[0] if isinstance(values, tuple) and values else values
-            for key, values in self.query_dict.items()
-        }
-
-        required = ("catalog_name", "schema_name", "table_name")
-        missing = [key for key in required if not items.get(key)]
-        if missing:
-            raise ValueError(
-                "Missing required Databricks table query params: "
-                f"{', '.join(missing)}. "
-                "Expected query params: catalog_name, schema_name, table_name"
-            )
-
-        if not self.host:
-            raise ValueError("Databricks URI is missing host")
-
-        return Table(
-            workspace=Workspace(host=self.host),
-            catalog_name=items["catalog_name"],
-            schema_name=items["schema_name"],
-            table_name=items["table_name"],
-        )
-
 
 class URLResource(ABC):
     @classmethod
@@ -644,18 +607,14 @@ def registered_url_schemes() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
-def url_resource_class(
-    cls: Type[T] | None = None,
-    *,
-    overwrite: bool = False,
-):
+def url_resource_class(cls: Type[T] | None = None):
     def decorator(resource_cls: Type[T]) -> Type[T]:
-        return register_url_resource(resource_cls, overwrite=overwrite)
+        return register_url_resource(resource_cls)
 
     return decorator if cls is None else decorator(cls)
 
 
-def register_url_resource(resource_cls: Type[T], *, overwrite: bool = False) -> Type[T]:
+def register_url_resource(resource_cls: Type[T]) -> Type[T]:
     if not issubclass(resource_cls, URLResource):
         raise TypeError(f"Can only register URLResource subclasses, got {resource_cls!r}")
 

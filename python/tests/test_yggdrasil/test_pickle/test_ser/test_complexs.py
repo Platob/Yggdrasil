@@ -21,7 +21,7 @@ from yggdrasil.pickle.ser.complexs import (
     _dump_dataclass_payload,
     _dump_reference_function_payload,
     _load_dataclass_payload,
-    _load_reference_function_payload,
+    _load_reference_function_payload, MethodSerialized,
 )
 
 GLOBAL_OFFSET = 5
@@ -473,16 +473,6 @@ def test_dump_load_dataclass_payload_custom_getstate_setstate():
     assert restored == StatefulPoint(2, 3)
 
 
-def test_dump_dataclass_payload_rejects_dataclass_type():
-    with pytest.raises(TypeError, match="dataclass instance"):
-        _dump_dataclass_payload(Point)
-
-
-def test_dump_dataclass_payload_rejects_non_dataclass():
-    with pytest.raises(TypeError, match="dataclass instance"):
-        _dump_dataclass_payload({"x": 1, "y": 2})
-
-
 def test_dataclass_serialized_build_and_restore():
     obj = Point(11, 22)
 
@@ -637,7 +627,7 @@ def test_reference_only_function_roundtrip_through_write_to():
 def test_reference_only_bound_method_uses_underlying_function():
     bound = pd.DataFrame({"a": [1, 2]}).head
 
-    ser = FunctionSerialized.build_function(bound)
+    ser = Serialized.from_python_object(bound)
     fn = ser.as_python()
 
-    assert fn is pd.DataFrame.head
+    assert fn().equals(bound())

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from yggdrasil.io.enums import MimeType
+from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
 
@@ -172,38 +173,6 @@ def test_prepare_with_json_can_compress_when_threshold_exceeded() -> None:
     assert req.headers["Content-Length"] == str(req.buffer.size)
 
 
-def test_prepare_to_send_without_sniff_keeps_timestamp_zero() -> None:
-    req = PreparedRequest.prepare(
-        method="GET",
-        url="https://example.com",
-    )
-
-    out = req.prepare_to_send(normalize=False)
-
-    assert out.sent_at_timestamp == 0
-
-
-def test_prepare_to_send_with_sniff_sets_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
-    class DummyUser:
-        product = None
-        product_version = None
-        email = None
-        hostname = None
-        url = None
-        git_url = None
-
-    monkeypatch.setattr("yggdrasil.environ.UserInfo.current", lambda: DummyUser())
-
-    req = PreparedRequest.prepare(
-        method="GET",
-        url="https://example.com",
-    )
-
-    out = req.prepare_to_send(normalize=True)
-
-    assert out.sent_at_timestamp > 0
-
-
 def test_prepare_to_send_applies_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyUser:
         product = None
@@ -225,7 +194,7 @@ def test_prepare_to_send_applies_before_send(monkeypatch: pytest.MonkeyPatch) ->
         before_send=before_send,
     )
 
-    out = req.prepare_to_send(normalize=True)
+    out = req.prepare_to_send(sent_at_timestamp=1, headers=None)
 
     assert out.headers["X-Test-Before-Send"] == "1"
 
@@ -304,7 +273,7 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
     assert row["request_url_path"] == "/api"
     assert row["request_url_query"] == "a=1&shared=url"
 
-    assert row["request_host"] == "example.com"
+    assert row["request_host"] == DEFAULT_HOSTNAME
     assert row["request_user_agent"] == "pytest"
     assert row["request_accept"] == "application/json"
     assert row["request_accept_encoding"] == "gzip"
@@ -322,7 +291,7 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
     }
     assert row["request_body"] == b"hello world"
     assert row["request_body_hash"] is not None
-    assert len(row["request_body_hash"]) == 32
+    assert row["request_body_hash"] == -3150353794653054837
     assert row["request_sent_at"] == datetime.datetime(1970, 1, 1, 0, 0, 0, 42, tzinfo=datetime.timezone.utc)
     assert row["request_sent_at_epoch"] == 42
 

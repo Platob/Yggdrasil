@@ -6,8 +6,6 @@ import pytest
 
 from yggdrasil.io.enums.codec import (
     Codec,
-    detect,
-    detect_bytes,
     GZIP,
     ZSTD,
     LZ4,
@@ -92,11 +90,11 @@ def test_codec_from_mime():
     ],
 )
 def test_detect_bytes(payload: bytes, expected):
-    assert detect_bytes(payload) is expected
+    assert Codec.parse(payload) is expected
 
 
 def test_detect_bytes_unknown_returns_none():
-    assert detect_bytes(b"\x00\x01\x02\x03\x04") is None
+    assert Codec.parse(b"\x00\x01\x02\x03\x04") is None
 
 
 # ----------------------------
@@ -108,7 +106,7 @@ def test_detect_io_preserves_cursor():
     fh = io.BytesIO(data)
     fh.seek(0)
     pos = fh.tell()
-    assert detect(fh) is GZIP
+    assert Codec.parse(fh) is GZIP
     assert fh.tell() == pos
 
 
@@ -243,11 +241,11 @@ def test_read_start_end_io_preserves_cursor_optional(codec, dep):
 
 def test_detect_bytes_and_detect_io_smoke():
     gz = GZIP.compress_bytes(b"hello")
-    assert detect_bytes(gz) is GZIP
+    assert Codec.parse(gz) is GZIP
     fh = io.BytesIO(gz)
     fh.seek(2)
     pos = fh.tell()
-    assert detect(fh) is GZIP
+    assert Codec.parse(fh) is GZIP
     assert fh.tell() == pos
 
 
