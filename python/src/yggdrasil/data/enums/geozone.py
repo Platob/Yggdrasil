@@ -415,11 +415,27 @@ class GeoZone:
         dict[str, bytes],
         dict[str, Optional[str]],
         dict[str, Optional[str]],
+        dict[str, int],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, int],
     ]:
         alias_to_key: dict[str, str] = {}
         key_to_wkb: dict[str, bytes] = {}
         key_to_country_iso: dict[str, Optional[str]] = {}
         key_to_city_iso: dict[str, Optional[str]] = {}
+        key_to_gtype: dict[str, int] = {}
+        key_to_name: dict[str, Optional[str]] = {}
+        key_to_country_name: dict[str, Optional[str]] = {}
+        key_to_city_name: dict[str, Optional[str]] = {}
+        key_to_eic: dict[str, Optional[str]] = {}
+        key_to_tz: dict[str, Optional[str]] = {}
+        key_to_ccy: dict[str, Optional[str]] = {}
+        key_to_srid: dict[str, int] = {}
 
         def _index_zone(zone: "GeoZone") -> None:
             canonical_key = zone.key
@@ -430,6 +446,14 @@ class GeoZone:
             key_to_wkb[canonical_key] = zone.wkb
             key_to_country_iso[canonical_key] = zone.country_iso
             key_to_city_iso[canonical_key] = zone.city_iso
+            key_to_gtype[canonical_key] = zone.gtype
+            key_to_name[canonical_key] = zone.name
+            key_to_country_name[canonical_key] = zone.country_name
+            key_to_city_name[canonical_key] = zone.city_name
+            key_to_eic[canonical_key] = zone.eic
+            key_to_tz[canonical_key] = zone.tz
+            key_to_ccy[canonical_key] = zone.ccy
+            key_to_srid[canonical_key] = zone.srid
 
             raw_aliases: set[str] = {
                 canonical_key,
@@ -472,6 +496,14 @@ class GeoZone:
             key_to_wkb[canonical_key] = zone.wkb
             key_to_country_iso[canonical_key] = zone.country_iso
             key_to_city_iso[canonical_key] = zone.city_iso
+            key_to_gtype[canonical_key] = zone.gtype
+            key_to_name[canonical_key] = zone.name
+            key_to_country_name[canonical_key] = zone.country_name
+            key_to_city_name[canonical_key] = zone.city_name
+            key_to_eic[canonical_key] = zone.eic
+            key_to_tz[canonical_key] = zone.tz
+            key_to_ccy[canonical_key] = zone.ccy
+            key_to_srid[canonical_key] = zone.srid
 
             raw_aliases = {
                 alias,
@@ -496,21 +528,39 @@ class GeoZone:
         regex_rules: list[tuple[str, str]] = []
         for alias, canonical_key in sorted(alias_to_key.items(), key=lambda kv: (-len(kv[0]), kv[0])):
             esc = re.escape(alias)
-            # Match either:
-            #   1. the whole normalized string  (exact: ^ALIAS$)
-            #   2. the alias as a word-token inside the string ((?:^|_)ALIAS(?:_|$))
             regex_rules.append((rf"(?:^|_){esc}(?:_|$)|^{esc}$", canonical_key))
 
-        return regex_rules, key_to_wkb, key_to_country_iso, key_to_city_iso
+        return (
+            regex_rules,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        )
 
     @classmethod
     def _build_output_expr_from_key(
         cls,
         ck: "pl.Expr",
-        return_value: Literal["wkb", "country_iso", "city_iso", "point"],
+        return_value: "Literal['wkb', 'country_iso', 'city_iso', 'point', 'struct']",
         key_to_wkb: "dict[str, bytes]",
         key_to_country_iso: "dict[str, Optional[str]]",
         key_to_city_iso: "dict[str, Optional[str]]",
+        key_to_gtype: "dict[str, int]",
+        key_to_name: "dict[str, Optional[str]]",
+        key_to_country_name: "dict[str, Optional[str]]",
+        key_to_city_name: "dict[str, Optional[str]]",
+        key_to_eic: "dict[str, Optional[str]]",
+        key_to_tz: "dict[str, Optional[str]]",
+        key_to_ccy: "dict[str, Optional[str]]",
+        key_to_srid: "dict[str, int]",
     ) -> "pl.Expr":
         """Shared expression builder: canonical-key Expr → output Expr."""
         import polars as pl
@@ -531,8 +581,28 @@ class GeoZone:
             lon_expr = ck.replace(key_to_lon, default=None).cast(pl.Float64)
             return pl.struct(lat=lat_expr, lon=lon_expr)
 
+        if return_value == "struct":
+            key_to_lat = {k: _parse_point_wkb(v)[0] for k, v in key_to_wkb.items()}
+            key_to_lon = {k: _parse_point_wkb(v)[1] for k, v in key_to_wkb.items()}
+            return pl.struct(
+                gtype=ck.replace(key_to_gtype, default=None).cast(pl.Int32),
+                wkb=ck.replace(key_to_wkb, default=None).cast(pl.Binary),
+                srid=ck.replace(key_to_srid, default=None).cast(pl.Int32),
+                key=ck.cast(pl.Utf8),
+                name=ck.replace(key_to_name, default=None).cast(pl.Utf8),
+                country_iso=ck.replace(key_to_country_iso, default=None).cast(pl.Utf8),
+                country_name=ck.replace(key_to_country_name, default=None).cast(pl.Utf8),
+                city_iso=ck.replace(key_to_city_iso, default=None).cast(pl.Utf8),
+                city_name=ck.replace(key_to_city_name, default=None).cast(pl.Utf8),
+                eic=ck.replace(key_to_eic, default=None).cast(pl.Utf8),
+                tz=ck.replace(key_to_tz, default=None).cast(pl.Utf8),
+                ccy=ck.replace(key_to_ccy, default=None).cast(pl.Utf8),
+                lat=ck.replace(key_to_lat, default=None).cast(pl.Float64),
+                lon=ck.replace(key_to_lon, default=None).cast(pl.Float64),
+            )
+
         raise ValueError(
-            f"return_value must be one of 'wkb', 'country_iso', 'city_iso', 'point'; got {return_value!r}"
+            f"return_value must be one of 'wkb', 'country_iso', 'city_iso', 'point', 'struct'; got {return_value!r}"
         )
 
     @classmethod
@@ -540,7 +610,7 @@ class GeoZone:
         cls,
         col: "pl.Series | pl.Expr",
         *,
-        return_value: Literal["wkb", "country_iso", "city_iso", "point"] = "wkb",
+        return_value: Literal["wkb", "country_iso", "city_iso", "point", "struct"] = "wkb",
         lazy: bool = False,
     ) -> "pl.Series | pl.Expr":
         """Parse a string column into a zone field.
@@ -550,8 +620,8 @@ class GeoZone:
         col:
             A ``pl.Series`` (Utf8) or a ``pl.Expr``.
         return_value:
-            Which field to return for each resolved zone:
-            ``"wkb"`` (default) · ``"country_iso"`` · ``"city_iso"`` · ``"point"``.
+            ``"wkb"`` (default) · ``"country_iso"`` · ``"city_iso"`` · ``"point"`` ·
+            ``"struct"`` (all GeoZone fields as a Polars Struct).
         lazy:
             When *True* and *col* is a ``pl.Series``, return a ``pl.Expr``
             instead of evaluating immediately.  When *False* (default) a
@@ -559,9 +629,20 @@ class GeoZone:
         """
         import polars as pl
 
-        regex_rules, key_to_wkb, key_to_country_iso, key_to_city_iso = (
-            cls._build_bidding_zone_regex_cache()
-        )
+        (
+            regex_rules,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        ) = cls._build_bidding_zone_regex_cache()
 
         def _normalize_expr(expr: pl.Expr) -> pl.Expr:
             return (
@@ -583,7 +664,10 @@ class GeoZone:
         def _build_expr(expr: pl.Expr) -> pl.Expr:
             return cls._build_output_expr_from_key(
                 _canonical_key_expr(expr),
-                return_value, key_to_wkb, key_to_country_iso, key_to_city_iso,
+                return_value,
+                key_to_wkb, key_to_country_iso, key_to_city_iso,
+                key_to_gtype, key_to_name, key_to_country_name, key_to_city_name,
+                key_to_eic, key_to_tz, key_to_ccy, key_to_srid,
             )
 
         if isinstance(col, pl.Expr):
@@ -606,20 +690,52 @@ class GeoZone:
         dict[str, bytes],
         dict[str, Optional[str]],
         dict[str, Optional[str]],
+        dict[str, int],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, Optional[str]],
+        dict[str, int],
     ]:
-        """Build wkb→canonical_key plus the same value maps as the string cache."""
-        _, key_to_wkb, key_to_country_iso, key_to_city_iso = (
-            cls._build_bidding_zone_regex_cache()
-        )
+        """Build wkb→canonical_key plus all the value maps from the string cache."""
+        (
+            _,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        ) = cls._build_bidding_zone_regex_cache()
         wkb_to_key: dict[bytes, str] = {v: k for k, v in key_to_wkb.items()}
-        return wkb_to_key, key_to_wkb, key_to_country_iso, key_to_city_iso
+        return (
+            wkb_to_key,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        )
 
     @classmethod
     def polars_parse_bin(
         cls,
         col: "pl.Series | pl.Expr",
         *,
-        return_value: Literal["wkb", "country_iso", "city_iso", "point"] = "wkb",
+        return_value: Literal["wkb", "country_iso", "city_iso", "point", "struct"] = "wkb",
         lazy: bool = False,
     ) -> "pl.Series | pl.Expr":
         """Parse a WKB binary column into a zone field.
@@ -632,28 +748,39 @@ class GeoZone:
             ``GeoZone.wkb`` (21 bytes).  Unknown / unregistered WKB values
             map to ``None``.
         return_value:
-            Which field to return for each resolved zone:
-            ``"wkb"`` (default, i.e. pass-through the canonical WKB) ·
-            ``"country_iso"`` · ``"city_iso"`` · ``"point"``.
+            ``"wkb"`` (default, pass-through canonical WKB) · ``"country_iso"`` ·
+            ``"city_iso"`` · ``"point"`` · ``"struct"`` (all GeoZone fields).
         lazy:
             When *True* and *col* is a ``pl.Series``, return a ``pl.Expr``
             instead of evaluating immediately.
         """
         import polars as pl
 
-        wkb_to_key, key_to_wkb, key_to_country_iso, key_to_city_iso = (
-            cls._build_bin_lookup_cache()
-        )
+        (
+            wkb_to_key,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        ) = cls._build_bin_lookup_cache()
 
         def _canonical_key_expr(expr: pl.Expr) -> pl.Expr:
-            # Replace each known WKB bytes value with the canonical key string.
-            # Unknown WKB → None (default).
             return expr.cast(pl.Binary).replace(wkb_to_key, default=None).cast(pl.Utf8)
 
         def _build_expr(expr: pl.Expr) -> pl.Expr:
             return cls._build_output_expr_from_key(
                 _canonical_key_expr(expr),
-                return_value, key_to_wkb, key_to_country_iso, key_to_city_iso,
+                return_value,
+                key_to_wkb, key_to_country_iso, key_to_city_iso,
+                key_to_gtype, key_to_name, key_to_country_name, key_to_city_name,
+                key_to_eic, key_to_tz, key_to_ccy, key_to_srid,
             )
 
         if isinstance(col, pl.Expr):

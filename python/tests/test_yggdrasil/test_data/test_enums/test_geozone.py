@@ -987,6 +987,76 @@ class TestPolarsParseStr:
         assert row["lon"] is None
 
     # ------------------------------------------------------------------
+    # return_value="struct"
+    # ------------------------------------------------------------------
+
+    def test_struct_series_fields(self) -> None:
+        s = pl.Series("zone", ["FR", "ZRH", "unknown"])
+        out = GeoZone.polars_parse_str(s, return_value="struct")
+
+        assert isinstance(out, pl.Series)
+        fr_row = out[0]
+        assert fr_row["key"] == "FR"
+        assert fr_row["name"] == "France"
+        assert fr_row["country_iso"] == "FR"
+        assert fr_row["country_name"] == "France"
+        assert fr_row["city_iso"] is None
+        assert fr_row["city_name"] is None
+        assert fr_row["eic"] == "10YFR-RTE------C"
+        assert fr_row["gtype"] == GeoZoneType.COUNTRY
+        assert fr_row["srid"] == 4326
+        assert fr_row["wkb"] == self._fr.wkb
+        assert fr_row["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert fr_row["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+        zrh_row = out[1]
+        assert zrh_row["key"] == "ZRH"
+        assert zrh_row["city_iso"] == "ZRH"
+        assert zrh_row["country_iso"] == "CH"
+        assert zrh_row["gtype"] == GeoZoneType.CITY
+
+        none_row = out[2]
+        assert none_row["key"] is None
+        assert none_row["wkb"] is None
+        assert none_row["lat"] is None
+
+    def test_struct_expr(self) -> None:
+        df = pl.DataFrame({"zone": ["FR"]})
+        out = df.select(GeoZone.polars_parse_str(pl.col("zone"), return_value="struct").alias("s"))
+        row = out["s"][0]
+        assert row["key"] == "FR"
+        assert row["country_iso"] == "FR"
+
+    def test_struct_dtype_has_all_fields(self) -> None:
+        s = pl.Series("zone", ["FR"])
+        out = GeoZone.polars_parse_str(s, return_value="struct")
+        expected_fields = {
+            "gtype", "wkb", "srid", "key", "name",
+            "country_iso", "country_name", "city_iso", "city_name",
+            "eic", "tz", "ccy", "lat", "lon",
+        }
+        actual_fields = {f.name for f in out.dtype.fields}  # type: ignore[attr-defined]
+        assert actual_fields == expected_fields
+
+    def test_struct_no2_zone_fields(self) -> None:
+        s = pl.Series("zone", ["NO2"])
+        out = GeoZone.polars_parse_str(s, return_value="struct")
+        row = out[0]
+        assert row["key"] == "NO2"
+        assert row["country_iso"] == "NO"
+        assert row["gtype"] == GeoZoneType.ZONE
+        assert row["eic"] == "10YNO-2--------T"
+        assert row["lat"] == pytest.approx(self._no2.lat, abs=1e-4)
+
+    def test_struct_free_text_resolves_fields(self) -> None:
+        """Free-text substring match via parse_str also populates all struct fields."""
+        s = pl.Series("zone", ["Norway NO2 wind power"])
+        out = GeoZone.polars_parse_str(s, return_value="struct")
+        row = out[0]
+        assert row["key"] == "NO2"
+        assert row["country_iso"] == "NO"
+
+    # ------------------------------------------------------------------
     # Invalid inputs (shared across all modes)
     # ------------------------------------------------------------------
 
@@ -1210,6 +1280,67 @@ class TestPolarsParseBin:
         expr = GeoZone.polars_parse_bin(s, return_value="country_iso", lazy=True)
         out = pl.DataFrame({"wkb": [self._fr.wkb, self._no2.wkb]}).select(expr.alias("iso"))
         assert out["iso"].to_list() == ["FR", "NO"]
+
+    # ---------------------------------------------------------------
+    # return_value="struct"
+    # ---------------------------------------------------------------
+
+    def test_struct_series_fields(self) -> None:
+        s = pl.Series("wkb", [self._fr.wkb, self._zrh.wkb, b"\x00" * 21])
+        out = GeoZone.polars_parse_bin(s, return_value="struct")
+
+        assert isinstance(out, pl.Series)
+        fr_row = out[0]
+        assert fr_row["key"] == "FR"
+        assert fr_row["name"] == "France"
+        assert fr_row["country_iso"] == "FR"
+        assert fr_row["country_name"] == "France"
+        assert fr_row["city_iso"] is None
+        assert fr_row["eic"] == "10YFR-RTE------C"
+        assert fr_row["gtype"] == GeoZoneType.COUNTRY
+        assert fr_row["srid"] == 4326
+        assert fr_row["wkb"] == self._fr.wkb
+        assert fr_row["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert fr_row["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+        zrh_row = out[1]
+        assert zrh_row["key"] == "ZRH"
+        assert zrh_row["city_iso"] == "ZRH"
+        assert zrh_row["gtype"] == GeoZoneType.CITY
+
+        none_row = out[2]
+        assert none_row["key"] is None
+        assert none_row["wkb"] is None
+        assert none_row["lat"] is None
+
+    def test_struct_expr(self) -> None:
+        df = pl.DataFrame({"wkb": [self._no2.wkb]})
+        out = df.select(GeoZone.polars_parse_bin(pl.col("wkb"), return_value="struct").alias("s"))
+        row = out["s"][0]
+        assert row["key"] == "NO2"
+        assert row["country_iso"] == "NO"
+        assert row["eic"] == "10YNO-2--------T"
+
+    def test_struct_dtype_has_all_fields(self) -> None:
+        s = pl.Series("wkb", [self._fr.wkb])
+        out = GeoZone.polars_parse_bin(s, return_value="struct")
+        expected_fields = {
+            "gtype", "wkb", "srid", "key", "name",
+            "country_iso", "country_name", "city_iso", "city_name",
+            "eic", "tz", "ccy", "lat", "lon",
+        }
+        actual_fields = {f.name for f in out.dtype.fields}  # type: ignore[attr-defined]
+        assert actual_fields == expected_fields
+
+    def test_struct_roundtrip_str_to_bin_to_struct(self) -> None:
+        """Full round-trip: string → WKB → struct."""
+        s_str = pl.Series("zone", ["France", "NO2"])
+        wkb_series = GeoZone.polars_parse_str(s_str)
+        struct_series = GeoZone.polars_parse_bin(wkb_series, return_value="struct")
+        assert struct_series[0]["key"] == "FR"
+        assert struct_series[1]["key"] == "NO2"
+        assert struct_series[0]["country_iso"] == "FR"
+        assert struct_series[1]["country_iso"] == "NO"
 
     # ---------------------------------------------------------------
     # Round-trip: polars_parse_str → polars_parse_bin
