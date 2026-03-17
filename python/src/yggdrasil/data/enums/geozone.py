@@ -411,18 +411,19 @@ class GeoZone:
     def _build_bidding_zone_regex_cache(
         cls,
     ) -> tuple[
-        list[tuple[str, str]],
-        dict[str, bytes],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, int],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, Optional[str]],
-        dict[str, int],
+        str,                          # combined alternation pattern
+        dict[str, str],               # alias_to_key
+        dict[str, bytes],             # key_to_wkb
+        dict[str, Optional[str]],     # key_to_country_iso
+        dict[str, Optional[str]],     # key_to_city_iso
+        dict[str, int],               # key_to_gtype
+        dict[str, Optional[str]],     # key_to_name
+        dict[str, Optional[str]],     # key_to_country_name
+        dict[str, Optional[str]],     # key_to_city_name
+        dict[str, Optional[str]],     # key_to_eic
+        dict[str, Optional[str]],     # key_to_tz
+        dict[str, Optional[str]],     # key_to_ccy
+        dict[str, int],               # key_to_srid
     ]:
         alias_to_key: dict[str, str] = {}
         key_to_wkb: dict[str, bytes] = {}
@@ -525,13 +526,18 @@ class GeoZone:
                 if norm_alias:
                     alias_to_key[norm_alias] = canonical_key
 
-        regex_rules: list[tuple[str, str]] = []
-        for alias, canonical_key in sorted(alias_to_key.items(), key=lambda kv: (-len(kv[0]), kv[0])):
-            esc = re.escape(alias)
-            regex_rules.append((rf"(?:^|_){esc}(?:_|$)|^{esc}$", canonical_key))
+        # Build a single alternation regex sorted longest-first so the most
+        # specific token wins when multiple aliases could match.
+        # Pattern: each alias matches either as the full normalised string OR as
+        # a _-delimited token within it.  We use a single non-capturing
+        # alternation and a capture group so str.extract() returns the matched
+        # alias in one vectorised pass — O(1) expression nesting depth.
+        sorted_aliases = sorted(alias_to_key.keys(), key=lambda a: (-len(a), a))
+        combined_pattern = "(?:^|_)(" + "|".join(re.escape(a) for a in sorted_aliases) + ")(?:_|$)"
 
         return (
-            regex_rules,
+            combined_pattern,
+            alias_to_key,
             key_to_wkb,
             key_to_country_iso,
             key_to_city_iso,
@@ -630,7 +636,8 @@ class GeoZone:
         import polars as pl
 
         (
-            regex_rules,
+            combined_pattern,
+            alias_to_key,
             key_to_wkb,
             key_to_country_iso,
             key_to_city_iso,
@@ -655,11 +662,10 @@ class GeoZone:
             )
 
         def _canonical_key_expr(expr: pl.Expr) -> pl.Expr:
-            z = _normalize_expr(expr)
-            out: pl.Expr = pl.lit(None, dtype=pl.Utf8)
-            for pattern, canonical_key in reversed(regex_rules):
-                out = pl.when(z.str.contains(pattern)).then(pl.lit(canonical_key)).otherwise(out)
-            return out
+            # Single str.extract call: O(1) expression depth regardless of zone count.
+            # Extracts the matched alias token, then maps alias → canonical key.
+            matched_alias = _normalize_expr(expr).str.extract(combined_pattern, group_index=1)
+            return matched_alias.replace(alias_to_key, default=None)
 
         def _build_expr(expr: pl.Expr) -> pl.Expr:
             return cls._build_output_expr_from_key(
@@ -701,7 +707,8 @@ class GeoZone:
     ]:
         """Build wkb→canonical_key plus all the value maps from the string cache."""
         (
-            _,
+            _combined_pattern,
+            _alias_to_key,
             key_to_wkb,
             key_to_country_iso,
             key_to_city_iso,
