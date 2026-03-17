@@ -294,7 +294,6 @@ class Session(ABC):
                         req,
                         wait=wait,
                         raise_error=raise_error,
-                        normalize=normalize,
                         stream=stream,
                     )
 

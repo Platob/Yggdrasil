@@ -11,8 +11,10 @@ Coverage areas
 * Cache operations – put, get_by_*, clear_cache, alias resolution
 * GeoZone.parse_str – key, name, EIC, compact key (dash/space), coordinates
 * GeoZone.parse – None, self, bytes, str, dict, arbitrary objects
-* polars_parse_str – return_value wkb / country_iso / city_iso / point, Expr, Series, lazy, invalid type/value
-* polars_parse_bin – return_value wkb / country_iso / city_iso / point, Expr, Series, lazy, invalid type/value
+* polars_parse_str – return_value wkb / country_iso / city_iso / point / struct, Expr, Series, lazy, invalid type/value
+* polars_parse_bin – return_value wkb / country_iso / city_iso / point / struct, Expr, Series, lazy, invalid type/value
+* py_parse_str – scalar pure-Python mirror of polars_parse_str (all return_value modes)
+* py_parse_bin – scalar pure-Python mirror of polars_parse_bin (all return_value modes)
 """
 
 from __future__ import annotations
@@ -74,18 +76,22 @@ def clear_geozone_cache() -> None:
 class TestGeoZoneType:
     def test_constants_are_distinct_ints(self) -> None:
         values = [
+            GeoZoneType.UNKNOWN,
             GeoZoneType.WORLD,
             GeoZoneType.CONTINENT,
             GeoZoneType.COUNTRY,
             GeoZoneType.CITY,
             GeoZoneType.ZONE,
         ]
-        assert len(set(values)) == 5
+        assert len(set(values)) == 6
         assert all(isinstance(v, int) for v in values)
 
     def test_ordering(self) -> None:
-        assert GeoZoneType.WORLD < GeoZoneType.CONTINENT < GeoZoneType.COUNTRY
+        assert GeoZoneType.UNKNOWN < GeoZoneType.WORLD < GeoZoneType.CONTINENT < GeoZoneType.COUNTRY
         assert GeoZoneType.COUNTRY < GeoZoneType.CITY < GeoZoneType.ZONE
+
+    def test_unknown_is_negative(self) -> None:
+        assert GeoZoneType.UNKNOWN < 0
 
 
 # ---------------------------------------------------------------------------
@@ -1380,4 +1386,704 @@ class TestPolarsParseBin:
                 GeoZone.polars_parse_bin(pl.col("wkb"), return_value="bad_mode").alias("x")  # type: ignore[arg-type]
             )
 
+
+# ---------------------------------------------------------------------------
+# py_parse_str  (pure-Python scalar mirror of polars_parse_str)
+# ---------------------------------------------------------------------------
+
+class TestPyParseStr:
+    """Tests for GeoZone.py_parse_str covering all return_value modes."""
+
+    @pytest.fixture(autouse=True)
+    def _register_zones(self) -> None:
+        fr = GeoZone.from_coordinates(
+            gtype=GeoZoneType.COUNTRY,
+            lat=46.2276, lon=2.2137,
+            key="FR", name="France",
+            country_iso="FR", country_name="France",
+            eic="10YFR-RTE------C",
+        )
+        zrh = GeoZone.from_coordinates(
+            gtype=GeoZoneType.CITY,
+            lat=47.3769, lon=8.5417,
+            key="ZRH", name="Zurich",
+            country_iso="CH", country_name="Switzerland",
+            city_iso="ZRH", city_name="Zurich",
+        )
+        de_lu = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE,
+            lat=50.9, lon=8.7,
+            key="DE_LU", name="Germany-Luxembourg",
+            country_name="Germany-Luxembourg",
+        )
+        no2 = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE,
+            lat=58.1467, lon=7.9956,
+            key="NO2", name="Norway NO2",
+            country_iso="NO", country_name="Norway",
+            eic="10YNO-2--------T",
+        )
+        for z in (fr, zrh, de_lu, no2):
+            GeoZone.put(z)
+        GeoZone._build_bidding_zone_regex_cache.cache_clear()
+
+        self._fr = fr
+        self._zrh = zrh
+        self._de_lu = de_lu
+        self._no2 = no2
+
+    # ------------------------------------------------------------------
+    # None input
+    # ------------------------------------------------------------------
+
+    def test_none_returns_none_wkb(self) -> None:
+        assert GeoZone.py_parse_str(None) is None
+
+    def test_none_returns_point_nulls(self) -> None:
+        result = GeoZone.py_parse_str(None, return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_none_returns_struct_nulls(self) -> None:
+        result = GeoZone.py_parse_str(None, return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    # ------------------------------------------------------------------
+    # return_value="wkb"  (default)
+    # ------------------------------------------------------------------
+
+    def test_wkb_exact_key(self) -> None:
+        assert GeoZone.py_parse_str("FR") == self._fr.wkb
+
+    def test_wkb_case_insensitive(self) -> None:
+        assert GeoZone.py_parse_str("fr") == self._fr.wkb
+        assert GeoZone.py_parse_str("France") == self._fr.wkb
+        assert GeoZone.py_parse_str("france") == self._fr.wkb
+
+    def test_wkb_by_eic(self) -> None:
+        assert GeoZone.py_parse_str("10YFR-RTE------C") == self._fr.wkb
+
+    def test_wkb_compact_dash(self) -> None:
+        assert GeoZone.py_parse_str("DE-LU") == self._de_lu.wkb
+
+    def test_wkb_compact_space(self) -> None:
+        assert GeoZone.py_parse_str("DE LU") == self._de_lu.wkb
+
+    def test_wkb_free_text(self) -> None:
+        """Free-text string with embedded zone key resolves via token scan."""
+        assert GeoZone.py_parse_str("Norway NO2 wind power") == self._no2.wkb
+
+    def test_wkb_unknown_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("TOTALLY_UNKNOWN_XYZ") is None
+
+    def test_wkb_empty_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("") is None
+
+    def test_wkb_whitespace_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("   ") is None
+
+    def test_wkb_is_bytes(self) -> None:
+        result = GeoZone.py_parse_str("FR")
+        assert isinstance(result, bytes)
+
+    # ------------------------------------------------------------------
+    # return_value="country_iso"
+    # ------------------------------------------------------------------
+
+    def test_country_iso_known(self) -> None:
+        assert GeoZone.py_parse_str("FR", return_value="country_iso") == "FR"
+        assert GeoZone.py_parse_str("NO2", return_value="country_iso") == "NO"
+
+    def test_country_iso_none_when_missing(self) -> None:
+        # DE_LU has no country_iso set
+        assert GeoZone.py_parse_str("DE-LU", return_value="country_iso") is None
+
+    def test_country_iso_unknown(self) -> None:
+        assert GeoZone.py_parse_str("UNKNOWN_XYZ", return_value="country_iso") is None
+
+    def test_country_iso_none_input(self) -> None:
+        assert GeoZone.py_parse_str(None, return_value="country_iso") is None
+
+    def test_country_iso_free_text(self) -> None:
+        assert GeoZone.py_parse_str("Norway NO2 wind power", return_value="country_iso") == "NO"
+
+    # ------------------------------------------------------------------
+    # return_value="city_iso"
+    # ------------------------------------------------------------------
+
+    def test_city_iso_known(self) -> None:
+        assert GeoZone.py_parse_str("ZRH", return_value="city_iso") == "ZRH"
+        assert GeoZone.py_parse_str("Zurich", return_value="city_iso") == "ZRH"
+
+    def test_city_iso_none_for_country(self) -> None:
+        assert GeoZone.py_parse_str("FR", return_value="city_iso") is None
+
+    def test_city_iso_unknown(self) -> None:
+        assert GeoZone.py_parse_str("UNKNOWN_XYZ", return_value="city_iso") is None
+
+    def test_city_iso_none_input(self) -> None:
+        assert GeoZone.py_parse_str(None, return_value="city_iso") is None
+
+    # ------------------------------------------------------------------
+    # return_value="point"
+    # ------------------------------------------------------------------
+
+    def test_point_known(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="point")
+        assert result["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+    def test_point_unknown(self) -> None:
+        result = GeoZone.py_parse_str("UNKNOWN_XYZ", return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_point_none_input(self) -> None:
+        result = GeoZone.py_parse_str(None, return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_point_free_text(self) -> None:
+        result = GeoZone.py_parse_str("Norway NO2 wind power", return_value="point")
+        assert result["lat"] == pytest.approx(self._no2.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._no2.lon, abs=1e-4)
+
+    def test_point_has_lat_lon_keys(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="point")
+        assert set(result.keys()) == {"lat", "lon"}
+
+    # ------------------------------------------------------------------
+    # return_value="struct"
+    # ------------------------------------------------------------------
+
+    def test_struct_known_fr(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="struct")
+        assert result["key"] == "FR"
+        assert result["name"] == "France"
+        assert result["country_iso"] == "FR"
+        assert result["country_name"] == "France"
+        assert result["city_iso"] is None
+        assert result["eic"] == "10YFR-RTE------C"
+        assert result["gtype"] == GeoZoneType.COUNTRY
+        assert result["srid"] == 4326
+        assert result["wkb"] == self._fr.wkb
+        assert result["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+    def test_struct_known_zrh(self) -> None:
+        result = GeoZone.py_parse_str("ZRH", return_value="struct")
+        assert result["key"] == "ZRH"
+        assert result["city_iso"] == "ZRH"
+        assert result["country_iso"] == "CH"
+        assert result["gtype"] == GeoZoneType.CITY
+
+    def test_struct_unknown_all_none(self) -> None:
+        result = GeoZone.py_parse_str("UNKNOWN_XYZ", return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    def test_struct_none_input_all_none(self) -> None:
+        result = GeoZone.py_parse_str(None, return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    def test_struct_has_all_geozone_fields(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="struct")
+        expected_fields = {
+            "gtype", "wkb", "srid", "key", "name",
+            "country_iso", "country_name", "city_iso", "city_name",
+            "eic", "tz", "ccy", "lat", "lon",
+        }
+        assert set(result.keys()) == expected_fields
+
+    def test_struct_field_order_matches_geozone(self) -> None:
+        """Field order in the returned dict matches GeoZone dataclass order."""
+        result = GeoZone.py_parse_str("FR", return_value="struct")
+        expected_order = [
+            "gtype", "wkb", "srid",
+            "country_iso", "country_name",
+            "city_iso", "city_name",
+            "key", "name", "eic",
+            "tz", "ccy", "lat", "lon",
+        ]
+        assert list(result.keys()) == expected_order
+
+    def test_struct_free_text(self) -> None:
+        result = GeoZone.py_parse_str("Norway NO2 wind power", return_value="struct")
+        assert result["key"] == "NO2"
+        assert result["country_iso"] == "NO"
+
+    # ------------------------------------------------------------------
+    # Longer-alias-wins (specificity)
+    # ------------------------------------------------------------------
+
+    def test_longer_alias_wins_over_shorter(self) -> None:
+        se1 = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE, lat=65.0, lon=17.0,
+            key="SE1", name="Sweden SE1",
+            country_iso="SE", country_name="Sweden",
+        )
+        se = GeoZone.from_coordinates(
+            gtype=GeoZoneType.COUNTRY, lat=60.1, lon=18.6,
+            key="SE", name="Sweden",
+            country_iso="SE", country_name="Sweden",
+        )
+        GeoZone.put(se)
+        GeoZone.put(se1)
+        GeoZone._build_bidding_zone_regex_cache.cache_clear()
+
+        # "Sweden SE1 area" must resolve to SE1 (longer token wins)
+        assert GeoZone.py_parse_str("Sweden SE1 area") == se1.wkb
+
+    # ------------------------------------------------------------------
+    # Consistency with polars_parse_str
+    # ------------------------------------------------------------------
+
+    def test_consistent_with_polars_parse_str_wkb(self) -> None:
+        for zone_str in ["FR", "france", "10YFR-RTE------C", "DE-LU", "NO2", "UNKNOWN"]:
+            py_result = GeoZone.py_parse_str(zone_str)
+            pl_result = GeoZone.polars_parse_str(pl.Series("z", [zone_str]))[0]
+            assert py_result == pl_result, f"mismatch for {zone_str!r}"
+
+    def test_consistent_with_polars_parse_str_country_iso(self) -> None:
+        for zone_str in ["FR", "NO2", "ZRH", "UNKNOWN"]:
+            py_result = GeoZone.py_parse_str(zone_str, return_value="country_iso")
+            pl_result = GeoZone.polars_parse_str(
+                pl.Series("z", [zone_str]), return_value="country_iso"
+            )[0]
+            assert py_result == pl_result, f"mismatch for {zone_str!r}"
+
+    def test_consistent_with_polars_parse_str_city_iso(self) -> None:
+        for zone_str in ["ZRH", "FR", "UNKNOWN"]:
+            py_result = GeoZone.py_parse_str(zone_str, return_value="city_iso")
+            pl_result = GeoZone.polars_parse_str(
+                pl.Series("z", [zone_str]), return_value="city_iso"
+            )[0]
+            assert py_result == pl_result, f"mismatch for {zone_str!r}"
+
+    def test_consistent_with_polars_parse_str_point(self) -> None:
+        for zone_str in ["FR", "NO2", "UNKNOWN"]:
+            py_result = GeoZone.py_parse_str(zone_str, return_value="point")
+            pl_row = GeoZone.polars_parse_str(
+                pl.Series("z", [zone_str]), return_value="point"
+            )[0]
+            assert py_result["lat"] == pl_row["lat"], f"lat mismatch for {zone_str!r}"
+            assert py_result["lon"] == pl_row["lon"], f"lon mismatch for {zone_str!r}"
+
+
+# ---------------------------------------------------------------------------
+# py_parse_bin  (pure-Python scalar mirror of polars_parse_bin)
+# ---------------------------------------------------------------------------
+
+class TestPyParseBin:
+    """Tests for GeoZone.py_parse_bin covering all return_value modes."""
+
+    @pytest.fixture(autouse=True)
+    def _register_zones(self) -> None:
+        fr = GeoZone.from_coordinates(
+            gtype=GeoZoneType.COUNTRY,
+            lat=46.2276, lon=2.2137,
+            key="FR", name="France",
+            country_iso="FR", country_name="France",
+            eic="10YFR-RTE------C",
+        )
+        zrh = GeoZone.from_coordinates(
+            gtype=GeoZoneType.CITY,
+            lat=47.3769, lon=8.5417,
+            key="ZRH", name="Zurich",
+            country_iso="CH", country_name="Switzerland",
+            city_iso="ZRH", city_name="Zurich",
+        )
+        no2 = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE,
+            lat=58.1467, lon=7.9956,
+            key="NO2", name="Norway NO2",
+            country_iso="NO", country_name="Norway",
+            eic="10YNO-2--------T",
+        )
+        for z in (fr, zrh, no2):
+            GeoZone.put(z)
+        GeoZone._build_bidding_zone_regex_cache.cache_clear()
+        GeoZone._build_bin_lookup_cache.cache_clear()
+
+        self._fr = fr
+        self._zrh = zrh
+        self._no2 = no2
+
+    _UNKNOWN_WKB = b"\x00" * 21
+
+    # ------------------------------------------------------------------
+    # None input
+    # ------------------------------------------------------------------
+
+    def test_none_returns_none_wkb(self) -> None:
+        assert GeoZone.py_parse_bin(None) is None
+
+    def test_none_returns_point_nulls(self) -> None:
+        result = GeoZone.py_parse_bin(None, return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_none_returns_struct_nulls(self) -> None:
+        result = GeoZone.py_parse_bin(None, return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    # ------------------------------------------------------------------
+    # return_value="wkb"  (default)
+    # ------------------------------------------------------------------
+
+    def test_wkb_known(self) -> None:
+        assert GeoZone.py_parse_bin(self._fr.wkb) == self._fr.wkb
+        assert GeoZone.py_parse_bin(self._no2.wkb) == self._no2.wkb
+
+    def test_wkb_accepts_bytearray(self) -> None:
+        assert GeoZone.py_parse_bin(bytearray(self._fr.wkb)) == self._fr.wkb
+
+    def test_wkb_accepts_memoryview(self) -> None:
+        assert GeoZone.py_parse_bin(memoryview(self._fr.wkb)) == self._fr.wkb
+
+    def test_wkb_unknown_returns_none(self) -> None:
+        assert GeoZone.py_parse_bin(self._UNKNOWN_WKB) is None
+
+    def test_wkb_result_is_bytes(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb)
+        assert isinstance(result, bytes)
+
+    # ------------------------------------------------------------------
+    # return_value="country_iso"
+    # ------------------------------------------------------------------
+
+    def test_country_iso_known(self) -> None:
+        assert GeoZone.py_parse_bin(self._fr.wkb, return_value="country_iso") == "FR"
+        assert GeoZone.py_parse_bin(self._no2.wkb, return_value="country_iso") == "NO"
+        assert GeoZone.py_parse_bin(self._zrh.wkb, return_value="country_iso") == "CH"
+
+    def test_country_iso_unknown(self) -> None:
+        assert GeoZone.py_parse_bin(self._UNKNOWN_WKB, return_value="country_iso") is None
+
+    def test_country_iso_none_input(self) -> None:
+        assert GeoZone.py_parse_bin(None, return_value="country_iso") is None
+
+    def test_country_iso_missing_field(self) -> None:
+        no_country = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE, lat=1.0, lon=1.0,
+            key="NOCOUNTRY", name="No Country",
+        )
+        GeoZone.put(no_country)
+        GeoZone._build_bin_lookup_cache.cache_clear()
+        assert GeoZone.py_parse_bin(no_country.wkb, return_value="country_iso") is None
+
+    # ------------------------------------------------------------------
+    # return_value="city_iso"
+    # ------------------------------------------------------------------
+
+    def test_city_iso_known(self) -> None:
+        assert GeoZone.py_parse_bin(self._zrh.wkb, return_value="city_iso") == "ZRH"
+
+    def test_city_iso_none_for_country(self) -> None:
+        assert GeoZone.py_parse_bin(self._fr.wkb, return_value="city_iso") is None
+
+    def test_city_iso_unknown(self) -> None:
+        assert GeoZone.py_parse_bin(self._UNKNOWN_WKB, return_value="city_iso") is None
+
+    def test_city_iso_none_input(self) -> None:
+        assert GeoZone.py_parse_bin(None, return_value="city_iso") is None
+
+    # ------------------------------------------------------------------
+    # return_value="point"
+    # ------------------------------------------------------------------
+
+    def test_point_known(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="point")
+        assert result["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+    def test_point_unknown(self) -> None:
+        result = GeoZone.py_parse_bin(self._UNKNOWN_WKB, return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_point_none_input(self) -> None:
+        result = GeoZone.py_parse_bin(None, return_value="point")
+        assert result == {"lat": None, "lon": None}
+
+    def test_point_has_lat_lon_keys(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="point")
+        assert set(result.keys()) == {"lat", "lon"}
+
+    def test_point_no2(self) -> None:
+        result = GeoZone.py_parse_bin(self._no2.wkb, return_value="point")
+        assert result["lat"] == pytest.approx(self._no2.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._no2.lon, abs=1e-4)
+
+    # ------------------------------------------------------------------
+    # return_value="struct"
+    # ------------------------------------------------------------------
+
+    def test_struct_known_fr(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="struct")
+        assert result["key"] == "FR"
+        assert result["name"] == "France"
+        assert result["country_iso"] == "FR"
+        assert result["country_name"] == "France"
+        assert result["city_iso"] is None
+        assert result["eic"] == "10YFR-RTE------C"
+        assert result["gtype"] == GeoZoneType.COUNTRY
+        assert result["srid"] == 4326
+        assert result["wkb"] == self._fr.wkb
+        assert result["lat"] == pytest.approx(self._fr.lat, abs=1e-4)
+        assert result["lon"] == pytest.approx(self._fr.lon, abs=1e-4)
+
+    def test_struct_known_zrh(self) -> None:
+        result = GeoZone.py_parse_bin(self._zrh.wkb, return_value="struct")
+        assert result["key"] == "ZRH"
+        assert result["city_iso"] == "ZRH"
+        assert result["country_iso"] == "CH"
+        assert result["gtype"] == GeoZoneType.CITY
+
+    def test_struct_unknown_all_none(self) -> None:
+        result = GeoZone.py_parse_bin(self._UNKNOWN_WKB, return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    def test_struct_none_input_all_none(self) -> None:
+        result = GeoZone.py_parse_bin(None, return_value="struct")
+        assert result["key"] is None
+        assert result["wkb"] is None
+        assert result["lat"] is None
+
+    def test_struct_has_all_geozone_fields(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="struct")
+        expected_fields = {
+            "gtype", "wkb", "srid", "key", "name",
+            "country_iso", "country_name", "city_iso", "city_name",
+            "eic", "tz", "ccy", "lat", "lon",
+        }
+        assert set(result.keys()) == expected_fields
+
+    def test_struct_field_order_matches_geozone(self) -> None:
+        """Field order in the returned dict matches GeoZone dataclass order."""
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="struct")
+        expected_order = [
+            "gtype", "wkb", "srid",
+            "country_iso", "country_name",
+            "city_iso", "city_name",
+            "key", "name", "eic",
+            "tz", "ccy", "lat", "lon",
+        ]
+        assert list(result.keys()) == expected_order
+
+    # ------------------------------------------------------------------
+    # Invalid return_value
+    # ------------------------------------------------------------------
+
+    def test_invalid_return_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="return_value must be one of"):
+            GeoZone.py_parse_bin(self._fr.wkb, return_value="bad_mode")  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Round-trip: py_parse_str → py_parse_bin
+    # ------------------------------------------------------------------
+
+    def test_roundtrip_str_to_bin_wkb(self) -> None:
+        wkb = GeoZone.py_parse_str("France")
+        assert GeoZone.py_parse_bin(wkb) == self._fr.wkb
+
+    def test_roundtrip_str_to_bin_country_iso(self) -> None:
+        wkb = GeoZone.py_parse_str("NO2")
+        assert GeoZone.py_parse_bin(wkb, return_value="country_iso") == "NO"
+
+    def test_roundtrip_str_to_bin_struct(self) -> None:
+        wkb = GeoZone.py_parse_str("France")
+        result = GeoZone.py_parse_bin(wkb, return_value="struct")
+        assert result["key"] == "FR"
+        assert result["country_iso"] == "FR"
+
+    # ------------------------------------------------------------------
+    # Consistency with polars_parse_bin
+    # ------------------------------------------------------------------
+
+    def test_consistent_with_polars_parse_bin_wkb(self) -> None:
+        for zone in (self._fr, self._zrh, self._no2):
+            py_result = GeoZone.py_parse_bin(zone.wkb)
+            pl_result = GeoZone.polars_parse_bin(pl.Series("w", [zone.wkb]))[0]
+            assert py_result == pl_result
+
+    def test_consistent_with_polars_parse_bin_country_iso(self) -> None:
+        for zone in (self._fr, self._zrh, self._no2):
+            py_result = GeoZone.py_parse_bin(zone.wkb, return_value="country_iso")
+            pl_result = GeoZone.polars_parse_bin(
+                pl.Series("w", [zone.wkb]), return_value="country_iso"
+            )[0]
+            assert py_result == pl_result
+
+    def test_consistent_with_polars_parse_bin_point(self) -> None:
+        for zone in (self._fr, self._no2):
+            py_result = GeoZone.py_parse_bin(zone.wkb, return_value="point")
+            pl_row = GeoZone.polars_parse_bin(
+                pl.Series("w", [zone.wkb]), return_value="point"
+            )[0]
+            assert py_result["lat"] == pytest.approx(pl_row["lat"], abs=1e-9)
+            assert py_result["lon"] == pytest.approx(pl_row["lon"], abs=1e-9)
+
+    def test_consistent_with_polars_parse_bin_unknown(self) -> None:
+        py_result = GeoZone.py_parse_bin(self._UNKNOWN_WKB)
+        pl_result = GeoZone.polars_parse_bin(pl.Series("w", [self._UNKNOWN_WKB]))[0]
+        assert py_result == pl_result
+
+    # ------------------------------------------------------------------
+    # return_value="dataclass"
+    # ------------------------------------------------------------------
+
+    def test_dataclass_known_returns_singleton(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="dataclass")
+        assert result is self._fr
+
+    def test_dataclass_zrh_singleton(self) -> None:
+        result = GeoZone.py_parse_bin(self._zrh.wkb, return_value="dataclass")
+        assert result is self._zrh
+
+    def test_dataclass_no2_singleton(self) -> None:
+        result = GeoZone.py_parse_bin(self._no2.wkb, return_value="dataclass")
+        assert result is self._no2
+
+    def test_dataclass_unknown_returns_none(self) -> None:
+        result = GeoZone.py_parse_bin(self._UNKNOWN_WKB, return_value="dataclass")
+        assert result is None
+
+    def test_dataclass_none_input_returns_none(self) -> None:
+        result = GeoZone.py_parse_bin(None, return_value="dataclass")
+        assert result is None
+
+    def test_dataclass_bytearray_input(self) -> None:
+        result = GeoZone.py_parse_bin(bytearray(self._fr.wkb), return_value="dataclass")
+        assert result is self._fr
+
+    def test_dataclass_memoryview_input(self) -> None:
+        result = GeoZone.py_parse_bin(memoryview(self._no2.wkb), return_value="dataclass")
+        assert result is self._no2
+
+    def test_dataclass_is_geozone_instance(self) -> None:
+        result = GeoZone.py_parse_bin(self._fr.wkb, return_value="dataclass")
+        assert isinstance(result, GeoZone)
+
+    def test_dataclass_invalid_return_value_still_raises(self) -> None:
+        with pytest.raises(ValueError, match="return_value must be one of"):
+            GeoZone.py_parse_bin(self._fr.wkb, return_value="bad_mode")  # type: ignore[arg-type]
+
+    def test_dataclass_roundtrip_str_to_bin(self) -> None:
+        """str → wkb → GeoZone singleton round-trip."""
+        wkb = GeoZone.py_parse_str("France")
+        result = GeoZone.py_parse_bin(wkb, return_value="dataclass")
+        assert result is self._fr
+
+
+# ---------------------------------------------------------------------------
+# py_parse_str  — return_value="dataclass"
+# ---------------------------------------------------------------------------
+
+class TestPyParseStrDataclass:
+    """Tests for GeoZone.py_parse_str with return_value='dataclass'."""
+
+    @pytest.fixture(autouse=True)
+    def _register_zones(self) -> None:
+        fr = GeoZone.from_coordinates(
+            gtype=GeoZoneType.COUNTRY,
+            lat=46.2276, lon=2.2137,
+            key="FR", name="France",
+            country_iso="FR", country_name="France",
+            eic="10YFR-RTE------C",
+        )
+        zrh = GeoZone.from_coordinates(
+            gtype=GeoZoneType.CITY,
+            lat=47.3769, lon=8.5417,
+            key="ZRH", name="Zurich",
+            country_iso="CH", country_name="Switzerland",
+            city_iso="ZRH", city_name="Zurich",
+        )
+        no2 = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE,
+            lat=58.1467, lon=7.9956,
+            key="NO2", name="Norway NO2",
+            country_iso="NO", country_name="Norway",
+            eic="10YNO-2--------T",
+        )
+        de_lu = GeoZone.from_coordinates(
+            gtype=GeoZoneType.ZONE,
+            lat=50.9, lon=8.7,
+            key="DE_LU", name="Germany-Luxembourg",
+            country_name="Germany-Luxembourg",
+        )
+        for z in (fr, zrh, no2, de_lu):
+            GeoZone.put(z)
+        GeoZone._build_bidding_zone_regex_cache.cache_clear()
+        GeoZone._build_bin_lookup_cache.cache_clear()
+
+        self._fr = fr
+        self._zrh = zrh
+        self._no2 = no2
+        self._de_lu = de_lu
+
+    def test_exact_key_returns_singleton(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="dataclass")
+        assert result is self._fr
+
+    def test_case_insensitive_returns_singleton(self) -> None:
+        assert GeoZone.py_parse_str("fr", return_value="dataclass") is self._fr
+        assert GeoZone.py_parse_str("france", return_value="dataclass") is self._fr
+        assert GeoZone.py_parse_str("FRANCE", return_value="dataclass") is self._fr
+
+    def test_by_name_returns_singleton(self) -> None:
+        assert GeoZone.py_parse_str("Zurich", return_value="dataclass") is self._zrh
+
+    def test_by_eic_returns_singleton(self) -> None:
+        assert GeoZone.py_parse_str("10YFR-RTE------C", return_value="dataclass") is self._fr
+
+    def test_compact_dash_returns_singleton(self) -> None:
+        assert GeoZone.py_parse_str("DE-LU", return_value="dataclass") is self._de_lu
+
+    def test_compact_space_returns_singleton(self) -> None:
+        assert GeoZone.py_parse_str("DE LU", return_value="dataclass") is self._de_lu
+
+    def test_free_text_returns_singleton(self) -> None:
+        result = GeoZone.py_parse_str("Norway NO2 wind power", return_value="dataclass")
+        assert result is self._no2
+
+    def test_unknown_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("TOTALLY_UNKNOWN_XYZ", return_value="dataclass") is None
+
+    def test_empty_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("", return_value="dataclass") is None
+
+    def test_whitespace_returns_none(self) -> None:
+        assert GeoZone.py_parse_str("   ", return_value="dataclass") is None
+
+    def test_none_input_returns_none(self) -> None:
+        assert GeoZone.py_parse_str(None, return_value="dataclass") is None
+
+    def test_result_is_geozone_instance(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="dataclass")
+        assert isinstance(result, GeoZone)
+
+    def test_result_fields_match(self) -> None:
+        result = GeoZone.py_parse_str("FR", return_value="dataclass")
+        assert result.key == "FR"
+        assert result.country_iso == "FR"
+        assert result.eic == "10YFR-RTE------C"
+        assert result.gtype == GeoZoneType.COUNTRY
+        assert result.wkb == self._fr.wkb
+
+    def test_consistent_with_py_parse_bin_dataclass(self) -> None:
+        """py_parse_str dataclass → py_parse_bin dataclass produce the same singleton."""
+        zone_via_str = GeoZone.py_parse_str("France", return_value="dataclass")
+        wkb = GeoZone.py_parse_str("France")
+        zone_via_bin = GeoZone.py_parse_bin(wkb, return_value="dataclass")
+        assert zone_via_str is zone_via_bin
+
+    def test_is_frozen_singleton(self) -> None:
+        result = GeoZone.py_parse_str("ZRH", return_value="dataclass")
+        with pytest.raises((AttributeError, TypeError)):
+            result.key = "MUTATED"  # type: ignore[misc]
 

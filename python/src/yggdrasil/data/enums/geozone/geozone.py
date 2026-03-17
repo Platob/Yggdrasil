@@ -17,6 +17,7 @@ __all__ = [
 
 
 class GeoZoneType:
+    UNKNOWN: int = -1   # sentinel – "not resolved / not applicable"
     WORLD: int = 0
     CONTINENT: int = 1
     COUNTRY: int = 2
@@ -584,6 +585,306 @@ class GeoZone:
             key_to_srid,
         )
 
+    # ------------------------------------------------------------------
+    # Pure-Python parse helpers (mirror of polars_parse_str / polars_parse_bin)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _canonical_key_for_str(cls, s: str) -> Optional[str]:
+        """Normalise *s* and resolve it to a canonical key (or *None*).
+
+        Mirrors the two-pass logic used in :meth:`polars_parse_str`:
+
+        * **Pass 1** – normalise the whole string and look it up directly in
+          ``alias_to_key``.  Covers exact keys, EICs, names, etc.
+        * **Pass 2** – token scan: split the normalised string on ``_`` and
+          check each token (longest first) against ``alias_to_key``.  This
+          handles free-text strings like ``"Sweden SE1 wind power"``.
+        """
+        (
+            _chunk_patterns,
+            alias_to_key,
+            *_rest,
+        ) = cls._build_bidding_zone_regex_cache()
+
+        norm = re.sub(r"_+", "_", re.sub(r"[\s\-/|]+", "_", s.strip().upper())).strip("_")
+        if not norm:
+            return None
+
+        # Pass 1 – exact whole-string match.
+        ck = alias_to_key.get(norm)
+        if ck is not None:
+            return ck
+
+        # Pass 2 – token scan (sorted longest first so more-specific wins).
+        tokens = norm.split("_")
+        # Build candidate multi-token windows (longest first) then single tokens.
+        candidates: list[str] = []
+        for length in range(len(tokens), 0, -1):
+            for start in range(len(tokens) - length + 1):
+                candidates.append("_".join(tokens[start: start + length]))
+        for candidate in candidates:
+            ck = alias_to_key.get(candidate)
+            if ck is not None:
+                return ck
+
+        return None
+
+    @classmethod
+    def _zone_field_from_key(
+        cls,
+        canonical_key: Optional[str],
+        return_value: "Literal['wkb', 'country_iso', 'city_iso', 'point', 'struct', 'dataclass']",
+        *,
+        key_to_wkb: "dict[str, bytes]",
+        key_to_country_iso: "dict[str, Optional[str]]",
+        key_to_city_iso: "dict[str, Optional[str]]",
+        key_to_gtype: "dict[str, int]",
+        key_to_name: "dict[str, Optional[str]]",
+        key_to_country_name: "dict[str, Optional[str]]",
+        key_to_city_name: "dict[str, Optional[str]]",
+        key_to_eic: "dict[str, Optional[str]]",
+        key_to_tz: "dict[str, Optional[str]]",
+        key_to_ccy: "dict[str, Optional[str]]",
+        key_to_srid: "dict[str, int]",
+    ) -> Any:
+        """Return the requested field value for *canonical_key*, or *None*."""
+        if canonical_key is None:
+            if return_value == "point":
+                return {"lat": None, "lon": None}
+            if return_value == "struct":
+                return {
+                    "gtype": None, "wkb": None, "srid": None,
+                    "country_iso": None, "country_name": None,
+                    "city_iso": None, "city_name": None,
+                    "key": None, "name": None, "eic": None,
+                    "tz": None, "ccy": None, "lat": None, "lon": None,
+                }
+            return None
+
+        if return_value == "dataclass":
+            return cls.get_by_key(canonical_key)
+
+        if return_value == "wkb":
+            return key_to_wkb.get(canonical_key)
+
+        if return_value == "country_iso":
+            return key_to_country_iso.get(canonical_key)
+
+        if return_value == "city_iso":
+            return key_to_city_iso.get(canonical_key)
+
+        if return_value == "point":
+            wkb = key_to_wkb.get(canonical_key)
+            if wkb is None:
+                return {"lat": None, "lon": None}
+            lat, lon = _parse_point_wkb(wkb)
+            return {"lat": lat, "lon": lon}
+
+        if return_value == "struct":
+            wkb = key_to_wkb.get(canonical_key)
+            if wkb is None:
+                lat_val: Optional[float] = None
+                lon_val: Optional[float] = None
+            else:
+                lat_val, lon_val = _parse_point_wkb(wkb)
+            return {
+                "gtype": key_to_gtype.get(canonical_key),
+                "wkb": wkb,
+                "srid": key_to_srid.get(canonical_key),
+                "country_iso": key_to_country_iso.get(canonical_key),
+                "country_name": key_to_country_name.get(canonical_key),
+                "city_iso": key_to_city_iso.get(canonical_key),
+                "city_name": key_to_city_name.get(canonical_key),
+                "key": canonical_key,
+                "name": key_to_name.get(canonical_key),
+                "eic": key_to_eic.get(canonical_key),
+                "tz": key_to_tz.get(canonical_key),
+                "ccy": key_to_ccy.get(canonical_key),
+                "lat": lat_val,
+                "lon": lon_val,
+            }
+
+        raise ValueError(
+            f"return_value must be one of 'wkb', 'country_iso', 'city_iso', 'point', 'struct', 'dataclass';"
+            f" got {return_value!r}"
+        )
+
+    @classmethod
+    def py_parse_str(
+        cls,
+        value: "str | None",
+        *,
+        return_value: Literal["wkb", "country_iso", "city_iso", "point", "struct", "dataclass"] = "wkb",
+    ) -> Any:
+        """Pure-Python equivalent of :meth:`polars_parse_str` for scalar values.
+
+        Accepts a single string (or *None*) and returns the zone field
+        indicated by *return_value*:
+
+        * ``"wkb"`` (default) – ``bytes | None``
+        * ``"country_iso"`` – ``str | None``
+        * ``"city_iso"`` – ``str | None``
+        * ``"point"`` – ``{"lat": float | None, "lon": float | None}``
+        * ``"struct"`` – ``dict`` with all GeoZone fields (field order matches
+          the dataclass declaration; missing values are ``None``).
+        * ``"dataclass"`` – the cached :class:`GeoZone` singleton (or *None*).
+
+        The lookup uses the same two-pass strategy as the Polars version:
+        whole-string normalisation first, then a longest-token scan for
+        free-text inputs like ``"Sweden SE1 wind power"``.
+        """
+        if value is None:
+            if return_value == "point":
+                return {"lat": None, "lon": None}
+            if return_value == "struct":
+                return {
+                    "gtype": None, "wkb": None, "srid": None,
+                    "country_iso": None, "country_name": None,
+                    "city_iso": None, "city_name": None,
+                    "key": None, "name": None, "eic": None,
+                    "tz": None, "ccy": None, "lat": None, "lon": None,
+                }
+            return None
+
+        (
+            _chunk_patterns,
+            alias_to_key,
+            key_to_wkb,
+            key_to_country_iso,
+            key_to_city_iso,
+            key_to_gtype,
+            key_to_name,
+            key_to_country_name,
+            key_to_city_name,
+            key_to_eic,
+            key_to_tz,
+            key_to_ccy,
+            key_to_srid,
+        ) = cls._build_bidding_zone_regex_cache()
+
+        canonical_key = cls._canonical_key_for_str(value)
+        return cls._zone_field_from_key(
+            canonical_key,
+            return_value,
+            key_to_wkb=key_to_wkb,
+            key_to_country_iso=key_to_country_iso,
+            key_to_city_iso=key_to_city_iso,
+            key_to_gtype=key_to_gtype,
+            key_to_name=key_to_name,
+            key_to_country_name=key_to_country_name,
+            key_to_city_name=key_to_city_name,
+            key_to_eic=key_to_eic,
+            key_to_tz=key_to_tz,
+            key_to_ccy=key_to_ccy,
+            key_to_srid=key_to_srid,
+        )
+
+    @classmethod
+    def py_parse_bin(
+        cls,
+        value: "bytes | bytearray | memoryview | None",
+        *,
+        return_value: Literal["wkb", "country_iso", "city_iso", "point", "struct", "dataclass"] = "wkb",
+    ) -> Any:
+        """Pure-Python equivalent of :meth:`polars_parse_bin` for scalar values.
+
+        Accepts a single WKB bytes value (or *None*) and returns the zone
+        field indicated by *return_value*:
+
+        * ``"wkb"`` (default) – ``bytes | None`` (pass-through canonical WKB)
+        * ``"country_iso"`` – ``str | None``
+        * ``"city_iso"`` – ``str | None``
+        * ``"point"`` – ``{"lat": float | None, "lon": float | None}``
+        * ``"struct"`` – ``dict`` with all GeoZone fields (field order matches
+          the dataclass declaration; missing values are ``None``).
+        * ``"dataclass"`` – the cached :class:`GeoZone` singleton (or *None*).
+
+        Unknown / unregistered WKB values map to ``None`` (or a null-filled
+        dict for ``"point"`` and ``"struct"``).
+        """
+        if return_value not in ("wkb", "country_iso", "city_iso", "point", "struct", "dataclass"):
+            raise ValueError(
+                f"return_value must be one of 'wkb', 'country_iso', 'city_iso', 'point', 'struct', 'dataclass';"
+                f" got {return_value!r}"
+            )
+
+        if value is None:
+            if return_value == "point":
+                return {"lat": None, "lon": None}
+            if return_value == "struct":
+                return {
+                    "gtype": None, "wkb": None, "srid": None,
+                    "country_iso": None, "country_name": None,
+                    "city_iso": None, "city_name": None,
+                    "key": None, "name": None, "eic": None,
+                    "tz": None, "ccy": None, "lat": None, "lon": None,
+                }
+            return None
+
+        (
+            wkb_to_wkb,
+            wkb_to_country_iso,
+            wkb_to_city_iso,
+            wkb_to_gtype,
+            wkb_to_key,
+            wkb_to_name,
+            wkb_to_country_name,
+            wkb_to_city_name,
+            wkb_to_eic,
+            wkb_to_tz,
+            wkb_to_ccy,
+            wkb_to_srid,
+            wkb_to_lat,
+            wkb_to_lon,
+        ) = cls._build_bin_lookup_cache()
+
+        b = bytes(value)
+
+        if return_value == "dataclass":
+            srid = cls._build_bin_lookup_cache()[11].get(b, 4326)  # wkb_to_srid
+            return cls.get_by_geom(b, srid=srid)
+
+        if return_value == "wkb":
+            return wkb_to_wkb.get(b)
+
+        if return_value == "country_iso":
+            return wkb_to_country_iso.get(b)
+
+        if return_value == "city_iso":
+            return wkb_to_city_iso.get(b)
+
+        if return_value == "point":
+            if b not in wkb_to_lat:
+                return {"lat": None, "lon": None}
+            return {"lat": wkb_to_lat[b], "lon": wkb_to_lon[b]}
+
+        # return_value == "struct"
+        if b not in wkb_to_wkb:
+            return {
+                "gtype": None, "wkb": None, "srid": None,
+                "country_iso": None, "country_name": None,
+                "city_iso": None, "city_name": None,
+                "key": None, "name": None, "eic": None,
+                "tz": None, "ccy": None, "lat": None, "lon": None,
+            }
+        return {
+            "gtype": wkb_to_gtype.get(b),
+            "wkb": wkb_to_wkb.get(b),
+            "srid": wkb_to_srid.get(b),
+            "country_iso": wkb_to_country_iso.get(b),
+            "country_name": wkb_to_country_name.get(b),
+            "city_iso": wkb_to_city_iso.get(b),
+            "city_name": wkb_to_city_name.get(b),
+            "key": wkb_to_key.get(b),
+            "name": wkb_to_name.get(b),
+            "eic": wkb_to_eic.get(b),
+            "tz": wkb_to_tz.get(b),
+            "ccy": wkb_to_ccy.get(b),
+            "lat": wkb_to_lat.get(b),
+            "lon": wkb_to_lon.get(b),
+        }
+
     @classmethod
     def _build_output_expr_from_key(
         cls,
@@ -929,7 +1230,3 @@ class GeoZone:
             return col.to_frame().select(expr).to_series()
 
         raise TypeError(f"expected pl.Series | pl.Expr, got {type(col)!r}")
-
-from .geozone_cache import load_geozones
-
-load_geozones()
