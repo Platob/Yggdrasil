@@ -24,5 +24,5 @@ class VersionInfo(NamedTuple):
         return base
 
 
-__version_info__ = VersionInfo(0, 5, 7)
+__version_info__ = VersionInfo(0, 5, 8)
 __version__ = str(__version_info__)
