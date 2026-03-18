@@ -33,6 +33,23 @@ _COORDINATE_RE = re.compile(
     r"\s*$"
 )
 
+_DEFAULT_SRID: int = 4326
+# Prefix prepended to wkb bytes when srid != _DEFAULT_SRID to form the geom
+# cache key.  Format: b"\x00" + srid as 4-byte big-endian unsigned int.
+_SRID_PREFIX_LEN: int = 5
+
+
+def _geom_cache_key(wkb: bytes, srid: int) -> bytes:
+    """Return the key used in CACHE_BY_GEOM.
+
+    For the common case (srid == 4326) the key is the raw WKB bytes, saving
+    a tuple allocation per entry.  For other SRIDs a compact 5-byte prefix is
+    prepended so there is no collision with standard 21-byte WKB POINT values.
+    """
+    if srid == _DEFAULT_SRID:
+        return wkb
+    return b"\x00" + struct.pack(">I", srid) + wkb
+
 
 def _point_wkb(lat: float, lon: float) -> bytes:
     # WKB POINT, little-endian, geometry type 1
@@ -60,6 +77,59 @@ def _parse_point_wkb(wkb: bytes) -> tuple[float, float]:
     return float(lat), float(lon)
 
 
+class _ZoneMeta:
+    """Compact per-zone metadata record used in lookup caches.
+
+    Using explicit ``__slots__`` avoids the per-instance ``__dict__`` overhead
+    that a plain dataclass or namedtuple would carry.  One ``_ZoneMeta`` object
+    consolidates what was previously spread across 12–14 separate dicts,
+    reducing total allocation count dramatically.
+    """
+    __slots__ = (
+        "wkb", "srid", "gtype",
+        "key", "name", "eic",
+        "country_iso", "country_name",
+        "city_iso", "city_name",
+        "tz", "ccy",
+    )
+
+    def __init__(
+        self,
+        wkb: bytes,
+        srid: int,
+        gtype: int,
+        key: Optional[str],
+        name: Optional[str],
+        eic: Optional[str],
+        country_iso: Optional[str],
+        country_name: Optional[str],
+        city_iso: Optional[str],
+        city_name: Optional[str],
+        tz: Optional[str],
+        ccy: Optional[str],
+    ) -> None:
+        self.wkb          = wkb
+        self.srid         = srid
+        self.gtype        = gtype
+        self.key          = key
+        self.name         = name
+        self.eic          = eic
+        self.country_iso  = country_iso
+        self.country_name = country_name
+        self.city_iso     = city_iso
+        self.city_name    = city_name
+        self.tz           = tz
+        self.ccy          = ccy
+
+    @property
+    def lat(self) -> float:
+        return _parse_point_wkb(self.wkb)[0]
+
+    @property
+    def lon(self) -> float:
+        return _parse_point_wkb(self.wkb)[1]
+
+
 @dataclass(frozen=True, slots=True)
 class GeoZone:
     gtype: int
@@ -85,10 +155,11 @@ class GeoZone:
     lat: float = 0.0
     lon: float = 0.0
 
-    CACHE_BY_KEY: ClassVar[dict[str, "GeoZone"]] = {}
-    CACHE_BY_NAME: ClassVar[dict[str, "GeoZone"]] = {}
-    CACHE_BY_EIC: ClassVar[dict[str, "GeoZone"]] = {}
-    CACHE_BY_GEOM: ClassVar[dict[tuple[int, bytes], "GeoZone"]] = {}
+    # CACHE_BY_GEOM key: raw wkb bytes for srid==4326; prefixed bytes otherwise.
+    # CACHE_BY_EIC removed – EICs are already stored in CACHE_BY_KEY.
+    CACHE_BY_KEY:  ClassVar[dict[str, "GeoZone"]]   = {}
+    CACHE_BY_NAME: ClassVar[dict[str, "GeoZone"]]   = {}
+    CACHE_BY_GEOM: ClassVar[dict[bytes, "GeoZone"]] = {}
 
     def __post_init__(self) -> None:
         if not isinstance(self.wkb, (bytes, bytearray, memoryview)):
@@ -136,8 +207,9 @@ class GeoZone:
         object.__setattr__(self, "lon", parsed_lon)
 
     @property
-    def geom_key(self) -> tuple[int, bytes]:
-        return self.srid, self.wkb
+    def geom_key(self) -> bytes:
+        """Cache key for CACHE_BY_GEOM (flat bytes; no tuple allocation)."""
+        return _geom_cache_key(self.wkb, self.srid)
 
     @property
     def point(self) -> tuple[float, float]:
@@ -197,7 +269,7 @@ class GeoZone:
             keys.add(zone.key)
 
         if zone.eic:
-            cls.CACHE_BY_EIC[zone.eic] = zone
+            # EIC is registered in CACHE_BY_KEY (no separate CACHE_BY_EIC).
             keys.add(zone.eic)
 
         if zone.gtype == GeoZoneType.COUNTRY and zone.country_iso:
@@ -224,11 +296,11 @@ class GeoZone:
 
     @classmethod
     def get_by_geom(cls, wkb: bytes, srid: int = 4326) -> Optional["GeoZone"]:
-        return cls.CACHE_BY_GEOM.get((int(srid), bytes(wkb)))
+        return cls.CACHE_BY_GEOM.get(_geom_cache_key(bytes(wkb), int(srid)))
 
     @classmethod
     def get_by_coordinates(cls, lat: float, lon: float, srid: int = 4326) -> Optional["GeoZone"]:
-        return cls.CACHE_BY_GEOM.get((int(srid), _point_wkb(float(lat), float(lon))))
+        return cls.CACHE_BY_GEOM.get(_geom_cache_key(_point_wkb(float(lat), float(lon)), int(srid)))
 
     @classmethod
     def get_by_key(cls, key: str) -> Optional["GeoZone"]:
@@ -240,13 +312,13 @@ class GeoZone:
 
     @classmethod
     def get_by_eic(cls, eic: str) -> Optional["GeoZone"]:
-        return cls.CACHE_BY_EIC.get(eic.strip().upper())
+        # EIC keys live in CACHE_BY_KEY; no separate dict needed.
+        return cls.CACHE_BY_KEY.get(eic.strip().upper())
 
     @classmethod
     def clear_cache(cls) -> None:
         cls.CACHE_BY_KEY.clear()
         cls.CACHE_BY_NAME.clear()
-        cls.CACHE_BY_EIC.clear()
         cls.CACHE_BY_GEOM.clear()
         cls._build_bidding_zone_regex_cache.cache_clear()
         cls._build_bin_lookup_cache.cache_clear()
@@ -290,10 +362,6 @@ class GeoZone:
         s_upper = s.upper()
 
         zone = cls.CACHE_BY_KEY.get(s_upper)
-        if zone is not None:
-            return zone
-
-        zone = cls.CACHE_BY_EIC.get(s_upper)
         if zone is not None:
             return zone
 
@@ -423,32 +491,35 @@ class GeoZone:
     def _build_bidding_zone_regex_cache(
         cls,
     ) -> tuple[
-        list[str],                    # chunk_patterns (one per ≤200-alias group)
-        dict[str, str],               # alias_to_key
-        dict[str, bytes],             # key_to_wkb
-        dict[str, Optional[str]],     # key_to_country_iso
-        dict[str, Optional[str]],     # key_to_city_iso
-        dict[str, int],               # key_to_gtype
-        dict[str, Optional[str]],     # key_to_name
-        dict[str, Optional[str]],     # key_to_country_name
-        dict[str, Optional[str]],     # key_to_city_name
-        dict[str, Optional[str]],     # key_to_eic
-        dict[str, Optional[str]],     # key_to_tz
-        dict[str, Optional[str]],     # key_to_ccy
-        dict[str, int],               # key_to_srid
+        list[str],                # chunk_patterns (one per ≤200-alias group)
+        dict[str, str],           # alias_to_key
+        dict[str, "_ZoneMeta"],   # key_to_meta  (replaces 11 separate field dicts)
     ]:
+        """Build string-key lookup structures used by polars_parse_str.
+
+        Returns a compact triple instead of the previous 13-element tuple:
+        - ``chunk_patterns`` – pre-built regex strings for token-scan pass 2.
+        - ``alias_to_key`` – normalised alias → canonical key.
+        - ``key_to_meta`` – canonical key → :class:`_ZoneMeta` with all fields.
+        """
         alias_to_key: dict[str, str] = {}
-        key_to_wkb: dict[str, bytes] = {}
-        key_to_country_iso: dict[str, Optional[str]] = {}
-        key_to_city_iso: dict[str, Optional[str]] = {}
-        key_to_gtype: dict[str, int] = {}
-        key_to_name: dict[str, Optional[str]] = {}
-        key_to_country_name: dict[str, Optional[str]] = {}
-        key_to_city_name: dict[str, Optional[str]] = {}
-        key_to_eic: dict[str, Optional[str]] = {}
-        key_to_tz: dict[str, Optional[str]] = {}
-        key_to_ccy: dict[str, Optional[str]] = {}
-        key_to_srid: dict[str, int] = {}
+        key_to_meta:  dict[str, _ZoneMeta] = {}
+
+        def _make_meta(zone: "GeoZone", canonical_key: str) -> _ZoneMeta:
+            return _ZoneMeta(
+                wkb=zone.wkb,
+                srid=zone.srid,
+                gtype=zone.gtype,
+                key=canonical_key,
+                name=zone.name,
+                eic=zone.eic,
+                country_iso=zone.country_iso,
+                country_name=zone.country_name,
+                city_iso=zone.city_iso,
+                city_name=zone.city_name,
+                tz=zone.tz,
+                ccy=zone.ccy,
+            )
 
         def _index_zone(zone: "GeoZone") -> None:
             canonical_key = zone.key
@@ -456,17 +527,8 @@ class GeoZone:
                 return
 
             canonical_key = cls._normalize_zone_token_py(canonical_key)
-            key_to_wkb[canonical_key] = zone.wkb
-            key_to_country_iso[canonical_key] = zone.country_iso
-            key_to_city_iso[canonical_key] = zone.city_iso
-            key_to_gtype[canonical_key] = zone.gtype
-            key_to_name[canonical_key] = zone.name
-            key_to_country_name[canonical_key] = zone.country_name
-            key_to_city_name[canonical_key] = zone.city_name
-            key_to_eic[canonical_key] = zone.eic
-            key_to_tz[canonical_key] = zone.tz
-            key_to_ccy[canonical_key] = zone.ccy
-            key_to_srid[canonical_key] = zone.srid
+            if canonical_key not in key_to_meta:
+                key_to_meta[canonical_key] = _make_meta(zone, canonical_key)
 
             raw_aliases: set[str] = {
                 canonical_key,
@@ -506,17 +568,8 @@ class GeoZone:
                 continue
 
             canonical_key = cls._normalize_zone_token_py(zone.key)
-            key_to_wkb[canonical_key] = zone.wkb
-            key_to_country_iso[canonical_key] = zone.country_iso
-            key_to_city_iso[canonical_key] = zone.city_iso
-            key_to_gtype[canonical_key] = zone.gtype
-            key_to_name[canonical_key] = zone.name
-            key_to_country_name[canonical_key] = zone.country_name
-            key_to_city_name[canonical_key] = zone.city_name
-            key_to_eic[canonical_key] = zone.eic
-            key_to_tz[canonical_key] = zone.tz
-            key_to_ccy[canonical_key] = zone.ccy
-            key_to_srid[canonical_key] = zone.srid
+            if canonical_key not in key_to_meta:
+                key_to_meta[canonical_key] = _make_meta(zone, canonical_key)
 
             raw_aliases = {
                 alias,
@@ -553,8 +606,6 @@ class GeoZone:
         #   str.extract() calls, one per chunk of ≤ CHUNK aliases, combined
         #   with pl.coalesce() so only one result is kept.  Each individual
         #   regex is small and safe for the regex engine.
-        #
-        # The combined_pattern is kept for metadata / documentation only.
         sorted_aliases = sorted(alias_to_key.keys(), key=lambda a: (-len(a), a))
 
         # Chunk the sorted aliases into groups to keep each regex small.
@@ -570,19 +621,9 @@ class GeoZone:
         ]
 
         return (
-            chunk_patterns,       # list[str]  (replaces single combined_pattern)
+            chunk_patterns,
             alias_to_key,
-            key_to_wkb,
-            key_to_country_iso,
-            key_to_city_iso,
-            key_to_gtype,
-            key_to_name,
-            key_to_country_name,
-            key_to_city_name,
-            key_to_eic,
-            key_to_tz,
-            key_to_ccy,
-            key_to_srid,
+            key_to_meta,
         )
 
     # ------------------------------------------------------------------
@@ -601,11 +642,7 @@ class GeoZone:
           check each token (longest first) against ``alias_to_key``.  This
           handles free-text strings like ``"Sweden SE1 wind power"``.
         """
-        (
-            _chunk_patterns,
-            alias_to_key,
-            *_rest,
-        ) = cls._build_bidding_zone_regex_cache()
+        _chunk_patterns, alias_to_key, _key_to_meta = cls._build_bidding_zone_regex_cache()
 
         norm = re.sub(r"_+", "_", re.sub(r"[\s\-/|]+", "_", s.strip().upper())).strip("_")
         if not norm:
@@ -636,73 +673,66 @@ class GeoZone:
         canonical_key: Optional[str],
         return_value: "Literal['wkb', 'country_iso', 'city_iso', 'point', 'struct', 'dataclass']",
         *,
-        key_to_wkb: "dict[str, bytes]",
-        key_to_country_iso: "dict[str, Optional[str]]",
-        key_to_city_iso: "dict[str, Optional[str]]",
-        key_to_gtype: "dict[str, int]",
-        key_to_name: "dict[str, Optional[str]]",
-        key_to_country_name: "dict[str, Optional[str]]",
-        key_to_city_name: "dict[str, Optional[str]]",
-        key_to_eic: "dict[str, Optional[str]]",
-        key_to_tz: "dict[str, Optional[str]]",
-        key_to_ccy: "dict[str, Optional[str]]",
-        key_to_srid: "dict[str, int]",
+        key_to_meta: "dict[str, _ZoneMeta]",
     ) -> Any:
         """Return the requested field value for *canonical_key*, or *None*."""
+        _NULL_POINT  = {"lat": None, "lon": None}
+        _NULL_STRUCT = {
+            "gtype": None, "wkb": None, "srid": None,
+            "country_iso": None, "country_name": None,
+            "city_iso": None, "city_name": None,
+            "key": None, "name": None, "eic": None,
+            "tz": None, "ccy": None, "lat": None, "lon": None,
+        }
+
         if canonical_key is None:
             if return_value == "point":
-                return {"lat": None, "lon": None}
+                return _NULL_POINT
             if return_value == "struct":
-                return {
-                    "gtype": None, "wkb": None, "srid": None,
-                    "country_iso": None, "country_name": None,
-                    "city_iso": None, "city_name": None,
-                    "key": None, "name": None, "eic": None,
-                    "tz": None, "ccy": None, "lat": None, "lon": None,
-                }
+                return _NULL_STRUCT
             return None
 
         if return_value == "dataclass":
             return cls.get_by_key(canonical_key)
 
+        meta = key_to_meta.get(canonical_key)
+        if meta is None:
+            if return_value == "point":
+                return _NULL_POINT
+            if return_value == "struct":
+                return _NULL_STRUCT
+            return None
+
         if return_value == "wkb":
-            return key_to_wkb.get(canonical_key)
+            return meta.wkb
 
         if return_value == "country_iso":
-            return key_to_country_iso.get(canonical_key)
+            return meta.country_iso
 
         if return_value == "city_iso":
-            return key_to_city_iso.get(canonical_key)
+            return meta.city_iso
 
         if return_value == "point":
-            wkb = key_to_wkb.get(canonical_key)
-            if wkb is None:
-                return {"lat": None, "lon": None}
-            lat, lon = _parse_point_wkb(wkb)
+            lat, lon = _parse_point_wkb(meta.wkb)
             return {"lat": lat, "lon": lon}
 
         if return_value == "struct":
-            wkb = key_to_wkb.get(canonical_key)
-            if wkb is None:
-                lat_val: Optional[float] = None
-                lon_val: Optional[float] = None
-            else:
-                lat_val, lon_val = _parse_point_wkb(wkb)
+            lat, lon = _parse_point_wkb(meta.wkb)
             return {
-                "gtype": key_to_gtype.get(canonical_key),
-                "wkb": wkb,
-                "srid": key_to_srid.get(canonical_key),
-                "country_iso": key_to_country_iso.get(canonical_key),
-                "country_name": key_to_country_name.get(canonical_key),
-                "city_iso": key_to_city_iso.get(canonical_key),
-                "city_name": key_to_city_name.get(canonical_key),
+                "gtype": meta.gtype,
+                "wkb": meta.wkb,
+                "srid": meta.srid,
+                "country_iso": meta.country_iso,
+                "country_name": meta.country_name,
+                "city_iso": meta.city_iso,
+                "city_name": meta.city_name,
                 "key": canonical_key,
-                "name": key_to_name.get(canonical_key),
-                "eic": key_to_eic.get(canonical_key),
-                "tz": key_to_tz.get(canonical_key),
-                "ccy": key_to_ccy.get(canonical_key),
-                "lat": lat_val,
-                "lon": lon_val,
+                "name": meta.name,
+                "eic": meta.eic,
+                "tz": meta.tz,
+                "ccy": meta.ccy,
+                "lat": lat,
+                "lon": lon,
             }
 
         raise ValueError(
@@ -747,38 +777,10 @@ class GeoZone:
                 }
             return None
 
-        (
-            _chunk_patterns,
-            alias_to_key,
-            key_to_wkb,
-            key_to_country_iso,
-            key_to_city_iso,
-            key_to_gtype,
-            key_to_name,
-            key_to_country_name,
-            key_to_city_name,
-            key_to_eic,
-            key_to_tz,
-            key_to_ccy,
-            key_to_srid,
-        ) = cls._build_bidding_zone_regex_cache()
+        _chunk_patterns, _alias_to_key, key_to_meta = cls._build_bidding_zone_regex_cache()
 
         canonical_key = cls._canonical_key_for_str(value)
-        return cls._zone_field_from_key(
-            canonical_key,
-            return_value,
-            key_to_wkb=key_to_wkb,
-            key_to_country_iso=key_to_country_iso,
-            key_to_city_iso=key_to_city_iso,
-            key_to_gtype=key_to_gtype,
-            key_to_name=key_to_name,
-            key_to_country_name=key_to_country_name,
-            key_to_city_name=key_to_city_name,
-            key_to_eic=key_to_eic,
-            key_to_tz=key_to_tz,
-            key_to_ccy=key_to_ccy,
-            key_to_srid=key_to_srid,
-        )
+        return cls._zone_field_from_key(canonical_key, return_value, key_to_meta=key_to_meta)
 
     @classmethod
     def py_parse_bin(
@@ -822,45 +824,35 @@ class GeoZone:
                 }
             return None
 
-        (
-            wkb_to_wkb,
-            wkb_to_country_iso,
-            wkb_to_city_iso,
-            wkb_to_gtype,
-            wkb_to_key,
-            wkb_to_name,
-            wkb_to_country_name,
-            wkb_to_city_name,
-            wkb_to_eic,
-            wkb_to_tz,
-            wkb_to_ccy,
-            wkb_to_srid,
-            wkb_to_lat,
-            wkb_to_lon,
-        ) = cls._build_bin_lookup_cache()
+        wkb_to_meta, known_wkb = cls._build_bin_lookup_cache()
 
         b = bytes(value)
 
         if return_value == "dataclass":
-            srid = cls._build_bin_lookup_cache()[11].get(b, 4326)  # wkb_to_srid
-            return cls.get_by_geom(b, srid=srid)
+            meta = wkb_to_meta.get(b)
+            if meta is None:
+                return None
+            return cls.get_by_geom(b, srid=meta.srid)
 
         if return_value == "wkb":
-            return wkb_to_wkb.get(b)
+            return b if b in known_wkb else None
+
+        meta = wkb_to_meta.get(b)
 
         if return_value == "country_iso":
-            return wkb_to_country_iso.get(b)
+            return meta.country_iso if meta is not None else None
 
         if return_value == "city_iso":
-            return wkb_to_city_iso.get(b)
+            return meta.city_iso if meta is not None else None
 
         if return_value == "point":
-            if b not in wkb_to_lat:
+            if meta is None:
                 return {"lat": None, "lon": None}
-            return {"lat": wkb_to_lat[b], "lon": wkb_to_lon[b]}
+            lat, lon = _parse_point_wkb(meta.wkb)
+            return {"lat": lat, "lon": lon}
 
         # return_value == "struct"
-        if b not in wkb_to_wkb:
+        if meta is None:
             return {
                 "gtype": None, "wkb": None, "srid": None,
                 "country_iso": None, "country_name": None,
@@ -868,21 +860,22 @@ class GeoZone:
                 "key": None, "name": None, "eic": None,
                 "tz": None, "ccy": None, "lat": None, "lon": None,
             }
+        lat, lon = _parse_point_wkb(meta.wkb)
         return {
-            "gtype": wkb_to_gtype.get(b),
-            "wkb": wkb_to_wkb.get(b),
-            "srid": wkb_to_srid.get(b),
-            "country_iso": wkb_to_country_iso.get(b),
-            "country_name": wkb_to_country_name.get(b),
-            "city_iso": wkb_to_city_iso.get(b),
-            "city_name": wkb_to_city_name.get(b),
-            "key": wkb_to_key.get(b),
-            "name": wkb_to_name.get(b),
-            "eic": wkb_to_eic.get(b),
-            "tz": wkb_to_tz.get(b),
-            "ccy": wkb_to_ccy.get(b),
-            "lat": wkb_to_lat.get(b),
-            "lon": wkb_to_lon.get(b),
+            "gtype": meta.gtype,
+            "wkb": meta.wkb,
+            "srid": meta.srid,
+            "country_iso": meta.country_iso,
+            "country_name": meta.country_name,
+            "city_iso": meta.city_iso,
+            "city_name": meta.city_name,
+            "key": meta.key,
+            "name": meta.name,
+            "eic": meta.eic,
+            "tz": meta.tz,
+            "ccy": meta.ccy,
+            "lat": lat,
+            "lon": lon,
         }
 
     @classmethod
@@ -890,40 +883,49 @@ class GeoZone:
         cls,
         ck: "pl.Expr",
         return_value: "Literal['wkb', 'country_iso', 'city_iso', 'point', 'struct']",
-        key_to_wkb: "dict[str, bytes]",
-        key_to_country_iso: "dict[str, Optional[str]]",
-        key_to_city_iso: "dict[str, Optional[str]]",
-        key_to_gtype: "dict[str, int]",
-        key_to_name: "dict[str, Optional[str]]",
-        key_to_country_name: "dict[str, Optional[str]]",
-        key_to_city_name: "dict[str, Optional[str]]",
-        key_to_eic: "dict[str, Optional[str]]",
-        key_to_tz: "dict[str, Optional[str]]",
-        key_to_ccy: "dict[str, Optional[str]]",
-        key_to_srid: "dict[str, int]",
+        key_to_meta: "dict[str, _ZoneMeta]",
     ) -> "pl.Expr":
-        """Shared expression builder: canonical-key Expr → output Expr."""
+        """Shared expression builder: canonical-key Expr → output Expr.
+
+        Derives flat ``dict[str, V]`` projections from *key_to_meta* on demand;
+        these small per-field dicts are only materialised when needed for the
+        chosen *return_value* and are not cached themselves.
+        """
         import polars as pl
 
         if return_value == "wkb":
+            key_to_wkb = {k: m.wkb for k, m in key_to_meta.items()}
             return ck.replace_strict(key_to_wkb, default=None).cast(pl.Binary)
 
         if return_value == "country_iso":
+            key_to_country_iso = {k: m.country_iso for k, m in key_to_meta.items()}
             return ck.replace_strict(key_to_country_iso, default=None).cast(pl.Utf8)
 
         if return_value == "city_iso":
+            key_to_city_iso = {k: m.city_iso for k, m in key_to_meta.items()}
             return ck.replace_strict(key_to_city_iso, default=None).cast(pl.Utf8)
 
         if return_value == "point":
-            key_to_lat = {k: _parse_point_wkb(v)[0] for k, v in key_to_wkb.items()}
-            key_to_lon = {k: _parse_point_wkb(v)[1] for k, v in key_to_wkb.items()}
+            key_to_lat = {k: _parse_point_wkb(m.wkb)[0] for k, m in key_to_meta.items()}
+            key_to_lon = {k: _parse_point_wkb(m.wkb)[1] for k, m in key_to_meta.items()}
             lat_expr = ck.replace_strict(key_to_lat, default=None).cast(pl.Float64)
             lon_expr = ck.replace_strict(key_to_lon, default=None).cast(pl.Float64)
             return pl.struct(lat=lat_expr, lon=lon_expr)
 
         if return_value == "struct":
-            key_to_lat = {k: _parse_point_wkb(v)[0] for k, v in key_to_wkb.items()}
-            key_to_lon = {k: _parse_point_wkb(v)[1] for k, v in key_to_wkb.items()}
+            key_to_wkb         = {k: m.wkb          for k, m in key_to_meta.items()}
+            key_to_gtype       = {k: m.gtype         for k, m in key_to_meta.items()}
+            key_to_srid        = {k: m.srid          for k, m in key_to_meta.items()}
+            key_to_country_iso = {k: m.country_iso   for k, m in key_to_meta.items()}
+            key_to_country_name= {k: m.country_name  for k, m in key_to_meta.items()}
+            key_to_city_iso    = {k: m.city_iso      for k, m in key_to_meta.items()}
+            key_to_city_name   = {k: m.city_name     for k, m in key_to_meta.items()}
+            key_to_name        = {k: m.name          for k, m in key_to_meta.items()}
+            key_to_eic         = {k: m.eic           for k, m in key_to_meta.items()}
+            key_to_tz          = {k: m.tz            for k, m in key_to_meta.items()}
+            key_to_ccy         = {k: m.ccy           for k, m in key_to_meta.items()}
+            key_to_lat         = {k: _parse_point_wkb(m.wkb)[0] for k, m in key_to_meta.items()}
+            key_to_lon         = {k: _parse_point_wkb(m.wkb)[1] for k, m in key_to_meta.items()}
             return pl.struct(
                 # Field order mirrors GeoZone dataclass declaration exactly.
                 # aliases is a tuple[str, ...] and has no scalar Polars equivalent
@@ -972,21 +974,7 @@ class GeoZone:
         """
         import polars as pl
 
-        (
-            chunk_patterns,
-            alias_to_key,
-            key_to_wkb,
-            key_to_country_iso,
-            key_to_city_iso,
-            key_to_gtype,
-            key_to_name,
-            key_to_country_name,
-            key_to_city_name,
-            key_to_eic,
-            key_to_tz,
-            key_to_ccy,
-            key_to_srid,
-        ) = cls._build_bidding_zone_regex_cache()
+        chunk_patterns, alias_to_key, key_to_meta = cls._build_bidding_zone_regex_cache()
 
         def _normalize_expr(expr: pl.Expr) -> pl.Expr:
             return (
@@ -1023,9 +1011,7 @@ class GeoZone:
             return cls._build_output_expr_from_key(
                 _canonical_key_expr(expr),
                 return_value,
-                key_to_wkb, key_to_country_iso, key_to_city_iso,
-                key_to_gtype, key_to_name, key_to_country_name, key_to_city_name,
-                key_to_eic, key_to_tz, key_to_ccy, key_to_srid,
+                key_to_meta,
             )
 
         if isinstance(col, pl.Expr):
@@ -1044,96 +1030,30 @@ class GeoZone:
     def _build_bin_lookup_cache(
         cls,
     ) -> tuple[
-        dict[bytes, bytes],            # wkb → canonical_wkb  (identity, for wkb pass-through)
-        dict[bytes, Optional[str]],    # wkb → country_iso
-        dict[bytes, Optional[str]],    # wkb → city_iso
-        dict[bytes, int],              # wkb → gtype
-        dict[bytes, Optional[str]],    # wkb → key
-        dict[bytes, Optional[str]],    # wkb → name
-        dict[bytes, Optional[str]],    # wkb → country_name
-        dict[bytes, Optional[str]],    # wkb → city_name
-        dict[bytes, Optional[str]],    # wkb → eic
-        dict[bytes, Optional[str]],    # wkb → tz
-        dict[bytes, Optional[str]],    # wkb → ccy
-        dict[bytes, int],              # wkb → srid
-        dict[bytes, float],            # wkb → lat
-        dict[bytes, float],            # wkb → lon
+        dict[bytes, "_ZoneMeta"],   # wkb → _ZoneMeta  (replaces 12 separate field dicts)
+        frozenset[bytes],           # set of known canonical WKB values (replaces identity wkb→wkb dict)
     ]:
         """Build direct wkb→field maps.
 
         WKB is the unique key for every registered zone, so all field lookups
         for polars_parse_bin are a single replace_strict on the Binary column —
         no intermediate string canonical-key step required.
+
+        Returns a compact pair instead of the previous 14-element tuple:
+        - ``wkb_to_meta`` – wkb bytes → :class:`_ZoneMeta`.
+        - ``known_wkb`` – frozenset of all registered WKB values (for the
+          pass-through ``"wkb"`` return mode without an identity dict).
         """
-        (
-            _chunk_patterns,
-            _alias_to_key,
-            key_to_wkb,
-            key_to_country_iso,
-            key_to_city_iso,
-            key_to_gtype,
-            key_to_name,
-            key_to_country_name,
-            key_to_city_name,
-            key_to_eic,
-            key_to_tz,
-            key_to_ccy,
-            key_to_srid,
-        ) = cls._build_bidding_zone_regex_cache()
+        _chunk_patterns, _alias_to_key, key_to_meta = cls._build_bidding_zone_regex_cache()
 
-        # Invert key→wkb to get the canonical WKB for every canonical key.
-        # (Multiple keys may map to the same zone/WKB; the canonical key is the
-        # one stored in key_to_wkb, so inversion is 1-to-1 at the zone level.)
-        wkb_to_wkb:          dict[bytes, bytes]           = {}
-        wkb_to_country_iso:  dict[bytes, Optional[str]]   = {}
-        wkb_to_city_iso:     dict[bytes, Optional[str]]   = {}
-        wkb_to_gtype:        dict[bytes, int]              = {}
-        wkb_to_key:          dict[bytes, Optional[str]]   = {}
-        wkb_to_name:         dict[bytes, Optional[str]]   = {}
-        wkb_to_country_name: dict[bytes, Optional[str]]   = {}
-        wkb_to_city_name:    dict[bytes, Optional[str]]   = {}
-        wkb_to_eic:          dict[bytes, Optional[str]]   = {}
-        wkb_to_tz:           dict[bytes, Optional[str]]   = {}
-        wkb_to_ccy:          dict[bytes, Optional[str]]   = {}
-        wkb_to_srid:         dict[bytes, int]              = {}
-        wkb_to_lat:          dict[bytes, float]            = {}
-        wkb_to_lon:          dict[bytes, float]            = {}
+        wkb_to_meta: dict[bytes, _ZoneMeta] = {}
 
-        for k, wkb in key_to_wkb.items():
-            if wkb in wkb_to_wkb:
-                continue  # already indexed (multiple keys → same zone)
-            lat, lon = _parse_point_wkb(wkb)
-            wkb_to_wkb[wkb]          = wkb
-            wkb_to_country_iso[wkb]  = key_to_country_iso.get(k)
-            wkb_to_city_iso[wkb]     = key_to_city_iso.get(k)
-            wkb_to_gtype[wkb]        = key_to_gtype[k]
-            wkb_to_key[wkb]          = k
-            wkb_to_name[wkb]         = key_to_name.get(k)
-            wkb_to_country_name[wkb] = key_to_country_name.get(k)
-            wkb_to_city_name[wkb]    = key_to_city_name.get(k)
-            wkb_to_eic[wkb]          = key_to_eic.get(k)
-            wkb_to_tz[wkb]           = key_to_tz.get(k)
-            wkb_to_ccy[wkb]          = key_to_ccy.get(k)
-            wkb_to_srid[wkb]         = key_to_srid[k]
-            wkb_to_lat[wkb]          = lat
-            wkb_to_lon[wkb]          = lon
+        for _k, meta in key_to_meta.items():
+            wkb = meta.wkb
+            if wkb not in wkb_to_meta:
+                wkb_to_meta[wkb] = meta
 
-        return (
-            wkb_to_wkb,
-            wkb_to_country_iso,
-            wkb_to_city_iso,
-            wkb_to_gtype,
-            wkb_to_key,
-            wkb_to_name,
-            wkb_to_country_name,
-            wkb_to_city_name,
-            wkb_to_eic,
-            wkb_to_tz,
-            wkb_to_ccy,
-            wkb_to_srid,
-            wkb_to_lat,
-            wkb_to_lon,
-        )
+        return wkb_to_meta, frozenset(wkb_to_meta)
 
     @classmethod
     def polars_parse_bin(
@@ -1161,46 +1081,51 @@ class GeoZone:
         """
         import polars as pl
 
-        (
-            wkb_to_wkb,
-            wkb_to_country_iso,
-            wkb_to_city_iso,
-            wkb_to_gtype,
-            wkb_to_key,
-            wkb_to_name,
-            wkb_to_country_name,
-            wkb_to_city_name,
-            wkb_to_eic,
-            wkb_to_tz,
-            wkb_to_ccy,
-            wkb_to_srid,
-            wkb_to_lat,
-            wkb_to_lon,
-        ) = cls._build_bin_lookup_cache()
+        wkb_to_meta, known_wkb = cls._build_bin_lookup_cache()
 
         def _build_expr(expr: pl.Expr) -> pl.Expr:
             # Cast once; every branch does a single replace_strict on raw WKB.
             b = expr.cast(pl.Binary)
 
             if return_value == "wkb":
-                return b.replace_strict(wkb_to_wkb, default=None).cast(pl.Binary)
+                # Pass-through: keep value when known, else null.
+                wkb_identity = {w: w for w in known_wkb}
+                return b.replace_strict(wkb_identity, default=None).cast(pl.Binary)
 
             if return_value == "country_iso":
+                wkb_to_country_iso = {w: m.country_iso for w, m in wkb_to_meta.items()}
                 return b.replace_strict(wkb_to_country_iso, default=None).cast(pl.Utf8)
 
             if return_value == "city_iso":
+                wkb_to_city_iso = {w: m.city_iso for w, m in wkb_to_meta.items()}
                 return b.replace_strict(wkb_to_city_iso, default=None).cast(pl.Utf8)
 
             if return_value == "point":
+                wkb_to_lat = {w: _parse_point_wkb(w)[0] for w in known_wkb}
+                wkb_to_lon = {w: _parse_point_wkb(w)[1] for w in known_wkb}
                 lat_expr = b.replace_strict(wkb_to_lat, default=None).cast(pl.Float64)
                 lon_expr = b.replace_strict(wkb_to_lon, default=None).cast(pl.Float64)
                 return pl.struct(lat=lat_expr, lon=lon_expr)
 
             if return_value == "struct":
+                wkb_to_gtype        = {w: m.gtype        for w, m in wkb_to_meta.items()}
+                wkb_identity        = {w: w               for w in known_wkb}
+                wkb_to_srid         = {w: m.srid         for w, m in wkb_to_meta.items()}
+                wkb_to_country_iso  = {w: m.country_iso  for w, m in wkb_to_meta.items()}
+                wkb_to_country_name = {w: m.country_name for w, m in wkb_to_meta.items()}
+                wkb_to_city_iso     = {w: m.city_iso     for w, m in wkb_to_meta.items()}
+                wkb_to_city_name    = {w: m.city_name    for w, m in wkb_to_meta.items()}
+                wkb_to_key          = {w: m.key          for w, m in wkb_to_meta.items()}
+                wkb_to_name         = {w: m.name         for w, m in wkb_to_meta.items()}
+                wkb_to_eic          = {w: m.eic          for w, m in wkb_to_meta.items()}
+                wkb_to_tz           = {w: m.tz           for w, m in wkb_to_meta.items()}
+                wkb_to_ccy          = {w: m.ccy          for w, m in wkb_to_meta.items()}
+                wkb_to_lat          = {w: _parse_point_wkb(w)[0] for w in known_wkb}
+                wkb_to_lon          = {w: _parse_point_wkb(w)[1] for w in known_wkb}
                 return pl.struct(
                     # Field order mirrors GeoZone dataclass declaration exactly.
                     gtype=b.replace_strict(wkb_to_gtype, default=None).cast(pl.Int32),
-                    wkb=b.replace_strict(wkb_to_wkb, default=None).cast(pl.Binary),
+                    wkb=b.replace_strict(wkb_identity, default=None).cast(pl.Binary),
                     srid=b.replace_strict(wkb_to_srid, default=None).cast(pl.Int32),
                     country_iso=b.replace_strict(wkb_to_country_iso, default=None).cast(pl.Utf8),
                     country_name=b.replace_strict(wkb_to_country_name, default=None).cast(pl.Utf8),

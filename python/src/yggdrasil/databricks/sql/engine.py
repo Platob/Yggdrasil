@@ -34,6 +34,7 @@ from yggdrasil.arrow.cast import arrow_field_to_schema
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
+from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import SaveMode, FileFormat
 from .statement_result import StatementResult
 from .table import Table
@@ -336,8 +337,12 @@ class SQLEngine(DatabricksService):
         """
         # --- Engine auto-detection ---
         if not engine:
-            if self.is_in_databricks_environment():
+            spark_session = PyEnv.spark_session(create=False, install_spark=False)
+
+            if spark_session is not None:
                 engine = "spark"
+            else:
+                engine = "api"
 
         statement = statement.strip()
 
@@ -351,15 +356,13 @@ class SQLEngine(DatabricksService):
 
         # --- Spark path ---
         if engine == "spark":
-            from ...spark.lib import pyspark_sql
-
-            spark_session = pyspark_sql.SparkSession.getActiveSession()
+            spark_session = PyEnv.spark_session(create=False, install_spark=True)
             if spark_session is None:
                 raise ValueError("No spark session found to run sql query")
 
             logger.debug("SPARK SQL executing query:\n%s", statement)
 
-            df: pyspark_sql.DataFrame = spark_session.sql(statement)
+            df = spark_session.sql(statement)
             if row_limit:
                 df = df.limit(row_limit)
 
@@ -431,12 +434,8 @@ class SQLEngine(DatabricksService):
     def insert_into(
         self,
         data: Union[
-            pa.Table,
-            pa.RecordBatch,
-            pa.RecordBatchReader,
-            dict,
-            list,
-            str,
+            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
+            dict, list, str,
             "pandas.DataFrame",
             "polars.DataFrame",
             "pyspark.sql.DataFrame",

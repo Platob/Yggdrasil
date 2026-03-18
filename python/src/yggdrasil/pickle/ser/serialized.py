@@ -165,7 +165,21 @@ class Serialized(ABC, Generic[T]):
             found = Tags.get_class_from_type(type(obj))
 
             if found is not None:
-                return found.from_python_object(obj, metadata=metadata, codec=codec)
+                result = found.from_python_object(obj, metadata=metadata, codec=codec)
+                if result is not None:
+                    return result
+
+        # isinstance-based routing for logging objects whose concrete type may
+        # be a third-party subclass (e.g. pip's VerboseLogger) that is not
+        # registered in TYPES and whose __module__ is not "logging".
+        import logging as _logging
+        if isinstance(obj, (_logging.Logger, _logging.Handler, _logging.Formatter, _logging.LogRecord)):
+            from yggdrasil.pickle.ser.logging import LoggingSerialized as _LoggingSerialized
+            out = _LoggingSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
 
         mod, _ = cls.module_and_name(obj, fallback="unknown")
 
@@ -189,6 +203,22 @@ class Serialized(ABC, Generic[T]):
             from yggdrasil.pickle.ser.polars import PolarsSerialized
 
             out = PolarsSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
+        elif mod.startswith("pyspark"):
+            from yggdrasil.pickle.ser.pyspark import PySparkSerialized
+
+            out = PySparkSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
+        elif mod == "logging" or mod.startswith("logging."):
+            from yggdrasil.pickle.ser.logging import LoggingSerialized
+
+            out = LoggingSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:
                 if is_obj:
                     Tags.register_class(out.__class__, pytype=type(obj))

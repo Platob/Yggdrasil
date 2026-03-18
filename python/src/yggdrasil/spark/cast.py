@@ -370,15 +370,25 @@ def _arrow_type_to_metadata(arrow_type: ArrowDataType) -> dict[str, str]:
         meta["value_type"] = str(arrow_type.value_type)
 
     # --- Variable list / large list ---
-    elif pat.is_list(arrow_type) or pat.is_large_list(arrow_type):
+    elif pat.is_large_list(arrow_type):
         meta["value_type"] = str(arrow_type.value_type)
-        if pat.is_large_list(arrow_type):
-            meta["large"] = "true"
+        meta["large"] = "true"
+    elif pat.is_list(arrow_type):
+        # Plain list maps perfectly to Spark ArrayType – only store value_type
+        # when the element type itself is lossy (i.e. needs __arrow__ metadata).
+        child_meta = _arrow_type_to_metadata(arrow_type.value_type)
+        if {k for k in child_meta if k != "arrow_type_id"}:
+            meta["value_type"] = str(arrow_type.value_type)
 
     # --- Map ---
     elif pat.is_map(arrow_type):
-        meta["key_type"]  = str(arrow_type.key_type)
-        meta["item_type"] = str(arrow_type.item_type)
+        # Only store key/item types when they are lossy.
+        key_extra  = {k for k in _arrow_type_to_metadata(arrow_type.key_type)  if k != "arrow_type_id"}
+        item_extra = {k for k in _arrow_type_to_metadata(arrow_type.item_type) if k != "arrow_type_id"}
+        if key_extra:
+            meta["key_type"]  = str(arrow_type.key_type)
+        if item_extra:
+            meta["item_type"] = str(arrow_type.item_type)
 
     # --- Unsigned integers (Spark widens these; record sign) ---
     elif arrow_type in (pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64()):
@@ -601,8 +611,12 @@ def arrow_field_to_spark_field(
         }
 
     # Capture Arrow-specific type attributes that Spark cannot represent natively.
+    # Only store the metadata when there are attributes beyond the fallback
+    # ``arrow_type_id`` string – types that map perfectly to Spark primitives
+    # need no extra metadata, and including it would break StructField equality.
     arrow_meta = _arrow_type_to_metadata(field.type)
-    if arrow_meta:
+    extra_keys = {k for k in arrow_meta if k != "arrow_type_id"}
+    if extra_keys:
         # Store as a compact JSON string; Spark metadata values must be strings.
         metadata[_ARROW_META_KEY] = json.dumps(arrow_meta, separators=(",", ":"))
 

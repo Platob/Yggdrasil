@@ -245,7 +245,8 @@ class TestConstructorNormalisation:
     def test_geom_key_property(self) -> None:
         wkb = _make_point_wkb(10.0, 20.0)
         zone = GeoZone(gtype=GeoZoneType.COUNTRY, wkb=wkb, srid=4326)
-        assert zone.geom_key == (4326, wkb)
+        # For the default SRID (4326) the key is just the raw WKB bytes (no tuple).
+        assert zone.geom_key == wkb
 
 
 # ---------------------------------------------------------------------------

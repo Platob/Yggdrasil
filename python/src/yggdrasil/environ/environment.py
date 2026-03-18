@@ -1,35 +1,4 @@
-"""
-pyenv.py — Thin wrapper around a Python interpreter for environment management.
-
-Provides :class:`PyEnv`, a dataclass that anchors all package-management and
-subprocess-execution operations to a single Python interpreter path. It
-preferentially delegates to ``uv`` for speed but falls back to ``pip`` / bare
-``python`` when ``uv`` is unavailable or explicitly disabled.
-
-Typical usage
--------------
-::
-
-    # Use the current interpreter (singleton)
-    env = PyEnv.current()
-    env.install("pyarrow", "pandas")
-
-    # Resolve or create a named venv
-    env = PyEnv.get_or_create("3.12", packages=["pyarrow"])
-
-    # Execute arbitrary Python in a subprocess
-    env.run_python_code("import pyarrow; print(pyarrow.__version__)")
-
-Module-level globals
---------------------
-CURRENT_PYENV : PyEnv | None
-    Singleton for the running interpreter; populated on first call to
-    :meth:`PyEnv.current`.
-
-PIP_MODULE_NAME_MAPPINGS : dict[str, str]
-    Maps Python import names to their pip distribution names where they differ
-    (e.g. ``'yaml'`` → ``'PyYAML'``).
-"""
+# yggdrasil.environ.environment
 
 from __future__ import annotations
 
@@ -45,12 +14,16 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, TYPE_CHECKING
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.version import VersionInfo
+
 from .system_command import SystemCommand
 from .userinfo import UserInfo
+
+if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
 
 __all__ = [
     "runtime_import_module",
@@ -703,6 +676,37 @@ class PyEnv:
             return self._version_info
         except Exception as exc:
             raise RuntimeError(f"Failed to get version info for Python at {self.python_path}: {exc}") from exc
+
+    @classmethod
+    def spark_session(
+        cls,
+        create: bool = True,
+        import_error: bool = True,
+        install_spark: bool = True,
+    ) -> "SparkSession | None":
+        try:
+            from pyspark.sql import SparkSession
+        except ImportError as exc:
+            if not install_spark and import_error:
+                raise ImportError("pyspark is not installed in this environment") from exc
+
+            if not install_spark:
+                return None
+
+            runtime_import_module(
+                module_name="pyspark", pip_name="pyspark", install=True
+            )
+            from pyspark.sql import SparkSession
+
+        active = SparkSession.getActiveSession()
+
+        if active is not None:
+            return active
+
+        if create:
+            return SparkSession.builder.getOrCreate()
+
+        return None
 
     # ---------------------------------------------------------------------
     # uv resolution / runtime installation

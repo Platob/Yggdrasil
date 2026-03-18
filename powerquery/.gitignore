@@ -1,0 +1,7 @@
+# Built connector
+*.mez
+
+# Power Query SDK build output
+bin/
+obj/
+

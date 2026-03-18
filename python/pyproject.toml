@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.5.10"
+version = "0.5.11"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -78,6 +78,9 @@ Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://github.com/Platob/Yggdrasil"
 
+[project.scripts]
+ygg-api = "yggdrasil.fastapi:main"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 license-files = ["LICENSE"]
@@ -86,8 +89,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# If your import package is yggdrasil (seems likely from yggenv entrypoint),
-# ship the PEP 561 marker file. Put `py.typed` inside src/yggdrasil/
 [tool.setuptools.package-data]
 yggdrasil = ["py.typed"]
 

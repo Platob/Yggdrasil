@@ -1,3 +1,3 @@
-from .lib import fastapi
+from .app import app, create_app
 
-from fastapi import * # type: ignore
+__all__ = ["app", "create_app"]

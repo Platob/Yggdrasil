@@ -18,11 +18,12 @@ class Tags:
     -------------------------
     0..99    : primitive / logical scalars
     100..199 : collections
-    200..299 : system / complex / runtime objects
+    200..299 : system / complex / runtime objects  (logging: 216–219)
     300..399 : framework-specific internal objects
     400..499 : pyarrow
     500..599 : pandas
     600..699 : polars
+    700..799 : pyspark
     """
 
     # ------------------------------------------------------------------
@@ -46,6 +47,7 @@ class Tags:
     CATEGORY_ARROW: ClassVar[str] = "arrow"
     CATEGORY_PANDAS: ClassVar[str] = "pandas"
     CATEGORY_POLARS: ClassVar[str] = "polars"
+    CATEGORY_PYSPARK: ClassVar[str] = "pyspark"
 
     # ------------------------------------------------------------------
     # category ranges
@@ -58,6 +60,7 @@ class Tags:
     ARROW_BASE: ClassVar[int] = 400
     PANDAS_BASE: ClassVar[int] = 500
     POLARS_BASE: ClassVar[int] = 600
+    PYSPARK_BASE: ClassVar[int] = 700
     CATEGORY_SIZE: ClassVar[int] = 100
 
     # ------------------------------------------------------------------
@@ -134,6 +137,10 @@ class Tags:
     IO_STRING_BUFFER = 213
     URL: int = 214
     METHOD: int = 215
+    LOGGING_LOGGER: int = 216
+    LOGGING_HANDLER: int = 217
+    LOGGING_FORMATTER: int = 218
+    LOGGING_LOG_RECORD: int = 219
 
     # ------------------------------------------------------------------
     # arrow
@@ -171,6 +178,18 @@ class Tags:
     POLARS_DATATYPE: int = 605
 
     # ------------------------------------------------------------------
+    # pyspark
+    # ------------------------------------------------------------------
+
+    PYSPARK_DATAFRAME: int = 700
+    PYSPARK_ROW: int = 701
+    PYSPARK_SCHEMA: int = 702
+    PYSPARK_DATATYPE: int = 703
+    PYSPARK_COLUMN: int = 704
+    PYSPARK_RDD: int = 705
+    PYSPARK_SESSION: int = 706
+
+    # ------------------------------------------------------------------
     # category helpers
     # ------------------------------------------------------------------
 
@@ -196,6 +215,8 @@ class Tags:
             return cls.CATEGORY_PANDAS
         if cid == 6:
             return cls.CATEGORY_POLARS
+        if cid == 7:
+            return cls.CATEGORY_PYSPARK
         return cls.CATEGORY_UNKNOWN
 
     @classmethod
@@ -225,6 +246,10 @@ class Tags:
     @classmethod
     def is_polars(cls, tag: int) -> bool:
         return 600 <= tag < 700
+
+    @classmethod
+    def is_pyspark(cls, tag: int) -> bool:
+        return 700 <= tag < 800
 
     # ------------------------------------------------------------------
     # lookup helpers
@@ -261,12 +286,15 @@ class Tags:
             from yggdrasil.pickle.ser.ios import IOSerialized  # noqa: F401
             from yggdrasil.pickle.ser.pickles import PickleSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logicals import PathSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.logging import LoggingSerialized  # noqa: F401
         elif cid == 4:
             from yggdrasil.pickle.ser.pyarrow import ArrowSerialized  # noqa: F401
         elif cid == 5:
             from yggdrasil.pickle.ser.pandas import PandasSerialized  # noqa: F401
         elif cid == 6:
             from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
+        elif cid == 7:
+            from yggdrasil.pickle.ser.pyspark import PySparkSerialized  # noqa: F401
 
     # ------------------------------------------------------------------
     # class resolution
@@ -356,4 +384,5 @@ def _build_tag_to_name() -> dict[int, str]:
     return out
 
 
+Tags.TAG_TO_NAME = _build_tag_to_name()
 Tags.TAG_TO_NAME = _build_tag_to_name()
