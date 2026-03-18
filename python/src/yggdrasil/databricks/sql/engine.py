@@ -29,13 +29,12 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
-
-from yggdrasil.arrow.cast import arrow_field_to_schema
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import SaveMode, FileFormat
+
 from .statement_result import StatementResult
 from .table import Table
 from .types import quote_ident
@@ -53,7 +52,6 @@ if TYPE_CHECKING:
 __all__ = [
     "SQLEngine",
     "StatementResult",
-    "CreateTablePlan",
 ]
 
 
@@ -86,44 +84,6 @@ def _build_match_condition(
         f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
         for k in match_by
     )
-
-
-@dataclass
-class CreateTablePlan:
-    """
-    A plan produced by :meth:`SQLEngine.create_table`.
-
-    Attributes:
-        sql:
-            The generated CREATE TABLE statement.
-        properties:
-            Final Delta/Databricks table properties emitted into TBLPROPERTIES.
-        warnings:
-            Non-fatal issues detected while building the statement (e.g., invalid column names
-            while column mapping is disabled).
-        arrow_field:
-            Arrow field representing the table schema. Convention:
-              - If struct: its children become table columns.
-              - Otherwise: it represents a single-column table.
-        result:
-            The execution result when ``execute=True`` was used; otherwise None.
-    """
-
-    sql: str
-    properties: dict[str, Any]
-    warnings: list[str]
-    arrow_field: pa.Field
-    result: Optional[StatementResult] = None
-
-    @property
-    def arrow_schema(self) -> pa.Schema:
-        """
-        Return the table schema as an Arrow :class:`pyarrow.Schema`.
-
-        Returns:
-            Arrow schema derived from :attr:`arrow_field` using project conventions.
-        """
-        return arrow_field_to_schema(self.arrow_field, None)
 
 
 @dataclass(frozen=True)
@@ -337,7 +297,9 @@ class SQLEngine(DatabricksService):
         """
         # --- Engine auto-detection ---
         if not engine:
-            spark_session = PyEnv.spark_session(create=False, install_spark=False)
+            spark_session = PyEnv.spark_session(
+                create=False, import_error=False, install_spark=False
+            )
 
             if spark_session is not None:
                 engine = "spark"
