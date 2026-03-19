@@ -1,50 +1,36 @@
 from yggdrasil.mongoengine import *
-
-
-class Plants(Document):
-    plant_name = StringField(required=True)
-    plant_type = StringField(required=True)
-    plant_subtype = StringField(required=True)
-    capacity = FloatField(required=True)
-    lat = FloatField(required=True)
-    lon = FloatField(required=True)
-    country = StringField(required=True)
-    as_of = DateTimeField(required=True)
-
-    def __repr__(self):
-        return f'{self.country} {self.plant_name} {self.plant_type} {self.plant_subtype} {self.capacity} MW ({self.lat} {self.lon})'
-
-    def __str__(self):
-        return f'{self.country} {self.plant_name} {self.plant_type} {self.plant_subtype} {self.capacity} MW ({self.lat} {self.lon})'
-
-    meta = {
-        'db_alias': 'GenCast',
-        'indexes': [
-            {'fields': ['-as_of', '-country', '-plant_type', '-plant_subtype', 'lat', 'lon', '-capacity', 'plant_name'],
-             'unique': True}
-        ]
-    }
+import pandas
+from datamanagement.mongo_gencast.mongo_utils import Plants
 
 
 def resolver():
     connect(
         alias="GenCast",
         db="GenCast",
-        host="mongodb+srv://xxx:xxx@xxx",
+        host="mongodb+srv://mats-weather-prod-rw:q53qqmAjCgcz7NHX@mats-weather-prod-rs0-pl-3.3vnse1.mongodb.net",
     )
 
 @with_mongo_connection(
-    databricks="https://xxx",
+    databricks="https://dbc-82edd6f4-1e97.cloud.databricks.com/",
     resolver=resolver,
 )
-def decorated():
-    import pandas
-    return pandas.DataFrame(Plants.objects())
+def decorated(a: int, b: int = None):
+    pipeline = [
+        {'$sort': {'as_of': -1}},
+        {'$group': {'_id': {'plant_name': '$plant_name', 'plant_subtype': '$plant_subtype',
+                            'capacity': '$capacity', 'lat': '$lat', 'lon': '$lon', 'country': '$country'},
+                    'latest_update': {'$first': '$$ROOT'}}},
+        {'$replaceRoot': {'newRoot': '$latest_update'}}
+    ]
+
+    result = Plants.objects().aggregate(*pipeline)
+    data = pandas.DataFrame(result)
+    return data.drop(columns=['as_of']), a, b
 
 
 class TestDecorator:
 
     def test_decorator(self):
-        result = decorated(__install_modules=["yggdrasil"])
+        result = decorated(1)
 
         assert result is not None

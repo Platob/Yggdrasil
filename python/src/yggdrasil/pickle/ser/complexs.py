@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
 import hashlib
+import importlib
+import importlib.util
 import inspect
+import io
+import logging
 import marshal
 import sys
+import tempfile
 import textwrap
+import zipfile
 from dataclasses import MISSING, dataclass, field as dataclass_field, fields, is_dataclass, make_dataclass
+from pathlib import Path
 from types import CodeType, FunctionType, MethodType, ModuleType
 from typing import Callable, ClassVar, Generic, Mapping
 
@@ -34,11 +42,211 @@ _BUILTINS_KEY = "__builtins__"
 _FORMAT_VERSION = 1
 _PYTHON_VERSION = tuple(sys.version_info[:3])
 
-_MODULE_CACHE: dict[str, ModuleType] = {}
-_CLASS_CACHE: dict[tuple[str, str], type[object]] = {}
-_REFERENCE_FUNCTION_CACHE: dict[tuple[str, str], Callable[..., object]] = {}
-_LOCAL_DATACLASS_CACHE: dict[tuple[object, ...], type[object]] = {}
+_LOGGER = logging.getLogger(__name__)
 
+# Maximum total (filtered) directory size for inline module serialisation.
+_MAX_MODULE_INLINE_BYTES: int = 1024  # 1 Kb
+
+# ---------------------------------------------------------------------------
+# Module whitelist – modules that should always be serialised as a name-only
+# reference because they are part of the stdlib, too large, or expected to
+# already be installed on the target environment.
+# ---------------------------------------------------------------------------
+
+_MODULE_WHITELIST_NAMES: frozenset[str] = frozenset(
+    getattr(sys, "stdlib_module_names", set())
+) | frozenset({
+    # stdlib extras / aliases sometimes not in stdlib_module_names
+    "builtins", "importlib", "encodings", "codecs", "_thread",
+    # well-known third-party packages that should be imported by name
+    "numpy", "np",
+    "pandas", "pd",
+    "polars", "pl",
+    "pyarrow", "pa",
+    "pyspark",
+    "scipy",
+    "sklearn", "scikit_learn",
+    "torch", "torchvision", "torchaudio",
+    "tensorflow", "tf",
+    "jax", "jaxlib",
+    "matplotlib", "mpl_toolkits",
+    "seaborn",
+    "plotly",
+    "bokeh",
+    "PIL", "pillow",
+    "cv2", "opencv",
+    "requests",
+    "httpx",
+    "aiohttp",
+    "flask",
+    "fastapi",
+    "django",
+    "celery",
+    "sqlalchemy",
+    "alembic",
+    "boto3", "botocore",
+    "google", "googleapis",
+    "azure",
+    "databricks",
+    "setuptools", "pip", "wheel", "pkg_resources",
+    "pytest", "unittest", "nose",
+    "cryptography", "jwt", "certifi",
+    "yaml", "pyyaml",
+    "toml", "tomli", "tomllib",
+    "click", "typer", "argparse",
+    "attrs", "pydantic",
+    "grpc", "grpcio", "protobuf",
+    "cython", "cffi", "ctypes",
+    "msgpack",
+    "orjson", "ujson", "simplejson",
+    "dask",
+    "ray",
+    "mlflow",
+    "wandb",
+    "transformers", "tokenizers", "datasets", "huggingface_hub",
+    "langchain", "openai", "anthropic",
+    "IPython", "ipykernel", "ipywidgets", "notebook", "nbformat",
+    "mongoengine", "pymongo", "uv", "yggdrasil"
+})
+
+# ---------------------------------------------------------------------------
+# Module zip cache
+# ---------------------------------------------------------------------------
+# Keyed by (module_name, root_path_str) → zip bytes.
+# Avoids re-zipping the same module directory across repeated serialisations.
+_MODULE_ZIP_CACHE: dict[tuple[str, str], bytes] = {}
+
+# ---------------------------------------------------------------------------
+# Module zip exclusion rules
+# ---------------------------------------------------------------------------
+
+_MODULE_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    "__pycache__",
+    "__pypackages__",
+    ".git", ".svn", ".hg",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis",
+    ".tox", ".nox",
+    ".venv", "venv", "env", ".env",
+    "node_modules",
+    ".idea", ".vscode", ".vs",
+    "build", "dist",
+    ".eggs",
+    "htmlcov", "coverage",
+    ".ipynb_checkpoints",
+    "tmp", "temp",
+})
+
+_MODULE_EXCLUDE_PATTERNS: frozenset[str] = frozenset({
+    "*.egg-info",
+    "*.dist-info",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    "*.so",
+    "*.dylib",
+    "*.dll",
+    "*.o",
+    "*.obj",
+    "*.a",
+    "*.lib",
+    "*.class",
+})
+
+
+def _is_whitelisted_module(module_name: str) -> bool:
+    """Return True if *module_name* (root package) should stay name-only."""
+    root = module_name.split(".", 1)[0]
+    return root in _MODULE_WHITELIST_NAMES
+
+
+def _should_exclude_module_path(parts: tuple[str, ...]) -> bool:
+    """Return True when a relative path inside a module tree should be skipped."""
+    for part in parts:
+        if part in _MODULE_EXCLUDE_DIRS:
+            return True
+        if any(fnmatch.fnmatch(part, p) for p in _MODULE_EXCLUDE_PATTERNS):
+            return True
+    return False
+
+
+def _get_module_root_path(module: ModuleType) -> Path | None:
+    """Return the filesystem root directory of a module/package, or None."""
+    name = module.__name__.split(".", 1)[0]
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ValueError, ModuleNotFoundError):
+        spec = None
+
+    if spec is not None and spec.submodule_search_locations:
+        return Path(next(iter(spec.submodule_search_locations))).resolve()
+
+    mod_file = getattr(module, "__file__", None)
+    if mod_file:
+        p = Path(mod_file).resolve()
+        # single-file module → return its parent so we can grab that one file
+        return p.parent if p.is_file() else p
+
+    return None
+
+
+def _module_dir_filtered_bytes(root: Path) -> int:
+    """Total bytes of files that would be included in a module zip."""
+    total = 0
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel_parts = p.relative_to(root).parts
+        except ValueError:
+            continue
+        if _should_exclude_module_path(rel_parts):
+            continue
+        total += p.stat().st_size
+    return total
+
+
+def _zip_module_to_bytes(root: Path) -> bytes:
+    """Zip a module directory, excluding junk / system files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in root.rglob("*"):
+            if not p.exists():
+                continue
+            arcname = p.relative_to(root)
+            if _should_exclude_module_path(arcname.parts):
+                continue
+            if p.is_dir():
+                if arcname.parts:
+                    zf.writestr(f"{arcname.as_posix().rstrip('/')}/", b"")
+            elif p.is_file():
+                zf.write(filename=p, arcname=arcname.as_posix())
+    return buf.getvalue()
+
+
+def _get_or_zip_module(module_name: str, root: Path) -> bytes:
+    """Return cached module zip bytes, or build and cache them."""
+    key = (module_name, str(root))
+    cached = _MODULE_ZIP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    data = _zip_module_to_bytes(root)
+    _MODULE_ZIP_CACHE[key] = data
+    return data
+
+
+def _extract_module_zip(data: bytes, module_name: str) -> Path:
+    """Extract module zip to a temp directory and add it to sys.path."""
+    root_name = module_name.split(".", 1)[0]
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"ygg_mod_{root_name}_"))
+    pkg_dir = tmp_root / root_name
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
+        zf.extractall(pkg_dir)
+    # Add the parent of the package dir so ``import root_name`` works
+    str_path = str(tmp_root)
+    if str_path not in sys.path:
+        sys.path.insert(0, str_path)
+    return pkg_dir
 
 # ============================================================================
 # Payload tags / compact schemas
@@ -447,7 +655,7 @@ def _module_file_contains_site_packages(module_name: str | None) -> bool:
         return False
 
     try:
-        module = _module_cache_get_or_load(module_name)
+        module = runtime_import_module(module_name, install=False)
     except Exception:
         return False
 
@@ -507,34 +715,17 @@ def _should_use_reference_only_for_callable(obj: object) -> bool:
 
     return _should_reference_only_module(module_name)
 
-
 # ============================================================================
 # Caches
 # ============================================================================
 
-def _module_cache_get_or_load(module_name: str) -> ModuleType:
-    cached = _MODULE_CACHE.get(module_name)
-    if cached is not None:
-        return cached
-
-    module = runtime_import_module(module_name, install=False)
-    _MODULE_CACHE[module_name] = module
-    return module
-
-
 def _class_cache_get_or_load(module_name: str, qualname: str) -> type[object]:
-    key = (module_name, qualname)
-    cached = _CLASS_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    module = _module_cache_get_or_load(module_name)
+    module = runtime_import_module(module_name, install=False)
     obj = _resolve_qualname(module, qualname)
 
     if not isinstance(obj, type):
         raise TypeError(f"Resolved object is not a class: {module_name}.{qualname}")
 
-    _CLASS_CACHE[key] = obj
     return obj
 
 
@@ -915,17 +1106,11 @@ def _load_reference_function_payload(data: bytes) -> Callable[..., object]:
     module_name = _require_str(payload[_FN_REF_MODULE], name="Reference function payload module")
     qualname = _require_str(payload[_FN_REF_QUALNAME], name="Reference function payload qualname")
 
-    key = (module_name, qualname)
-    cached = _REFERENCE_FUNCTION_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    module = _module_cache_get_or_load(module_name)
+    module = runtime_import_module(module_name, install=False)
     obj = _resolve_qualname(module, qualname)
     if not callable(obj):
         raise TypeError(f"Resolved reference is not callable: {module_name}.{qualname}")
 
-    _REFERENCE_FUNCTION_CACHE[key] = obj
     return obj
 
 
@@ -1368,16 +1553,6 @@ def _load_dataclass_class_payload(payload: object) -> type[object]:
 
     fields_payload = _require_list(data[_DC_LOCAL_FIELDS], name="Dataclass local payload fields")
 
-    cache_key = (
-        module_name,
-        qualname,
-        flags,
-        repr(fields_payload),
-    )
-    cached = _LOCAL_DATACLASS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     spec = []
     for item in fields_payload:
         if isinstance(item, dict):
@@ -1429,7 +1604,6 @@ def _load_dataclass_class_payload(payload: object) -> type[object]:
         slots=_flag_on(flags, _DC_SLOTS),
     )
 
-    _LOCAL_DATACLASS_CACHE[cache_key] = cls
     return cls
 
 
@@ -1602,14 +1776,61 @@ class ComplexSerialized(Serialized[T], Generic[T]):
 @dataclass(frozen=True, slots=True)
 class ModuleSerialized(ComplexSerialized[ModuleType]):
     """
-    Module payload is just the utf-8 encoded module name.
+    Module serializer that handles both name-only and full-zip payloads
+    using the same tag (MODULE).  The variant is distinguished by a
+    metadata flag.
+
+    Name-only payload (no metadata / ``M_MODULE_MODE`` absent):
+        utf-8 encoded module name.
+
+    Full payload (``M_MODULE_MODE == b"full"``):
+        nested serialized tuple (version, root_name, module_name, zip_bytes).
     """
     TAG: ClassVar[int] = Tags.MODULE
 
+    # Metadata key that marks a full-zip module payload.
+    M_MODULE_MODE: ClassVar[bytes] = b"module_mode"
+    _MODE_FULL: ClassVar[bytes] = b"full"
+
     @property
     def value(self) -> ModuleType:
+        meta = self.metadata
+        if meta and meta.get(self.M_MODULE_MODE) == self._MODE_FULL:
+            return self._load_full()
+        return self._load_name_only()
+
+    def _load_name_only(self) -> ModuleType:
         module_name = self.decode().decode("utf-8")
-        return _module_cache_get_or_load(module_name)
+        # Whitelisted modules are expected to be available (or installable) on
+        # the target runtime.  Non-whitelisted modules serialised as name-only
+        # fell back from the full-zip path, so we don't attempt an install.
+        install = _is_whitelisted_module(module_name)
+        return runtime_import_module(module_name, install=install)
+
+    def _load_full(self) -> ModuleType:
+        payload = _require_tuple_len(
+            _deserialize_nested(self.decode()),
+            name="Full module payload",
+            expected=4,
+        )
+        version = payload[0]
+        if version != _FORMAT_VERSION:
+            raise ValueError(f"Unsupported full module payload version: {version!r}")
+
+        root_name = _require_str(payload[1], name="Full module payload root_name")
+        module_name = _require_str(payload[2], name="Full module payload module_name")
+        zip_data = _require_bytes(payload[3], name="Full module payload zip_bytes")
+
+        # Fast path: if the current runtime already has it, use it directly.
+        try:
+            return importlib.import_module(module_name)
+        except ImportError:
+            pass
+
+        # Extract and install into sys.path, then import.
+        _extract_module_zip(zip_data, root_name)
+        importlib.invalidate_caches()
+        return importlib.import_module(module_name)
 
     @classmethod
     def build_module(
@@ -1618,11 +1839,54 @@ class ModuleSerialized(ComplexSerialized[ModuleType]):
         *,
         codec: int | None = None,
     ) -> Serialized[object]:
+        module_name = module.__name__
+        root_name = module_name.split(".", 1)[0]
+
+        # Whitelisted modules (stdlib, well-known packages) → name-only reference
+        if _is_whitelisted_module(root_name):
+            return cls.build(
+                tag=cls.TAG,
+                data=module_name.encode("utf-8"),
+                codec=codec,
+            )
+
+        # Try full-module serialisation for non-whitelisted modules
+        root_path = _get_module_root_path(module)
+        if root_path is not None and root_path.exists():
+            try:
+                total = _module_dir_filtered_bytes(root_path)
+            except Exception:
+                total = _MAX_MODULE_INLINE_BYTES + 1
+
+            if total <= _MAX_MODULE_INLINE_BYTES:
+                try:
+                    zip_bytes = _get_or_zip_module(root_name, root_path)
+                    payload = _serialize_nested((
+                        _FORMAT_VERSION,
+                        root_name,
+                        module_name,
+                        zip_bytes,
+                    ))
+                    return cls.build(
+                        tag=cls.TAG,
+                        data=payload,
+                        metadata={cls.M_MODULE_MODE: cls._MODE_FULL},
+                        codec=codec,
+                    )
+                except Exception:
+                    _LOGGER.debug(
+                        "Failed to zip-serialize module '%s'; falling back to name-only",
+                        module_name,
+                        exc_info=True,
+                    )
+
+        # Fallback: name-only reference
         return cls.build(
             tag=cls.TAG,
-            data=module.__name__.encode("utf-8"),
+            data=module_name.encode("utf-8"),
             codec=codec,
         )
+
 
 
 @dataclass(frozen=True, slots=True)

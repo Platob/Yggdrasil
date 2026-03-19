@@ -1,6 +1,7 @@
 """Remote execution helpers for Databricks command contexts."""
 
 import dataclasses as dc
+import inspect
 import logging
 import os
 import threading
@@ -108,6 +109,79 @@ class RemoteMetadata:
     context_path: str
     tmp_path: str
     libs_path: str
+
+
+def _bind_call_args(
+    func: Callable,
+    args: tuple,
+    kwargs: dict,
+) -> tuple[tuple, dict]:
+    """Validate *args*/*kwargs* against *func*'s signature, fill in defaults.
+
+    Parameters
+    ----------
+    func:
+        The callable whose signature to inspect.
+    args:
+        Positional arguments intended for *func*.
+    kwargs:
+        Keyword arguments intended for *func*.
+
+    Returns
+    -------
+    tuple[tuple, dict]
+        ``(args, kwargs)`` with defaults for optional parameters filled in
+        to the *kwargs* dict.
+
+    Raises
+    ------
+    TypeError
+        If required parameters are missing or unexpected keyword arguments
+        are passed.
+    """
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        # Built-ins or C extensions may not expose a signature; skip validation.
+        return args, kwargs
+
+    try:
+        bound = sig.bind(*args, **kwargs)
+    except TypeError as exc:
+        raise TypeError(
+            f"Invalid arguments for {getattr(func, '__qualname__', repr(func))!r}: {exc}"
+        ) from exc
+
+    bound.apply_defaults()
+
+    # Reconstruct positional and keyword arguments from the bound mapping.
+    # Parameters that were originally positional stay positional; the rest
+    # (keyword-only + defaults that were filled in) go into kwargs.
+    new_args: list = []
+    new_kwargs: dict = {}
+
+    for param_name, param in sig.parameters.items():
+        if param_name not in bound.arguments:
+            continue
+        value = bound.arguments[param_name]
+        kind = param.kind
+        if kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            new_args.append(value)
+        elif kind == inspect.Parameter.VAR_POSITIONAL:
+            new_args.extend(value)
+        elif kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            if kind == inspect.Parameter.VAR_KEYWORD:
+                new_kwargs.update(value)
+            else:
+                new_kwargs[param_name] = value
+
+    return tuple(new_args), new_kwargs
 
 
 @dc.dataclass
@@ -570,10 +644,18 @@ if p.returncode != 0:
             *remote_payload_path* is the Databricks path where the
             payload was uploaded, or ``None`` when the payload was
             embedded inline.
+
+        Raises
+        ------
+        TypeError
+            When *args* / *kwargs* do not satisfy *func*'s signature
+            (missing required arguments, unexpected keyword arguments, etc.).
         """
         from yggdrasil.pickle.ser import dumps
 
-        payload: str = dumps([func, args or (), kwargs or {}], b64=True)
+        args, kwargs = _bind_call_args(func, args or (), kwargs or {})
+
+        payload: str = dumps([func, args, kwargs], b64=True)
         remote_payload_path: Optional[str] = None
 
         if len(payload) > self._MAX_INLINE_PAYLOAD_BYTES:
