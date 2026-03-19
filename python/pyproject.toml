@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.5.17"
+version = "0.5.18"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -73,13 +73,19 @@ pickle = [
   "blake3",
 ]
 
+api = [
+  "fastapi",
+  "uvicorn",
+  "pydantic>=2.10",
+]
+
 [project.urls]
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://github.com/Platob/Yggdrasil"
 
 [project.scripts]
-ygg-api = "yggdrasil.fastapi:main"
+ygg-api = "yggdrasil.fastapi.main:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
