@@ -363,7 +363,6 @@ class BytesIO(io.RawIOBase):
     def _replace_with_payload(self, payload: bytes) -> None:
         self._reset_backing_keep_open()
         self._init_from(payload, copy=False)
-        self._pos = 0
 
     def buffer(self) -> IO[bytes]:
         """

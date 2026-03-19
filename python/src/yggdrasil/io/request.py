@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json as json_module
 from dataclasses import MISSING, dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.dataclasses.dataclass import get_from_dict
@@ -498,6 +498,19 @@ class PreparedRequest:
         )
 
     def to_arrow_batch(self, parse: bool = False) -> pa.RecordBatch:
+        """Serialise this request into a single-row :class:`pyarrow.RecordBatch`.
+
+        Parameters
+        ----------
+        parse:
+            Reserved for future use.  Currently raises
+            :exc:`NotImplementedError` when ``True``.
+
+        Returns
+        -------
+        pyarrow.RecordBatch
+            A single-row batch conforming to :data:`REQUEST_ARROW_SCHEMA`.
+        """
         if parse:
             raise NotImplementedError
 
@@ -553,6 +566,192 @@ class PreparedRequest:
         ]
 
         return pa.RecordBatch.from_arrays(arrays, schema=REQUEST_ARROW_SCHEMA)  # type: ignore[arg-type]
+
+    def to_arrow_table(self, parse: bool = False) -> pa.Table:
+        """Serialise this request into a single-row :class:`pyarrow.Table`.
+
+        Wraps :meth:`to_arrow_batch` in a table.
+
+        Parameters
+        ----------
+        parse:
+            Forwarded to :meth:`to_arrow_batch`.
+
+        Returns
+        -------
+        pyarrow.Table
+        """
+        return pa.Table.from_batches([self.to_arrow_batch(parse=parse)])
+
+    # ------------------------------------------------------------------
+    # from_arrow
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_arrow(
+        cls,
+        batch: pa.RecordBatch | pa.Table,
+        *,
+        normalize: bool = True,
+    ) -> "Iterator[PreparedRequest]":
+        """Yield :class:`PreparedRequest` objects from an Arrow batch or table.
+
+        Each row in *batch* / *table* is reconstructed into a
+        :class:`PreparedRequest` using the same logic that
+        :meth:`Response.from_arrow` uses for the request portion of its
+        schema.
+
+        Parameters
+        ----------
+        batch:
+            An Arrow :class:`~pyarrow.RecordBatch` or :class:`~pyarrow.Table`
+            whose schema is (or is a superset of) :data:`REQUEST_ARROW_SCHEMA`.
+        normalize:
+            Whether to normalise reconstructed headers and URLs.
+
+        Yields
+        ------
+        PreparedRequest
+            One instance per row, in row order.
+        """
+
+        def _iter_batches(obj: pa.RecordBatch | pa.Table) -> Iterator[pa.RecordBatch]:
+            if isinstance(obj, pa.RecordBatch):
+                yield obj
+            else:
+                yield from obj.to_batches()
+
+        req_cols = [f.name for f in REQUEST_ARROW_SCHEMA]
+
+        for rb in _iter_batches(batch):
+            cols = {
+                name: rb.column(name)
+                for name in req_cols
+                if name in rb.schema.names
+            }
+
+            for i in range(rb.num_rows):
+                yield cls._from_arrow_cols(cols, i, normalize=normalize)
+
+    @classmethod
+    def _from_arrow_cols(
+        cls,
+        cols: dict[str, Any],
+        i: int,
+        *,
+        normalize: bool = True,
+    ) -> "PreparedRequest":
+        """Reconstruct a single :class:`PreparedRequest` from Arrow columns.
+
+        Parameters
+        ----------
+        cols:
+            ``{column_name: arrow_column}`` mapping.
+        i:
+            Row index.
+        normalize:
+            Whether to normalise headers and URLs.
+
+        Returns
+        -------
+        PreparedRequest
+        """
+        def _get(name: str) -> Any:
+            if name in cols:
+                return cols[name][i].as_py()
+            return None
+
+        method = _get("request_method") or "GET"
+
+        url_str = _get("request_url_str")
+        if url_str not in (None, ""):
+            url_val = str(url_str)
+            url_struct = None
+        else:
+            scheme   = _get("request_url_scheme")
+            userinfo = _get("request_url_userinfo")
+            host     = _get("request_url_host")
+            port     = _get("request_url_port")
+            path     = _get("request_url_path")
+            query    = _get("request_url_query")
+            fragment = _get("request_url_fragment")
+
+            if any(part not in (None, "", 0)
+                   for part in (scheme, userinfo, host, port, path, query, fragment)):
+                url_val = None
+                url_struct = {
+                    "scheme":   scheme or "",
+                    "userinfo": userinfo or "",
+                    "host":     host or "",
+                    "port":     0 if port in (None, "") else int(port),
+                    "path":     path or "/",
+                    "query":    query or "",
+                    "fragment": fragment or "",
+                }
+            else:
+                url_val = ""
+                url_struct = None
+
+        # Reconstruct headers from promoted columns + remaining map
+        _map_val = _get("request_headers")
+        try:
+            req_headers: dict[str, str] = (
+                {str(k): str(v) for k, v in _map_val if k is not None and v is not None}
+                if _map_val else {}
+            )
+        except Exception:
+            req_headers = {}
+
+        for hk, col_name in (
+            ("Host",              "request_host"),
+            ("User-Agent",        "request_user_agent"),
+            ("Accept",            "request_accept"),
+            ("Accept-Encoding",   "request_accept_encoding"),
+            ("Accept-Language",   "request_accept_language"),
+            ("Content-Type",      "request_content_type"),
+            ("Content-Length",    "request_content_length"),
+            ("Content-Encoding",  "request_content_encoding"),
+            ("Transfer-Encoding", "request_transfer_encoding"),
+        ):
+            hv = _get(col_name)
+            if hv not in (None, ""):
+                req_headers[hk] = str(hv)
+
+        # Tags
+        _tags_val = _get("request_tags")
+        try:
+            tags: dict[str, str] = (
+                {str(k): str(v) for k, v in _tags_val if k is not None and v is not None}
+                if _tags_val else {}
+            )
+        except Exception:
+            tags = {}
+
+        # Timestamp
+        sent_at_col = cols.get("request_sent_at")
+        if sent_at_col is not None:
+            ts_raw = sent_at_col[i].as_py()
+            if ts_raw is not None and hasattr(ts_raw, "timestamp"):
+                sent_at = int(ts_raw.timestamp() * 1_000_000)
+            elif isinstance(ts_raw, (int, float)):
+                sent_at = int(ts_raw)
+            else:
+                sent_at = 0
+        else:
+            sent_at = 0
+
+        return cls.parse_dict(
+            {
+                "method":            method,
+                "url_str":           url_val,
+                "url":               url_struct,
+                "headers":           req_headers,
+                "tags":              tags,
+                "buffer":            _get("request_body"),
+                "sent_at_timestamp": sent_at,
+            },
+            normalize=normalize,
+        )
 
     def apply(
         self,

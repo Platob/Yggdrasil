@@ -1,4 +1,12 @@
-# yggdrasil/io/buffer/zip_io.py
+"""ZIP container I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`.
+
+Reads ZIP archives by selecting members (exact name, glob, or all),
+inferring each member's inner media type, and concatenating the resulting
+Arrow tables.  Writes serialise an Arrow table into a single inner
+payload (defaulting to Parquet) inside a new ZIP archive.
+
+Transport-level compression is handled transparently by the base class.
+"""
 from __future__ import annotations
 
 import io
@@ -20,34 +28,37 @@ __all__ = ["ZipOptions", "ZipIO"]
 
 @dataclass(slots=True)
 class ZipOptions(MediaOptions):
-    """
-    Options for ZipIO.
+    """Options for ZIP I/O.
 
+    Parameters
+    ----------
     member:
-      - None: read ALL members (files) and concat
-      - exact name: read only that member
-      - glob pattern (contains '*', '?', or '['): read all matching members and concat
+        Which member(s) to read:
 
+        * ``None`` — read **all** members and concatenate.
+        * An exact name — read only that member.
+        * A glob pattern (``*``, ``?``, ``[``) — read matching members
+          and concatenate.
     inner_media:
-      - when writing: media type used for the inner payload (default parquet)
-      - when reading: optional override if force_inner_media=True
-
+        Media type for inner payloads.  Used as the write format (default
+        Parquet) and optionally forced on read when *force_inner_media* is
+        ``True``.
     force_inner_media:
-      - if True and inner_media provided, use it for ALL members (skip inference)
-
+        When ``True`` and *inner_media* is set, skip per-member media
+        inference and use *inner_media* for all members.
     zip_compression:
-      - deflate compresslevel (0..9-ish); method is ZIP_DEFLATED
+        Deflate compression level (0–9).  Method is always
+        ``ZIP_DEFLATED``.
     """
 
     member: str | None = None
-
     inner_media: MediaType | str | None = None
     force_inner_media: bool = False
-
     zip_compression: int = 8
 
     @classmethod
     def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
+        """Merge *overrides* into *options* (or a fresh default)."""
         base = options or cls()
         valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]
         unknown = set(overrides) - set(valid)
@@ -60,28 +71,15 @@ class ZipOptions(MediaOptions):
 
 @dataclass(slots=True)
 class ZipIO(MediaIO[ZipOptions]):
+    """ZIP container I/O.
+
+    Reads are cursor-safe — a :meth:`BytesIO.view` owns its own cursor
+    so the parent buffer position is never disturbed.
     """
-    ZIP container IO on top of BytesIO.
-
-    Read:
-      - opens zip from a cursor-owned view (does not touch parent cursor)
-      - selects members via ZipOptions.member (exact or glob or None)
-      - infers inner media per member:
-          1) by member name/extension (MediaType.parse_str)
-          2) fallback: magic bytes via BytesIO(payload).media_type
-      - reads each member via BytesIO(payload).media_io(inner_media).read_arrow_table()
-      - concatenates tables (schema-relaxed) when multiple members
-
-    Write:
-      - serializes provided Arrow table into a single inner payload (inner_media)
-      - writes a single zip member (options.member or default name)
-      - replaces outer BytesIO bytes
-    """
-
-    buffer: BytesIO
 
     @classmethod
     def check_options(cls, options: Optional[ZipOptions], *args, **kwargs) -> ZipOptions:
+        """Validate and merge caller-supplied options."""
         return ZipOptions.check_parameters(options=options, **kwargs)
 
     # ------------------------------------------------------------------
@@ -89,30 +87,32 @@ class ZipIO(MediaIO[ZipOptions]):
     # ------------------------------------------------------------------
 
     def _member_names(self, zf: zipfile.ZipFile) -> list[str]:
+        """Return non-directory member names."""
         return [n for n in zf.namelist() if n and not n.endswith("/")]
 
-    def _is_glob(self, s: str) -> bool:
+    @staticmethod
+    def _is_glob(s: str) -> bool:
+        """Return ``True`` when *s* contains glob metacharacters."""
         return any(ch in s for ch in ("*", "?", "["))
 
     def _select_members(
         self,
         zf: zipfile.ZipFile,
         *,
-        options: ZipOptions
+        options: ZipOptions,
     ) -> list[str]:
+        """Select members from *zf* according to *options.member*."""
         names = self._member_names(zf)
 
         m = options.member
         if not m:
             return names
 
-        # exact
         if not self._is_glob(m):
             if m not in names:
                 raise KeyError(f"ZipIO: member not found: {m!r}. Available: {names}")
             return [m]
 
-        # glob
         matched = sorted({n for n in names if fnmatchcase(n, m)})
         if not matched:
             raise KeyError(f"ZipIO: no members matched pattern={m!r}. Available: {names}")
@@ -122,32 +122,37 @@ class ZipIO(MediaIO[ZipOptions]):
     # Inner media inference
     # ------------------------------------------------------------------
 
-    def _infer_inner_media_from_name(self, name: str) -> MediaType:
+    @staticmethod
+    def _infer_inner_media_from_name(name: str) -> MediaType:
+        """Infer media type from the member file name / extension."""
         try:
-            return MediaType.parse_str(name)
+            return MediaType.parse(name)
         except Exception:
             return MediaType(MimeType.OCTET_STREAM)
 
     def _infer_inner_media(self, name: str, payload: bytes) -> MediaType:
-        # 1) extension / name-based
+        """Infer media type by name first, then by magic-byte sniffing."""
         mt = self._infer_inner_media_from_name(name)
         if not mt.is_octet:
             return mt
 
-        # 2) magic bytes fallback (works for parquet/ipc/zip/etc; JSON has no magic)
         try:
             return BytesIO(payload, config=self.buffer.config).media_type
         except Exception:
             return MediaType(MimeType.OCTET_STREAM)
 
-    def _pick_inner_media_for_write(self, options: ZipOptions) -> MediaType:
+    @staticmethod
+    def _pick_inner_media_for_write(options: ZipOptions) -> MediaType:
+        """Resolve the inner media type used when writing."""
         if options.inner_media is not None:
             mt = MediaType.parse(options.inner_media)
             if not mt.is_octet:
                 return mt
         return MediaType(MimeType.PARQUET)
 
-    def _default_member_for_write(self, inner_media: MediaType) -> str:
+    @staticmethod
+    def _default_member_for_write(inner_media: MediaType) -> str:
+        """Generate a default member name from the media type extension."""
         ext = inner_media.full_extension
         return f"data.{ext}" if ext else "data"
 
@@ -155,9 +160,10 @@ class ZipIO(MediaIO[ZipOptions]):
     # Zipfile kwargs (compression)
     # ------------------------------------------------------------------
 
-    def _zipfile_kwargs(self, options: ZipOptions) -> dict:
-        kw = {"compression": zipfile.ZIP_DEFLATED}
-        # compresslevel support varies by Python build
+    @staticmethod
+    def _zipfile_kwargs(options: ZipOptions) -> dict:
+        """Build ``**kwargs`` for :class:`zipfile.ZipFile` construction."""
+        kw: dict = {"compression": zipfile.ZIP_DEFLATED}
         try:
             zipfile.ZipFile(
                 io.BytesIO(),
@@ -171,10 +177,11 @@ class ZipIO(MediaIO[ZipOptions]):
         return kw
 
     # ------------------------------------------------------------------
-    # MediaIO required impl
+    # Arrow implementation
     # ------------------------------------------------------------------
 
     def _read_arrow_table(self, *, options: ZipOptions) -> "pyarrow.Table":
+        """Read and concatenate selected ZIP members into an Arrow table."""
         from yggdrasil.arrow.lib import pyarrow as _pa
 
         if self.buffer.size <= 0:
@@ -182,7 +189,6 @@ class ZipIO(MediaIO[ZipOptions]):
 
         tables: list[_pa.Table] = []
 
-        # cursor-safe: view owns its own cursor
         with self.buffer.view(pos=0) as f:
             with zipfile.ZipFile(f, mode="r") as zf:
                 members = self._select_members(zf, options=options)
@@ -209,6 +215,7 @@ class ZipIO(MediaIO[ZipOptions]):
         return _pa.concat_tables(tables, promote_options="default")
 
     def _write_arrow_table(self, *, table: "pyarrow.Table", options: ZipOptions) -> None:
+        """Serialise *table* into a single ZIP member."""
         inner_media = self._pick_inner_media_for_write(options)
 
         inner_buf = BytesIO(config=self.buffer.config)
@@ -225,5 +232,5 @@ class ZipIO(MediaIO[ZipOptions]):
         with zipfile.ZipFile(mem, mode="w", **self._zipfile_kwargs(options)) as zf:
             zf.writestr(member, inner_payload)
 
-        # overwrite outer bytes
-        self.buffer._replace_with_payload(mem.getvalue())
+        self.buffer._replace_with_payload(mem)
+

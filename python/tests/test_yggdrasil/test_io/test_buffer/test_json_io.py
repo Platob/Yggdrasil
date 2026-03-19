@@ -7,12 +7,14 @@ import pytest
 
 import yggdrasil.pickle.json as json_mod
 from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.json_io import JsonIO
+from yggdrasil.io.enums import MimeType
 
 
 def test_jsonio_read_pylist_empty_returns_empty_list():
     buf = BytesIO()
-    io_ = JsonIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.JSON)
 
     assert buf.size == 0
     assert io_.read_pylist() == []
@@ -20,7 +22,7 @@ def test_jsonio_read_pylist_empty_returns_empty_list():
 
 def test_jsonio_read_pylist_wraps_non_list_payload():
     buf = BytesIO()
-    io_ = JsonIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.JSON)
 
     # Manually write a single JSON object (not a list)
     buf.write_bytes(b'{"a": 1, "b": "x"}')
@@ -44,7 +46,7 @@ def test_bytesio_view_does_not_close_parent_on_exit():
 
 def test_jsonio_write_pylist_and_read_back_roundtrip():
     buf = BytesIO()
-    io_ = JsonIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.JSON)
 
     payload = [{"a": 1}, {"a": 2, "b": "ok"}, {"nested": {"k": 7}}]
 

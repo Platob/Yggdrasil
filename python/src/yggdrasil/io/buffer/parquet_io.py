@@ -1,29 +1,50 @@
-# yggdrasil/io/buffer/parquet_io.py
+"""Parquet I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`.
+
+Uses :mod:`pyarrow.parquet` for both reading and writing.  Transport-level
+compression (gzip, zstd, …) is handled transparently by the base class;
+the ``compression`` option on :class:`ParquetOptions` controls the
+*intra-file* Parquet column compression codec.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, Optional
+from typing import TYPE_CHECKING, Optional, Self
 
 from .media_io import MediaIO
 from .media_options import MediaOptions
 
 if TYPE_CHECKING:
-    import pyarrow  # for type checkers only
-
+    import pyarrow
 
 __all__ = ["ParquetOptions", "ParquetIO"]
 
 
 @dataclass(slots=True)
 class ParquetOptions(MediaOptions):
-    """
-    Options for Parquet IO.
+    """Options for Parquet I/O.
 
-    Notes:
-    - We include common read params (columns/use_threads) because your ParquetIO.read_table
-      already expects them (they were referenced before but not declared in the options class).
-    - We keep write params (compression, etc.) with sane defaults.
+    Inherits all :class:`MediaOptions` fields and adds Parquet-specific
+    knobs for write-time compression and statistics.
+
+    Parameters
+    ----------
+    columns:
+        Column names to read (``None`` reads all).
+    use_threads:
+        Enable multi-threaded reading / writing.
+    compression:
+        Intra-file column compression codec passed to
+        :func:`pyarrow.parquet.write_table`.
+    compression_level:
+        Codec-specific compression level.
+    use_dictionary:
+        Enable dictionary encoding for eligible columns.
+    use_statistics:
+        Write column statistics in the Parquet metadata.
+    allow_truncated_timestamps:
+        When ``True``, coerce timestamps to microsecond precision.
     """
+
     # ---- read options ----
     columns: list[str] | None = None
     use_threads: bool = True
@@ -35,12 +56,10 @@ class ParquetOptions(MediaOptions):
     use_statistics: bool = True
     allow_truncated_timestamps: bool = True
 
-    # If you want "kwargs" overrides from public signatures to merge into an options instance,
-    # keep this helper. It preserves concrete type (Self).
     @classmethod
     def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
+        """Merge *overrides* into *options* (or a fresh default)."""
         base = options or cls()
-        # Only apply known fields (prevents silent typos)
         valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]
         unknown = set(overrides) - set(valid)
         if unknown:
@@ -52,21 +71,18 @@ class ParquetOptions(MediaOptions):
 
 @dataclass(slots=True)
 class ParquetIO(MediaIO[ParquetOptions]):
-    """
-    Concrete IO for Parquet.
-    """
+    """Parquet I/O backed by :mod:`pyarrow.parquet`."""
 
     @classmethod
     def check_options(cls, options: Optional[ParquetOptions], *args, **kwargs) -> ParquetOptions:
-        return ParquetOptions.check_parameters(
-            options=options,
-            **kwargs
-        )
+        """Validate and merge caller-supplied options."""
+        return ParquetOptions.check_parameters(options=options, **kwargs)
 
     def _read_arrow_table(self, *, options: ParquetOptions) -> "pyarrow.Table":
+        """Read Parquet bytes from the (uncompressed) buffer."""
         if self.buffer.size <= 0:
             import pyarrow as pa
-            return pa.Table.from_batches([], schema=pa.schema([])) # noqa
+            return pa.Table.from_batches([], schema=pa.schema([]))
 
         import pyarrow.parquet as pq
 
@@ -81,6 +97,7 @@ class ParquetIO(MediaIO[ParquetOptions]):
             arrow_io.close()
 
     def _write_arrow_table(self, *, table: "pyarrow.Table", options: ParquetOptions) -> None:
+        """Write an Arrow table as Parquet into the (uncompressed) buffer."""
         import pyarrow.parquet as pq
 
         arrow_io = self.buffer.to_arrow_io("w")
@@ -94,8 +111,6 @@ class ParquetIO(MediaIO[ParquetOptions]):
                 write_statistics=options.use_statistics,
                 coerce_timestamps="us" if options.allow_truncated_timestamps else None,
                 use_deprecated_int96_timestamps=not options.allow_truncated_timestamps,
-                # If you actually use this option in your project, wire it to pq.write_table params
-                # or to a coercion/normalization step before writing.
             )
         finally:
             arrow_io.close()

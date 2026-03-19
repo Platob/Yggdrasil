@@ -36,5 +36,6 @@ from .buffer import BytesIO, BufferLike
 from .config import BufferConfig, DEFAULT_CONFIG
 from .enums import *
 from .headers import get_default_user_agent
+from .send_config import SendConfig, SendManyConfig
 from .types import BytesLike
 from .url import URL

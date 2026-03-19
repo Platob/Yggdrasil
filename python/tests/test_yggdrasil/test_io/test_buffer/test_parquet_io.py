@@ -6,9 +6,10 @@ from pathlib import Path
 import pytest
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.parquet_io import ParquetIO, ParquetOptions
 from yggdrasil.io.config import BufferConfig
-from yggdrasil.io.enums import SaveMode
+from yggdrasil.io.enums import SaveMode, MimeType
 
 
 def _make_cfg(tmp_path: Path) -> BufferConfig:
@@ -48,7 +49,7 @@ def sample_table():
 
 def test_write_then_read_roundtrip_memory(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
 
     io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
 
@@ -61,7 +62,7 @@ def test_write_then_read_roundtrip_memory(cfg: BufferConfig, sample_table):
 
 def test_read_with_columns_projection(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
     io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
     out = io_.read_arrow_table(options=ParquetOptions(columns=["id", "s"]))
 
@@ -72,7 +73,7 @@ def test_read_with_columns_projection(cfg: BufferConfig, sample_table):
 def test_ignore_mode_does_not_overwrite(cfg: BufferConfig, sample_table):
     pa = _pa()
     buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
 
     t1 = sample_table
     t2 = pa.table({"id": pa.array([999], type=pa.int64()), "s": pa.array(["z"]), "x": pa.array([0.0])})
@@ -92,7 +93,7 @@ def test_ignore_mode_does_not_overwrite(cfg: BufferConfig, sample_table):
 
 def test_error_if_exists_raises(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
 
     io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
 
@@ -103,7 +104,7 @@ def test_error_if_exists_raises(cfg: BufferConfig, sample_table):
 def test_overwrite_replaces_content(cfg: BufferConfig, sample_table):
     pa = _pa()
     buf = BytesIO(config=cfg)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
 
     t1 = sample_table
     t2 = pa.table(
@@ -138,7 +139,7 @@ def test_spilled_buffer_path_read_write(cfg: BufferConfig, sample_table):
         keep_spilled_file=False,
     )
     buf = BytesIO(config=cfg2)
-    io_ = ParquetIO(buffer=buf)
+    io_ = MediaIO.make(buf, MimeType.PARQUET)
 
     io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
     assert buf.spilled is True

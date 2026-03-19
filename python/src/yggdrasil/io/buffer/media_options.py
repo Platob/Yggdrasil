@@ -1,3 +1,58 @@
+"""Base options dataclass for :class:`~yggdrasil.io.buffer.media_io.MediaIO`.
+
+:class:`MediaOptions` collects every parameter that can influence how an
+Arrow table is read from / written to a :class:`~yggdrasil.io.buffer.BytesIO`
+buffer.  Format-specific subclasses (:class:`ParquetOptions`,
+:class:`JsonOptions`, …) extend it with codec-level knobs, but the
+fields defined here are shared across *all* formats:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 10 70
+
+   * - Field
+     - Default
+     - Description
+   * - ``columns``
+     - ``None``
+     - Column names to read (``None`` = all).
+   * - ``use_threads``
+     - ``True``
+     - Enable multi-threaded reads / writes.
+   * - ``ignore_empty``
+     - ``True``
+     - Silently return an empty table when the buffer is empty.
+   * - ``lazy``
+     - ``False``
+     - Return a lazy / streaming representation when the format supports it.
+   * - ``raise_error``
+     - ``True``
+     - Raise on read/write errors instead of returning a sentinel.
+   * - ``mode``
+     - ``AUTO``
+     - :class:`~yggdrasil.io.enums.SaveMode` governing the write strategy.
+   * - ``match_by``
+     - ``None``
+     - Column names forming the composite key for ``UPSERT`` mode.
+
+Save modes
+----------
+``AUTO`` / ``OVERWRITE``
+    Replace the buffer contents entirely.
+
+``APPEND``
+    Concatenate new data after the existing data.
+
+``UPSERT``
+    Merge by ``match_by`` columns — new rows replace matching old rows,
+    unmatched old rows survive, unmatched new rows are appended.
+
+``IGNORE``
+    Skip the write when the buffer already contains data.
+
+``ERROR_IF_EXISTS``
+    Raise :exc:`IOError` when the buffer already contains data.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -16,6 +71,30 @@ _ALLOWED_COMPRESSION = {"auto", "none", "off", "zstd", "snappy", "gzip", "lz4"}
 
 @dataclass(slots=True)
 class MediaOptions:
+    """Base options shared by all :class:`MediaIO` subclasses.
+
+    Parameters
+    ----------
+    columns:
+        Column names to read.  ``None`` means all columns.
+    use_threads:
+        Enable multi-threaded reading / writing.
+    ignore_empty:
+        When ``True``, an empty buffer returns an empty table instead of
+        raising.
+    lazy:
+        When ``True``, return a lazy / streaming representation if the
+        format supports it (e.g. a Polars ``LazyFrame``).
+    raise_error:
+        When ``True``, raise on read/write errors.
+    mode:
+        :class:`~yggdrasil.io.enums.SaveMode` governing the write
+        strategy.  See the module docstring for semantics.
+    match_by:
+        Column names forming the composite deduplication key for
+        ``UPSERT`` mode.  Ignored by other modes.
+    """
+
     # global read properties
     columns: Optional[Sequence[str]] = None
     use_threads: bool = True
@@ -23,7 +102,7 @@ class MediaOptions:
     lazy: bool = False
     raise_error: bool = True
 
-    # global write properties (fixed types)
+    # global write properties
     mode: SaveMode = SaveMode.AUTO
     match_by: Sequence[str] | None = None
 
@@ -41,13 +120,36 @@ class MediaOptions:
         raise_error: bool = _MISSING,
         **kwargs,
     ) -> "MediaOptions":
-        """
-        Merge/validate parameters into an options instance.
+        """Merge and validate parameters into an options instance.
 
-        - Only explicitly provided kwargs override existing values
-        - Unknown kwargs raise TypeError
-        - mode normalized via SaveMode.parse -> SaveMode
-        - match_by normalized to tuple[str, ...] | None (still fits Sequence[str] | None)
+        * Only explicitly supplied kwargs override existing values.
+        * Unknown kwargs raise :exc:`TypeError`.
+        * ``mode`` is normalised via :meth:`SaveMode.parse`.
+        * ``match_by`` is normalised to ``tuple[str, …] | None``.
+        * ``columns`` is normalised to ``list[str] | None``.
+
+        Parameters
+        ----------
+        options:
+            An existing instance to update, or ``None`` for a fresh default.
+        mode, match_by, columns, use_threads, ignore_empty, lazy, raise_error:
+            Overrides for the corresponding fields.
+        **kwargs:
+            Subclass-specific overrides (e.g. ``compression``).
+
+        Returns
+        -------
+        MediaOptions
+            The validated, merged instance (mutated in-place when *options*
+            is an instance of *cls*; a new object otherwise).
+
+        Raises
+        ------
+        TypeError
+            On unknown kwargs, bad types for ``columns``, ``match_by``,
+            boolean fields, or ``compression``.
+        ValueError
+            On invalid ``compression`` or ``skip_rows`` values.
         """
         if options is None:
             out = cls()
@@ -107,7 +209,7 @@ class MediaOptions:
                 if not all(isinstance(c, str) for c in cols_list):
                     bad = [type(c).__name__ for c in cols_list if not isinstance(c, str)]
                     raise TypeError(f"columns must contain only str, found: {bad[:3]}")
-                updates["columns"] = tuple(cols_list)
+                updates["columns"] = list(cols_list)
 
         for b in ("use_threads", "ignore_empty", "lazy", "raise_error"):
             if b in updates and not isinstance(updates[b], bool):
