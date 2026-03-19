@@ -517,7 +517,7 @@ def _module_cache_get_or_load(module_name: str) -> ModuleType:
     if cached is not None:
         return cached
 
-    module = runtime_import_module(module_name)
+    module = runtime_import_module(module_name, install=False)
     _MODULE_CACHE[module_name] = module
     return module
 

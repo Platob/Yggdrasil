@@ -1,5 +1,30 @@
-# yggdrasil.environ.environment
+"""Python environment management with uv-first toolchain.
 
+:class:`PyEnv` wraps a single Python interpreter path and provides:
+
+* **Resolution** — locate interpreters by path, version selector, or venv dir.
+* **Virtual-env lifecycle** — create, delete, and reuse virtual environments
+  via ``uv venv`` (with automatic ``uv`` bootstrap).
+* **Package management** — install / update / uninstall via ``uv pip`` or
+  ``python -m pip`` with private-API fallback.
+* **Subprocess execution** — run Python code under ``uv run`` or bare Python.
+* **Runtime imports** — import-or-install a module at call time.
+
+The module prefers ``uv`` for all pip and subprocess operations but
+falls back to plain pip / python transparently when ``uv`` is
+unavailable.
+
+Public API
+----------
+.. autosummary::
+
+   PyEnv
+   safe_pip_name
+   runtime_import_module
+   SYSTEM_LIBS
+   PIP_MODULE_NAME_MAPPINGS
+   CURRENT_PYENV
+"""
 from __future__ import annotations
 
 import importlib
@@ -54,7 +79,7 @@ _PY_VERSION_RE = re.compile(
 
 CURRENT_PYENV: PyEnv | None = None
 
-SYSTEM_LIBS: list[str] = [
+SYSTEM_LIBS: frozenset[str] = frozenset({
     # Core Python / packaging
     "pip",
     "setuptools",
@@ -269,7 +294,7 @@ SYSTEM_LIBS: list[str] = [
     "pytokens",
     "unitycatalog",
     "pyproject-hooks",
-]
+})
 
 
 def safe_pip_name(
@@ -627,22 +652,27 @@ class PyEnv:
 
     @property
     def is_current(self) -> bool:
+        """``True`` when this instance is the module-level :data:`CURRENT_PYENV` singleton."""
         return CURRENT_PYENV is not None and CURRENT_PYENV is self
 
     @property
     def is_windows(self) -> bool:
+        """``True`` when running on Windows (``os.name == 'nt'``)."""
         return os.name == "nt"
 
     @property
     def bin_path(self) -> Path:
+        """Directory containing the Python executable (``Scripts`` on Windows, ``bin`` elsewhere)."""
         return self.python_path.parent
 
     @property
     def root_path(self) -> Path:
+        """Parent of :attr:`bin_path` — typically the venv root."""
         return self.bin_path.parent
 
     @property
     def userinfo(self) -> UserInfo:
+        """Return the current :class:`~yggdrasil.environ.userinfo.UserInfo`."""
         return UserInfo.current()
 
     @property
@@ -758,6 +788,7 @@ class PyEnv:
             raise RuntimeError(f"pip internal API failed installing {package!r} with exit code {rc}")
 
     def _is_current_interpreter(self) -> bool:
+        """``True`` when :attr:`python_path` points to the running interpreter."""
         return self.python_path.resolve() == Path(sys.executable).resolve()
 
     def ensure_uv(self, *, install_runtime: bool = True) -> Path | None:

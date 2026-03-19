@@ -83,6 +83,8 @@ def _normalize_context_key(
 
 def _contextual_alias(alias: str, context_key: str | None) -> str:
     """Build a context-prefixed alias."""
+    return alias
+
     if not context_key:
         return alias
     prefix = context_key.rstrip("_")
@@ -197,7 +199,7 @@ def get_connection_settings(
     """
     effective_context = _normalize_context_key(context_key, environ, default=None)
 
-    for candidate in _iter_alias_candidates(alias, effective_context):
+    for candidate in _iter_alias_candidates(alias, alias):
         info = mongoengine.connection._connection_settings.get(candidate)
         if info is None:
             continue

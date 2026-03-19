@@ -21,7 +21,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 from .exceptions import ClientTerminatedSession, CommandExecutionError
-from .execution_context import ExecutionContext, EXCLUDED_ENV_KEYS
+from .execution_context import ExecutionContext
 
 DONE_STATES = {
     CommandStatus.FINISHED, CommandStatus.CANCELLED, CommandStatus.ERROR
@@ -56,6 +56,7 @@ class CommandExecution:
 
     _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _local_checks: dict[Path, float] = field(default_factory=dict, init=False, repr=False, compare=False, hash=False)
+    _remote_payload_path: Optional[str] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self):
         if self.environ:
@@ -66,12 +67,6 @@ class CommandExecution:
                     raise ValueError(
                         f"environ must be a mapping or convertible to dict, got {type(self.environ)}"
                     ) from e
-
-            if any(k in EXCLUDED_ENV_KEYS for k in self.environ.keys()):
-                raise ValueError(
-                    f"Databricks command execution environ cannot contain any of the following reserved keys: {EXCLUDED_ENV_KEYS}. "
-                    f"Found keys: {[k for k in self.environ.keys() if k in EXCLUDED_ENV_KEYS]}"
-                )
 
         if self.language is None:
             self.language = Language.PYTHON if self.pyfunc is not None else self.context.language
@@ -150,7 +145,7 @@ class CommandExecution:
 
             # Create command
             language_to_execute = Language.PYTHON
-            command_to_execute = self.context.make_python_function_command(
+            command_to_execute, remote_payload_path = self.context.make_python_function_command(
                 func=self.pyfunc,
                 args=args,
                 kwargs=kwargs,
@@ -159,6 +154,7 @@ class CommandExecution:
         else:
             language_to_execute = self.language
             command_to_execute = self.command
+            remote_payload_path = None
 
         assert command_to_execute, "Cannot call %s, missing command" % self
 
@@ -169,10 +165,11 @@ class CommandExecution:
             ephemeral=True
         )
         temp._local_checks = self._local_checks
+        temp._remote_payload_path = remote_payload_path
 
         if install_modules:
             for m in install_modules:
-                temp.install_module(m)
+                temp.install_module(m, auto_pip=False)
 
         # Check local dependencies
         for local_root in temp._local_checks.keys():
@@ -183,7 +180,6 @@ class CommandExecution:
             return (
                 temp
                 .start()
-                .wait(raise_error=True)
                 .result(raise_error=True)
             )
         finally:
@@ -471,19 +467,106 @@ class CommandExecution:
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> Any:
+        """Wait for the command to finish and return the deserialized result.
+
+        The remote snippet (see
+        :meth:`ExecutionContext.make_python_function_command`) always
+        prints a tagged payload — either the serialised return value or
+        a serialised exception.  This method:
+
+        1. Waits for the command to reach a terminal state.
+        2. Decodes the tagged payload from stdout.
+        3. Deserialises the payload.
+        4. If the payload is a ``BaseException``, re-raises it.
+        5. Otherwise returns the value.
+        6. Cleans up the temporary remote payload file if one was used
+           (see :attr:`_remote_payload_path`).
+
+        Transient failures (``InternalError``, ``ClientTerminatedSession``,
+        ``ModuleNotFoundError``) trigger automatic reconnection / module
+        upload and retry up to ``wait.total_try_count`` times.
+
+        Parameters
+        ----------
+        wait:
+            Waiting / retry configuration.
+        raise_error:
+            Whether to raise on non-2xx command status.
+        tag:
+            Sentinel used to split logs from the return payload.
+
+        Returns
+        -------
+        Any
+            The deserialised return value of the remote function.
+
+        Raises
+        ------
+        BaseException
+            Re-raised from the remote side when the function raised.
+        RuntimeError
+            When a missing module persists after upload retry.
+        """
+        try:
+            return self._result_inner(
+                wait=wait,
+                raise_error=raise_error,
+                tag=tag,
+            )
+        finally:
+            self._cleanup_remote_payload()
+
+    def _cleanup_remote_payload(self) -> None:
+        """Delete the temporary remote payload file, if one was used.
+
+        Failures are logged but never propagated — the payload file
+        lives inside the cluster's ephemeral scratch directory and will
+        be garbage-collected eventually even if the explicit delete
+        fails.
+        """
+        path = self._remote_payload_path
+        if path is None:
+            return
+
+        self._remote_payload_path = None
+
+        try:
+            dbfs_path = self.client.dbfs_path(path)
+            dbfs_path.rmfile(missing_ok=True)
+        except Exception:
+            LOGGER.debug(
+                "Failed to clean up remote payload path %s (non-fatal)",
+                path,
+                exc_info=True,
+            )
+
+    def _result_inner(
+        self,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        tag: str = "__CALL_RESULT__",
+    ) -> Any:
+        """Core result-retrieval logic (called by :meth:`result`)."""
         wait = WaitingConfig.check_arg(wait)
         installed_modules: set[str] = set()
-        last_exc: Exception | None = None
+        last_exc, logs, raw_result = None, None, None
 
         for attempt in range(wait.total_try_count):
             try:
                 self.wait(wait=wait, raise_error=raise_error)
+                logs, raw_result = self.decode_response(
+                    response=self.details,
+                    language=self.language,
+                    raise_error=raise_error,
+                    tag=tag
+                )
                 last_exc = None
                 break
             except (InternalError, ClientTerminatedSession) as e:
                 last_exc = e
                 self.context = self.context.connect(reset=True)
                 self.start(reset=True)
+                continue
 
             except ModuleNotFoundError as e:
                 last_exc = e
@@ -507,22 +590,47 @@ class CommandExecution:
                 installed_modules.add(root_module)
 
                 self.start(reset=True)
+                continue
 
         if raise_error and last_exc is not None:
             raise last_exc
 
-        logs, result = self.decode_response(
-            response=self.details,
-            language=self.language,
-            raise_error=raise_error,
-            tag=tag
-        )
-
         if logs is not None:
             from yggdrasil.pickle.ser import loads
 
-            return loads(result)
-        return result
+            # If the result was too large to inline, the remote side
+            # wrote it to a tmp path and printed DBXPATH:<path>.
+            _DBXPATH_PREFIX = self.context._DBXPATH_PREFIX
+            if raw_result.startswith(_DBXPATH_PREFIX):
+                result_path = raw_result[len(_DBXPATH_PREFIX):]
+                try:
+                    raw_result = (
+                        self.client
+                        .dbfs_path(result_path)
+                        .read_bytes()
+                        .decode("ascii")
+                    )
+                finally:
+                    try:
+                        self.client.dbfs_path(result_path).remove(recursive=True)
+                    except Exception:
+                        LOGGER.debug(
+                            "Failed to clean up remote result path %s (non-fatal)",
+                            result_path,
+                            exc_info=True,
+                        )
+
+            if (
+                (raw_result.startswith("[") and raw_result.endswith("]"))
+                or (raw_result.startswith("{") and raw_result.endswith("}"))
+            ):
+                return json.loads(raw_result)
+
+            value = loads(raw_result)
+
+            return value
+
+        return raw_result
 
 
     @staticmethod
@@ -600,6 +708,7 @@ class CommandExecution:
         self,
         local_root: str | Path,
         *,
+        auto_pip: bool = True,
         check_diffs: bool = False
     ) -> str:
         """
@@ -623,7 +732,7 @@ class CommandExecution:
 
                 return self.context.remote_metadata.libs_path.rstrip("/")
 
-        if any(part == "site-packages" for part in local_root.parts):
+        if auto_pip and any(part == "site-packages" for part in local_root.parts):
             spec = _get_local_distribution_compatible_spec(
                 module_name=module_name, raise_error=False
             )
@@ -664,7 +773,7 @@ buf = io.BytesIO(base64.b64decode(payload_b64.encode("ascii")))
 with zipfile.ZipFile(buf, "r") as zf:
     zf.extractall(remote_libs)
 
-importlib.invalidate_caches()
+_ = importlib.import_module(root_module)
 print(remote_libs, flush=True)
 """
         res = (
@@ -743,7 +852,6 @@ if {editable!r}:
 if {quiet!r}:
     cmd.append("--quiet")
 
-cmd.extend(packages)
 
 proc = subprocess.run(
     cmd,

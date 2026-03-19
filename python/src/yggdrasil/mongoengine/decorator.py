@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar, Union, T
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
 from yggdrasil.mongoengine import register_connection
+
 from .lib import (
     mongoengine,
     get_connection_settings,
@@ -89,7 +90,19 @@ def with_mongo_connection(
     environ: EnvironLike = None,
     resolver: Optional[Callable[[], None] | str] = None,
 ) -> Callable[[F], F]:
+    def decorator(fn: F) -> F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            import yggdrasil.mongoengine.lib # noqa
+            return fn(*args, **kwargs)
+        return wrapper  # type: ignore[return-value]
+
+    final_decorator: Callable[[F], F] = decorator
+
     force_local = force_local or bool(os.getenv("DATABRICKS_RUNTIME_VERSION"))
+
+    if force_local:
+        return final_decorator if func is None else final_decorator(func)
 
     if resolver is not None:
         register_connection(resolver=resolver)
@@ -122,18 +135,9 @@ def with_mongo_connection(
                 )
             databricks = cluster.client
 
-    def decorator(fn: F) -> F:
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            import yggdrasil.mongoengine.lib # noqa
-            return fn(*args, **kwargs)
-        return wrapper  # type: ignore[return-value]
-
-    final_decorator: Callable[[F], F] = decorator
-
     if not force_local and databricks is not None:
         from yggdrasil.databricks import DatabricksClient
-        from yggdrasil.databricks.compute.execution_context import EXCLUDED_ENV_KEYS
+        from yggdrasil.databricks.compute.execution_context import exclude_env_key
         from yggdrasil.databricks.compute.cluster import Cluster
 
         databricks = DatabricksClient.parse(databricks)
@@ -169,14 +173,14 @@ def with_mongo_connection(
                 environ = {
                     k: v
                     for k, v in environ.items()
-                    if k not in EXCLUDED_ENV_KEYS
+                    if not exclude_env_key(k)
                 }
 
             environ[CONTEXT_KEY_ENVIRON] = context_key
             environ.update({
                 k: v
                 for k, v in os.environ.items()
-                if k not in EXCLUDED_ENV_KEYS
+                if not exclude_env_key(k)
             })
 
             final_decorator = cl.command(func=decorator, environ=environ)

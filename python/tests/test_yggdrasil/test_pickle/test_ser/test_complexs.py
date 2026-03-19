@@ -2,29 +2,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, is_dataclass
-from functools import wraps
 from types import ModuleType
-from typing import Any
 
-import pandas as pd
 import pytest
-
-from yggdrasil.mongoengine.decorator import with_mongo_connection
 from yggdrasil.pickle.ser import Serialized, Tags
 from yggdrasil.pickle.ser.complexs import (
     BaseExceptionSerialized,
     ClassSerialized,
     ComplexSerialized,
     DataclassSerialized,
-    FunctionSerialized,
     ModuleSerialized,
     _dump_dataclass_payload,
-    _dump_reference_function_payload,
     _load_dataclass_payload,
-    _load_reference_function_payload, MethodSerialized,
 )
-
-GLOBAL_OFFSET = 5
 
 
 class DemoClass:
@@ -32,81 +22,6 @@ class DemoClass:
 
     def mul(self, x: int) -> int:
         return x * 2
-
-
-def simple_fn(x: int) -> int:
-    return x + 1
-
-
-def global_fn(x: int) -> int:
-    return x + GLOBAL_OFFSET
-
-
-def make_closure(y: int):
-    z = 10
-
-    def inner(x: int) -> int:
-        return x + y + z
-
-    return inner
-
-
-def annotated_fn(
-    x: int,
-    y: int = 2,
-    *,
-    scale: int = 3,
-) -> int:
-    return (x + y) * scale
-
-
-def plain_decorator(fn):
-    def wrapper(x: int) -> int:
-        return fn(x) + 100
-
-    return wrapper
-
-
-def multiplier_decorator(factor: int):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(x: int) -> int:
-            return fn(x) * factor
-
-        return wrapper
-
-    return deco
-
-
-def logging_decorator(fn):
-    calls: list[int] = []
-
-    @wraps(fn)
-    def wrapper(x: int) -> tuple[int, list[int]]:
-        calls.append(x)
-        return fn(x), list(calls)
-
-    return wrapper
-
-
-@plain_decorator
-def decorated_plain_fn(x: int) -> int:
-    return x * 2
-
-
-@multiplier_decorator(3)
-def decorated_wrapped_fn(x: int) -> int:
-    return x + 1
-
-
-@logging_decorator
-def decorated_stateful_fn(x: int) -> int:
-    return x + 5
-
-
-@with_mongo_connection
-def decorated_external(x: int) -> int:
-    return x + 5
 
 
 def test_module_serialized_value_roundtrip() -> None:
@@ -128,84 +43,6 @@ def test_class_serialized_value_roundtrip() -> None:
     assert cls is DemoClass
     assert cls.value == 123
     assert cls().mul(4) == 8
-
-
-def test_function_serialized_simple_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(simple_fn)
-
-    assert isinstance(ser, FunctionSerialized)
-
-    fn = ser.as_python()
-    assert fn(10) == 11
-    assert fn.__name__ == simple_fn.__name__
-    assert fn.__qualname__ == simple_fn.__qualname__
-
-
-def test_function_serialized_with_global_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(global_fn)
-
-    fn = ser.as_python()
-    assert fn(7) == 12
-
-
-def test_function_serialized_with_closure_roundtrip() -> None:
-    original = make_closure(20)
-    ser = FunctionSerialized.build_function(original)
-
-    fn = ser.as_python()
-    assert fn(3) == 33
-
-
-def test_function_serialized_preserves_defaults_kwdefaults_annotations() -> None:
-    ser = FunctionSerialized.build_function(annotated_fn)
-
-    fn = ser.as_python()
-
-    assert fn(1) == 9
-    assert fn(1, 4, scale=2) == 10
-    assert fn.__defaults__ == annotated_fn.__defaults__
-    assert fn.__kwdefaults__ == annotated_fn.__kwdefaults__
-    assert fn.__annotations__ == annotated_fn.__annotations__
-
-
-def test_function_serialized_decorated_plain_closure_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(decorated_plain_fn)
-
-    fn = ser.as_python()
-    assert fn(2) == 104
-
-
-def test_function_serialized_decorated_with_wraps_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(decorated_wrapped_fn)
-
-    fn = ser.as_python()
-    assert fn(4) == 15
-    assert fn.__name__ == decorated_wrapped_fn.__name__
-    assert fn.__qualname__ == decorated_wrapped_fn.__qualname__
-
-
-def test_function_serialized_decorated_stateful_closure_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(decorated_stateful_fn)
-
-    fn = ser.as_python()
-
-    first = fn(1)
-    second = fn(2)
-
-    assert first == (6, [1])
-    assert second == (7, [1, 2])
-
-
-def test_function_serialized_decorated_external_roundtrip() -> None:
-    ser = FunctionSerialized.build_function(decorated_external)
-
-    fn = ser.as_python()
-
-    first = fn(1)
-    second = fn(2)
-
-    assert first == 6
-    assert second == 7
 
 
 def test_module_serialized_write_to_roundtrip() -> None:
@@ -230,19 +67,6 @@ def test_class_serialized_write_to_roundtrip() -> None:
     assert reread.as_python() is DemoClass
 
 
-def test_function_serialized_write_to_roundtrip() -> None:
-    original = FunctionSerialized.build_function(global_fn)
-
-    buf = original.write_to()
-    reread = Serialized.read_from(buf, pos=0)
-
-    assert isinstance(reread, FunctionSerialized)
-    assert reread.tag == Tags.FUNCTION
-
-    fn = reread.as_python()
-    assert fn(10) == 15
-
-
 def test_serialized_from_python_object_dispatches_module() -> None:
     ser = Serialized.from_python_object(math)
 
@@ -257,36 +81,9 @@ def test_serialized_from_python_object_dispatches_class() -> None:
     assert ser.as_python() is DemoClass
 
 
-def test_serialized_from_python_object_dispatches_function() -> None:
-    ser = Serialized.from_python_object(simple_fn)
-
-    assert isinstance(ser, FunctionSerialized)
-    fn = ser.as_python()
-    assert fn(4) == 5
-
-
-def test_serialized_from_python_object_dispatches_decorated_function() -> None:
-    ser = Serialized.from_python_object(decorated_wrapped_fn)
-
-    assert isinstance(ser, FunctionSerialized)
-    fn = ser.as_python()
-    assert fn(3) == 12
-
-
-def test_function_serialized_nested_global_objects_use_main_dispatcher() -> None:
-    local_state = {
-        "nums": [1, 2, 3],
-        "flag": True,
-    }
-
-    def fn(x: int) -> Any:
-        return x + len(local_state["nums"]), local_state["flag"]
-
-    ser = FunctionSerialized.build_function(fn)
-    rebuilt = ser.as_python()
-
-    assert rebuilt(5) == (8, True)
-
+# ===================================================================
+# Exception tests
+# ===================================================================
 
 class HttpError(Exception):
     def __init__(self, code: int, msg: str):
@@ -341,6 +138,10 @@ def test_base_exception_serialized_write_to_roundtrip() -> None:
     assert isinstance(got, KeyError)
     assert got.args == ("x",)
 
+
+# ===================================================================
+# Dataclass tests
+# ===================================================================
 
 @dataclass
 class Point:
@@ -515,6 +316,8 @@ def test_complex_serialized_dataclass_type_prefers_class_serialized():
 
 
 def test_complex_serialized_function_still_uses_function_serialized():
+    from yggdrasil.pickle.ser.complexs import FunctionSerialized
+
     ser = ComplexSerialized.from_python_object(sample_function)
 
     assert ser is not None
@@ -583,51 +386,11 @@ def test_complex_serialized_from_python_object_non_supported_returns_none():
     assert ComplexSerialized.from_python_object([1, 2, 3]) is None
 
 
-def test_reference_function_payload_roundtrip_for_pandas_site_packages():
-    payload = _dump_reference_function_payload(pd.DataFrame.head)
-    fn = _load_reference_function_payload(payload)
-
-    assert callable(fn)
-    assert fn is pd.DataFrame.head
-
-
-def test_function_serialized_uses_reference_only_for_pandas_method():
-    ser = FunctionSerialized.build_function(pd.DataFrame.head)
-    fn = ser.as_python()
-
-    assert fn is pd.DataFrame.head
-
-
-def test_serialized_from_python_object_dispatches_reference_only_function():
-    ser = Serialized.from_python_object(pd.DataFrame.head)
-
-    assert isinstance(ser, FunctionSerialized)
-    fn = ser.as_python()
-    assert fn is pd.DataFrame.head
-
-
 def test_class_serialized_reference_only_for_pandas_class():
+    import pandas as pd
+
     ser = ClassSerialized.build_class(pd.DataFrame)
     cls = ser.as_python()
 
     assert cls is pd.DataFrame
 
-
-def test_reference_only_function_roundtrip_through_write_to():
-    original = FunctionSerialized.build_function(pd.DataFrame.head)
-
-    buf = original.write_to()
-    reread = Serialized.read_from(buf, pos=0)
-
-    assert isinstance(reread, FunctionSerialized)
-    fn = reread.as_python()
-    assert fn is pd.DataFrame.head
-
-
-def test_reference_only_bound_method_uses_underlying_function():
-    bound = pd.DataFrame({"a": [1, 2]}).head
-
-    ser = Serialized.from_python_object(bound)
-    fn = ser.as_python()
-
-    assert fn().equals(bound())

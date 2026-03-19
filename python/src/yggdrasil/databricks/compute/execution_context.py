@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Literal,
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
@@ -24,10 +23,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ExecutionContext",
-    "EXCLUDED_ENV_KEYS"
+    "exclude_env_key"
 ]
 
-EXCLUDED_ENV_KEYS = frozenset([
+EXCLUDED_ENV_EXACT_KEYS = frozenset([
     'ALLUSERSPROFILE', 'APPDATA',
     'ARM_CLIENT_ID', 'ARM_CLIENT_SECRET', 'ARM_ENVIRONMENT', 'ARM_RESOURCE_ID', 'ARM_TENANT_ID',
     'CLASSPATH', 'CLICOLOR', 'CLICOLOR_FORCE', 'CLUSTER_DB_HOME', 'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)',
@@ -65,6 +64,35 @@ EXCLUDED_ENV_KEYS = frozenset([
     'VIRTUAL_ENV_PROMPT', 'WINDIR', 'ZES_ENABLE_SYSMAN', '_JB_PPRINT_PRIMITIVES', '_OLD_VIRTUAL_PATH',
     '_OLD_VIRTUAL_PROMPT', '_PIP_USE_IMPORTLIB_METADATA', '_RJEM_MALLOC_CONF', 'container'
 ])
+
+EXCLUDED_ENV_PREFIXES = (
+    "ARM_",
+    "DATABRICKS_",
+    "SPARK_",
+    "PYSPARK_",
+    "PYTHON_",
+    "PYTEST_",
+    "PYDEVD_",
+    "PYCHARM_",
+    "VSCODE_",
+    "MLFLOW_",
+    "TS_",
+    "EFC_",
+    "GIT_",
+    "GITGUARDIAN_",
+    "COMMONPROGRAMFILES",
+    "FPS_BROWSER"
+)
+
+def exclude_env_key(key: str) -> bool:
+    """Return True when an environment variable key should be excluded."""
+    k = key.upper()
+
+    return (
+        k in EXCLUDED_ENV_EXACT_KEYS
+        or k.startswith(EXCLUDED_ENV_PREFIXES)
+    )
+
 
 LOGGER = logging.getLogger(__name__)
 UPLOADED_PACKAGE_ROOTS: Dict[str, ExpiringDict] = {}
@@ -375,20 +403,38 @@ class ExecutionContext:
             self.context_id = None
 
     # ------------ public API ------------
-    def syspath_lines(self, environ: Optional[Mapping[str, str]]) -> str:
-        if environ:
+    def syspath_lines(self, environ: Optional[Mapping[str, str]] = None) -> str:
+        """Build the preamble that sets ``sys.path`` and environment variables.
 
-            return f"""import base64, os, traceback, json, sys
-_p = os.path.expanduser({self.remote_metadata.libs_path!r})
-if _p not in sys.path:
-    sys.path.insert(0, _p)
-_env = {environ!r} or {{}}"""
-        else:
-            return f"""import base64, os, traceback, json, sys
+        The snippet is prepended to every Python command sent to the
+        remote execution context.  It:
+
+        1. Ensures the remote libs path is on ``sys.path``.
+        2. Injects any extra environment variables into ``os.environ``.
+
+        Parameters
+        ----------
+        environ:
+            Optional mapping of environment variables to propagate.
+
+        Returns
+        -------
+        str
+            A multi-line Python snippet suitable for ``exec()``.
+        """
+        lines = f"""\
+import base64, os, traceback, json, sys
 _p = os.path.expanduser({self.remote_metadata.libs_path!r})
 if _p not in sys.path:
     sys.path.insert(0, _p)"""
-    
+
+        if environ:
+            lines += f"""
+for _k, _v in {dict(environ)!r}.items():
+    os.environ[_k] = str(_v)"""
+
+        return lines
+
     def command(
         self,
         command: Optional[str | Callable] = None,
@@ -407,7 +453,7 @@ if _p not in sys.path:
         out_environ = {
             k: v
             for k, v in os.environ.items()
-            if k not in EXCLUDED_ENV_KEYS
+            if not exclude_env_key(k)
         }
 
         if environ:
@@ -415,13 +461,13 @@ if _p not in sys.path:
                 out_environ.update({
                     k: os.getenv(k)
                     for k in (str(_) for _ in environ if _)
-                    if k and k not in EXCLUDED_ENV_KEYS and os.getenv(k)
+                    if k and not exclude_env_key(k)
                 })
             else:
                 out_environ.update({
                     str(k): str(v)
                     for k, v in environ.items()
-                    if v is not None and k not in EXCLUDED_ENV_KEYS
+                    if not exclude_env_key(k)
                 })
 
         if isinstance(command, str):
@@ -460,41 +506,121 @@ if p.returncode != 0:
             environ=out_environ
         )
 
+    # Prefix used to signal that the payload literal in the remote
+    # command is a Databricks path to read from, not an inline value.
+    _DBXPATH_PREFIX = "DBXPATH:"
+
+    # Conservative payload-size threshold.  Databricks command execution
+    # has a ~1 MB command-text limit; we leave headroom for the preamble
+    # and wrapper code.
+    _MAX_INLINE_PAYLOAD_BYTES = 900_000
+
     def make_python_function_command(
         self,
         func: Callable,
         args: Optional[tuple] = None,
         kwargs: Optional[dict] = None,
         tag: str = "__CALL_RESULT__",
-        environ: Optional[Mapping] = None
-    ) -> str:
-        """
-        Build a remote Python snippet that:
-          - loads a CommandExecution proxy
-          - loads args/kwargs
-          - decodes the function payload + args/kwargs payloads
-          - executes
-          - ALWAYS prints a tagged payload (success or error)
-          - restores environment variables afterwards
+        environ: Optional[Mapping] = None,
+    ) -> tuple[str, Optional[str]]:
+        """Build a remote Python command that executes a serialised callable.
 
-        Notes:
-          - protocol=5 for perf + modern compatibility
-          - strongly prefer byref=True for cross Python minor stability
+        The generated snippet:
+
+        1. Prepends ``sys.path`` / environment preamble.
+        2. Checks whether the payload literal starts with ``DBXPATH:``.
+           If so, reads the base64 payload from the Databricks path;
+           otherwise treats it as an inline base64 string.
+        3. Deserialises ``[func, args, kwargs]`` from the payload.
+        4. Calls ``func(*args, **kwargs)``.
+        5. Serialises the result (or the exception) and prints it after
+           the *tag* sentinel so that
+           :meth:`CommandExecution.decode_response` can split logs from
+           the return value.
+
+        The ``try/except`` wrapper guarantees the tag is **always**
+        printed, even when the function raises.  The caller-side
+        ``result()`` method deserialises the exception and re-raises it.
+
+        When the serialised payload exceeds
+        :attr:`_MAX_INLINE_PAYLOAD_BYTES` the payload is uploaded to a
+        temporary Databricks path (Volumes / DBFS) and the command
+        references it via the ``DBXPATH:`` prefix.  The caller is
+        responsible for deleting this path after use (see
+        :meth:`CommandExecution.result`).
+
+        Parameters
+        ----------
+        func:
+            The callable to execute remotely.
+        args:
+            Positional arguments for *func*.
+        kwargs:
+            Keyword arguments for *func*.
+        tag:
+            Sentinel string separating stdout logs from the serialised
+            return value.
+        environ:
+            Extra environment variables to inject on the remote side.
+
+        Returns
+        -------
+        tuple[str, str | None]
+            ``(command_string, remote_payload_path_or_None)``.
+            *remote_payload_path* is the Databricks path where the
+            payload was uploaded, or ``None`` when the payload was
+            embedded inline.
         """
         from yggdrasil.pickle.ser import dumps
 
-        payload = [func, args or (), kwargs or {}]
-        payload = dumps(payload, b64=True)
+        payload: str = dumps([func, args or (), kwargs or {}], b64=True)
+        remote_payload_path: Optional[str] = None
+
+        if len(payload) > self._MAX_INLINE_PAYLOAD_BYTES:
+            tmp = self.client.tmp_path(
+                suffix="-pyfunc", extension="b64",
+                max_lifetime=3600,
+            )
+            payload_bytes = (
+                payload.encode("ascii")
+                if isinstance(payload, str)
+                else payload
+            )
+            tmp.write_bytes(payload_bytes)
+            remote_payload_path = str(tmp)
+
+            # The remote snippet receives a DBXPATH:-prefixed literal
+            # and reads the actual base64 data from the path.
+            payload_literal = f"{self._DBXPATH_PREFIX}{remote_payload_path}"
+        else:
+            payload_literal = payload
 
         cmd = f"""\
 {self.syspath_lines(environ)}
 
 from yggdrasil.pickle.ser import loads, dumps
-f,a,k=loads({payload!r})
-r = dumps(f(*a, **k), b64=True)
-print({tag!r} + r, flush=True)
+_DBXPATH_PREFIX = {self._DBXPATH_PREFIX!r}
+_MAX_INLINE = {self._MAX_INLINE_PAYLOAD_BYTES!r}
+_raw = {payload_literal!r}
+
+if _raw.startswith(_DBXPATH_PREFIX):
+    from yggdrasil.databricks.client import DatabricksClient as _DBC
+    _client = _DBC.current()
+    _path = _raw[len(_DBXPATH_PREFIX):]
+    _raw = _client.dbfs_path(_path).read_bytes().decode("ascii")
+_f, _a, _k = loads(_raw)
+_r = dumps(_f(*_a, **_k), b64=True)
+
+if len(_r) > _MAX_INLINE:
+    from yggdrasil.databricks.client import DatabricksClient as _DBC
+    _client = _DBC.current()
+    _tmp = _client.tmp_path(suffix="-pyresult", extension="b64", max_lifetime=3600)
+    _tmp.write_bytes(_r.encode("ascii") if isinstance(_r, str) else _r)
+    _r = _DBXPATH_PREFIX + str(_tmp)
+    
+print({tag!r} + _r, flush=True)
 """
-        return cmd
+        return cmd, remote_payload_path
 
     def is_in_databricks_environment(self):
         """Return True when running on a Databricks runtime."""
