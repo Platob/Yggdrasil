@@ -1348,7 +1348,28 @@ class PyEnv:
             raise ValueError("module_name must be a non-empty string")
 
         root_module = module_name.split(".", 1)[0]
-        spec = importlib.util.find_spec(root_module)
+
+        # Special-case __main__ because find_spec("__main__") may raise
+        # ValueError when __main__.__spec__ is None (common for direct script execution).
+        if root_module == "__main__":
+            main_mod = sys.modules.get("__main__")
+            main_file = getattr(main_mod, "__file__", None)
+            if main_file:
+                return Path(main_file).resolve().parent
+            raise FileNotFoundError(
+                "Module '__main__' has no filesystem directory "
+                "(likely running interactively or in an environment without __file__)"
+            )
+
+        try:
+            spec = importlib.util.find_spec(root_module)
+        except ValueError as e:
+            # Fallback for odd import states / partially initialized modules
+            mod = sys.modules.get(root_module)
+            mod_file = getattr(mod, "__file__", None) if mod else None
+            if mod_file:
+                return Path(mod_file).resolve().parent
+            raise ModuleNotFoundError(f"Cannot determine module spec for '{root_module}'") from e
 
         if spec is None:
             raise ModuleNotFoundError(f"Cannot find module '{root_module}'")
