@@ -1,19 +1,134 @@
-name: 🐸 Build and Push to PyPI (uv)
+# ============================================================================
+# publish-pypi.yml
+#
+# Publishes the `ygg` Python package to PyPI with smart change detection:
+#
+#   • Path filter  – only runs when python/ sources actually change
+#   • Version gate – skips if pyproject.toml version is already on PyPI
+#   • Tag shortcut – vX.Y.Z tags bypass the branch path filter
+#   • Force flag   – manual dispatch can override the version gate
+#
+# Jobs
+# ----
+#   detect  → reads version, queries PyPI, decides whether to publish
+#   build   → builds sdist + wheel (gated on detect)
+#   publish → uploads to PyPI via OIDC trusted publishing (gated on build)
+#   skip    → posts a clear summary when publish is intentionally skipped
+# ============================================================================
+
+name: 🐸 Publish to PyPI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
+      # Python package source & metadata
       - "python/src/**"
+      - "python/pyproject.toml"
+      - "python/README.md"
+      - "python/LICENSE"
+      # Workflow itself
       - ".github/workflows/publish-pypi.yml"
-  workflow_dispatch:
+    tags:
+      # vX.Y.Z tags always trigger (path filter does not apply to tags)
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Publish even if version already exists on PyPI"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# Serialise publishes so we never race
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+# Minimal default permissions; publish job broadens id-token for OIDC
 permissions:
   contents: read
 
 jobs:
-  release:
+
+  # --------------------------------------------------------------------------
+  # detect — read the version from pyproject.toml, check PyPI, decide.
+  # --------------------------------------------------------------------------
+  detect:
+    name: Detect version & decide
     runs-on: ubuntu-latest
+
+    outputs:
+      version:        ${{ steps.meta.outputs.version }}
+      already_on_pypi: ${{ steps.pypi.outputs.exists }}
+      should_publish: ${{ steps.decision.outputs.should_publish }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Read version string from pyproject.toml (no extra dependencies needed)
+      - name: Extract version
+        id: meta
+        run: |
+          VERSION=$(python3 - <<'PY'
+          import re, pathlib
+          text = pathlib.Path("python/pyproject.toml").read_text()
+          m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+          print(m.group(1))
+          PY
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📦 Package version: $VERSION"
+
+      # Query PyPI JSON API – 200 means the exact version already exists
+      - name: Check version against PyPI
+        id: pypi
+        env:
+          PKG: ygg
+          VER: ${{ steps.meta.outputs.version }}
+        run: |
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            "https://pypi.org/pypi/${PKG}/${VER}/json" || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "⚠️  v${VER} is already on PyPI."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ v${VER} is not on PyPI yet."
+          fi
+
+      # Publish when: version is new  OR  caller forced it  OR  it's a tag push
+      - name: Decide whether to publish
+        id: decision
+        env:
+          EXISTS: ${{ steps.pypi.outputs.exists }}
+          FORCE:  ${{ github.event.inputs.force_publish || 'false' }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [ "$EXISTS" = "false" ] || [ "$FORCE" = "true" ] || [ "$IS_TAG" = "true" ]; then
+            echo "should_publish=true"  >> "$GITHUB_OUTPUT"
+            echo "🚀 Will publish v${{ steps.meta.outputs.version }}."
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️  Skipping – version already on PyPI and force=false."
+          fi
+
+  # --------------------------------------------------------------------------
+  # build — build sdist + wheel; upload as a workflow artifact.
+  # --------------------------------------------------------------------------
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
 
     defaults:
       run:
@@ -23,21 +138,111 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build package
-        run: |
-          uv build --no-sources
-          ls -la dist
+      - name: Build sdist and wheel
+        run: uv build --no-sources
 
-      - name: Publish to PyPI
+      - name: Verify dist contents
+        run: ls -lh dist/
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ needs.detect.outputs.version }}
+          path: python/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # publish — push to PyPI.
+  #   Primary:  OIDC trusted publishing (no token required, set up once on PyPI)
+  #   Fallback: UV_PUBLISH_TOKEN secret (backwards compatible)
+  # --------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [detect, build]
+    if: needs.detect.outputs.should_publish == 'true'
+
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+      contents: read
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/
+
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.detect.outputs.version }}
+          path: dist/
+
+      # Preferred: OIDC trusted publishing (no API token in repo secrets)
+      - name: Publish via trusted publishing (OIDC)
+        if: vars.PYPI_TRUSTED_PUBLISHING == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true
+          verbose: true
+
+      # Fallback: classic API token stored in PYPI_API_TOKEN secret
+      - name: Install uv (for token-based fallback)
+        if: vars.PYPI_TRUSTED_PUBLISHING != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Publish via API token
+        if: vars.PYPI_TRUSTED_PUBLISHING != 'true'
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish dist/*
+
+      - name: Write success summary
         run: |
-          uv publish
+          {
+            echo "## ✅ Published \`ygg\` v${{ needs.detect.outputs.version }}"
+            echo ""
+            echo "🔗 https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${{ needs.detect.outputs.version }}\` |"
+            echo "| Triggered by | \`${{ github.event_name }}\` |"
+            echo "| Ref | \`${{ github.ref }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # skip-summary — clear explanation when the publish was skipped
+  # --------------------------------------------------------------------------
+  skip-summary:
+    name: Skip summary
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'false'
+
+    steps:
+      - name: Write skip summary
+        run: |
+          {
+            echo "## ⏭️ Publish skipped"
+            echo ""
+            echo "Version **\`${{ needs.detect.outputs.version }}\`** is already"
+            echo "published on PyPI."
+            echo ""
+            echo "To publish anyway, re-run this workflow with **force_publish = true**,"
+            echo "or push a version bump to \`python/pyproject.toml\`."
+          } >> "$GITHUB_STEP_SUMMARY"

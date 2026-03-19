@@ -245,7 +245,7 @@ let
                 warehouse_id   = Record.FieldOrDefault(Opts, "WarehouseId",   null),
                 warehouse_name = Record.FieldOrDefault(Opts, "WarehouseName", null),
                 df_name        = Record.FieldOrDefault(Opts, "DfName",        "df"),
-                max_rows       = Record.FieldOrDefault(Opts, "MaxRows",       null),
+                max_rows       = Record.FieldOrDefault(Opts, "MaxRows",       512000),
                 cache_ttl      = Record.FieldOrDefault(Opts, "CacheTtl",      null),
                 force_refresh  = Record.FieldOrDefault(Opts, "ForceRefresh",  false)
             ],
