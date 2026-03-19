@@ -1,7 +1,12 @@
 /**
- * Yggdrasil.query.pq — Sample queries for testing in Power Query SDK.
+ * Yggdrasil.query.pq - Test queries
  *
- * Open this file in the Power Query SDK to test the connector interactively.
+ * For Power BI (with .mez installed):
+ *   Uncomment any Test block below.
+ *
+ * For Excel (no .mez):
+ *   Use YggdrasilExcel.pq instead - paste it into the Advanced Editor.
+ *
  * The Yggdrasil FastAPI service must be running on localhost:8000.
  */
 
@@ -14,8 +19,8 @@ in
 // ---- Test 2: Execute Python code ----
 // let
 //     Result = Yggdrasil.Execute(
-//         "import pandas as pd#(lf)df = pd.DataFrame({'id': [1,2,3], 'value': [10.5, 20.3, 30.1]})",
-//         [Packages = {"pandas"}, DfName = "df"]
+//         "import pyarrow as pa#(lf)df = pa.table({'id': [1,2,3], 'value': [10.5, 20.3, 30.1]})",
+//         [Packages = {"pyarrow"}, DfName = "df"]
 //     )
 // in
 //     Result;
@@ -23,8 +28,8 @@ in
 // ---- Test 3: Execute with max rows ----
 // let
 //     Result = Yggdrasil.Execute(
-//         "import pandas as pd#(lf)df = pd.DataFrame({'x': range(1000)})",
-//         [Packages = {"pandas"}, MaxRows = 10]
+//         "import pyarrow as pa#(lf)df = pa.table({'x': list(range(1000))})",
+//         [Packages = {"pyarrow"}, MaxRows = 10]
 //     )
 // in
 //     Result;
@@ -32,13 +37,38 @@ in
 // ---- Test 4: Prepare (cached) ----
 // let
 //     Result = Yggdrasil.Prepare(
-//         "import pandas as pd#(lf)df = pd.DataFrame({'a': [1,2,3], 'b': ['x','y','z']})",
-//         [Packages = {"pandas"}, ForceRefresh = false]
+//         "import pyarrow as pa#(lf)df = pa.table({'a': [1,2,3], 'b': ['x','y','z']})",
+//         [Packages = {"pyarrow"}, ForceRefresh = false]
 //     )
 // in
 //     Result;
 
-// ---- Test 5: Navigation table ----
+// ---- Test 5: Databricks SQL ----
+// let
+//     Result = Yggdrasil.DatabricksSQL(
+//         "SELECT * FROM main.default.my_table LIMIT 100",
+//         [CacheTtl = 300, ForceRefresh = false]
+//     )
+// in
+//     Result;
+
+// ---- Test 6: Databricks SQL with connection options ----
+// let
+//     Result = Yggdrasil.DatabricksSQL(
+//         "SELECT id, name, amount FROM main.analytics.transactions LIMIT 50",
+//         [
+//             CatalogName   = "main",
+//             SchemaName    = "analytics",
+//             WarehouseName = "Starter Warehouse",
+//             MaxRows       = 50,
+//             CacheTtl      = 600,
+//             ForceRefresh  = false
+//         ]
+//     )
+// in
+//     Result;
+
+// ---- Test 7: Navigation table ----
 // let
 //     Nav = Yggdrasil.Contents()
 // in

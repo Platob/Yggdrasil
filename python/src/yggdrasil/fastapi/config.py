@@ -29,6 +29,8 @@ class Settings:
     env_home: Path = field(default_factory=lambda: Path.home() / ".local" / "yggdrasil" / "python" / "envs")
     cache_home: Path = field(default_factory=_default_cache_root)
     excel_app_version: str = "excel-exec-v3"
+    databricks_cache_max_size: int = 128
+    databricks_cache_default_ttl: int = 300
 
     @property
     def local_clients(self) -> set[str]:
@@ -76,4 +78,6 @@ def get_settings() -> Settings:
             )
         ).expanduser().resolve(),
         excel_app_version=os.getenv("YGG_FASTAPI_EXCEL_APP_VERSION", "excel-exec-v3"),
+        databricks_cache_max_size=int(os.getenv("YGG_FASTAPI_DATABRICKS_CACHE_MAX_SIZE", "128")),
+        databricks_cache_default_ttl=int(os.getenv("YGG_FASTAPI_DATABRICKS_CACHE_DEFAULT_TTL", "300")),
     )

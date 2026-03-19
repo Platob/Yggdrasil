@@ -1,24 +1,21 @@
-"""Excel-specific router for DataFrame execution and cached parquet output.
+"""Python/Excel execution routes.
 
-Uses the global service layer, dependency injection, and shared schemas.
-Gzip request decompression is handled via ``GzipRoute`` for all endpoints
-on this router.
+Handles real-time DataFrame execution and cached parquet preparation.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from ..deps import get_python_service
-from ..middleware import GzipRoute
-from ..schemas.python import (
+from ...deps import get_python_service
+from ...schemas.python import (
     ExcelExecuteRequest,
     ExcelExecuteResponse,
     ExcelPrepareRequest,
     ExcelPrepareResponse,
 )
-from ..services.python import PythonService
+from ...services.python import PythonService
 
-router = APIRouter(tags=["python", "excel"], route_class=GzipRoute)
+router = APIRouter(tags=["python", "excel"])
 
 
 @router.post("/execute", response_model=ExcelExecuteResponse)
@@ -35,3 +32,4 @@ async def prepare_excel(
     service: PythonService = Depends(get_python_service),
 ) -> ExcelPrepareResponse:
     return await service.prepare_excel(req)
+

@@ -6,18 +6,22 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Mapping, Any, Union, TYPE_CHECKING, Iterator, Callable, Literal
 
+import yggdrasil.pickle.ser as pickle
 from yggdrasil.concurrent.threading import JobPoolExecutor, Job
-from yggdrasil.data import any_to_datetime
+from yggdrasil.data import any_to_datetime, CastOptions
 from yggdrasil.dataclasses import serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, DEFAULT_WAITING_CONFIG
+from yggdrasil.environ import PyEnv
 from yggdrasil.io import SaveMode
+
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import Response, RESPONSE_ARROW_SCHEMA
 from .url import URL
 
 if TYPE_CHECKING:
-    from ..databricks.sql.table import Table
+    from pyspark.sql import SparkSession
+    from yggdrasil.databricks.sql.table import Table
 
 
 __all__ = ["Session"]
@@ -84,6 +88,21 @@ class Session(ABC):
                     self._job_pool = self._build_job_pool()
         return self._job_pool
 
+
+    @property
+    def x_api_key(self) -> Optional[str]:
+        if self.send_headers and "X-API-Key" in self.send_headers:
+            return self.send_headers["X-API-Key"]
+        return None
+
+    @x_api_key.setter
+    def x_api_key(self, value: Optional[str]):
+        if value:
+            if not self.send_headers:
+                self.send_headers = {}
+
+            self.send_headers["X-API-Key"] = value
+
     @classmethod
     def from_url(
         cls,
@@ -134,8 +153,8 @@ class Session(ABC):
                 "request_url_query",
                 "request_content_length",
                 "request_body_hash",
-                "response_content_length",
-                "response_body_hash"
+                # "response_content_length",
+                # "response_body_hash"
             ]
 
         invalid = [key for key in arg if key not in RESPONSE_ARROW_SCHEMA.names]
@@ -733,4 +752,40 @@ WHERE __rn = 1"""
             normalize=normalize,
             before_send=before_send,
             after_received=after_received
+        )
+
+    def to_spark(
+        self,
+        requests: Iterator[PreparedRequest],
+        *,
+        spark_session: Optional["SparkSession"] = None,
+        cast_options: Optional[CastOptions] = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: Optional[bool] = None,
+        stream: bool = True,
+        cache: Optional["Table"] = None,
+        cache_by: Optional[list[str]] = None,
+        cache_anonymize: Literal["remove", "redact"] = "remove",
+        received_from: Optional[dt.datetime | dt.date | str] = None,
+        received_to: Optional[dt.datetime | dt.date | str] = None,
+        wait_cache: WaitingConfigArg = False,
+        # Pooling options
+        batch_size: Optional[int] = None,
+        ordered: bool = False,
+        max_in_flight: Optional[int] = None,
+    ):
+        serialized = pickle.dumps(self)
+
+        if spark_session is None:
+            spark_session = PyEnv.spark_session(
+                create=True, import_error=True, install_spark=True
+            )
+
+        df = spark_session.createDataFrame(
+            [
+                pickle.dumps(_)
+                for _ in requests
+            ],
+            schema=["request BINARY"]
         )

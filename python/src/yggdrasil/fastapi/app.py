@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
 from .routers import excel_router, python_router, system_router
-from .services import PythonService, SystemService
+from .services import DatabricksExcelService, PythonService, SystemService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -24,6 +24,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.system_service = SystemService(settings)
     app.state.python_service = PythonService(settings)
+    app.state.databricks_excel_service = DatabricksExcelService(settings)
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):

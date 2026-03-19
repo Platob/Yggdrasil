@@ -36,6 +36,7 @@ class SystemService:
                 "execute": f"{api}{py_prefix}/execute",
                 "excel_execute": f"{api}{py_prefix}{xl_prefix}/execute",
                 "excel_prepare": f"{api}{py_prefix}{xl_prefix}/prepare",
+                "excel_databricks_sql": f"{api}{py_prefix}{xl_prefix}/databricks/sql",
             },
         )
 

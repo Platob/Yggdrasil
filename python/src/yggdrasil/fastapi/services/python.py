@@ -258,7 +258,7 @@ class PythonService:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
             output_path = Path(tmp.name)
 
-        packages = list(dict.fromkeys([*req.packages, "pandas"]))
+        packages = list(dict.fromkeys([*req.packages, "pyarrow"]))
         wrapped_code = self._build_excel_capture_code(
             user_code=req.code,
             output_path=output_path,
@@ -409,7 +409,7 @@ class PythonService:
     @staticmethod
     def _normalize_packages(values: list[str]) -> list[str]:
         cleaned = {v.strip() for v in values if v and v.strip()}
-        cleaned.update({"pandas", "pyarrow"})
+        cleaned.add("pyarrow")
         return sorted(cleaned)
 
     @staticmethod
@@ -669,7 +669,7 @@ def _write_payload(payload):
 
 
 try:
-    import pandas as pd
+    import pyarrow as pa
 except Exception as exc:
     _write_payload({{
         "ok": False,
@@ -680,6 +680,12 @@ except Exception as exc:
         }},
     }})
     raise
+
+# pandas is optional — only needed when user code produces a pandas DataFrame
+try:
+    import pandas as _pd
+except ImportError:
+    _pd = None
 
 
 globals_dict = {{"__name__": "__main__", "__file__": "<powerquery-execute>"}}
@@ -692,31 +698,38 @@ try:
     if DF_NAME not in namespace:
         raise KeyError(f"Expected dataframe '{{DF_NAME}}' in locals()")
 
-    df = namespace[DF_NAME]
-    if not isinstance(df, pd.DataFrame):
+    _obj = namespace[DF_NAME]
+
+    # Convert to Arrow table regardless of source type
+    if isinstance(_obj, pa.Table):
+        _table = _obj
+    elif _pd is not None and isinstance(_obj, _pd.DataFrame):
+        _table = pa.Table.from_pandas(_obj, preserve_index=False)
+    else:
         raise TypeError(
-            f"locals()['{{DF_NAME}}'] must be a pandas.DataFrame, got {{type(df).__name__}}"
+            f"locals()['{{DF_NAME}}'] must be a pyarrow.Table or pandas.DataFrame, "
+            f"got {{type(_obj).__name__}}"
         )
 
-    total_rows = int(len(df.index))
-    export_df = df if MAX_ROWS is None else df.head(MAX_ROWS)
-    rows = json.loads(export_df.to_json(orient="records", date_format="iso"))
-    columns = [str(column) for column in export_df.columns]
-    schema = [
-        {{"name": str(column), "dtype": str(dtype)}}
-        for column, dtype in zip(export_df.columns, export_df.dtypes)
+    _total_rows = _table.num_rows
+    _export = _table if MAX_ROWS is None else _table.slice(0, MAX_ROWS)
+    _rows = _export.to_pylist()
+    _columns = [f.name for f in _export.schema]
+    _schema = [
+        {{"name": f.name, "dtype": str(f.type)}}
+        for f in _export.schema
     ]
 
     _write_payload({{
         "ok": True,
         "data": {{
             "df_name": DF_NAME,
-            "columns": columns,
-            "schema": schema,
-            "rows": rows,
-            "row_count": total_rows,
-            "returned_rows": int(len(export_df.index)),
-            "truncated": bool(MAX_ROWS is not None and total_rows > len(export_df.index)),
+            "columns": _columns,
+            "schema": _schema,
+            "rows": _rows,
+            "row_count": _total_rows,
+            "returned_rows": _export.num_rows,
+            "truncated": bool(MAX_ROWS is not None and _total_rows > _export.num_rows),
         }},
     }})
 except Exception as exc:

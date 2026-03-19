@@ -1,4 +1,5 @@
 from .common import ErrorResponse, StrictModel
+from .databricks import DatabricksSQLRequest, DatabricksSQLResponse
 from .python import (
     CommandResult,
     CreateEnvRequest,
@@ -50,4 +51,6 @@ __all__ = [
     "ExcelExecuteResponse",
     "ExcelPrepareResponse",
     "ManifestData",
+    "DatabricksSQLRequest",
+    "DatabricksSQLResponse",
 ]

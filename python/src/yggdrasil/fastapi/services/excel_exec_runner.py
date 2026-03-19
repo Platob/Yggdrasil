@@ -31,11 +31,19 @@ def main() -> None:
     max_rows: int | None = payload.get("max_rows")
 
     try:
-        import pandas as pd
+        import pyarrow as pa  # noqa: F811
+        import pyarrow.parquet as pq  # noqa: F811
+    except ImportError:
+        pa = None  # type: ignore[assignment]
+        pq = None  # type: ignore[assignment]
+        _write_error(manifest_path, "ImportError", "pyarrow is not installed in this environment")
+        sys.exit(1)
+
+    # pandas is optional — only needed if user code produces a pandas DataFrame
+    try:
+        import pandas as pd  # noqa: F401
     except ImportError:
         pd = None  # type: ignore[assignment]
-        _write_error(manifest_path, "ImportError", "pandas is not installed in this environment")
-        sys.exit(1)
 
     globals_dict: dict = {"__name__": "__main__", "__file__": "<excel-prepare>"}
     locals_dict: dict = {}
@@ -47,22 +55,29 @@ def main() -> None:
         if df_name not in namespace:
             raise KeyError(f"Expected DataFrame '{df_name}' in locals()")
 
-        df = namespace[df_name]
-        if not isinstance(df, pd.DataFrame):
+        obj = namespace[df_name]
+
+        # Convert to Arrow table regardless of source type
+        if isinstance(obj, pa.Table):
+            table = obj
+        elif pd is not None and isinstance(obj, pd.DataFrame):
+            table = pa.Table.from_pandas(df=obj, preserve_index=False)
+        else:
             raise TypeError(
-                f"locals()['{df_name}'] must be a pandas.DataFrame, got {type(df).__name__}"
+                f"locals()['{df_name}'] must be a pyarrow.Table or pandas.DataFrame, "
+                f"got {type(obj).__name__}"
             )
 
-        total_rows = len(df.index)
-        export_df = df if max_rows is None else df.head(max_rows)
+        total_rows = table.num_rows
+        export_table = table if max_rows is None else table.slice(0, max_rows)
 
-        # Write parquet
-        export_df.to_parquet(str(result_path), index=False, engine="pyarrow")
+        # Write parquet via pyarrow
+        pq.write_table(export_table, str(result_path))
 
-        columns = [str(c) for c in export_df.columns]
+        columns = [f.name for f in export_table.schema]
         schema = [
-            {"name": str(c), "dtype": str(d)}
-            for c, d in zip(export_df.columns, export_df.dtypes)
+            {"name": f.name, "dtype": str(f.type)}
+            for f in export_table.schema
         ]
 
         manifest = {
@@ -70,8 +85,8 @@ def main() -> None:
             "columns": columns,
             "schema": schema,
             "row_count": total_rows,
-            "returned_rows": len(export_df.index),
-            "truncated": bool(max_rows is not None and total_rows > len(export_df.index)),
+            "returned_rows": export_table.num_rows,
+            "truncated": bool(max_rows is not None and total_rows > export_table.num_rows),
             "result_path": str(result_path),
         }
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")

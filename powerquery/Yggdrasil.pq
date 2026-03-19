@@ -1,13 +1,14 @@
 /**
  * Yggdrasil Power Query Connector
  *
- * Custom data connector for Excel / Power BI that communicates with the
+ * Custom data connector for Power BI Desktop that communicates with the
  * Yggdrasil FastAPI service (yggdrasil.fastapi.routers.excel).
  *
  * Endpoints consumed:
- *   POST /api/python/excel/execute   — real-time JSON DataFrame
- *   POST /api/python/excel/prepare   — cached parquet execution
- *   GET  /api/system/healthz         — service health check
+ *   POST /api/python/excel/execute        - real-time JSON DataFrame
+ *   POST /api/python/excel/prepare        - cached parquet execution
+ *   POST /api/python/excel/databricks/sql - Databricks SQL query (cached)
+ *   GET  /api/system/healthz              - service health check
  */
 
 section Yggdrasil;
@@ -25,70 +26,59 @@ SystemPath     = "/system";
 // Shared HTTP helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build a full endpoint URL.
- */
 Yggdrasil.BuildUrl = (baseUrl as text, path as text) as text =>
     Text.TrimEnd(baseUrl, "/") & path;
 
-/**
- * POST JSON to the Yggdrasil API and return the parsed response.
- */
-Yggdrasil.PostJson = (url as text, body as record) as record =>
+Yggdrasil.PostJson = (url as text, body as record) as any =>
     let
-        JsonBody   = Json.FromValue(body),
+        JsonBody    = Json.FromValue(body),
         RawResponse = Web.Contents(
             url,
             [
-                Content  = JsonBody,
-                Headers  = [
+                Content = JsonBody,
+                Headers = [
                     #"Content-Type" = "application/json",
                     #"Accept"       = "application/json"
                 ],
                 ManualStatusHandling = {400, 403, 404, 500}
             ]
         ),
-        BufferedResponse = Binary.Buffer(RawResponse),
-        Parsed = Json.Document(BufferedResponse),
-        Meta   = Value.Metadata(RawResponse),
-        Status = Meta[Response.Status],
-        Result = if Status >= 400 then
-                     error Error.Record(
-                         "Yggdrasil.APIError",
-                         "API request failed (HTTP " & Number.ToText(Status) & ")",
-                         Parsed
-                     )
-                 else
-                     Parsed
+        Buffered = Binary.Buffer(RawResponse),
+        Meta     = Value.Metadata(RawResponse),
+        Status   = Meta[Response.Status],
+        Parsed   = Json.Document(Buffered),
+        Result   = if Status >= 400 then
+                       error Error.Record(
+                           "Yggdrasil.APIError",
+                           "API returned HTTP " & Number.ToText(Status),
+                           Parsed
+                       )
+                   else
+                       Parsed
     in
         Result;
 
-/**
- * GET from the Yggdrasil API and return the parsed JSON.
- */
-Yggdrasil.GetJson = (url as text) as record =>
+Yggdrasil.GetJson = (url as text) as any =>
     let
         RawResponse = Web.Contents(
             url,
             [
-                Headers = [
-                    #"Accept" = "application/json"
-                ],
+                Headers = [#"Accept" = "application/json"],
                 ManualStatusHandling = {400, 403, 404, 500}
             ]
         ),
-        BufferedResponse = Binary.Buffer(RawResponse),
-        Parsed = Json.Document(BufferedResponse),
-        Meta   = Value.Metadata(RawResponse),
-        Status = Meta[Response.Status],
-        Result = if Status >= 400 then
-                     error Error.Record(
-                         "Yggdrasil.APIError",
-                         "API request failed (HTTP " & Number.ToText(Status) & ")",
-                         Parsed
-                     )
-                 else
-                     Parsed
+        Buffered = Binary.Buffer(RawResponse),
+        Meta     = Value.Metadata(RawResponse),
+        Status   = Meta[Response.Status],
+        Parsed   = Json.Document(Buffered),
+        Result   = if Status >= 400 then
+                       error Error.Record(
+                           "Yggdrasil.APIError",
+                           "API returned HTTP " & Number.ToText(Status),
+                           Parsed
+                       )
+                   else
+                       Parsed
     in
         Result;
 
@@ -96,96 +86,71 @@ Yggdrasil.GetJson = (url as text) as record =>
 // Schema helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Map a Python/pandas dtype string to a Power Query M type.
- */
 Yggdrasil.MapDtype = (dtype as text) as type =>
     let
-        Lower = Text.Lower(dtype),
-        Mapped =
-            if Text.StartsWith(Lower, "int")    then Int64.Type    else
-            if Text.StartsWith(Lower, "uint")   then Int64.Type    else
-            if Text.StartsWith(Lower, "float")  then Double.Type   else
-            if Text.StartsWith(Lower, "bool")   then Logical.Type  else
-            if Text.StartsWith(Lower, "datetime") then DateTimeZone.Type else
-            if Text.StartsWith(Lower, "date")   then Date.Type     else
-            if Text.StartsWith(Lower, "time")   then Time.Type     else
-            if Lower = "object"                  then Text.Type     else
-            if Text.StartsWith(Lower, "str")     then Text.Type     else
-            if Text.StartsWith(Lower, "category") then Text.Type   else
+        L = Text.Lower(dtype),
+        T = // Arrow types
+            if L = "string" or L = "utf8" or L = "large_string" or L = "large_utf8"
+                                           then Text.Type        else
+            if L = "int8" or L = "int16" or L = "int32" or L = "int64"
+                                           then Int64.Type       else
+            if L = "uint8" or L = "uint16" or L = "uint32" or L = "uint64"
+                                           then Int64.Type       else
+            if L = "float" or L = "float16" or L = "float32" or L = "double" or L = "float64" or L = "halffloat"
+                                           then Double.Type      else
+            if L = "bool" or L = "boolean" then Logical.Type     else
+            if L = "date32" or L = "date32[day]"
+                                           then Date.Type        else
+            if Text.StartsWith(L, "timestamp")
+                                           then DateTimeZone.Type else
+            if Text.StartsWith(L, "date")  then Date.Type        else
+            if Text.StartsWith(L, "time")  then Time.Type        else
+            if Text.StartsWith(L, "duration")
+                                           then Duration.Type    else
+            if L = "binary" or L = "large_binary"
+                                           then Binary.Type      else
+            if L = "null"                  then Any.Type         else
+            if Text.StartsWith(L, "decimal")
+                                           then Number.Type      else
+            // pandas fallbacks
+            if Text.StartsWith(L, "int")       then Int64.Type       else
+            if Text.StartsWith(L, "uint")      then Int64.Type       else
+            if Text.StartsWith(L, "float")     then Double.Type      else
+            if Text.StartsWith(L, "bool")      then Logical.Type     else
+            if Text.StartsWith(L, "datetime")  then DateTimeZone.Type else
+            if L = "object"                    then Text.Type        else
+            if Text.StartsWith(L, "str")       then Text.Type        else
+            if Text.StartsWith(L, "category")  then Text.Type        else
             Any.Type
     in
-        Mapped;
+        T;
 
-/**
- * Build a typed Table.Type from the schema list returned by the API.
- * Each schema entry is a record with "name" and "dtype" fields.
- */
-Yggdrasil.BuildTableType = (schemaList as list) as type =>
-    let
-        Columns = List.Transform(
-            schemaList,
-            each {[name], Yggdrasil.MapDtype([dtype])}
-        ),
-        TableType = type table (Type.ForRecord(
-            Record.FromList(
-                List.Transform(Columns, each _{1}),
-                List.Transform(Columns, each _{0})
-            ),
-            false
-        ))
-    in
-        TableType;
-
-/**
- * Convert the API rows (list of records) into a typed Power Query table.
- */
 Yggdrasil.RowsToTable = (rows as list, schemaList as list, columns as list) as table =>
     let
-        RawTable  = Table.FromRecords(rows, columns, MissingField.UseNull),
-        // Apply column types from schema
-        TypePairs = List.Transform(
-            schemaList,
-            each {[name], Yggdrasil.MapDtype([dtype])}
-        ),
-        Typed = Table.TransformColumnTypes(RawTable, TypePairs)
+        Raw       = Table.FromRecords(rows, columns, MissingField.UseNull),
+        TypePairs = List.Transform(schemaList, each {[name], Yggdrasil.MapDtype([dtype])}),
+        Typed     = Table.TransformColumnTypes(Raw, TypePairs)
     in
         Typed;
 
 // ---------------------------------------------------------------------------
-// Public API functions
+// Yggdrasil.Health
 // ---------------------------------------------------------------------------
 
-/**
- * Yggdrasil.Health
- *
- * Check the Yggdrasil service health.
- * Returns a record with { ok, env_home, python_executable }.
- */
 shared Yggdrasil.Health = Value.ReplaceType(
-    Yggdrasil.Health.Impl,
-    Yggdrasil.Health.Type
+    Yggdrasil.HealthImpl,
+    type function (
+        optional baseUrl as (type text meta [
+            Documentation.FieldCaption = "Base URL",
+            Documentation.SampleValues = {"http://127.0.0.1:8000"}
+        ])
+    ) as record meta [
+        Documentation.Name = "Yggdrasil.Health",
+        Documentation.LongDescription = "Check the Yggdrasil service health."
+    ]
 );
 
-Yggdrasil.Health.Type = type function (
-    optional baseUrl as (
-        type text meta [
-            Documentation.FieldCaption     = "Base URL",
-            Documentation.FieldDescription = "Yggdrasil API base URL",
-            Documentation.SampleValues     = {"http://127.0.0.1:8000"}
-        ]
-    )
-) as record meta [
-    Documentation.Name             = "Yggdrasil.Health",
-    Documentation.LongDescription  = "Check the Yggdrasil FastAPI service health.",
-    Documentation.Examples = {[
-        Description = "Default health check",
-        Code        = "Yggdrasil.Health()",
-        Result      = "[ok = true, env_home = ""..."", python_executable = ""...""]"
-    ]}
-];
-
-Yggdrasil.Health.Impl = (optional baseUrl as text) as record =>
+Yggdrasil.HealthImpl = (optional baseUrl as text) as record =>
     let
         Base = if baseUrl <> null then baseUrl else DefaultBaseUrl,
         Url  = Yggdrasil.BuildUrl(Base, ApiPrefix & SystemPath & "/healthz")
@@ -193,207 +158,178 @@ Yggdrasil.Health.Impl = (optional baseUrl as text) as record =>
         Yggdrasil.GetJson(Url);
 
 // ---------------------------------------------------------------------------
+// Yggdrasil.Execute
+// ---------------------------------------------------------------------------
 
-/**
- * Yggdrasil.Execute
- *
- * Execute Python code and return the resulting DataFrame as a Power Query table.
- * Calls POST /api/python/excel/execute.
- *
- * Options record fields:
- *   Identifier       text      "current"  — Python env identifier
- *   Packages         list      {}         — pip packages to ensure
- *   DfName           text      "df"       — name of the DataFrame variable
- *   MaxRows          number    null       — limit returned rows
- *   PreferUv         logical   true       — prefer uv over pip
- *   CreateIfMissing  logical   false      — create env if not found
- *   IncludeResult    logical   false      — include CommandResult in metadata
- *   AutoInstall      logical   false      — auto-install missing imports
- */
 shared Yggdrasil.Execute = Value.ReplaceType(
-    Yggdrasil.Execute.Impl,
-    Yggdrasil.Execute.Type
+    Yggdrasil.ExecuteImpl,
+    type function (
+        code as (type text meta [
+            Documentation.FieldCaption     = "Python Code",
+            Documentation.FieldDescription = "Python code that produces a pyarrow.Table or pandas DataFrame named 'df'",
+            Documentation.SampleValues     = {"import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3]})"}
+        ]),
+        optional options as (type record meta [
+            Documentation.FieldCaption = "Options"
+        ]),
+        optional baseUrl as (type text meta [
+            Documentation.FieldCaption = "Base URL",
+            Documentation.SampleValues = {"http://127.0.0.1:8000"}
+        ])
+    ) as table meta [
+        Documentation.Name = "Yggdrasil.Execute",
+        Documentation.LongDescription = "Execute Python code and return the DataFrame as a table."
+    ]
 );
 
-Yggdrasil.Execute.Type = type function (
-    code as (
-        type text meta [
-            Documentation.FieldCaption     = "Python Code",
-            Documentation.FieldDescription = "Python source code that produces a pandas DataFrame",
-            Documentation.SampleValues     = {"import pandas as pd#(lf)df = pd.DataFrame({'x': [1,2,3]})"}
-        ]
-    ),
-    optional options as (
-        type record meta [
-            Documentation.FieldCaption     = "Options",
-            Documentation.FieldDescription = "Optional settings for execution"
-        ]
-    ),
-    optional baseUrl as (
-        type text meta [
-            Documentation.FieldCaption     = "Base URL",
-            Documentation.FieldDescription = "Yggdrasil API base URL",
-            Documentation.SampleValues     = {"http://127.0.0.1:8000"}
-        ]
-    )
-) as table meta [
-    Documentation.Name            = "Yggdrasil.Execute",
-    Documentation.LongDescription = "Execute Python code via the Yggdrasil FastAPI service and return the resulting pandas DataFrame as a Power Query table.",
-    Documentation.Examples = {[
-        Description = "Simple DataFrame",
-        Code        = "Yggdrasil.Execute(""import pandas as pd#(lf)df = pd.DataFrame({'col': [1,2,3]})"")",
-        Result      = "#table({""col""}, {{1},{2},{3}})"
-    ]}
-];
-
-Yggdrasil.Execute.Impl = (code as text, optional options as record, optional baseUrl as text) as table =>
+Yggdrasil.ExecuteImpl = (code as text, optional options as record, optional baseUrl as text) as table =>
     let
         Base = if baseUrl <> null then baseUrl else DefaultBaseUrl,
         Url  = Yggdrasil.BuildUrl(Base, ApiPrefix & ExcelPath & "/execute"),
-        Opts = if options <> null then options else [],
+        Opts = if options <> null then options else [dummy = null],
 
-        Body = Record.Combine({
-            [
-                code              = code,
-                identifier        = Record.FieldOrDefault(Opts, "Identifier",      "current"),
-                prefer_uv         = Record.FieldOrDefault(Opts, "PreferUv",         true),
-                create_if_missing = Record.FieldOrDefault(Opts, "CreateIfMissing",  false),
-                packages          = Record.FieldOrDefault(Opts, "Packages",         {}),
-                df_name           = Record.FieldOrDefault(Opts, "DfName",           "df"),
-                auto_install      = Record.FieldOrDefault(Opts, "AutoInstall",      false),
-                raise_error       = true,
-                include_result    = Record.FieldOrDefault(Opts, "IncludeResult",    false)
-            ],
-            // Conditionally include max_rows only when provided
-            if Record.HasFields(Opts, {"MaxRows"}) then
-                [max_rows = Record.Field(Opts, "MaxRows")]
-            else
-                []
-        }),
+        Body = [
+            code              = code,
+            identifier        = Record.FieldOrDefault(Opts, "Identifier",     "current"),
+            prefer_uv         = Record.FieldOrDefault(Opts, "PreferUv",        true),
+            create_if_missing = Record.FieldOrDefault(Opts, "CreateIfMissing", false),
+            packages          = Record.FieldOrDefault(Opts, "Packages",        {}),
+            df_name           = Record.FieldOrDefault(Opts, "DfName",          "df"),
+            auto_install      = Record.FieldOrDefault(Opts, "AutoInstall",     false),
+            raise_error       = true,
+            include_result    = Record.FieldOrDefault(Opts, "IncludeResult",   false),
+            max_rows          = Record.FieldOrDefault(Opts, "MaxRows",         null)
+        ],
 
         Response    = Yggdrasil.PostJson(Url, Body),
         DataPayload = Response[data],
-        Rows        = DataPayload[rows],
-        Columns     = DataPayload[columns],
-        Schema      = DataPayload[schema],
-
-        ResultTable = Yggdrasil.RowsToTable(Rows, Schema, Columns)
+        ResultTable = Yggdrasil.RowsToTable(DataPayload[rows], DataPayload[schema], DataPayload[columns])
     in
         ResultTable;
 
 // ---------------------------------------------------------------------------
+// Yggdrasil.Prepare
+// ---------------------------------------------------------------------------
 
-/**
- * Yggdrasil.Prepare
- *
- * Execute Python code with server-side caching (parquet).
- * Calls POST /api/python/excel/prepare.
- *
- * Options record fields:
- *   Identifier       text      "default"  — Python env identifier
- *   Packages         list      {}         — pip packages to ensure
- *   DfName           text      "df"       — name of the DataFrame variable
- *   MaxRows          number    null       — limit returned rows
- *   PreferUv         logical   true       — prefer uv over pip
- *   ForceRefresh     logical   false      — bypass cache
- */
 shared Yggdrasil.Prepare = Value.ReplaceType(
-    Yggdrasil.Prepare.Impl,
-    Yggdrasil.Prepare.Type
+    Yggdrasil.PrepareImpl,
+    type function (
+        code as (type text meta [
+            Documentation.FieldCaption     = "Python Code",
+            Documentation.FieldDescription = "Python code that produces a pyarrow.Table or pandas DataFrame named 'df'",
+            Documentation.SampleValues     = {"import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3]})"}
+        ]),
+        optional options as (type record meta [
+            Documentation.FieldCaption = "Options"
+        ]),
+        optional baseUrl as (type text meta [
+            Documentation.FieldCaption = "Base URL",
+            Documentation.SampleValues = {"http://127.0.0.1:8000"}
+        ])
+    ) as record meta [
+        Documentation.Name = "Yggdrasil.Prepare",
+        Documentation.LongDescription = "Execute Python code with server-side caching. Returns a manifest record."
+    ]
 );
 
-Yggdrasil.Prepare.Type = type function (
-    code as (
-        type text meta [
-            Documentation.FieldCaption     = "Python Code",
-            Documentation.FieldDescription = "Python source code that produces a pandas DataFrame",
-            Documentation.SampleValues     = {"import pandas as pd#(lf)df = pd.DataFrame({'x': [1,2,3]})"}
-        ]
-    ),
-    optional options as (
-        type record meta [
-            Documentation.FieldCaption     = "Options",
-            Documentation.FieldDescription = "Optional settings for preparation"
-        ]
-    ),
-    optional baseUrl as (
-        type text meta [
-            Documentation.FieldCaption     = "Base URL",
-            Documentation.FieldDescription = "Yggdrasil API base URL",
-            Documentation.SampleValues     = {"http://127.0.0.1:8000"}
-        ]
-    )
-) as record meta [
-    Documentation.Name            = "Yggdrasil.Prepare",
-    Documentation.LongDescription = "Execute Python code with server-side parquet caching via the Yggdrasil FastAPI service. Returns a manifest record with cache metadata.",
-    Documentation.Examples = {[
-        Description = "Prepare with caching",
-        Code        = "Yggdrasil.Prepare(""import pandas as pd#(lf)df = pd.DataFrame({'x': [1,2,3]})"")",
-        Result      = "[ok = true, data = [cache_hit = false, ...]]"
-    ]}
-];
-
-Yggdrasil.Prepare.Impl = (code as text, optional options as record, optional baseUrl as text) as record =>
+Yggdrasil.PrepareImpl = (code as text, optional options as record, optional baseUrl as text) as record =>
     let
         Base = if baseUrl <> null then baseUrl else DefaultBaseUrl,
         Url  = Yggdrasil.BuildUrl(Base, ApiPrefix & ExcelPath & "/prepare"),
-        Opts = if options <> null then options else [],
+        Opts = if options <> null then options else [dummy = null],
 
-        Body = Record.Combine({
-            [
-                code              = code,
-                identifier        = Record.FieldOrDefault(Opts, "Identifier",      "default"),
-                prefer_uv         = Record.FieldOrDefault(Opts, "PreferUv",         true),
-                create_if_missing = Record.FieldOrDefault(Opts, "CreateIfMissing",  false),
-                packages          = Record.FieldOrDefault(Opts, "Packages",         {}),
-                df_name           = Record.FieldOrDefault(Opts, "DfName",           "df"),
-                force_refresh     = Record.FieldOrDefault(Opts, "ForceRefresh",     false)
-            ],
-            if Record.HasFields(Opts, {"MaxRows"}) then
-                [max_rows = Record.Field(Opts, "MaxRows")]
-            else
-                []
-        }),
+        Body = [
+            code              = code,
+            identifier        = Record.FieldOrDefault(Opts, "Identifier",     "default"),
+            prefer_uv         = Record.FieldOrDefault(Opts, "PreferUv",        true),
+            create_if_missing = Record.FieldOrDefault(Opts, "CreateIfMissing", false),
+            packages          = Record.FieldOrDefault(Opts, "Packages",        {}),
+            df_name           = Record.FieldOrDefault(Opts, "DfName",          "df"),
+            force_refresh     = Record.FieldOrDefault(Opts, "ForceRefresh",    false),
+            max_rows          = Record.FieldOrDefault(Opts, "MaxRows",         null)
+        ],
 
         Response = Yggdrasil.PostJson(Url, Body)
     in
         Response;
 
 // ---------------------------------------------------------------------------
-// Navigation table (Get Data entry point)
+// Yggdrasil.DatabricksSQL
 // ---------------------------------------------------------------------------
 
-/**
- * Yggdrasil.Contents
- *
- * Navigation table shown in the "Get Data" dialog of Excel / Power BI.
- */
-shared Yggdrasil.Contents = Value.ReplaceType(
-    Yggdrasil.Contents.Impl,
-    Yggdrasil.Contents.Type
+shared Yggdrasil.DatabricksSQL = Value.ReplaceType(
+    Yggdrasil.DatabricksSQLImpl,
+    type function (
+        statement as (type text meta [
+            Documentation.FieldCaption     = "SQL Statement",
+            Documentation.FieldDescription = "SQL query to execute on Databricks",
+            Documentation.SampleValues     = {"SELECT * FROM main.default.my_table LIMIT 100"}
+        ]),
+        optional options as (type record meta [
+            Documentation.FieldCaption = "Options"
+        ]),
+        optional baseUrl as (type text meta [
+            Documentation.FieldCaption = "Base URL",
+            Documentation.SampleValues = {"http://127.0.0.1:8000"}
+        ])
+    ) as table meta [
+        Documentation.Name = "Yggdrasil.DatabricksSQL",
+        Documentation.LongDescription = "Execute a SQL query on Databricks and return the result as a table. Results are cached server-side to avoid redundant calls."
+    ]
 );
 
-Yggdrasil.Contents.Type = type function (
-    optional baseUrl as (
-        type text meta [
-            Documentation.FieldCaption     = "Base URL",
-            Documentation.FieldDescription = "Yggdrasil API base URL",
-            Documentation.SampleValues     = {"http://127.0.0.1:8000"}
-        ]
-    )
-) as table meta [
-    Documentation.Name            = "Yggdrasil",
-    Documentation.LongDescription = "Connect to a Yggdrasil Python execution service to run Python code and return DataFrames in Excel or Power BI."
-];
+Yggdrasil.DatabricksSQLImpl = (statement as text, optional options as record, optional baseUrl as text) as table =>
+    let
+        Base = if baseUrl <> null then baseUrl else DefaultBaseUrl,
+        Url  = Yggdrasil.BuildUrl(Base, ApiPrefix & ExcelPath & "/databricks/sql"),
+        Opts = if options <> null then options else [dummy = null],
 
-Yggdrasil.Contents.Impl = (optional baseUrl as text) as table =>
+        Body = [
+            statement      = statement,
+            host           = Record.FieldOrDefault(Opts, "Host",          null),
+            token          = Record.FieldOrDefault(Opts, "Token",         null),
+            catalog_name   = Record.FieldOrDefault(Opts, "CatalogName",   null),
+            schema_name    = Record.FieldOrDefault(Opts, "SchemaName",    null),
+            warehouse_id   = Record.FieldOrDefault(Opts, "WarehouseId",   null),
+            warehouse_name = Record.FieldOrDefault(Opts, "WarehouseName", null),
+            df_name        = Record.FieldOrDefault(Opts, "DfName",        "df"),
+            max_rows       = Record.FieldOrDefault(Opts, "MaxRows",       null),
+            cache_ttl      = Record.FieldOrDefault(Opts, "CacheTtl",      null),
+            force_refresh  = Record.FieldOrDefault(Opts, "ForceRefresh",  false)
+        ],
+
+        Response    = Yggdrasil.PostJson(Url, Body),
+        DataPayload = Response[data],
+        ResultTable = Yggdrasil.RowsToTable(DataPayload[rows], DataPayload[schema], DataPayload[columns])
+    in
+        ResultTable;
+
+// ---------------------------------------------------------------------------
+// Navigation table  (Get Data entry point)
+// ---------------------------------------------------------------------------
+
+shared Yggdrasil.Contents = Value.ReplaceType(
+    Yggdrasil.ContentsImpl,
+    type function (
+        optional baseUrl as (type text meta [
+            Documentation.FieldCaption = "Base URL",
+            Documentation.SampleValues = {"http://127.0.0.1:8000"}
+        ])
+    ) as table meta [
+        Documentation.Name = "Yggdrasil",
+        Documentation.LongDescription = "Connect to a Yggdrasil Python execution service."
+    ]
+);
+
+Yggdrasil.ContentsImpl = (optional baseUrl as text) as table =>
     let
         Objects = #table(
-            {"Name",             "Key",      "Data",                                    "ItemKind", "ItemName", "IsLeaf"},
+            {"Name",              "Key",      "Data",                       "ItemKind", "ItemName", "IsLeaf"},
             {
-                {"Execute Python",  "Execute",  Yggdrasil.Execute,                        "Function", "Function", true},
-                {"Prepare (Cached)","Prepare",  Yggdrasil.Prepare,                        "Function", "Function", true},
-                {"Service Health",  "Health",   Yggdrasil.Health(baseUrl),                "Record",   "Record",   true}
+                {"Execute Python",   "Execute",       Yggdrasil.Execute,       "Function", "Function", true},
+                {"Prepare (Cached)", "Prepare",       Yggdrasil.Prepare,       "Function", "Function", true},
+                {"Databricks SQL",   "DatabricksSQL", Yggdrasil.DatabricksSQL, "Function", "Function", true},
+                {"Service Health",   "Health",         Yggdrasil.Health(baseUrl), "Record", "Record",   true}
             }
         ),
         NavTable = Table.ToNavigationTable(Objects, {"Key"}, "Name", "Data", "ItemKind", "ItemName", "IsLeaf")
@@ -401,7 +337,7 @@ Yggdrasil.Contents.Impl = (optional baseUrl as text) as table =>
         NavTable;
 
 // ---------------------------------------------------------------------------
-// Navigation table helper  (standard PQ SDK pattern)
+// Navigation table helper
 // ---------------------------------------------------------------------------
 
 Table.ToNavigationTable = (
@@ -416,10 +352,10 @@ Table.ToNavigationTable = (
     let
         tableType = Value.Type(table),
         newTableType = Type.AddTableKey(tableType, keyColumns, true) meta [
-            NavigationTable.NameColumn  = nameColumn,
-            NavigationTable.DataColumn  = dataColumn,
+            NavigationTable.NameColumn   = nameColumn,
+            NavigationTable.DataColumn   = dataColumn,
             NavigationTable.ItemKindColumn = itemKindColumn,
-            Preview.DelayColumn         = itemNameColumn,
+            Preview.DelayColumn          = itemNameColumn,
             NavigationTable.IsLeafColumn = isLeafColumn
         ],
         navigationTable = Value.ReplaceType(table, newTableType)
@@ -427,14 +363,13 @@ Table.ToNavigationTable = (
         navigationTable;
 
 // ---------------------------------------------------------------------------
-// Data Source Kind declaration
+// Data Source Kind  (the record name MUST match the section name)
 // ---------------------------------------------------------------------------
 
 Yggdrasil = [
     TestConnection = (dataSourcePath) =>
         let
-            json  = Json.Document(dataSourcePath),
-            base  = if Record.HasFields(json, {"baseUrl"}) then json[baseUrl] else DefaultBaseUrl
+            base = DefaultBaseUrl
         in
             { "Yggdrasil.Contents", base },
     Authentication = [
@@ -444,28 +379,22 @@ Yggdrasil = [
 ];
 
 // ---------------------------------------------------------------------------
-// Data Source UI metadata
+// Publish metadata  (Power BI Get Data dialog)
 // ---------------------------------------------------------------------------
 
 Yggdrasil.Publish = [
     Beta            = true,
     Category        = "Other",
     ButtonText      = { "Yggdrasil", "Connect to a Yggdrasil Python execution service" },
-    LearnMoreUrl    = "https://github.com/your-org/Yggdrasil",
+    LearnMoreUrl    = "https://github.com/Platob/Yggdrasil",
     SourceImage     = Yggdrasil.Icons,
     SourceTypeImage = Yggdrasil.Icons
 ];
 
 Yggdrasil.Icons = [
-    Icon16 = Yggdrasil.Icon16,
-    Icon20 = Yggdrasil.Icon20,
-    Icon24 = Yggdrasil.Icon24,
-    Icon32 = Yggdrasil.Icon32
+    Icon16 = Extension.Contents("Yggdrasil16.png"),
+    Icon20 = Extension.Contents("Yggdrasil20.png"),
+    Icon24 = Extension.Contents("Yggdrasil24.png"),
+    Icon32 = Extension.Contents("Yggdrasil32.png")
 ];
-
-// Placeholder 1×1 PNG (replace with real icons)
-Yggdrasil.Icon16 = Extension.Contents("Yggdrasil16.png");
-Yggdrasil.Icon20 = Extension.Contents("Yggdrasil20.png");
-Yggdrasil.Icon24 = Extension.Contents("Yggdrasil24.png");
-Yggdrasil.Icon32 = Extension.Contents("Yggdrasil32.png");
 
