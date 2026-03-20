@@ -13,7 +13,7 @@
 #   detect  → reads version, queries PyPI, decides whether to publish
 #   build   → builds sdist + wheel (gated on detect)
 #   publish → uploads to PyPI via OIDC trusted publishing (gated on build)
-#   tag     → creates a vX.Y.Z git tag after a successful publish
+#   tag     → creates a vX.Y.Z git tag + GitHub Release after a successful publish
 #   skip    → posts a clear summary when publish is intentionally skipped
 # ============================================================================
 
@@ -227,12 +227,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
-  # tag — create a vX.Y.Z git tag for the published version (if missing).
+  # tag — create a vX.Y.Z git tag + GitHub Release for the published version.
   #   Runs only after a successful publish and only when the push was NOT
   #   already triggered by a tag (avoids creating a tag that already exists).
+  #   The release includes auto-generated notes and the built dist artifacts.
   # --------------------------------------------------------------------------
   tag:
-    name: Tag release
+    name: Tag & Release
     runs-on: ubuntu-latest
     needs: [detect, publish]
     if: >-
@@ -263,16 +264,36 @@ jobs:
             echo "🏷️  Created and pushed tag $TAG"
           fi
 
-      - name: Write tag summary
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.detect.outputs.version }}
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          TAG="v${VERSION}"
+          gh release create "$TAG" dist/* \
+            --title "Release ${TAG}" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Write release summary
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           {
-            echo "## 🏷️ Tagged \`v${VERSION}\`"
+            echo "## 🏷️ Tagged & Released \`v${VERSION}\`"
+            echo ""
+            echo "🔗 https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Tag | \`v${VERSION}\` |"
+            echo "| PyPI | https://pypi.org/project/ygg/${VERSION}/ |"
             echo "| Commit | \`${{ github.sha }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
