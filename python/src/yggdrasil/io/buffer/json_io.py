@@ -1,25 +1,28 @@
-"""JSON array-of-objects I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`.
+"""JSON I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`.
 
-Reads and writes a single JSON document — an array of objects (rows).
+Reading:
+    * Parses the raw JSON bytes.
+    * If the top-level value is a **list**, each element becomes a row:
+      - list of dicts → each dict is a row (standard array-of-objects).
+      - list of scalars → each scalar becomes a row with a ``"value"`` column.
+    * If the top-level value is a **dict** (single object), it is wrapped
+      in ``[obj]`` so the table has exactly one row.
+    * An empty buffer yields no batches.
+
+Writing:
+    * Converts all record batches into a flat ``list[dict]`` and serialises
+      as a compact JSON **array** (``[{…}, {…}, …]``), optimised for size.
+
 Transport-level compression is handled transparently by the base class.
-
-Reading flow:
-
-1. Parse the raw JSON bytes via :func:`json.load`.
-2. Wrap non-list payloads in a single-element list (tolerant).
-3. Convert the list of dicts to a :class:`pyarrow.Table`.
-
-Writing flow:
-
-1. Convert the Arrow table to ``list[dict]`` via :meth:`Table.to_pylist`.
-2. Serialise with :func:`json.dump` into the buffer.
 """
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Optional, Self, Union
 
 import yggdrasil.pickle.json as json_mod
+from yggdrasil.io.enums import SaveMode
 from .media_io import MediaIO
 from .media_options import MediaOptions
 
@@ -29,27 +32,21 @@ if TYPE_CHECKING:
 __all__ = ["JsonOptions", "JsonIO"]
 
 
+_VALUE_COLUMN = "value"
+
+
 @dataclass(slots=True)
 class JsonOptions(MediaOptions):
     """Options for JSON I/O.
 
     Parameters
     ----------
-    columns:
-        Column names to read (``None`` reads all).
-    use_threads:
-        Enable multi-threaded Arrow conversion.
-    allow_newlines_in_values:
-        Tolerate literal newlines inside JSON string values.
     encoding:
-        Character encoding used when writing.
+        Character encoding used when decoding / writing.
     errors:
         Error-handling mode for encoding (``"strict"``, ``"replace"``, …).
     """
 
-    columns: list[str] | None = None
-    use_threads: bool = True
-    allow_newlines_in_values: bool = False
 
     encoding: str = "utf-8"
     errors: str = "strict"
@@ -69,14 +66,7 @@ class JsonOptions(MediaOptions):
 
 @dataclass(slots=True)
 class JsonIO(MediaIO[JsonOptions]):
-    """JSON array-of-objects I/O.
-
-    The :meth:`read_pylist` / :meth:`write_pylist` overrides use native
-    JSON serialisation, which is faster than the base-class Arrow
-    round-trip for simple payloads.  The ``batch_size`` parameter is
-    fully supported — when positive, :meth:`read_pylist` returns an
-    ``Iterator[list[dict]]``.
-    """
+    """JSON I/O with list-expansion on read and optimised list output on write."""
 
     @classmethod
     def check_options(cls, options: Optional[JsonOptions], *args, **kwargs) -> JsonOptions:
@@ -84,120 +74,143 @@ class JsonIO(MediaIO[JsonOptions]):
         return JsonOptions.check_parameters(options=options, **kwargs)
 
     # ------------------------------------------------------------------
-    # Internal JSON helpers (no codec, no batching)
+    # Batch-oriented implementation
     # ------------------------------------------------------------------
 
-    def _read_json_records(self) -> list[dict]:
-        """Parse the buffer's raw bytes as a JSON list of dicts.
+    def _read_arrow_batches(self, *, options: JsonOptions) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield record batches from the JSON buffer.
 
-        Returns
-        -------
-        list[dict]
-            An empty list when the buffer is empty.  A single object is
-            wrapped in a one-element list.
+        * ``[]``  or empty buffer → no batches.
+        * ``[{…}, {…}]`` → one batch, each dict is a row.
+        * ``[1, 2, 3]`` → one batch with a ``"value"`` column.
+        * ``{…}`` (single object) → one batch with one row.
         """
+        import pyarrow as pa
+
         if self.buffer.size <= 0:
-            return []
+            return
 
-        with self.buffer.view() as f:
-            parsed = json_mod.load(f)
+        raw = self.buffer.to_bytes()
+        data = _json.loads(raw.decode(options.encoding, errors=options.errors))
 
-        if not isinstance(parsed, list):
-            parsed = [parsed]
+        if isinstance(data, list):
+            if not data:
+                return
+            # List of dicts → standard row-per-dict
+            if isinstance(data[0], dict):
+                records = data
+            else:
+                # List of scalars → wrap each in a {value: x} row
+                records = [{_VALUE_COLUMN: v} for v in data]
+        elif isinstance(data, dict):
+            records = [data]
+        else:
+            # Scalar top-level value
+            records = [{_VALUE_COLUMN: data}]
 
-        return parsed
+        batch = pa.RecordBatch.from_pylist(records)
 
-    def _write_json_records(self, data: list[dict]) -> None:
-        """Write *data* as a JSON array into the buffer (no codec handling)."""
-        with self.buffer.view() as f:
-            json_mod.dump(data, f)
+        if options.columns is not None:
+            tbl = pa.Table.from_batches([batch]).select(options.columns)
+            yield from tbl.to_batches()
+        else:
+            yield batch
+
+    def _write_arrow_batches(
+        self,
+        *,
+        batches: Iterator["pyarrow.RecordBatch"],
+        schema: "pyarrow.Schema",
+        options: JsonOptions,
+    ) -> None:
+        """Write record batches as a JSON array into the buffer.
+
+        Collects all rows and serialises as a single ``[{…}, …]`` list
+        for compact, optimised output.
+        """
+        import pyarrow as pa
+
+        all_batches = list(batches)
+        if not all_batches:
+            records: list[dict] = []
+        else:
+            table = pa.Table.from_batches(all_batches, schema=schema)
+            records = table.to_pylist()
+
+        payload = json_mod.dumps(records, encoding=options.encoding, errors=options.errors)
+        self.buffer._replace_with_payload(payload)
 
     # ------------------------------------------------------------------
-    # Public overrides matching base-class signatures
+    # Optimised convenience overrides
     # ------------------------------------------------------------------
 
     def read_pylist(
         self,
         *,
-        batch_size: Optional[int] = None,
+        options: JsonOptions | None = None,
+        **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
-        """Read the buffer as a list of row dicts (native JSON path).
+        """Read JSON directly as a list of dicts (fast path, no Arrow overhead).
 
-        When the media type carries a codec the base-class Arrow path is
-        used so that transparent decompression is honoured.
-
-        Parameters
-        ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single ``list[dict]``.
-            When a positive integer, return an ``Iterator[list[dict]]``
-            yielding chunks of at most *batch_size* rows.
-
-        Returns
-        -------
-        list[dict] | Iterator[list[dict]]
+        When ``batch_size`` > 0 in options, falls back to the base-class
+        Arrow-based batched path.
         """
-        # If codec is set, delegate to base class (decompresses → Arrow → pylist)
-        if self.codec is not None:
-            return super().read_pylist(batch_size=batch_size)
+        resolved = self.check_options(options=options, **option_kwargs)
+        bs = resolved.batch_size
+        if bs and bs > 0:
+            return super().read_pylist(options=resolved)
 
-        records = self._read_json_records()
+        if self.buffer.size <= 0:
+            return []
 
-        if batch_size is not None and batch_size > 0:
-            def _chunks():
-                for i in range(0, len(records), batch_size):
-                    yield records[i : i + batch_size]
-            return _chunks()
+        raw = self.buffer.to_bytes()
 
-        return records
+        codec = self.codec
+        if codec is not None:
+            buf, _ = self._decompressed_buffer()
+            raw = buf.to_bytes()
+
+        data = _json.loads(raw.decode(resolved.encoding, errors=resolved.errors))
+
+        if isinstance(data, list):
+            if data and not isinstance(data[0], dict):
+                return [{_VALUE_COLUMN: v} for v in data]
+            return data
+        elif isinstance(data, dict):
+            return [data]
+        else:
+            return [{_VALUE_COLUMN: data}]
 
     def write_pylist(
         self,
         data: list[dict],
         *,
-        batch_size: Optional[int] = None,
-        mode=None,
-        match_by=None,
-        options=None,
+        options: JsonOptions | None = None,
         **option_kwargs,
-    ) -> None:
-        """Write a list of row dicts as JSON (native path).
+    ):
+        """Write a list of dicts directly as JSON (fast path, no Arrow overhead).
 
-        When the media type carries a codec the base-class Arrow path is
-        used so that transparent compression is honoured.
-
-        Parameters
-        ----------
-        data:
-            List of ``{column: value}`` dicts.
-        batch_size:
-            Forwarded to base-class :meth:`write_arrow_table` when the
-            codec path is used.  Ignored on the native JSON path (the
-            entire list is always written as one document).
-        mode, match_by, options, **option_kwargs:
-            Forwarded to :meth:`write_arrow_table` on the codec path.
+        Save-mode logic and ``batch_size`` fall back to the base class.
         """
-        if self.codec is not None:
+        resolved = self.check_options(options=options, **option_kwargs)
+
+        if self.skip_write(mode=resolved.mode):
+            return
+
+        bs = resolved.batch_size
+        # For APPEND / UPSERT or batched writes we need the full merge, go via Arrow
+        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT) or (bs and bs > 0):
             return super().write_pylist(
-                data, batch_size=batch_size, mode=mode,
-                match_by=match_by, options=options, **option_kwargs,
+                data,
+                options=resolved,
             )
-        self._write_json_records(data)
 
-    # ------------------------------------------------------------------
-    # Arrow implementation
-    # ------------------------------------------------------------------
+        payload = json_mod.dumps(data, encoding=resolved.encoding, errors=resolved.errors)
 
-    def _read_arrow_table(self, *, options: JsonOptions) -> "pyarrow.Table":
-        """Read JSON bytes into an Arrow table (uncompressed buffer)."""
-        from yggdrasil.arrow.lib import pyarrow as _pa
-
-        records = self._read_json_records()
-        if not records:
-            return _pa.table({})
-
-        return _pa.Table.from_pylist(records)
-
-    def _write_arrow_table(self, *, table: "pyarrow.Table", options: JsonOptions) -> None:
-        """Write an Arrow table as JSON into the (uncompressed) buffer."""
-        self._write_json_records(table.to_pylist())
+        codec = self.codec
+        if codec is not None:
+            from .bytes_io import BytesIO as _BIO
+            plain = _BIO(payload, config=self.buffer.config)
+            self._compress_into_buffer(plain)
+        else:
+            self.buffer._replace_with_payload(payload)

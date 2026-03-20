@@ -1,21 +1,15 @@
-"""ZIP container I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`.
+"""ZIP container I/O on top of :class:`~yggdrasil.io.buffer.BytesIO`."""
 
-Reads ZIP archives by selecting members (exact name, glob, or all),
-inferring each member's inner media type, and concatenating the resulting
-Arrow tables.  Writes serialise an Arrow table into a single inner
-payload (defaulting to Parquet) inside a new ZIP archive.
-
-Transport-level compression is handled transparently by the base class.
-"""
 from __future__ import annotations
 
 import io
 import zipfile
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Optional, Self
 
 from yggdrasil.io.enums import MediaType, MimeType, SaveMode
+
 from .bytes_io import BytesIO
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -26,211 +20,268 @@ if TYPE_CHECKING:
 __all__ = ["ZipOptions", "ZipIO"]
 
 
+def _check_member_info(value: tuple[str, str] | str) -> tuple[str, str]:
+    """Validate a member-info specifier."""
+    if isinstance(value, str):
+        value = (value, f"_zip_member_{value}")
+    elif not isinstance(value, tuple):
+        try:
+            value = tuple(value)
+        except Exception as e:
+            raise TypeError(
+                "ZipOptions.read_member_infos values must be str or tuple[str, str], "
+                f"got {type(value).__name__}"
+            ) from e
+
+    if len(value) < 2:
+        raise TypeError(
+            "ZipOptions.read_member_infos values must be str or tuple[str, str], "
+            f"got length {len(value)}"
+        )
+
+    key, alias = value[0], value[1]
+
+    if key != "name":
+        raise ValueError(
+            "ZipOptions.read_member_infos keys must be ('name',), "
+            f"got {key!r}"
+        )
+
+    if not alias:
+        alias = f"_zip_member_{key}"
+
+    return key, alias
+
+
 @dataclass(slots=True)
 class ZipOptions(MediaOptions):
-    """Options for ZIP I/O.
-
-    Parameters
-    ----------
-    member:
-        Which member(s) to read:
-
-        * ``None`` — read **all** members and concatenate.
-        * An exact name — read only that member.
-        * A glob pattern (``*``, ``?``, ``[``) — read matching members
-          and concatenate.
-    inner_media:
-        Media type for inner payloads.  Used as the write format (default
-        Parquet) and optionally forced on read when *force_inner_media* is
-        ``True``.
-    force_inner_media:
-        When ``True`` and *inner_media* is set, skip per-member media
-        inference and use *inner_media* for all members.
-    zip_compression:
-        Deflate compression level (0–9).  Method is always
-        ``ZIP_DEFLATED``.
-    """
+    """Options for ZIP I/O."""
 
     member: str | None = None
     inner_media: MediaType | str | None = None
     force_inner_media: bool = False
     zip_compression: int = 8
+    read_member_infos: list[tuple[str, str]] | None = None
+
+    def __post_init__(self) -> None:
+        infos = self.read_member_infos
+        if not infos:
+            return
+
+        if isinstance(infos, Mapping):
+            items = infos.items()
+        elif isinstance(infos, str):
+            items = [infos]
+        elif isinstance(infos, Iterable):
+            items = [v for v in infos if v is not None]
+        else:
+            raise TypeError(
+                "ZipOptions.read_member_infos must be a mapping or iterable of "
+                "str or tuple[str, str], "
+                f"got {type(infos).__name__}"
+            )
+
+        self.read_member_infos = [_check_member_info(v) for v in items]
+
+    @property
+    def is_glob(self) -> bool:
+        member = self.member
+        return bool(member and any(ch in member for ch in ("*", "?", "[")))
 
     @classmethod
     def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
-        """Merge *overrides* into *options* (or a fresh default)."""
+        """Merge overrides into ``options`` or a fresh default."""
         base = options or cls()
         valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]
         unknown = set(overrides) - set(valid)
         if unknown:
-            raise TypeError(f"{cls.__name__}.resolve(): unknown option(s): {sorted(unknown)}")
-        for k, v in overrides.items():
-            setattr(base, k, v)
+            raise TypeError(
+                f"{cls.__name__}.resolve(): unknown option(s): {sorted(unknown)}"
+            )
+        for key, value in overrides.items():
+            setattr(base, key, value)
         return base
 
 
 @dataclass(slots=True)
 class ZipIO(MediaIO[ZipOptions]):
-    """ZIP container I/O.
-
-    Reads are cursor-safe — a :meth:`BytesIO.view` owns its own cursor
-    so the parent buffer position is never disturbed.
-    """
+    """ZIP container I/O."""
 
     @classmethod
-    def check_options(cls, options: Optional[ZipOptions], *args, **kwargs) -> ZipOptions:
-        """Validate and merge caller-supplied options."""
+    def check_options(
+        cls,
+        options: Optional[ZipOptions],
+        *args,
+        **kwargs,
+    ) -> ZipOptions:
         return ZipOptions.check_parameters(options=options, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Member selection (exact or glob)
-    # ------------------------------------------------------------------
-
-    def _member_names(self, zf: zipfile.ZipFile) -> list[str]:
-        """Return non-directory member names."""
-        return [n for n in zf.namelist() if n and not n.endswith("/")]
-
-    @staticmethod
-    def _is_glob(s: str) -> bool:
-        """Return ``True`` when *s* contains glob metacharacters."""
-        return any(ch in s for ch in ("*", "?", "["))
-
-    def _select_members(
+    def _iter_selected_infos(
         self,
         zf: zipfile.ZipFile,
-        *,
         options: ZipOptions,
-    ) -> list[str]:
-        """Select members from *zf* according to *options.member*."""
-        names = self._member_names(zf)
+    ) -> Iterator[zipfile.ZipInfo]:
+        """Yield selected non-directory members in archive order."""
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        names = [info.filename for info in infos]
 
-        m = options.member
-        if not m:
-            return names
+        member = options.member
+        if member is None:
+            yield from infos
+            return
 
-        if not self._is_glob(m):
-            if m not in names:
-                raise KeyError(f"ZipIO: member not found: {m!r}. Available: {names}")
-            return [m]
+        if not options.is_glob:
+            for info in infos:
+                if info.filename == member:
+                    yield info
+                    return
+            raise KeyError(f"ZipIO: member not found: {member!r}. Available: {names}")
 
-        matched = sorted({n for n in names if fnmatchcase(n, m)})
+        matched = False
+        for info in infos:
+            if fnmatchcase(info.filename, member):
+                matched = True
+                yield info
+
         if not matched:
-            raise KeyError(f"ZipIO: no members matched pattern={m!r}. Available: {names}")
-        return matched
-
-    # ------------------------------------------------------------------
-    # Inner media inference
-    # ------------------------------------------------------------------
+            raise KeyError(
+                f"ZipIO: no members matched pattern={member!r}. Available: {names}"
+            )
 
     @staticmethod
     def _infer_inner_media_from_name(name: str) -> MediaType:
-        """Infer media type from the member file name / extension."""
+        """Infer media type from member name / extension."""
         try:
             return MediaType.parse(name)
         except Exception:
             return MediaType(MimeType.OCTET_STREAM)
 
     def _infer_inner_media(self, name: str, payload: bytes) -> MediaType:
-        """Infer media type by name first, then by magic-byte sniffing."""
-        mt = self._infer_inner_media_from_name(name)
-        if not mt.is_octet:
-            return mt
+        """Infer media type from name first, then by sniffing payload bytes."""
+        media_type = self._infer_inner_media_from_name(name)
+        if not media_type.is_octet:
+            return media_type
 
         try:
             return BytesIO(payload, config=self.buffer.config).media_type
         except Exception:
             return MediaType(MimeType.OCTET_STREAM)
 
+    def _resolve_member_media_type(
+        self,
+        *,
+        options: ZipOptions,
+        name: str,
+        payload: bytes,
+    ) -> MediaType:
+        """Resolve the media type for one member."""
+        if options.force_inner_media and options.inner_media is not None:
+            media_type = MediaType.parse(options.inner_media)
+            if not media_type.is_octet:
+                return media_type
+        return self._infer_inner_media(name, payload)
+
     @staticmethod
     def _pick_inner_media_for_write(options: ZipOptions) -> MediaType:
-        """Resolve the inner media type used when writing."""
+        """Resolve the inner media type used for writes."""
         if options.inner_media is not None:
-            mt = MediaType.parse(options.inner_media)
-            if not mt.is_octet:
-                return mt
+            media_type = MediaType.parse(options.inner_media)
+            if not media_type.is_octet:
+                return media_type
         return MediaType(MimeType.PARQUET)
 
     @staticmethod
     def _default_member_for_write(inner_media: MediaType) -> str:
-        """Generate a default member name from the media type extension."""
+        """Generate a default member name for the inner payload."""
         ext = inner_media.full_extension
         return f"data.{ext}" if ext else "data"
 
-    # ------------------------------------------------------------------
-    # Zipfile kwargs (compression)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _zipfile_kwargs(options: ZipOptions) -> dict:
-        """Build ``**kwargs`` for :class:`zipfile.ZipFile` construction."""
-        kw: dict = {"compression": zipfile.ZIP_DEFLATED}
-        try:
-            zipfile.ZipFile(
-                io.BytesIO(),
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=int(options.zip_compression),
-            ).close()
-            kw["compresslevel"] = int(options.zip_compression)
-        except TypeError:
-            pass
-        return kw
+        """Build ``zipfile.ZipFile`` kwargs for writing."""
+        return {
+            "compression": zipfile.ZIP_DEFLATED,
+            "compresslevel": max(0, min(9, int(options.zip_compression))),
+        }
 
-    # ------------------------------------------------------------------
-    # Arrow implementation
-    # ------------------------------------------------------------------
+    def iter_members(self, options: ZipOptions) -> Iterator[tuple[zipfile.ZipInfo, BytesIO]]:
+        """Yield selected ZIP members as ``(info, buffer)``."""
+        if self.buffer.size <= 0:
+            return
 
-    def _read_arrow_table(self, *, options: ZipOptions) -> "pyarrow.Table":
-        """Read and concatenate selected ZIP members into an Arrow table."""
+        with self.buffer.view(pos=0) as buf_view:
+            with zipfile.ZipFile(buf_view, mode="r") as zf:
+                for info in self._iter_selected_infos(zf, options):
+                    payload = zf.read(info.filename)
+                    media_type = self._resolve_member_media_type(
+                        options=options,
+                        name=info.filename,
+                        payload=payload,
+                    )
+
+                    buf = BytesIO(payload, config=self.buffer.config)
+                    buf._media_type = media_type
+                    yield info, buf
+
+    def _apply_member_infos(
+        self,
+        table: "pyarrow.Table",
+        *,
+        name: str,
+        options: ZipOptions,
+    ) -> "pyarrow.Table":
+        """Append requested member metadata columns to a table."""
+        if not options.read_member_infos:
+            return table
+
         from yggdrasil.arrow.lib import pyarrow as _pa
 
-        if self.buffer.size <= 0:
-            return _pa.table({})
+        for key, alias in options.read_member_infos:
+            if key == "name":
+                table = table.append_column(
+                    _pa.field(alias, _pa.string(), nullable=False),
+                    _pa.array([name] * table.num_rows),
+                )
+            else:
+                raise ValueError(
+                    f"ZipIO: unknown options.read_member_infos[{key!r}]. "
+                    "Must be in ('name',)"
+                )
 
-        tables: list[_pa.Table] = []
+        return table
 
-        with self.buffer.view(pos=0) as f:
-            with zipfile.ZipFile(f, mode="r") as zf:
-                members = self._select_members(zf, options=options)
+    def _read_arrow_batches(self, *, options: ZipOptions) -> "Iterator[pyarrow.RecordBatch]":
+        """Read and stream batches from selected ZIP members."""
+        for info, buf in self.iter_members(options=options):
+            table = buf.media_io().read_arrow_table()
+            table = self._apply_member_infos(table, name=info.filename, options=options)
+            yield from table.to_batches()
 
-                for name in members:
-                    payload = zf.read(name)
+    def _write_arrow_batches(
+        self,
+        *,
+        batches: "Iterator[pyarrow.RecordBatch]",
+        schema: "pyarrow.Schema",
+        options: ZipOptions,
+    ) -> None:
+        """Serialise batches into a single ZIP member."""
+        import pyarrow as pa
 
-                    if options.force_inner_media and options.inner_media is not None:
-                        inner_media = MediaType.parse(options.inner_media)
-                        if inner_media.is_octet:
-                            inner_media = self._infer_inner_media(name, payload)
-                    else:
-                        inner_media = self._infer_inner_media(name, payload)
-
-                    inner_buf = BytesIO(payload, config=self.buffer.config)
-                    t = inner_buf.media_io(inner_media).read_arrow_table()
-                    tables.append(t)
-
-        if not tables:
-            return _pa.table({})
-        if len(tables) == 1:
-            return tables[0]
-
-        return _pa.concat_tables(tables, promote_options="default")
-
-    def _write_arrow_table(self, *, table: "pyarrow.Table", options: ZipOptions) -> None:
-        """Serialise *table* into a single ZIP member."""
+        table = pa.Table.from_batches(list(batches), schema=schema)
         inner_media = self._pick_inner_media_for_write(options)
 
-        inner_buf = BytesIO(config=self.buffer.config)
-        inner_buf.media_io(inner_media).write_arrow_table(
+        inner_buffer = BytesIO(config=self.buffer.config)
+        inner_buffer.media_io(inner_media).write_arrow_table(
             table,
             mode=SaveMode.OVERWRITE,
-            match_by=options.match_by,
         )
-        inner_payload = inner_buf.to_bytes()
 
-        member = options.member or self._default_member_for_write(inner_media)
+        member_name = options.member or self._default_member_for_write(inner_media)
 
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", **self._zipfile_kwargs(options)) as zf:
-            zf.writestr(member, inner_payload)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, mode="w", **self._zipfile_kwargs(options)) as zf:
+            zf.writestr(member_name, inner_buffer.to_bytes())
 
-        self.buffer._replace_with_payload(mem)
-
+        self.buffer.seek(0)
+        self.buffer.write_bytes(archive.getvalue())
+        self.buffer.seek(0)

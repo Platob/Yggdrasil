@@ -28,6 +28,9 @@ fields defined here are shared across *all* formats:
    * - ``raise_error``
      - ``True``
      - Raise on read/write errors instead of returning a sentinel.
+   * - ``batch_size``
+     - ``0``
+     - When > 0, read/write in chunks of *batch_size* rows.
    * - ``mode``
      - ``AUTO``
      - :class:`~yggdrasil.io.enums.SaveMode` governing the write strategy.
@@ -87,6 +90,10 @@ class MediaOptions:
         format supports it (e.g. a Polars ``LazyFrame``).
     raise_error:
         When ``True``, raise on read/write errors.
+    batch_size:
+        When > 0, read or write in chunks of *batch_size* rows.
+        Reads return an ``Iterator`` of chunks; writes slice the table
+        and write each chunk sequentially.
     mode:
         :class:`~yggdrasil.io.enums.SaveMode` governing the write
         strategy.  See the module docstring for semantics.
@@ -101,6 +108,9 @@ class MediaOptions:
     ignore_empty: bool = True
     lazy: bool = False
     raise_error: bool = True
+
+    # global read / write properties
+    batch_size: int = 0
 
     # global write properties
     mode: SaveMode = SaveMode.AUTO
@@ -118,6 +128,7 @@ class MediaOptions:
         ignore_empty: bool = _MISSING,
         lazy: bool = _MISSING,
         raise_error: bool = _MISSING,
+        batch_size: int | None = _MISSING,
         **kwargs,
     ) -> "MediaOptions":
         """Merge and validate parameters into an options instance.
@@ -184,6 +195,8 @@ class MediaOptions:
             updates["lazy"] = lazy
         if raise_error is not _MISSING:
             updates["raise_error"] = raise_error
+        if batch_size is not _MISSING:
+            updates["batch_size"] = batch_size
 
         updates.update(kwargs)
 
@@ -214,6 +227,15 @@ class MediaOptions:
         for b in ("use_threads", "ignore_empty", "lazy", "raise_error"):
             if b in updates and not isinstance(updates[b], bool):
                 raise TypeError(f"{b} must be bool, got {type(updates[b]).__name__}")
+
+        if "batch_size" in updates:
+            bs = updates["batch_size"]
+            if bs is None:
+                updates["batch_size"] = 0
+            elif not isinstance(bs, int):
+                raise TypeError(f"batch_size must be int or None, got {type(bs).__name__}")
+            elif bs < 0:
+                updates["batch_size"] = 0
 
         if "mode" in updates:
             updates["mode"] = SaveMode.parse(updates["mode"], default=SaveMode.AUTO)

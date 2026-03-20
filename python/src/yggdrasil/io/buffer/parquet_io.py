@@ -8,7 +8,7 @@ the ``compression`` option on :class:`ParquetOptions` controls the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Iterator, Optional, Self
 
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -28,10 +28,6 @@ class ParquetOptions(MediaOptions):
 
     Parameters
     ----------
-    columns:
-        Column names to read (``None`` reads all).
-    use_threads:
-        Enable multi-threaded reading / writing.
     compression:
         Intra-file column compression codec passed to
         :func:`pyarrow.parquet.write_table`.
@@ -45,9 +41,6 @@ class ParquetOptions(MediaOptions):
         When ``True``, coerce timestamps to microsecond precision.
     """
 
-    # ---- read options ----
-    columns: list[str] | None = None
-    use_threads: bool = True
 
     # ---- write options ----
     compression: str | None = "zstd"
@@ -78,33 +71,39 @@ class ParquetIO(MediaIO[ParquetOptions]):
         """Validate and merge caller-supplied options."""
         return ParquetOptions.check_parameters(options=options, **kwargs)
 
-    def _read_arrow_table(self, *, options: ParquetOptions) -> "pyarrow.Table":
-        """Read Parquet bytes from the (uncompressed) buffer."""
+    def _read_arrow_batches(self, *, options: ParquetOptions) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield record batches from the (uncompressed) Parquet buffer."""
         if self.buffer.size <= 0:
-            import pyarrow as pa
-            return pa.Table.from_batches([], schema=pa.schema([]))
+            return
 
         import pyarrow.parquet as pq
 
         arrow_io = self.buffer.to_arrow_io("r")
         try:
-            return pq.read_table(
-                arrow_io,
+            pf = pq.ParquetFile(arrow_io)
+            for batch in pf.iter_batches(
                 columns=options.columns,
                 use_threads=options.use_threads,
-            )
+            ):
+                yield batch
         finally:
             arrow_io.close()
 
-    def _write_arrow_table(self, *, table: "pyarrow.Table", options: ParquetOptions) -> None:
-        """Write an Arrow table as Parquet into the (uncompressed) buffer."""
+    def _write_arrow_batches(
+        self,
+        *,
+        batches: Iterator["pyarrow.RecordBatch"],
+        schema: "pyarrow.Schema",
+        options: ParquetOptions,
+    ) -> None:
+        """Write record batches as Parquet into the (uncompressed) buffer."""
         import pyarrow.parquet as pq
 
         arrow_io = self.buffer.to_arrow_io("w")
         try:
-            pq.write_table(
-                table,
+            writer = pq.ParquetWriter(
                 arrow_io,
+                schema,
                 compression=options.compression,
                 compression_level=options.compression_level,
                 use_dictionary=options.use_dictionary,
@@ -112,5 +111,10 @@ class ParquetIO(MediaIO[ParquetOptions]):
                 coerce_timestamps="us" if options.allow_truncated_timestamps else None,
                 use_deprecated_int96_timestamps=not options.allow_truncated_timestamps,
             )
+            try:
+                for batch in batches:
+                    writer.write_batch(batch)
+            finally:
+                writer.close()
         finally:
             arrow_io.close()

@@ -13,6 +13,7 @@
 #   detect  → reads version, queries PyPI, decides whether to publish
 #   build   → builds sdist + wheel (gated on detect)
 #   publish → uploads to PyPI via OIDC trusted publishing (gated on build)
+#   tag     → creates a vX.Y.Z git tag after a successful publish
 #   skip    → posts a clear summary when publish is intentionally skipped
 # ============================================================================
 
@@ -222,6 +223,56 @@ jobs:
             echo "| Version | \`${{ needs.detect.outputs.version }}\` |"
             echo "| Triggered by | \`${{ github.event_name }}\` |"
             echo "| Ref | \`${{ github.ref }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # tag — create a vX.Y.Z git tag for the published version (if missing).
+  #   Runs only after a successful publish and only when the push was NOT
+  #   already triggered by a tag (avoids creating a tag that already exists).
+  # --------------------------------------------------------------------------
+  tag:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: [detect, publish]
+    if: >-
+      needs.detect.outputs.should_publish == 'true'
+      && !startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create git tag v${{ needs.detect.outputs.version }}
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          TAG="v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "⏭️  Tag $TAG already exists — skipping."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release ${TAG}"
+            git push origin "$TAG"
+            echo "🏷️  Created and pushed tag $TAG"
+          fi
+
+      - name: Write tag summary
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          {
+            echo "## 🏷️ Tagged \`v${VERSION}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`v${VERSION}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 

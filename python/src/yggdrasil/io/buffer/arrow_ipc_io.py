@@ -9,7 +9,7 @@ Transport-level compression is handled transparently by the base class.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Self
+from typing import TYPE_CHECKING, Iterator, Optional, Self
 
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -26,17 +26,11 @@ class IPCOptions(MediaOptions):
 
     Parameters
     ----------
-    columns:
-        Column names to read (``None`` reads all).
-    use_threads:
-        Enable multi-threaded reading.
     compression:
         Intra-file body compression codec used by
         :class:`pyarrow.ipc.IpcWriteOptions`.
     """
 
-    columns: list[str] | None = None
-    use_threads: bool = True
 
     compression: str | None = "zstd"
 
@@ -62,37 +56,48 @@ class IPCIO(MediaIO[IPCOptions]):
         """Validate and merge caller-supplied options."""
         return IPCOptions.check_parameters(options=options, **kwargs)
 
-    def _read_arrow_table(self, *, options: IPCOptions) -> "pyarrow.Table":
-        """Read IPC bytes from the (uncompressed) buffer.
+    def _read_arrow_batches(self, *, options: IPCOptions) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield record batches from the (uncompressed) IPC buffer.
 
-        Tries the *file* layout first; falls back to *stream* on
-        :class:`ArrowInvalid`.
+        Tries the *file* layout first; falls back to *stream*.
         """
         import pyarrow as pa
         import pyarrow.ipc as ipc
 
         if self.buffer.size <= 0:
-            return pa.Table.from_batches([], schema=pa.schema([]))
+            return
 
         arrow_io = self.buffer.to_arrow_io("r")
         try:
             try:
                 reader = ipc.open_file(arrow_io)
+                for i in range(reader.num_record_batches):
+                    batch = reader.get_batch(i)
+                    if options.columns is not None:
+                        tbl = pa.Table.from_batches([batch]).select(options.columns)
+                        yield from tbl.to_batches()
+                    else:
+                        yield batch
             except (pa.ArrowInvalid, pa.ArrowIOError):
                 arrow_io.seek(0)
                 reader = ipc.open_stream(arrow_io)
-
-            table = reader.read_all()
-
-            if options.columns is not None:
-                table = table.select(options.columns)
-
-            return table
+                for batch in reader:
+                    if options.columns is not None:
+                        tbl = pa.Table.from_batches([batch]).select(options.columns)
+                        yield from tbl.to_batches()
+                    else:
+                        yield batch
         finally:
             arrow_io.close()
 
-    def _write_arrow_table(self, *, table: "pyarrow.Table", options: IPCOptions) -> None:
-        """Write an Arrow table as IPC into the (uncompressed) buffer."""
+    def _write_arrow_batches(
+        self,
+        *,
+        batches: Iterator["pyarrow.RecordBatch"],
+        schema: "pyarrow.Schema",
+        options: IPCOptions,
+    ) -> None:
+        """Write record batches as IPC into the (uncompressed) buffer."""
         import pyarrow.ipc as ipc
 
         arrow_io = self.buffer.to_arrow_io("w")
@@ -103,12 +108,8 @@ class IPCIO(MediaIO[IPCOptions]):
                 use_threads=True,
                 allow_64bit=True,
             )
-
-            with ipc.new_file(
-                arrow_io,
-                table.schema,
-                options=write_options,
-            ) as writer:
-                writer.write_table(table)
+            with ipc.new_file(arrow_io, schema, options=write_options) as writer:
+                for batch in batches:
+                    writer.write_batch(batch)
         finally:
             arrow_io.close()

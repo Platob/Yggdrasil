@@ -51,7 +51,7 @@ def test_write_then_read_roundtrip_memory(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
     io_ = MediaIO.make(buf, MimeType.PARQUET)
 
-    io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(sample_table, options=ParquetOptions(mode=SaveMode.OVERWRITE))
 
     assert buf.size > 0
     out = io_.read_arrow_table()
@@ -63,7 +63,7 @@ def test_write_then_read_roundtrip_memory(cfg: BufferConfig, sample_table):
 def test_read_with_columns_projection(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
     io_ = MediaIO.make(buf, MimeType.PARQUET)
-    io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(sample_table, options=ParquetOptions(mode=SaveMode.OVERWRITE))
     out = io_.read_arrow_table(options=ParquetOptions(columns=["id", "s"]))
 
     assert out.column_names == ["id", "s"]
@@ -78,12 +78,12 @@ def test_ignore_mode_does_not_overwrite(cfg: BufferConfig, sample_table):
     t1 = sample_table
     t2 = pa.table({"id": pa.array([999], type=pa.int64()), "s": pa.array(["z"]), "x": pa.array([0.0])})
 
-    io_.write_arrow_table(t1, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(t1, options=ParquetOptions(mode=SaveMode.OVERWRITE))
     size1 = buf.size
     bytes1 = buf.to_bytes()
 
     # IGNORE: should leave buffer unchanged if already exists
-    io_.write_arrow_table(t2, mode=SaveMode.IGNORE)
+    io_.write_arrow_table(t2, options=ParquetOptions(mode=SaveMode.IGNORE))
     assert buf.size == size1
     assert buf.to_bytes() == bytes1
 
@@ -95,10 +95,10 @@ def test_error_if_exists_raises(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg)
     io_ = MediaIO.make(buf, MimeType.PARQUET)
 
-    io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(sample_table, options=ParquetOptions(mode=SaveMode.OVERWRITE))
 
     with pytest.raises(IOError):
-        io_.write_arrow_table(sample_table, mode=SaveMode.ERROR_IF_EXISTS)
+        io_.write_arrow_table(sample_table, options=ParquetOptions(mode=SaveMode.ERROR_IF_EXISTS))
 
 
 def test_overwrite_replaces_content(cfg: BufferConfig, sample_table):
@@ -115,10 +115,10 @@ def test_overwrite_replaces_content(cfg: BufferConfig, sample_table):
         }
     )
 
-    io_.write_arrow_table(t1, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(t1, options=ParquetOptions(mode=SaveMode.OVERWRITE))
     bytes1 = buf.to_bytes()
 
-    io_.write_arrow_table(t2, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(t2, options=ParquetOptions(mode=SaveMode.OVERWRITE))
     bytes2 = buf.to_bytes()
 
     assert bytes1 != bytes2
@@ -141,7 +141,7 @@ def test_spilled_buffer_path_read_write(cfg: BufferConfig, sample_table):
     buf = BytesIO(config=cfg2)
     io_ = MediaIO.make(buf, MimeType.PARQUET)
 
-    io_.write_arrow_table(sample_table, mode=SaveMode.OVERWRITE)
+    io_.write_arrow_table(sample_table, options=ParquetOptions(mode=SaveMode.OVERWRITE))
     assert buf.spilled is True
     assert buf.path is not None
     assert buf.size > 0

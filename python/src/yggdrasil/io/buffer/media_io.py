@@ -20,10 +20,10 @@ provides:
 Subclasses only need to implement three methods:
 
 * ``check_options(options, **kwargs) → O`` — validate/merge caller options.
-* ``_read_arrow_table(options) → pyarrow.Table`` — read the *uncompressed*
-  buffer into an Arrow table.
-* ``_write_arrow_table(table, options)`` — write an Arrow table into the
-  *uncompressed* buffer.
+* ``_read_arrow_batches(options) → Iterator[pyarrow.RecordBatch]`` — yield
+  record batches from the *uncompressed* buffer.
+* ``_write_arrow_batches(batches, schema, options)`` — consume an iterator
+  of record batches and write into the *uncompressed* buffer.
 
 Typical usage::
 
@@ -144,22 +144,50 @@ class MediaIO(ABC, Generic[O]):
         """
 
     @abstractmethod
-    def _read_arrow_table(self, *, options: O) -> "pyarrow.Table":
-        """Read the **uncompressed** buffer into an Arrow table.
+    def _read_arrow_batches(self, *, options: O) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield record batches from the **uncompressed** buffer.
 
         Subclasses implement this without worrying about transport
-        compression — the public :meth:`read_arrow_table` handles
-        decompression automatically before calling this method.
+        compression — the public methods handle decompression before
+        calling this.  An empty buffer should yield nothing (bare ``return``).
         """
 
     @abstractmethod
-    def _write_arrow_table(self, *, table: "pyarrow.Table", options: O) -> None:
-        """Write an Arrow table into the **uncompressed** buffer.
+    def _write_arrow_batches(
+        self,
+        *,
+        batches: Iterator["pyarrow.RecordBatch"],
+        schema: "pyarrow.Schema",
+        options: O,
+    ) -> None:
+        """Consume record batches and write into the **uncompressed** buffer.
 
         Subclasses implement this without worrying about transport
-        compression — the public :meth:`write_arrow_table` handles
-        compression automatically after calling this method.
+        compression — the public methods handle compression afterwards.
+        *schema* is supplied separately so writers can initialise headers
+        before consuming any batches.
         """
+
+    # ------------------------------------------------------------------
+    # Internal helpers: table ↔ batches bridge
+    # ------------------------------------------------------------------
+
+    def _read_table_from_batches(self, *, options: O) -> "pyarrow.Table":
+        """Collect all batches from :meth:`_read_arrow_batches` into one table."""
+        import pyarrow as pa
+
+        batches = list(self._read_arrow_batches(options=options))
+        if not batches:
+            return pa.table({})
+        return pa.Table.from_batches(batches)
+
+    def _write_table_as_batches(self, *, table: "pyarrow.Table", options: O) -> None:
+        """Convert *table* to batches and forward to :meth:`_write_arrow_batches`."""
+        self._write_arrow_batches(
+            batches=iter(table.to_batches()),
+            schema=table.schema,
+            options=options,
+        )
 
     # ------------------------------------------------------------------
     # Factory
@@ -432,7 +460,6 @@ class MediaIO(ABC, Generic[O]):
     def read_arrow_table(
         self,
         *,
-        batch_size: Optional[int] = None,
         options: O | None = None,
         **option_kwargs,
     ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
@@ -443,14 +470,12 @@ class MediaIO(ABC, Generic[O]):
 
         Parameters
         ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single :class:`pyarrow.Table`.
-            When a positive integer, return an ``Iterator[pyarrow.Table]``
-            yielding slices of at most *batch_size* rows.
         options:
             Format-specific options, or ``None`` for defaults.
+            Set ``batch_size`` > 0 on the options to get an
+            ``Iterator[pyarrow.Table]`` of chunks instead.
         **option_kwargs:
-            Overrides merged into *options*.
+            Overrides merged into *options* (e.g. ``batch_size=1000``).
 
         Returns
         -------
@@ -458,26 +483,24 @@ class MediaIO(ABC, Generic[O]):
         """
         resolved = self.check_options(options=options, **option_kwargs)
         buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
         try:
-            orig_buffer = self.buffer
             if decompressed:
                 self.buffer = buf
-            table = self._read_arrow_table(options=resolved)
+            table = self._read_table_from_batches(options=resolved)
         finally:
             if decompressed:
                 self.buffer = orig_buffer
 
-        if batch_size is not None and batch_size > 0:
-            return self._iter_arrow_batches(table, batch_size)
+        bs = resolved.batch_size
+        if bs and bs > 0:
+            return self._iter_arrow_batches(table, bs)
         return table
 
     def write_arrow_table(
         self,
         table: "pyarrow.Table",
         *,
-        batch_size: Optional[int] = None,
-        mode: SaveMode | str | None = None,
-        match_by: list[str] | None = None,
         options: O | None = None,
         **option_kwargs,
     ) -> None:
@@ -486,50 +509,21 @@ class MediaIO(ABC, Generic[O]):
         Handles transport compression transparently when the media type
         carries a codec.
 
-        Save-mode semantics
-        --------------------
-        ``AUTO`` / ``OVERWRITE`` / ``TRUNCATE``
-            Replace the buffer contents entirely with *table*.
-
-        ``APPEND``
-            Read the current buffer, concatenate *table* after it, and
-            write the combined result back.  Schema promotion fills
-            missing columns with nulls.
-
-        ``UPSERT``
-            Read the current buffer, remove any existing rows whose
-            ``match_by`` composite key appears in *table*, then append
-            *table*.  Requires ``match_by`` to be a non-empty list of
-            column names present in both the existing and incoming data.
-
-        ``IGNORE``
-            Skip the write when the buffer already contains data.
-
-        ``ERROR_IF_EXISTS``
-            Raise :exc:`IOError` when the buffer already contains data.
-
         Parameters
         ----------
         table:
             The Arrow table to serialise.
-        batch_size:
-            When ``None`` or ≤ 0, write the entire table at once.
-            When a positive integer, slice the table into chunks of at
-            most *batch_size* rows and write each chunk sequentially.
-            Only the **last** chunk is kept in the buffer (each write
-            overwrites the previous content).  For accumulation, callers
-            should iterate and use ``APPEND`` mode.
-        mode:
-            Save mode governing the merge strategy.
-        match_by:
-            Columns used as the composite key for ``UPSERT`` mode.
         options:
             Format-specific options, or ``None`` for defaults.
+            Set ``batch_size`` > 0 on the options to slice the table
+            into chunks and write each sequentially (last chunk wins).
+            Set ``mode`` and ``match_by`` on the options to control the
+            write strategy.
         **option_kwargs:
-            Overrides merged into *options*.
+            Overrides merged into *options* (e.g. ``batch_size=1000``).
         """
         resolved = self.check_options(
-            options=options, mode=mode, match_by=match_by, **option_kwargs,
+            options=options, **option_kwargs,
         )
         if self.skip_write(mode=resolved.mode):
             return
@@ -543,8 +537,9 @@ class MediaIO(ABC, Generic[O]):
                 match_by=resolved.match_by,
             )
 
-        if batch_size is not None and batch_size > 0:
-            for chunk in self._iter_arrow_batches(table, batch_size):
+        bs = resolved.batch_size
+        if bs and bs > 0:
+            for chunk in self._iter_arrow_batches(table, bs):
                 self._write_single_table(chunk, resolved)
         else:
             self._write_single_table(table, resolved)
@@ -561,12 +556,12 @@ class MediaIO(ABC, Generic[O]):
             orig_buffer = self.buffer
             self.buffer = plain
             try:
-                self._write_arrow_table(table=table, options=options)
+                self._write_table_as_batches(table=table, options=options)
             finally:
                 self.buffer = orig_buffer
             self._compress_into_buffer(plain)
         else:
-            self._write_arrow_table(table=table, options=options)
+            self._write_table_as_batches(table=table, options=options)
 
     # ------------------------------------------------------------------
     # Python dict / list convenience wrappers
@@ -575,100 +570,69 @@ class MediaIO(ABC, Generic[O]):
     def read_pylist(
         self,
         *,
-        batch_size: Optional[int] = None,
+        options: O | None = None,
+        **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
         """Read the buffer as a list of row dicts.
 
         Parameters
         ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single ``list[dict]``.
-            When a positive integer, return an ``Iterator[list[dict]]``
-            yielding chunks of at most *batch_size* rows.
+        options:
+            Format-specific options.  Set ``batch_size`` > 0 to get an
+            ``Iterator[list[dict]]`` of chunks.
+        **option_kwargs:
+            Overrides merged into *options* (e.g. ``batch_size=1000``).
 
         Returns
         -------
         list[dict] | Iterator[list[dict]]
         """
-        if batch_size is not None and batch_size > 0:
-            return (chunk.to_pylist() for chunk in self.read_arrow_table(batch_size=batch_size))
-        return self.read_arrow_table().to_pylist()
+        resolved = self.check_options(options=options, **option_kwargs)
+        bs = resolved.batch_size
+        if bs and bs > 0:
+            return (chunk.to_pylist() for chunk in self.read_arrow_table(options=resolved))
+        return self.read_arrow_table(options=resolved).to_pylist()
 
     def write_pylist(
         self,
         data: list[dict],
         *,
-        batch_size: Optional[int] = None,
-        mode: SaveMode | str | None = None,
-        match_by: list[str] | None = None,
         options: O | None = None,
         **option_kwargs,
     ):
-        """Write a list of row dicts to the buffer.
-
-        Parameters
-        ----------
-        data:
-            List of ``{column: value}`` dicts.
-        batch_size:
-            Forwarded to :meth:`write_arrow_table`.
-        mode, match_by, options, **option_kwargs:
-            Forwarded to :meth:`write_arrow_table`.
-        """
+        """Write a list of row dicts to the buffer."""
         import pyarrow as _pa
         tb = _pa.Table.from_pylist(data)
         self.write_arrow_table(
-            table=tb, batch_size=batch_size, mode=mode, match_by=match_by,
+            table=tb,
             options=options, **option_kwargs,
         )
 
     def read_pydict(
         self,
         *,
-        batch_size: Optional[int] = None,
+        options: O | None = None,
+        **option_kwargs,
     ) -> Union[dict[str, list], Iterator[dict[str, list]]]:
-        """Read the buffer as a column-oriented dict.
-
-        Parameters
-        ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single ``dict[str, list]``.
-            When a positive integer, return an ``Iterator[dict[str, list]]``
-            yielding chunks of at most *batch_size* rows.
-
-        Returns
-        -------
-        dict[str, list] | Iterator[dict[str, list]]
-        """
-        if batch_size is not None and batch_size > 0:
-            return (chunk.to_pydict() for chunk in self.read_arrow_table(batch_size=batch_size))
-        return self.read_arrow_table().to_pydict()
+        """Read the buffer as a column-oriented dict."""
+        resolved = self.check_options(options=options, **option_kwargs)
+        bs = resolved.batch_size
+        if bs and bs > 0:
+            return (chunk.to_pydict() for chunk in self.read_arrow_table(options=resolved))
+        return self.read_arrow_table(options=resolved).to_pydict()
 
     def write_pydict(
         self,
         data: dict[str, list],
         *,
-        batch_size: Optional[int] = None,
-        mode: SaveMode | str | None = None,
-        match_by: list[str] | None = None,
         options: O | None = None,
         **option_kwargs,
     ):
-        """Write a column-oriented dict to the buffer.
-
-        Parameters
-        ----------
-        data:
-            ``{column_name: [values]}`` dict.
-        batch_size:
-            Forwarded to :meth:`write_arrow_table`.
-        mode, match_by, options, **option_kwargs:
-            Forwarded to :meth:`write_arrow_table`.
-        """
+        """Write a column-oriented dict to the buffer."""
         import pyarrow as _pa
         tb = _pa.Table.from_pydict(data)
         self.write_arrow_table(
-            table=tb, batch_size=batch_size, mode=mode, match_by=match_by,
+            table=tb,
             options=options, **option_kwargs,
         )
 
@@ -679,68 +643,37 @@ class MediaIO(ABC, Generic[O]):
     def read_pandas_frame(
         self,
         *,
-        batch_size: Optional[int] = None,
         options: O | None = None,
         **option_kwargs,
     ) -> Union["pandas.DataFrame", Iterator["pandas.DataFrame"]]:
-        """Read the buffer as a :class:`pandas.DataFrame`.
-
-        Parameters
-        ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single :class:`pandas.DataFrame`.
-            When a positive integer, return an
-            ``Iterator[pandas.DataFrame]`` yielding chunks of at most
-            *batch_size* rows.
-        options, **option_kwargs:
-            Forwarded to :meth:`read_arrow_table`.
-
-        Returns
-        -------
-        pandas.DataFrame | Iterator[pandas.DataFrame]
-        """
-        if batch_size is not None and batch_size > 0:
+        """Read the buffer as a :class:`pandas.DataFrame`."""
+        resolved = self.check_options(options=options, **option_kwargs)
+        bs = resolved.batch_size
+        if bs and bs > 0:
             return (
                 chunk.to_pandas()
-                for chunk in self.read_arrow_table(
-                    batch_size=batch_size, options=options, **option_kwargs,
-                )
+                for chunk in self.read_arrow_table(options=resolved)
             )
-        return self.read_arrow_table(options=options, **option_kwargs).to_pandas()
+        return self.read_arrow_table(options=resolved).to_pandas()
 
     def write_pandas_frame(
         self,
         frame: "pandas.DataFrame",
         *,
-        batch_size: Optional[int] = None,
-        mode: SaveMode | str | None = None,
-        match_by: list[str] | None = None,
         options: O | None = None,
         **option_kwargs,
     ) -> None:
-        """Write a :class:`pandas.DataFrame` to the buffer.
-
-        Parameters
-        ----------
-        frame:
-            The DataFrame to serialise.
-        batch_size:
-            Forwarded to :meth:`write_arrow_table`.
-        mode, match_by, options, **option_kwargs:
-            Forwarded to :meth:`write_arrow_table`.
-        """
+        """Write a :class:`pandas.DataFrame` to the buffer."""
         import pyarrow as _pa
         tb = _pa.Table.from_pandas(frame)
         self.write_arrow_table(
-            table=tb, batch_size=batch_size, mode=mode, match_by=match_by,
+            table=tb,
             options=options, **option_kwargs,
         )
 
     def read_polars_frame(
         self,
         *,
-        batch_size: Optional[int] = None,
-        lazy: bool = False,
         options: O | None = None,
         **option_kwargs,
     ) -> Union[
@@ -748,63 +681,31 @@ class MediaIO(ABC, Generic[O]):
         "polars.LazyFrame",
         Iterator["polars.DataFrame"],
     ]:
-        """Read the buffer as a Polars frame.
-
-        Parameters
-        ----------
-        batch_size:
-            When ``None`` or ≤ 0, return a single frame.
-            When a positive integer, return an
-            ``Iterator[polars.DataFrame]`` yielding chunks of at most
-            *batch_size* rows.  The *lazy* parameter is ignored when
-            batching (each chunk is always a materialised DataFrame).
-        lazy:
-            When ``True`` and ``batch_size`` is ``None`` / ≤ 0, return a
-            :class:`polars.LazyFrame`.
-        options, **option_kwargs:
-            Forwarded to :meth:`read_arrow_table`.
-
-        Returns
-        -------
-        polars.DataFrame | polars.LazyFrame | Iterator[polars.DataFrame]
-        """
+        """Read the buffer as a Polars frame."""
         from yggdrasil.polars.lib import polars as _pl
 
-        if batch_size is not None and batch_size > 0:
+        resolved = self.check_options(options=options, **option_kwargs)
+        bs = resolved.batch_size
+        if bs and bs > 0:
             return (
                 _pl.from_arrow(chunk, rechunk=False)
-                for chunk in self.read_arrow_table(
-                    batch_size=batch_size, options=options, **option_kwargs,
-                )
+                for chunk in self.read_arrow_table(options=resolved)
             )
 
-        tb = self.read_arrow_table(options=options, **option_kwargs)
+        tb = self.read_arrow_table(options=resolved)
         df = _pl.from_arrow(tb, rechunk=False)
-        return df.lazy() if lazy else df
+        return df.lazy() if resolved.lazy else df
 
     def write_polars_frame(
         self,
         frame: "polars.DataFrame",
         *,
-        batch_size: Optional[int] = None,
-        mode: SaveMode | str | None = None,
-        match_by: list[str] | None = None,
         options: O | None = None,
         **option_kwargs,
     ) -> None:
-        """Write a Polars DataFrame to the buffer.
-
-        Parameters
-        ----------
-        frame:
-            The Polars frame to serialise.
-        batch_size:
-            Forwarded to :meth:`write_arrow_table`.
-        mode, match_by, options, **option_kwargs:
-            Forwarded to :meth:`write_arrow_table`.
-        """
+        """Write a Polars DataFrame to the buffer."""
         tb = frame.to_arrow()
         self.write_arrow_table(
-            table=tb, batch_size=batch_size, mode=mode, match_by=match_by,
+            table=tb,
             options=options, **option_kwargs,
         )

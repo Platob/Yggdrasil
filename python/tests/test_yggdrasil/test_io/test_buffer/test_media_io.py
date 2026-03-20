@@ -24,11 +24,12 @@ import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 import pytest
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.arrow_ipc_io import IPCIO
-from yggdrasil.io.buffer.json_io import JsonIO
+from yggdrasil.io.buffer.arrow_ipc_io import IPCIO, IPCOptions
+from yggdrasil.io.buffer.json_io import JsonIO, JsonOptions
 from yggdrasil.io.buffer.media_io import MediaIO
+from yggdrasil.io.buffer.media_options import MediaOptions
 from yggdrasil.io.buffer.parquet_io import ParquetIO, ParquetOptions
-from yggdrasil.io.buffer.zip_io import ZipIO
+from yggdrasil.io.buffer.zip_io import ZipIO, ZipOptions
 from yggdrasil.io.enums import MediaType, MimeType, SaveMode, GZIP
 
 # ---------------------------------------------------------------------------
@@ -214,7 +215,7 @@ class TestParquetIO:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(SAMPLE_TABLE)
-        result = mio.read_arrow_table(columns=["b"])
+        result = mio.read_arrow_table(options=ParquetOptions(columns=["b"]))
         assert result.column_names == ["b"]
         assert result.num_rows == 3
 
@@ -276,11 +277,48 @@ class TestJsonIO:
         records = mio.read_pylist()
         assert records == [{"a": 1}]
 
-    def test_read_pylist(self):
+    def test_read_list_of_dicts(self):
         buf = BytesIO(_json_bytes())
         mio = MediaIO.make(buf, MimeType.JSON)
         records = mio.read_pylist()
         assert records == SAMPLE_DICTS
+
+    def test_read_list_of_scalars_expands_to_value_column(self):
+        """A JSON list of scalars [1, 2, 3] → rows with a 'value' column."""
+        buf = BytesIO(json.dumps([10, 20, 30]).encode("utf-8"))
+        mio = MediaIO.make(buf, MimeType.JSON)
+        result = mio.read_arrow_table()
+        assert result.column_names == ["value"]
+        assert result.to_pylist() == [{"value": 10}, {"value": 20}, {"value": 30}]
+
+    def test_read_list_of_strings_expands_to_value_column(self):
+        buf = BytesIO(json.dumps(["a", "b", "c"]).encode("utf-8"))
+        mio = MediaIO.make(buf, MimeType.JSON)
+        result = mio.read_pylist()
+        assert result == [{"value": "a"}, {"value": "b"}, {"value": "c"}]
+
+    def test_read_list_of_mixed_scalars(self):
+        buf = BytesIO(json.dumps([1, "two", 3.0, None]).encode("utf-8"))
+        mio = MediaIO.make(buf, MimeType.JSON)
+        result = mio.read_pylist()
+        assert len(result) == 4
+        assert all("value" in r for r in result)
+
+    def test_read_empty_list_returns_empty_table(self):
+        buf = BytesIO(b"[]")
+        mio = MediaIO.make(buf, MimeType.JSON)
+        result = mio.read_arrow_table()
+        assert result.num_rows == 0
+
+    def test_write_produces_json_array(self):
+        """Write should produce a top-level JSON array."""
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeType.JSON)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        raw = buf.to_bytes()
+        parsed = json.loads(raw)
+        assert isinstance(parsed, list)
+        assert parsed == SAMPLE_DICTS
 
     def test_write_read_pylist(self):
         buf = BytesIO()
@@ -307,6 +345,13 @@ class TestJsonIO:
         result = mio.read_arrow_table()
         assert result.to_pylist() == SAMPLE_TABLE.to_pylist()
 
+    def test_read_scalar_toplevel(self):
+        """A bare scalar JSON value wraps into [{value: x}]."""
+        buf = BytesIO(b"42")
+        mio = MediaIO.make(buf, MimeType.JSON)
+        result = mio.read_pylist()
+        assert result == [{"value": 42}]
+
 
 # ===================================================================
 # IPCIO
@@ -330,7 +375,7 @@ class TestIPCIO:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.ARROW_IPC)
         mio.write_arrow_table(SAMPLE_TABLE)
-        result = mio.read_arrow_table(columns=["a"])
+        result = mio.read_arrow_table(options=IPCOptions(columns=["a"]))
         assert result.column_names == ["a"]
         assert result.num_rows == 3
 
@@ -404,7 +449,7 @@ class TestZipIO:
         })
         buf = BytesIO(raw_zip)
         mio = MediaIO.make(buf, MimeType.ZIP)
-        result = mio.read_arrow_table(member="b.parquet")
+        result = mio.read_arrow_table(options=ZipOptions(member="b.parquet"))
         assert result.to_pylist() == [{"x": 2}]
 
     def test_glob_member_selection(self):
@@ -418,7 +463,7 @@ class TestZipIO:
         })
         buf = BytesIO(raw_zip)
         mio = MediaIO.make(buf, MimeType.ZIP)
-        result = mio.read_arrow_table(member="data_*.parquet")
+        result = mio.read_arrow_table(options=ZipOptions(member="data_*.parquet"))
         assert result.num_rows == 2
 
     def test_missing_member_raises_key_error(self):
@@ -426,19 +471,19 @@ class TestZipIO:
         buf = BytesIO(raw_zip)
         mio = MediaIO.make(buf, MimeType.ZIP)
         with pytest.raises(KeyError, match="missing.parquet"):
-            mio.read_arrow_table(member="missing.parquet")
+            mio.read_arrow_table(options=ZipOptions(member="missing.parquet"))
 
     def test_glob_no_match_raises_key_error(self):
         raw_zip = _zip_bytes({"data.parquet": _parquet_bytes()})
         buf = BytesIO(raw_zip)
         mio = MediaIO.make(buf, MimeType.ZIP)
         with pytest.raises(KeyError, match="no members matched"):
-            mio.read_arrow_table(member="*.csv")
+            mio.read_arrow_table(options=ZipOptions(member="*.csv"))
 
     def test_write_custom_inner_media(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.ZIP)
-        mio.write_arrow_table(SAMPLE_TABLE, inner_media=MimeType.ARROW_IPC)
+        mio.write_arrow_table(SAMPLE_TABLE, options=ZipOptions(inner_media=MimeType.ARROW_IPC))
         # Verify inner member is IPC
         with zipfile.ZipFile(io.BytesIO(buf.to_bytes()), "r") as zf:
             names = zf.namelist()
@@ -448,7 +493,7 @@ class TestZipIO:
     def test_write_custom_member_name(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.ZIP)
-        mio.write_arrow_table(SAMPLE_TABLE, member="custom.parquet")
+        mio.write_arrow_table(SAMPLE_TABLE, options=ZipOptions(member="custom.parquet"))
         with zipfile.ZipFile(io.BytesIO(buf.to_bytes()), "r") as zf:
             assert "custom.parquet" in zf.namelist()
 
@@ -502,7 +547,7 @@ class TestPolarsWrapper:
     def test_read_polars_lazy(self):
         buf = BytesIO(_parquet_bytes())
         mio = MediaIO.make(buf, MimeType.PARQUET)
-        lf = mio.read_polars_frame(lazy=True)
+        lf = mio.read_polars_frame(options=ParquetOptions(lazy=True))
         from yggdrasil.polars.lib import polars as pl
         assert isinstance(lf, pl.LazyFrame)
         assert lf.collect().shape == (3, 2)
@@ -615,7 +660,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_arrow_table(batch_size=None)
+        result = mio.read_arrow_table(options=ParquetOptions(batch_size=None))
         assert isinstance(result, pa.Table)
         assert result.num_rows == 10
 
@@ -623,21 +668,21 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_arrow_table(batch_size=0)
+        result = mio.read_arrow_table(options=ParquetOptions(batch_size=0))
         assert isinstance(result, pa.Table)
 
     def test_batch_size_negative_returns_table(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_arrow_table(batch_size=-5)
+        result = mio.read_arrow_table(options=ParquetOptions(batch_size=-5))
         assert isinstance(result, pa.Table)
 
     def test_batch_size_returns_iterator(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_arrow_table(batch_size=3)
+        result = mio.read_arrow_table(options=ParquetOptions(batch_size=3))
         # Should be an iterator, not a table
         assert hasattr(result, '__iter__') and hasattr(result, '__next__')
 
@@ -645,7 +690,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=3))
+        chunks = list(mio.read_arrow_table(options=ParquetOptions(batch_size=3)))
         # 10 rows / 3 = 4 chunks: 3, 3, 3, 1
         assert len(chunks) == 4
         assert chunks[0].num_rows == 3
@@ -657,7 +702,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=10))
+        chunks = list(mio.read_arrow_table(options=ParquetOptions(batch_size=10)))
         assert len(chunks) == 1
         assert chunks[0].num_rows == 10
 
@@ -665,7 +710,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=100))
+        chunks = list(mio.read_arrow_table(options=ParquetOptions(batch_size=100)))
         assert len(chunks) == 1
         assert chunks[0].num_rows == 10
 
@@ -673,7 +718,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=4))
+        chunks = list(mio.read_arrow_table(options=ParquetOptions(batch_size=4)))
         combined = pa.concat_tables(chunks)
         assert combined.to_pylist() == BIG_TABLE.to_pylist()
 
@@ -681,7 +726,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.JSON)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=5))
+        chunks = list(mio.read_arrow_table(options=JsonOptions(batch_size=5)))
         assert len(chunks) == 2
         combined = pa.concat_tables(chunks)
         assert combined.to_pylist() == BIG_TABLE.to_pylist()
@@ -690,7 +735,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.ARROW_IPC)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=4))
+        chunks = list(mio.read_arrow_table(options=IPCOptions(batch_size=4)))
         assert len(chunks) == 3
         combined = pa.concat_tables(chunks)
         assert combined.equals(BIG_TABLE)
@@ -701,7 +746,7 @@ class TestBatchedReadArrowTable:
         buf = BytesIO()
         mio = MediaIO.make(buf, mt)
         mio.write_arrow_table(BIG_TABLE)
-        chunks = list(mio.read_arrow_table(batch_size=4))
+        chunks = list(mio.read_arrow_table(options=ParquetOptions(batch_size=4)))
         combined = pa.concat_tables(chunks)
         assert combined.to_pylist() == BIG_TABLE.to_pylist()
 
@@ -719,7 +764,7 @@ class TestBatchedReadPylist:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_pylist(batch_size=4)
+        result = mio.read_pylist(options=ParquetOptions(batch_size=4))
         chunks = list(result)
         assert len(chunks) == 3
         assert all(isinstance(c, list) for c in chunks)
@@ -739,7 +784,7 @@ class TestBatchedReadPydict:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
-        result = mio.read_pydict(batch_size=5)
+        result = mio.read_pydict(options=ParquetOptions(batch_size=5))
         chunks = list(result)
         assert len(chunks) == 2
         assert all(isinstance(c, dict) for c in chunks)
@@ -762,7 +807,7 @@ class TestBatchedReadPolars:
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
         from yggdrasil.polars.lib import polars as pl
-        result = mio.read_polars_frame(batch_size=3)
+        result = mio.read_polars_frame(options=ParquetOptions(batch_size=3))
         chunks = list(result)
         assert len(chunks) == 4
         assert all(isinstance(c, pl.DataFrame) for c in chunks)
@@ -775,7 +820,7 @@ class TestBatchedReadPolars:
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
         from yggdrasil.polars.lib import polars as pl
-        result = mio.read_polars_frame(batch_size=5, lazy=True)
+        result = mio.read_polars_frame(options=ParquetOptions(batch_size=5, lazy=True))
         chunks = list(result)
         assert all(isinstance(c, pl.DataFrame) for c in chunks)
 
@@ -795,7 +840,7 @@ class TestBatchedReadPandas:
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(BIG_TABLE)
         import pandas as pd
-        result = mio.read_pandas_frame(batch_size=4)
+        result = mio.read_pandas_frame(options=ParquetOptions(batch_size=4))
         chunks = list(result)
         assert len(chunks) == 3
         assert all(isinstance(c, pd.DataFrame) for c in chunks)
@@ -808,7 +853,7 @@ class TestBatchedWrite:
         """write_arrow_table with batch_size writes last chunk (each overwrites)."""
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
-        mio.write_arrow_table(BIG_TABLE, batch_size=4)
+        mio.write_arrow_table(BIG_TABLE, options=ParquetOptions(batch_size=4))
         # The buffer now contains the LAST chunk (rows 8-9, 2 rows)
         result = mio.read_arrow_table()
         assert result.num_rows == 2
@@ -817,7 +862,7 @@ class TestBatchedWrite:
     def test_write_pylist_with_batch_size(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
-        mio.write_pylist(BIG_TABLE.to_pylist(), batch_size=5)
+        mio.write_pylist(BIG_TABLE.to_pylist(), options=ParquetOptions(batch_size=5))
         result = mio.read_arrow_table()
         # Last chunk of 5 rows
         assert result.num_rows == 5
@@ -827,7 +872,7 @@ class TestBatchedWrite:
         df = pl.from_arrow(BIG_TABLE)
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
-        mio.write_polars_frame(df, batch_size=7)
+        mio.write_polars_frame(df, options=ParquetOptions(batch_size=7))
         result = mio.read_arrow_table()
         # Last chunk: 10 - 7 = 3 rows
         assert result.num_rows == 3
@@ -846,7 +891,7 @@ class TestSaveModeOverwrite:
         t1 = pa.table({"a": [1, 2]})
         t2 = pa.table({"a": [3, 4, 5]})
         mio.write_arrow_table(t1)
-        mio.write_arrow_table(t2, mode="auto")
+        mio.write_arrow_table(t2, options=ParquetOptions(mode="auto"))
         assert mio.read_arrow_table().to_pylist() == [{"a": 3}, {"a": 4}, {"a": 5}]
 
     def test_overwrite_replaces_content(self):
@@ -855,14 +900,14 @@ class TestSaveModeOverwrite:
         t1 = pa.table({"a": [1, 2]})
         t2 = pa.table({"a": [10]})
         mio.write_arrow_table(t1)
-        mio.write_arrow_table(t2, mode="overwrite")
+        mio.write_arrow_table(t2, options=ParquetOptions(mode="overwrite"))
         assert mio.read_arrow_table().to_pylist() == [{"a": 10}]
 
     def test_overwrite_on_empty_buffer(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         t = pa.table({"x": [1]})
-        mio.write_arrow_table(t, mode="overwrite")
+        mio.write_arrow_table(t, options=ParquetOptions(mode="overwrite"))
         assert mio.read_arrow_table().to_pylist() == [{"x": 1}]
 
 
@@ -875,7 +920,7 @@ class TestSaveModeAppend:
         t1 = pa.table({"a": [1, 2]})
         t2 = pa.table({"a": [3, 4]})
         mio.write_arrow_table(t1)
-        mio.write_arrow_table(t2, mode="append")
+        mio.write_arrow_table(t2, options=ParquetOptions(mode="append"))
         result = mio.read_arrow_table()
         assert result.to_pylist() == [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}]
 
@@ -883,14 +928,14 @@ class TestSaveModeAppend:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         t = pa.table({"a": [1, 2]})
-        mio.write_arrow_table(t, mode="append")
+        mio.write_arrow_table(t, options=ParquetOptions(mode="append"))
         assert mio.read_arrow_table().to_pylist() == [{"a": 1}, {"a": 2}]
 
     def test_append_multiple_times(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         for i in range(3):
-            mio.write_arrow_table(pa.table({"v": [i]}), mode="append")
+            mio.write_arrow_table(pa.table({"v": [i]}), options=ParquetOptions(mode="append"))
         assert mio.read_arrow_table().to_pylist() == [{"v": 0}, {"v": 1}, {"v": 2}]
 
     def test_append_schema_promotion(self):
@@ -900,7 +945,7 @@ class TestSaveModeAppend:
         t1 = pa.table({"a": [1], "b": ["x"]})
         t2 = pa.table({"a": [2], "c": [3.14]})
         mio.write_arrow_table(t1)
-        mio.write_arrow_table(t2, mode="append")
+        mio.write_arrow_table(t2, options=ParquetOptions(mode="append"))
         result = mio.read_arrow_table()
         assert result.num_rows == 2
         assert set(result.column_names) == {"a", "b", "c"}
@@ -909,14 +954,14 @@ class TestSaveModeAppend:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.JSON)
         mio.write_arrow_table(pa.table({"x": [1]}))
-        mio.write_arrow_table(pa.table({"x": [2]}), mode="append")
+        mio.write_arrow_table(pa.table({"x": [2]}), options=JsonOptions(mode="append"))
         assert mio.read_arrow_table().to_pylist() == [{"x": 1}, {"x": 2}]
 
     def test_append_with_ipc(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.ARROW_IPC)
         mio.write_arrow_table(pa.table({"x": [1]}))
-        mio.write_arrow_table(pa.table({"x": [2]}), mode="append")
+        mio.write_arrow_table(pa.table({"x": [2]}), options=IPCOptions(mode="append"))
         assert mio.read_arrow_table().to_pylist() == [{"x": 1}, {"x": 2}]
 
     def test_append_with_gzip_codec(self):
@@ -924,7 +969,7 @@ class TestSaveModeAppend:
         buf = BytesIO()
         mio = MediaIO.make(buf, mt)
         mio.write_arrow_table(pa.table({"x": [1]}))
-        mio.write_arrow_table(pa.table({"x": [2]}), mode="append")
+        mio.write_arrow_table(pa.table({"x": [2]}), options=ParquetOptions(mode="append"))
         result = mio.read_arrow_table()
         assert result.to_pylist() == [{"x": 1}, {"x": 2}]
 
@@ -938,7 +983,7 @@ class TestSaveModeUpsert:
         existing = pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]})
         incoming = pa.table({"id": [2, 3],     "val": ["B", "C"]})
         mio.write_arrow_table(existing)
-        mio.write_arrow_table(incoming, mode="upsert", match_by=["id"])
+        mio.write_arrow_table(incoming, options=ParquetOptions(mode="upsert", match_by=["id"]))
         result = mio.read_arrow_table()
         result_dict = {row["id"]: row["val"] for row in result.to_pylist()}
         assert result_dict == {1: "a", 2: "B", 3: "C"}
@@ -949,7 +994,7 @@ class TestSaveModeUpsert:
         existing = pa.table({"id": [1], "val": ["a"]})
         incoming = pa.table({"id": [2], "val": ["b"]})
         mio.write_arrow_table(existing)
-        mio.write_arrow_table(incoming, mode="upsert", match_by=["id"])
+        mio.write_arrow_table(incoming, options=ParquetOptions(mode="upsert", match_by=["id"]))
         result = mio.read_arrow_table()
         assert result.num_rows == 2
         result_dict = {row["id"]: row["val"] for row in result.to_pylist()}
@@ -961,7 +1006,7 @@ class TestSaveModeUpsert:
         existing = pa.table({"id": [1, 2], "val": ["old1", "old2"]})
         incoming = pa.table({"id": [1, 2], "val": ["new1", "new2"]})
         mio.write_arrow_table(existing)
-        mio.write_arrow_table(incoming, mode="upsert", match_by=["id"])
+        mio.write_arrow_table(incoming, options=ParquetOptions(mode="upsert", match_by=["id"]))
         result = mio.read_arrow_table()
         result_dict = {row["id"]: row["val"] for row in result.to_pylist()}
         assert result_dict == {1: "new1", 2: "new2"}
@@ -976,7 +1021,7 @@ class TestSaveModeUpsert:
             "k1": [1, 2], "k2": ["b", "a"], "val": [99, 88],
         })
         mio.write_arrow_table(existing)
-        mio.write_arrow_table(incoming, mode="upsert", match_by=["k1", "k2"])
+        mio.write_arrow_table(incoming, options=ParquetOptions(mode="upsert", match_by=["k1", "k2"]))
         result = mio.read_arrow_table()
         rows = {(r["k1"], r["k2"]): r["val"] for r in result.to_pylist()}
         assert rows == {(1, "a"): 10, (1, "b"): 99, (2, "a"): 88}
@@ -985,7 +1030,7 @@ class TestSaveModeUpsert:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         incoming = pa.table({"id": [1], "val": ["x"]})
-        mio.write_arrow_table(incoming, mode="upsert", match_by=["id"])
+        mio.write_arrow_table(incoming, options=ParquetOptions(mode="upsert", match_by=["id"]))
         assert mio.read_arrow_table().to_pylist() == [{"id": 1, "val": "x"}]
 
     def test_upsert_no_match_by_raises(self):
@@ -994,7 +1039,7 @@ class TestSaveModeUpsert:
         mio.write_arrow_table(pa.table({"id": [1]}))
         with pytest.raises(ValueError, match="match_by"):
             mio.write_arrow_table(
-                pa.table({"id": [2]}), mode="upsert", match_by=None,
+                pa.table({"id": [2]}), options=ParquetOptions(mode="upsert", match_by=None),
             )
 
     def test_upsert_missing_column_raises(self):
@@ -1003,7 +1048,7 @@ class TestSaveModeUpsert:
         mio.write_arrow_table(pa.table({"id": [1], "val": ["a"]}))
         with pytest.raises(ValueError, match="not in incoming"):
             mio.write_arrow_table(
-                pa.table({"other": [2]}), mode="upsert", match_by=["id"],
+                pa.table({"other": [2]}), options=ParquetOptions(mode="upsert", match_by=["id"]),
             )
 
     def test_upsert_with_json(self):
@@ -1011,7 +1056,7 @@ class TestSaveModeUpsert:
         mio = MediaIO.make(buf, MimeType.JSON)
         mio.write_arrow_table(pa.table({"id": [1, 2], "v": ["a", "b"]}))
         mio.write_arrow_table(
-            pa.table({"id": [2], "v": ["B"]}), mode="upsert", match_by=["id"],
+            pa.table({"id": [2], "v": ["B"]}), options=JsonOptions(mode="upsert", match_by=["id"]),
         )
         rows = {r["id"]: r["v"] for r in mio.read_arrow_table().to_pylist()}
         assert rows == {1: "a", 2: "B"}
@@ -1023,7 +1068,7 @@ class TestSaveModeUpsert:
         mio.write_arrow_table(pa.table({"id": [1, 2], "v": [10, 20]}))
         mio.write_arrow_table(
             pa.table({"id": [2, 3], "v": [99, 30]}),
-            mode="upsert", match_by=["id"],
+            options=ParquetOptions(mode="upsert", match_by=["id"]),
         )
         rows = {r["id"]: r["v"] for r in mio.read_arrow_table().to_pylist()}
         assert rows == {1: 10, 2: 99, 3: 30}
@@ -1037,7 +1082,7 @@ class TestSaveModeIgnoreAndError:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_arrow_table(pa.table({"a": [1]}))
-        mio.write_arrow_table(pa.table({"a": [999]}), mode="ignore")
+        mio.write_arrow_table(pa.table({"a": [999]}), options=ParquetOptions(mode="ignore"))
         assert mio.read_arrow_table().to_pylist() == [{"a": 1}]
 
     def test_error_if_exists_raises_on_non_empty(self):
@@ -1046,7 +1091,7 @@ class TestSaveModeIgnoreAndError:
         mio.write_arrow_table(pa.table({"a": [1]}))
         with pytest.raises(IOError):
             mio.write_arrow_table(
-                pa.table({"a": [999]}), mode="error_if_exists",
+                pa.table({"a": [999]}), options=ParquetOptions(mode="error_if_exists"),
             )
 
 
@@ -1057,14 +1102,14 @@ class TestSaveModeViaConvenienceMethods:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_pylist([{"a": 1}])
-        mio.write_pylist([{"a": 2}], mode="append")
+        mio.write_pylist([{"a": 2}], options=ParquetOptions(mode="append"))
         assert mio.read_pylist() == [{"a": 1}, {"a": 2}]
 
     def test_upsert_via_write_pydict(self):
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_pydict({"id": [1, 2], "v": [10, 20]})
-        mio.write_pydict({"id": [2], "v": [99]}, mode="upsert", match_by=["id"])
+        mio.write_pydict({"id": [2], "v": [99]}, options=ParquetOptions(mode="upsert", match_by=["id"]))
         rows = {r["id"]: r["v"] for r in mio.read_pylist()}
         assert rows == {1: 10, 2: 99}
 
@@ -1073,7 +1118,7 @@ class TestSaveModeViaConvenienceMethods:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_polars_frame(pl.DataFrame({"x": [1]}))
-        mio.write_polars_frame(pl.DataFrame({"x": [2]}), mode="append")
+        mio.write_polars_frame(pl.DataFrame({"x": [2]}), options=ParquetOptions(mode="append"))
         result = mio.read_polars_frame()
         assert result.to_dicts() == [{"x": 1}, {"x": 2}]
 
@@ -1082,6 +1127,6 @@ class TestSaveModeViaConvenienceMethods:
         buf = BytesIO()
         mio = MediaIO.make(buf, MimeType.PARQUET)
         mio.write_pandas_frame(pd.DataFrame({"x": [1]}))
-        mio.write_pandas_frame(pd.DataFrame({"x": [2]}), mode="append")
+        mio.write_pandas_frame(pd.DataFrame({"x": [2]}), options=ParquetOptions(mode="append"))
         result = mio.read_pandas_frame()
         assert list(result["x"]) == [1, 2]
