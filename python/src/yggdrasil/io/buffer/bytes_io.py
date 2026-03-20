@@ -521,7 +521,7 @@ class BytesIO(io.RawIOBase):
 
         if media_type.codec is None:
             if media_type.is_json:
-                with self.view() as v:
+                with self.view(pos=0) as v:
                     return json_module.load(v)
 
             mio = self.media_io(media_type)
