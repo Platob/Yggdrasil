@@ -15,6 +15,8 @@ __all__ = [
     "is_arrow_type_binary_like",
     "is_arrow_type_string_like",
     "is_arrow_type_list_like",
+    "merge_arrow_fields",
+    "merge_arrow_types",
 ]
 
 for key, func in [
@@ -587,17 +589,53 @@ def _merge_time_units(left_unit: str, right_unit: str) -> str:
 def merge_arrow_types(
     left: Union[pa.DataType, pa.TimestampType, pa.ListType, pa.MapType, pa.StructType],
     right: Union[pa.DataType, pa.TimestampType, pa.ListType, pa.MapType, pa.StructType],
-    add_missing_columns: bool = True
+    add_missing_columns: bool = True,
 ) -> pa.DataType:
-    """Merge two Arrow types into a compatible supertype.
+    """Merge two Arrow types into a compatible supertype without narrowing.
+
+    Implements a non-destructive merge strategy optimised for evolving schemas
+    in Delta / Spark / Polars pipelines.  The returned type is the "widest"
+    type that can represent values from *both* sides without data loss.
+
+    Rules (applied in order):
+
+    * **null** is the identity element — ``merge(null, T) → T``.
+    * **Identical types** short-circuit immediately.
+    * **Extension types** — if both are the same extension, keep it;
+      otherwise merge the underlying storage types.
+    * **Numeric promotion** — integers, floats, and decimals are widened
+      via :func:`_promote_numeric` (wider bit-width, signed over unsigned,
+      float dominates int, decimal precision/scale expanded).
+    * **Booleans** — ``bool ∧ bool → bool``.
+    * **Strings / binaries** — ``large_*`` wins when either side is large.
+    * **Timestamps** — finer time unit wins; timezone mismatch raises.
+    * **Dates** — ``date64`` wins over ``date32``.
+    * **Times** — finer unit wins; ``time32`` + ``time64`` → ``time64``.
+    * **Durations** — finer unit wins.
+    * **Lists** — value types are recursively merged;
+      ``large_list`` wins over ``list``.
+    * **Fixed-size lists** — equal sizes preserve the fixed variant;
+      mismatched sizes degrade to ``list``.
+    * **Structs** — all sub-fields are recursively merged; matching
+      children are upcasted, extra children from either side are added
+      (when *add_missing_columns* is ``True``) or only the intersection
+      is kept (when ``False``).
+    * **Maps** — key and item types are recursively merged.
+    * **Dictionaries** — index and value types are recursively merged.
+    * **Incompatible types** raise :class:`TypeError`.
 
     Args:
-        left: Left Arrow data type.
-        right: Right Arrow data type.
-        add_missing_columns: Whether to include missing struct fields.
+        left: Source / observed type.
+        right: Target / desired type.
+        add_missing_columns: When ``True``, struct children present in only
+            one side are kept.  When ``False``, only the intersection of
+            struct children is retained.
 
     Returns:
-        Merged Arrow data type.
+        Merged Arrow type guaranteed to be at least as wide as both inputs.
+
+    Raises:
+        TypeError: If the two types are genuinely incompatible.
     """
     # null is identity
     if _is_null(left):
@@ -610,14 +648,14 @@ def merge_arrow_types(
         return left
 
     # Extension types: keep only if truly same extension, else fall back to storage merge.
-    if pa.types.is_extension(left) or pa.types.is_extension(right):
-        if pa.types.is_extension(left) and pa.types.is_extension(right):
+    l_ext = isinstance(left, pa.ExtensionType)
+    r_ext = isinstance(right, pa.ExtensionType)
+    if l_ext or r_ext:
+        if l_ext and r_ext:
             if type(left) is type(right) and left.extension_name == right.extension_name:
-                # assume compatible metadata; keep left
                 return left
-        # otherwise merge storage and drop extension wrapper
-        l_storage = left.storage_type if pa.types.is_extension(left) else left
-        r_storage = right.storage_type if pa.types.is_extension(right) else right
+        l_storage = left.storage_type if l_ext else left
+        r_storage = right.storage_type if r_ext else right
         return merge_arrow_types(l_storage, r_storage, add_missing_columns=add_missing_columns)
 
     # numeric promotion (int/float/decimal)
@@ -742,24 +780,54 @@ def merge_arrow_types(
 def merge_arrow_fields(
     left: pa.Field,
     right: pa.Field,
-    add_missing_columns: bool = True
+    add_missing_columns: bool = True,
 ) -> pa.Field:
-    """Merge two Arrow fields into a compatible field.
+    """Merge two Arrow fields into a single, non-narrowing field.
+
+    Name resolution
+    ~~~~~~~~~~~~~~~
+    * If either name is ``"root"`` (a synthetic placeholder), the other wins.
+    * Otherwise the *right* (target) name is preferred to ensure schema
+      convergence.
+
+    Type resolution
+    ~~~~~~~~~~~~~~~
+    Delegates to :func:`merge_arrow_types` which recursively widens:
+
+    * **Structs** — all sub-fields from both sides are merged; matching
+      children are recursively upcasted, extra children are added.
+    * **Lists / maps / dicts** — inner types are upcasted to the most
+      compatible supertype.
+    * **Primitives** — numeric promotion (int→wider int, int+float→float,
+      decimal precision/scale expansion), timestamp unit/tz merging, etc.
+
+    Nullability is the logical OR of both fields.
+
+    Metadata is merged with *right* keys taking precedence on collision.
 
     Args:
-        left: Left Arrow field.
-        right: Right Arrow field.
-        add_missing_columns: Whether to include missing struct fields.
+        left: Incoming / observed field (source).
+        right: Schema-defined desired field (target).
+        add_missing_columns: When ``True``, struct children present in only
+            one side are kept in the result.  When ``False``, only the
+            intersection of struct children is retained.
 
     Returns:
-        Merged Arrow field.
+        Merged ``pa.Field``.
     """
-    if left.name != right.name:
-        raise TypeError(f"Cannot merge fields with different names: {left.name!r} vs {right.name!r}")
+    # ---- name resolution ----
+    l_name = left.name or ""
+    r_name = right.name or ""
+
+    if l_name == "root" and r_name and r_name != "root":
+        name = r_name
+    elif r_name == "root" and l_name and l_name != "root":
+        name = l_name
+    else:
+        name = r_name or l_name or "root"
 
     merged_type = merge_arrow_types(left.type, right.type, add_missing_columns=add_missing_columns)
-    nullable = bool(left.nullable or right.nullable)
+    nullable = left.nullable or right.nullable
     metadata = _merge_metadata(left.metadata, right.metadata)
 
-    # preserve dictionary-encoding? handled in merge_arrow_types
-    return pa.field(left.name, merged_type, nullable=nullable, metadata=metadata)
+    return pa.field(name, merged_type, nullable=nullable, metadata=metadata)

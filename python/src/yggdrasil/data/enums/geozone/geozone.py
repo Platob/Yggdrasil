@@ -924,8 +924,8 @@ class GeoZone:
             key_to_eic         = {k: m.eic           for k, m in key_to_meta.items()}
             key_to_tz          = {k: m.tz            for k, m in key_to_meta.items()}
             key_to_ccy         = {k: m.ccy           for k, m in key_to_meta.items()}
-            key_to_lat         = {k: _parse_point_wkb(m.wkb)[0] for k, m in key_to_meta.items()}
-            key_to_lon         = {k: _parse_point_wkb(m.wkb)[1] for k, m in key_to_meta.items()}
+            key_to_lat         = {k: m.lat for k, m in key_to_meta.items()}
+            key_to_lon         = {k: m.lon for k, m in key_to_meta.items()}
             return pl.struct(
                 # Field order mirrors GeoZone dataclass declaration exactly.
                 # aliases is a tuple[str, ...] and has no scalar Polars equivalent

@@ -60,24 +60,37 @@ def _dump_path(
 ) -> bytes:
     try:
         with path.open("wb") as f:
-            return _dump(
+            _dump(
                 obj,
                 f,
                 metadata=metadata,
                 codec=codec,
             )
+
+            LOGGER.info(
+                "Dumped %s in %s",
+                obj, path
+            )
+            return None
     except (OSError, IOError):
         # likely parent does not exist; create it and retry once
         path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         with path.open("wb") as f:
-            return _dump(
+            _dump(
                 obj,
                 f,
                 metadata=metadata,
                 codec=codec,
             )
+
+            LOGGER.info(
+                "Dumped %s in %s",
+                obj,
+                path
+            )
+            return None
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -112,7 +125,7 @@ def dump(
             fp.unlink(missing_ok=True)
             raise
 
-    raise TypeError(
+    raise SerializationError(
         f"Cannot write to object of type {type(fp).__name__!r}. "
         "Expected a file-like object, pathlib.Path, or string path."
     )
@@ -148,13 +161,20 @@ def load(
     mag = buffer.read(len(MAGIC))
     if mag != MAGIC:
         if isinstance(fp, (str, Path)):
+            p = Path(fp)
+
             if clean_corrupted:
-                LOGGER.warning(
-                    "Invalid magic header in %r; file may be corrupted. Removing file.", fp
-                )
-                p = Path(fp)
+                if not p.exists():
+                    return default
+
+                if p.stat().st_size > 0:
+                    LOGGER.warning(
+                        "Invalid magic header in %r; file may be corrupted. Removing file.", fp
+                    )
+
                 p.unlink(missing_ok=True)
                 return default
+
             raise SerializationError(f"Invalid magic header in file {fp!r}")
         raise SerializationError("Invalid magic header")
 
@@ -170,6 +190,12 @@ def load(
                 p.unlink(missing_ok=True)
                 return default
         raise
+
+    LOGGER.debug(
+        "Loaded %s from %s",
+        read,
+        fp
+    )
 
     if unpickle:
         return read.as_python()

@@ -480,7 +480,7 @@ class Cluster(DatabricksResource):
 
     def wait_installed_libraries(
         self,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ):
         if not self.is_running:

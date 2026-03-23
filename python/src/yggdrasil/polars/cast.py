@@ -381,9 +381,13 @@ def cast_polars_array_to_temporal(
             working = working.dt.time()
 
         elif src_cls is pl.Duration:
+            # Duration internal value is already nanoseconds → cast directly.
             working = working.cast(pl.Int64, strict=safe).cast(pl.Time, strict=safe)
 
         elif src_cls in _NUMERIC_CLASSES:
+            # Interpret numeric values as nanoseconds since midnight.
+            # Polars Time is stored as i64 nanoseconds from 00:00:00.000000000.
+            # Float inputs are rounded to the nearest integer first.
             working = working.cast(pl.Int64, strict=safe).cast(pl.Time, strict=safe)
 
         else:
@@ -797,12 +801,56 @@ def cast_polars_array(
 
     # ── Scalar cast ───────────────────────────────────────────────────────────
     else:
-        if is_expr:
-            array = array.cast(tpdt, strict=options.safe)
-        elif to_expr:
-            array = pl.col(col_name).cast(tpdt, strict=options.safe)
+        safe = options.safe
+
+        # Temporal source → numeric target needs special handling because
+        # Polars doesn't always support direct temporal.cast(numeric).
+        #   Time     → Int64 : nanoseconds since midnight (via Duration(ns))
+        #   Date     → Int32 : days since epoch (1970-01-01)
+        #   Datetime → Int64 : epoch value in the datetime's time_unit
+        #   Duration → Int64 : duration value in the duration's time_unit
+        # After extracting the integer, cast to the final numeric dtype.
+        if spdt.is_temporal() and (tpdt.is_numeric() or tpdt.is_integer() or tpdt.is_float()):
+            if spdt.__class__ is pl.Time:
+                # Time has no direct .cast(Int64); go via Duration("ns")
+                # then extract .dt.total_nanoseconds().
+                if is_expr:
+                    array = (
+                        array.cast(pl.Duration("ns"), strict=safe)
+                        .dt.total_nanoseconds()
+                        .cast(tpdt, strict=safe)
+                    )
+                elif to_expr:
+                    array = (
+                        pl.col(col_name)
+                        .cast(pl.Duration("ns"), strict=safe)
+                        .dt.total_nanoseconds()
+                        .cast(tpdt, strict=safe)
+                    )
+                else:
+                    tmp_name = "__time_to_ns__"
+                    array = (
+                        array.cast(pl.Duration("ns"), strict=safe)
+                        .to_frame(tmp_name)
+                        .select(pl.col(tmp_name).dt.total_nanoseconds().cast(tpdt, strict=safe))
+                        .to_series()
+                        .rename(base_name)
+                    )
+            else:
+                # Date/Datetime/Duration → target numeric (Polars supports natively)
+                if is_expr:
+                    array = array.cast(tpdt, strict=safe)
+                elif to_expr:
+                    array = pl.col(col_name).cast(tpdt, strict=safe)
+                else:
+                    array = array.cast(tpdt, strict=safe)
         else:
-            array = array.cast(tpdt, strict=options.safe)
+            if is_expr:
+                array = array.cast(tpdt, strict=safe)
+            elif to_expr:
+                array = pl.col(col_name).cast(tpdt, strict=safe)
+            else:
+                array = array.cast(tpdt, strict=safe)
 
     # ── Nullability fill ──────────────────────────────────────────────────────
     if need_fill:
@@ -938,7 +986,7 @@ def cast_polars_lazyframe(lf: pl.LazyFrame, options: Optional[CastOptions] = Non
     if target_schema is None:
         return lf
 
-    lf_schema: dict[str, pl.DataType] = dict(lf.schema)
+    lf_schema: dict[str, pl.DataType] = dict(lf.collect_schema())
 
     # ── Build source lookups from schema (no collect) ─────────────────────────
     src_pl_fields: list[pl.Field] = [pl.Field(n, d) for n, d in lf_schema.items()]

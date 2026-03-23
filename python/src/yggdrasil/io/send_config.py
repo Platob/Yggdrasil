@@ -1,207 +1,564 @@
-"""Configuration dataclasses for :class:`~yggdrasil.io.session.Session` send methods.
-
-Two dataclasses are provided:
-
-* :class:`SendConfig` – controls a **single** request sent via
-  :meth:`~yggdrasil.io.session.Session.send`.
-* :class:`SendManyConfig` – extends :class:`SendConfig` with additional
-  options for concurrent, batched, and cached execution via
-  :meth:`~yggdrasil.io.session.Session.send_many`.
-
-Both are *frozen* so they can be safely shared across threads and expose a
-consistent factory API:
-
-``cls.default()``
-    Return the instance with all fields at their defaults.
-
-``cls.parse_mapping(options)``
-    Build an instance from a ``Mapping[str, Any]``.  Unknown keys are
-    silently ignored so callers can pass broad option dicts without filtering.
-
-``cls.check_arg(arg)``
-    Coerce *arg* into a config instance.  Accepts ``None`` (returns default),
-    an existing instance (returned unchanged), or any mapping.
-
-``instance.merge(**overrides)``
-    Return a new instance with the given fields replaced, leaving all other
-    fields unchanged.
-
-Typical usage::
-
-    from yggdrasil.io.send_config import SendConfig, SendManyConfig
-
-    cfg = SendConfig(stream=True, raise_error=True, wait=30)
-
-    # override a single field without rebuilding the whole object
-    no_stream = cfg.merge(stream=False)
-
-    # build from an options dict (e.g. from a config file or API response)
-    cfg2 = SendConfig.parse_mapping({"stream": False, "raise_error": False})
-
-    # many requests
-    many_cfg = SendManyConfig(stream=True, batch_size=50, ordered=True)
-    for resp in session.send_many(requests, config=many_cfg):
-        ...
-"""
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.data import any_to_datetime, any_to_timedelta
+from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.io import SaveMode
+from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 
 if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
     from yggdrasil.databricks.sql.table import Table
-
-__all__ = ["SendConfig", "SendManyConfig"]
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-# Field names understood by each config class – used by parse_mapping to
-# filter out unknown keys before calling the dataclass constructor.
-_SEND_CONFIG_FIELDS: frozenset[str] = frozenset({
-    "wait", "raise_error", "stream", "cache", "cache_by",
-    "anonymize", "received_from", "received_to", "wait_cache",
-})
-
-_SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset({
-    "cache_anonymize", "normalize", "batch_size", "ordered", "max_in_flight",
-})
+    from yggdrasil.io.response import Response
 
 
-# ---------------------------------------------------------------------------
-# SendConfig
-# ---------------------------------------------------------------------------
+__all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
+
+
+_DEFAULT_REQUEST_BY: tuple[str, ...] = (
+    "request_method",
+    "request_url_str",
+    "request_content_length",
+    "request_body_hash",
+)
+
+_CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
+    {
+        "path",
+        "table",
+        "request_by",
+        "response_by",
+        "mode",
+        "anonymize",
+        "received_from",
+        "received_to",
+        "wait",
+    }
+)
+
+_SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
+    {
+        "wait",
+        "raise_error",
+        "stream",
+        "remote_cache",
+        "local_cache",
+        "spark_session",
+    }
+)
+
+_SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset(
+    {
+        "normalize",
+        "batch_size",
+        "ordered",
+        "max_in_flight",
+    }
+)
+
+
+def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    keys = list(_DEFAULT_REQUEST_BY if not arg else arg)
+    invalid = [key for key in keys if key not in REQUEST_ARROW_SCHEMA.names]
+    if invalid:
+        raise ValueError(
+            f"Invalid request_by key(s): {invalid!r}. "
+            f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
+        )
+    return keys
+
+
+def _validate_response_by(
+    arg: list[str] | tuple[str, ...] | None = None,
+) -> list[str] | None:
+    if arg is None:
+        return None
+
+    keys = list(arg)
+    invalid = [key for key in keys if key not in RESPONSE_ARROW_SCHEMA.names]
+    if invalid:
+        raise ValueError(
+            f"Invalid response_by key(s): {invalid!r}. "
+            f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+        )
+    return keys
+
+
+def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    return any_to_datetime(value)
+
 
 @dataclass(frozen=True, slots=True)
-class SendConfig:
-    """Configuration for a single HTTP request.
-
-    Pass an instance as ``config=`` to
-    :meth:`~yggdrasil.io.session.Session.send` or any of the convenience
-    HTTP methods (``get``, ``post``, …).  Individual keyword arguments on the
-    call site override the corresponding field.
-
-    Parameters
-    ----------
-    wait:
-        Waiting / retry configuration forwarded to the transport layer.
-        Accepts anything that :class:`~yggdrasil.dataclasses.waiting.WaitingConfig`
-        understands: a :class:`WaitingConfig` instance, a dict, a timeout in
-        seconds (``int`` or ``float``), a deadline :class:`datetime.datetime`,
-        or ``True`` / ``False``.  ``None`` defers to the session default.
-    raise_error:
-        When ``True`` (default) a non-2xx response raises immediately.
-        Set to ``False`` to inspect error responses manually.
-    stream:
-        When ``True`` (default) the response body is streamed lazily.
-        Set to ``False`` to buffer the entire body before returning.
-    cache:
-        Optional Databricks Delta table used to cache responses.  When
-        provided the session checks the table before hitting the network and
-        writes new responses back on success.
-    cache_by:
-        List of response-schema column names that form the cache key.
-        Defaults to ``["request_method", "request_url_host",
-        "request_url_path", "request_url_query",
-        "request_content_length", "request_body_hash"]`` when ``cache``
-        is set.  Must be a subset of
-        :data:`~yggdrasil.io.response.RESPONSE_ARROW_SCHEMA` field names.
-    anonymize:
-        Controls how sensitive fields are removed before caching or
-        comparing cached entries.
-
-        * ``"remove"`` – strip values completely (default).
-        * ``"redact"`` – replace values with a fixed placeholder.
-    received_from:
-        Earliest ``response_received_at`` timestamp to accept from cache.
-        Any timezone-aware datetime, date, or ISO-8601 string is accepted.
-    received_to:
-        Latest ``response_received_at`` timestamp to accept from cache.
-    wait_cache:
-        Waiting config for the asynchronous cache-write operation.
-        ``False`` (default) means fire-and-forget.
-    """
-
-    wait: WaitingConfigArg = None
-    raise_error: bool = True
-    stream: bool = True
-    cache: Optional["Table"] = field(default=None, hash=False, compare=False)
-    cache_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    anonymize: Literal["remove", "redact"] = "remove"
-    received_from: Optional[dt.datetime | dt.date | str] = None
-    received_to: Optional[dt.datetime | dt.date | str] = None
-    wait_cache: WaitingConfigArg = False
-
-    # ------------------------------------------------------------------
-    # Factory classmethods
-    # ------------------------------------------------------------------
+class _ConfigBase:
+    _FIELD_NAMES: ClassVar[frozenset[str]]
 
     @classmethod
-    def default(cls) -> "SendConfig":
-        """Return a :class:`SendConfig` with all fields at their defaults.
-
-        Examples
-        --------
-        >>> SendConfig.default()
-        SendConfig(wait=None, raise_error=True, stream=True, ...)
-        """
+    def default(cls):
         return cls()
 
     @classmethod
-    def parse_mapping(
-        cls,
-        options: Mapping[str, Any],
-        **overrides: Any,
-    ) -> "SendConfig":
-        """Build a :class:`SendConfig` from a mapping (e.g. a dict or config file row).
-
-        Unknown keys are silently dropped so callers can pass broad option
-        dicts without filtering them first.  *overrides* are applied on top
-        after the mapping is parsed.
-
-        Parameters
-        ----------
-        options:
-            Any ``Mapping[str, Any]``.  Recognised keys match the field names
-            of :class:`SendConfig`; all other keys are ignored.
-        **overrides:
-            Keyword arguments that take precedence over values in *options*.
-            Useful for pinning one field while letting the rest come from the
-            mapping.
-
-        Returns
-        -------
-        SendConfig
-
-        Raises
-        ------
-        TypeError
-            If *options* is not a ``Mapping``.
-
-        Examples
-        --------
-        >>> SendConfig.parse_mapping({"stream": False, "raise_error": False})
-        SendConfig(wait=None, raise_error=False, stream=False, ...)
-
-        >>> SendConfig.parse_mapping({"stream": False}, raise_error=False)
-        SendConfig(wait=None, raise_error=False, stream=False, ...)
-
-        >>> # extra keys are silently ignored
-        >>> SendConfig.parse_mapping({"stream": False, "unknown_key": 99})
-        SendConfig(wait=None, raise_error=True, stream=False, ...)
-        """
+    def parse_mapping(cls, options: Mapping[str, Any], **overrides: Any):
         if not isinstance(options, Mapping):
             raise TypeError(
-                f"SendConfig.parse_mapping expects a Mapping, got {type(options).__name__!r}"
+                f"{cls.__name__}.parse_mapping expects a Mapping, "
+                f"got {type(options).__name__!r}"
             )
-        known = {k: v for k, v in options.items() if k in _SEND_CONFIG_FIELDS}
-        known.update(overrides)
-        return cls(**known)
+        values = {k: v for k, v in options.items() if k in cls._FIELD_NAMES}
+        values.update(overrides)
+        return cls(**cls._check_mapping(values))
+
+    @staticmethod
+    def _check_mapping(values: MutableMapping[str, Any]):
+        spark_session = values.get("spark_session")
+        if spark_session is not None and isinstance(spark_session, bool):
+            if spark_session:
+                from yggdrasil.environ import PyEnv
+
+                values["spark_session"] = PyEnv.spark_session(
+                    create=True,
+                    install_spark=True,
+                    import_error=True,
+                )
+            else:
+                values["spark_session"] = None
+
+        wait = values.get("wait")
+        if wait is not None:
+            values["wait"] = WaitingConfig.check_arg(wait)
+
+        remote_cache = values.get("remote_cache")
+        if remote_cache is not None:
+            values["remote_cache"] = CacheConfig.check_arg(remote_cache)
+
+        local_cache = values.get("local_cache")
+        if local_cache is not None:
+            values["local_cache"] = CacheConfig.check_arg(local_cache)
+
+        return {
+            k: v
+            for k, v in values.items()
+            if v is not None
+        }
+
+    def merge(self, **overrides: Any):
+        unknown = set(overrides) - self._FIELD_NAMES
+        if unknown:
+            raise TypeError(
+                f"{type(self).__name__}.merge got unexpected field(s): {sorted(unknown)!r}"
+            )
+        return dataclasses.replace(self, **self._check_mapping(overrides))
+
+
+@dataclass(frozen=True, slots=True)
+class CacheConfig(_ConfigBase):
+    _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
+
+    path: Optional[Path] = field(default=None, hash=False, compare=False)
+    table: Optional["Table"] = field(default=None, hash=False, compare=False)
+    request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
+    response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
+    mode: SaveMode = SaveMode.APPEND
+    anonymize: Literal["remove", "redact"] = "remove"
+    received_from: Optional[dt.datetime] = None
+    received_to: Optional[dt.datetime] = None
+    received_ttl: Optional[dt.timedelta] = None
+    wait: WaitingConfig = False
+
+    @staticmethod
+    def _check_mapping(values: MutableMapping[str, Any]):
+        wait = values.get("wait")
+        if wait is not None:
+            values["wait"] = WaitingConfig.check_arg(wait)
+
+        received_ttl = values.get("received_ttl")
+        if received_ttl is not None:
+            values["received_ttl"] = any_to_timedelta(received_ttl)
+
+        received_from = values.get("received_from")
+        if received_from is not None:
+            values["received_from"] = _coerce_optional_datetime(received_from)
+
+        received_to = values.get("received_to")
+        if received_to is not None:
+            values["received_to"] = _coerce_optional_datetime(received_to)
+
+        return values
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "wait",  WaitingConfig.check_arg(self.wait))
+
+        object.__setattr__(self, "request_by", _validate_request_by(self.request_by))
+        object.__setattr__(self, "response_by", _validate_response_by(self.response_by))
+
+        object.__setattr__(self, "received_from", _coerce_optional_datetime(self.received_from))
+        object.__setattr__(self, "received_to", _coerce_optional_datetime(self.received_to))
+
+        if self.received_ttl:
+            if not self.received_to:
+                object.__setattr__(self, "received_to", dt.datetime.now(dt.timezone.utc))
+
+            if not self.received_from:
+                object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
+
+    @classmethod
+    def check_arg(
+        cls,
+        arg: "CacheConfig | Mapping[str, Any] | None",
+        **overrides: Any,
+    ) -> "CacheConfig":
+        if arg is None:
+            return cls.parse_mapping(overrides) if overrides else cls.default()
+        if isinstance(arg, cls):
+            return arg.merge(**overrides) if overrides else arg
+        if isinstance(arg, Mapping):
+            return cls.parse_mapping(arg, **overrides)
+
+        if isinstance(arg, Path):
+            overrides["path"] = arg
+
+        elif hasattr(arg, "create") and callable(getattr(arg, "create")):
+            overrides["table"] = arg
+
+        elif isinstance(arg, dt.datetime):
+            overrides["received_from"] = arg
+        elif isinstance(arg, dt.date):
+            overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
+
+        elif isinstance(arg, dt.timedelta):
+            overrides["received_ttl"] = arg
+
+            # fill received_from and received_to if not exists
+            received_to = overrides.get("received_to")
+            received_to = dt.datetime.now(dt.timezone.utc) if received_to is None else any_to_datetime(received_to)
+            overrides["received_to"] = received_to
+
+            received_from = overrides.get("received_from")
+            if not received_from:
+                overrides["received_from"] = received_to - arg
+
+        return cls.parse_mapping(overrides) if overrides else cls.default()
+
+    @property
+    def local_cache_enabled(self):
+        return self.received_from is not None or self.received_to is not None
+
+    @property
+    def remote_cache_enabled(self):
+        return self.table is not None
+
+    @property
+    def by(self) -> list[str]:
+        return [
+            *(self.request_by or ()),
+            *(self.response_by or ()),
+        ]
+
+    @property
+    def defined_received_from(self) -> dt.datetime:
+        if self.received_from:
+            return self.received_from.timestamp()
+
+        return dt.datetime.fromtimestamp(
+            0,
+            tz=dt.timezone.utc,
+        )
+
+    @property
+    def defined_received_to(self) -> dt.datetime:
+        if self.received_to:
+            return self.received_to.timestamp()
+
+        return dt.datetime.fromtimestamp(
+            time.time() + 3600,
+            tz=dt.timezone.utc,
+        )
+
+    @staticmethod
+    def sql_literal(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, dt.datetime):
+            return f"timestamp '{value.isoformat(sep=' ', timespec='microseconds')}'"
+        if isinstance(value, bytes):
+            import base64
+            value = base64.b64encode(value).decode("ascii")
+        else:
+            value = str(value)
+        return f"'{value.replace(chr(39), chr(39) * 2)}'"
+
+    def local_cache_folder(self) -> Path:
+        if self.path is None:
+            object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "io" / "session")
+        return self.path
+
+    def local_cache_file(
+        self,
+        request: PreparedRequest,
+        *,
+        suffix: str | None = None,
+        force: bool = False
+    ) -> Path | None:
+        if not force and not self.local_cache_enabled:
+            return None
+
+        cache_folder = self.local_cache_folder() / "cache"
+        url = request.url
+
+        if url.host:
+            cache_folder = cache_folder / url.host
+
+        if url.path:
+            path_parts = [part for part in url.path.split("/") if part]
+            if path_parts:
+                cache_folder = cache_folder.joinpath(*path_parts)
+
+        path = cache_folder / f"{request.xxh3_b64(url_safe=True)}{suffix or '.bin'}"
+
+        if force:
+            return path
+
+        if not path.exists():
+            return None
+
+        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+
+        if self.received_from is not None and mtime < self.received_from:
+            path.unlink(missing_ok=True)
+            return None
+
+        if self.received_to is not None and mtime > self.received_to:
+            return None
+
+        return path
+
+    def request_values(
+        self,
+        request: PreparedRequest,
+    ) -> dict[str, Any]:
+        return {key: request.match_value(key) for key in (self.request_by or [])}
+
+    def response_values(
+        self,
+        response: "Response",
+    ) -> dict[str, Any]:
+        return {key: response.match_value(key) for key in (self.response_by or [])}
+
+    def filter_request(
+        self,
+        request: PreparedRequest,
+    ) -> bool:
+        for key in self.request_by or []:
+            request.match_value(key)
+        return True
+
+    def filter_response(
+        self,
+        response: "Response",
+        request: PreparedRequest | None = None,
+    ) -> bool:
+        if request is not None:
+            for key, expected in self.request_values(request).items():
+                actual = response.match_value(key)
+                if actual != expected:
+                    return False
+
+        for key in self.response_by or []:
+            response.match_value(key)
+
+        if self.received_from is not None:
+            if response.received_at < self.received_from:
+                return False
+
+        if self.received_to is not None:
+            if response.received_at >= self.received_to:
+                return False
+
+        return True
+
+    def request_tuple(
+        self,
+        request: PreparedRequest,
+    ) -> tuple[Any, ...]:
+        values = self.request_values(request)
+        return tuple(values[key] for key in (self.request_by or []))
+
+    def response_tuple(
+        self,
+        response: "Response",
+    ) -> tuple[Any, ...]:
+        values = self.response_values(response)
+        return tuple(values[key] for key in (self.response_by or []))
+
+    def identity_tuple(
+        self,
+        response: "Response",
+        request: PreparedRequest | None = None,
+    ) -> tuple[Any, ...]:
+        out: list[Any] = []
+        if request is not None:
+            out.extend(self.request_tuple(request))
+        out.extend(self.response_tuple(response))
+        return tuple(out)
+
+    def sql_request_clause(
+        self,
+        request: PreparedRequest | None,
+    ) -> str:
+        clauses: list[str] = []
+
+        if request is not None:
+            for key, value in self.request_values(request).items():
+                if value is None:
+                    clauses.append(f"{key} IS NULL")
+                else:
+                    clauses.append(f"{key} = {self.sql_literal(value)}")
+
+        return " AND ".join(clauses) if clauses else "1=1"
+
+    def sql_response_clause(
+        self,
+        response: "Response | None" = None,
+    ) -> str:
+        clauses: list[str] = []
+
+        if response is not None:
+            for key, value in self.response_values(response).items():
+                if value is None:
+                    clauses.append(f"{key} IS NULL")
+                else:
+                    clauses.append(f"{key} = {self.sql_literal(value)}")
+
+        if self.received_from is not None:
+            clauses.append(f"response_received_at >= {self.sql_literal(self.received_from)}")
+
+        if self.received_to is not None:
+            clauses.append(f"response_received_at < {self.sql_literal(self.received_to)}")
+
+        return " AND ".join(clauses) if clauses else "1=1"
+
+    def sql_clause(
+        self,
+        request: PreparedRequest | None = None,
+        response: "Response | None" = None,
+    ) -> str:
+        clauses: list[str] = []
+
+        request_clause = self.sql_request_clause(request)
+        if request_clause != "1=1":
+            clauses.append(f"({request_clause})")
+
+        response_clause = self.sql_response_clause(response)
+        if response_clause != "1=1":
+            clauses.append(f"({response_clause})")
+
+        return " AND ".join(clauses) if clauses else "1=1"
+
+    def make_lookup_sql(
+        self,
+        table_name: str,
+        request: PreparedRequest | None = None,
+        response: "Response | None" = None,
+        *,
+        identity_by: Optional[Iterable[str]] = None,
+    ) -> str:
+        where_clause = self.sql_clause(request=request, response=response)
+        base_query = f"SELECT * FROM {table_name}"
+        if where_clause != "1=1":
+            base_query += f" WHERE {where_clause}"
+
+        identity_cols = list(identity_by) if identity_by is not None else self.by
+        if identity_cols:
+            partition_by = ", ".join(identity_cols)
+            return (
+                "SELECT * FROM ("
+                "  SELECT t.*, row_number() OVER ("
+                f"    PARTITION BY {partition_by} "
+                "    ORDER BY response_received_at_epoch DESC"
+                "  ) AS __rn "
+                f"  FROM ({base_query}) t"
+                ") ranked WHERE __rn = 1"
+            )
+
+        return base_query
+
+    def make_batch_lookup_sql(
+        self,
+        table_name: str,
+        requests: Iterable[PreparedRequest],
+        *,
+        identity_by: Optional[Iterable[str]] = None,
+    ) -> str:
+        request_clauses = " OR ".join(
+            f"({self.sql_request_clause(req)})"
+            for req in requests
+        )
+        response_clause = self.sql_response_clause(None)
+
+        where_parts: list[str] = []
+        if request_clauses:
+            where_parts.append(f"({request_clauses})")
+        if response_clause != "1=1":
+            where_parts.append(f"({response_clause})")
+
+        base_query = f"SELECT * FROM {table_name}"
+        if where_parts:
+            base_query += " WHERE " + " AND ".join(where_parts)
+
+        identity_cols = list(identity_by) if identity_by is not None else self.by
+        if identity_cols:
+            partition_by = ", ".join(identity_cols)
+            return (
+                "SELECT * FROM ("
+                "  SELECT t.*, row_number() OVER ("
+                f"    PARTITION BY {partition_by} "
+                "    ORDER BY response_received_at_epoch DESC"
+                "  ) AS __rn "
+                f"  FROM ({base_query}) t"
+                ") ranked WHERE __rn = 1"
+            )
+
+        return base_query
+
+
+DEFAULT_CACHE_CONFIG = CacheConfig()
+
+
+@dataclass(frozen=True, slots=True)
+class SendConfig(_ConfigBase):
+    _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_CONFIG_FIELDS
+
+    raise_error: bool = True
+    stream: bool = True
+    wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
+    remote_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
+    local_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
+    spark_session: Optional["SparkSession"] = field(
+        default=None,
+        hash=False,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self):
+        object.__setattr__(self, "wait", WaitingConfig.check_arg(self.wait))
+        object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
+        object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
 
     @classmethod
     def check_arg(
@@ -209,231 +566,43 @@ class SendConfig:
         arg: "SendConfig | Mapping[str, Any] | None",
         **overrides: Any,
     ) -> "SendConfig":
-        """Coerce *arg* into a :class:`SendConfig`.
-
-        Accepted forms:
-
-        * ``None`` – returns :meth:`default` (optionally with *overrides*).
-        * :class:`SendConfig` instance – returned as-is when no *overrides*
-          are given; otherwise merged with the overrides.
-        * ``Mapping`` – forwarded to :meth:`parse_mapping`.
-
-        Parameters
-        ----------
-        arg:
-            Value to coerce.
-        **overrides:
-            Field overrides applied after coercion.  Allows callers to pin
-            individual fields regardless of the input type.
-
-        Returns
-        -------
-        SendConfig
-
-        Raises
-        ------
-        TypeError
-            If *arg* is not one of the accepted types.
-
-        Examples
-        --------
-        >>> SendConfig.check_arg(None)
-        SendConfig(wait=None, raise_error=True, stream=True, ...)
-
-        >>> SendConfig.check_arg({"stream": False})
-        SendConfig(wait=None, raise_error=True, stream=False, ...)
-
-        >>> cfg = SendConfig(stream=False)
-        >>> SendConfig.check_arg(cfg)
-        SendConfig(wait=None, raise_error=True, stream=False, ...)
-
-        >>> SendConfig.check_arg(cfg, raise_error=False)
-        SendConfig(wait=None, raise_error=False, stream=False, ...)
-        """
         if arg is None:
-            return cls(**overrides) if overrides else cls.default()
+            return cls.parse_mapping(overrides) if overrides else cls.default()
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
         raise TypeError(
-            f"SendConfig.check_arg expects a SendConfig, Mapping, or None; "
+            f"{cls.__name__}.check_arg expects a {cls.__name__}, Mapping, or None; "
             f"got {type(arg).__name__!r}"
         )
 
-    # ------------------------------------------------------------------
-    # Instance helpers
-    # ------------------------------------------------------------------
-
-    def merge(self, **overrides: Any) -> "SendConfig":
-        """Return a new :class:`SendConfig` with *overrides* applied.
-
-        All fields not listed in *overrides* retain their current values.
-        Because :class:`SendConfig` is frozen, this always creates a new
-        instance.
-
-        Parameters
-        ----------
-        **overrides:
-            Fields to replace.  Unknown field names raise :exc:`TypeError`.
-
-        Returns
-        -------
-        SendConfig
-
-        Raises
-        ------
-        TypeError
-            If any key in *overrides* is not a recognised field name.
-
-        Examples
-        --------
-        >>> cfg = SendConfig(stream=True, raise_error=True)
-        >>> cfg.merge(stream=False)
-        SendConfig(wait=None, raise_error=True, stream=False, ...)
-        """
-        unknown = set(overrides) - _SEND_CONFIG_FIELDS
-        if unknown:
-            raise TypeError(
-                f"SendConfig.merge got unexpected field(s): {sorted(unknown)!r}"
-            )
-        return dataclasses.replace(self, **overrides)
-
-
-# ---------------------------------------------------------------------------
-# SendManyConfig
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
-class SendManyConfig:
-    """Configuration for concurrent batched HTTP requests.
+class SendManyConfig(_ConfigBase):
+    _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_MANY_CONFIG_FIELDS
 
-    Pass an instance as ``config=`` to
-    :meth:`~yggdrasil.io.session.Session.send_many`.  Individual keyword
-    arguments on the call site override the corresponding field.
-
-    All :class:`SendConfig` fields are duplicated here (rather than
-    inheriting) to preserve ``frozen=True`` and ``slots=True`` semantics,
-    and to allow independent defaults for the many-request path.
-
-    Parameters
-    ----------
-    wait:
-        See :attr:`SendConfig.wait`.
-    raise_error:
-        See :attr:`SendConfig.raise_error`.
-    stream:
-        See :attr:`SendConfig.stream`.
-    cache:
-        See :attr:`SendConfig.cache`.
-    cache_by:
-        See :attr:`SendConfig.cache_by`.
-    cache_anonymize:
-        Controls how sensitive fields are stripped before the cache lookup
-        and before writing new entries.  Uses the same
-        ``"remove"`` / ``"redact"`` semantics as :attr:`SendConfig.anonymize`.
-    received_from:
-        See :attr:`SendConfig.received_from`.
-    received_to:
-        See :attr:`SendConfig.received_to`.
-    wait_cache:
-        See :attr:`SendConfig.wait_cache`.
-    normalize:
-        When ``True`` URLs are normalised before the request is dispatched.
-        ``None`` (default) normalises automatically when ``cache`` is set.
-    batch_size:
-        Number of requests per cache-lookup batch.  ``None`` defaults to
-        ``pool_maxsize × 100``.  Has no effect when ``cache`` is ``None``.
-    ordered:
-        When ``True`` responses are yielded in the same order as the input
-        requests.  ``False`` (default) yields in completion order for higher
-        throughput.
-    max_in_flight:
-        Maximum number of concurrent in-flight requests in the thread pool.
-        ``None`` uses the pool's natural concurrency limit.
-    """
-
-    # --- shared with SendConfig ---
     wait: WaitingConfigArg = None
     raise_error: bool = True
     stream: bool = True
-    cache: Optional["Table"] = field(default=None, hash=False, compare=False)
-    cache_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    cache_anonymize: Literal["remove", "redact"] = "remove"
-    received_from: Optional[dt.datetime | dt.date | str] = None
-    received_to: Optional[dt.datetime | dt.date | str] = None
-    wait_cache: WaitingConfigArg = False
+    remote_cache: CacheConfig = field(default_factory=CacheConfig)
+    local_cache: CacheConfig = field(default_factory=CacheConfig)
+    spark_session: Optional["SparkSession"] = field(
+        default=None,
+        hash=False,
+        compare=False,
+        repr=False,
+    )
 
-    # --- send_many-specific ---
     normalize: Optional[bool] = None
     batch_size: Optional[int] = None
     ordered: bool = False
     max_in_flight: Optional[int] = None
 
-    # ------------------------------------------------------------------
-    # Factory classmethods
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def default(cls) -> "SendManyConfig":
-        """Return a :class:`SendManyConfig` with all fields at their defaults.
-
-        Examples
-        --------
-        >>> SendManyConfig.default()
-        SendManyConfig(wait=None, raise_error=True, stream=True, ...)
-        """
-        return cls()
-
-    @classmethod
-    def parse_mapping(
-        cls,
-        options: Mapping[str, Any],
-        **overrides: Any,
-    ) -> "SendManyConfig":
-        """Build a :class:`SendManyConfig` from a mapping.
-
-        Unknown keys are silently dropped.  *overrides* are applied on top
-        after the mapping is parsed.
-
-        Parameters
-        ----------
-        options:
-            Any ``Mapping[str, Any]``.  Recognised keys match the field names
-            of :class:`SendManyConfig` (a superset of :class:`SendConfig`
-            fields); all other keys are ignored.
-        **overrides:
-            Keyword arguments that take precedence over values in *options*.
-
-        Returns
-        -------
-        SendManyConfig
-
-        Raises
-        ------
-        TypeError
-            If *options* is not a ``Mapping``.
-
-        Examples
-        --------
-        >>> SendManyConfig.parse_mapping({"batch_size": 50, "ordered": True})
-        SendManyConfig(..., batch_size=50, ordered=True, ...)
-
-        >>> SendManyConfig.parse_mapping({"stream": False}, batch_size=100)
-        SendManyConfig(..., stream=False, batch_size=100, ...)
-
-        >>> # SendConfig fields are also accepted
-        >>> SendManyConfig.parse_mapping({"raise_error": False, "stream": False})
-        SendManyConfig(..., raise_error=False, stream=False, ...)
-        """
-        if not isinstance(options, Mapping):
-            raise TypeError(
-                f"SendManyConfig.parse_mapping expects a Mapping, "
-                f"got {type(options).__name__!r}"
-            )
-        known = {k: v for k, v in options.items() if k in _SEND_MANY_CONFIG_FIELDS}
-        known.update(overrides)
-        return cls(**known)
+    def __post_init__(self):
+        object.__setattr__(self, "wait", WaitingConfig.check_arg(self.wait))
+        object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
+        object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
 
     @classmethod
     def check_arg(
@@ -441,298 +610,38 @@ class SendManyConfig:
         arg: "SendManyConfig | SendConfig | Mapping[str, Any] | None",
         **overrides: Any,
     ) -> "SendManyConfig":
-        """Coerce *arg* into a :class:`SendManyConfig`.
-
-        Accepted forms:
-
-        * ``None`` – returns :meth:`default` (optionally with *overrides*).
-        * :class:`SendManyConfig` instance – returned as-is (or merged with
-          *overrides*).
-        * :class:`SendConfig` instance – promoted to a :class:`SendManyConfig`
-          using the shared fields; send-many–specific fields take their
-          defaults (or are set via *overrides*).
-        * ``Mapping`` – forwarded to :meth:`parse_mapping`.
-
-        Parameters
-        ----------
-        arg:
-            Value to coerce.
-        **overrides:
-            Field overrides applied after coercion.
-
-        Returns
-        -------
-        SendManyConfig
-
-        Raises
-        ------
-        TypeError
-            If *arg* is not one of the accepted types.
-
-        Examples
-        --------
-        >>> SendManyConfig.check_arg(None)
-        SendManyConfig(wait=None, raise_error=True, ...)
-
-        >>> SendManyConfig.check_arg({"batch_size": 20, "ordered": True})
-        SendManyConfig(..., batch_size=20, ordered=True, ...)
-
-        >>> base = SendConfig(stream=False, raise_error=False)
-        >>> SendManyConfig.check_arg(base, batch_size=50)
-        SendManyConfig(..., stream=False, raise_error=False, batch_size=50, ...)
-        """
         if arg is None:
             return cls(**overrides) if overrides else cls.default()
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
         if isinstance(arg, SendConfig):
-            # Promote a SendConfig to SendManyConfig, mapping the shared fields.
             return cls(
                 wait=arg.wait,
                 raise_error=arg.raise_error,
                 stream=arg.stream,
-                cache=arg.cache,
-                cache_by=arg.cache_by,
-                cache_anonymize=arg.anonymize,
-                received_from=arg.received_from,
-                received_to=arg.received_to,
-                wait_cache=arg.wait_cache,
+                remote_cache=arg.remote_cache,
+                local_cache=arg.local_cache,
+                spark_session=arg.spark_session,
                 **overrides,
             )
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
         raise TypeError(
-            f"SendManyConfig.check_arg expects a SendManyConfig, SendConfig, "
+            f"{cls.__name__}.check_arg expects a {cls.__name__}, SendConfig, "
             f"Mapping, or None; got {type(arg).__name__!r}"
         )
 
-    # ------------------------------------------------------------------
-    # Instance helpers
-    # ------------------------------------------------------------------
-
-    def merge(self, **overrides: Any) -> "SendManyConfig":
-        """Return a new :class:`SendManyConfig` with *overrides* applied.
-
-        All fields not listed in *overrides* retain their current values.
-
-        Parameters
-        ----------
-        **overrides:
-            Fields to replace.  Unknown field names raise :exc:`TypeError`.
-
-        Returns
-        -------
-        SendManyConfig
-
-        Raises
-        ------
-        TypeError
-            If any key in *overrides* is not a recognised field name.
-
-        Examples
-        --------
-        >>> cfg = SendManyConfig(batch_size=50)
-        >>> cfg.merge(batch_size=100, ordered=True)
-        SendManyConfig(..., batch_size=100, ordered=True, ...)
-        """
-        unknown = set(overrides) - _SEND_MANY_CONFIG_FIELDS
-        if unknown:
-            raise TypeError(
-                f"SendManyConfig.merge got unexpected field(s): {sorted(unknown)!r}"
-            )
-        return dataclasses.replace(self, **overrides)
-
-    def to_send_config(self) -> SendConfig:
-        """Return a :class:`SendConfig` built from the shared fields.
-
-        Useful when delegating from :meth:`send_many` to :meth:`send` for
-        each cache miss.  The ``cache`` field is intentionally set to ``None``
-        because individual miss dispatches never write to the cache directly.
-
-        Returns
-        -------
-        SendConfig
-
-        Examples
-        --------
-        >>> many = SendManyConfig(stream=False, raise_error=False, batch_size=10)
-        >>> many.to_send_config()
-        SendConfig(wait=None, raise_error=False, stream=False, ...)
-        """
+    def to_send_config(
+        self,
+        with_remote_cache: bool = True,
+        with_local_cache: bool = True,
+        with_spark: bool = False,
+    ) -> SendConfig:
         return SendConfig(
             wait=self.wait,
             raise_error=self.raise_error,
             stream=self.stream,
-            cache=None,
-            cache_by=self.cache_by,
-            anonymize=self.cache_anonymize,
-            received_from=self.received_from,
-            received_to=self.received_to,
-            wait_cache=self.wait_cache,
+            remote_cache=self.remote_cache if with_remote_cache else CacheConfig(),
+            local_cache=self.local_cache if with_local_cache else CacheConfig(),
+            spark_session=self.spark_session if with_spark else None,
         )
-
-
-
-# ---------------------------------------------------------------------------
-# SendConfig
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class SendConfig:
-    """Configuration for a single HTTP request.
-
-    Pass an instance as ``config=`` to
-    :meth:`~yggdrasil.io.session.Session.send` or any of the convenience
-    HTTP methods (``get``, ``post``, …).  Individual keyword arguments on the
-    call site override the corresponding field.
-
-    Parameters
-    ----------
-    wait:
-        Waiting / retry configuration forwarded to the transport layer.
-        Accepts anything that :class:`~yggdrasil.dataclasses.waiting.WaitingConfig`
-        understands: a :class:`WaitingConfig` instance, a dict, a timeout in
-        seconds (``int`` or ``float``), a deadline :class:`datetime.datetime`,
-        or ``True`` / ``False``.  ``None`` defers to the session default.
-    raise_error:
-        When ``True`` (default) a non-2xx response raises immediately.
-        Set to ``False`` to inspect error responses manually.
-    stream:
-        When ``True`` (default) the response body is streamed lazily.
-        Set to ``False`` to buffer the entire body before returning.
-    cache:
-        Optional Databricks Delta table used to cache responses.  When
-        provided the session checks the table before hitting the network and
-        writes new responses back on success.
-    cache_by:
-        List of response-schema column names that form the cache key.
-        Defaults to ``["request_method", "request_url_host",
-        "request_url_path", "request_url_query",
-        "request_content_length", "request_body_hash"]`` when ``cache``
-        is set.  Must be a subset of
-        :data:`~yggdrasil.io.response.RESPONSE_ARROW_SCHEMA` field names.
-    anonymize:
-        Controls how sensitive fields are removed before caching or
-        comparing cached entries.
-
-        * ``"remove"`` – strip values completely (default).
-        * ``"redact"`` – replace values with a fixed placeholder.
-    received_from:
-        Earliest ``response_received_at`` timestamp to accept from cache.
-        Any timezone-aware datetime, date, or ISO-8601 string is accepted.
-    received_to:
-        Latest ``response_received_at`` timestamp to accept from cache.
-    wait_cache:
-        Waiting config for the asynchronous cache-write operation.
-        ``False`` (default) means fire-and-forget.
-    """
-
-    wait: WaitingConfigArg = None
-    raise_error: bool = True
-    stream: bool = True
-    cache: Optional["Table"] = field(default=None, hash=False, compare=False)
-    cache_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    anonymize: Literal["remove", "redact"] = "remove"
-    received_from: Optional[dt.datetime | dt.date | str] = None
-    received_to: Optional[dt.datetime | dt.date | str] = None
-    wait_cache: WaitingConfigArg = False
-
-    @classmethod
-    def default(cls) -> "SendConfig":
-        """Return the default :class:`SendConfig` (all fields at their defaults)."""
-        return cls()
-
-
-# ---------------------------------------------------------------------------
-# SendManyConfig
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class SendManyConfig:
-    """Configuration for concurrent batched HTTP requests.
-
-    Pass an instance as ``config=`` to
-    :meth:`~yggdrasil.io.session.Session.send_many`.  Individual keyword
-    arguments on the call site override the corresponding field.
-
-    All :class:`SendConfig` fields are duplicated here (rather than
-    inheriting) to preserve ``frozen=True`` and ``slots=True`` semantics,
-    and to allow independent defaults for the many-request path.
-
-    Parameters
-    ----------
-    wait:
-        See :attr:`SendConfig.wait`.
-    raise_error:
-        See :attr:`SendConfig.raise_error`.
-    stream:
-        See :attr:`SendConfig.stream`.
-    cache:
-        See :attr:`SendConfig.cache`.
-    cache_by:
-        See :attr:`SendConfig.cache_by`.
-    cache_anonymize:
-        Controls how sensitive fields are stripped before the cache lookup
-        and before writing new entries.  Uses the same
-        ``"remove"`` / ``"redact"`` semantics as :attr:`SendConfig.anonymize`.
-    received_from:
-        See :attr:`SendConfig.received_from`.
-    received_to:
-        See :attr:`SendConfig.received_to`.
-    wait_cache:
-        See :attr:`SendConfig.wait_cache`.
-    normalize:
-        When ``True`` URLs are normalised before the request is dispatched.
-        ``None`` (default) normalises automatically when ``cache`` is set.
-    batch_size:
-        Number of requests per cache-lookup batch.  ``None`` defaults to
-        ``pool_maxsize × 100``.  Has no effect when ``cache`` is ``None``.
-    ordered:
-        When ``True`` responses are yielded in the same order as the input
-        requests.  ``False`` (default) yields in completion order for higher
-        throughput.
-    max_in_flight:
-        Maximum number of concurrent in-flight requests in the thread pool.
-        ``None`` uses the pool's natural concurrency limit.
-    """
-
-    # --- shared with SendConfig ---
-    wait: WaitingConfigArg = None
-    raise_error: bool = True
-    stream: bool = True
-    cache: Optional["Table"] = field(default=None, hash=False, compare=False)
-    cache_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    cache_anonymize: Literal["remove", "redact"] = "remove"
-    received_from: Optional[dt.datetime | dt.date | str] = None
-    received_to: Optional[dt.datetime | dt.date | str] = None
-    wait_cache: WaitingConfigArg = False
-
-    # --- send_many-specific ---
-    normalize: Optional[bool] = None
-    batch_size: Optional[int] = None
-    ordered: bool = False
-    max_in_flight: Optional[int] = None
-
-    @classmethod
-    def default(cls) -> "SendManyConfig":
-        """Return the default :class:`SendManyConfig` (all fields at their defaults)."""
-        return cls()
-
-    def to_send_config(self) -> SendConfig:
-        """Return a :class:`SendConfig` built from the shared fields.
-
-        Useful when delegating from :meth:`send_many` to :meth:`send` for
-        each cache miss.
-        """
-        return SendConfig(
-            wait=self.wait,
-            raise_error=self.raise_error,
-            stream=self.stream,
-            cache=None,  # individual sends never write to cache directly
-            cache_by=self.cache_by,
-            anonymize=self.cache_anonymize,
-            received_from=self.received_from,
-            received_to=self.received_to,
-            wait_cache=self.wait_cache,
-        )
-

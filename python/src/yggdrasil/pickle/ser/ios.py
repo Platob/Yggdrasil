@@ -23,6 +23,7 @@ _M_KIND = b"k"   # io family discriminator
 _M_ENC = b"e"    # text encoding
 _M_ERR = b"r"    # text errors
 _M_NL = b"nl"    # newline / observed newline state
+_M_MT = b"mt"    # media type (mime[+codec])
 
 # compact metadata values
 _K_BIN = b"b"    # binary stream
@@ -193,6 +194,48 @@ def _metadata_text(
     return raw.decode("utf-8", errors="replace")
 
 
+def _encode_media_type(obj: io.IOBase) -> bytes | None:
+    """Return compact ``b"MIME_NAME"`` or ``b"MIME_NAME+codec"`` for the media type, or *None*."""
+    mt = getattr(obj, "_media_type", None)
+    if mt is None:
+        return None
+    wire = mt.mime_type.name.encode("utf-8")
+    if mt.codec is not None:
+        wire = wire + b"+" + mt.codec.name.encode("utf-8")
+    return wire
+
+
+def _restore_media_type(buf: BytesIO, metadata: Mapping[bytes, bytes] | None) -> None:
+    """Set ``_media_type`` on *buf* from serialized metadata, if present."""
+    if not metadata:
+        return
+    raw = metadata.get(_M_MT)
+    if raw is None:
+        return
+    from yggdrasil.io.enums.codec import Codec
+    from yggdrasil.io.enums.media_type import MediaType
+    from yggdrasil.io.enums.mime_type import MimeType
+
+    text = raw.decode("utf-8")
+    if "+" in text:
+        mime_name, codec_name = text.split("+", 1)
+    else:
+        mime_name = text
+        codec_name = None
+
+    mt = MimeType._BY_NAME.get(mime_name.lower())
+    if mt is None:
+        return
+
+    c = None
+    if codec_name:
+        c = Codec.parse(codec_name)
+        if c is None:
+            return
+
+    buf._media_type = MediaType(mime_type=mt, codec=c)
+
+
 # ============================================================================
 # base serializer
 # ============================================================================
@@ -220,7 +263,9 @@ class IOSerialized(Serialized[object]):
             text = _decode_text_payload(self.decode(), encoding=encoding, errors=errors)
             return io.StringIO(text)
 
-        return BytesIO(self.decode())
+        buf = BytesIO(self.decode())
+        _restore_media_type(buf, self.metadata)
+        return buf
 
     def as_python(self) -> object:
         return self.value
@@ -265,7 +310,9 @@ class BinaryIOSerialized(IOSerialized):
 
     @property
     def value(self) -> BytesIO:
-        return BytesIO(self.decode())
+        buf = BytesIO(self.decode())
+        _restore_media_type(buf, self.metadata)
+        return buf
 
     def as_python(self) -> BytesIO:
         return self.value
@@ -279,7 +326,11 @@ class BinaryIOSerialized(IOSerialized):
         codec: int | None = None,
     ) -> Serialized[object]:
         payload = _read_binary_io_data(obj)
-        merged = _merge_metadata(metadata, _binary_io_metadata(obj))
+        extra = _binary_io_metadata(obj)
+        mt_wire = _encode_media_type(obj)
+        if mt_wire is not None:
+            extra[_M_MT] = mt_wire
+        merged = _merge_metadata(metadata, extra)
         return cls.build(
             tag=cls.TAG,
             data=payload,

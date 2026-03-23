@@ -29,12 +29,12 @@ from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import SaveMode, FileFormat
-
 from .statement_result import StatementResult
 from .table import Table
 from .types import quote_ident
@@ -251,6 +251,7 @@ class SQLEngine(DatabricksService):
         warehouse_name: Optional[str] = None,
         byte_limit: Optional[int] = None,
         cache_for: WaitingConfigArg = None,
+        spark_session: Optional["SparkSession"] = None
     ) -> StatementResult:
         """
         Execute a SQL statement using either Spark SQL or the Databricks SQL Statement Execution API.
@@ -299,12 +300,15 @@ class SQLEngine(DatabricksService):
         if not engine:
             spark_session = PyEnv.spark_session(
                 create=False, import_error=False, install_spark=False
-            )
+            ) if spark_session is None else spark_session
 
             if spark_session is not None:
                 engine = "spark"
             else:
                 engine = "api"
+
+        if spark_session is not None:
+            engine = "spark"
 
         statement = statement.strip()
 
@@ -318,11 +322,11 @@ class SQLEngine(DatabricksService):
 
         # --- Spark path ---
         if engine == "spark":
-            spark_session = PyEnv.spark_session(create=False, install_spark=True)
-            if spark_session is None:
-                raise ValueError("No spark session found to run sql query")
-
-            logger.debug("SPARK SQL executing query:\n%s", statement)
+            spark_session = PyEnv.spark_session(
+                create=True,
+                install_spark=True,
+                import_error=True
+            ) if spark_session is None else spark_session
 
             df = spark_session.sql(statement)
             if row_limit:
@@ -468,15 +472,14 @@ class SQLEngine(DatabricksService):
             None.
         """
         if spark_session is None:
-            try:
-                import pyspark.sql as psql
-
-                if isinstance(data, psql.DataFrame):
-                    spark_session = data.sparkSession
-                else:
-                    spark_session = psql.SparkSession.getActiveSession()
-            except ImportError:
-                pass
+            if hasattr(data, "sparkSession"):
+                spark_session = data.sparkSession
+            else:
+                spark_session = PyEnv.spark_session(
+                    create=False,
+                    import_error=False,
+                    install_spark=False
+                )
 
         if spark_session is not None:
             return self.spark_insert_into(

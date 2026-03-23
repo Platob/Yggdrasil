@@ -353,7 +353,7 @@ class SystemCommand:
 
     def wait(
         self,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         auto_install: bool = False,
     ) -> "SystemCommand":
@@ -413,7 +413,7 @@ class SystemCommand:
 
     def retry(
         self,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         auto_install: bool = False,
     ) -> "SystemCommand":
@@ -437,7 +437,7 @@ class SystemCommand:
 
     def _maybe_auto_install_missing_module(
         self,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
     ) -> bool:
         """
         Attempt a one-shot recovery for ``ModuleNotFoundError``.
@@ -473,7 +473,7 @@ class SystemCommand:
 
     def exception(
         self,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         auto_install: bool = True,
     ) -> Optional["SystemCommandError"]:
         """
@@ -493,7 +493,7 @@ class SystemCommand:
     def raise_for_status(
         self,
         *,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         auto_install: bool = True,
     ) -> "SystemCommand":

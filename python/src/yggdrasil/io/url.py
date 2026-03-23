@@ -201,6 +201,10 @@ class URL:
     def empty(cls) -> "URL":
         return _EMPTY_URL
 
+    @staticmethod
+    def path_encode(path: str) -> str:
+        return _encode_path(path)
+
     @classmethod
     def parse(
         cls,

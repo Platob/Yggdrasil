@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -23,7 +24,7 @@ class HTTPResponse(Response):
         request: "PreparedRequest",
         response: BaseHTTPResponse,
         tags: Optional[Mapping[str, str]],
-        received_at_timestamp: int
+        received_at: dt.datetime
     ) -> "HTTPResponse":
         response = cls(
             request=request,
@@ -31,7 +32,7 @@ class HTTPResponse(Response):
             headers=dict(response.headers),
             buffer=BytesIO(),
             tags=tags,
-            received_at_timestamp=received_at_timestamp
+            received_at=received_at
         )
 
         if request.prepare_response is not None:

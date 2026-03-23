@@ -1,8 +1,9 @@
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
-__all__ = ["SaveMode", "STR_MAPPING"]
+__all__ = ["SaveMode", "SaveModeArg", "STR_MAPPING"]
 
+SaveModeArg = Union["SaveMode", str]
 
 class SaveMode(str, Enum):
     AUTO = "auto"
@@ -14,7 +15,7 @@ class SaveMode(str, Enum):
     ERROR_IF_EXISTS = "error_if_exists"
 
     @classmethod
-    def parse(cls, value: object, default: Optional["SaveMode"] = None) -> "SaveMode":
+    def parse(cls, value: SaveModeArg, default: Optional["SaveMode"] = None) -> "SaveMode":
         """
         Normalize user input into a SaveMode.
 

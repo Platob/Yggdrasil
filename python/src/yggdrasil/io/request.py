@@ -1,17 +1,20 @@
 # yggdrasil.io.request
 from __future__ import annotations
 
+import base64
+import datetime as dt
 import json as json_module
 from dataclasses import MISSING, dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
-from .headers import PromotedHeaders, normalize_headers, DEFAULT_HOSTNAME
+from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
 from .url import URL
+from ..data import any_to_datetime
 
 if TYPE_CHECKING:
     from .response import Response
@@ -41,7 +44,6 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         pa.field("request_url_path", pa.string(), nullable=True, metadata={"comment": "Path component of the URL"}),
         pa.field("request_url_query", pa.string(), nullable=True, metadata={"comment": "Raw query string (without leading '?')"}),
         pa.field("request_url_fragment", pa.string(), nullable=True, metadata={"comment": "Fragment identifier (without leading '#')"}),
-
         pa.field("request_host", pa.string(), nullable=True, metadata={"comment": "Host header"}),
         pa.field("request_user_agent", pa.string(), nullable=True, metadata={"comment": "User-Agent header"}),
         pa.field("request_accept", pa.string(), nullable=True, metadata={"comment": "Accept header"}),
@@ -51,7 +53,6 @@ REQUEST_ARROW_SCHEMA = pa.schema(
         pa.field("request_content_length", pa.int64(), nullable=False, metadata={"comment": "Content-Length header parsed as integer when possible"}),
         pa.field("request_content_encoding", pa.string(), nullable=True, metadata={"comment": "Content-Encoding header"}),
         pa.field("request_transfer_encoding", pa.string(), nullable=True, metadata={"comment": "Transfer-Encoding header"}),
-
         pa.field(
             "request_headers",
             pa.map_(pa.string(), pa.string()),
@@ -78,7 +79,7 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             pa.int64(),
             nullable=True,
             metadata={
-                "comment": "Signed Int64 XXH3 digest of response_body",
+                "comment": "Signed Int64 XXH3 digest of request_body",
                 "algorithm": "xxh3_64",
             },
         ),
@@ -88,15 +89,43 @@ REQUEST_ARROW_SCHEMA = pa.schema(
             nullable=False,
             metadata={"comment": "UTC timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
         ),
-        pa.field(
-            "request_sent_at_epoch",
-            pa.int64(),
-            nullable=False,
-            metadata={"comment": "UTC epoch timestamp when request was dispatched", "unit": "us", "tz": "UTC"},
-        ),
     ],
     metadata={"comment": "Prepared request flattened into deterministic columns for logging/replay."},
 )
+
+_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_ARROW_SCHEMA.names)
+_PROMOTED_REQUEST_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
+    ("Host", "request_host"),
+    ("User-Agent", "request_user_agent"),
+    ("Accept", "request_accept"),
+    ("Accept-Encoding", "request_accept_encoding"),
+    ("Accept-Language", "request_accept_language"),
+    ("Content-Type", "request_content_type"),
+    ("Content-Length", "request_content_length"),
+    ("Content-Encoding", "request_content_encoding"),
+    ("Transfer-Encoding", "request_transfer_encoding"),
+)
+
+
+def _string_dict(arg: Optional[Mapping[Any, Any]]) -> dict[str, str]:
+    if not arg:
+        return {}
+    return {str(k): str(v) for k, v in arg.items()}
+
+
+def _map_as_str_dict(value: Any) -> dict[str, str]:
+    if not value:
+        return {}
+    if isinstance(value, Mapping):
+        return {str(k): str(v) for k, v in value.items()}
+    try:
+        return {str(k): str(v) for k, v in value if k is not None and v is not None}
+    except Exception:
+        return {}
+
+
+def _epoch_us_to_utc_datetime(value: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(value / 1_000_000, tz=dt.timezone.utc)
 
 
 @dataclass
@@ -104,9 +133,9 @@ class PreparedRequest:
     method: str
     url: URL
     headers: MutableMapping[str, str]
-    tags: Optional[MutableMapping[str, str]]
+    tags: MutableMapping[str, str]
     buffer: Optional[BytesIO]
-    sent_at_timestamp: int = field(default=0, hash=False, compare=False)
+    sent_at: dt.datetime
 
     before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = field(
         default=None,
@@ -120,6 +149,24 @@ class PreparedRequest:
         hash=False,
         compare=False,
     )
+
+    def __post_init__(self) -> None:
+        self.method = self.method or "GET"
+        self.url = URL.parse(self.url)
+        self.headers = _string_dict(self.headers)
+        self.tags = _string_dict(self.tags)
+        self.sent_at = any_to_datetime(self.sent_at) if self.sent_at else dt.datetime.fromtimestamp(
+            0, tz=dt.timezone.utc
+        )
+
+        if self.buffer is not None and not isinstance(self.buffer, BytesIO):
+            self.buffer = BytesIO.parse(self.buffer)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}<{self.method} {self.url.to_string()!r}>"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     @classmethod
     def parse(
@@ -145,20 +192,13 @@ class PreparedRequest:
         normalize: bool = True,
         prefix: str = "request_",
     ) -> "PreparedRequest":
-        method = cls._parse_method(obj, prefix=prefix)
-        url = cls._parse_url(obj, normalize=normalize, prefix=prefix)
-        headers = cls._parse_headers(obj, prefix=prefix)
-        tags = cls._parse_tags(obj, prefix=prefix)
-        buffer = cls._parse_buffer(obj, prefix=prefix)
-        sent_at_timestamp = cls._parse_sent_at_timestamp(obj, prefix=prefix)
-
         return cls(
-            method=method,
-            url=url,
-            headers=headers,
-            tags=tags,
-            buffer=buffer,
-            sent_at_timestamp=sent_at_timestamp,
+            method=cls._parse_method(obj, prefix=prefix),
+            url=cls._parse_url(obj, normalize=normalize, prefix=prefix),
+            headers=cls._parse_headers(obj, prefix=prefix),
+            tags=cls._parse_tags(obj, prefix=prefix),
+            buffer=cls._parse_buffer(obj, prefix=prefix),
+            sent_at=cls._parse_sent_at_timestamp(obj, prefix=prefix),
         )
 
     @staticmethod
@@ -223,10 +263,9 @@ class PreparedRequest:
 
     @staticmethod
     def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str, str]:
-        headers = get_from_dict(obj, keys=("headers",), prefix="request_")
-
+        headers = get_from_dict(obj, keys=("headers",), prefix=prefix)
         if isinstance(headers, Mapping):
-            parsed = {str(k): str(v) for k, v in headers.items()}
+            parsed = _string_dict(headers)
             if parsed:
                 return parsed
 
@@ -245,7 +284,7 @@ class PreparedRequest:
             "Last-Modified": get_from_dict(obj, keys=("last_modified",), prefix=prefix),
         }
 
-        out: MutableMapping[str, str] = {}
+        out: dict[str, str] = {}
         for header_name, value in dumped_headers.items():
             if value is MISSING or value in (None, ""):
                 continue
@@ -256,9 +295,7 @@ class PreparedRequest:
     @staticmethod
     def _parse_tags(obj: Mapping[str, Any], *, prefix: str) -> dict[str, str]:
         tags = get_from_dict(obj, keys=("tags", "request_tags"), prefix=prefix)
-        if not isinstance(tags, Mapping):
-            return {}
-        return {str(k): str(v) for k, v in tags.items()}
+        return _string_dict(tags if isinstance(tags, Mapping) else None)
 
     @staticmethod
     def _parse_buffer(obj: Mapping[str, Any], *, prefix: str) -> Optional[BytesIO]:
@@ -268,66 +305,19 @@ class PreparedRequest:
         return BytesIO.parse(buffer)
 
     @staticmethod
-    def _parse_sent_at_timestamp(obj: Mapping[str, Any], *, prefix: str) -> int:
+    def _parse_sent_at_timestamp(obj: Mapping[str, Any], *, prefix: str) -> dt.datetime:
         value = get_from_dict(
             obj,
             keys=(
                 "sent_at_timestamp",
-                "sent_at_timestamp_epoch",
                 "sent_at",
-                "request_sent_at_epoch",
                 "request_sent_at",
             ),
             prefix=prefix,
         )
-        if value is MISSING or value in (None, ""):
-            return 0
-        return int(value)
-
-    def copy(
-        self,
-        *,
-        method: Optional[str] = None,
-        url: URL | str | None = None,
-        headers: Optional[Mapping[str, str]] = None,
-        buffer: Optional[BytesIO] = ...,
-        tags: Optional[Mapping[str, str]] = None,
-        sent_at_timestamp: Optional[int] = None,
-        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
-        prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
-        normalize: bool = True,
-        copy_buffer: bool = False,
-    ) -> "PreparedRequest":
-        new_url = self.url if url is None else URL.parse(url, normalize=normalize)
-
-        if headers is None:
-            new_headers = dict(self.headers) if self.headers else {}
-        else:
-            new_headers = {str(k): str(v) for k, v in headers.items()}
-
-        if buffer is ...:
-            new_buffer = self.buffer
-            if copy_buffer and new_buffer is not None:
-                new_buffer = BytesIO.parse(new_buffer.to_bytes())
-        else:
-            new_buffer = buffer
-
-        new_before_send = self.before_send if before_send is ... else before_send
-        new_prepare_response = self.prepare_response if prepare_response is ... else prepare_response
-
-        built = self.__class__(
-            method=self.method if method is None else str(method),
-            url=new_url,
-            headers=new_headers,
-            buffer=new_buffer,
-            tags=self.tags if tags is None else tags,
-            sent_at_timestamp=self.sent_at_timestamp if sent_at_timestamp is None else int(sent_at_timestamp),
+        return any_to_datetime(value) if value not in (None, "", MISSING) else dt.datetime.fromtimestamp(
+            0, tz=dt.timezone.utc
         )
-
-        built.before_send = new_before_send
-        built.prepare_response = new_prepare_response
-
-        return built
 
     @classmethod
     def prepare(
@@ -346,7 +336,7 @@ class PreparedRequest:
         compress_codec: Optional[Codec] = GZIP,
     ) -> "PreparedRequest":
         parsed_url = URL.parse(url, normalize=normalize)
-        out_headers: MutableMapping[str, str] = {str(k): str(v) for k, v in (headers or {}).items()}
+        out_headers: dict[str, str] = _string_dict(headers)
 
         request_body: Optional[BytesIO] = None
         if body is not None:
@@ -357,7 +347,8 @@ class PreparedRequest:
 
             if compress_threshold and request_body.size > compress_threshold:
                 request_body = request_body.compress(codec=compress_codec)
-                out_headers["Content-Encoding"] = compress_codec.name
+                if compress_codec is not None:
+                    out_headers["Content-Encoding"] = compress_codec.name
 
         if request_body is not None:
             out_headers["Content-Length"] = str(request_body.size)
@@ -366,19 +357,56 @@ class PreparedRequest:
             method=str(method),
             url=parsed_url,
             headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
+            tags=_string_dict(tags),
             buffer=request_body,
-            tags=tags,
-            sent_at_timestamp=0,
+            sent_at=0,
         )
-
         built.before_send = before_send
         built.prepare_response = after_received
+        return built
 
+    def copy(
+        self,
+        *,
+        method: Optional[str] = None,
+        url: URL | str | None = None,
+        headers: Optional[Mapping[str, str]] = None,
+        buffer: Optional[BytesIO] = ...,
+        tags: Optional[Mapping[str, str]] = None,
+        sent_at: Optional[int] = None,
+        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
+        prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
+        normalize: bool = True,
+        copy_buffer: bool = False,
+    ) -> "PreparedRequest":
+        new_url = self.url if url is None else URL.parse(url, normalize=normalize)
+        new_headers = dict(self.headers) if headers is None else _string_dict(headers)
+
+        if buffer is ...:
+            new_buffer = self.buffer
+            if copy_buffer and new_buffer is not None:
+                new_buffer = BytesIO.parse(new_buffer.to_bytes())
+        else:
+            new_buffer = buffer
+
+        new_tags = dict(self.tags) if tags is None else _string_dict(tags)
+
+        built = self.__class__(
+            method=self.method if method is None else str(method),
+            url=new_url,
+            headers=new_headers,
+            tags=new_tags,
+            buffer=new_buffer,
+            sent_at=self.sent_at if sent_at is None else any_to_datetime(sent_at),
+        )
+
+        built.before_send = self.before_send if before_send is ... else before_send
+        built.prepare_response = self.prepare_response if prepare_response is ... else prepare_response
         return built
 
     def prepare_to_send(
         self,
-        sent_at_timestamp: int,
+        sent_at: dt.datetime | dt.date | str | int | None,
         headers: Optional[Mapping[str, str]],
     ) -> "PreparedRequest":
         instance = self.before_send(self) if self.before_send else self
@@ -387,9 +415,9 @@ class PreparedRequest:
             instance.headers = {}
 
         if headers:
-            instance.headers.update(headers)
+            instance.headers.update(_string_dict(headers))
 
-        instance.sent_at_timestamp = sent_at_timestamp
+        instance.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
 
         return instance
 
@@ -399,22 +427,41 @@ class PreparedRequest:
 
     @property
     def content_length(self) -> int:
-        if self.buffer is not None:
-            return self.buffer.size
-        return 0
+        return self.buffer.size if self.buffer is not None else 0
 
     @property
     def authorization(self) -> Optional[str]:
         return self.headers.get("Authorization") if self.headers else None
 
+    @authorization.setter
+    def authorization(self, value: Optional[str]):
+        if self.headers is None:
+            self.headers = {}
+        if value is None:
+            self.headers.pop("Authorization", None)
+        else:
+            self.headers["Authorization"] = str(value)
+
     @property
-    def accept_media_type(self):
+    def x_api_key(self) -> Optional[str]:
+        return self.headers.get("X-API-Key") if self.headers else None
+
+    @x_api_key.setter
+    def x_api_key(self, value: Optional[str]):
+        if self.headers is None:
+            self.headers = {}
+        if value is None:
+            self.headers.pop("X-API-Key", None)
+        else:
+            self.headers["X-API-Key"] = str(value)
+
+    @property
+    def accept_media_type(self) -> MediaType:
         if not self.headers:
             return MediaType(MimeType.OCTET_STREAM, None)
 
         accept = MimeType.parse(self.headers.get("Accept"), default=MimeType.OCTET_STREAM)
         codec = Codec.parse(self.headers.get("Accept-Encoding"), default=None)
-
         return MediaType(accept, codec)
 
     @accept_media_type.setter
@@ -427,48 +474,138 @@ class PreparedRequest:
         else:
             self.headers.pop("Accept-Encoding", None)
 
-    @authorization.setter
-    def authorization(self, value: Optional[str]):
-        if self.headers is None:
-            self.headers = {}
-        if value is not None:
-            self.headers["Authorization"] = value
-        else:
-            self.headers.pop("Authorization", None)
+    @property
+    def sent_at_timestamp(self) -> int:
+        return int(self.sent_at.timestamp() * 1_000_000)
 
     @property
-    def x_api_key(self) -> Optional[str]:
-        return self.headers.get("X-API-Key") if self.headers else None
+    def arrow_values(self) -> dict[str, Any]:
+        u = self.url
+        promoted = PromotedHeaders.extract(self.headers or {})
 
-    @x_api_key.setter
-    def x_api_key(self, value: Optional[str]):
-        if self.headers is None:
-            self.headers = {}
-        if value is not None:
-            self.headers["X-API-Key"] = value
+        tags_v = dict(u.query_items())
+        if self.tags:
+            tags_v.update(_string_dict(self.tags))
+
+        if self.buffer is not None:
+            body_bytes = self.buffer.to_bytes()
+            body_hash = self.buffer.xxh3_int64()
         else:
-            self.headers.pop("X-API-Key", None)
+            body_bytes = None
+            body_hash = None
+
+        return {
+            "request_method": self.method,
+            "request_url_str": u.to_string(),
+            "request_url_scheme": u.scheme,
+            "request_url_userinfo": u.userinfo,
+            "request_url_host": u.host,
+            "request_url_port": u.port,
+            "request_url_path": u.path,
+            "request_url_query": u.query,
+            "request_url_fragment": u.fragment,
+            "request_host": promoted.host or DEFAULT_HOSTNAME,
+            "request_user_agent": promoted.user_agent,
+            "request_accept": promoted.accept,
+            "request_accept_encoding": promoted.accept_encoding,
+            "request_accept_language": promoted.accept_language,
+            "request_content_type": promoted.content_type,
+            "request_content_length": promoted.content_length or 0,
+            "request_content_encoding": promoted.content_encoding,
+            "request_transfer_encoding": promoted.transfer_encoding,
+            "request_headers": promoted.remaining,
+            "request_tags": tags_v,
+            "request_body": body_bytes,
+            "request_body_hash": body_hash,
+            "request_sent_at": self.sent_at
+        }
+
+    def match_value(self, key: str) -> Any:
+        values = self.arrow_values
+        if key in values:
+            return values[key]
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise ValueError(
+            f"Unsupported request match key: {key!r}. "
+            f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
+        )
+
+    def match_values(
+        self,
+        keys: Iterable[str],
+    ) -> dict[str, Any]:
+        return {str(key): self.match_value(str(key)) for key in keys}
+
+    def match_tuple(
+        self,
+        keys: Iterable[str],
+    ) -> tuple[Any, ...]:
+        key_list = [str(key) for key in keys]
+        values = self.match_values(key_list)
+        return tuple(values[key] for key in key_list)
+
+    def xxh3_64(
+        self,
+        hash_fields: Optional[Iterable[str]] = None,
+    ):
+        if not hash_fields:
+            hash_fields = ["method", "url", "headers", "buffer"]
+
+        buff = BytesIO()
+        for hash_field in sorted(hash_fields):
+            v = getattr(self, hash_field, None)
+
+            if isinstance(v, str):
+                buff.write(v.encode("utf-8"))
+            elif isinstance(v, URL):
+                buff.write(v.to_string().encode("utf-8"))
+            elif isinstance(v, Mapping):
+                for k, val in sorted(v.items()):
+                    buff.write(str(k).encode("utf-8"))
+                    buff.write(str(val).encode("utf-8"))
+            elif isinstance(v, BytesIO):
+                buff.write(v.xxh3_64().digest())
+            elif v is None:
+                buff.write(b"0")
+            else:
+                raise TypeError(f"Cannot hash field {hash_field} of type {type(v)}")
+
+        return buff.xxh3_64()
+
+    def xxh3_b64(
+        self,
+        url_safe: bool = True,
+    ) -> str:
+        h = self.xxh3_64().digest()
+        return (
+            base64.urlsafe_b64encode(h).decode("ascii")
+            if url_safe
+            else base64.b64encode(h).decode("ascii")
+        )
 
     def update_headers(
         self,
-        headers: Mapping[str, str],
+        headers: MutableMapping[str, str],
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
         if not headers:
             return self
 
+        next_headers: Mapping[str, str] = headers
         if normalize:
-            headers = normalize_headers(
+            next_headers = normalize_headers(
                 headers,
-                is_request=True, anonymize=False, add_missing=False
+                is_request=True,
+                anonymize=False,
+                add_missing=False,
             )
 
         if not self.headers:
-            self.headers = headers
-            return self
-
-        self.headers.update(headers)
+            self.headers = _string_dict(next_headers)
+        else:
+            self.headers.update(_string_dict(next_headers))
 
         return self
 
@@ -480,10 +617,9 @@ class PreparedRequest:
             return self
 
         if not self.tags:
-            self.tags = tags
-            return self
-
-        self.tags.update(tags)
+            self.tags = _string_dict(tags)
+        else:
+            self.tags.update(_string_dict(tags))
 
         return self
 
@@ -492,100 +628,27 @@ class PreparedRequest:
             self,
             headers=normalize_headers(
                 self.headers,
-                is_request=True, mode=mode, body=self.body, anonymize=True
+                is_request=True,
+                mode=mode,
+                body=self.body,
+                anonymize=True,
             ),
             url=self.url.anonymize(mode=mode),
         )
 
     def to_arrow_batch(self, parse: bool = False) -> pa.RecordBatch:
-        """Serialise this request into a single-row :class:`pyarrow.RecordBatch`.
-
-        Parameters
-        ----------
-        parse:
-            Reserved for future use.  Currently raises
-            :exc:`NotImplementedError` when ``True``.
-
-        Returns
-        -------
-        pyarrow.RecordBatch
-            A single-row batch conforming to :data:`REQUEST_ARROW_SCHEMA`.
-        """
         if parse:
             raise NotImplementedError
 
-        u = self.url
-        url_s = u.to_string()
-
-        promoted = PromotedHeaders.extract(self.headers or {})
-
-        tags_v = dict(u.query_items())
-        if self.tags:
-            tags_v.update({str(k): str(v) for k, v in self.tags.items()})
-
-        if self.buffer is not None:
-            body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.xxh3_int64()
-        else:
-            body_bytes = None
-            body_hash = None
-
-        values = {
-            "request_method": self.method,
-            "request_url_str": url_s,
-            "request_url_scheme": u.scheme,
-            "request_url_userinfo": u.userinfo,
-            "request_url_host": u.host,
-            "request_url_port": u.port,
-            "request_url_path": u.path,
-            "request_url_query": u.query,
-            "request_url_fragment": u.fragment,
-
-            "request_host": promoted.host or DEFAULT_HOSTNAME,
-            "request_user_agent": promoted.user_agent,
-            "request_accept": promoted.accept,
-            "request_accept_encoding": promoted.accept_encoding,
-            "request_accept_language": promoted.accept_language,
-            "request_content_type": promoted.content_type,
-            "request_content_length": promoted.content_length or 0,
-            "request_content_encoding": promoted.content_encoding,
-            "request_transfer_encoding": promoted.transfer_encoding,
-
-            "request_headers": promoted.remaining,
-            "request_tags": tags_v,
-            "request_body": body_bytes,
-            "request_body_hash": body_hash,
-
-            "request_sent_at": self.sent_at_timestamp,
-            "request_sent_at_epoch": self.sent_at_timestamp,
-        }
-
+        values = self.arrow_values
         arrays = [
             pa.array([values[f.name]], type=f.type)
             for f in REQUEST_ARROW_SCHEMA
         ]
-
         return pa.RecordBatch.from_arrays(arrays, schema=REQUEST_ARROW_SCHEMA)  # type: ignore[arg-type]
 
     def to_arrow_table(self, parse: bool = False) -> pa.Table:
-        """Serialise this request into a single-row :class:`pyarrow.Table`.
-
-        Wraps :meth:`to_arrow_batch` in a table.
-
-        Parameters
-        ----------
-        parse:
-            Forwarded to :meth:`to_arrow_batch`.
-
-        Returns
-        -------
-        pyarrow.Table
-        """
         return pa.Table.from_batches([self.to_arrow_batch(parse=parse)])
-
-    # ------------------------------------------------------------------
-    # from_arrow
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_arrow(
@@ -593,28 +656,7 @@ class PreparedRequest:
         batch: pa.RecordBatch | pa.Table,
         *,
         normalize: bool = True,
-    ) -> "Iterator[PreparedRequest]":
-        """Yield :class:`PreparedRequest` objects from an Arrow batch or table.
-
-        Each row in *batch* / *table* is reconstructed into a
-        :class:`PreparedRequest` using the same logic that
-        :meth:`Response.from_arrow` uses for the request portion of its
-        schema.
-
-        Parameters
-        ----------
-        batch:
-            An Arrow :class:`~pyarrow.RecordBatch` or :class:`~pyarrow.Table`
-            whose schema is (or is a superset of) :data:`REQUEST_ARROW_SCHEMA`.
-        normalize:
-            Whether to normalise reconstructed headers and URLs.
-
-        Yields
-        ------
-        PreparedRequest
-            One instance per row, in row order.
-        """
-
+    ) -> Iterator["PreparedRequest"]:
         def _iter_batches(obj: pa.RecordBatch | pa.Table) -> Iterator[pa.RecordBatch]:
             if isinstance(obj, pa.RecordBatch):
                 yield obj
@@ -629,7 +671,6 @@ class PreparedRequest:
                 for name in req_cols
                 if name in rb.schema.names
             }
-
             for i in range(rb.num_rows):
                 yield cls._from_arrow_cols(cols, i, normalize=normalize)
 
@@ -641,116 +682,60 @@ class PreparedRequest:
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
-        """Reconstruct a single :class:`PreparedRequest` from Arrow columns.
-
-        Parameters
-        ----------
-        cols:
-            ``{column_name: arrow_column}`` mapping.
-        i:
-            Row index.
-        normalize:
-            Whether to normalise headers and URLs.
-
-        Returns
-        -------
-        PreparedRequest
-        """
         def _get(name: str) -> Any:
             if name in cols:
                 return cols[name][i].as_py()
             return None
-
-        method = _get("request_method") or "GET"
 
         url_str = _get("request_url_str")
         if url_str not in (None, ""):
             url_val = str(url_str)
             url_struct = None
         else:
-            scheme   = _get("request_url_scheme")
+            scheme = _get("request_url_scheme")
             userinfo = _get("request_url_userinfo")
-            host     = _get("request_url_host")
-            port     = _get("request_url_port")
-            path     = _get("request_url_path")
-            query    = _get("request_url_query")
+            host = _get("request_url_host")
+            port = _get("request_url_port")
+            path = _get("request_url_path")
+            query = _get("request_url_query")
             fragment = _get("request_url_fragment")
 
-            if any(part not in (None, "", 0)
-                   for part in (scheme, userinfo, host, port, path, query, fragment)):
+            if any(part not in (None, "", 0) for part in (scheme, userinfo, host, port, path, query, fragment)):
                 url_val = None
                 url_struct = {
-                    "scheme":   scheme or "",
+                    "scheme": scheme or "",
                     "userinfo": userinfo or "",
-                    "host":     host or "",
-                    "port":     0 if port in (None, "") else int(port),
-                    "path":     path or "/",
-                    "query":    query or "",
+                    "host": host or "",
+                    "port": 0 if port in (None, "") else int(port),
+                    "path": path or "/",
+                    "query": query or "",
                     "fragment": fragment or "",
                 }
             else:
                 url_val = ""
                 url_struct = None
 
-        # Reconstruct headers from promoted columns + remaining map
-        _map_val = _get("request_headers")
-        try:
-            req_headers: dict[str, str] = (
-                {str(k): str(v) for k, v in _map_val if k is not None and v is not None}
-                if _map_val else {}
-            )
-        except Exception:
-            req_headers = {}
+        headers = _map_as_str_dict(_get("request_headers"))
+        for header_name, field_name in _PROMOTED_REQUEST_HEADER_FIELDS:
+            value = _get(field_name)
+            if value not in (None, ""):
+                headers[header_name] = str(value)
 
-        for hk, col_name in (
-            ("Host",              "request_host"),
-            ("User-Agent",        "request_user_agent"),
-            ("Accept",            "request_accept"),
-            ("Accept-Encoding",   "request_accept_encoding"),
-            ("Accept-Language",   "request_accept_language"),
-            ("Content-Type",      "request_content_type"),
-            ("Content-Length",    "request_content_length"),
-            ("Content-Encoding",  "request_content_encoding"),
-            ("Transfer-Encoding", "request_transfer_encoding"),
-        ):
-            hv = _get(col_name)
-            if hv not in (None, ""):
-                req_headers[hk] = str(hv)
-
-        # Tags
-        _tags_val = _get("request_tags")
-        try:
-            tags: dict[str, str] = (
-                {str(k): str(v) for k, v in _tags_val if k is not None and v is not None}
-                if _tags_val else {}
-            )
-        except Exception:
-            tags = {}
-
-        # Timestamp
-        sent_at_col = cols.get("request_sent_at")
-        if sent_at_col is not None:
-            ts_raw = sent_at_col[i].as_py()
-            if ts_raw is not None and hasattr(ts_raw, "timestamp"):
-                sent_at = int(ts_raw.timestamp() * 1_000_000)
-            elif isinstance(ts_raw, (int, float)):
-                sent_at = int(ts_raw)
-            else:
-                sent_at = 0
-        else:
-            sent_at = 0
+        sent_at_value = _get("request_sent_at")
+        sent_at_timestamp = any_to_datetime(sent_at_value)
 
         return cls.parse_dict(
             {
-                "method":            method,
-                "url_str":           url_val,
-                "url":               url_struct,
-                "headers":           req_headers,
-                "tags":              tags,
-                "buffer":            _get("request_body"),
-                "sent_at_timestamp": sent_at,
+                "method": _get("request_method") or "GET",
+                "url_str": url_val,
+                "url": url_struct,
+                "headers": headers,
+                "tags": _map_as_str_dict(_get("request_tags")),
+                "buffer": _get("request_body"),
+                "sent_at_timestamp": sent_at_timestamp,
             },
             normalize=normalize,
+            prefix="",
         )
 
     def apply(

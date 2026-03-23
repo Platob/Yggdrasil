@@ -19,13 +19,15 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import convert
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.io.enums import SaveMode
 from .types import arrow_field_to_column_info, column_info_to_arrow_field, arrow_field_to_ddl, quote_ident, \
     escape_sql_string
 from ..client import DatabricksService
+from ...environ import PyEnv
+from ...io.enums.save_mode import SaveModeArg
 
 if TYPE_CHECKING:
     import delta
+    from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
 
 __all__ = ["Table"]
 
@@ -662,26 +664,35 @@ class Table(DatabricksService):
 
         return self
 
-    def delta_spark(self) -> "delta.tables.DeltaTable":
-        from yggdrasil.spark.lib import pyspark_sql
+    def delta_spark(
+        self,
+        spark_session: "SparkSession | None" = None,
+    ) -> "delta.tables.DeltaTable":
 
         try:
             from delta.tables import DeltaTable
         except ImportError:
             from yggdrasil.environ import runtime_import_module
 
-            m = runtime_import_module(module_name="delta.tables", pip_name="delta-spark", install=True)
+            m = runtime_import_module(
+                module_name="delta.tables", pip_name="delta-spark",
+                install=True
+            )
             DeltaTable = m.DeltaTable
 
         return DeltaTable.forName(
-            sparkSession=pyspark_sql.SparkSession.getActiveSession(),
+            sparkSession=PyEnv.spark_session(
+                create=True,
+                import_error=True,
+                install_spark=True
+            ) if spark_session is None else spark_session,
             tableOrViewName=self.full_name(safe=True),
         )
 
     def delete(
         self,
         *,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> "Table":
         """Delete this table from Unity Catalog.
@@ -788,6 +799,14 @@ class Table(DatabricksService):
             operation=operation,
         )
 
+    def to_spark(
+        self,
+        spark_session: Optional["SparkSession"] = None,
+    ) -> "SparkDataFrame":
+        dt = self.delta_spark(spark_session=spark_session)
+
+        return dt.toDF()
+
     def to_arrow_dataset(
         self,
         *,
@@ -815,15 +834,13 @@ class Table(DatabricksService):
         self,
         data: Any,
         *,
-        mode: SaveMode | str = None,
+        mode: SaveModeArg = None,
         match_by: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
-        raise_error: bool = True
+        raise_error: bool = True,
+        spark_session: Optional["SparkSession"] = None,
     ):
-        mode = SaveMode.parse(mode, SaveMode.AUTO)
-        engine = self.sql
-
-        return engine.insert_into(
+        return self.sql.insert_into(
             data,
             mode=mode,
             catalog_name=self.catalog_name,
@@ -832,7 +849,8 @@ class Table(DatabricksService):
             table=self,
             match_by=match_by,
             wait=wait,
-            raise_error=raise_error
+            raise_error=raise_error,
+            spark_session=spark_session
         )
 
 
