@@ -727,6 +727,9 @@ class PyEnv:
                 else:
                     cls._SPARK_SESSION = None
                     return cls._SPARK_SESSION
+            except Exception:
+                cls._SPARK_SESSION = None
+                return cls._SPARK_SESSION
 
             active = None
             try:

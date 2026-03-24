@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json as _json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator, Optional, Self, Union
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Self, Union
 
 import yggdrasil.pickle.json as json_mod
 from yggdrasil.io.enums import SaveMode
@@ -35,7 +35,7 @@ __all__ = ["JsonOptions", "JsonIO"]
 _VALUE_COLUMN = "value"
 
 
-@dataclass(slots=True)
+@dataclass
 class JsonOptions(MediaOptions):
     """Options for JSON I/O.
 
@@ -47,21 +47,31 @@ class JsonOptions(MediaOptions):
         Error-handling mode for encoding (``"strict"``, ``"replace"``, …).
     """
 
-
     encoding: str = "utf-8"
     errors: str = "strict"
 
+    def __post_init__(self) -> None:
+        """Normalize and validate JSON-specific options."""
+        super().__post_init__()
+
+        if not isinstance(self.encoding, str):
+            raise TypeError(
+                f"encoding must be str, got {type(self.encoding).__name__}"
+            )
+        if not self.encoding:
+            raise ValueError("encoding must not be empty")
+
+        if not isinstance(self.errors, str):
+            raise TypeError(
+                f"errors must be str, got {type(self.errors).__name__}"
+            )
+        if not self.errors:
+            raise ValueError("errors must not be empty")
+
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
+    def resolve(cls, *, options: Self | None = None, **overrides: Any) -> Self:
         """Merge *overrides* into *options* (or a fresh default)."""
-        base = options or cls()
-        valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]
-        unknown = set(overrides) - set(valid)
-        if unknown:
-            raise TypeError(f"{cls.__name__}.resolve(): unknown option(s): {sorted(unknown)}")
-        for k, v in overrides.items():
-            setattr(base, k, v)
-        return base
+        return cls.check_parameters(options=options, **overrides)
 
 
 @dataclass(slots=True)
@@ -69,52 +79,69 @@ class JsonIO(MediaIO[JsonOptions]):
     """JSON I/O with list-expansion on read and optimised list output on write."""
 
     @classmethod
-    def check_options(cls, options: Optional[JsonOptions], *args, **kwargs) -> JsonOptions:
+    def check_options(
+        cls,
+        options: Optional[JsonOptions],
+        *args,
+        **kwargs,
+    ) -> JsonOptions:
         """Validate and merge caller-supplied options."""
         return JsonOptions.check_parameters(options=options, **kwargs)
+
+    @staticmethod
+    def _normalize_loaded_json(data: Any) -> list[dict]:
+        """Normalize loaded JSON into row-oriented ``list[dict]`` form."""
+        if isinstance(data, list):
+            if not data:
+                return []
+            if isinstance(data[0], dict):
+                return data
+            return [{_VALUE_COLUMN: value} for value in data]
+
+        if isinstance(data, dict):
+            return [data]
+
+        return [{_VALUE_COLUMN: data}]
+
+    def _load_json_records(self, options: JsonOptions) -> list[dict]:
+        """Decode buffer JSON and normalize it into row records."""
+        if self.buffer.size <= 0:
+            return []
+
+        raw = self.buffer.to_bytes()
+        data = _json.loads(raw.decode(options.encoding, errors=options.errors))
+        return self._normalize_loaded_json(data)
 
     # ------------------------------------------------------------------
     # Batch-oriented implementation
     # ------------------------------------------------------------------
 
-    def _read_arrow_batches(self, *, options: JsonOptions) -> Iterator["pyarrow.RecordBatch"]:
+    def _read_arrow_batches(
+        self,
+        *,
+        options: JsonOptions,
+    ) -> Iterator["pyarrow.RecordBatch"]:
         """Yield record batches from the JSON buffer.
 
-        * ``[]``  or empty buffer → no batches.
+        * ``[]`` or empty buffer → no batches.
         * ``[{…}, {…}]`` → one batch, each dict is a row.
         * ``[1, 2, 3]`` → one batch with a ``"value"`` column.
         * ``{…}`` (single object) → one batch with one row.
         """
         import pyarrow as pa
 
-        if self.buffer.size <= 0:
+        records = self._load_json_records(options)
+        if not records:
             return
-
-        raw = self.buffer.to_bytes()
-        data = _json.loads(raw.decode(options.encoding, errors=options.errors))
-
-        if isinstance(data, list):
-            if not data:
-                return
-            # List of dicts → standard row-per-dict
-            if isinstance(data[0], dict):
-                records = data
-            else:
-                # List of scalars → wrap each in a {value: x} row
-                records = [{_VALUE_COLUMN: v} for v in data]
-        elif isinstance(data, dict):
-            records = [data]
-        else:
-            # Scalar top-level value
-            records = [{_VALUE_COLUMN: data}]
 
         batch = pa.RecordBatch.from_pylist(records)
 
         if options.columns is not None:
-            tbl = pa.Table.from_batches([batch]).select(options.columns)
-            yield from tbl.to_batches()
-        else:
-            yield batch
+            table = pa.Table.from_batches([batch]).select(options.columns)
+            yield from table.to_batches()
+            return
+
+        yield batch
 
     def _write_arrow_batches(
         self,
@@ -137,7 +164,11 @@ class JsonIO(MediaIO[JsonOptions]):
             table = pa.Table.from_batches(all_batches, schema=schema)
             records = table.to_pylist()
 
-        payload = json_mod.dumps(records, encoding=options.encoding, errors=options.errors)
+        payload = json_mod.dumps(
+            records,
+            encoding=options.encoding,
+            errors=options.errors,
+        )
         self.buffer._replace_with_payload(payload)
 
     # ------------------------------------------------------------------
@@ -156,8 +187,8 @@ class JsonIO(MediaIO[JsonOptions]):
         Arrow-based batched path.
         """
         resolved = self.check_options(options=options, **option_kwargs)
-        bs = resolved.batch_size
-        if bs and bs > 0:
+        batch_size = resolved.batch_size
+        if batch_size and batch_size > 0:
             return super().read_pylist(options=resolved)
 
         if self.buffer.size <= 0:
@@ -171,15 +202,7 @@ class JsonIO(MediaIO[JsonOptions]):
             raw = buf.to_bytes()
 
         data = _json.loads(raw.decode(resolved.encoding, errors=resolved.errors))
-
-        if isinstance(data, list):
-            if data and not isinstance(data[0], dict):
-                return [{_VALUE_COLUMN: v} for v in data]
-            return data
-        elif isinstance(data, dict):
-            return [data]
-        else:
-            return [{_VALUE_COLUMN: data}]
+        return self._normalize_loaded_json(data)
 
     def write_pylist(
         self,
@@ -197,20 +220,26 @@ class JsonIO(MediaIO[JsonOptions]):
         if self.skip_write(mode=resolved.mode):
             return
 
-        bs = resolved.batch_size
-        # For APPEND / UPSERT or batched writes we need the full merge, go via Arrow
-        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT) or (bs and bs > 0):
+        batch_size = resolved.batch_size
+        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT) or (batch_size and batch_size > 0):
             return super().write_pylist(
                 data,
                 options=resolved,
             )
 
-        payload = json_mod.dumps(data, encoding=resolved.encoding, errors=resolved.errors)
+        payload = json_mod.dumps(
+            data,
+            encoding=resolved.encoding,
+            errors=resolved.errors,
+        )
 
         codec = self.codec
         if codec is not None:
             from .bytes_io import BytesIO as _BIO
+
             plain = _BIO(payload, config=self.buffer.config)
             self._compress_into_buffer(plain)
         else:
             self.buffer._replace_with_payload(payload)
+
+        return None

@@ -465,6 +465,7 @@ class Response:
             obj if req_obj is MISSING or req_obj in (None, "") else req_obj,
             normalize=normalize,
         )
+
         status_code = _parse_status_code(obj, prefix=prefix)
         headers = _parse_headers(obj, prefix=prefix)
         buffer = _parse_buffer(obj, prefix=prefix)
@@ -475,6 +476,19 @@ class Response:
             headers = normalize_headers(headers, body=buffer, is_request=False)
 
         _ensure_media_headers(headers, buffer)
+
+        if cls is Response:
+            if request.url.is_http:
+                from .http_ import HTTPResponse
+
+                return HTTPResponse(
+                    request=request,
+                    status_code=status_code,
+                    headers=headers,
+                    tags=tags,
+                    buffer=buffer,
+                    received_at=received_at,
+                )
 
         return cls(
             request=request,
@@ -748,6 +762,21 @@ class Response:
     # Serialisation — Polars / pandas / Spark
     # ------------------------------------------------------------------
 
+    def read_polars_frames(
+        self,
+        parse: bool = True,
+        *,
+        lazy: bool = False,
+        **media_options: Any,
+    ):
+        if parse:
+            mio = self.buffer.media_io(media=self.media_type)
+
+            for df in mio.read_polars_frames(lazy=lazy, **media_options):
+                yield df
+        else:
+            yield _pl.from_arrow(self.to_arrow_batch(parse=False))
+
     def to_polars(
         self,
         parse: bool = True,
@@ -842,46 +871,8 @@ class Response:
                     yield from _iter_batches(inner)
 
         for rb in _iter_batches(batch):
-            cols = {
-                name: rb.column(name)
-                for name in req_cols + resp_cols
-                if name in rb.schema.names
-            }
-
-            for i in range(rb.num_rows):
-                request = next(PreparedRequest.from_arrow(pa.RecordBatch.from_arrays(
-                    [cols[name] for name in req_cols if name in cols],
-                    schema=pa.schema([REQUEST_ARROW_SCHEMA.field(name) for name in req_cols if name in cols]),
-                ), normalize=False))
-
-                resp_headers = _map_to_str_dict(_first_present(cols, i, "response_headers"))
-                for hk, col_name in _PROMOTED_RESPONSE_HEADER_FIELDS:
-                    hv = _first_present(cols, i, col_name)
-                    if hv not in (None, ""):
-                        resp_headers[hk] = str(hv)
-
-                body_bytes = _first_present(cols, i, "response_body")
-                buffer = BytesIO(body_bytes) if body_bytes is not None else BytesIO()
-
-                received_at = (
-                    _arrow_ts_col_to_us(cols["response_received_at"], i)
-                    if "response_received_at" in cols else 0
-                )
-
-                kwargs = dict(
-                    request=request,
-                    status_code=int(_first_present(cols, i, "response_status_code") or 0),
-                    headers=resp_headers,
-                    buffer=buffer,
-                    tags=_map_to_str_dict(_first_present(cols, i, "response_tags")),
-                    received_at=received_at,
-                )
-
-                if cls is Response and request.url.is_http:
-                    from .http_.response import HTTPResponse
-                    yield HTTPResponse(**kwargs)
-                else:
-                    yield cls(**kwargs)
+            for info in rb.to_pylist():
+                yield cls.parse_mapping(info, normalize=False)
 
     # ------------------------------------------------------------------
     # ASGI helpers

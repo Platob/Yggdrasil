@@ -6,7 +6,7 @@ import io
 import zipfile
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Optional, Self
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Self
 
 from yggdrasil.io.enums import MediaType, MimeType, SaveMode
 
@@ -21,7 +21,7 @@ __all__ = ["ZipOptions", "ZipIO"]
 
 
 def _check_member_info(value: tuple[str, str] | str) -> tuple[str, str]:
-    """Validate a member-info specifier."""
+    """Validate and normalize one member-info specifier."""
     if isinstance(value, str):
         value = (value, f"_zip_member_{value}")
     elif not isinstance(value, tuple):
@@ -47,13 +47,19 @@ def _check_member_info(value: tuple[str, str] | str) -> tuple[str, str]:
             f"got {key!r}"
         )
 
+    if not isinstance(alias, str):
+        raise TypeError(
+            "ZipOptions.read_member_infos aliases must be str, "
+            f"got {type(alias).__name__}"
+        )
+
     if not alias:
         alias = f"_zip_member_{key}"
 
     return key, alias
 
 
-@dataclass(slots=True)
+@dataclass
 class ZipOptions(MediaOptions):
     """Options for ZIP I/O."""
 
@@ -64,43 +70,59 @@ class ZipOptions(MediaOptions):
     read_member_infos: list[tuple[str, str]] | None = None
 
     def __post_init__(self) -> None:
-        infos = self.read_member_infos
+        """Normalize and validate ZIP-specific options."""
+        super().__post_init__()
+
+        if self.member is not None and not isinstance(self.member, str):
+            raise TypeError(
+                f"member must be str|None, got {type(self.member).__name__}"
+            )
+
+        if not isinstance(self.force_inner_media, bool):
+            raise TypeError(
+                f"force_inner_media must be bool, got {type(self.force_inner_media).__name__}"
+            )
+
+        if self.inner_media is not None:
+            self.inner_media = MediaType.parse(self.inner_media)
+
+        self.read_member_infos = self._normalize_read_member_infos(
+            self.read_member_infos
+        )
+
+    @staticmethod
+    def _normalize_read_member_infos(
+        infos: Any,
+    ) -> list[tuple[str, str]] | None:
+        """Normalize ``read_member_infos`` to a validated list."""
         if not infos:
-            return
+            return None
 
         if isinstance(infos, Mapping):
             items = infos.items()
         elif isinstance(infos, str):
             items = [infos]
         elif isinstance(infos, Iterable):
-            items = [v for v in infos if v is not None]
+            items = [value for value in infos if value is not None]
         else:
             raise TypeError(
-                "ZipOptions.read_member_infos must be a mapping or iterable of "
-                "str or tuple[str, str], "
+                "read_member_infos must be a mapping or iterable of str or tuple[str, str], "
                 f"got {type(infos).__name__}"
             )
 
-        self.read_member_infos = [_check_member_info(v) for v in items]
+        normalized = [_check_member_info(value) for value in items]
+        return normalized or None
 
     @property
     def is_glob(self) -> bool:
+        """Return ``True`` when ``member`` contains glob wildcards."""
         member = self.member
         return bool(member and any(ch in member for ch in ("*", "?", "[")))
 
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
+    def resolve(cls, *, options: Self | None = None, **overrides: Any) -> Self:
         """Merge overrides into ``options`` or a fresh default."""
-        base = options or cls()
-        valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]
-        unknown = set(overrides) - set(valid)
-        if unknown:
-            raise TypeError(
-                f"{cls.__name__}.resolve(): unknown option(s): {sorted(unknown)}"
-            )
-        for key, value in overrides.items():
-            setattr(base, key, value)
-        return base
+        return cls.check_parameters(options=options, **overrides)
 
 
 @dataclass(slots=True)
@@ -114,6 +136,7 @@ class ZipIO(MediaIO[ZipOptions]):
         *args,
         **kwargs,
     ) -> ZipOptions:
+        """Validate / merge options for this media type."""
         return ZipOptions.check_parameters(options=options, **kwargs)
 
     def _iter_selected_infos(
@@ -175,20 +198,18 @@ class ZipIO(MediaIO[ZipOptions]):
         payload: bytes,
     ) -> MediaType:
         """Resolve the media type for one member."""
-        if options.force_inner_media and options.inner_media is not None:
-            media_type = MediaType.parse(options.inner_media)
-            if not media_type.is_octet:
-                return media_type
+        inner_media = options.inner_media
+        if options.force_inner_media and inner_media is not None and not inner_media.is_octet:
+            return inner_media
         return self._infer_inner_media(name, payload)
 
     @staticmethod
     def _pick_inner_media_for_write(options: ZipOptions) -> MediaType:
         """Resolve the inner media type used for writes."""
-        if options.inner_media is not None:
-            media_type = MediaType.parse(options.inner_media)
-            if not media_type.is_octet:
-                return media_type
-        return MediaType(MimeType.PARQUET)
+        inner_media = options.inner_media
+        if inner_media is None or inner_media.is_octet:
+            return MediaType(MimeType.PARQUET)
+        return inner_media
 
     @staticmethod
     def _default_member_for_write(inner_media: MediaType) -> str:
@@ -197,14 +218,17 @@ class ZipIO(MediaIO[ZipOptions]):
         return f"data.{ext}" if ext else "data"
 
     @staticmethod
-    def _zipfile_kwargs(options: ZipOptions) -> dict:
+    def _zipfile_kwargs(options: ZipOptions) -> dict[str, int]:
         """Build ``zipfile.ZipFile`` kwargs for writing."""
         return {
             "compression": zipfile.ZIP_DEFLATED,
             "compresslevel": max(0, min(9, int(options.zip_compression))),
         }
 
-    def iter_members(self, options: ZipOptions) -> Iterator[tuple[zipfile.ZipInfo, BytesIO]]:
+    def iter_members(
+        self,
+        options: ZipOptions,
+    ) -> Iterator[tuple[zipfile.ZipInfo, BytesIO]]:
         """Yield selected ZIP members as ``(info, buffer)``."""
         if self.buffer.size <= 0:
             return
@@ -250,17 +274,25 @@ class ZipIO(MediaIO[ZipOptions]):
 
         return table
 
-    def _read_arrow_batches(self, *, options: ZipOptions) -> "Iterator[pyarrow.RecordBatch]":
+    def _read_arrow_batches(
+        self,
+        *,
+        options: ZipOptions,
+    ) -> Iterator["pyarrow.RecordBatch"]:
         """Read and stream batches from selected ZIP members."""
         for info, buf in self.iter_members(options=options):
             table = buf.media_io().read_arrow_table()
-            table = self._apply_member_infos(table, name=info.filename, options=options)
+            table = self._apply_member_infos(
+                table,
+                name=info.filename,
+                options=options,
+            )
             yield from table.to_batches()
 
     def _write_arrow_batches(
         self,
         *,
-        batches: "Iterator[pyarrow.RecordBatch]",
+        batches: Iterator["pyarrow.RecordBatch"],
         schema: "pyarrow.Schema",
         options: ZipOptions,
     ) -> None:

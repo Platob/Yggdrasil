@@ -181,7 +181,7 @@ def str_to_datetime(value: str, opts: Any = None) -> dt.datetime:
             raise last or ValueError(f"Cannot parse datetime from {value!r}")
 
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=CURRENT_TZINFO)
+        parsed = parsed.replace(tzinfo=_UTC)
 
     return parsed
 

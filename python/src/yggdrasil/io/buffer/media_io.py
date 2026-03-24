@@ -164,6 +164,20 @@ class MediaIO(ABC, Generic[O]):
         calling this.  An empty buffer should yield nothing (bare ``return``).
         """
 
+    def read_polars_frames(
+        self,
+        *args,
+        options: Optional[O] = None,
+        **media_options
+    ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
+        from yggdrasil.polars.lib import polars as _pl
+
+        for batch in self.read_arrow_batches(
+            *args, options=options, **media_options
+        ):
+            df = _pl.from_arrow(batch, rechunk=False)
+            yield df.lazy() if options and options.lazy else df
+
     @abstractmethod
     def _write_arrow_batches(
         self,

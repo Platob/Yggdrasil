@@ -412,10 +412,9 @@ class Session(ABC):
                     else:
                         raise
 
-                cached_responses = list(Response.from_arrow_tabular(cache_result.to_arrow_table()))
-
                 cache_map: dict[tuple[Any, ...], list[Response]] = {}
-                for response in cached_responses:
+
+                for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
                     key = remote_cfg.request_tuple(response.request)
                     cache_map.setdefault(key, []).append(response)
 
@@ -423,9 +422,8 @@ class Session(ABC):
                 misses: list[PreparedRequest] = []
 
                 for req in batch:
-                    key = remote_cfg.request_tuple(
-                        req.anonymize(mode=remote_cfg.anonymize)
-                    )
+                    key = remote_cfg.request_tuple(req.anonymize(mode=remote_cfg.anonymize))
+
                     candidates = cache_map.get(key)
                     if candidates:
                         hits.append(candidates[0])
