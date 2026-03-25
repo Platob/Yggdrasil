@@ -454,6 +454,111 @@ class TestCastToTime:
         s = pl.Series("t", [dt.time(10, 0, 0)], dtype=pl.Time())
         assert self._cast(s)[0] == dt.time(10, 0, 0)
 
+    def test_int64_nanoseconds_to_time(self):
+        """14:30:00 = 14*3600 + 30*60 = 52200 seconds = 52_200_000_000_000 ns."""
+        ns = 52_200_000_000_000
+        s = pl.Series("t", [ns], dtype=pl.Int64())
+        result = self._cast(s)
+        assert result[0] == dt.time(14, 30, 0)
+
+    def test_int64_midnight_to_time(self):
+        s = pl.Series("t", [0], dtype=pl.Int64())
+        result = self._cast(s)
+        assert result[0] == dt.time(0, 0, 0)
+
+    def test_int32_to_time(self):
+        """Small nanosecond value within int32 range → Time."""
+        ns = 1_000_000  # 1 millisecond
+        s = pl.Series("t", [ns], dtype=pl.Int32())
+        result = self._cast(s)
+        assert result[0] == dt.time(0, 0, 0, 1000)  # 1ms = 1000μs
+
+    def test_float64_to_time(self):
+        """Float is truncated to int64 before casting to Time."""
+        ns = 3_600_000_000_000.0  # 1 hour in ns
+        s = pl.Series("t", [ns], dtype=pl.Float64())
+        result = self._cast(s)
+        assert result[0] == dt.time(1, 0, 0)
+
+    def test_duration_to_time(self):
+        # Duration(ns) of 3h15m = 11_700_000_000_000 ns
+        ns_val = (3 * 3600 + 15 * 60) * 1_000_000_000
+        s = pl.Series("t", [ns_val], dtype=pl.Duration("ns"))
+        result = self._cast(s)
+        assert result[0] == dt.time(3, 15, 0)
+
+
+# ===========================================================================
+# Time → numeric (via cast_polars_array dispatch)
+# ===========================================================================
+
+class TestTimeToNumeric:
+
+    def test_time_to_int64_nanoseconds(self):
+        """Time(14:30:00) → nanoseconds since midnight."""
+        s = pl.Series("x", [dt.time(14, 30, 0)], dtype=pl.Time())
+        result = cast_polars_array(s, _opts(pa.time64("ns"), pa.int64()))
+        expected_ns = (14 * 3600 + 30 * 60) * 1_000_000_000
+        assert result[0] == expected_ns
+
+    def test_time_to_float64(self):
+        s = pl.Series("x", [dt.time(1, 0, 0)], dtype=pl.Time())
+        result = cast_polars_array(s, _opts(pa.time64("ns"), pa.float64()))
+        expected_ns = 3_600_000_000_000.0
+        assert result[0] == pytest.approx(expected_ns)
+
+    def test_time_midnight_to_int64(self):
+        s = pl.Series("x", [dt.time(0, 0, 0)], dtype=pl.Time())
+        result = cast_polars_array(s, _opts(pa.time64("ns"), pa.int64()))
+        assert result[0] == 0
+
+    def test_time_with_microseconds_to_int64(self):
+        s = pl.Series("x", [dt.time(0, 0, 0, 500)], dtype=pl.Time())  # 500μs
+        result = cast_polars_array(s, _opts(pa.time64("ns"), pa.int64()))
+        assert result[0] == 500_000  # 500μs = 500_000 ns
+
+    def test_time_to_int32_small(self):
+        s = pl.Series("x", [dt.time(0, 0, 0, 1)], dtype=pl.Time())  # 1μs
+        result = cast_polars_array(s, _opts(pa.time64("ns"), pa.int32()))
+        assert result[0] == 1000  # 1μs = 1000ns
+
+    def test_time_to_int64_roundtrip(self):
+        """Time → int64 → Time roundtrip."""
+        original = dt.time(14, 30, 15)
+        s = pl.Series("x", [original], dtype=pl.Time())
+        as_int = cast_polars_array(s, _opts(pa.time64("ns"), pa.int64()))
+        back = cast_polars_array_to_temporal(
+            as_int, as_int.dtype, pl.Time(), safe=False,
+        )
+        assert back[0] == original
+
+    def test_time_to_int64_expr(self):
+        """Expr path: Time → Int64."""
+        result = cast_polars_array(pl.col("x"), _opts(pa.time64("ns"), pa.int64()))
+        assert isinstance(result, pl.Expr)
+        # Verify it works in a DataFrame context
+        df = pl.DataFrame({"x": pl.Series([dt.time(1, 0, 0)], dtype=pl.Time())})
+        val = df.select(result).to_series()[0]
+        assert val == 3_600_000_000_000
+
+    def test_date_to_int32_days_since_epoch(self):
+        """Date → Int32 gives days since epoch."""
+        s = pl.Series("x", [dt.date(1970, 1, 2)], dtype=pl.Date())
+        result = cast_polars_array(s, _opts(pa.date32(), pa.int32()))
+        assert result[0] == 1  # 1 day after epoch
+
+    def test_datetime_to_int64_epoch_us(self):
+        """Datetime[us] → Int64 gives microseconds since epoch."""
+        s = pl.Series("x", [dt.datetime(1970, 1, 1, 0, 0, 1)], dtype=pl.Datetime("us"))
+        result = cast_polars_array(s, _opts(pa.timestamp("us"), pa.int64()))
+        assert result[0] == 1_000_000  # 1 second = 1_000_000 us
+
+    def test_duration_to_int64(self):
+        """Duration[us] → Int64 gives microseconds."""
+        s = pl.Series("x", [dt.timedelta(seconds=1)], dtype=pl.Duration("us"))
+        result = cast_polars_array(s, _opts(pa.duration("us"), pa.int64()))
+        assert result[0] == 1_000_000
+
 
 # ===========================================================================
 # cast_polars_array_to_temporal — Duration

@@ -19,7 +19,7 @@ class DataTable(ABC):
         self,
         statement: str,
         *,
-        wait: WaitingConfigArg | None = None
+        wait: WaitingConfigArg = None
     ) -> StatementResult:
         pass
 

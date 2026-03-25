@@ -41,7 +41,8 @@ Type normalisation helpers
 are not supported by the respective engine (e.g. ``large_string`` → ``string`` for
 Spark; ``map<k,v>`` → ``list<struct<key,value>>`` for Polars).
 
-``merge_arrow_fields`` / ``merge_arrow_types`` implement a non-destructive merge
+``merge_arrow_fields`` / ``merge_arrow_types`` (defined in
+:mod:`~.python_arrow` and re-exported here) implement a non-destructive merge
 strategy: widen types rather than narrow them, preserve nullability, and recurse
 into nested containers.
 
@@ -79,6 +80,8 @@ from .python_arrow import (
     is_arrow_type_list_like,
     is_arrow_type_string_like,
     is_arrow_type_binary_like,
+    merge_arrow_fields,
+    merge_arrow_types,
 )
 from .python_defaults import default_arrow_scalar, default_arrow_array
 
@@ -108,7 +111,9 @@ __all__ = [
     "arrow_type_to_dict",
     "dict_to_arrow_type",
     "dict_to_arrow_field",
-    "default_arrow_scalar"
+    "default_arrow_scalar",
+    "merge_arrow_fields",
+    "merge_arrow_types",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1837,210 +1842,9 @@ def any_to_arrow_schema(
 
 
 # ---------------------------------------------------------------------------
-# Type merging helpers
+# Dict serialization helpers
 # ---------------------------------------------------------------------------
 
-def _ci_key(name: str) -> str:
-    """Return the case-folded version of *name* for case-insensitive lookups."""
-    return (name or "").casefold()
-
-
-def _is_string_like(t: ArrowDataType) -> bool:
-    """Return ``True`` if *t* is any string or binary primitive type."""
-    return (
-        pat.is_string(t)
-        or pat.is_large_string(t)
-        or pat.is_binary(t)
-        or pat.is_large_binary(t)
-    )
-
-
-def merge_arrow_types(
-    source: Optional[ArrowDataType],
-    target: Optional[ArrowDataType],
-) -> ArrowDataType:
-    """Merge two Arrow ``DataType`` values without narrowing.
-
-    Implements a *non-destructive* merge strategy optimised for Delta / Spark
-    pipelines where schemas evolve over time.  The returned type is the
-    "widest" type that can hold values from both *source* and *target* without
-    data loss.
-
-    Rules (applied in order):
-
-    * If either side is ``None`` or ``null``, return the other.
-    * **Struct**: recurse into children, keeping target ordering; append
-      extra source fields.
-    * **List / large_list**: recurse into the value type; prefer target
-      container variant.
-    * **Fixed-size list**: recurse into value type; target list size wins.
-    * **Map**: recurse into key and item types; target ``keys_sorted`` flag
-      wins.
-    * **Dictionary**: recurse into value type; target index type wins.
-    * **Integer**: prefer wider bit-width; resolve sign conflicts with a
-      signed type wide enough for both ranges.
-    * **Float**: prefer wider bit-width.
-    * **Integer + Float mix**: prefer the float side.
-    * **Decimal**: avoid reducing precision or scale.
-    * **Timestamp**: preserve timezone if the source has one.
-    * **String / binary**: use the target flavour.
-    * **Default**: return ``target``.
-
-    Args:
-        source: Incoming / observed type.  May be ``None``.
-        target: Schema-defined desired type.  May be ``None``.
-
-    Returns:
-        Merged ``ArrowDataType`` guaranteed to be at least as wide as both
-        inputs.
-    """
-    if source is None:
-        return target or pa.null()
-    elif target is None:
-        return source or pa.null()
-
-    if pat.is_null(source):
-        return target
-    if pat.is_null(target):
-        return source
-
-    # ---- STRUCT ----
-    if pat.is_struct(source) and pat.is_struct(target):
-        s_by_ci = {_ci_key(f.name): f for f in source}
-        t_by_ci = {_ci_key(f.name): f for f in target}
-
-        merged_fields: list[pa.Field] = []
-
-        # Maintain target field ordering (most important for schema convergence).
-        for name_ci, tf in t_by_ci.items():
-            sf = s_by_ci.get(name_ci)
-            if sf is None:
-                merged_fields.append(tf)
-            else:
-                merged_fields.append(merge_arrow_fields(sf, tf))
-
-        # Append source-only fields (don't drop unexpected columns).
-        for name_ci, sf in s_by_ci.items():
-            if name_ci not in t_by_ci:
-                merged_fields.append(sf)
-
-        return pa.struct(merged_fields)
-
-    # ---- LIST / LARGE_LIST ----
-    if (pat.is_list(source) or pat.is_large_list(source)) and (
-        pat.is_list(target) or pat.is_large_list(target)
-    ):
-        merged_value = merge_arrow_types(source.value_type, target.value_type)
-        if pat.is_large_list(target):
-            return pa.large_list(merged_value)
-        return pa.list_(merged_value)
-
-    # ---- FIXED_SIZE_LIST ----
-    if pat.is_fixed_size_list(source) and pat.is_fixed_size_list(target):
-        merged_value = merge_arrow_types(source.value_type, target.value_type)
-        return pa.list_(merged_value, target.list_size)  # target size wins
-
-    # ---- MAP ----
-    if pat.is_map(source) and pat.is_map(target):
-        merged_key = merge_arrow_types(source.key_type, target.key_type)
-        merged_item = merge_arrow_types(source.item_type, target.item_type)
-        return pa.map_(merged_key, merged_item, keys_sorted=target.keys_sorted)
-
-    # ---- DICTIONARY ----
-    if pat.is_dictionary(source) and pat.is_dictionary(target):
-        merged_value = merge_arrow_types(source.value_type, target.value_type)
-        return pa.dictionary(
-            target.index_type, merged_value, ordered=target.ordered
-        )  # type: ignore
-
-    # ---- PRIMITIVES ----
-    if pat.is_primitive(source) and pat.is_primitive(target):
-        if _is_string_like(source) or _is_string_like(target):
-            return target
-
-        if pat.is_boolean(source) and pat.is_boolean(target):
-            return target
-
-        if pat.is_integer(source) and pat.is_integer(target):
-            if source.bit_width > target.bit_width:
-                return source  # avoid narrowing
-            if pat.is_signed_integer(source) != pat.is_signed_integer(target):
-                # Resolve sign conflict: pick smallest signed type that covers both.
-                bw = max(source.bit_width, target.bit_width)
-                if bw <= 8:
-                    return pa.int8()
-                if bw <= 16:
-                    return pa.int16()
-                if bw <= 32:
-                    return pa.int32()
-                return pa.int64()
-            return target
-
-        if pat.is_floating(source) and pat.is_floating(target):
-            return source if source.bit_width > target.bit_width else target
-
-        if (pat.is_integer(source) and pat.is_floating(target)) or (
-            pat.is_floating(source) and pat.is_integer(target)
-        ):
-            # Always prefer the float side.
-            return target if pat.is_floating(target) else source
-
-        if pat.is_decimal(source) and pat.is_decimal(target):
-            if target.precision < source.precision or target.scale < source.scale:
-                return source  # avoid precision loss
-            return target
-
-        if pat.is_timestamp(source) and pat.is_timestamp(target):
-            if source.tz is not None and target.tz is None:
-                return source  # preserve timezone
-            return target
-
-    return target
-
-
-def merge_arrow_fields(source: pa.Field, target: pa.Field) -> pa.Field:
-    """Merge two ``pa.Field`` values into a single, non-narrowing field.
-
-    Name resolution:
-
-    * If source or target name is ``"root"`` (a synthetic placeholder), the
-      other name wins.
-    * Otherwise the target name is used to ensure schema convergence.
-
-    Type is resolved via :func:`merge_arrow_types`.
-
-    Nullability is the logical OR of both fields (adding columns always
-    introduces potential nulls).
-
-    Metadata is merged with target keys taking precedence on collision.
-
-    Args:
-        source: Incoming / observed field.
-        target: Schema-defined desired field.
-
-    Returns:
-        Merged ``pa.Field``.
-    """
-    if target.name and source.name:
-        if target.name == "root" and source.name:
-            name = source.name
-        elif source.name == "root" and target.name:
-            name = target.name
-        else:
-            name = target.name or source.name or "root"
-    else:
-        name = target.name or source.name or "root"
-
-    dtype = merge_arrow_types(source.type, target.type)
-    nullable = source.nullable or target.nullable
-    metadata = {**(source.metadata or {}), **(target.metadata or {})}
-
-    return pa.field(
-        name=name,
-        type=dtype,
-        nullable=nullable,
-        metadata=metadata if metadata else None,
-    )
 
 @register_converter(pa.Field, dict)
 def arrow_field_to_dict(field: pa.Field, options=None) -> dict[str, Any]:

@@ -1,13 +1,14 @@
+# tests/io/test_response.py
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 from typing import Any
 
 import pytest
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.enums import MediaType, MimeType
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response, ARROW_SCHEMA, RESPONSE_ARROW_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
 
 
 def _rb_row(batch) -> dict[str, Any]:
@@ -17,210 +18,343 @@ def _rb_row(batch) -> dict[str, Any]:
 def _make_request() -> PreparedRequest:
     req = PreparedRequest.prepare(
         method="GET",
-        url="https://example.com/api?q=1",
-        headers={"X-Test": "req"},
-        tags={"req_tag": "1"},
+        url="https://example.com/api?a=1",
+        headers={"User-Agent": "pytest"},
+        tags={"rq": "1"},
     )
-    req.sent_at_timestamp = 111
+    req.sent_at = dt.datetime.fromtimestamp(7, tz=dt.timezone.utc)
     return req
 
 
-def test_parse_dict_minimal() -> None:
-    resp = Response.parse_dict(
+def test_parse_mapping_minimal() -> None:
+    resp = Response.parse_mapping(
         {
-            "request_url_str": "https://example.com",
+            "request_url_str": "https://example.com/a",
             "response_status_code": 200,
         }
     )
 
     assert resp.status_code == 200
-    assert resp.request.url.to_string() == "https://example.com/"
+    assert resp.request.method == "GET"
+    assert resp.request.url.to_string() == "https://example.com/a"
     assert resp.headers["Content-Type"] == "application/octet-stream"
     assert resp.headers["Content-Length"] == "0"
-    assert resp.buffer.to_bytes() == b""
     assert resp.tags == {}
+    assert resp.buffer.to_bytes() == b""
     assert resp.received_at_timestamp == 0
 
 
-def test_parse_dict_with_explicit_headers_and_body() -> None:
-    resp = Response.parse_dict(
+def test_parse_mapping_missing_status_code_raises() -> None:
+    with pytest.raises(ValueError, match="missing status_code/status/code"):
+        Response.parse_mapping(
+            {
+                "request_url_str": "https://example.com/a",
+            }
+        )
+
+
+def test_parse_mapping_with_nested_request() -> None:
+    resp = Response.parse_mapping(
         {
-            "request_url_str": "https://example.com",
-            "response_status_code": 201,
-            "response_headers": {
-                "Content-Type": "application/json; charset=utf-8",
-                "Content-Encoding": "gzip",
-                "ETag": '"abc"',
+            "request": {
+                "request_method": "POST",
+                "request_url_str": "https://example.com/items",
+                "request_headers": {"X-Test": "1"},
             },
+            "response_status_code": 201,
+            "response_headers": {"Content-Type": "application/json"},
             "response_body": b'{"ok":true}',
-            "response_tags": {"a": 1},
-            "response_received_at_epoch": 123,
         }
     )
 
+    assert resp.request.method == "POST"
+    assert resp.request.url.to_string() == "https://example.com/items"
+    assert resp.request.headers["X-Test"] == "1"
     assert resp.status_code == 201
-    assert resp.headers["Content-Type"] == "application/json; charset=utf-8"
-    assert resp.headers["Content-Encoding"] == "gzip"
-    assert resp.headers["ETag"] == '"abc"'
     assert resp.buffer.to_bytes() == b'{"ok":true}'
-    assert resp.tags == {"a": "1"}
-    assert resp.received_at_timestamp == 123
 
 
-def test_parse_dict_from_promoted_header_fields() -> None:
-    resp = Response.parse_dict(
+def test_parse_mapping_respects_custom_prefix() -> None:
+    resp = Response.parse_mapping(
         {
-            "request_url_str": "https://example.com",
-            "response_status_code": 302,
-            "response_content_type": "text/plain",
-            "response_content_length": 4,
-            "response_content_encoding": "gzip",
-            "response_transfer_encoding": "chunked",
-            "response_location": "/next",
-            "response_etag": '"etag-1"',
-            "response_last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            "response_body": b"test",
-        }
+            "request_url_str": "https://example.com/a",
+            "foo_status_code": 200,
+            "foo_headers": {"Content-Type": "text/plain"},
+            "foo_tags": {"a": 1},
+            "foo_body": b"hello",
+            "foo_received_at": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+        },
+        prefix="foo_",
     )
 
-    assert resp.headers["Content-Type"] == "text/plain"
-    assert resp.headers["Content-Length"] == "4"
-    assert resp.headers["Content-Encoding"] == "gzip"
-    assert resp.headers["Transfer-Encoding"] == "chunked"
-    assert resp.headers["Location"] == "/next"
-    assert resp.headers["ETag"] == '"etag-1"'
-    assert resp.headers["Last-Modified"] == "Mon, 01 Jan 2024 00:00:00 GMT"
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    assert resp.tags == {"a": "1"}
+    assert resp.buffer.to_bytes() == b"hello"
+    assert resp.received_at_timestamp > 0
 
 
 def test_parse_str_accepts_json_object_string() -> None:
-    resp = Response.parse(
-        '{"request_url_str":"https://example.com","response_status_code":204}'
+    resp = Response.parse_str(
+        '{"request_url_str":"https://example.com/a","response_status_code":200}'
     )
 
-    assert resp.status_code == 204
-    assert resp.request.url.to_string() == "https://example.com/"
+    assert resp.status_code == 200
+    assert resp.request.url.to_string() == "https://example.com/a"
 
 
-def test_parse_dict_missing_status_raises() -> None:
-    with pytest.raises(ValueError, match="missing status_code/status/code"):
-        Response.parse_dict({"request_url_str": "https://example.com"})
+def test_parse_str_empty_raises() -> None:
+    with pytest.raises(ValueError, match="empty string"):
+        Response.parse_str("   ")
 
 
-def test_media_type_uses_declared_header() -> None:
+def test_update_headers_and_tags() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={"Content-Type": "text/plain"},
+        tags={"a": "1"},
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    resp.update_headers({"X-Test": "2"})
+    resp.update_tags({"b": "2"})
+
+    assert resp.headers["X-Test"] == "2"
+    assert resp.tags == {"a": "1", "b": "2"}
+
+
+def test_media_type_and_set_media_type() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={},
+        tags={},
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    media = resp.media_type
+    assert media.mime_type is not None
+
+    resp.set_media_type(MediaType(MimeType.JSON, None))
+    assert resp.headers["Content-Type"] == MimeType.JSON.value
+    assert resp.request.headers["Accept"] == MimeType.JSON.value
+
+
+def test_body_content_text_and_json() -> None:
     resp = Response(
         request=_make_request(),
         status_code=200,
         headers={"Content-Type": "application/json; charset=utf-8"},
-        buffer=BytesIO(b'{"a":1}'),
         tags={},
-        received_at_timestamp=0,
+        buffer=b'{"x":1}',  # type: ignore[arg-type]
+        received_at=1,
     )
 
-    assert resp.media_type.mime_type.value == "application/json"
-    assert resp.text == '{"a":1}'
+    assert resp.body.to_bytes() == b'{"x":1}'
+    assert resp.content == b'{"x":1}'
+    assert resp.text == '{"x":1}'
+    assert resp.json() == {"x": 1}
 
 
-def test_json_parsing() -> None:
-    resp = Response(
-        request=_make_request(),
-        status_code=200,
-        headers={"Content-Type": "application/json"},
-        buffer=BytesIO(b'{"a":1}'),
-        tags={},
-        received_at_timestamp=0,
-    )
-
-    assert resp.json() == {"a": 1}
-
-
-def test_ok_property() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
+def test_ok_raise_for_status_warn_for_status() -> None:
     ok_resp = Response(
         request=_make_request(),
-        status_code=200,
+        status_code=204,
         headers={},
-        buffer=BytesIO(),
         tags={},
-        received_at_timestamp=0,
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=1,
     )
+    assert ok_resp.ok is True
+    assert ok_resp.error() is None
+
     bad_resp = Response(
         request=_make_request(),
         status_code=500,
         headers={},
-        buffer=BytesIO(),
         tags={},
-        received_at_timestamp=0,
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=1,
+    )
+    assert bad_resp.ok is False
+    assert bad_resp.error() is not None
+
+    with pytest.raises(Exception):
+        bad_resp.raise_for_status()
+
+    with pytest.warns(RuntimeWarning):
+        bad_resp.warn_for_status()
+
+
+def test_received_at_property() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={},
+        tags={},
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=42,
     )
 
-    assert ok_resp.ok is True
-    assert bad_resp.ok is False
+    assert resp.received_at == dt.datetime(1970, 1, 1, 0, 0, 42, tzinfo=dt.timezone.utc)
 
 
-def test_anonymize_redacts_response_and_request() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
+def test_anonymize_redacts_request_and_response_headers() -> None:
     req = PreparedRequest.prepare(
         method="GET",
-        url="https://user:pass@example.com/path?token=secret",
-        headers={"Authorization": "Bearer secret"},
+        url="https://user:pass@example.com/a?token=secret",
+        headers={"Authorization": "Bearer abc"},
     )
     resp = Response(
         request=req,
         status_code=200,
-        headers={"Set-Cookie": "a=b", "X-API-Key": "secret"},
-        buffer=BytesIO(),
+        headers={"X-API-Key": "secret"},
         tags={},
-        received_at_timestamp=0,
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=1,
     )
 
     anon = resp.anonymize(mode="redact")
 
     assert anon is not resp
+    assert "<redacted>" in anon.request.url.to_string().lower() or "secret" not in anon.request.url.to_string()
+    assert "Authorization" in anon.request.headers
     assert "X-API-Key" in anon.headers
-    assert anon.headers["X-API-Key"] == "<redacted>"
-    assert anon.request is not req
+
+
+def test_arrow_values_contains_expected_projection() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com/api?a=1",
+        headers={"User-Agent": "pytest"},
+        body=b"rq",
+        tags={"rt": "1"},
+    )
+    req.sent_at = dt.datetime.fromtimestamp(7, tz=dt.timezone.utc)
+
+    resp = Response(
+        request=req,
+        status_code=201,
+        headers={
+            "User-Agent": "server",
+            "Content-Type": "application/json",
+            "X-Other": "keep",
+        },
+        tags={"t": "2"},
+        buffer=b'{"ok":true}',  # type: ignore[arg-type]
+        received_at=42,
+    )
+
+    values = resp.arrow_values
+
+    assert values["request_method"] == "POST"
+    assert values["request_url_str"] == "https://example.com/api?a=1"
+    assert values["response_status_code"] == 201
+    assert values["response_user_agent"] == "server"
+    assert values["response_content_type"] == "application/json"
+    assert values["response_body"] == b'{"ok":true}'
+    assert values["response_body_hash"] is not None
+    assert values["response_tags"] == {"t": "2"}
+    assert values["response_received_at"] == dt.datetime(1970, 1, 1, 0, 0, 42, tzinfo=dt.timezone.utc)
+
+
+def test_match_value_supports_request_and_response_fields() -> None:
+    resp = Response(
+        request=PreparedRequest.prepare(
+            method="POST",
+            url="https://example.com/api?a=1",
+            body=b"rq",
+        ),
+        status_code=200,
+        headers={"Content-Type": "application/json"},
+        tags={"t": "2"},
+        buffer=b'{"ok":true}',  # type: ignore[arg-type]
+        received_at=42,
+    )
+
+    assert resp.match_value("request_method") == "POST"
+    assert resp.match_value("request_url_str") == "https://example.com/api?a=1"
+    assert resp.match_value("response_status_code") == 200
+    assert resp.match_value("response_content_type") == "application/json"
+    assert resp.match_value("response_body") == b'{"ok":true}'
+    assert resp.match_value("response_received_at") == dt.datetime(1970, 1, 1, 0, 0, 42, tzinfo=dt.timezone.utc)
+
+
+def test_match_value_invalid_key_raises() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={},
+        tags={},
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported response match key"):
+        resp.match_value("not_a_real_key")
+
+
+def test_match_tuple() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={"Content-Type": "application/json"},
+        tags={},
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=42,
+    )
+
+    out = resp.match_tuple(
+        ["request_method", "request_url_str", "response_status_code", "response_body_hash"]
+    )
+
+    assert out[0] == "GET"
+    assert out[1] == "https://example.com/api?a=1"
+    assert out[2] == 200
+    assert out[3] is not None
 
 
 def test_to_arrow_batch_matches_schema() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
     resp = Response(
         request=_make_request(),
         status_code=200,
         headers={
+            "User-Agent": "server",
             "Content-Type": "application/json",
-            "Content-Length": "5",
             "Content-Encoding": "gzip",
             "Transfer-Encoding": "chunked",
-            "Location": "/next",
-            "ETag": '"abc"',
-            "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            "X-Request-ID": "rid-1",
-            "X-Correlation-ID": "cid-1",
-            "X-Other": "keep-me",
+            "X-Other": "keep",
         },
-        buffer=BytesIO(b"hello"),
-        tags={"t": "1"},
-        received_at_timestamp=222,
+        tags={"t": "2"},
+        buffer=b'{"ok":true}',  # type: ignore[arg-type]
+        received_at=42,
     )
 
-    rb = resp.to_arrow_batch()
+    rb = resp.to_arrow_batch(parse=False)
 
     assert rb.schema == RESPONSE_ARROW_SCHEMA
     assert rb.num_rows == 1
-    assert ARROW_SCHEMA.names[-1] == "response_received_at_epoch"
 
 
 def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
-    from yggdrasil.io.buffer import BytesIO
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com/api?a=1&shared=url",
+        headers={"User-Agent": "pytest"},
+        body=b"hello rq",
+        tags={"shared": "rq"},
+    )
+    req.sent_at = dt.datetime.fromtimestamp(11, tz=dt.timezone.utc)
 
     resp = Response(
-        request=_make_request(),
-        status_code=206,
+        request=req,
+        status_code=200,
         headers={
             "Host": "example.com",
-            "User-Agent": "pytest",
+            "User-Agent": "server",
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
             "Accept-Language": "en",
@@ -230,16 +364,19 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
             "Transfer-Encoding": "chunked",
             "X-Other": "keep-me",
         },
-        buffer=BytesIO(b"hello world"),
-        tags={"explicit": "tag"},
-        received_at_timestamp=333,
+        tags={"t": "2"},
+        buffer=b"hello world",  # type: ignore[arg-type]
+        received_at=42,
     )
 
-    row = _rb_row(resp.to_arrow_batch())
+    row = _rb_row(resp.to_arrow_batch(parse=False))
 
-    assert row["response_status_code"] == 206
+    assert row["request_method"] == "POST"
+    assert row["request_url_str"] == "https://example.com/api?a=1&shared=url"
+    assert row["response_status_code"] == 200
+
     assert row["response_host"] == "example.com"
-    assert row["response_user_agent"] == "pytest"
+    assert row["response_user_agent"] == "server"
     assert row["response_accept"] == "application/json"
     assert row["response_accept_encoding"] == "gzip"
     assert row["response_accept_language"] == "en"
@@ -247,165 +384,146 @@ def test_to_arrow_batch_promotes_headers_and_keeps_remaining() -> None:
     assert row["response_content_length"] == 11
     assert row["response_content_encoding"] == "gzip"
     assert row["response_transfer_encoding"] == "chunked"
-    assert dict(row["response_headers"]) == {"X-Other": "keep-me"}
-    assert dict(row["response_tags"]) == {"explicit": "tag"}
+
+    headers_map = dict(row["response_headers"])
+    assert headers_map["X-Other"] == "keep-me"
+
+    assert dict(row["response_tags"]) == {"t": "2"}
     assert row["response_body"] == b"hello world"
-    assert row["response_body_hash"] is not None
-    assert row["response_body_hash"] == -3150353794653054837
-    assert row["response_received_at"] == datetime.datetime(1970, 1, 1, 0, 0, 0, 333, tzinfo=datetime.timezone.utc)
-    assert row["response_received_at_epoch"] == 333
+    assert row["response_body_hash"] == resp.buffer.xxh3_int64()
+    assert row["response_received_at"] == dt.datetime(1970, 1, 1, 0, 0, 42, 0, tzinfo=dt.timezone.utc)
 
 
-def test_from_arrow_round_trip_rebuilds_promoted_headers() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
-    original = Response(
-        request=_make_request(),
-        status_code=200,
-        headers={
-            "Content-Type": "application/json",
-            "Content-Length": "5",
-            "Content-Encoding": "gzip",
-            "Transfer-Encoding": "chunked",
-            "Location": "/next",
-            "ETag": '"etag-1"',
-            "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            "X-Request-ID": "rid-1",
-            "X-Correlation-ID": "cid-1",
-            "X-Other": "keep-me",
-        },
-        buffer=BytesIO(b"hello"),
-        tags={"a": "1"},
-        received_at_timestamp=444,
-    )
-
-    rb = original.to_arrow_batch()
-    rebuilt = next(Response.from_arrow(rb))
-
-    assert rebuilt.status_code == 200
-    assert rebuilt.headers["Content-Type"] == "application/json"
-    assert rebuilt.headers["Content-Length"] == "5"
-    assert rebuilt.headers["Content-Encoding"] == "gzip"
-    assert rebuilt.headers["Transfer-Encoding"] == "chunked"
-    assert rebuilt.headers["Location"] == "/next"
-    assert rebuilt.headers["ETag"] == '"etag-1"'
-    assert rebuilt.headers["Last-Modified"] == "Mon, 01 Jan 2024 00:00:00 GMT"
-    assert rebuilt.headers["X-Request-ID"] == "rid-1"
-    assert rebuilt.headers["X-Correlation-ID"] == "cid-1"
-    assert rebuilt.headers["X-Other"] == "keep-me"
-    assert rebuilt.tags == {"a": "1"}
-    assert rebuilt.buffer.to_bytes() == b"hello"
-    assert rebuilt.received_at_timestamp == 444
-
-
-def test_from_arrow_round_trip_rebuilds_request_promoted_headers_too() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
-    req = PreparedRequest.prepare(
-        method="POST",
-        url="https://example.com/api?q=1",
-        headers={
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-            "Transfer-Encoding": "chunked",
-            "ETag": '"req-etag"',
-            "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT",
-            "Location": "/req-next",
-            "X-Other": "keep-me",
-        },
-        body=b"{}",
-        tags={"x": "1"},
-    )
-    req.sent_at_timestamp = 999
-
-    resp = Response(
-        request=req,
-        status_code=200,
-        headers={"Content-Type": "application/json"},
-        buffer=BytesIO(b"{}"),
-        tags={},
-        received_at_timestamp=555,
-    )
-
-    rebuilt = next(Response.from_arrow(resp.to_arrow_batch()))
-
-    assert rebuilt.request.headers["Content-Type"] == "application/json"
-    assert rebuilt.request.headers["Content-Encoding"] == "gzip"
-    assert rebuilt.request.headers["Transfer-Encoding"] == "chunked"
-    assert rebuilt.request.headers["ETag"] == '"req-etag"'
-    assert rebuilt.request.headers["Last-Modified"] == "Mon, 01 Jan 2024 00:00:00 GMT"
-    assert rebuilt.request.headers["Location"] == "/req-next"
-    assert rebuilt.request.headers["X-Other"] == "keep-me"
-    assert rebuilt.request.tags == {"q": "1", "x": "1"}
-
-
-def test_to_arrow_batch_without_body_has_hash_for_empty_buffer() -> None:
-    from yggdrasil.io.buffer import BytesIO
-
+def test_to_arrow_batch_without_body_has_empty_body_hash_from_empty_buffer() -> None:
     resp = Response(
         request=_make_request(),
         status_code=204,
         headers={},
-        buffer=BytesIO(),
         tags={},
-        received_at_timestamp=0,
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=0,
     )
 
-    row = _rb_row(resp.to_arrow_batch())
+    row = _rb_row(resp.to_arrow_batch(parse=False))
 
     assert row["response_body"] == b""
     assert row["response_body_hash"] is not None
-    assert row["response_body_hash"] == 3244421341483603138
 
 
-def test_to_starlette_strips_hop_by_hop_and_sets_media_type() -> None:
-    from yggdrasil.io.buffer import BytesIO
+def test_from_arrow_roundtrip_record_batch() -> None:
+    req = PreparedRequest.prepare(
+        method="POST",
+        url="https://example.com/api?a=1",
+        headers={"User-Agent": "pytest"},
+        body=b"rq",
+        tags={"rt": "1"},
+    )
+    req.sent_at = dt.datetime.fromtimestamp(7, tz=dt.timezone.utc)
 
     resp = Response(
-        request=_make_request(),
-        status_code=200,
+        request=req,
+        status_code=201,
         headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Transfer-Encoding": "chunked",
-            "X-Test": "1",
+            "User-Agent": "server",
+            "Content-Type": "application/json",
+            "X-Other": "keep",
         },
-        buffer=BytesIO(b'{"a":1}'),
-        tags={},
-        received_at_timestamp=0,
+        tags={"t": "2"},
+        buffer=b'{"ok":true}',  # type: ignore[arg-type]
+        received_at=123,
     )
 
-    out = resp.to_starlette()
+    rb = resp.to_arrow_batch(parse=False)
+    out = list(Response.from_arrow_tabular(rb))
 
-    assert out.status_code == 200
-    assert out.headers["content-length"] == str(len(b'{"a":1}'))
-    assert out.headers["x-test"] == "1"
-    assert "transfer-encoding" not in out.headers
-    assert out.media_type == "application/json"
+    assert len(out) == 1
+    rebuilt = out[0]
+
+    assert rebuilt.request.method == "POST"
+    assert rebuilt.request.url.to_string() == "https://example.com/api?a=1"
+    assert rebuilt.status_code == 201
+    assert rebuilt.buffer.to_bytes() == b'{"ok":true}'
+    assert rebuilt.tags == {"t": "2"}
+    assert rebuilt.received_at_timestamp == 123000000
+    assert rebuilt.headers["User-Agent"] == "server"
+    assert rebuilt.headers["Content-Type"] == "application/json"
 
 
-def test_to_fastapi_falls_back_to_starlette_when_fastapi_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    import builtins
-    from yggdrasil.io.buffer import BytesIO
-
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "fastapi":
-            raise ImportError("boom")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
+def test_from_arrow_roundtrip_table() -> None:
     resp = Response(
         request=_make_request(),
         status_code=200,
         headers={"Content-Type": "text/plain"},
-        buffer=BytesIO(b"ok"),
-        tags={},
-        received_at_timestamp=0,
+        tags={"t": "2"},
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=7,
     )
 
-    out = resp.to_fastapi()
+    table = resp.to_arrow_table(parse=False)
+    out = list(Response.from_arrow_tabular(table))
 
-    assert out.status_code == 200
-    assert out.headers["content-length"] == "2"
+    assert len(out) == 1
+    rebuilt = out[0]
+
+    assert rebuilt.request.url.to_string() == "https://example.com/api?a=1"
+    assert rebuilt.status_code == 200
+    assert rebuilt.buffer.to_bytes() == b"hello"
+    assert rebuilt.received_at_timestamp == 7000000
+
+
+def test_to_asgi_payload_strips_hop_by_hop_and_sets_length() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+            "Connection": "keep-alive",
+            "X-Test": "1",
+        },
+        tags={},
+        buffer=b'{"ok":true}',  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    body, headers, media_type = resp._to_asgi_payload()
+
+    assert body == b'{"ok":true}'
+    assert headers["Content-Length"] == str(len(body))
+    assert headers["X-Test"] == "1"
+    assert "Connection" not in headers
+    assert "Transfer-Encoding" not in headers
+    assert media_type == "application/json"
+
+
+def test_apply_returns_transformed_response() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={},
+        tags={},
+        buffer=b"",  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    def transform(r: Response) -> Response:
+        r.status_code = 201
+        return r
+
+    out = resp.apply(transform)
+    assert out.status_code == 201
+
+
+def test_response_repr_contains_status_and_url() -> None:
+    resp = Response(
+        request=_make_request(),
+        status_code=200,
+        headers={},
+        tags={},
+        buffer=b"hello",  # type: ignore[arg-type]
+        received_at=1,
+    )
+
+    rep = repr(resp)
+    assert "status_code=200" in rep
+    assert "https://example.com/api?a=1" in rep

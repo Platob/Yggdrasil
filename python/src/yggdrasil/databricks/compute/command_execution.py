@@ -294,7 +294,7 @@ class CommandExecution:
 
     def cancel(
         self,
-        wait: WaitingConfigArg | None = True
+        wait: WaitingConfigArg = True
     ):
         if self.command_id:
             wait = WaitingConfig.check_arg(wait)

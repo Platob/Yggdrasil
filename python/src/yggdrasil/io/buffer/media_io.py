@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Iterator, Sequence, TypeVar, overload, Optional, Union
+from typing import TYPE_CHECKING, Generic, Iterator, Sequence, TypeVar, Optional, Union
 
 from yggdrasil.io.enums import Codec, MediaType, MimeType, SaveMode
 from .bytes_io import BytesIO
@@ -143,6 +143,18 @@ class MediaIO(ABC, Generic[O]):
             A fully-resolved, validated options instance.
         """
 
+    def read_arrow_batches(
+        self,
+        *args,
+        options: Optional[O] = None,
+        **media_options
+    ):
+        options = self.check_options(
+            options=options, *args, **media_options
+        )
+
+        yield from self._read_arrow_batches(options=options)
+
     @abstractmethod
     def _read_arrow_batches(self, *, options: O) -> Iterator["pyarrow.RecordBatch"]:
         """Yield record batches from the **uncompressed** buffer.
@@ -151,6 +163,20 @@ class MediaIO(ABC, Generic[O]):
         compression — the public methods handle decompression before
         calling this.  An empty buffer should yield nothing (bare ``return``).
         """
+
+    def read_polars_frames(
+        self,
+        *args,
+        options: Optional[O] = None,
+        **media_options
+    ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
+        from yggdrasil.polars.lib import polars as _pl
+
+        for batch in self.read_arrow_batches(
+            *args, options=options, **media_options
+        ):
+            df = _pl.from_arrow(batch, rechunk=False)
+            yield df.lazy() if options and options.lazy else df
 
     @abstractmethod
     def _write_arrow_batches(
@@ -192,26 +218,6 @@ class MediaIO(ABC, Generic[O]):
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
-
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MimeType.PARQUET) -> "ParquetIO": ...
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MimeType.JSON) -> "JsonIO": ...
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MimeType.NDJSON) -> "JsonIO": ...
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MimeType.ZIP) -> "ZipIO": ...
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MimeType.ARROW_IPC) -> "IPCIO": ...
-    @overload
-    @classmethod
-    def make(cls, buffer: BytesIO, media: MediaType | str) -> "MediaIO[MediaOptions]": ...
-
     @classmethod
     def make(cls, buffer: BytesIO, media: MediaType | MimeType | str) -> "MediaIO[MediaOptions]":
         """Create the appropriate :class:`MediaIO` subclass for *media*.

@@ -37,13 +37,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, MISSING
 from pathlib import Path
-from typing import Any, Iterable, Sequence, TYPE_CHECKING
+from typing import Any, Iterable, Sequence, TYPE_CHECKING, ClassVar
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.version import VersionInfo
-
 from .system_command import SystemCommand
 from .userinfo import UserInfo
 
@@ -300,20 +299,6 @@ SYSTEM_LIBS: frozenset[str] = frozenset({
 def safe_pip_name(
     value: str | tuple[str, str] | Iterable[str | tuple[str, str]],
 ) -> str | list[str]:
-    """
-    Map an import name to its pip distribution name, or return it unchanged.
-
-    Accepts either a single string, a ``(name, version)`` tuple, or an iterable
-    of either. The return type mirrors the input shape.
-
-    Examples
-    --------
-    ::
-
-        safe_pip_name("yaml")                # -> "PyYAML"
-        safe_pip_name(("pyarrow", "18.1.0")) # -> "pyarrow==18.1.0"
-        safe_pip_name(["yaml", "jwt"])       # -> ["PyYAML", "PyJWT"]
-    """
     if isinstance(value, str):
         return PIP_MODULE_NAME_MAPPINGS.get(value, value)
 
@@ -355,6 +340,8 @@ class PyEnv:
     _version_info: VersionInfo | None = field(default=None, init=False, repr=False)
     _uv_bin: Path | None = field(default=None, init=False, repr=False)
     _checked_modules: set[str] = field(default_factory=set, init=False, repr=False)
+
+    _SPARK_SESSION: ClassVar[object] = MISSING
 
     def __post_init__(self) -> None:
         self.python_path = Path(self.python_path).expanduser().resolve()
@@ -602,7 +589,7 @@ class PyEnv:
         packages: list[str] | None = None,
         linked: bool = False,
         native_tls: bool = True,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         clear: bool = True,
     ) -> PyEnv:
         """
@@ -708,35 +695,73 @@ class PyEnv:
             raise RuntimeError(f"Failed to get version info for Python at {self.python_path}: {exc}") from exc
 
     @classmethod
+    def in_databricks(cls):
+        return os.getenv("DATABRICKS_RUNTIME_VERSION")
+
+    @classmethod
+    def can_access_databricks(cls):
+        return (
+            cls.in_databricks
+            or "DATABRICKS_HOST" in os.environ.keys()
+            or "DATABRICKS_CLUSTER_ID" in os.environ.keys()
+        )
+
+    @classmethod
     def spark_session(
         cls,
         create: bool = True,
         import_error: bool = True,
-        install_spark: bool = True,
+        install_spark: bool = False,
     ) -> "SparkSession | None":
-        try:
-            from pyspark.sql import SparkSession
-        except ImportError as exc:
-            if not install_spark and import_error:
-                raise ImportError("pyspark is not installed in this environment") from exc
+        if cls._SPARK_SESSION is MISSING:
+            try:
+                from pyspark.sql import SparkSession
+            except ImportError:
+                if import_error and not install_spark:
+                    raise
 
-            if not install_spark:
-                return None
+                if install_spark:
+                    runtime_import_module(
+                        module_name="pyspark", pip_name="pyspark", install=True
+                    )
+                else:
+                    cls._SPARK_SESSION = None
+                    return cls._SPARK_SESSION
+            except Exception:
+                cls._SPARK_SESSION = None
+                return cls._SPARK_SESSION
 
-            runtime_import_module(
-                module_name="pyspark", pip_name="pyspark", install=True
-            )
-            from pyspark.sql import SparkSession
+            active = None
+            try:
+                from pyspark.sql import SparkSession
 
-        active = SparkSession.getActiveSession()
+                active = SparkSession.getActiveSession()
+            except ImportError:
+                pass
 
-        if active is not None:
-            return active
+            if active is None:
+                try:
+                    from yggdrasil.databricks.client import DatabricksClient
 
-        if create:
-            return SparkSession.builder.getOrCreate()
+                    active = DatabricksClient.current().spark_connect(create=create)
+                except:
+                    pass
 
-        return None
+            if active is not None:
+                cls._SPARK_SESSION = active
+
+            elif create:
+                from pyspark.sql import SparkSession
+
+                cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
+
+            else:
+                cls._SPARK_SESSION = None
+        return cls._SPARK_SESSION
+
+    @classmethod
+    def set_spark_session(cls, spark_session: "SparkSession"):
+        cls._SPARK_SESSION = spark_session
 
     # ---------------------------------------------------------------------
     # uv resolution / runtime installation
@@ -991,7 +1016,7 @@ class PyEnv:
         *packages: str,
         requirements: str | Path | None = None,
         extra_args: Sequence[str] = (),
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         prefer_uv: bool | None = None,
         target: Path | str | None = None,
@@ -1005,6 +1030,7 @@ class PyEnv:
         1. Try normal subprocess install (uv pip or python -m pip)
         2. If that fails and this env is the current interpreter, try pip internal API
         """
+        result: SystemCommand | None = None
         prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
 
         if not packages and requirements is None:
@@ -1046,7 +1072,6 @@ class PyEnv:
                 wait=wait_cfg,
                 raise_error=True,
             )
-            return result
         except Exception as exc:
             if self._is_externally_managed_failure(exc):
                 if break_system_packages:
@@ -1105,8 +1130,6 @@ class PyEnv:
                     "Failed to install packages with both subprocess pip and pip internal fallback"
                 ) from inner_exc
 
-            result = None
-
         finally:
             if wait_cfg and tmp_req is not None:
                 try:
@@ -1124,7 +1147,7 @@ class PyEnv:
         self,
         *packages: str,
         extra_args: Sequence[str] = (),
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         prefer_uv: bool | None = None,
     ) -> SystemCommand | None:
         if not packages:
@@ -1161,7 +1184,7 @@ class PyEnv:
         self,
         *packages: str,
         extra_args: Sequence[str] = (),
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         prefer_uv: bool | None = None,
     ) -> SystemCommand | None:
         """
@@ -1180,7 +1203,7 @@ class PyEnv:
     def pip(
         self,
         *args: str,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         prefer_uv: bool | None = None,
     ) -> SystemCommand:
         """
@@ -1231,7 +1254,7 @@ class PyEnv:
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
-        wait: WaitingConfigArg | None = True,
+        wait: WaitingConfigArg = True,
         raise_error: bool = True,
         stdin: str | None = None,
         python: PyEnv | Path | str | None = None,
@@ -1366,7 +1389,7 @@ class PyEnv:
             return imported
         except Exception as exc:
             raise ModuleNotFoundError(
-                f"Failed to import module '{module_name}' and auto-install package '{pip_name or module_name}'",
+                f"No module named '{module_name}' and auto-install package '{pip_name or module_name}'",
                 name=module_name,
             ) from exc
 

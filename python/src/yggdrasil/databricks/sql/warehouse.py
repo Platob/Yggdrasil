@@ -461,7 +461,7 @@ class SQLWarehouse(DatabricksService):
             )
 
         if details.cluster_size is None:
-            details.cluster_size = "X-Small"
+            details.cluster_size = "Small"
 
         if details.warehouse_type is None:
             details.warehouse_type = EndpointInfoWarehouseType.PRO

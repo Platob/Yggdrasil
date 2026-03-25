@@ -12,7 +12,7 @@ from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
 
-from yggdrasil.environ import UserInfo
+from yggdrasil.environ import UserInfo, PyEnv, runtime_import_module
 from yggdrasil.io.url import URL, URLResource, url_resource_class
 from ..concurrent.threading import Job
 from ..dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
@@ -92,6 +92,8 @@ class DatabricksClient(URLResource):
     client_id: Optional[str] = env_field("DATABRICKS_CLIENT_ID", repr_=False)
     client_secret: Optional[str] = env_field("DATABRICKS_CLIENT_SECRET", repr_=False)
     token_audience: Optional[str] = env_field("DATABRICKS_TOKEN_AUDIENCE", repr_=False)
+    cluster_id: Optional[str] = env_field("DATABRICKS_CLUSTER_ID", repr_=False)
+    serverless_compute_id: Optional[str] = env_field("DATABRICKS_SERVERLESS_COMPUTE_ID", repr_=False)
 
     # Azure
     azure_workspace_resource_id: Optional[str] = env_field("ARM_RESOURCE_ID", repr_=False)
@@ -330,12 +332,17 @@ class DatabricksClient(URLResource):
         else:
             host = self.host
 
+        if not self.cluster_id and not self.serverless_compute_id:
+            self.serverless_compute_id = "auto"
+
         config = Config(
             host=host,
             token=self.token,
             client_id=self.client_id,
             client_secret=self.client_secret,
             account_id=self.account_id,
+            cluster_id=self.cluster_id,
+            serverless_compute_id=self.serverless_compute_id,
             token_audience=self.token_audience,
             azure_workspace_resource_id=self.azure_workspace_resource_id,
             azure_use_msi=self.azure_use_msi,
@@ -794,6 +801,29 @@ class DatabricksClient(URLResource):
             factory=lambda: IAM(client=self),
             use_cache=True,
         )
+
+    def spark_connect(
+        self,
+        create: bool = False,
+    ):
+        try:
+            import databricks.connect
+        except ImportError:
+            runtime_import_module(
+                module_name="databricks.connect",
+                pip_name="databricks-connect",
+                install=True
+            )
+
+        from databricks.connect import DatabricksSession
+
+        session = (
+            DatabricksSession().builder
+            .sdkConfig(self.workspace_config)
+            .getOrCreate()
+        )
+
+        return session
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)

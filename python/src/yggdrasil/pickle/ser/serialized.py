@@ -183,6 +183,19 @@ class Serialized(ABC, Generic[T]):
 
         mod, _ = cls.module_and_name(obj, fallback="unknown")
 
+        if mod.startswith("yggdrasil.io"):
+            from yggdrasil.pickle.ser.media import (
+                MediaTypeSerialized as _MTS,
+                MimeTypeSerialized as _MiTS,
+                CodecSerialized as _CS,
+            )
+            for _ser_cls in (_MTS, _MiTS, _CS):
+                out = _ser_cls.from_python_object(obj, metadata=metadata, codec=codec)
+                if out is not None:
+                    if is_obj:
+                        Tags.register_class(out.__class__, pytype=type(obj))
+                    return out
+
         if mod.startswith("pyarrow"):
             from yggdrasil.pickle.ser.pyarrow import ArrowSerialized
 

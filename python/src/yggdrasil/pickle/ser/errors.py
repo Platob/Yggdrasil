@@ -8,7 +8,7 @@ __all__ = [
 ]
 
 
-class SerializationError(Exception):
+class SerializationError(RuntimeError):
     """Base exception for yggdrasil.pickle.ser."""
 
 

@@ -143,6 +143,14 @@ class Tags:
     LOGGING_LOG_RECORD: int = 219
 
     # ------------------------------------------------------------------
+    # framework-specific internal objects
+    # ------------------------------------------------------------------
+
+    MEDIA_TYPE: int = 300
+    MIME_TYPE: int = 301
+    CODEC: int = 302
+
+    # ------------------------------------------------------------------
     # arrow
     # ------------------------------------------------------------------
 
@@ -287,6 +295,8 @@ class Tags:
             from yggdrasil.pickle.ser.pickles import PickleSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logicals import PathSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logging import LoggingSerialized  # noqa: F401
+        elif cid == 3:
+            from yggdrasil.pickle.ser.media import MediaTypeSerialized  # noqa: F401
         elif cid == 4:
             from yggdrasil.pickle.ser.pyarrow import ArrowSerialized  # noqa: F401
         elif cid == 5:

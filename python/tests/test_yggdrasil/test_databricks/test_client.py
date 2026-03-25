@@ -1,3 +1,5 @@
+from unittest import TestCase
+
 import pytest
 
 import yggdrasil.databricks.client as module_under_test
@@ -270,3 +272,21 @@ def test_is_in_databricks_environment_true(monkeypatch):
 def test_is_in_databricks_environment_false(monkeypatch):
     monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
     assert DatabricksClient.is_in_databricks_environment() is False
+
+
+class TestSparkSession(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = DatabricksClient(host="https://dbc-xxx.cloud.databricks.com/").connect()
+
+    def test_spark_session(self):
+        pytest.importorskip("databricks.connect")
+        spark_session = self.client.spark_connect()
+
+        assert spark_session is not None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+
