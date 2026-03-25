@@ -317,8 +317,9 @@ class CacheConfig(_ConfigBase):
         if not force and not self.local_cache_enabled:
             return None
 
+        anonymized = request.anonymize(mode="remove")
         cache_folder = self.local_cache_folder() / "cache"
-        url = request.url
+        url = anonymized.url
 
         if url.host:
             cache_folder = cache_folder / url.host
@@ -328,7 +329,7 @@ class CacheConfig(_ConfigBase):
             if path_parts:
                 cache_folder = cache_folder.joinpath(*path_parts)
 
-        path = cache_folder / f"{request.xxh3_b64(url_safe=True)}{suffix or '.bin'}"
+        path = cache_folder / f"{anonymized.xxh3_b64(url_safe=True)}{suffix or '.bin'}"
 
         if force:
             return path
@@ -351,7 +352,10 @@ class CacheConfig(_ConfigBase):
         self,
         request: PreparedRequest,
     ) -> dict[str, Any]:
-        return {key: request.match_value(key) for key in (self.request_by or [])}
+        return {
+            key: request.match_value(key)
+            for key in (self.request_by or [])
+        }
 
     def response_values(
         self,

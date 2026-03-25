@@ -7,10 +7,10 @@ import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
-
 import yggdrasil.pickle.ser as pickle
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import restore_dataclass_state, serialize_dataclass_state
@@ -19,6 +19,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
+
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response
@@ -107,7 +108,7 @@ class Session(ABC):
         self,
         request: PreparedRequest,
         cache_cfg: CacheConfig,
-    ) -> tuple[Optional[Response], Optional[Any]]:
+    ) -> tuple[Optional[Response], Optional[Path]]:
         filepath = cache_cfg.local_cache_file(
             request=request,
             suffix=".ypkl",
@@ -135,26 +136,30 @@ class Session(ABC):
         if not cache_cfg.filter_response(loaded, request=request):
             return None, filepath
 
+        LOGGER.debug(
+            "Found local %s %s from %s",
+            request.method, request.url, filepath
+        )
         return loaded, filepath
 
     def _store_local_cached_response(
         self,
-        request: PreparedRequest,
         response: Response,
         cache_cfg: CacheConfig,
         *,
         filepath=None,
     ) -> None:
-        if not cache_cfg.local_cache_enabled or not response.ok:
+        if not response.ok:
             return
 
+        anonymized = response.anonymize(mode=cache_cfg.anonymize)
         target = filepath if filepath else cache_cfg.local_cache_file(
-            request=request,
+            request=anonymized.request,
             suffix=".ypkl",
             force=True
         )
 
-        Job.make(pickle.dump, response, target).fire_and_forget()
+        Job.make(pickle.dump, anonymized, target).fire_and_forget()
 
     def _load_remote_cached_response(
         self,
@@ -189,9 +194,10 @@ class Session(ABC):
         for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
             if cache_cfg.filter_response(response, request=request):
                 LOGGER.debug(
-                    "Found match of %s in %s",
-                    request,
-                    cache_cfg.table
+                    "Found remote %s %s in %s",
+                    request.method,
+                    request.url,
+                    cache_cfg.table,
                 )
                 return response
 
@@ -204,10 +210,11 @@ class Session(ABC):
         *,
         spark_session: Optional["SparkSession"] = None,
     ) -> None:
-        if not cache_cfg.remote_cache_enabled or not response.ok:
+        if not response.ok:
             return
 
         batch = response.anonymize(mode=cache_cfg.anonymize).to_arrow_batch(parse=False)
+
         cache_cfg.table.insert(
             batch,
             mode=cache_cfg.mode,
@@ -265,65 +272,52 @@ class Session(ABC):
         remote_cfg = cfg.remote_cache
         local_cfg = cfg.local_cache
 
-        final_response: Optional[Response] = None
+        # --- 1. Check local cache first (fast, disk-based) ---
         local_filepath = None
+        if local_cfg.local_cache_enabled:
+            local_response, local_filepath = self._load_local_cached_response(request, local_cfg)
+            if local_response is not None:
+                if cfg.raise_error:
+                    local_response.raise_for_status()
+                return local_response
 
-        in_local = False
-        in_remote = False
-
+        # --- 2. Check remote cache (slower, SQL-based) ---
         if remote_cfg.remote_cache_enabled:
-            final_response = self._load_remote_cached_response(
+            remote_response = self._load_remote_cached_response(
                 request,
                 remote_cfg,
                 spark_session=cfg.spark_session,
             )
-            in_remote = final_response is not None
+            if remote_response is not None:
+                # Backfill local cache with the remote hit
+                if local_cfg.local_cache_enabled:
+                    self._store_local_cached_response(
+                        remote_response,
+                        local_cfg,
+                        filepath=local_filepath,
+                    )
+                if cfg.raise_error:
+                    remote_response.raise_for_status()
+                return remote_response
+
+        # --- 3. No cache hit — perform actual request ---
+        LOGGER.debug("Sending %s %s", request.method, request.url)
+        response = self._local_send(request, config=cfg)
+        LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cfg.local_cache_enabled:
-            local_response, local_filepath = self._load_local_cached_response(
-                request,
+            self._store_local_cached_response(
+                response,
                 local_cfg,
+                filepath=local_filepath,
             )
-            in_local = local_response is not None
-            if final_response is None and local_response is not None:
-                final_response = local_response
 
-        if final_response is not None:
-            if in_remote and not in_local and local_cfg.local_cache_enabled:
-                self._store_local_cached_response(
-                    request,
-                    final_response,
-                    local_cfg,
-                    filepath=local_filepath,
-                )
-            elif in_local and not in_remote and remote_cfg.remote_cache_enabled and remote_cfg.table is not None:
-                self._store_remote_cached_response(
-                    final_response,
-                    remote_cfg,
-                    spark_session=cfg.spark_session,
-                )
-
-            if cfg.raise_error:
-                final_response.raise_for_status()
-            return final_response
-
-        response = self._local_send(request, config=cfg)
-
-        if response.ok:
-            if local_cfg.local_cache_enabled:
-                self._store_local_cached_response(
-                    request,
-                    response,
-                    local_cfg,
-                    filepath=local_filepath,
-                )
-
-            if remote_cfg.remote_cache_enabled and remote_cfg.table is not None:
-                self._store_remote_cached_response(
-                    response,
-                    remote_cfg,
-                    spark_session=cfg.spark_session,
-                )
+        if remote_cfg.remote_cache_enabled:
+            self._store_remote_cached_response(
+                response,
+                remote_cfg,
+                spark_session=cfg.spark_session,
+            )
 
         if cfg.raise_error:
             response.raise_for_status()
@@ -377,113 +371,151 @@ class Session(ABC):
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
     ) -> "Iterator[Response] | SparkDataFrame":
-        pool = self.job_pool
-        remote_cfg = config.remote_cache
-        batch_size = config.batch_size or pool.max_workers * 100
-
-        if not remote_cfg.remote_cache_enabled:
+        if not config.remote_cache.remote_cache_enabled:
             yield from self._send_many_local(requests, config)
         else:
-            def _batched(it: Iterator[PreparedRequest], n: int) -> Iterator[list[PreparedRequest]]:
-                iterator = iter(it)
-                while True:
-                    b = list(itertools.islice(iterator, n))
-                    if not b:
-                        break
-                    yield b
+            yield from self._send_many_remote(requests, config)
 
-            for batch in _batched(requests, batch_size):
-                anonymized_batch = [
-                    req.anonymize(mode=remote_cfg.anonymize)
-                    for req in batch
-                ]
+    def _send_many_remote(
+        self,
+        requests: Iterator[PreparedRequest],
+        config: SendManyConfig,
+    ) -> Iterator[Response]:
+        pool = self.job_pool
+        remote_cfg = config.remote_cache
+        local_cfg = config.local_cache
+        batch_size = config.batch_size or pool.max_workers * 100
 
-                query = remote_cfg.make_batch_lookup_sql(
-                    table_name=remote_cfg.table.full_name(safe=True),
-                    requests=anonymized_batch,
-                )
+        def _batched(it: Iterator[PreparedRequest], n: int) -> Iterator[list[PreparedRequest]]:
+            iterator = iter(it)
+            while True:
+                b = list(itertools.islice(iterator, n))
+                if not b:
+                    break
+                yield b
 
-                try:
-                    cache_result = remote_cfg.table.sql.execute(query)
-                except Exception as exc:
-                    if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                        remote_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                        cache_result = remote_cfg.table.sql.execute(query)
-                    else:
-                        raise
-
-                cache_map: dict[tuple[Any, ...], list[Response]] = {}
-
-                for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
-                    key = remote_cfg.request_tuple(response.request)
-                    cache_map.setdefault(key, []).append(response)
-
-                hits: list[Response] = []
-                misses: list[PreparedRequest] = []
-
+        for batch in _batched(requests, batch_size):
+            # --- 1. Check local cache first for each request in the batch ---
+            after_local: list[PreparedRequest] = []
+            if local_cfg.local_cache_enabled:
                 for req in batch:
-                    key = remote_cfg.request_tuple(req.anonymize(mode=remote_cfg.anonymize))
-
-                    candidates = cache_map.get(key)
-                    if candidates:
-                        hits.append(candidates[0])
+                    local_response, _ = self._load_local_cached_response(req, local_cfg)
+                    if local_response is not None:
+                        yield local_response
                     else:
-                        misses.append(req)
+                        after_local.append(req)
+                local_hits = len(batch) - len(after_local)
+                if local_hits:
+                    LOGGER.debug(
+                        "Batch local cache: %s/%s hits",
+                        local_hits,
+                        len(batch),
+                    )
+            else:
+                after_local = batch
 
-                yield from hits
+            if not after_local:
+                continue
 
-                if not misses:
-                    continue
+            # --- 2. Batch lookup in remote cache ---
+            anonymized_batch = [
+                req.anonymize(mode=remote_cfg.anonymize)
+                for req in after_local
+            ]
 
-                miss_send_config = config.to_send_config(
-                    with_remote_cache=False,
-                    with_local_cache=True,
-                    with_spark=False,
+            query = remote_cfg.make_batch_lookup_sql(
+                table_name=remote_cfg.table.full_name(safe=True),
+                requests=anonymized_batch,
+            )
+
+            try:
+                cache_result = remote_cfg.table.sql.execute(query)
+            except Exception as exc:
+                if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+                    remote_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                    cache_result = remote_cfg.table.sql.execute(query)
+                else:
+                    raise
+
+            cache_map: dict[tuple[Any, ...], Response] = {}
+            for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
+                key = remote_cfg.request_tuple(response.request)
+                cache_map[key] = response
+
+            remote_hits: list[tuple[PreparedRequest, Response]] = []
+            remote_misses: list[PreparedRequest] = []
+
+            for req in after_local:
+                key = remote_cfg.request_tuple(req.anonymize(mode=remote_cfg.anonymize))
+                candidate = cache_map.get(key)
+                if candidate is not None:
+                    remote_hits.append(candidate)
+                else:
+                    remote_misses.append(req)
+
+            # --- 3. Yield remote hits and backfill local cache ---
+            if remote_hits:
+                LOGGER.debug(
+                    "Batch remote cache: %s/%s hits (table=%s)",
+                    len(remote_hits),
+                    len(after_local),
+                    remote_cfg.table.full_name(safe=True),
+                )
+            for remote_hit in remote_hits:
+                if local_cfg.local_cache_enabled:
+                    self._store_local_cached_response(remote_hit, local_cfg)
+                yield remote_hit
+
+            if not remote_misses:
+                continue
+
+            # --- 4. Send misses (local cache only; remote written in batch below) ---
+            miss_send_config = config.to_send_config(
+                with_remote_cache=False,
+                with_local_cache=True,
+                with_spark=False,
+            )
+            to_insert: list[Response] = []
+            failed: list[Response] = []
+
+            for result in pool.as_completed(
+                (
+                    Job.make(self.send, r, miss_send_config)
+                    for r in remote_misses
+                ),
+                ordered=config.ordered,
+                max_in_flight=config.max_in_flight,
+                cancel_on_exit=False,
+                shutdown_on_exit=False,
+                raise_error=True,
+            ):
+                response: Response = result.result
+                if response.ok:
+                    to_insert.append(response)
+                    yield response
+                elif config.raise_error:
+                    failed.append(response)
+
+            if to_insert:
+                LOGGER.debug(
+                    "Persisting %s responses in remote cache %s",
+                    len(to_insert),
+                    remote_cfg.table,
+                )
+                batches = [
+                    response.anonymize(mode=remote_cfg.anonymize).to_arrow_batch(parse=False)
+                    for response in to_insert
+                ]
+                combined = pa.Table.from_batches(batches).combine_chunks()
+                remote_cfg.table.insert(
+                    combined,
+                    mode=remote_cfg.mode,
+                    match_by=remote_cfg.by or None,
+                    wait=remote_cfg.wait,
                 )
 
-                def _miss_jobs() -> Iterator[Job]:
-                    for req in misses:
-                        yield Job.make(self.send, req, miss_send_config)
-
-                to_insert: list[Response] = []
-                failed: list[Response] = []
-
-                for result in pool.as_completed(
-                    _miss_jobs(),
-                    ordered=config.ordered,
-                    max_in_flight=config.max_in_flight,
-                    cancel_on_exit=False,
-                    shutdown_on_exit=False,
-                    raise_error=True,
-                ):
-                    response: Response = result.result
-                    if response.ok:
-                        to_insert.append(response)
-                        yield response
-                    elif config.raise_error:
-                        failed.append(response)
-
-                if to_insert:
-                    LOGGER.debug(
-                        "Persisting %s send_many responses to remote cache table=%s",
-                        len(to_insert),
-                        remote_cfg.table.full_name(safe=True),
-                    )
-                    batches = [
-                        response.anonymize(mode=remote_cfg.anonymize).to_arrow_batch(parse=False)
-                        for response in to_insert
-                    ]
-                    combined = pa.Table.from_batches(batches).combine_chunks()
-
-                    remote_cfg.table.insert(
-                        combined,
-                        mode=remote_cfg.mode,
-                        match_by=remote_cfg.by or None,
-                        wait=remote_cfg.wait,
-                    )
-
-                if config.raise_error and failed:
-                    failed[-1].raise_for_status()
+            if config.raise_error and failed:
+                failed[-1].raise_for_status()
 
     def _send_many_local(
         self,
@@ -497,12 +529,8 @@ class Session(ABC):
             with_spark=False,
         )
 
-        def _uncached_jobs() -> Iterator[Job]:
-            for req in requests:
-                yield Job.make(self.send, req, send_config)
-
         for result in pool.as_completed(
-            _uncached_jobs(),
+            (Job.make(self.send, r, send_config) for r in requests),
             ordered=config.ordered,
             max_in_flight=config.max_in_flight or self.pool_maxsize,
             cancel_on_exit=False,
@@ -523,8 +551,13 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "GET",
@@ -534,8 +567,13 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def post(
@@ -548,8 +586,13 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "POST",
@@ -560,8 +603,13 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def put(
@@ -574,8 +622,13 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "PUT",
@@ -586,8 +639,13 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def patch(
@@ -600,8 +658,13 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "PATCH",
@@ -612,8 +675,13 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def delete(
@@ -626,8 +694,13 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "DELETE",
@@ -638,8 +711,13 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def head(
@@ -651,10 +729,14 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = False,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
-        send_kwargs.setdefault("stream", False)
         return self.request(
             "HEAD",
             url,
@@ -663,8 +745,13 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def options(
@@ -677,8 +764,13 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
         normalize: bool = True,
-        **send_kwargs: Any,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
         return self.request(
             "OPTIONS",
@@ -689,8 +781,13 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
+            before_send=before_send,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
             normalize=normalize,
-            **send_kwargs,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
         )
 
     def request(

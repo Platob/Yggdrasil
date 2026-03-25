@@ -176,29 +176,51 @@ class PreparedRequest:
         normalize: bool = True,
         prefix: str = "request_",
     ) -> "PreparedRequest":
-        if isinstance(obj, (str, bytes)):
-            obj = json_module.loads(obj)
+        if isinstance(obj, str):
+            obj = {
+                "url": URL.parse_str(obj, normalize=normalize)
+            }
 
         if isinstance(obj, Mapping):
-            return cls.parse_dict(obj, normalize=normalize, prefix=prefix)
+            return cls.parse_mapping(obj, normalize=normalize, prefix=prefix)
 
         raise ValueError(f"Cannot make {cls.__name__} from {type(obj)}")
 
     @classmethod
-    def parse_dict(
+    def parse_mapping(
         cls,
         obj: Mapping[str, Any],
         *,
         normalize: bool = True,
         prefix: str = "request_",
     ) -> "PreparedRequest":
+        method = cls._parse_method(obj, prefix=prefix)
+        url = cls._parse_url(obj, normalize=normalize, prefix=prefix)
+        headers = cls._parse_headers(obj, prefix=prefix)
+        tags = cls._parse_tags(obj, prefix=prefix)
+        buffer = cls._parse_buffer(obj, prefix=prefix)
+        sent_at = cls._parse_sent_at_timestamp(obj, prefix=prefix)
+
+        if cls is PreparedRequest:
+            if url.is_http:
+                from .http_ import HTTPRequest
+
+                return HTTPRequest(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    tags=tags,
+                    buffer=buffer,
+                    sent_at=sent_at
+                )
+
         return cls(
-            method=cls._parse_method(obj, prefix=prefix),
-            url=cls._parse_url(obj, normalize=normalize, prefix=prefix),
-            headers=cls._parse_headers(obj, prefix=prefix),
-            tags=cls._parse_tags(obj, prefix=prefix),
-            buffer=cls._parse_buffer(obj, prefix=prefix),
-            sent_at=cls._parse_sent_at_timestamp(obj, prefix=prefix),
+            method=method,
+            url=url,
+            headers=headers,
+            tags=tags,
+            buffer=buffer,
+            sent_at=sent_at
         )
 
     @staticmethod
@@ -353,7 +375,14 @@ class PreparedRequest:
         if request_body is not None:
             out_headers["Content-Length"] = str(request_body.size)
 
-        built = cls(
+        out_class = cls
+
+        if cls is PreparedRequest:
+            if parsed_url.is_http:
+                from .http_ import HTTPRequest
+                out_class = HTTPRequest
+
+        built = out_class(
             method=str(method),
             url=parsed_url,
             headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
@@ -624,6 +653,9 @@ class PreparedRequest:
         return self
 
     def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "PreparedRequest":
+        if not mode:
+            return self
+
         return replace(
             self,
             headers=normalize_headers(
@@ -724,7 +756,7 @@ class PreparedRequest:
         sent_at_value = _get("request_sent_at")
         sent_at_timestamp = any_to_datetime(sent_at_value)
 
-        return cls.parse_dict(
+        return cls.parse_mapping(
             {
                 "method": _get("request_method") or "GET",
                 "url_str": url_val,

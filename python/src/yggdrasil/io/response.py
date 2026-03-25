@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import warnings
-from dataclasses import MISSING, dataclass, replace
+from dataclasses import MISSING, dataclass, replace, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import pyarrow as pa
@@ -400,10 +400,10 @@ _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
 class Response:
     request: PreparedRequest
     status_code: int
-    headers: MutableMapping[str, str]
-    tags: MutableMapping[str, str]
-    buffer: BytesIO
-    received_at: dt.datetime
+    headers: MutableMapping[str, str] = field(compare=False, hash=False, repr=False)
+    tags: MutableMapping[str, str] = field(compare=False, hash=False, repr=False)
+    buffer: BytesIO = field(compare=False, hash=False, repr=False)
+    received_at: dt.datetime = field(compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
         self.status_code = int(self.status_code)
@@ -703,6 +703,9 @@ class Response:
     # ------------------------------------------------------------------
 
     def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "Response":
+        if not mode:
+            return self
+
         return replace(
             self,
             request=self.request.anonymize(mode=mode),
@@ -775,6 +778,8 @@ class Response:
             for df in mio.read_polars_frames(lazy=lazy, **media_options):
                 yield df
         else:
+            from yggdrasil.polars.lib import polars as _pl
+
             yield _pl.from_arrow(self.to_arrow_batch(parse=False))
 
     def to_polars(
@@ -856,9 +861,6 @@ class Response:
         cls,
         batch: pa.RecordBatch | pa.Table | Iterator[pa.RecordBatch | pa.Table],
     ) -> Iterator["Response"]:
-        req_cols = [f.name for f in REQUEST_ARROW_SCHEMA]
-        resp_cols = [f.name for f in BASE_ARROW_SCHEMA]
-
         def _iter_batches(
             obj: pa.RecordBatch | pa.Table | Iterator[pa.RecordBatch | pa.Table]
         ) -> Iterator[pa.RecordBatch]:

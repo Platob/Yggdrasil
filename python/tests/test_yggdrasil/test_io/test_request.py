@@ -16,7 +16,7 @@ def _rb_row(batch) -> dict[str, Any]:
 
 
 def test_parse_dict_minimal_defaults() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_url_str": "https://example.com/a?x=1",
         }
@@ -31,7 +31,7 @@ def test_parse_dict_minimal_defaults() -> None:
 
 
 def test_parse_dict_from_flattened_url_parts() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_method": "POST",
             "request_url_scheme": "https",
@@ -54,11 +54,11 @@ def test_parse_dict_from_flattened_url_parts() -> None:
 
 def test_parse_dict_missing_url_raises() -> None:
     with pytest.raises(ValueError, match="missing url/url_str/request_url_str"):
-        PreparedRequest.parse_dict({"request_method": "GET"})
+        PreparedRequest.parse_mapping({"request_method": "GET"})
 
 
 def test_parse_dict_headers_from_mapping() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_url_str": "https://example.com",
             "request_headers": {
@@ -73,7 +73,7 @@ def test_parse_dict_headers_from_mapping() -> None:
 
 
 def test_parse_dict_headers_from_promoted_fields() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_url_str": "https://example.com",
             "request_content_type": "application/json",
@@ -90,7 +90,7 @@ def test_parse_dict_headers_from_promoted_fields() -> None:
 
 
 def test_parse_dict_respects_custom_prefix() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "foo_url_str": "https://example.com",
             "foo_headers": {"X-Test": "1"},
@@ -105,7 +105,7 @@ def test_parse_dict_respects_custom_prefix() -> None:
 
 
 def test_parse_dict_tags_and_buffer() -> None:
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_url_str": "https://example.com",
             "request_tags": {"a": 1, "b": "two"},
@@ -121,7 +121,7 @@ def test_parse_dict_tags_and_buffer() -> None:
 def test_parse_dict_sent_at_accepts_datetime() -> None:
     ts = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
 
-    req = PreparedRequest.parse_dict(
+    req = PreparedRequest.parse_mapping(
         {
             "request_url_str": "https://example.com",
             "request_sent_at": ts,

@@ -196,6 +196,7 @@ class URL:
 
     _str_enc: str | None = field(default=None, init=False, repr=False, compare=False)
     _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
+    _anonymized: bool | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def empty(cls) -> "URL":
@@ -548,18 +549,25 @@ class URL:
         *,
         sort_keys: bool = True,
     ) -> URL:
-        result = self
+        if self._anonymized:
+            return self
 
-        if self.query:
-            current = self.query_dict
-            anonymized = anonymize_parameters(current, mode=mode)
-            if anonymized != current:
-                result = result.with_query_items(anonymized, sort_keys=sort_keys)
+        if self._anonymized is None:
+            result = self
 
-        if self.userinfo:
-            result = result.with_userinfo("<redacted>" if mode == "redact" else None)
+            if self.query:
+                current = self.query_dict
+                anonymized = anonymize_parameters(current, mode=mode)
+                if anonymized != current:
+                    result = result.with_query_items(anonymized, sort_keys=sort_keys)
 
-        return result
+            if self.userinfo:
+                result = result.with_userinfo("<redacted>" if mode == "redact" else None)
+
+            object.__setattr__(result, "_anonymized", True)
+            return result
+
+        return self
 
 
 class URLResource(ABC):

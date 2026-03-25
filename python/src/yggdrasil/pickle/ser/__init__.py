@@ -191,12 +191,6 @@ def load(
                 return default
         raise
 
-    LOGGER.debug(
-        "Loaded %s from %s",
-        read,
-        fp
-    )
-
     if unpickle:
         return read.as_python()
     return read
