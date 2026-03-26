@@ -29,6 +29,8 @@ __all__ = [
 ]
 
 _TIMEZONE_ALIASES: dict[str, str] = {
+    "UTC": "UTC",
+    "ETC/UTC": "UTC",
     "+00:00": "UTC",
     "-00:00": "UTC",
     "GMT": "UTC",
@@ -58,6 +60,11 @@ _TIMEZONE_ALIASES: dict[str, str] = {
 }
 
 _OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
+
+
+@lru_cache(maxsize=1)
+def _available_timezones_cached() -> frozenset[str]:
+    return frozenset(available_timezones())
 
 
 @dataclass(slots=True, frozen=True)
@@ -123,7 +130,7 @@ class Timezone:
         if isinstance(obj, cls):
             return obj
         if obj is None:
-            return cls("UTC")
+            return cls.UTC
         if isinstance(obj, ZoneInfo):
             return cls(obj.key)
         if isinstance(obj, str):
@@ -152,7 +159,7 @@ class Timezone:
             raise ValueError("Timezone string cannot be empty")
 
         # Exact IANA timezone
-        if raw in available_timezones():
+        if raw in _available_timezones_cached():
             return cls(raw)
 
         upper = raw.upper()
@@ -365,8 +372,15 @@ class Timezone:
 
         if return_value != "iana":
             raise ValueError(f"Unsupported return_value: {return_value!r}")
+        if not isinstance(col, (pl.Series, pl.Expr)):
+            raise TypeError(f"Expected polars.Series | polars.Expr, got {type(col).__name__}")
 
-        return col.replace_strict(_TIMEZONE_ALIASES, default=None)
+        normalized = (
+            col.cast(pl.Utf8)
+            .str.strip_chars()
+            .str.to_uppercase()
+        )
+        return normalized.replace_strict(_TIMEZONE_ALIASES, default=None)
 
     # ── Arrow integration ────────────────────────────────────────────────────
 
@@ -399,7 +413,7 @@ class Timezone:
     @classmethod
     def all_iana(cls) -> frozenset[str]:
         """Return all IANA timezone identifiers available on this system."""
-        return frozenset(available_timezones())
+        return _available_timezones_cached()
 
 
 # ── Class-level constants (can't be set inside a frozen dataclass body) ──────
@@ -413,4 +427,3 @@ Timezone.MOUNTAIN = Timezone("America/Denver")
 Timezone.PACIFIC = Timezone("America/Los_Angeles")
 Timezone.JST = Timezone("Asia/Tokyo")
 Timezone.SGT = Timezone("Asia/Singapore")
-
