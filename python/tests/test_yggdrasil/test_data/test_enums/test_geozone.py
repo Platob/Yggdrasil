@@ -25,7 +25,7 @@ from typing import Any
 import polars as pl
 import pytest
 
-from yggdrasil.data.enums.geozone import GeoZone, GeoZoneType
+from yggdrasil.data.enums.geozone import GeoZone, GeoZoneType, load_geozones
 
 
 # ---------------------------------------------------------------------------
@@ -2088,3 +2088,15 @@ class TestPyParseStrDataclass:
         with pytest.raises((AttributeError, TypeError)):
             result.key = "MUTATED"  # type: ignore[misc]
 
+
+
+class TestLoadedCountryZones:
+    def test_country_zone_attrs_are_loaded(self) -> None:
+        load_geozones()
+        assert GeoZone.GREAT_BRITAIN.key == "GREAT_BRITAIN"
+        assert GeoZone.NORTHERN_IRELAND.country_iso == "GB"
+
+    def test_country_zone_aliases_resolve(self) -> None:
+        load_geozones()
+        assert GeoZone.parse_str("britain") is GeoZone.GREAT_BRITAIN
+        assert GeoZone.parse_str("north_ireland") is GeoZone.NORTHERN_IRELAND

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, InitVar
 from functools import lru_cache
 from typing import Any, ClassVar, Optional, TYPE_CHECKING, Literal
 
@@ -91,6 +91,7 @@ class _ZoneMeta:
         "country_iso", "country_name",
         "city_iso", "city_name",
         "tz", "ccy",
+        "lat", "lon",
     )
 
     def __init__(
@@ -107,6 +108,8 @@ class _ZoneMeta:
         city_name: Optional[str],
         tz: Optional[str],
         ccy: Optional[str],
+        lat: float,
+        lon: float,
     ) -> None:
         self.wkb          = wkb
         self.srid         = srid
@@ -120,14 +123,8 @@ class _ZoneMeta:
         self.city_name    = city_name
         self.tz           = tz
         self.ccy          = ccy
-
-    @property
-    def lat(self) -> float:
-        return _parse_point_wkb(self.wkb)[0]
-
-    @property
-    def lon(self) -> float:
-        return _parse_point_wkb(self.wkb)[1]
+        self.lat          = lat
+        self.lon          = lon
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +140,7 @@ class GeoZone:
     city_name: Optional[str] = None
 
     key: Optional[str] = None
-    aliases: tuple[str, ...] = ()
+    aliases: InitVar[tuple[str, ...]] = ()
 
     name: Optional[str] = None
     eic: Optional[str] = None
@@ -160,8 +157,10 @@ class GeoZone:
     CACHE_BY_KEY:  ClassVar[dict[str, "GeoZone"]]   = {}
     CACHE_BY_NAME: ClassVar[dict[str, "GeoZone"]]   = {}
     CACHE_BY_GEOM: ClassVar[dict[bytes, "GeoZone"]] = {}
+    CACHE_ALIASES_BY_GEOM: ClassVar[dict[bytes, tuple[str, ...]]] = {}
+    _INIT_ALIASES_BY_ID: ClassVar[dict[int, tuple[str, ...]]] = {}
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, aliases: tuple[str, ...]) -> None:
         if not isinstance(self.wkb, (bytes, bytearray, memoryview)):
             raise TypeError("wkb must be bytes-like")
 
@@ -173,9 +172,9 @@ class GeoZone:
         if srid < 0:
             raise ValueError(f"srid must be >= 0, got {srid}")
 
-        aliases = tuple(
+        norm_aliases = tuple(
             alias
-            for alias in (self._norm_upper(x) for x in self.aliases)
+            for alias in (self._norm_upper(x) for x in aliases)
             if alias
         )
 
@@ -198,13 +197,19 @@ class GeoZone:
         object.__setattr__(self, "city_iso", self._norm_upper(self.city_iso))
         object.__setattr__(self, "city_name", self._norm_text(self.city_name))
         object.__setattr__(self, "key", self._norm_upper(self.key))
-        object.__setattr__(self, "aliases", aliases)
         object.__setattr__(self, "name", self._norm_text(self.name))
         object.__setattr__(self, "eic", self._norm_upper(self.eic))
         object.__setattr__(self, "tz", self._norm_text(self.tz))
         object.__setattr__(self, "ccy", self._norm_upper(self.ccy))
         object.__setattr__(self, "lat", parsed_lat)
         object.__setattr__(self, "lon", parsed_lon)
+        self.__class__._INIT_ALIASES_BY_ID[id(self)] = norm_aliases
+
+    def _get_aliases(self) -> tuple[str, ...]:
+        cached = self.CACHE_ALIASES_BY_GEOM.get(self.geom_key)
+        if cached is not None:
+            return cached
+        return self._INIT_ALIASES_BY_ID.get(id(self), ())
 
     @property
     def geom_key(self) -> bytes:
@@ -262,8 +267,10 @@ class GeoZone:
     @classmethod
     def put(cls, zone: "GeoZone") -> "GeoZone":
         cls.CACHE_BY_GEOM[zone.geom_key] = zone
+        aliases = cls._INIT_ALIASES_BY_ID.pop(id(zone), ())
+        cls.CACHE_ALIASES_BY_GEOM[zone.geom_key] = aliases
 
-        keys: set[str] = set(zone.aliases)
+        keys: set[str] = set(aliases)
 
         if zone.key:
             keys.add(zone.key)
@@ -320,6 +327,8 @@ class GeoZone:
         cls.CACHE_BY_KEY.clear()
         cls.CACHE_BY_NAME.clear()
         cls.CACHE_BY_GEOM.clear()
+        cls.CACHE_ALIASES_BY_GEOM.clear()
+        cls._INIT_ALIASES_BY_ID.clear()
         cls._build_bidding_zone_regex_cache.cache_clear()
         cls._build_bin_lookup_cache.cache_clear()
 
@@ -519,6 +528,8 @@ class GeoZone:
                 city_name=zone.city_name,
                 tz=zone.tz,
                 ccy=zone.ccy,
+                lat=zone.lat,
+                lon=zone.lon,
             )
 
         def _index_zone(zone: "GeoZone") -> None:
@@ -668,6 +679,44 @@ class GeoZone:
         return None
 
     @classmethod
+    def _null_point(cls) -> dict[str, None]:
+        return {"lat": None, "lon": None}
+
+    @classmethod
+    def _null_struct(cls) -> dict[str, None]:
+        return {
+            "gtype": None, "wkb": None, "srid": None,
+            "country_iso": None, "country_name": None,
+            "city_iso": None, "city_name": None,
+            "key": None, "name": None, "eic": None,
+            "tz": None, "ccy": None, "lat": None, "lon": None,
+        }
+
+    @classmethod
+    def _meta_to_struct(
+        cls,
+        meta: "_ZoneMeta",
+        *,
+        canonical_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return {
+            "gtype": meta.gtype,
+            "wkb": meta.wkb,
+            "srid": meta.srid,
+            "country_iso": meta.country_iso,
+            "country_name": meta.country_name,
+            "city_iso": meta.city_iso,
+            "city_name": meta.city_name,
+            "key": canonical_key if canonical_key is not None else meta.key,
+            "name": meta.name,
+            "eic": meta.eic,
+            "tz": meta.tz,
+            "ccy": meta.ccy,
+            "lat": meta.lat,
+            "lon": meta.lon,
+        }
+
+    @classmethod
     def _zone_field_from_key(
         cls,
         canonical_key: Optional[str],
@@ -676,20 +725,11 @@ class GeoZone:
         key_to_meta: "dict[str, _ZoneMeta]",
     ) -> Any:
         """Return the requested field value for *canonical_key*, or *None*."""
-        _NULL_POINT  = {"lat": None, "lon": None}
-        _NULL_STRUCT = {
-            "gtype": None, "wkb": None, "srid": None,
-            "country_iso": None, "country_name": None,
-            "city_iso": None, "city_name": None,
-            "key": None, "name": None, "eic": None,
-            "tz": None, "ccy": None, "lat": None, "lon": None,
-        }
-
         if canonical_key is None:
             if return_value == "point":
-                return _NULL_POINT
+                return cls._null_point()
             if return_value == "struct":
-                return _NULL_STRUCT
+                return cls._null_struct()
             return None
 
         if return_value == "dataclass":
@@ -698,9 +738,9 @@ class GeoZone:
         meta = key_to_meta.get(canonical_key)
         if meta is None:
             if return_value == "point":
-                return _NULL_POINT
+                return cls._null_point()
             if return_value == "struct":
-                return _NULL_STRUCT
+                return cls._null_struct()
             return None
 
         if return_value == "wkb":
@@ -713,27 +753,10 @@ class GeoZone:
             return meta.city_iso
 
         if return_value == "point":
-            lat, lon = _parse_point_wkb(meta.wkb)
-            return {"lat": lat, "lon": lon}
+            return {"lat": meta.lat, "lon": meta.lon}
 
         if return_value == "struct":
-            lat, lon = _parse_point_wkb(meta.wkb)
-            return {
-                "gtype": meta.gtype,
-                "wkb": meta.wkb,
-                "srid": meta.srid,
-                "country_iso": meta.country_iso,
-                "country_name": meta.country_name,
-                "city_iso": meta.city_iso,
-                "city_name": meta.city_name,
-                "key": canonical_key,
-                "name": meta.name,
-                "eic": meta.eic,
-                "tz": meta.tz,
-                "ccy": meta.ccy,
-                "lat": lat,
-                "lon": lon,
-            }
+            return cls._meta_to_struct(meta, canonical_key=canonical_key)
 
         raise ValueError(
             f"return_value must be one of 'wkb', 'country_iso', 'city_iso', 'point', 'struct', 'dataclass';"
@@ -766,15 +789,9 @@ class GeoZone:
         """
         if value is None:
             if return_value == "point":
-                return {"lat": None, "lon": None}
+                return cls._null_point()
             if return_value == "struct":
-                return {
-                    "gtype": None, "wkb": None, "srid": None,
-                    "country_iso": None, "country_name": None,
-                    "city_iso": None, "city_name": None,
-                    "key": None, "name": None, "eic": None,
-                    "tz": None, "ccy": None, "lat": None, "lon": None,
-                }
+                return cls._null_struct()
             return None
 
         _chunk_patterns, _alias_to_key, key_to_meta = cls._build_bidding_zone_regex_cache()
@@ -813,15 +830,9 @@ class GeoZone:
 
         if value is None:
             if return_value == "point":
-                return {"lat": None, "lon": None}
+                return cls._null_point()
             if return_value == "struct":
-                return {
-                    "gtype": None, "wkb": None, "srid": None,
-                    "country_iso": None, "country_name": None,
-                    "city_iso": None, "city_name": None,
-                    "key": None, "name": None, "eic": None,
-                    "tz": None, "ccy": None, "lat": None, "lon": None,
-                }
+                return cls._null_struct()
             return None
 
         wkb_to_meta, known_wkb = cls._build_bin_lookup_cache()
@@ -847,36 +858,13 @@ class GeoZone:
 
         if return_value == "point":
             if meta is None:
-                return {"lat": None, "lon": None}
-            lat, lon = _parse_point_wkb(meta.wkb)
-            return {"lat": lat, "lon": lon}
+                return cls._null_point()
+            return {"lat": meta.lat, "lon": meta.lon}
 
         # return_value == "struct"
         if meta is None:
-            return {
-                "gtype": None, "wkb": None, "srid": None,
-                "country_iso": None, "country_name": None,
-                "city_iso": None, "city_name": None,
-                "key": None, "name": None, "eic": None,
-                "tz": None, "ccy": None, "lat": None, "lon": None,
-            }
-        lat, lon = _parse_point_wkb(meta.wkb)
-        return {
-            "gtype": meta.gtype,
-            "wkb": meta.wkb,
-            "srid": meta.srid,
-            "country_iso": meta.country_iso,
-            "country_name": meta.country_name,
-            "city_iso": meta.city_iso,
-            "city_name": meta.city_name,
-            "key": meta.key,
-            "name": meta.name,
-            "eic": meta.eic,
-            "tz": meta.tz,
-            "ccy": meta.ccy,
-            "lat": lat,
-            "lon": lon,
-        }
+            return cls._null_struct()
+        return cls._meta_to_struct(meta)
 
     @classmethod
     def _build_output_expr_from_key(
@@ -906,8 +894,8 @@ class GeoZone:
             return ck.replace_strict(key_to_city_iso, default=None).cast(pl.Utf8)
 
         if return_value == "point":
-            key_to_lat = {k: _parse_point_wkb(m.wkb)[0] for k, m in key_to_meta.items()}
-            key_to_lon = {k: _parse_point_wkb(m.wkb)[1] for k, m in key_to_meta.items()}
+            key_to_lat = {k: m.lat for k, m in key_to_meta.items()}
+            key_to_lon = {k: m.lon for k, m in key_to_meta.items()}
             lat_expr = ck.replace_strict(key_to_lat, default=None).cast(pl.Float64)
             lon_expr = ck.replace_strict(key_to_lon, default=None).cast(pl.Float64)
             return pl.struct(lat=lat_expr, lon=lon_expr)
@@ -1101,8 +1089,8 @@ class GeoZone:
                 return b.replace_strict(wkb_to_city_iso, default=None).cast(pl.Utf8)
 
             if return_value == "point":
-                wkb_to_lat = {w: _parse_point_wkb(w)[0] for w in known_wkb}
-                wkb_to_lon = {w: _parse_point_wkb(w)[1] for w in known_wkb}
+                wkb_to_lat = {w: m.lat for w, m in wkb_to_meta.items()}
+                wkb_to_lon = {w: m.lon for w, m in wkb_to_meta.items()}
                 lat_expr = b.replace_strict(wkb_to_lat, default=None).cast(pl.Float64)
                 lon_expr = b.replace_strict(wkb_to_lon, default=None).cast(pl.Float64)
                 return pl.struct(lat=lat_expr, lon=lon_expr)
@@ -1120,8 +1108,8 @@ class GeoZone:
                 wkb_to_eic          = {w: m.eic          for w, m in wkb_to_meta.items()}
                 wkb_to_tz           = {w: m.tz           for w, m in wkb_to_meta.items()}
                 wkb_to_ccy          = {w: m.ccy          for w, m in wkb_to_meta.items()}
-                wkb_to_lat          = {w: _parse_point_wkb(w)[0] for w in known_wkb}
-                wkb_to_lon          = {w: _parse_point_wkb(w)[1] for w in known_wkb}
+                wkb_to_lat          = {w: m.lat for w, m in wkb_to_meta.items()}
+                wkb_to_lon          = {w: m.lon for w, m in wkb_to_meta.items()}
                 return pl.struct(
                     # Field order mirrors GeoZone dataclass declaration exactly.
                     gtype=b.replace_strict(wkb_to_gtype, default=None).cast(pl.Int32),
@@ -1155,3 +1143,8 @@ class GeoZone:
             return col.to_frame().select(expr).to_series()
 
         raise TypeError(f"expected pl.Series | pl.Expr, got {type(col)!r}")
+
+
+# aliases are accepted in __init__ (InitVar) but stored in side caches, not on
+# the dataclass instance itself.
+GeoZone.aliases = property(GeoZone._get_aliases)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .cities import load_cities
 from .core import load_core_geozones
+from .country_zones import load_country_zones
 from .countries import load_countries
 from .geozone import GeoZone
 from .mountains import load_mountains
@@ -19,6 +20,7 @@ def load_geozones() -> None:
     load_cities()
     load_entsoe_zones()
     load_market_zones()
+    load_country_zones()
     load_mountains()
 
     # convenience aliases
