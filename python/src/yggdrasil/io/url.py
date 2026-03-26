@@ -69,8 +69,8 @@ def _encode_userinfo(userinfo: str) -> str:
     return quote(userinfo, safe=":!$&'()*+,;=") if userinfo else ""
 
 
-def _encode_path(path: str) -> str:
-    return quote(path, safe=_SAFE_PATH + "%")
+def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
+    return quote(path, safe=safe + "%")
 
 
 def _encode_query(query: str) -> str:
@@ -203,8 +203,8 @@ class URL:
         return _EMPTY_URL
 
     @staticmethod
-    def path_encode(path: str) -> str:
-        return _encode_path(path)
+    def path_encode(path: str, safe: str = _SAFE_PATH) -> str:
+        return _encode_path(path, safe=safe)
 
     @classmethod
     def parse(
