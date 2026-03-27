@@ -15,7 +15,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeType
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
-from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
+from .request import PreparedRequest, REQUEST_ARROW_SCHEMA, _build_metadata, _field
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -297,85 +297,193 @@ _HOP_BY_HOP: frozenset[str] = frozenset({
 # Arrow schemas
 # ---------------------------------------------------------------------------
 
+_RESPONSE_BASE_SCHEMA_JSON_TAGS: dict[str, str] = {
+    "domain": "http",
+    "entity": "response",
+    "layer": "bronze",
+    "namespace": "yggdrasil.io.response",
+}
+
+_RESPONSE_COMBINED_SCHEMA_JSON_TAGS: dict[str, str] = {
+    "domain": "http",
+    "entity": "response",
+    "layer": "bronze",
+    "namespace": "yggdrasil.io.response"
+}
+
 BASE_ARROW_SCHEMA = pa.schema(
     [
-        pa.field(
+        _field(
             "response_status_code",
             pa.int32(),
             nullable=False,
-            metadata={"comment": "HTTP status code returned by the server"},
+            comment="HTTP status code returned by the server",
+            json_tags={
+                "entity": "response",
+                "group": "status",
+                "semantic_type": "http_status_code",
+                "dimension": "low_cardinality",
+            },
         ),
-        pa.field("response_host", pa.string(), nullable=True, metadata={"comment": "Host header"}),
-        pa.field("response_user_agent", pa.string(), nullable=True, metadata={"comment": "User-Agent header"}),
-        pa.field("response_accept", pa.string(), nullable=True, metadata={"comment": "Accept header"}),
-        pa.field("response_accept_encoding", pa.string(), nullable=True, metadata={"comment": "Accept-Encoding header"}),
-        pa.field("response_accept_language", pa.string(), nullable=True, metadata={"comment": "Accept-Language header"}),
-        pa.field("response_content_type", pa.string(), nullable=True, metadata={"comment": "Content-Type header"}),
-        pa.field(
+        _field(
+            "response_host",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Host header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+                "semantic_type": "host_header",
+            },
+        ),
+        _field(
+            "response_user_agent",
+            pa.string(),
+            nullable=True,
+            comment="HTTP User-Agent header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
+            "response_accept",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Accept header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
+            "response_accept_encoding",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Accept-Encoding header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
+            "response_accept_language",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Accept-Language header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
+            "response_content_type",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Content-Type header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
             "response_content_length",
             pa.int64(),
             nullable=False,
-            metadata={"comment": "Content-Length header parsed as integer"},
+            comment="HTTP Content-Length header parsed as integer",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
         ),
-        pa.field("response_content_encoding", pa.string(), nullable=True, metadata={"comment": "Content-Encoding header"}),
-        pa.field("response_transfer_encoding", pa.string(), nullable=True, metadata={"comment": "Transfer-Encoding header"}),
-        pa.field(
+        _field(
+            "response_content_encoding",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Content-Encoding header",
+            json_tags={
+                "entity": "response",
+                "group": "headers_promoted",
+            },
+        ),
+        _field(
+            "response_transfer_encoding",
+            pa.string(),
+            nullable=True,
+            comment="HTTP Transfer-Encoding header",
+            json_tags={
+                "entity": "response",
+            },
+        ),
+        _field(
             "response_headers",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
-            metadata={
-                "comment": "Response headers excluding promoted common headers",
-                "keys_sorted": "false",
+            comment="Response headers excluding promoted common headers",
+            json_tags={
+                "entity": "response",
+                "group": "headers",
             },
+            keys_sorted="false",
         ),
-        pa.field(
+        _field(
             "response_tags",
             pa.map_(pa.string(), pa.string()),
             nullable=False,
-            metadata={"comment": "Arbitrary string tags attached to this response"},
+            comment="Arbitrary string tags attached to this response",
+            json_tags={
+                "entity": "response",
+                "group": "tags",
+            },
         ),
-        pa.field(
+        _field(
             "response_body",
             pa.binary(),
             nullable=True,
-            metadata={"comment": "Raw binary payload of the response"},
+            comment="Raw binary payload of the response",
+            json_tags={
+                "entity": "response",
+                "group": "payload",
+            },
         ),
-        pa.field(
+        _field(
             "response_body_hash",
             pa.int64(),
             nullable=True,
-            metadata={
-                "comment": "Signed Int64 XXH3 digest of response_body",
+            comment="Signed Int64 XXH3 digest of response_body",
+            json_tags={
+                "entity": "response",
+                "group": "payload",
                 "algorithm": "xxh3_64",
             },
+            algorithm="xxh3_64",
         ),
-        pa.field(
+        _field(
             "response_received_at",
             pa.timestamp("us", "UTC"),
             nullable=False,
-            metadata={
-                "comment": "UTC timestamp when the response was captured",
-                "unit": "us",
-                "tz": "UTC",
+            comment="UTC timestamp when the response was captured",
+            json_tags={
+                "entity": "response",
+                "group": "timing",
+                "timezone": "UTC",
             },
+            unit="us",
+            tz="UTC",
         ),
     ],
-    metadata={
-        "comment": (
-            "Response record (single row), designed for deterministic "
-            "logging and replay."
-        ),
-    },
+    metadata=_build_metadata(
+        comment="Response record (single row), designed for deterministic logging and replay.",
+        json_tags=_RESPONSE_BASE_SCHEMA_JSON_TAGS,
+    ),
 )
 
 RESPONSE_ARROW_SCHEMA = pa.schema(
     list(REQUEST_ARROW_SCHEMA) + list(BASE_ARROW_SCHEMA),
-    metadata={
-        "comment": (
-            "Prepared request and response flattened into a single row "
-            "schema for Delta-table caching."
-        ),
-    },
+    metadata=_build_metadata(
+        comment="Prepared request and response flattened into a single row schema for Delta-table caching.",
+        json_tags=_RESPONSE_COMBINED_SCHEMA_JSON_TAGS,
+    ),
 )
 
 _RESPONSE_FIELD_NAMES: frozenset[str] = frozenset(RESPONSE_ARROW_SCHEMA.names)

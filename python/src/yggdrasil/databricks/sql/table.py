@@ -1,7 +1,8 @@
 import base64
+import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union, Iterator, TYPE_CHECKING
+from typing import Any, Optional, Union, Iterator, TYPE_CHECKING, Mapping
 
 import pyarrow as pa
 from databricks.sdk.client_types import HostType
@@ -13,17 +14,20 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
-
 from yggdrasil.arrow.cast import any_to_arrow_schema
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import convert
+from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from .types import arrow_field_to_column_info, column_info_to_arrow_field, arrow_field_to_ddl, quote_ident, \
+from yggdrasil.environ import PyEnv
+from yggdrasil.io.enums.save_mode import SaveModeArg
+
+from .column import Column
+from .types import (
+    arrow_field_to_column_info, arrow_field_to_ddl, quote_ident,
     escape_sql_string
-from ..client import DatabricksService
-from ...environ import PyEnv
-from ...io.enums.save_mode import SaveModeArg
+)
 
 if TYPE_CHECKING:
     import delta
@@ -44,12 +48,8 @@ class Table(DatabricksService):
     schema_name: Optional[str] = None
     table_name: Optional[str] = None
 
-    _infos: Optional[TableInfo] = field(default=None, repr=False, compare=False, hash=False)
-    _arrow_fields: Optional[list[pa.Field]] = field(default=None, repr=False, compare=False, hash=False)
-
-    @classmethod
-    def service_name(cls):
-        return "uctable"
+    _infos: Optional[TableInfo] = field(default=None, init=False, repr=False, compare=False, hash=False)
+    _columns: Optional[list[Column]] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     # -------------------------------------------------------------------------
     # Identity
@@ -74,6 +74,9 @@ class Table(DatabricksService):
                 safe, self.table_name, safe
             )
         return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
+
+    def __getitem__(self, item):
+        return self.column(item)
 
     def __repr__(self) -> str:
         return f"Table({self.full_name()})"
@@ -141,13 +144,16 @@ class Table(DatabricksService):
         name = table_name or self.table_name
 
         def _return(i: TableInfo) -> "Table":
-            return Table(
+            tb = Table(
                 client=self.client,
                 catalog_name=i.catalog_name,
                 schema_name=i.schema_name,
                 table_name=i.name,
-                _infos=i,
             )
+
+            object.__setattr__(tb, "_infos", i)
+
+            return tb
 
         # ------------------------------------------------------------
         # 1) Search by table_id (best-effort; requires listing scope)
@@ -218,13 +224,14 @@ class Table(DatabricksService):
             catalog_name=catalog_name,
             schema_name=schema_name
         ):
-            yield Table(
+            tb = Table(
                 client=self.client,
                 catalog_name=info.catalog_name,
                 schema_name=info.schema_name,
                 table_name=info.name,
-                _infos=info,
             )
+            object.__setattr__(tb, "_infos", info)
+            yield tb
 
     def _schema_metadata(self) -> dict[bytes, bytes]:
         return {
@@ -238,15 +245,25 @@ class Table(DatabricksService):
     # -------------------------------------------------------------------------
     # Arrow schema
     # -------------------------------------------------------------------------
+    @property
+    def columns(self) -> list[Column]:
+        if self._columns is None:
+            columns = [Column.from_api(table=self, infos=infos) for infos in self.infos.columns]
+            object.__setattr__(self, "_columns", columns)
+        return self._columns
+
+    def column(self, name: str):
+        for c in self.columns:
+            if c.name == name:
+                return c
+
+        raise ValueError(
+            f"Cannot find columns {name!r} in {self!r}"
+        )
 
     @property
     def arrow_fields(self) -> list[pa.Field]:
-        if self._arrow_fields is None:
-            arrow_fields = [
-                column_info_to_arrow_field(c) for c in self.infos.columns
-            ]
-            object.__setattr__(self, "_arrow_fields", arrow_fields)
-        return self._arrow_fields
+        return [_.arrow_field for _ in self.columns]
 
     @property
     def arrow_schema(self) -> pa.Schema:
@@ -264,6 +281,44 @@ class Table(DatabricksService):
             pa.struct(self.arrow_fields),
             metadata=self._schema_metadata(),
         )
+
+    @staticmethod
+    def _sql_str(value: str) -> str:
+        """Escape a SQL string literal for Databricks SQL."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def set_tags_ddl(self, tags: Mapping[str, str] | None):
+        if not tags:
+            return
+
+        pairs: list[str] = []
+        for k, v in tags.items():
+            if k is None or v is None:
+                continue
+
+            key = str(k).strip()
+            value = str(v).strip()
+            if not key or not value:
+                continue
+
+            pairs.append(f"{self._sql_str(key)} = {self._sql_str(value)}")
+
+        if not pairs:
+            return
+
+        yield (
+            f"ALTER TABLE {self.full_name(safe=True)} "
+            f"SET TAGS ({', '.join(pairs)})"
+        )
+
+    def set_tags(self, tags: Mapping[str, str] | None):
+        if not tags:
+            return self
+
+        for query in self.set_tags_ddl(tags):
+            self.sql.execute(query)
+
+        return self
 
     # -------------------------------------------------------------------------
     # CRUD
@@ -346,7 +401,7 @@ class Table(DatabricksService):
         *,
         storage_location: Optional[str] = None,
         partition_by: Optional[list[str]] = None,
-        cluster_by: Optional[bool | list[str]] = None,
+        cluster_by: Optional[list[str]] = None,
         comment: Optional[str] = None,
         properties: Optional[dict[str, Any]] = None,
         if_not_exists: bool = True,
@@ -359,116 +414,50 @@ class Table(DatabricksService):
         target_file_size: Optional[int] = None,
         column_mapping_mode: Optional[str] = None,
         wait_result: bool = True,
+        column_tags: Mapping[str, Mapping[str, str]] | None = None,
+        tags: Mapping[str, str] | None = None
     ) -> "Table":
-        """
-        Generate (and optionally execute) a Databricks/Delta CREATE TABLE statement from an Apache Arrow schema/field,
-        with safety checks and performance-oriented defaults.
-
-        Safety/perf behaviors:
-          - Quotes identifiers to avoid keyword/name edge cases.
-          - Validates `partition_by` / `cluster_by` columns exist in schema.
-          - Supports managed or external tables via `storage_location`.
-          - Optionally enables Delta Column Mapping (name/id) with required protocol props.
-          - Adds workspace default tags into table properties (`tags.<k>`).
-
-        Args:
-            description:
-                Arrow schema/field describing the table, or any object convertible to `pa.Field` via `convert()`.
-                - If `pa.Schema`: all schema fields become columns.
-                - If struct `pa.Field`: its children become columns.
-                - If non-struct `pa.Field`: single-column table.
-            storage_location:
-                External storage location path. If set, emits `LOCATION '<path>'` (SQL-escaped).
-            partition_by:
-                Partition column names. Must exist in schema.
-                Note: if set, clustering is not emitted (partition wins).
-            cluster_by:
-                Controls clustering / liquid clustering.
-                - True: emits `CLUSTER BY AUTO`
-                - False: emits nothing
-                - list[str]: emits `CLUSTER BY (<cols...>)` (must exist in schema)
-                Note: only applied when `partition_by` is not set.
-            comment:
-                Table comment. If None and Arrow metadata contains "comment", that is used.
-            properties:
-                Additional/override Delta table properties (caller wins last).
-            if_not_exists:
-                If True, generates `CREATE TABLE IF NOT EXISTS ...`. Mutually exclusive with `or_replace`.
-            or_replace:
-                If True, generates `CREATE OR REPLACE TABLE ...`. Mutually exclusive with `if_not_exists`.
-            using:
-                Storage format keyword (default "DELTA").
-            optimize_write:
-                Sets `delta.autoOptimize.optimizeWrite`.
-            auto_compact:
-                Sets `delta.autoOptimize.autoCompact`.
-            enable_cdf:
-                If set, sets `delta.enableChangeDataFeed`.
-            enable_deletion_vectors:
-                If set, sets `delta.enableDeletionVectors`.
-            target_file_size:
-                If set, sets `delta.targetFileSize` (bytes).
-            column_mapping_mode:
-                Delta column mapping mode:
-                - None: auto-detect (enable "name" iff invalid column names exist, else "none")
-                - "none": do not enable column mapping
-                - "name": enable name-based column mapping
-                - "id": enable id-based column mapping
-                When enabled (name/id), also sets:
-                - `delta.minReaderVersion = 2`
-                - `delta.minWriterVersion = 5`
-            wait_result:
-                Passed to :meth:`execute` when `execute=True`.
-
-        Returns:
-            CreateTablePlan:
-                Always returns a plan. If `execute=True`, plan.result is populated.
-
-        Raises:
-            ValueError:
-                On invalid naming parameters, conflicting flags, invalid column mapping mode, or missing columns.
-            SqlStatementError:
-                If execution fails and cannot be recovered (e.g., schema creation retry fails).
-        """
         if not isinstance(description, pa.Field):
             description = convert(description, pa.Field)
 
         schema_metadata = description.metadata or {}
         arrow_fields: list[pa.Field] = list(description.type) if pa.types.is_struct(description.type) else [field]
+        partition_by = [] if partition_by is None else list(partition_by)
+        cluster_by = [] if cluster_by is None else list(cluster_by)
+        tags = {} if tags is None else dict(tags)
+        column_tags = {} if column_tags is None else dict(column_tags)
 
-        if comment is None and schema_metadata:
-            c = schema_metadata.get(b"comment")
-            if isinstance(c, bytes):
-                comment = c.decode("utf-8")
+        # Auto complete
+        for arrow_field in arrow_fields:
+            if arrow_field.metadata:
+                pby = arrow_field.metadata.get(b"partition_by")
+                cby = arrow_field.metadata.get(b"cluster_by")
+                json_tags = arrow_field.metadata.get(b"json_tags")
+
+                if pby:
+                    partition_by.append(arrow_field.name)
+
+                if cby:
+                    cluster_by.append(arrow_field.name)
+
+                if json_tags:
+                    if not isinstance(json_tags, dict):
+                        json_tags = json.loads(json_tags)
+
+                    column_tags[arrow_field.name] = json_tags
+
+        comment = comment or schema_metadata.get(b"comment")
+        if isinstance(comment, bytes):
+            comment = comment.decode("utf-8")
+
+        tags = tags or schema_metadata.get(b"json_tags")
+        if not isinstance(tags, Mapping):
+            tags = json.loads(tags)
 
         any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
-        warnings: list[str] = []
 
         if column_mapping_mode is None:
             column_mapping_mode = "name" if any_invalid else "none"
-
-        if column_mapping_mode not in ("none", "name", "id"):
-            raise ValueError("column_mapping_mode must be one of: None, 'none', 'name', 'id'.")
-
-        col_names = {f.name for f in arrow_fields}
-
-        if partition_by is None and cluster_by is None:
-            pby = []
-            for f in arrow_fields:
-                if f.metadata:
-                    mby = f.metadata.get(b"partition_by")
-                    if mby and (mby.startswith(b"1") or mby.startswith(b"t")):
-                        pby.append(f.name)
-
-        if partition_by:
-            missing = [c for c in partition_by if c not in col_names]
-            if missing:
-                raise ValueError(f"partition_by contains unknown columns: {missing}")
-
-        if isinstance(cluster_by, list):
-            missing = [c for c in cluster_by if c not in col_names]
-            if missing:
-                raise ValueError(f"cluster_by contains unknown columns: {missing}")
 
         column_definitions = [arrow_field_to_ddl(child) for child in arrow_fields]
 
@@ -488,12 +477,8 @@ class Table(DatabricksService):
 
         if partition_by:
             sql_parts.append("PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")")
-        elif cluster_by is not None:
-            if isinstance(cluster_by, bool):
-                if cluster_by:
-                    sql_parts.append("CLUSTER BY AUTO")
-            else:
-                sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
+        elif cluster_by:
+            sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
         else:
             sql_parts.append("CLUSTER BY AUTO")
 
@@ -525,18 +510,7 @@ class Table(DatabricksService):
         if properties:
             props.update(properties)
 
-        if any_invalid and column_mapping_mode == "none":
-            warnings.append(
-                "Schema has invalid column names but column_mapping_mode='none'. "
-                "This will fail unless you rename/escape columns or enable column mapping."
-            )
-
-        default_tags = self.default_tags()
-        for k, v in default_tags.items():
-            props[f"tags.{k}"] = v
-
         if props:
-
             def fmt(_key: str, _value: Any) -> str:
                 if isinstance(_value, str):
                     return f"'{_key}' = '{escape_sql_string(_value)}'"
@@ -558,6 +532,14 @@ class Table(DatabricksService):
                 raise
 
         self._reset_cache()
+
+        if tags:
+            self.set_tags(tags)
+
+        if column_tags:
+            for name, ctags in column_tags.items():
+                self.column(name=name).set_tags(ctags)
+
         return self
 
     def api_create(

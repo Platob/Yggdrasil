@@ -7,7 +7,6 @@ from typing import Union
 import pyarrow as pa
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo, ColumnTypeName
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
-
 from yggdrasil.arrow.cast import (
     ArrowDataType,
     is_arrow_type_binary_like,
