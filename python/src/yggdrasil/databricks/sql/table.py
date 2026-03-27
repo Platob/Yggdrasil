@@ -457,7 +457,7 @@ class Table(DatabricksService):
             for f in arrow_fields:
                 if f.metadata:
                     mby = f.metadata.get(b"partition_by")
-                    if mby and (mby.starswith(b"1") or mby.starswith(b"t")):
+                    if mby and (mby.startswith(b"1") or mby.startswith(b"t")):
                         pby.append(f.name)
 
         if partition_by:
