@@ -28,10 +28,24 @@ __all__ = [
     "dumps",
     "load",
     "loads",
+    "serialize",
 ]
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def serialize(
+    obj: Any,
+    *,
+    metadata: Mapping[bytes, bytes] | None = None,
+    codec: int | None = None,
+) -> Serialized:
+    return Serialized.from_python_object(
+        obj,
+        metadata=metadata,
+        codec=codec,
+    )
 
 
 def _dump(

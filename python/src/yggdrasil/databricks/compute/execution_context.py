@@ -1,6 +1,9 @@
 """Remote execution helpers for Databricks command contexts."""
-
+import base64
 import dataclasses as dc
+import gzip
+import inspect
+import json
 import logging
 import os
 import threading
@@ -10,11 +13,13 @@ from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Literal,
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
+from yggdrasil.pickle.ser import dumps, Serialized
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -62,7 +67,8 @@ EXCLUDED_ENV_EXACT_KEYS = frozenset([
     'TS_CONDA', 'TS_DFSN_ROOT', 'TS_IOADDIN', 'TS_PYTHON', 'TZDIR', 'UATDATA', 'USER', 'USERDNSDOMAIN', 'USERDOMAIN',
     'USERDOMAIN_ROAMINGPROFILE', 'USERNAME', 'USERPROFILE', 'USE_LOW_IMPACT_MONITORING', 'VIRTUAL_ENV',
     'VIRTUAL_ENV_PROMPT', 'WINDIR', 'ZES_ENABLE_SYSMAN', '_JB_PPRINT_PRIMITIVES', '_OLD_VIRTUAL_PATH',
-    '_OLD_VIRTUAL_PROMPT', '_PIP_USE_IMPORTLIB_METADATA', '_RJEM_MALLOC_CONF', 'container'
+    '_OLD_VIRTUAL_PROMPT', '_PIP_USE_IMPORTLIB_METADATA', '_RJEM_MALLOC_CONF', 'container',
+    "UV", "UV_PATH", "UV_BIN", "UV_RUN_RECURSION_DEPTH"
 ])
 
 EXCLUDED_ENV_PREFIXES = (
@@ -81,7 +87,7 @@ EXCLUDED_ENV_PREFIXES = (
     "GIT_",
     "GITGUARDIAN_",
     "COMMONPROGRAMFILES",
-    "FPS_BROWSER"
+    "FPS_BROWSER",
 )
 
 def exclude_env_key(key: str) -> bool:
@@ -101,6 +107,71 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 _CTX_RUNTIME_FIELDS = frozenset({"_lock",})
 _CTX_RESET_FIELDS = frozenset({"_remote_metadata"})
+
+
+def _normalize_call_args(
+    func: Callable,
+    args: Optional[tuple] = None,
+    kwargs: Optional[dict] = None,
+) -> tuple[tuple, dict]:
+    args = tuple(args or ())
+    kwargs = dict(kwargs or {})
+
+    # For bound methods the normal inspect.unwrap() does not cross the
+    # MethodType boundary, so __wrapped__ on __func__ is never followed.
+    # Unwrap __func__ explicitly so that @wraps-decorated methods expose
+    # the original function's signature (with real defaults), not the
+    # wrapper's generic (*args, **kwargs).
+    from types import MethodType as _MethodType  # noqa: PLC0415
+    if isinstance(func, _MethodType):
+        unwrapped_func = inspect.unwrap(func.__func__)
+        # Re-bind so inspect.signature strips the leading `self` correctly.
+        target = _MethodType(unwrapped_func, func.__self__)
+    else:
+        target = inspect.unwrap(func)
+
+    try:
+        sig = inspect.signature(target)
+    except (ValueError, TypeError):
+        # Signature not introspectable – pass args through unchanged.
+        return tuple(args), dict(kwargs)
+
+    # If the effective signature is only (*args, **kwargs) we cannot expand
+    # defaults (wrapper whose inner signature is unknown at this point).
+    # Return as-is; the remote function still has its own defaults stored in
+    # the payload (fixed in _dump_function_payload to use inner_fn's defaults).
+    _params = list(sig.parameters.values())
+    _only_var = all(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in _params
+    )
+    if _only_var:
+        return tuple(args), dict(kwargs)
+
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+
+    out_args: list = []
+    out_kwargs: dict = {}
+
+    for name, param in sig.parameters.items():
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            out_args.append(bound.arguments[name])
+
+        elif param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            out_args.append(bound.arguments[name])
+
+        elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+            out_args.extend(bound.arguments.get(name, ()))
+
+        elif param.kind is inspect.Parameter.KEYWORD_ONLY:
+            if name in bound.arguments:
+                out_kwargs[name] = bound.arguments[name]
+
+        elif param.kind is inspect.Parameter.VAR_KEYWORD:
+            out_kwargs.update(bound.arguments.get(name, {}))
+
+    return tuple(out_args), out_kwargs
 
 
 @dc.dataclass
@@ -407,7 +478,7 @@ class ExecutionContext:
         """Build the preamble that sets ``sys.path`` and environment variables.
 
         The snippet is prepended to every Python command sent to the
-        remote execution context.  It:
+        remote execution context. It:
 
         1. Ensures the remote libs path is on ``sys.path``.
         2. Injects any extra environment variables into ``os.environ``.
@@ -423,15 +494,23 @@ class ExecutionContext:
             A multi-line Python snippet suitable for ``exec()``.
         """
         lines = f"""\
-import base64, os, traceback, json, sys
+import base64, gzip, os, traceback, json, sys, pandas as pd, numpy as np
 _p = os.path.expanduser({self.remote_metadata.libs_path!r})
 if _p not in sys.path:
     sys.path.insert(0, _p)"""
 
         if environ:
+            env_json = json.dumps({str(k): "" if v is None else str(v) for k, v in dict(environ).items()})
+            env_b64_gzip = base64.b64encode(gzip.compress(env_json.encode("utf-8"))).decode("ascii")
+
             lines += f"""
-for _k, _v in {dict(environ)!r}.items():
-    os.environ[_k] = str(_v)"""
+_env = json.loads(
+    gzip.decompress(
+        base64.b64decode({env_b64_gzip!r}.encode("ascii"))
+    ).decode("utf-8")
+)
+for _k, _v in _env.items():
+    os.environ[_k] = _v"""
 
         return lines
 
@@ -506,77 +585,25 @@ if p.returncode != 0:
             environ=out_environ
         )
 
-    # Prefix used to signal that the payload literal in the remote
-    # command is a Databricks path to read from, not an inline value.
-    _DBXPATH_PREFIX = "DBXPATH:"
-
-    # Conservative payload-size threshold.  Databricks command execution
-    # has a ~1 MB command-text limit; we leave headroom for the preamble
-    # and wrapper code.
-    _MAX_INLINE_PAYLOAD_BYTES = 900_000
-
     def make_python_function_command(
         self,
-        func: Callable,
+        serfunc: Serialized,
         args: Optional[tuple] = None,
         kwargs: Optional[dict] = None,
         tag: str = "__CALL_RESULT__",
         environ: Optional[Mapping] = None,
+        pyfunc: Optional[Callable] = None,
     ) -> tuple[str, Optional[str]]:
-        """Build a remote Python command that executes a serialised callable.
-
-        The generated snippet:
-
-        1. Prepends ``sys.path`` / environment preamble.
-        2. Checks whether the payload literal starts with ``DBXPATH:``.
-           If so, reads the base64 payload from the Databricks path;
-           otherwise treats it as an inline base64 string.
-        3. Deserialises ``[func, args, kwargs]`` from the payload.
-        4. Calls ``func(*args, **kwargs)``.
-        5. Serialises the result (or the exception) and prints it after
-           the *tag* sentinel so that
-           :meth:`CommandExecution.decode_response` can split logs from
-           the return value.
-
-        The ``try/except`` wrapper guarantees the tag is **always**
-        printed, even when the function raises.  The caller-side
-        ``result()`` method deserialises the exception and re-raises it.
-
-        When the serialised payload exceeds
-        :attr:`_MAX_INLINE_PAYLOAD_BYTES` the payload is uploaded to a
-        temporary Databricks path (Volumes / DBFS) and the command
-        references it via the ``DBXPATH:`` prefix.  The caller is
-        responsible for deleting this path after use (see
-        :meth:`CommandExecution.result`).
-
-        Parameters
-        ----------
-        func:
-            The callable to execute remotely.
-        args:
-            Positional arguments for *func*.
-        kwargs:
-            Keyword arguments for *func*.
-        tag:
-            Sentinel string separating stdout logs from the serialised
-            return value.
-        environ:
-            Extra environment variables to inject on the remote side.
-
-        Returns
-        -------
-        tuple[str, str | None]
-            ``(command_string, remote_payload_path_or_None)``.
-            *remote_payload_path* is the Databricks path where the
-            payload was uploaded, or ``None`` when the payload was
-            embedded inline.
-        """
-        from yggdrasil.pickle.ser import dumps
-
-        payload: str = dumps([func, args or (), kwargs or {}], b64=True)
+        # Prefer the live callable (which still has __wrapped__ on @wraps
+        # wrappers) for signature inspection.  The deserialized copy loses
+        # __wrapped__ after the marshal round-trip, causing _normalize_call_args
+        # to see (*args, **kwargs) and skip default expansion.
+        func = pyfunc if pyfunc is not None else serfunc.as_cache_python()
+        args, kwargs = _normalize_call_args(func, args=args, kwargs=kwargs)
+        payload: str = dumps([serfunc, args, kwargs], b64=True)
         remote_payload_path: Optional[str] = None
 
-        if len(payload) > self._MAX_INLINE_PAYLOAD_BYTES:
+        if len(payload) > 900000:
             tmp = self.client.tmp_path(
                 suffix="-pyfunc", extension="b64",
                 max_lifetime=3600,
@@ -591,7 +618,7 @@ if p.returncode != 0:
 
             # The remote snippet receives a DBXPATH:-prefixed literal
             # and reads the actual base64 data from the path.
-            payload_literal = f"{self._DBXPATH_PREFIX}{remote_payload_path}"
+            payload_literal = f"DBXPATH:{remote_payload_path}"
         else:
             payload_literal = payload
 
@@ -599,15 +626,16 @@ if p.returncode != 0:
 {self.syspath_lines(environ)}
 
 from yggdrasil.pickle.ser import loads, dumps
-_DBXPATH_PREFIX = {self._DBXPATH_PREFIX!r}
-_MAX_INLINE = {self._MAX_INLINE_PAYLOAD_BYTES!r}
+_DBXPATH_PREFIX = "DBXPATH:"
+_MAX_INLINE = 900000
 _raw = {payload_literal!r}
 
 if _raw.startswith(_DBXPATH_PREFIX):
     from yggdrasil.databricks.client import DatabricksClient as _DBC
     _client = _DBC.current()
     _path = _raw[len(_DBXPATH_PREFIX):]
-    _raw = _client.dbfs_path(_path).read_bytes().decode("ascii")
+    _raw = _client.dbfs_path(_path, temporary=True).read_bytes().decode("ascii")
+
 _f, _a, _k = loads(_raw)
 _r = dumps(_f(*_a, **_k), b64=True)
 

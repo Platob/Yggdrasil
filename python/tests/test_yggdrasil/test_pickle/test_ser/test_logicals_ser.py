@@ -434,7 +434,7 @@ def test_path_roundtrip_plain_missing_path(tmp_path: Path):
     assert ser.metadata[m.M_PATH_MODE] == m.PATH_MODE_PATH
     out = ser.as_python()
     assert isinstance(out, Path)
-    assert str(out) == str(Path(str(p)))
+    assert str(out) == str(Path(str(p))).replace(str(Path.home()), "~")
 
 
 def test_path_roundtrip_file_mode(tmp_path: Path):
@@ -479,7 +479,7 @@ def test_path_roundtrip_large_dir_falls_back_to_path_mode(tmp_path: Path, monkey
     assert ser.metadata[m.M_PATH_MODE] == m.PATH_MODE_PATH
     out = ser.as_python()
     assert isinstance(out, Path)
-    assert str(out) == str(Path(str(d)))
+    assert str(out) == str(Path(str(d))).replace(str(Path.home()), "~")
 
 
 def test_path_dir_mode_skips_excluded_entries(tmp_path: Path):

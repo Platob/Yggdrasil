@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Generic, Mapping, TypeVar, Any
+from typing import Generic, Mapping, TypeVar, Any, Optional
 
 from yggdrasil.io import BytesIO
 from yggdrasil.io.buffer.bytes_view import BytesIOView
@@ -25,6 +25,11 @@ T = TypeVar("T", bound=object)
 class Serialized(ABC, Generic[T]):
     head: Header
     data: BytesIOView
+
+    _cached_obj: Optional[T] = field(
+        init=False, default=None,
+        repr=False, compare=False, hash=False
+    )
 
     def __new__(cls, head: Header, data: BytesIOView):
         if cls is Serialized:
@@ -65,6 +70,14 @@ class Serialized(ABC, Generic[T]):
 
     def as_python(self) -> T:
         return self.decode()  # type: ignore[return-value]
+
+    def as_cache_python(self):
+        if self._cached_obj is not None:
+            return self._cached_obj
+
+        obj = self.as_python()
+        object.__setattr__(self, "_cached_obj", obj)
+        return self._cached_obj
 
     def write_to(self, buffer: BytesIO | None = None) -> BytesIO:
         return self.head.write_to(self.to_bytes(), buffer=buffer)

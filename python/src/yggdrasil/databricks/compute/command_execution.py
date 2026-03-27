@@ -8,6 +8,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Optional, Any, Callable, Mapping
 
 from databricks.sdk.client_types import ClientType
@@ -15,11 +16,12 @@ from databricks.sdk.errors import InternalError, PermissionDenied, ResourceDoesN
 from databricks.sdk.service.compute import (
     Language, CommandStatusResponse, CommandStatus, ResultType
 )
-
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg, serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
+from yggdrasil.pickle.ser import serialize, Serialized, loads
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
+
 from .exceptions import ClientTerminatedSession, CommandExecutionError
 from .execution_context import ExecutionContext
 
@@ -42,6 +44,28 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------------------
+# Module-level cache: avoid re-uploading unchanged local modules/packages
+# ------------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class _ModuleUploadCacheKey:
+    cluster_id: str
+    remote_libs: str
+    local_root: Path
+
+
+@dataclass(slots=True)
+class _ModuleUploadCacheEntry:
+    tree_mtime: float
+    remote_pkg_dir: str
+    uploaded_at: float
+
+
+_MODULE_UPLOAD_CACHE: dict[_ModuleUploadCacheKey, _ModuleUploadCacheEntry] = {}
+_MODULE_UPLOAD_CACHE_LOCK = Lock()
+
+
 @dataclass
 class CommandExecution:
     context: ExecutionContext
@@ -54,6 +78,9 @@ class CommandExecution:
     pyfunc: Optional[Callable] = field(default=None, repr=False, compare=False, hash=False)
     environ: Optional[Mapping] = field(default=None, repr=False, compare=False, hash=False)
 
+    wait_config: Optional[WaitingConfig] = field(default=None, repr=False, compare=False, hash=False)
+
+    _ser_pyfunc: Optional[Serialized] = field(default=None, repr=False, compare=False, hash=False)
     _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _local_checks: dict[Path, float] = field(default_factory=dict, init=False, repr=False, compare=False, hash=False)
     _remote_payload_path: Optional[str] = field(default=None, init=False, repr=False, compare=False, hash=False)
@@ -73,6 +100,9 @@ class CommandExecution:
 
         if self._local_checks is None:
             self._local_checks = {}
+
+        if self.wait_config is not None:
+            self.wait_config = WaitingConfig.check_arg(self.wait_config)
 
     def __getstate__(self):
         return serialize_dataclass_state(self)
@@ -129,7 +159,7 @@ class CommandExecution:
                 if callable(to_decorate):
                     decorated = self.pyfunc(to_decorate)
 
-                    # Add dependency in self._local_checks to trigger re-upload if the decorated function's module file changes on disk
+                    # Track dependency for change detection
                     root_module = self._get_local_module_path(to_decorate)
                     self._local_checks[root_module] = 0
 
@@ -146,10 +176,11 @@ class CommandExecution:
             # Create command
             language_to_execute = Language.PYTHON
             command_to_execute, remote_payload_path = self.context.make_python_function_command(
-                func=self.pyfunc,
+                serfunc=self.serialized_pyfunc(),
                 args=args,
                 kwargs=kwargs,
-                environ=environ
+                environ=environ,
+                pyfunc=self.pyfunc,
             )
         else:
             language_to_execute = self.language
@@ -177,11 +208,7 @@ class CommandExecution:
                 temp.install_module(local_root=local_root, check_diffs=True)
 
         try:
-            return (
-                temp
-                .start()
-                .result(raise_error=True)
-            )
+            return temp.start().result(raise_error=True)
         finally:
             temp.context.close(wait=False, raise_error=False)
 
@@ -199,7 +226,10 @@ class CommandExecution:
 
         return url.with_query_items({
             **url.query_dict,
-            **{"command_id": self.command_id or "unknown"}
+            **{
+                "context_id": self.context.context_id or "unknown",
+                "command_id": self.command_id or "unknown"
+            }
         })
 
     def start(self, reset: bool = False):
@@ -229,7 +259,7 @@ class CommandExecution:
             m = re.search(r"but the single user of this cluster is\s*'([^']+)'", msg)
             single_user_name = m.group(1) if m else None
 
-            if single_user_name and "@" not in single_user_name:  # likely a single-user cluster with a username instead of group name
+            if single_user_name and "@" not in single_user_name:
                 groups = self.client.iam.groups
                 group = next(
                     groups.list(
@@ -250,7 +280,7 @@ class CommandExecution:
                 except Exception as inner_e:
                     raise inner_e from perm_denied
 
-                client = self.client.workspace_client().command_execution  # refresh client
+                client = self.client.workspace_client().command_execution
                 try:
                     details = client.execute(
                         cluster_id=self.cluster_id,
@@ -264,7 +294,7 @@ class CommandExecution:
                 raise
         except InternalError:
             self.context = self.context.connect(reset=True)
-            client = self.client.workspace_client().command_execution  # refresh client
+            client = self.client.workspace_client().command_execution
             details = client.execute(
                 cluster_id=self.cluster_id,
                 context_id=self.context_id,
@@ -275,7 +305,7 @@ class CommandExecution:
             msg = str(e).lower()
             if "context" in msg or "context_id" in msg or "invalid context" in msg:
                 self.context = self.context.connect(reset=True)
-                client = self.client.workspace_client().command_execution  # refresh client
+                client = self.client.workspace_client().command_execution
                 details = client.execute(
                     cluster_id=self.cluster_id,
                     context_id=self.context_id,
@@ -338,6 +368,18 @@ class CommandExecution:
     @property
     def done(self):
         return self.command_id is not None and self.state in DONE_STATES
+
+    def serialized_pyfunc(self):
+        if self._ser_pyfunc is not None:
+            return self._ser_pyfunc
+
+        if self.pyfunc is None:
+            raise ValueError(
+                f"{self} does not contain python function to serialize"
+            )
+
+        self._ser_pyfunc = serialize(self.pyfunc)
+        return self._ser_pyfunc
 
     def _command_status(self):
         client = self.client.workspace_client().command_execution
@@ -402,7 +444,7 @@ class CommandExecution:
                 raise_error=raise_error
             )
 
-        wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.check_arg(wait) if self.wait_config is None else self.wait_config
         iteration, start = 0, time.time()
 
         if wait:
@@ -426,17 +468,6 @@ class CommandExecution:
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> tuple[str | None, str]:
-        """Mirror the old Cluster.execute_command result handling.
-
-        Args:
-            response: Raw command execution response.
-            language: Language executed
-            raise_error: Raise error if response is failed
-            tag: Result tag
-
-        Returns:
-            The decoded output string.
-        """
         raise_error_from_response(
             response=response,
             language=language,
@@ -445,7 +476,6 @@ class CommandExecution:
 
         results = response.results
 
-        # normal output
         if results.result_type == ResultType.TEXT:
             data = results.data or ""
         else:
@@ -467,46 +497,6 @@ class CommandExecution:
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> Any:
-        """Wait for the command to finish and return the deserialized result.
-
-        The remote snippet (see
-        :meth:`ExecutionContext.make_python_function_command`) always
-        prints a tagged payload — either the serialised return value or
-        a serialised exception.  This method:
-
-        1. Waits for the command to reach a terminal state.
-        2. Decodes the tagged payload from stdout.
-        3. Deserialises the payload.
-        4. If the payload is a ``BaseException``, re-raises it.
-        5. Otherwise returns the value.
-        6. Cleans up the temporary remote payload file if one was used
-           (see :attr:`_remote_payload_path`).
-
-        Transient failures (``InternalError``, ``ClientTerminatedSession``,
-        ``ModuleNotFoundError``) trigger automatic reconnection / module
-        upload and retry up to ``wait.total_try_count`` times.
-
-        Parameters
-        ----------
-        wait:
-            Waiting / retry configuration.
-        raise_error:
-            Whether to raise on non-2xx command status.
-        tag:
-            Sentinel used to split logs from the return payload.
-
-        Returns
-        -------
-        Any
-            The deserialised return value of the remote function.
-
-        Raises
-        ------
-        BaseException
-            Re-raised from the remote side when the function raised.
-        RuntimeError
-            When a missing module persists after upload retry.
-        """
         try:
             return self._result_inner(
                 wait=wait,
@@ -517,13 +507,6 @@ class CommandExecution:
             self._cleanup_remote_payload()
 
     def _cleanup_remote_payload(self) -> None:
-        """Delete the temporary remote payload file, if one was used.
-
-        Failures are logged but never propagated — the payload file
-        lives inside the cluster's ephemeral scratch directory and will
-        be garbage-collected eventually even if the explicit delete
-        fails.
-        """
         path = self._remote_payload_path
         if path is None:
             return
@@ -546,7 +529,6 @@ class CommandExecution:
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> Any:
-        """Core result-retrieval logic (called by :meth:`result`)."""
         wait = WaitingConfig.check_arg(wait)
         installed_modules: set[str] = set()
         last_exc, logs, raw_result = None, None, None
@@ -596,11 +578,7 @@ class CommandExecution:
             raise last_exc
 
         if logs is not None:
-            from yggdrasil.pickle.ser import loads
-
-            # If the result was too large to inline, the remote side
-            # wrote it to a tmp path and printed DBXPATH:<path>.
-            _DBXPATH_PREFIX = self.context._DBXPATH_PREFIX
+            _DBXPATH_PREFIX = "DBXPATH:"
             if raw_result.startswith(_DBXPATH_PREFIX):
                 result_path = raw_result[len(_DBXPATH_PREFIX):]
                 try:
@@ -611,14 +589,7 @@ class CommandExecution:
                         .decode("ascii")
                     )
                 finally:
-                    try:
-                        self.client.dbfs_path(result_path).remove(recursive=True)
-                    except Exception:
-                        LOGGER.debug(
-                            "Failed to clean up remote result path %s (non-fatal)",
-                            result_path,
-                            exc_info=True,
-                        )
+                    self.client.dbfs_path(result_path).remove()
 
             if (
                 (raw_result.startswith("[") and raw_result.endswith("]"))
@@ -632,17 +603,10 @@ class CommandExecution:
 
         return raw_result
 
-
     @staticmethod
     def _get_local_module_path(
         obj: str | Path | Callable,
     ) -> Path:
-        """
-        Get the local filesystem path for the root local module/package.
-
-        Returns:
-            Path to the root module/package.
-        """
         if isinstance(obj, Path):
             if not obj.exists():
                 raise FileNotFoundError(f"Provided local module path does not exist: {obj}")
@@ -670,12 +634,6 @@ class CommandExecution:
     def _zip_local_module(
         local_root: str | Path
     ) -> tuple[str, bytes]:
-        """
-        Build a zip archive for the root local module/package.
-
-        Returns:
-            (root_module_name, zip_bytes)
-        """
         local_root = CommandExecution._get_local_module_path(local_root)
 
         buf = io.BytesIO()
@@ -687,7 +645,6 @@ class CommandExecution:
                     if path.is_dir():
                         continue
 
-                    # avoid junk
                     if path.name in {".DS_Store"}:
                         continue
                     if "__pycache__" in path.parts:
@@ -704,6 +661,13 @@ class CommandExecution:
 
         return local_root.name, buf.getvalue()
 
+    def _module_upload_cache_key(self, local_root: Path) -> _ModuleUploadCacheKey:
+        return _ModuleUploadCacheKey(
+            cluster_id=str(self.cluster_id),
+            remote_libs=self.context.remote_metadata.libs_path.rstrip("/"),
+            local_root=local_root.resolve(),
+        )
+
     def install_module(
         self,
         local_root: str | Path,
@@ -711,44 +675,46 @@ class CommandExecution:
         auto_pip: bool = True,
         check_diffs: bool = False
     ) -> str:
-        """
-        Zip local root module/package, upload via command payload, unzip directly
-        into the remote libs path already injected by syspath_lines().
-
-        Returns:
-            Remote libs path.
-        """
-        local_root: Path = self._get_local_module_path(obj=local_root)
+        local_root = self._get_local_module_path(obj=local_root)
         module_name = local_root.name
-
-        # Check diffs
-        if check_diffs:
-            last_mtime = self._local_checks.get(local_root, 0)
-            current_mtime = _get_tree_mtime(local_root)
-
-            if current_mtime <= last_mtime:
-                # update local check timestamp to avoid redundant checks in the future, but skip upload
-                self._local_checks[local_root] = current_mtime
-
-                return self.context.remote_metadata.libs_path.rstrip("/")
+        remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
+        remote_pkg_dir = f"{remote_libs}/{module_name}"
 
         if auto_pip and any(part == "site-packages" for part in local_root.parts):
             spec = _get_local_distribution_compatible_spec(
                 module_name=module_name, raise_error=False
             )
-
             return self._remote_pip_install(
                 spec,
                 upgrade=True,
             )
 
+        current_mtime = _get_tree_mtime(local_root)
+        cache_key = self._module_upload_cache_key(local_root)
+
+        # instance-level diff shortcut
+        if check_diffs:
+            last_mtime = self._local_checks.get(local_root, 0)
+            if current_mtime <= last_mtime:
+                self._local_checks[local_root] = current_mtime
+                return remote_libs
+
+        # module-level cross-instance cache shortcut
+        with _MODULE_UPLOAD_CACHE_LOCK:
+            cached = _MODULE_UPLOAD_CACHE.get(cache_key)
+            if cached is not None and cached.tree_mtime >= current_mtime:
+                self._local_checks[local_root] = current_mtime
+                LOGGER.debug(
+                    "Skipping upload for unchanged local module '%s' -> '%s' (module cache hit)",
+                    local_root,
+                    cached.remote_pkg_dir,
+                )
+                return remote_libs
+
         root_module, zip_bytes = self._zip_local_module(local_root=local_root)
 
         payload_b64 = base64.b64encode(zip_bytes).decode("ascii")
         payload_json = json.dumps(payload_b64)
-
-        remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
-        remote_pkg_dir = f"{remote_libs}/{root_module}"
 
         bootstrap = f"""
 import base64
@@ -785,6 +751,15 @@ print(remote_libs, flush=True)
             .result()
         )
 
+        self._local_checks[local_root] = current_mtime
+
+        with _MODULE_UPLOAD_CACHE_LOCK:
+            _MODULE_UPLOAD_CACHE[cache_key] = _ModuleUploadCacheEntry(
+                tree_mtime=current_mtime,
+                remote_pkg_dir=remote_pkg_dir,
+                uploaded_at=time.time(),
+            )
+
         LOGGER.info(
             "Installed local module '%s' to remote libs path '%s'",
             local_root,
@@ -800,21 +775,6 @@ print(remote_libs, flush=True)
         editable: bool = False,
         quiet: bool = True,
     ) -> list[tuple[str, str]]:
-        """
-        Install packages into the remote context-local libs path.
-
-        Packages are installed with:
-            python -m pip install --target <remote_libs> ...
-
-        Args:
-            *packages: Package specs like "orjson", "pydantic==2.11.1", etc.
-            upgrade: Add --upgrade
-            editable: Add --editable (mainly useful for path/vcs specs)
-            quiet: Add --quiet
-
-        Returns:
-            Parsed list of installed packages from `pip list --path <remote_libs>`.
-        """
         pkgs = [str(p).strip() for p in packages if str(p).strip()]
         if not pkgs:
             return []
@@ -851,7 +811,6 @@ if {editable!r}:
     cmd.append("--editable")
 if {quiet!r}:
     cmd.append("--quiet")
-
 
 proc = subprocess.run(
     cmd,
@@ -932,24 +891,14 @@ def _get_local_distribution_compatible_spec(
     module_name: str,
     raise_error: bool
 ) -> str:
-    """
-    Resolve a local import/module name to its installed distribution and
-    return a compatible-release spec: '<dist>~=major.minor'.
-
-    Examples:
-        pydantic 2.11.1 -> 'pydantic~=2.11'
-        pandas 2.2.3    -> 'pandas~=2.2'
-    """
     import importlib.metadata as im
 
     root_module = module_name.split(".", 1)[0]
 
-    # Build import-name -> distributions mapping
     pkg_map = im.packages_distributions()
     dist_names = pkg_map.get(root_module)
 
     if not dist_names:
-        # fallback: assume import name == distribution name
         dist_names = [root_module]
 
     last_err: Exception | None = None
@@ -988,6 +937,5 @@ def _get_tree_mtime(root: Path) -> float:
         try:
             latest = max(latest, p.stat().st_mtime)
         except FileNotFoundError:
-            # file vanished during scan
             continue
     return latest

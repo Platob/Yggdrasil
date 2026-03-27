@@ -34,13 +34,13 @@ from databricks.sdk.service.compute import (
     State, )
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.environ import PyEnv, UserInfo
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.url import URL
 from yggdrasil.version import VersionInfo
 from .execution_context import ExecutionContext
 from .service import Clusters, PYTHON_BY_DBR
 from ..client import DatabricksResource
+from ...io.headers import DEFAULT_HOSTNAME
 from ...pyutils.equality import dicts_equal
 
 if TYPE_CHECKING:
@@ -390,11 +390,7 @@ class Cluster(DatabricksResource):
         context_key: Optional[str] = None,
     ) -> "CommandExecution":
         language = Language.PYTHON if language is None else language
-
-        if not context_key:
-            usr, env = UserInfo.current(), PyEnv.current()
-            vinfo = env.version_info
-            context_key = f"{usr.hostname}-py{vinfo.major}.{vinfo.minor}"
+        context_key = context_key or DEFAULT_HOSTNAME
 
         context = self.context(language=language, context_key=context_key)
 

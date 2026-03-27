@@ -20,6 +20,7 @@ Semantics
 
 from __future__ import annotations
 
+import base64
 import io
 import mmap
 import os
@@ -886,6 +887,17 @@ class BytesIO(io.RawIOBase):
         if self.size == 0:
             return b""
         return self.pread(self.size, 0)
+
+    def to_base64(
+        self,
+        urlsafe: bool = True
+    ) -> str:
+        b = self.to_bytes()
+
+        if urlsafe:
+            return base64.urlsafe_b64encode(b).decode("ascii")
+        else:
+            return base64.b64encode(b).decode("ascii")
 
     def open_reader(self) -> IO[bytes]:
         if self._buf is not None:
