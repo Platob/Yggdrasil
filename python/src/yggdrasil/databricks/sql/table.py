@@ -302,6 +302,7 @@ class Table(DatabricksService):
         self,
         definition: Union[pa.Schema, Any],
         *,
+        partition_by: Optional[list[str]] = None,
         storage_location: Optional[str] = None,
         comment: Optional[str] = None,
         properties: Optional[dict[str, str]] = None,
@@ -309,50 +310,6 @@ class Table(DatabricksService):
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True
     ) -> "Table":
-        """Create this table in Unity Catalog via the Databricks Tables API.
-
-        Builds the request body from the Arrow schema and instance attributes,
-        then POSTs to ``/api/2.1/unity-catalog/tables``. On success, ``_infos``
-        is populated from the API response so subsequent property accesses
-        (``table_id``, ``storage_location``, ``arrow_schema``, …) reflect the
-        server-assigned metadata without an extra round-trip.
-
-        Note:
-            The UC Tables API currently only supports ``EXTERNAL`` + ``DELTA``
-            for external clients.  ``MANAGED`` tables and non-Delta formats must
-            be created via SQL / the DeltaTableBuilder API.
-
-        Args:
-            definition:            PyArrow schema defining columns.  Any type
-                               accepted by ``any_to_arrow_schema`` is valid
-                               (``pa.Schema``, ``list[pa.Field]``, dict, …).
-            storage_location:  S3 / ADLS URI for the table data directory, e.g.
-                               ``"s3://my-bucket/trading/raw/crude_oil/"``.
-                               Required for ``EXTERNAL`` tables.
-            comment:           Optional human-readable table description.
-                               Falls back to ``schema.metadata[b"comment"]``
-                               or ``schema.metadata[b"description"]`` when
-                               not supplied explicitly.
-            properties:        Delta / UC table properties dict, e.g.
-                               ``{"delta.autoOptimize.optimizeWrite": "true"}``.
-            table_type:        ``MANAGED`` (default) or ``EXTERNAL``.
-            data_source_format: ``DELTA`` (default) or another supported format.
-
-        Returns:
-            ``self`` — enables fluent chaining::
-
-                ds = (
-                    Table(workspace=ws, catalog_name="trading",
-                          schema_name="raw", table_name="crude_oil_trades")
-                    .create(schema, storage_location="s3://…/crude_oil_trades/")
-                    .read_arrow_dataset()
-                )
-
-        Raises:
-            ValueError: Wraps any ``DatabricksError`` raised by the API with
-                        the full table name for easier debugging in multi-table
-                        pipelines.
-        """
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
@@ -360,6 +317,7 @@ class Table(DatabricksService):
             self.sql_create(
                 definition,
                 comment=comment,
+                partition_by=partition_by,
                 if_not_exists=if_not_exists
             )
         else:
@@ -388,7 +346,7 @@ class Table(DatabricksService):
         *,
         storage_location: Optional[str] = None,
         partition_by: Optional[list[str]] = None,
-        cluster_by: Optional[bool | list[str]] = True,
+        cluster_by: Optional[bool | list[str]] = None,
         comment: Optional[str] = None,
         properties: Optional[dict[str, Any]] = None,
         if_not_exists: bool = True,
@@ -476,11 +434,7 @@ class Table(DatabricksService):
             description = convert(description, pa.Field)
 
         schema_metadata = description.metadata or {}
-
-        if pa.types.is_struct(description.type):
-            arrow_fields = list(description.type)
-        else:
-            arrow_fields = [field]
+        arrow_fields: list[pa.Field] = list(description.type) if pa.types.is_struct(description.type) else [field]
 
         if comment is None and schema_metadata:
             c = schema_metadata.get(b"comment")
@@ -497,6 +451,14 @@ class Table(DatabricksService):
             raise ValueError("column_mapping_mode must be one of: None, 'none', 'name', 'id'.")
 
         col_names = {f.name for f in arrow_fields}
+
+        if partition_by is None and cluster_by is None:
+            pby = []
+            for f in arrow_fields:
+                if f.metadata:
+                    mby = f.metadata.get(b"partition_by")
+                    if mby and (mby.starswith(b"1") or mby.starswith(b"t")):
+                        pby.append(f.name)
 
         if partition_by:
             missing = [c for c in partition_by if c not in col_names]
@@ -526,12 +488,14 @@ class Table(DatabricksService):
 
         if partition_by:
             sql_parts.append("PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")")
-        elif cluster_by:
+        elif cluster_by is not None:
             if isinstance(cluster_by, bool):
                 if cluster_by:
                     sql_parts.append("CLUSTER BY AUTO")
             else:
                 sql_parts.append("CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")")
+        else:
+            sql_parts.append("CLUSTER BY AUTO")
 
         if comment:
             sql_parts.append(f"COMMENT '{escape_sql_string(comment)}'")

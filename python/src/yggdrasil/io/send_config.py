@@ -25,7 +25,10 @@ __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
     "request_method",
-    "request_url_str",
+    "request_url_scheme",
+    "request_url_host",
+    "request_url_port",
+    "request_url_query",
     "request_content_length",
     "request_body_hash",
 )
