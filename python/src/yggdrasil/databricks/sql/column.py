@@ -42,7 +42,8 @@ class Column:
 
     def set_tags_ddl(self, tags: Mapping[str, str]):
         str_tags = ", ".join(
-            "'%s' = '%s'" % (k, v) for k, v in tags.items() if k and v
+            "'%s' = '%s'" % (self.table._safe_str(k), self.table._safe_str(v))
+            for k, v in tags.items() if k and v
         )
 
         if not str_tags:

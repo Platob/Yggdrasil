@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json as _json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Optional, Self, Union
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
 
 import yggdrasil.pickle.json as json_mod
 from yggdrasil.io.enums import SaveMode
@@ -69,7 +69,7 @@ class JsonOptions(MediaOptions):
             raise ValueError("errors must not be empty")
 
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides: Any) -> Self:
+    def resolve(cls, *, options: "JsonOptions | None" = None, **overrides: Any) -> "JsonOptions":
         """Merge *overrides* into *options* (or a fresh default)."""
         return cls.check_parameters(options=options, **overrides)
 

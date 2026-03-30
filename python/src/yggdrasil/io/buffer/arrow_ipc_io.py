@@ -9,7 +9,7 @@ Transport-level compression is handled transparently by the base class.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Optional, Self
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -49,7 +49,7 @@ class IPCOptions(MediaOptions):
             raise ValueError("compression must not be empty")
 
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides: Any) -> Self:
+    def resolve(cls, *, options: "IPCOptions | None" = None, **overrides: Any) -> "IPCOptions":
         """Merge *overrides* into *options* (or a fresh default)."""
         return cls.check_parameters(options=options, **overrides)
 

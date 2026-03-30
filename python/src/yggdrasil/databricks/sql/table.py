@@ -21,11 +21,10 @@ access pattern without grep-ing for API calls.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union, TYPE_CHECKING, Mapping
+from typing import Any, Optional, Union, TYPE_CHECKING, Mapping, AnyStr
 
 import pyarrow as pa
 from databricks.sdk.client_types import HostType
@@ -38,16 +37,14 @@ from databricks.sdk.service.catalog import (
 )
 from pyarrow.fs import FileSystem, S3FileSystem
 
-from yggdrasil.arrow.cast import any_to_arrow_schema
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data import convert
+from yggdrasil.data import Schema
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg
-
 from .column import Column
 from .types import (
     arrow_field_to_column_info, arrow_field_to_ddl, quote_ident,
@@ -317,13 +314,27 @@ class Table(DatabricksResource):
     @staticmethod
     def _sql_str(value: str) -> str:
         """Escape a string for use as a SQL string literal."""
-        return "'" + str(value).replace("'", "''") + "'"
+        return "'" + Table._safe_str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def _safe_str(value: AnyStr) -> str:
+        """Escape a string for use as an unquoted SQL identifier."""
+        if not value:
+            return ""
+
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, (bytes, memoryview, bytearray)):
+            return value.decode()
+
+        return str(value)
 
     def set_tags_ddl(self, tags: Mapping[str, str] | None) -> str:
         pairs: list[str] = []
         for k, v in (tags or {}).items():
-            key = str(k).strip() if k is not None else ""
-            val = str(v).strip() if v is not None else ""
+            key = self._safe_str(k).strip() if k is not None else ""
+            val = self._safe_str(v).strip() if v is not None else ""
             if key and val:
                 pairs.append(f"{self._sql_str(key)} = {self._sql_str(val)}")
 
@@ -336,20 +347,6 @@ class Table(DatabricksResource):
         if not tags:
             return self
         self.sql.execute(self.set_tags_ddl(tags))
-        return self
-
-    def set_column_tags(
-        self,
-        column_tags: Mapping[str, Mapping[str, str]] | None = None,
-        **others: Mapping[str, str] | None
-    ):
-        column_tags = column_tags or {}
-        if others:
-            column_tags.update(others)
-
-        for col_name, tags in column_tags.items():
-            self.column(name=col_name).set_tags(tags)
-
         return self
 
     # =========================================================================
@@ -442,42 +439,14 @@ class Table(DatabricksResource):
         target_file_size: Optional[int] = None,
         column_mapping_mode: Optional[str] = None,
         wait_result: bool = True,
-        column_tags: Mapping[str, Mapping[str, str]] | None = None,
-        tags: Mapping[str, str] | None = None,
+        auto_tag: bool = True,
     ) -> "Table":
         """Generate and execute a ``CREATE TABLE`` DDL statement."""
-        if not isinstance(description, pa.Field):
-            description = convert(description, pa.Field)
-
-        schema_metadata = description.metadata or {}
-        arrow_fields: list[pa.Field] = (
-            list(description.type) if pa.types.is_struct(description.type) else [description]
-        )
-        partition_by = list(partition_by or [])
-        cluster_by = list(cluster_by or [])
-        tags = dict(tags or {})
-        column_tags = dict(column_tags or {})
-
-        # Auto-detect partition / cluster / column tags from field metadata
-        for arrow_field in arrow_fields:
-            if arrow_field.metadata:
-                if arrow_field.metadata.get(b"partition_by"):
-                    partition_by.append(arrow_field.name)
-                if arrow_field.metadata.get(b"cluster_by"):
-                    cluster_by.append(arrow_field.name)
-                json_tags = arrow_field.metadata.get(b"json_tags")
-                if json_tags:
-                    if not isinstance(json_tags, dict):
-                        json_tags = json.loads(json_tags)
-                    column_tags[arrow_field.name] = json_tags
-
-        comment = comment or schema_metadata.get(b"comment")
-        if isinstance(comment, bytes):
-            comment = comment.decode("utf-8")
-
-        tags = tags or schema_metadata.get(b"json_tags")
-        if tags and not isinstance(tags, Mapping):
-            tags = json.loads(tags)
+        schema = Schema.from_any(description)
+        arrow_fields = schema.arrow_fields
+        partition_by = partition_by or schema.partition_by
+        cluster_by = cluster_by or schema.cluster_by
+        comment = comment or schema.comment
 
         any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
         if column_mapping_mode is None:
@@ -504,11 +473,11 @@ class Table(DatabricksResource):
 
         if partition_by:
             sql_parts.append(
-                "PARTITIONED BY (" + ", ".join(quote_ident(c) for c in partition_by) + ")"
+                "PARTITIONED BY (" + ", ".join(quote_ident(c.name) for c in partition_by) + ")"
             )
         elif cluster_by:
             sql_parts.append(
-                "CLUSTER BY (" + ", ".join(quote_ident(c) for c in cluster_by) + ")"
+                "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
         else:
             sql_parts.append("CLUSTER BY AUTO")
@@ -563,10 +532,16 @@ class Table(DatabricksResource):
 
         self._reset_cache()
 
-        if tags:
-            self.set_tags(tags)
-        if column_tags:
-            self.set_column_tags(column_tags=column_tags)
+        if auto_tag:
+            schema.autotag(tags={
+                b"format": data_source_format.value
+            })
+
+        self.set_tags(schema.tags)
+
+        for f in schema.fields:
+            if f.tags:
+                self.column(f.name).set_tags(f.tags)
 
         return self
 
@@ -582,8 +557,7 @@ class Table(DatabricksResource):
         if_not_exists: bool = False,
     ) -> "Table":
         """Create table via the Unity Catalog REST API (supports EXTERNAL tables)."""
-        if not isinstance(definition, pa.Schema):
-            definition = any_to_arrow_schema(definition)
+        definition = Schema.from_any(definition).to_arrow_schema()
 
         if not comment and definition.metadata:
             raw = definition.metadata.get(b"comment") or definition.metadata.get(b"description")

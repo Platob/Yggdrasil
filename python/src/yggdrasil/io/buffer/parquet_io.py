@@ -8,7 +8,7 @@ the ``compression`` option on :class:`ParquetOptions` controls the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator, Optional, Self
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -50,7 +50,7 @@ class ParquetOptions(MediaOptions):
     allow_truncated_timestamps: bool = True
 
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides) -> Self:
+    def resolve(cls, *, options: "ParquetOptions | None" = None, **overrides) -> "ParquetOptions":
         """Merge *overrides* into *options* (or a fresh default)."""
         base = options or cls()
         valid = cls.__dataclass_fields__.keys()  # type: ignore[attr-defined]

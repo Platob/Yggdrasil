@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
+from yggdrasil.arrow.cast import any_to_arrow_field
 
 if TYPE_CHECKING:
     import polars as pl
@@ -14,6 +15,9 @@ __all__ = [
     "Field",
     "field",
     "_normalize_metadata",
+    "_to_bytes",
+    "_merge_metadata_and_tags",
+    "_decode_metadata_dict",
 ]
 
 
@@ -29,34 +33,25 @@ def _to_bytes(value: object) -> bytes:
 
 def _normalize_metadata(
     metadata: dict[bytes | str, bytes | str | object] | None,
+    tags: dict[bytes | str, bytes | str | object] | None,
 ) -> dict[bytes, bytes] | None:
-    if not metadata:
+    if not metadata and not tags:
         return None
 
     normalized = {
-        (key if isinstance(key, bytes) else str(key).encode("utf-8")): _to_bytes(value)
-        for key, value in metadata.items()
-        if value is not None
+        _to_bytes(key): _to_bytes(value)
+        for key, value in (metadata or {}).items()
+        if key and value is not None
     }
+
+    if tags:
+        normalized.update({
+            b"t:" + _to_bytes(key): _to_bytes(value)
+            for key, value in tags.items()
+            if key and value is not None
+        })
+
     return normalized or None
-
-
-def _split_metadata_and_tags(
-    metadata: dict[bytes, bytes] | None,
-) -> tuple[dict[bytes, bytes] | None, dict[bytes, bytes] | None]:
-    if not metadata:
-        return None, None
-
-    base: dict[bytes, bytes] = {}
-    tags: dict[bytes, bytes] = {}
-
-    for key, value in metadata.items():
-        if key.startswith(b"t:"):
-            tags[key[2:]] = value
-        else:
-            base[key] = value
-
-    return base or None, tags or None
 
 
 def _merge_metadata_and_tags(
@@ -68,7 +63,7 @@ def _merge_metadata_and_tags(
     if tags:
         merged.update(
             {
-                (key if key.startswith(b"t:") else b"t:" + key): value
+                key if key.startswith(b"t:") else b"t:" + key: value
                 for key, value in tags.items()
             }
         )
@@ -106,8 +101,7 @@ def field(
         name=name,
         arrow_type=arrow_type,
         nullable=nullable,
-        metadata=_normalize_metadata(metadata),
-        tags=_normalize_metadata(tags),
+        metadata=_normalize_metadata(metadata, tags=tags),
     )
 
 
@@ -117,23 +111,33 @@ class Field:
     arrow_type: pa.DataType
     nullable: bool = True
     metadata: dict[bytes, bytes] | None = None
-    tags: dict[bytes, bytes] | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "metadata", _normalize_metadata(self.metadata))
-        object.__setattr__(self, "tags", _normalize_metadata(self.tags))
 
     @property
-    def merged_metadata(self) -> dict[bytes, bytes] | None:
-        return _merge_metadata_and_tags(self.metadata, self.tags)
+    def partition_by(self) -> bool:
+        if self.metadata:
+            v = self.metadata.get(b"t:partition_by")
+            if v:
+                return v.startswith(b"t")
+        return False
 
     @property
-    def decoded_metadata(self) -> dict[str, object]:
-        return _decode_metadata_dict(self.metadata)
+    def cluster_by(self) -> bool:
+        if self.metadata:
+            v = self.metadata.get(b"t:cluster_by")
+            if v:
+                return v.startswith(b"t")
+        return False
 
     @property
-    def decoded_tags(self) -> dict[str, object]:
-        return _decode_metadata_dict(self.tags)
+    def tags(self) -> dict[bytes, bytes]:
+        if not self.metadata:
+            return {}
+
+        return {
+            k[2:]: v
+            for k, v in self.metadata.items()
+            if k.startswith(b"t:")
+        }
 
     def copy(
         self,
@@ -148,8 +152,135 @@ class Field:
             name=self.name if name is None else name,
             arrow_type=self.arrow_type if arrow_type is None else arrow_type,
             nullable=self.nullable if nullable is None else nullable,
-            metadata=dict(self.metadata) if metadata is None else _normalize_metadata(metadata),
-            tags=dict(self.tags) if tags is None else _normalize_metadata(tags),
+            metadata=(
+                dict(self.metadata)
+                if metadata is None and tags is None
+                else _normalize_metadata(metadata, tags=tags)
+            ),
+        )
+
+    def autotag(self) -> "Field":
+        inferred: dict[str, object] = {}
+
+        name = self.name.lower()
+        dtype = self.arrow_type
+
+        # ---- dtype family tags
+        if pa.types.is_boolean(dtype):
+            inferred["kind"] = "boolean"
+        elif pa.types.is_integer(dtype):
+            inferred["kind"] = "integer"
+            inferred["numeric"] = True
+        elif pa.types.is_floating(dtype):
+            inferred["kind"] = "float"
+            inferred["numeric"] = True
+        elif pa.types.is_decimal(dtype):
+            inferred["kind"] = "decimal"
+            inferred["numeric"] = True
+        elif pa.types.is_timestamp(dtype):
+            inferred["kind"] = "timestamp"
+            inferred["temporal"] = True
+        elif pa.types.is_date(dtype):
+            inferred["kind"] = "date"
+            inferred["temporal"] = True
+        elif pa.types.is_time(dtype):
+            inferred["kind"] = "time"
+            inferred["temporal"] = True
+        elif pa.types.is_duration(dtype):
+            inferred["kind"] = "duration"
+            inferred["temporal"] = True
+        elif pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+            inferred["kind"] = "string"
+        elif pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
+            inferred["kind"] = "binary"
+        elif pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+            inferred["kind"] = "list"
+            inferred["nested"] = True
+        elif pa.types.is_struct(dtype):
+            inferred["kind"] = "struct"
+            inferred["nested"] = True
+        elif pa.types.is_map(dtype):
+            inferred["kind"] = "map"
+            inferred["nested"] = True
+        else:
+            inferred["kind"] = str(dtype)
+
+        inferred["nullable"] = self.nullable
+
+        # ---- timezone from Arrow timestamp type
+        if pa.types.is_timestamp(dtype):
+            unit = getattr(dtype, "unit", None)
+
+            if unit:
+                inferred["unit"] = str(unit)
+
+            tz = getattr(dtype, "tz", None)
+            if tz:
+                inferred["tz"] = tz
+
+        # ---- semantic name tags
+        if name == "id" or name.endswith("_id") or name.endswith("id"):
+            inferred.setdefault("role", "identifier")
+
+        if name in {"ts", "timestamp"} or name.endswith("_ts") or name.endswith("_timestamp"):
+            inferred["temporal"] = True
+            inferred.setdefault("role", "event_time")
+
+        if name == "date" or name.endswith("_date"):
+            inferred["temporal"] = True
+            inferred.setdefault("role", "date")
+
+        if name == "dt" or name.endswith("_dt"):
+            inferred["temporal"] = True
+
+        if "created_at" in name:
+            inferred["temporal"] = True
+            inferred["role"] = "created_at"
+
+        if "updated_at" in name:
+            inferred["temporal"] = True
+            inferred["role"] = "updated_at"
+
+        if "deleted_at" in name:
+            inferred["temporal"] = True
+            inferred["role"] = "deleted_at"
+
+        if name.startswith("is_") or name.startswith("has_") or name.endswith("_flag"):
+            inferred.setdefault("role", "flag")
+
+        if "price" in name:
+            inferred.setdefault("role", "price")
+            inferred["numeric"] = True
+
+        if any(token in name for token in ("qty", "quantity", "volume", "count", "size", "amount")):
+            inferred.setdefault("role", "measure")
+            inferred["numeric"] = True
+
+        if any(token in name for token in ("name", "label", "desc", "description", "comment")):
+            inferred.setdefault("role", "attribute")
+
+        if any(token in name for token in ("country", "region", "area", "zone", "market", "book", "desk")):
+            inferred.setdefault("role", "dimension")
+
+        if self.partition_by:
+            inferred["partition_by"] = True
+
+        if self.cluster_by:
+            inferred["cluster_by"] = True
+
+        # explicit existing tags win
+        merged_tags: dict[bytes, bytes] = {
+            _to_bytes(key): _to_bytes(value)
+            for key, value in inferred.items()
+            if key and value is not None
+        }
+        merged_tags.update(self.tags)
+
+        return Field(
+            name=self.name,
+            arrow_type=self.arrow_type,
+            nullable=self.nullable,
+            metadata=_merge_metadata_and_tags(self.metadata, merged_tags),
         )
 
     @classmethod
@@ -157,39 +288,18 @@ class Field:
         if isinstance(obj, cls):
             return obj
 
-        if isinstance(obj, pa.Field):
-            return cls.from_arrow(obj)
-
-        try:
-            import polars as pl
-
-            if isinstance(obj, pl.Field):
-                return cls.from_polars(obj)
-        except Exception:
-            pass
-
-        from yggdrasil.arrow.cast import any_to_arrow_field
-
-        try:
-            return cls.from_arrow(any_to_arrow_field(obj))
-        except Exception as exc:
-            raise TypeError(f"Cannot build Field from {type(obj)!r}") from exc
+        return cls.from_arrow(any_to_arrow_field(obj))
 
     @classmethod
     def from_arrow(cls, value: pa.Field) -> "Field":
         if not isinstance(value, pa.Field):
-            from yggdrasil.arrow.cast import any_to_arrow_field
-
             value = any_to_arrow_field(value)
-
-        metadata, tags = _split_metadata_and_tags(value.metadata or None)
 
         return cls(
             name=value.name,
             arrow_type=value.type,
             nullable=value.nullable,
-            metadata=metadata,
-            tags=tags,
+            metadata=value.metadata,
         )
 
     def to_arrow_field(self) -> pa.Field:
@@ -197,7 +307,7 @@ class Field:
             name=self.name,
             type=self.arrow_type,
             nullable=self.nullable,
-            metadata=self.merged_metadata,
+            metadata=self.metadata,
         )
 
     @classmethod
@@ -212,8 +322,6 @@ class Field:
         tags: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Field":
         if obj is not None:
-            from yggdrasil.arrow.cast import any_to_arrow_field
-
             return cls.from_arrow(any_to_arrow_field(obj))
 
         if name is None or dtype is None:
@@ -225,8 +333,7 @@ class Field:
             name=name,
             arrow_type=polars_type_to_arrow_type(dtype),
             nullable=nullable,
-            metadata=_normalize_metadata(metadata),
-            tags=_normalize_metadata(tags),
+            metadata=_normalize_metadata(metadata, tags=tags),
         )
 
     def to_polars_field(self) -> "pl.Field":

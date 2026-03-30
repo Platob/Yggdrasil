@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Ma
 
 import pyarrow as pa
 import yggdrasil.pickle.json as json_module
-from yggdrasil.data import any_to_datetime, Schema, field as schema_field
+from yggdrasil.data import any_to_datetime, field as schema_field, schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 
 from .buffer import BytesIO
@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 __all__ = [
     "Response",
     "BASE_SCHEMA",
-    "BASE_ARROW_SCHEMA",
     "RESPONSE_ARROW_SCHEMA",
 ]
 
@@ -310,7 +309,8 @@ _RESPONSE_COMBINED_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-BASE_SCHEMA = Schema(
+BASE_SCHEMA = schema(
+    fields=[],
     metadata={
         "comment": "Response record (single row), designed for deterministic logging and replay.",
     },
@@ -341,7 +341,7 @@ BASE_SCHEMA["response_host"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
         "semantic_type": "host_header",
     },
 )
@@ -355,7 +355,7 @@ BASE_SCHEMA["response_user_agent"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -368,7 +368,7 @@ BASE_SCHEMA["response_accept"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -381,7 +381,7 @@ BASE_SCHEMA["response_accept_encoding"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -394,7 +394,7 @@ BASE_SCHEMA["response_accept_language"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -407,7 +407,7 @@ BASE_SCHEMA["response_content_type"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -420,7 +420,7 @@ BASE_SCHEMA["response_content_length"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -433,7 +433,7 @@ BASE_SCHEMA["response_content_encoding"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -446,7 +446,7 @@ BASE_SCHEMA["response_transfer_encoding"] = schema_field(
     },
     tags={
         "entity": "response",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -517,21 +517,10 @@ BASE_SCHEMA["response_received_at"] = schema_field(
     tags={
         "entity": "response",
         "group": "timing",
-        "timezone": "UTC",
     },
 )
 
-BASE_ARROW_SCHEMA: pa.Schema = BASE_SCHEMA.to_arrow_schema()
-
-RESPONSE_ARROW_SCHEMA = pa.schema(
-    list(REQUEST_ARROW_SCHEMA) + list(BASE_ARROW_SCHEMA),
-    metadata=Schema(
-        metadata={
-            "comment": "Prepared request and response flattened into a single row schema for Delta-table caching.",
-        },
-        tags=_RESPONSE_COMBINED_SCHEMA_JSON_TAGS,
-    ).to_arrow_schema().metadata,
-)
+RESPONSE_ARROW_SCHEMA = (REQUEST_ARROW_SCHEMA + BASE_SCHEMA).to_arrow_schema()
 
 _RESPONSE_FIELD_NAMES: frozenset[str] = frozenset(RESPONSE_ARROW_SCHEMA.names)
 _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (

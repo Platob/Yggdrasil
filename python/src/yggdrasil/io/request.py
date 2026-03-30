@@ -8,7 +8,7 @@ from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.data import any_to_datetime, Schema, field as schema_field
+from yggdrasil.data import any_to_datetime, Schema, field as schema_field, schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType, MimeTypes
 
@@ -31,7 +31,8 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-REQUEST_SCHEMA = Schema(
+REQUEST_SCHEMA = schema(
+    fields=[],
     metadata={
         "comment": "Prepared request flattened into deterministic columns for logging and replay.",
         "time_column": "request_sent_at",
@@ -169,7 +170,7 @@ REQUEST_SCHEMA["request_host"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -182,7 +183,7 @@ REQUEST_SCHEMA["request_user_agent"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -195,7 +196,7 @@ REQUEST_SCHEMA["request_accept"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -208,7 +209,7 @@ REQUEST_SCHEMA["request_accept_encoding"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -221,7 +222,7 @@ REQUEST_SCHEMA["request_accept_language"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -234,7 +235,7 @@ REQUEST_SCHEMA["request_content_type"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -247,7 +248,7 @@ REQUEST_SCHEMA["request_content_length"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -260,7 +261,7 @@ REQUEST_SCHEMA["request_content_encoding"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 
@@ -273,7 +274,7 @@ REQUEST_SCHEMA["request_transfer_encoding"] = schema_field(
     },
     tags={
         "entity": "request",
-        "group": "headers_promoted",
+        "group": "headers",
     },
 )
 

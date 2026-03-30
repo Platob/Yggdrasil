@@ -6,10 +6,9 @@ import io
 import zipfile
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Self
-from yggdrasil.io import MimeTypes
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional
 
-from yggdrasil.io.enums import MediaType, MimeType, SaveMode
+from yggdrasil.io.enums import MediaType, MimeTypes, SaveMode
 
 from .bytes_io import BytesIO
 from .media_io import MediaIO
@@ -121,7 +120,7 @@ class ZipOptions(MediaOptions):
         return bool(member and any(ch in member for ch in ("*", "?", "[")))
 
     @classmethod
-    def resolve(cls, *, options: Self | None = None, **overrides: Any) -> Self:
+    def resolve(cls, *, options: "ZipOptions | None" = None, **overrides: Any) -> "ZipOptions":
         """Merge overrides into ``options`` or a fresh default."""
         return cls.check_parameters(options=options, **overrides)
 
