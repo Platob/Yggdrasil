@@ -21,6 +21,11 @@ __all__ = [
 T = TypeVar("T", bound=object)
 
 
+def _restore_serialized_from_wire(payload: bytes) -> "Serialized[object]":
+    """Rebuild a ``Serialized`` instance from its wire-format bytes."""
+    return Serialized.read_from(BytesIO(payload), pos=0)
+
+
 @dataclass(frozen=True, slots=True)
 class Serialized(ABC, Generic[T]):
     head: Header
@@ -31,7 +36,15 @@ class Serialized(ABC, Generic[T]):
         repr=False, compare=False, hash=False
     )
 
-    def __new__(cls, head: Header, data: BytesIOView):
+    def __new__(
+        cls,
+        head: Header | None = None,
+        data: BytesIOView | None = None,
+    ):
+        # ``pickle``/``copy`` may call ``__new__`` with no constructor args.
+        # Keep zero-arg construction valid for dataclass instance restoration.
+        if head is None or data is None:
+            return object.__new__(cls)
         if cls is Serialized:
             target_cls = cls._resolve_type(head.tag)
             return object.__new__(target_cls)
@@ -81,6 +94,20 @@ class Serialized(ABC, Generic[T]):
 
     def write_to(self, buffer: BytesIO | None = None) -> BytesIO:
         return self.head.write_to(self.to_bytes(), buffer=buffer)
+
+    def __reduce_ex__(self, protocol: int):
+        """
+        Prefer Yggdrasil wire-format for pickle payloads.
+
+        This is compact and robust across Python versions because restoration
+        goes through ``Serialized.read_from`` (tag-based dispatch). If writing
+        wire bytes fails for any reason, fall back to standard constructor-based
+        pickling.
+        """
+        try:
+            return (_restore_serialized_from_wire, (self.write_to().to_bytes(),))
+        except Exception:
+            return (self.__class__, (self.head, self.data))
 
     @staticmethod
     def module_and_name(obj: Any, *, fallback: str = "") -> tuple[str, str]:

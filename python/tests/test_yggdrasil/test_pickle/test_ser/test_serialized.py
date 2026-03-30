@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pickle
+
+import pytest
+
 from yggdrasil.pickle.ser.constants import CODEC_ZSTD, CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD, CODEC_ZLIB
 from yggdrasil.pickle.ser.primitives import BytesSerialized, UInt32Serialized
 from yggdrasil.pickle.ser.serialized import Serialized
@@ -75,3 +79,30 @@ def test_serialized_constructor_dispatches_subtype() -> None:
         data=b"abc",
     )
     assert ser.__class__.__name__ == "BytesSerialized"
+
+
+def test_serialized_instance_can_be_pickled_and_unpickled() -> None:
+    ser = Serialized.build(
+        tag=Tags.BYTES,
+        data=b"pickle-roundtrip",
+    )
+
+    restored = pickle.loads(pickle.dumps(ser))
+
+    assert isinstance(restored, type(ser))
+    assert restored.decode() == b"pickle-roundtrip"
+
+
+def test_serialized_pickle_falls_back_to_constructor_when_wire_dump_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ser = Serialized.build(
+        tag=Tags.BYTES,
+        data=b"fallback-roundtrip",
+    )
+
+    monkeypatch.setattr(type(ser), "write_to", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    restored = pickle.loads(pickle.dumps(ser))
+
+    assert isinstance(restored, type(ser))
+    assert restored.decode() == b"fallback-roundtrip"
