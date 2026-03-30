@@ -141,6 +141,8 @@ class Tags:
     LOGGING_HANDLER: int = 217
     LOGGING_FORMATTER: int = 218
     LOGGING_LOG_RECORD: int = 219
+    ANY_OBJECT: int = 220
+    SENSITIVE_OBJECT: int = 221
 
     # ------------------------------------------------------------------
     # framework-specific internal objects
@@ -292,6 +294,7 @@ class Tags:
         elif cid == 2:
             from yggdrasil.pickle.ser.complexs import ComplexSerialized  # noqa: F401
             from yggdrasil.pickle.ser.ios import IOSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.handlers import SensitiveObjectSerialized  # noqa: F401
             from yggdrasil.pickle.ser.pickles import PickleSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logicals import PathSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logging import LoggingSerialized  # noqa: F401
