@@ -8,7 +8,7 @@ from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.data import any_to_datetime
+from yggdrasil.data import any_to_datetime, Schema, field as schema_field
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType, MimeTypes
 
@@ -21,55 +21,7 @@ if TYPE_CHECKING:
     from .response import Response
 
 
-__all__ = ["PreparedRequest", "REQUEST_ARROW_SCHEMA"]
-
-
-def _json_meta(value: Mapping[str, Any]) -> str:
-    return json_module.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def _build_metadata(
-    *,
-    comment: str,
-    json_tags: Optional[Mapping[str, Any]] = None,
-    **extra: Any,
-) -> dict[str, str]:
-    """
-    Build Arrow-friendly metadata using string values only.
-
-    Notes
-    -----
-    Arrow field/schema metadata is key/value bytes under the hood.
-    Persisting JSON as a compact string is the most robust way to keep
-    structured classification metadata across Arrow -> Parquet -> Delta hops.
-    """
-    out: dict[str, str] = {"comment": str(comment)}
-    if json_tags:
-        out["json_tags"] = _json_meta(json_tags)
-    for k, v in extra.items():
-        out[str(k)] = str(v)
-    return out
-
-
-def _field(
-    name: str,
-    dtype: pa.DataType,
-    *,
-    nullable: bool,
-    comment: str,
-    json_tags: Optional[Mapping[str, Any]] = None,
-    **extra_metadata: Any,
-) -> pa.Field:
-    return pa.field(
-        name,
-        dtype,
-        nullable=nullable,
-        metadata=_build_metadata(
-            comment=comment,
-            json_tags=json_tags,
-            **extra_metadata,
-        ),
-    )
+__all__ = ["PreparedRequest", "REQUEST_SCHEMA", "REQUEST_ARROW_SCHEMA"]
 
 
 _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
@@ -78,257 +30,327 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
     "layer": "bronze",
 }
 
-REQUEST_ARROW_SCHEMA = pa.schema(
-    [
-        _field(
-            "request_method",
-            pa.string(),
-            nullable=False,
-            comment="HTTP method (GET, POST, etc.)",
-            json_tags={
-                "entity": "request",
-                "group": "routing",
-            },
-            partition_by="true",
-        ),
-        _field(
-            "request_url_str",
-            pa.string(),
-            nullable=False,
-            comment="Full request URL as deterministic string",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-        ),
-        _field(
-            "request_url_scheme",
-            pa.string(),
-            nullable=False,
-            comment="URL scheme (for example http or https)",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-            partition_by="true",
-        ),
-        _field(
-            "request_url_userinfo",
-            pa.string(),
-            nullable=True,
-            comment="Userinfo from URL authority (for example user:pass)",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-        ),
-        _field(
-            "request_url_host",
-            pa.string(),
-            nullable=False,
-            comment="Host name, domain, or IP address from the request URL",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-            partition_by="true",
-        ),
-        _field(
-            "request_url_port",
-            pa.int32(),
-            nullable=True,
-            comment="Port number if explicitly specified in the URL",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-        ),
-        _field(
-            "request_url_path",
-            pa.string(),
-            nullable=False,
-            comment="Path component of the request URL",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-            partition_by="true",
-        ),
-        _field(
-            "request_url_query",
-            pa.string(),
-            nullable=True,
-            comment="Raw query string without leading question mark",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-        ),
-        _field(
-            "request_url_fragment",
-            pa.string(),
-            nullable=True,
-            comment="Fragment identifier without leading hash",
-            json_tags={
-                "entity": "request",
-                "group": "url",
-            },
-        ),
-        _field(
-            "request_host",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Host header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_user_agent",
-            pa.string(),
-            nullable=True,
-            comment="HTTP User-Agent header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_accept",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Accept header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_accept_encoding",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Accept-Encoding header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_accept_language",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Accept-Language header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_content_type",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Content-Type header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_content_length",
-            pa.int64(),
-            nullable=False,
-            comment="HTTP Content-Length header parsed as integer when possible",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_content_encoding",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Content-Encoding header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_transfer_encoding",
-            pa.string(),
-            nullable=True,
-            comment="HTTP Transfer-Encoding header",
-            json_tags={
-                "entity": "request",
-                "group": "headers_promoted",
-            },
-        ),
-        _field(
-            "request_headers",
-            pa.map_(pa.string(), pa.string()),
-            nullable=False,
-            comment="Request headers excluding promoted common headers",
-            json_tags={
-                "entity": "request",
-                "group": "headers",
-            },
-            keys_sorted="false",
-        ),
-        _field(
-            "request_tags",
-            pa.map_(pa.string(), pa.string()),
-            nullable=False,
-            comment="Request tags merged with URL query params; explicit tags win on conflict",
-            json_tags={
-                "entity": "request",
-                "group": "tags",
-            },
-        ),
-        _field(
-            "request_body",
-            pa.binary(),
-            nullable=True,
-            comment="Raw request body bytes",
-            json_tags={
-                "entity": "request",
-                "group": "payload",
-            },
-        ),
-        _field(
-            "request_body_hash",
-            pa.int64(),
-            nullable=True,
-            comment="Signed Int64 XXH3 digest of request_body",
-            json_tags={
-                "entity": "request",
-                "group": "payload",
-                "algorithm": "xxh3_64",
-            },
-            algorithm="xxh3_64",
-        ),
-        _field(
-            "request_sent_at",
-            pa.timestamp("us", "UTC"),
-            nullable=False,
-            comment="UTC timestamp when request was dispatched",
-            json_tags={
-                "entity": "request",
-                "group": "timing",
-                "timezone": "UTC",
-            },
-            unit="us",
-            tz="UTC",
-        ),
-    ],
-    metadata=_build_metadata(
-        comment="Prepared request flattened into deterministic columns for logging and replay.",
-        json_tags=_REQUEST_SCHEMA_JSON_TAGS,
-        time_column="request_sent_at",
-    ),
+
+REQUEST_SCHEMA = Schema(
+    metadata={
+        "comment": "Prepared request flattened into deterministic columns for logging and replay.",
+        "time_column": "request_sent_at",
+    },
+    tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
 
-_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_ARROW_SCHEMA.names)
+REQUEST_SCHEMA["request_method"] = schema_field(
+    "request_method",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "HTTP method (GET, POST, etc.)",
+        "partition_by": "true",
+    },
+    tags={
+        "entity": "request",
+        "group": "routing",
+    },
+)
+
+REQUEST_SCHEMA["request_url_str"] = schema_field(
+    "request_url_str",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "Full request URL as deterministic string",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_scheme"] = schema_field(
+    "request_url_scheme",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "URL scheme (for example http or https)",
+        "partition_by": "true",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_userinfo"] = schema_field(
+    "request_url_userinfo",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "Userinfo from URL authority (for example user:pass)",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_host"] = schema_field(
+    "request_url_host",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "Host name, domain, or IP address from the request URL",
+        "partition_by": "true",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_port"] = schema_field(
+    "request_url_port",
+    pa.int32(),
+    nullable=True,
+    metadata={
+        "comment": "Port number if explicitly specified in the URL",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_path"] = schema_field(
+    "request_url_path",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "Path component of the request URL",
+        "partition_by": "true",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_query"] = schema_field(
+    "request_url_query",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "Raw query string without leading question mark",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_url_fragment"] = schema_field(
+    "request_url_fragment",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "Fragment identifier without leading hash",
+    },
+    tags={
+        "entity": "request",
+        "group": "url",
+    },
+)
+
+REQUEST_SCHEMA["request_host"] = schema_field(
+    "request_host",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Host header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_user_agent"] = schema_field(
+    "request_user_agent",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP User-Agent header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_accept"] = schema_field(
+    "request_accept",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Accept header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_accept_encoding"] = schema_field(
+    "request_accept_encoding",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Accept-Encoding header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_accept_language"] = schema_field(
+    "request_accept_language",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Accept-Language header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_content_type"] = schema_field(
+    "request_content_type",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Content-Type header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_content_length"] = schema_field(
+    "request_content_length",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "HTTP Content-Length header parsed as integer when possible",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_content_encoding"] = schema_field(
+    "request_content_encoding",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Content-Encoding header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_transfer_encoding"] = schema_field(
+    "request_transfer_encoding",
+    pa.string(),
+    nullable=True,
+    metadata={
+        "comment": "HTTP Transfer-Encoding header",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers_promoted",
+    },
+)
+
+REQUEST_SCHEMA["request_headers"] = schema_field(
+    "request_headers",
+    pa.map_(pa.string(), pa.string()),
+    nullable=False,
+    metadata={
+        "comment": "Request headers excluding promoted common headers",
+        "keys_sorted": "false",
+    },
+    tags={
+        "entity": "request",
+        "group": "headers",
+    },
+)
+
+REQUEST_SCHEMA["request_tags"] = schema_field(
+    "request_tags",
+    pa.map_(pa.string(), pa.string()),
+    nullable=False,
+    metadata={
+        "comment": "Request tags merged with URL query params; explicit tags win on conflict",
+    },
+    tags={
+        "entity": "request",
+        "group": "tags",
+    },
+)
+
+REQUEST_SCHEMA["request_body"] = schema_field(
+    "request_body",
+    pa.binary(),
+    nullable=True,
+    metadata={
+        "comment": "Raw request body bytes",
+    },
+    tags={
+        "entity": "request",
+        "group": "payload",
+    },
+)
+
+REQUEST_SCHEMA["request_body_hash"] = schema_field(
+    "request_body_hash",
+    pa.int64(),
+    nullable=True,
+    metadata={
+        "comment": "Signed Int64 XXH3 digest of request_body",
+        "algorithm": "xxh3_64",
+    },
+    tags={
+        "entity": "request",
+        "group": "payload",
+        "algorithm": "xxh3_64",
+    },
+)
+
+REQUEST_SCHEMA["request_sent_at"] = schema_field(
+    "request_sent_at",
+    pa.timestamp("us", "UTC"),
+    nullable=False,
+    metadata={
+        "comment": "UTC timestamp when request was dispatched",
+        "unit": "us",
+        "tz": "UTC",
+    },
+    tags={
+        "entity": "request",
+        "group": "timing",
+        "timezone": "UTC",
+    },
+)
+
+REQUEST_ARROW_SCHEMA: pa.Schema = REQUEST_SCHEMA.to_arrow_schema()
+
+_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_SCHEMA.names)
 _PROMOTED_REQUEST_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
     ("Host", "request_host"),
     ("User-Agent", "request_user_agent"),

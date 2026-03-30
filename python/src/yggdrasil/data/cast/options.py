@@ -565,11 +565,11 @@ class CastOptions:
 
     def cast_polars(
         self,
-        obj: "polars.DataFrame"
-    ) -> "polars.DataFrame":
-        from yggdrasil.polars.cast import cast_polars_dataframe
+        obj: "polars.DataFrame | polars.LazyFrame"
+    ) -> "polars.DataFrame | polars.LazyFrame":
+        from yggdrasil.polars.cast import cast_polars_frame
 
-        return cast_polars_dataframe(obj, self)
+        return cast_polars_frame(obj, self)
 
     def cast_pandas(
         self,

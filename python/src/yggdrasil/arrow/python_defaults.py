@@ -295,7 +295,7 @@ def default_arrow_array(
                 pa.repeat(
                     value=scalar_default,
                     size=chunk_size,
-                    memory_pool=memory_pool
+                    memory_pool=memory_pool # noqa
                 ) if chunk_size > 0 else pa.array([], type=dtype)
                 for chunk_size in chunks
             ],
@@ -305,7 +305,7 @@ def default_arrow_array(
     return pa.repeat(
         value=scalar_default,
         size=size,
-        memory_pool=memory_pool
+        memory_pool=memory_pool # noqa
     )
 
 

@@ -25,6 +25,7 @@ __all__ = [
     "cast_polars_array_to_list",
     "cast_polars_dataframe",
     "cast_polars_lazyframe",
+    "cast_polars_frame",
     "arrow_type_to_polars_type",
     "polars_type_to_arrow_type",
     "arrow_field_to_polars_field",
@@ -780,6 +781,13 @@ def cast_polars_array(
 # ---------------------------------------------------------------------------
 
 
+def cast_polars_frame(
+    df: pl.DataFrame | pl.LazyFrame, options: Optional[CastOptions] = None
+) -> pl.DataFrame | pl.LazyFrame:
+    if isinstance(df, pl.LazyFrame):
+        return cast_polars_lazyframe(df, options)
+    return cast_polars_dataframe(df, options)
+
 @register_converter(pl.DataFrame, pl.DataFrame)
 def cast_polars_dataframe(df: pl.DataFrame, options: Optional[CastOptions] = None) -> pl.DataFrame:
     """Cast a Polars DataFrame to a target Arrow schema (expr-first on eager DF)."""
@@ -937,7 +945,7 @@ def polars_dataframe_to_arrow_table(data: pl.DataFrame | pl.LazyFrame, options: 
     options = CastOptions.check_arg(options)
 
     if options.target_field is not None:
-        data = cast_polars_dataframe(data, options)
+        data = cast_polars_frame(data, options)
 
     compat_level = pl.CompatLevel.newest()
     try:

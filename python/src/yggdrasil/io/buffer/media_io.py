@@ -387,12 +387,32 @@ class MediaIO(ABC, Generic[O]):
         - dict[str, list]
         """
         if isinstance(obj, pa.Table):
-            self.write_arrow_table(
+            return self.write_arrow_table(
                 table=obj,
                 options=options,
                 **option_kwargs,
             )
-            return
+        elif isinstance(obj, pa.RecordBatch):
+            return self.write_arrow_table(
+                pa.Table.from_batches([obj]),
+                options=options,
+                **option_kwargs,
+            )
+
+        ns, _ = ObjectSerde.module_and_name(obj)
+
+        if ns.startswith("polars"):
+            return self.write_polars_frame(
+                obj,
+                options=options,
+                **option_kwargs,
+            )
+        elif ns.startswith("pandas"):
+            return self.write_pandas_frame(
+                obj,
+                options=options,
+                **option_kwargs
+            )
 
         if isinstance(obj, list):
             if obj and not all(isinstance(row, dict) for row in obj):
@@ -753,12 +773,14 @@ class MediaIO(ABC, Generic[O]):
         **option_kwargs,
     ) -> None:
         """Write a Polars DataFrame or LazyFrame to the buffer."""
-        from yggdrasil.polars.lib import polars as _pl
+        from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
 
-        if isinstance(frame, _pl.LazyFrame):
-            frame = frame.collect()
+        resolved = self.check_options(
+            options=options, **option_kwargs,
+        )
 
-        tb = frame.to_arrow()
+        tb = polars_dataframe_to_arrow_table(frame, resolved.cast)
+
         self.write_arrow_table(
             table=tb,
             options=options,

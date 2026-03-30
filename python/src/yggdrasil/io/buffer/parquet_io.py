@@ -85,7 +85,7 @@ class ParquetIO(MediaIO[ParquetOptions]):
                 columns=options.columns,
                 use_threads=options.use_threads,
             ):
-                yield batch
+                yield options.cast.cast_arrow(batch)
         finally:
             arrow_io.close()
 
@@ -113,7 +113,8 @@ class ParquetIO(MediaIO[ParquetOptions]):
             )
             try:
                 for batch in batches:
-                    writer.write_batch(batch)
+                    casted = options.cast.cast_arrow(batch)
+                    writer.write_batch(casted)
             finally:
                 writer.close()
         finally:
