@@ -6,6 +6,7 @@ from .geozone import GeoZone
 
 __all__ = ["load_countries"]
 
+
 COUNTRIES = [
     ("FRANCE", "FR", "France", 46.2276, 2.2137, {"eic": "10YFR-RTE------C", "aliases": ("BZN|FR", "FRANCE_FR"), "coord_source": _SRC_GOOGLE_COUNTRIES_CSV}),
     ("SWITZERLAND", "CH", "Switzerland", 46.8182, 8.2275, {"eic": "10YCH-SWISSGRIDZ", "aliases": ("BZN|CH", "SWITZERLAND_CH"), "coord_source": _SRC_GOOGLE_COUNTRIES_CSV}),
@@ -71,6 +72,8 @@ COUNTRIES = [
     ("UAE", "AE", "United Arab Emirates", 23.4241, 53.8478, {"aliases": ("AED", "EMIRATES"), "coord_source": _SRC_GOOGLE_COUNTRIES_CSV}),
     ("SOUTH_AFRICA", "ZA", "South Africa", -30.5595, 22.9375, {"aliases": ("ZAF", "RSA"), "coord_source": _SRC_GOOGLE_COUNTRIES_CSV}),
 ]
+
+
 
 
 def load_countries() -> None:

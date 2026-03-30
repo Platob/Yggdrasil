@@ -86,7 +86,6 @@ class MediaOptions:
             batch_size=batch_size,
             **kwargs,
         )
-        cls._validate_known_fields(updates)
 
         for key, value in updates.items():
             setattr(base, key, value)
@@ -117,18 +116,13 @@ class MediaOptions:
     @classmethod
     def _collect_updates(cls, **kwargs: Any) -> dict[str, Any]:
         """Drop sentinel values and keep only explicitly supplied overrides."""
-        return {key: value for key, value in kwargs.items() if value is not _MISSING}
+        names = {f.name for f in fields(cls)}
 
-    @classmethod
-    def _validate_known_fields(cls, updates: dict[str, Any]) -> None:
-        """Reject unknown option names for this class."""
-        allowed = {f.name for f in fields(cls)}
-        unknown = sorted(key for key in updates if key not in allowed)
-        if unknown:
-            raise TypeError(
-                f"{cls.__name__}.check_parameters got unexpected parameter(s): "
-                f"{', '.join(unknown)}"
-            )
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if key in names and value is not _MISSING
+        }
 
     @staticmethod
     def _validate_bool(name: str, value: Any) -> bool:
