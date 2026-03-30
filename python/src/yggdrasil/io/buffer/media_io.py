@@ -1,7 +1,7 @@
 """Media I/O abstraction layer for :class:`~yggdrasil.io.buffer.BytesIO`.
 
 Each concrete :class:`MediaIO` subclass handles reading and writing a specific
-columnar or container format (Parquet, JSON, Arrow IPC, ZIP).  The base class
+columnar or container format (Parquet, JSON, Arrow IPC, ZIP). The base class
 provides:
 
 * **Transparent compression** — when :attr:`media_type` carries a
@@ -13,7 +13,7 @@ provides:
   :meth:`read_pandas_frame`, :meth:`read_polars_frame` (and their write
   counterparts) are all routed through the Arrow table read/write path.
 * **Batched iteration** — every read method accepts an optional
-  ``batch_size`` parameter.  When set to a positive integer the method
+  ``batch_size`` parameter. When set to a positive integer the method
   returns an ``Iterator`` of chunks instead of a single object, enabling
   memory-efficient streaming over large datasets.
 
@@ -38,11 +38,18 @@ Typical usage::
 """
 from __future__ import annotations
 
+import itertools
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Iterator, Sequence, TypeVar, Optional, Union
+from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union
 
+import pyarrow as pa
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.io import MimeTypes
 from yggdrasil.io.enums import Codec, MediaType, MimeType, SaveMode
+from yggdrasil.pickle.serde import ObjectSerde
+
 from .bytes_io import BytesIO
 from .media_options import MediaOptions
 
@@ -51,6 +58,7 @@ if TYPE_CHECKING:
     import polars
     import pyarrow
 
+
 O = TypeVar("O", bound=MediaOptions)
 
 __all__ = ["MediaIO"]
@@ -58,18 +66,7 @@ __all__ = ["MediaIO"]
 
 @dataclass(slots=True)
 class MediaIO(ABC, Generic[O]):
-    """Abstract base for format-specific I/O on a :class:`BytesIO` buffer.
-
-    Parameters
-    ----------
-    media_type:
-        The resolved :class:`~yggdrasil.io.enums.MediaType` of the buffer.
-        When it carries a :attr:`~MediaType.codec` (e.g. gzip, zstd), reads
-        and writes transparently decompress / compress.
-    buffer:
-        The backing :class:`BytesIO` that holds the raw (possibly compressed)
-        payload.
-    """
+    """Abstract base for format-specific I/O on a :class:`BytesIO` buffer."""
 
     media_type: MediaType
     buffer: BytesIO
@@ -87,14 +84,8 @@ class MediaIO(ABC, Generic[O]):
         """Return ``(buffer, was_decompressed)``.
 
         If the media type has a codec the buffer is decompressed into a
-        **copy** (the original buffer is not mutated).  The caller must
+        **copy** (the original buffer is not mutated). The caller must
         close the copy when done.
-
-        Returns
-        -------
-        tuple[BytesIO, bool]
-            ``(buffer_to_read_from, True)`` when decompression happened;
-            ``(self.buffer, False)`` otherwise.
         """
         codec = self.codec
         if codec is not None and self.buffer.size > 0:
@@ -102,21 +93,140 @@ class MediaIO(ABC, Generic[O]):
         return self.buffer, False
 
     def _compress_into_buffer(self, plain: BytesIO) -> None:
-        """Compress *plain* with :attr:`codec` and replace :attr:`buffer` contents.
-
-        If no codec is set the raw bytes from *plain* are copied directly.
-
-        Parameters
-        ----------
-        plain:
-            A :class:`BytesIO` holding the uncompressed payload.
-        """
+        """Compress *plain* with :attr:`codec` and replace :attr:`buffer` contents."""
         codec = self.codec
         if codec is not None:
             compressed = plain.compress(codec=codec, copy=True)
-            self.buffer._replace_with_payload(compressed.to_bytes())
+            self.buffer.replace_with_payload(compressed.to_bytes())
         else:
-            self.buffer._replace_with_payload(plain.to_bytes())
+            self.buffer.replace_with_payload(plain.to_bytes())
+
+    # ------------------------------------------------------------------
+    # Cast helpers (private)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_cast(
+        data: "pyarrow.Table | pyarrow.RecordBatch",
+        *,
+        options: O,
+    ) -> "pyarrow.Table | pyarrow.RecordBatch":
+        """Apply configured Arrow cast when requested."""
+        cast = options.cast
+        if cast is None:
+            return data
+
+        try:
+            return cast_arrow_tabular(data, options=cast)
+        except Exception:
+            if options.raise_error:
+                raise
+            return data
+
+    # ------------------------------------------------------------------
+    # Iterable inference helpers (private)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_nonstring_iterable(obj: Any) -> bool:
+        """Return True for iterables not handled by dedicated branches."""
+        return (
+            isinstance(obj, Iterable)
+            and not isinstance(obj, (str, bytes, bytearray, dict, list, pa.Table))
+        )
+
+    @staticmethod
+    def _peek_iterable(obj: Iterable[Any]) -> tuple[Any, Iterator[Any]]:
+        """Return first item and a rebuilt iterator including that first item."""
+        iterator = iter(obj)
+        first = next(iterator)
+        return first, itertools.chain((first,), iterator)
+
+    @classmethod
+    def _table_from_tabular_iterable(cls, obj: Iterable[Any]) -> "pyarrow.Table":
+        """Infer an Arrow table from an iterable of supported tabular objects."""
+        first, iterator = cls._peek_iterable(obj)
+
+        if isinstance(first, dict):
+            return pa.Table.from_pylist(list(iterator)) # noqa
+
+        if isinstance(first, pa.RecordBatch):
+            return pa.Table.from_batches(list(iterator))
+
+        if isinstance(first, pa.Table):
+            tables = list(iterator)
+            if not tables:
+                return pa.table({})
+            return pa.concat_tables(tables, promote_options="default")
+
+        raise TypeError(
+            "Unsupported iterable for write_table: expected an iterable of "
+            "dict, pyarrow.RecordBatch, or pyarrow.Table, got first item "
+            f"of type {type(first)!r}"
+        )
+
+    @classmethod
+    def _iter_to_batches(
+        cls,
+        obj: Iterable[Any],
+    ) -> tuple[Iterator["pyarrow.RecordBatch"], "pyarrow.Schema"]:
+        """Infer a batch iterator and schema from an iterable of tabular objects."""
+        first, iterator = cls._peek_iterable(obj)
+
+        if isinstance(first, dict):
+            table = pa.Table.from_pylist(list(iterator)) # noqa
+            return iter(table.to_batches()), table.schema
+
+        if isinstance(first, pa.RecordBatch):
+            return iterator, first.schema
+
+        if isinstance(first, pa.Table):
+            def batch_iter() -> Iterator["pyarrow.RecordBatch"]:
+                for tb in iterator:
+                    yield from tb.to_batches()
+
+            return batch_iter(), first.schema
+
+        raise TypeError(
+            "Unsupported iterable for write_table: expected an iterable of "
+            "dict, pyarrow.RecordBatch, or pyarrow.Table, got first item "
+            f"of type {type(first)!r}"
+        )
+
+    def _write_batches_iterable(
+        self,
+        obj: Iterable[Any],
+        *,
+        options: O,
+    ) -> None:
+        """Write an iterable of tabular chunks to the buffer."""
+        try:
+            batches, schema = self._iter_to_batches(obj)
+        except StopIteration:
+            self._write_single_table(pa.table({}), options)
+            return
+
+        codec = self.codec
+        if codec is not None:
+            plain = BytesIO(config=self.buffer.config)
+            orig_buffer = self.buffer
+            self.buffer = plain
+            try:
+                self._write_arrow_batches(
+                    batches=batches,
+                    schema=schema,
+                    options=options,
+                )
+            finally:
+                self.buffer = orig_buffer
+            self._compress_into_buffer(plain)
+            plain.close()
+        else:
+            self._write_arrow_batches(
+                batches=batches,
+                schema=schema,
+                options=options,
+            )
 
     # ------------------------------------------------------------------
     # Abstract protocol
@@ -125,58 +235,54 @@ class MediaIO(ABC, Generic[O]):
     @classmethod
     @abstractmethod
     def check_options(cls, options: Optional[O], *args, **kwargs) -> O:
-        """Validate and merge caller-supplied options into a concrete instance.
-
-        Subclasses must implement this method.  It is called at the top of
-        every public read / write method.
-
-        Parameters
-        ----------
-        options:
-            An existing options instance, or ``None`` for defaults.
-        **kwargs:
-            Individual overrides merged on top of *options*.
-
-        Returns
-        -------
-        O
-            A fully-resolved, validated options instance.
-        """
+        """Validate and merge caller-supplied options into a concrete instance."""
 
     def read_arrow_batches(
         self,
         *args,
         options: Optional[O] = None,
-        **media_options
-    ):
-        options = self.check_options(
+        **media_options,
+    ) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield Arrow record batches, transparently handling decompression."""
+        resolved = self.check_options(
             options=options, *args, **media_options
         )
 
-        yield from self._read_arrow_batches(options=options)
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+
+            for batch in self._read_arrow_batches(options=resolved):
+                casted = self._apply_cast(batch, options=resolved)
+                if isinstance(casted, pa.Table):
+                    yield from casted.to_batches()
+                else:
+                    yield casted
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
 
     @abstractmethod
     def _read_arrow_batches(self, *, options: O) -> Iterator["pyarrow.RecordBatch"]:
-        """Yield record batches from the **uncompressed** buffer.
-
-        Subclasses implement this without worrying about transport
-        compression — the public methods handle decompression before
-        calling this.  An empty buffer should yield nothing (bare ``return``).
-        """
+        """Yield record batches from the **uncompressed** buffer."""
 
     def read_polars_frames(
         self,
         *args,
         options: Optional[O] = None,
-        **media_options
+        **media_options,
     ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
         from yggdrasil.polars.lib import polars as _pl
 
-        for batch in self.read_arrow_batches(
-            *args, options=options, **media_options
-        ):
+        resolved = self.check_options(
+            options=options, *args, **media_options
+        )
+        for batch in self.read_arrow_batches(options=resolved):
             df = _pl.from_arrow(batch, rechunk=False)
-            yield df.lazy() if options and options.lazy else df
+            yield df.lazy() if resolved.lazy else df
 
     @abstractmethod
     def _write_arrow_batches(
@@ -186,78 +292,54 @@ class MediaIO(ABC, Generic[O]):
         schema: "pyarrow.Schema",
         options: O,
     ) -> None:
-        """Consume record batches and write into the **uncompressed** buffer.
-
-        Subclasses implement this without worrying about transport
-        compression — the public methods handle compression afterwards.
-        *schema* is supplied separately so writers can initialise headers
-        before consuming any batches.
-        """
+        """Consume record batches and write into the **uncompressed** buffer."""
 
     # ------------------------------------------------------------------
     # Internal helpers: table ↔ batches bridge
     # ------------------------------------------------------------------
 
     def _read_table_from_batches(self, *, options: O) -> "pyarrow.Table":
-        """Collect all batches from :meth:`_read_arrow_batches` into one table."""
-        import pyarrow as pa
-
-        batches = list(self._read_arrow_batches(options=options))
+        """Collect all batches from :meth:`read_arrow_batches` into one table."""
+        batches = list(self.read_arrow_batches(options=options))
         if not batches:
             return pa.table({})
         return pa.Table.from_batches(batches)
 
     def _write_table_as_batches(self, *, table: "pyarrow.Table", options: O) -> None:
         """Convert *table* to batches and forward to :meth:`_write_arrow_batches`."""
+        casted = options.cast.cast_arrow(table)
+
         self._write_arrow_batches(
-            batches=iter(table.to_batches()),
-            schema=table.schema,
-            options=options,
+            batches=iter(casted.to_batches()),
+            schema=casted.schema,
+            options=options.with_cast(None),
         )
 
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
+
     @classmethod
-    def make(cls, buffer: BytesIO, media: MediaType | MimeType | str) -> "MediaIO[MediaOptions]":
-        """Create the appropriate :class:`MediaIO` subclass for *media*.
-
-        The *media* argument is parsed to a
-        :class:`~yggdrasil.io.enums.MediaType`; its ``mime_type`` selects the
-        concrete subclass and its ``codec`` (if any) is preserved so that
-        reads auto-decompress and writes auto-compress.
-
-        Parameters
-        ----------
-        buffer:
-            The backing byte buffer.
-        media:
-            A :class:`MediaType`, :class:`MimeType`, or parseable string.
-
-        Returns
-        -------
-        MediaIO
-            A concrete subclass instance ready for I/O.
-
-        Raises
-        ------
-        NotImplementedError
-            When no subclass is registered for the MIME type.
-        """
+    def make(
+        cls,
+        buffer: BytesIO,
+        media: MediaType | MimeType | str,
+    ) -> "MediaIO[MediaOptions]":
+        """Create the appropriate :class:`MediaIO` subclass for *media*."""
         media = MediaType.parse(media)
         mt = media.mime_type
         buffer.set_media_type(media, safe=False)
 
-        if mt is MimeType.PARQUET:
+        if mt is MimeTypes.PARQUET:
             from .parquet_io import ParquetIO
             return ParquetIO(media_type=media, buffer=buffer)
-        if mt is MimeType.JSON or mt is MimeType.NDJSON:
+        if mt is MimeTypes.JSON or mt is MimeTypes.NDJSON:
             from .json_io import JsonIO
             return JsonIO(media_type=media, buffer=buffer)
-        if mt is MimeType.ZIP:
+        if mt is MimeTypes.ZIP:
             from .zip_io import ZipIO
             return ZipIO(media_type=media, buffer=buffer)
-        if mt is MimeType.ARROW_IPC:
+        if mt is MimeTypes.ARROW_IPC:
             from .arrow_ipc_io import IPCIO
             return IPCIO(media_type=media, buffer=buffer)
 
@@ -268,27 +350,11 @@ class MediaIO(ABC, Generic[O]):
     # ------------------------------------------------------------------
 
     def skip_write(self, mode: SaveMode) -> bool:
-        """Return ``True`` when the write should be skipped.
-
-        Parameters
-        ----------
-        mode:
-            The requested save mode.
-
-        Returns
-        -------
-        bool
-            ``True`` when *mode* is ``IGNORE`` and the buffer is non-empty.
-
-        Raises
-        ------
-        IOError
-            When *mode* is ``ERROR_IF_EXISTS`` and the buffer is non-empty.
-        """
+        """Return ``True`` when to write should be skipped."""
         if self.buffer.size > 0:
             if mode == SaveMode.IGNORE:
                 return True
-            elif mode == SaveMode.ERROR_IF_EXISTS:
+            if mode == SaveMode.ERROR_IF_EXISTS:
                 raise IOError(
                     f"Cannot write in already existing {self.buffer!r} "
                     f"with save mode {SaveMode.ERROR_IF_EXISTS.value}"
@@ -296,24 +362,116 @@ class MediaIO(ABC, Generic[O]):
         return False
 
     # ------------------------------------------------------------------
+    # Generic write dispatcher
+    # ------------------------------------------------------------------
+
+    def write_table(
+        self,
+        obj: Any,
+        *,
+        options: O | None = None,
+        **option_kwargs,
+    ) -> None:
+        """Write a supported tabular object to the buffer.
+
+        Supported inputs
+        ----------------
+        - pyarrow.Table
+        - Iterator[pyarrow.Table]
+        - Iterator[pyarrow.RecordBatch]
+        - pandas.DataFrame
+        - polars.DataFrame
+        - polars.LazyFrame
+        - list[dict]
+        - Iterator[dict]
+        - dict[str, list]
+        """
+        if isinstance(obj, pa.Table):
+            self.write_arrow_table(
+                table=obj,
+                options=options,
+                **option_kwargs,
+            )
+            return
+
+        if isinstance(obj, list):
+            if obj and not all(isinstance(row, dict) for row in obj):
+                raise TypeError(
+                    "write_table(list) expects list[dict], "
+                    f"got list[{type(obj[0]).__name__}]"
+                )
+            self.write_pylist(
+                data=obj,
+                options=options,
+                **option_kwargs,
+            )
+            return
+
+        if isinstance(obj, dict):
+            self.write_pydict(
+                data=obj,
+                options=options,
+                **option_kwargs,
+            )
+            return
+
+        if self._is_nonstring_iterable(obj):
+            resolved = self.check_options(options=options, **option_kwargs)
+            if self.skip_write(mode=resolved.mode):
+                return
+
+            if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
+                table = self._table_from_tabular_iterable(obj)
+                existing = self._read_existing_table()
+                table = self._apply_save_mode(
+                    existing,
+                    table,
+                    mode=resolved.mode,
+                    match_by=resolved.match_by,
+                )
+                self._write_single_table(table, resolved)
+                return
+
+            self._write_batches_iterable(obj, options=resolved)
+            return
+
+        ns = ObjectSerde.full_namespace(obj)
+
+        if ns.startswith("pandas."):
+            self.write_pandas_frame(
+                frame=obj,
+                options=options,
+                **option_kwargs,
+            )
+            return
+
+        if ns.startswith("polars."):
+            self.write_polars_frame(
+                frame=obj,
+                options=options,
+                **option_kwargs,
+            )
+            return
+
+        raise TypeError(
+            "Unsupported tabular object for write_table: "
+            f"{type(obj)!r} (namespace={ns!r}). Expected one of: "
+            "pyarrow.Table, Iterator[pyarrow.Table], Iterator[pyarrow.RecordBatch], "
+            "pandas.DataFrame, polars.DataFrame, polars.LazyFrame, "
+            "list[dict], Iterator[dict], dict[str, list]."
+        )
+
+    # ------------------------------------------------------------------
     # Save-mode helpers (private)
     # ------------------------------------------------------------------
 
     def _read_existing_table(self) -> "pyarrow.Table | None":
-        """Read the current buffer contents as an Arrow table, or ``None``.
-
-        Returns ``None`` when the buffer is empty.  Handles codec
-        decompression transparently so that the returned table contains
-        plain rows regardless of on-disk encoding.
-
-        Returns
-        -------
-        pyarrow.Table | None
-        """
+        """Read the current buffer contents as an Arrow table, or ``None``."""
         if self.buffer.size <= 0:
             return None
         try:
-            return self.read_arrow_table()
+            table = self.read_arrow_table()
+            return table if isinstance(table, pa.Table) else None
         except Exception:
             return None
 
@@ -325,66 +483,16 @@ class MediaIO(ABC, Generic[O]):
         mode: SaveMode,
         match_by: "Sequence[str] | None",
     ) -> "pyarrow.Table":
-        """Combine *existing* and *incoming* tables according to *mode*.
-
-        Parameters
-        ----------
-        existing:
-            The data currently in the buffer, or ``None`` when the buffer
-            is empty.
-        incoming:
-            The new data to write.
-        mode:
-            Save mode governing the merge strategy.
-        match_by:
-            Column names used as the composite key for ``UPSERT``.
-            Ignored by other modes.  Required (non-empty) for ``UPSERT``;
-            raises :exc:`ValueError` when missing.
-
-        Returns
-        -------
-        pyarrow.Table
-            The final table that should be serialised into the buffer.
-
-        Raises
-        ------
-        ValueError
-            When *mode* is ``UPSERT`` and *match_by* is ``None`` or empty.
-
-        Notes
-        -----
-        Mode semantics:
-
-        ``AUTO`` / ``OVERWRITE`` / ``TRUNCATE``
-            Return *incoming* unchanged (full replace).
-
-        ``APPEND``
-            Concatenate ``[existing, incoming]``.  Schema promotion is
-            enabled so that columns present in only one side are filled
-            with nulls.
-
-        ``UPSERT``
-            Rows from *incoming* whose ``match_by`` key already exists in
-            *existing* **replace** the old rows.  Rows in *existing* that
-            have no match are kept.  New rows from *incoming* that have no
-            match in *existing* are appended.  The result is ordered as
-            ``[surviving_existing, new_incoming]``.
-        """
-        import pyarrow as pa
-
-        # --- Fast path: nothing to merge with --------------------------
+        """Combine *existing* and *incoming* tables according to *mode*."""
         if existing is None or existing.num_rows == 0:
             return incoming
 
-        # --- OVERWRITE / AUTO / TRUNCATE: full replace -----------------
         if mode in (SaveMode.AUTO, SaveMode.OVERWRITE, SaveMode.TRUNCATE):
             return incoming
 
-        # --- APPEND: stack rows ----------------------------------------
         if mode == SaveMode.APPEND:
             return pa.concat_tables([existing, incoming], promote_options="default")
 
-        # --- UPSERT: merge by key columns ------------------------------
         if mode == SaveMode.UPSERT:
             if not match_by:
                 raise ValueError(
@@ -392,7 +500,6 @@ class MediaIO(ABC, Generic[O]):
                 )
             match_by = list(match_by)
 
-            # Validate that key columns exist in both tables
             for col in match_by:
                 if col not in existing.column_names:
                     raise ValueError(
@@ -405,7 +512,6 @@ class MediaIO(ABC, Generic[O]):
                         f"(columns: {incoming.column_names})"
                     )
 
-            # Build a set of composite keys from the incoming table
             incoming_keys: set[tuple] = set()
             incoming_key_arrays = [
                 incoming.column(c).to_pylist() for c in match_by
@@ -414,11 +520,10 @@ class MediaIO(ABC, Generic[O]):
                 key = tuple(arr[row_idx] for arr in incoming_key_arrays)
                 incoming_keys.add(key)
 
-            # Filter existing: keep rows whose key is NOT in incoming
             existing_key_arrays = [
                 existing.column(c).to_pylist() for c in match_by
             ]
-            keep_mask = []
+            keep_mask: list[bool] = []
             for row_idx in range(existing.num_rows):
                 key = tuple(arr[row_idx] for arr in existing_key_arrays)
                 keep_mask.append(key not in incoming_keys)
@@ -426,10 +531,10 @@ class MediaIO(ABC, Generic[O]):
             surviving = existing.filter(pa.array(keep_mask, type=pa.bool_()))
 
             return pa.concat_tables(
-                [surviving, incoming], promote_options="default",
+                [surviving, incoming],
+                promote_options="default",
             )
 
-        # --- Unrecognised mode: fall back to overwrite -----------------
         return incoming
 
     # ------------------------------------------------------------------
@@ -441,20 +546,7 @@ class MediaIO(ABC, Generic[O]):
         table: "pyarrow.Table",
         batch_size: int,
     ) -> Iterator["pyarrow.Table"]:
-        """Yield successive :class:`pyarrow.Table` slices of *batch_size* rows.
-
-        Parameters
-        ----------
-        table:
-            The full Arrow table to slice.
-        batch_size:
-            Maximum number of rows per chunk.  Must be > 0.
-
-        Yields
-        ------
-        pyarrow.Table
-            A table slice with at most *batch_size* rows.
-        """
+        """Yield successive :class:`pyarrow.Table` slices of *batch_size* rows."""
         total = table.num_rows
         for offset in range(0, total, batch_size):
             yield table.slice(offset, min(batch_size, total - offset))
@@ -469,34 +561,9 @@ class MediaIO(ABC, Generic[O]):
         options: O | None = None,
         **option_kwargs,
     ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
-        """Read the buffer into a :class:`pyarrow.Table`.
-
-        Handles transport decompression transparently when the media type
-        carries a codec.
-
-        Parameters
-        ----------
-        options:
-            Format-specific options, or ``None`` for defaults.
-            Set ``batch_size`` > 0 on the options to get an
-            ``Iterator[pyarrow.Table]`` of chunks instead.
-        **option_kwargs:
-            Overrides merged into *options* (e.g. ``batch_size=1000``).
-
-        Returns
-        -------
-        pyarrow.Table | Iterator[pyarrow.Table]
-        """
+        """Read the buffer into a :class:`pyarrow.Table`."""
         resolved = self.check_options(options=options, **option_kwargs)
-        buf, decompressed = self._decompressed_buffer()
-        orig_buffer = self.buffer
-        try:
-            if decompressed:
-                self.buffer = buf
-            table = self._read_table_from_batches(options=resolved)
-        finally:
-            if decompressed:
-                self.buffer = orig_buffer
+        table = self._read_table_from_batches(options=resolved)
 
         bs = resolved.batch_size
         if bs and bs > 0:
@@ -510,52 +577,30 @@ class MediaIO(ABC, Generic[O]):
         options: O | None = None,
         **option_kwargs,
     ) -> None:
-        """Write a :class:`pyarrow.Table` to the buffer.
-
-        Handles transport compression transparently when the media type
-        carries a codec.
-
-        Parameters
-        ----------
-        table:
-            The Arrow table to serialise.
-        options:
-            Format-specific options, or ``None`` for defaults.
-            Set ``batch_size`` > 0 on the options to slice the table
-            into chunks and write each sequentially (last chunk wins).
-            Set ``mode`` and ``match_by`` on the options to control the
-            write strategy.
-        **option_kwargs:
-            Overrides merged into *options* (e.g. ``batch_size=1000``).
-        """
+        """Write a :class:`pyarrow.Table` to the buffer."""
         resolved = self.check_options(
             options=options, **option_kwargs,
         )
         if self.skip_write(mode=resolved.mode):
             return
 
-        # --- Apply save-mode merge logic ---
         if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
             existing = self._read_existing_table()
             table = self._apply_save_mode(
-                existing, table,
+                existing,
+                table,
                 mode=resolved.mode,
                 match_by=resolved.match_by,
             )
 
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            for chunk in self._iter_arrow_batches(table, bs):
-                self._write_single_table(chunk, resolved)
-        else:
-            self._write_single_table(table, resolved)
+        self._write_single_table(table, resolved)
 
     def _write_single_table(
         self,
         table: "pyarrow.Table",
         options: O,
     ) -> None:
-        """Write one table (or chunk) handling codec compression."""
+        """Write one table handling codec compression."""
         codec = self.codec
         if codec is not None:
             plain = BytesIO(config=self.buffer.config)
@@ -566,6 +611,7 @@ class MediaIO(ABC, Generic[O]):
             finally:
                 self.buffer = orig_buffer
             self._compress_into_buffer(plain)
+            plain.close()
         else:
             self._write_table_as_batches(table=table, options=options)
 
@@ -579,24 +625,14 @@ class MediaIO(ABC, Generic[O]):
         options: O | None = None,
         **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
-        """Read the buffer as a list of row dicts.
-
-        Parameters
-        ----------
-        options:
-            Format-specific options.  Set ``batch_size`` > 0 to get an
-            ``Iterator[list[dict]]`` of chunks.
-        **option_kwargs:
-            Overrides merged into *options* (e.g. ``batch_size=1000``).
-
-        Returns
-        -------
-        list[dict] | Iterator[list[dict]]
-        """
+        """Read the buffer as a list of row dicts."""
         resolved = self.check_options(options=options, **option_kwargs)
         bs = resolved.batch_size
         if bs and bs > 0:
-            return (chunk.to_pylist() for chunk in self.read_arrow_table(options=resolved))
+            return (
+                chunk.to_pylist()
+                for chunk in self.read_arrow_table(options=resolved)
+            )
         return self.read_arrow_table(options=resolved).to_pylist()
 
     def write_pylist(
@@ -605,13 +641,13 @@ class MediaIO(ABC, Generic[O]):
         *,
         options: O | None = None,
         **option_kwargs,
-    ):
+    ) -> None:
         """Write a list of row dicts to the buffer."""
-        import pyarrow as _pa
-        tb = _pa.Table.from_pylist(data)
+        tb = pa.Table.from_pylist(data) # noqa
         self.write_arrow_table(
             table=tb,
-            options=options, **option_kwargs,
+            options=options,
+            **option_kwargs,
         )
 
     def read_pydict(
@@ -624,7 +660,10 @@ class MediaIO(ABC, Generic[O]):
         resolved = self.check_options(options=options, **option_kwargs)
         bs = resolved.batch_size
         if bs and bs > 0:
-            return (chunk.to_pydict() for chunk in self.read_arrow_table(options=resolved))
+            return (
+                chunk.to_pydict()
+                for chunk in self.read_arrow_table(options=resolved)
+            )
         return self.read_arrow_table(options=resolved).to_pydict()
 
     def write_pydict(
@@ -633,13 +672,13 @@ class MediaIO(ABC, Generic[O]):
         *,
         options: O | None = None,
         **option_kwargs,
-    ):
+    ) -> None:
         """Write a column-oriented dict to the buffer."""
-        import pyarrow as _pa
-        tb = _pa.Table.from_pydict(data)
+        tb = pa.Table.from_pydict(data) # noqa
         self.write_arrow_table(
             table=tb,
-            options=options, **option_kwargs,
+            options=options,
+            **option_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -670,11 +709,15 @@ class MediaIO(ABC, Generic[O]):
         **option_kwargs,
     ) -> None:
         """Write a :class:`pandas.DataFrame` to the buffer."""
-        import pyarrow as _pa
-        tb = _pa.Table.from_pandas(frame)
+        tb = pa.Table.from_pandas(
+            frame,
+            preserve_index=bool(frame.index.name),
+        ) # noqa
+
         self.write_arrow_table(
             table=tb,
-            options=options, **option_kwargs,
+            options=options,
+            **option_kwargs,
         )
 
     def read_polars_frame(
@@ -704,14 +747,20 @@ class MediaIO(ABC, Generic[O]):
 
     def write_polars_frame(
         self,
-        frame: "polars.DataFrame",
+        frame: "polars.DataFrame | polars.LazyFrame",
         *,
         options: O | None = None,
         **option_kwargs,
     ) -> None:
-        """Write a Polars DataFrame to the buffer."""
+        """Write a Polars DataFrame or LazyFrame to the buffer."""
+        from yggdrasil.polars.lib import polars as _pl
+
+        if isinstance(frame, _pl.LazyFrame):
+            frame = frame.collect()
+
         tb = frame.to_arrow()
         self.write_arrow_table(
             table=tb,
-            options=options, **option_kwargs,
+            options=options,
+            **option_kwargs,
         )

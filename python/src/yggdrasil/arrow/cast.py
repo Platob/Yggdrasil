@@ -70,12 +70,11 @@ from typing import Optional, Union, List, Tuple, Any, Iterable
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.types as pat
-
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.dataclasses.dataclass import dataclass_to_arrow_field
 from yggdrasil.pickle.serde import ObjectSerde
+
 from .python_arrow import (
     is_arrow_type_list_like,
     is_arrow_type_string_like,

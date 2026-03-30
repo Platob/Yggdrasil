@@ -32,14 +32,14 @@ from typing import TYPE_CHECKING, Any, IO, Literal, Optional, Union
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.io.config import DEFAULT_CONFIG, BufferConfig
-from yggdrasil.io.enums import MediaType, MimeType
+from yggdrasil.io.enums import MediaType, MimeTypes
 from yggdrasil.io.types import BytesLike
 
 if TYPE_CHECKING:
     import blake3
     import xxhash
 
-    from .media_io import MediaIO
+    from .media_io import MediaIO, MediaOptions
     from ..enums import Codec
 
 __all__ = ["BytesIO", "BufferLike"]
@@ -361,7 +361,7 @@ class BytesIO(io.RawIOBase):
         self._pos = 0
         self._media_type = None
 
-    def _replace_with_payload(self, payload: bytes) -> None:
+    def replace_with_payload(self, payload: bytes) -> None:
         self._reset_backing_keep_open()
         self._init_from(payload, copy=False)
 
@@ -478,7 +478,7 @@ class BytesIO(io.RawIOBase):
     @property
     def media_type(self) -> MediaType:
         if self._media_type is None:
-            self._media_type = MediaType.parse(self, default=MediaType(MimeType.OCTET_STREAM))
+            self._media_type = MediaType.parse(self, default=MediaType(MimeTypes.OCTET_STREAM))
         return self._media_type
 
     @media_type.setter
@@ -956,7 +956,7 @@ class BytesIO(io.RawIOBase):
         if copy:
             return payload
 
-        self._replace_with_payload(payload)
+        self.replace_with_payload(payload)
         return self
 
     def decompress(
@@ -986,7 +986,7 @@ class BytesIO(io.RawIOBase):
             payload = self.__class__(raw, copy=False, media_type=mt)
             return payload
 
-        self._replace_with_payload(raw)
+        self.replace_with_payload(raw)
         self._media_type = mt
         return self
 
@@ -1021,3 +1021,15 @@ class BytesIO(io.RawIOBase):
                 pass
 
         super().close()
+
+    # Data framing
+    def to_polars(
+        self,
+        media: Optional[MediaType] = None,
+        options: "MediaOptions | None" = None,
+        **option_kwargs,
+    ):
+        return self.media_io(media=media).read_polars_frame(
+            options=options,
+            **option_kwargs
+        )

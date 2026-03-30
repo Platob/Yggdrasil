@@ -7,8 +7,10 @@ fields defined here are shared across all formats.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, Optional, Sequence
+
+from yggdrasil.data import CastOptions, CastOptionsArg
 
 from ..enums.save_mode import SaveMode
 
@@ -25,6 +27,7 @@ class MediaOptions:
 
     # global read properties
     columns: Optional[Sequence[str]] = None
+    cast: CastOptions = None
     use_threads: bool = True
     ignore_empty: bool = True
     lazy: bool = False
@@ -40,6 +43,7 @@ class MediaOptions:
     def __post_init__(self) -> None:
         """Normalize and validate all fields in-place."""
         self.columns = self._normalize_columns(self.columns)
+        self.cast = CastOptions.check_arg(self.cast)
         self.use_threads = self._validate_bool("use_threads", self.use_threads)
         self.ignore_empty = self._validate_bool("ignore_empty", self.ignore_empty)
         self.lazy = self._validate_bool("lazy", self.lazy)
@@ -50,6 +54,9 @@ class MediaOptions:
 
         self._validate_subclass_fields()
 
+    def with_cast(self, cast: CastOptionsArg):
+        return replace(self, cast=CastOptions.check_arg(cast))
+
     @classmethod
     def check_parameters(
         cls,
@@ -58,6 +65,7 @@ class MediaOptions:
         mode: SaveMode | str | None | Any = _MISSING,
         match_by: Sequence[str] | str | None | Any = _MISSING,
         columns: Optional[Sequence[str]] | Any = _MISSING,
+        cast: CastOptions | dict[str, Any] | None | Any = _MISSING,
         use_threads: bool | Any = _MISSING,
         ignore_empty: bool | Any = _MISSING,
         lazy: bool | Any = _MISSING,
@@ -65,12 +73,12 @@ class MediaOptions:
         batch_size: int | None | Any = _MISSING,
         **kwargs: Any,
     ) -> MediaOptions:
-        """Merge explicit overrides into an options instance and validate."""
         base = cls._coerce_options(options)
         updates = cls._collect_updates(
             mode=mode,
             match_by=match_by,
             columns=columns,
+            cast=cast,
             use_threads=use_threads,
             ignore_empty=ignore_empty,
             lazy=lazy,

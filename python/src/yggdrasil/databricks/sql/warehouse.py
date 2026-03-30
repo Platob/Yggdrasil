@@ -233,9 +233,17 @@ class SQLWarehouse(DatabricksService):
         iteration = 0
 
         if wait.timeout:
+            LOGGER.debug(
+                "Waiting for warehouse %s (%s) to leave pending state (timeout=%.0fs)",
+                self.warehouse_name, self.warehouse_id, wait.timeout,
+            )
             while self.is_pending:
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
+            LOGGER.debug(
+                "Warehouse %s (%s) ready after %.1fs",
+                self.warehouse_name, self.warehouse_id, time.time() - start,
+            )
 
         return self
 
@@ -248,23 +256,45 @@ class SQLWarehouse(DatabricksService):
 
         if self.warehouse_id:
             if not self.is_running:
+                LOGGER.debug(
+                    "Starting warehouse %s (%s)",
+                    self.warehouse_name, self.warehouse_id,
+                )
                 try:
                     response = client.start(id=self.warehouse_id)
                 except Exception:
                     if raise_error:
                         raise
+                    LOGGER.warning(
+                        "Failed to start warehouse %s (%s)",
+                        self.warehouse_name, self.warehouse_id,
+                    )
                     return self
 
                 if wait:
                     wait = WaitingConfig.check_arg(wait)
                     response.result(timeout=wait.timeout_timedelta)
 
+                LOGGER.info(
+                    "Started warehouse %s (%s)",
+                    self.warehouse_name, self.warehouse_id,
+                )
+
         return self
 
     def stop(self):
         if self.is_running:
+            LOGGER.debug(
+                "Stopping warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
+            )
             client = self.client.workspace_client().warehouses
-            return client.stop(id=self.warehouse_id)
+            result = client.stop(id=self.warehouse_id)
+            LOGGER.info(
+                "Stopped warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
+            )
+            return result
         return self
 
     def find_warehouse(
@@ -276,8 +306,10 @@ class SQLWarehouse(DatabricksService):
     ):
         if warehouse_id:
             if warehouse_id == self.warehouse_id:
+                LOGGER.debug("find_warehouse: cache hit id=%s", warehouse_id)
                 return self
 
+            LOGGER.debug("find_warehouse: resolving by id=%s", warehouse_id)
             return SQLWarehouse(
                 client=self.client,
                 warehouse_id=warehouse_id,
@@ -292,8 +324,10 @@ class SQLWarehouse(DatabricksService):
             )
 
             if cached is not None:
+                LOGGER.debug("find_warehouse: cache hit name=%r id=%s", warehouse_name, cached.warehouse_id)
                 return cached
 
+            LOGGER.debug("find_warehouse: listing warehouses to resolve name=%r", warehouse_name)
             for warehouse in self.list_warehouses():
                 if warehouse.warehouse_name == warehouse_name:
                     set_cached_warehouse(
@@ -308,6 +342,7 @@ class SQLWarehouse(DatabricksService):
 
                     return warehouse
 
+            LOGGER.warning("find_warehouse: warehouse %r not found", warehouse_name)
             if raise_error:
                 raise ResourceDoesNotExist(
                     f"Cannot find SQL warehouse {warehouse_name!r}"
@@ -529,6 +564,7 @@ class SQLWarehouse(DatabricksService):
         )
 
         if found is not None:
+            LOGGER.debug("create_or_update: updating existing warehouse %r (%s)", name, found.warehouse_id)
             return found.update(
                 name=name,
                 permissions=permissions,
@@ -536,6 +572,7 @@ class SQLWarehouse(DatabricksService):
                 **warehouse_specs
             )
 
+        LOGGER.debug("create_or_update: warehouse %r not found — creating", name)
         return self.create(
             name=name,
             permissions=permissions,
@@ -560,6 +597,13 @@ class SQLWarehouse(DatabricksService):
             update=False,
             name=name,
             **warehouse_specs
+        )
+
+        LOGGER.debug(
+            "Creating warehouse name=%r serverless=%s cluster_size=%s",
+            details.name,
+            details.enable_serverless_compute,
+            details.cluster_size,
         )
 
         update_details = {
@@ -589,6 +633,12 @@ class SQLWarehouse(DatabricksService):
             _details=info
         )
 
+        LOGGER.info(
+            "Created warehouse %r (%s) serverless=%s",
+            created.warehouse_name, created.warehouse_id,
+            details.enable_serverless_compute,
+        )
+
         return created
 
     def update(
@@ -598,6 +648,7 @@ class SQLWarehouse(DatabricksService):
         **warehouse_specs
     ):
         if not warehouse_specs:
+            LOGGER.debug("update: no specs provided for %s — skipping", self.warehouse_name)
             return self
 
         wait = WaitingConfig.check_arg(wait)
@@ -631,8 +682,8 @@ class SQLWarehouse(DatabricksService):
 
         if not same:
             LOGGER.debug(
-                "Updating %s with %s",
-                self, update_details
+                "Updating warehouse %s (%s) with %s",
+                self.warehouse_name, self.warehouse_id, update_details,
             )
 
             client = self.client.workspace_client().warehouses
@@ -650,13 +701,15 @@ class SQLWarehouse(DatabricksService):
                 new_details = EndpointInfo(**update_details)
 
             object.__setattr__(self, "_details", safeEndpointInfo(new_details))
+        else:
+            LOGGER.debug(
+                "update: warehouse %s (%s) already up-to-date — skipping API call",
+                self.warehouse_name, self.warehouse_id,
+            )
 
         self.update_permissions(permissions=permissions, wait=wait)
 
-        LOGGER.info(
-            "Updated %s",
-            self
-        )
+        LOGGER.info("Updated warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
 
         return self
 
@@ -715,17 +768,15 @@ class SQLWarehouse(DatabricksService):
 
     def delete(self):
         if self.warehouse_id:
-            client = self.client.workspace_client().warehouses
             LOGGER.debug(
-                "Deleting %s",
-                self
+                "Deleting warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
             )
-
+            client = self.client.workspace_client().warehouses
             client.delete(id=self.warehouse_id)
-
             LOGGER.info(
-                "Deleted %s",
-                self
+                "Deleted warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
             )
 
     def execute(
@@ -787,8 +838,9 @@ class SQLWarehouse(DatabricksService):
         client = instance.client.workspace_client().statement_execution
 
         LOGGER.debug(
-            "API SQL executing query:\n%s",
-            statement
+            "Executing SQL on warehouse %s (%s):\n%s",
+            instance.warehouse_name, warehouse_id,
+            statement,
         )
 
         response = client.execute_statement(
@@ -814,8 +866,8 @@ class SQLWarehouse(DatabricksService):
         )
 
         LOGGER.info(
-            "API SQL executed %s",
-            execution
+            "Executed SQL statement_id=%s on warehouse %s (%s)",
+            execution.statement_id, instance.warehouse_name, warehouse_id,
         )
 
         return execution.wait(wait=wait, raise_error=raise_error)

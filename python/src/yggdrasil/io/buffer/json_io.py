@@ -169,7 +169,7 @@ class JsonIO(MediaIO[JsonOptions]):
             encoding=options.encoding,
             errors=options.errors,
         )
-        self.buffer._replace_with_payload(payload)
+        self.buffer.replace_with_payload(payload)
 
     # ------------------------------------------------------------------
     # Optimised convenience overrides
@@ -240,6 +240,6 @@ class JsonIO(MediaIO[JsonOptions]):
             plain = _BIO(payload, config=self.buffer.config)
             self._compress_into_buffer(plain)
         else:
-            self.buffer._replace_with_payload(payload)
+            self.buffer.replace_with_payload(payload)
 
         return None

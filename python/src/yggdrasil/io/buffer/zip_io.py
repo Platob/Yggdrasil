@@ -7,6 +7,7 @@ import zipfile
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Self
+from yggdrasil.io import MimeTypes
 
 from yggdrasil.io.enums import MediaType, MimeType, SaveMode
 
@@ -177,7 +178,7 @@ class ZipIO(MediaIO[ZipOptions]):
         try:
             return MediaType.parse(name)
         except Exception:
-            return MediaType(MimeType.OCTET_STREAM)
+            return MediaType(MimeTypes.OCTET_STREAM)
 
     def _infer_inner_media(self, name: str, payload: bytes) -> MediaType:
         """Infer media type from name first, then by sniffing payload bytes."""
@@ -188,7 +189,7 @@ class ZipIO(MediaIO[ZipOptions]):
         try:
             return BytesIO(payload, config=self.buffer.config).media_type
         except Exception:
-            return MediaType(MimeType.OCTET_STREAM)
+            return MediaType(MimeTypes.OCTET_STREAM)
 
     def _resolve_member_media_type(
         self,
@@ -208,7 +209,7 @@ class ZipIO(MediaIO[ZipOptions]):
         """Resolve the inner media type used for writes."""
         inner_media = options.inner_media
         if inner_media is None or inner_media.is_octet:
-            return MediaType(MimeType.PARQUET)
+            return MediaType(MimeTypes.PARQUET)
         return inner_media
 
     @staticmethod

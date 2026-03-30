@@ -27,6 +27,7 @@ _DEFAULT_REQUEST_BY: tuple[str, ...] = (
     "request_method",
     "request_url_scheme",
     "request_url_host",
+    "request_url_path",
     "request_url_port",
     "request_url_query",
     "request_content_length",
@@ -200,6 +201,7 @@ class CacheConfig(_ConfigBase):
         return values
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", SaveMode.parse(self.mode, default=SaveMode.APPEND))
         object.__setattr__(self, "wait",  WaitingConfig.check_arg(self.wait))
 
         object.__setattr__(self, "request_by", _validate_request_by(self.request_by))

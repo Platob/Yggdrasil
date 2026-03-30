@@ -6,9 +6,10 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from tempfile import SpooledTemporaryFile
 from threading import Thread
 from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union, BinaryIO
+
+from yggdrasil.io.buffer import BytesIO as _Buffer  # spill-to-disk buffer
 
 from databricks.sdk.errors import InternalError
 from databricks.sdk.errors.platform import (
@@ -31,64 +32,19 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
-_SPOOL_MAX = 64 * 1024 * 1024   # 64MB in RAM then spill to disk
-_COPY_CHUNK = 8 * 1024 * 1024   # 8MB chunks
+_COPY_CHUNK = 8 * 1024 * 1024   # 8 MB upload chunks
 
 def _prepare_binaryio_and_size(
     data: Union[bytes, bytearray, memoryview, BinaryIO]
-) -> tuple[int, BinaryIO, bool]:
+) -> tuple[int, _Buffer, bool]:
+    """Wrap *data* in a :class:`_Buffer` (``yggdrasil.io.BytesIO``) and return
+    ``(byte_count, buffer, owns_buffer)``.
+
+    ``yggdrasil.io.BytesIO`` handles spill-to-disk transparently, so we never
+    need a ``SpooledTemporaryFile`` here.
     """
-    Returns (size, bio, should_close).
-
-    - bytes-like -> wrap in BytesIO (closeable by us).
-    - seekable file -> compute size via fstat or seek/tell.
-    - non-seekable stream -> spool into SpooledTemporaryFile, count bytes.
-    """
-    # bytes-like
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        b = bytes(data)
-        return len(b), io.BytesIO(b), True
-
-    f: BinaryIO = data
-
-    # 1) try OS-level size for real files
-    try:
-        fileno = f.fileno()  # type: ignore[attr-defined]
-    except Exception:
-        fileno = None
-
-    if fileno is not None:
-        try:
-            st = os.fstat(fileno)
-            # rewind if possible
-            try:
-                f.seek(0)
-            except Exception:
-                pass
-            return int(st.st_size), f, False
-        except Exception:
-            pass
-
-    # 2) try seek/tell (seekable streams)
-    try:
-        f.seek(0, io.SEEK_END)
-        end = f.tell()
-        f.seek(0)
-        return int(end), f, False
-    except Exception:
-        pass
-
-    # 3) non-seekable stream: spool + count
-    spooled = SpooledTemporaryFile(max_size=_SPOOL_MAX, mode="w+b")
-    size = 0
-    while True:
-        chunk = f.read(_COPY_CHUNK)
-        if not chunk:
-            break
-        spooled.write(chunk)
-        size += len(chunk)
-    spooled.seek(0)
-    return size, spooled, True
+    buf = _Buffer(data)
+    return buf.size, buf, True
 
 class DatabricksIO(ABC, IO):
     """File-like interface for Databricks workspace, volume, or DBFS paths."""
@@ -256,19 +212,19 @@ class DatabricksIO(ABC, IO):
         return self.content_length
 
     @property
-    def buffer(self):
-        """Return the in-memory buffer, creating it if necessary.
+    def buffer(self) -> _Buffer:
+        """Return the IO buffer (a :class:`_Buffer`), creating it if necessary.
 
-        Returns:
-            A BytesIO buffer for the file contents.
+        :class:`_Buffer` (``yggdrasil.io.BytesIO``) spills transparently to
+        disk for large payloads, avoiding OOM on big files.
         """
         if self._buffer is None:
-            self._buffer = io.BytesIO()
+            self._buffer = _Buffer()
             self._buffer.seek(self.position, io.SEEK_SET)
         return self._buffer
 
     @buffer.setter
-    def buffer(self, value: Optional[io.BytesIO]):
+    def buffer(self, value: Optional[_Buffer]) -> None:
         self._buffer = value
 
     def clear_buffer(self):
@@ -404,21 +360,13 @@ class DatabricksIO(ABC, IO):
         return True
 
     def getvalue(self):
-        """Return the buffer contents, reading from remote if needed.
-
-        Returns:
-            File contents as bytes or str depending on mode.
-        """
+        """Return the buffer contents, reading from remote if needed."""
         if self._buffer is not None:
-            return self._buffer.getvalue()
+            return self._buffer.to_bytes()
         return self.read_all_bytes()
 
     def getbuffer(self):
-        """Return the underlying BytesIO buffer.
-
-        Returns:
-            The BytesIO buffer instance.
-        """
+        """Return the underlying buffer instance."""
         return self.buffer
 
     @abstractmethod
@@ -436,31 +384,29 @@ class DatabricksIO(ABC, IO):
         pass
 
     def read_all_bytes(self, use_cache: bool = True, allow_not_found: bool = False) -> bytes:
-        """Read the full contents into memory, optionally caching.
+        """Read the full contents into memory, optionally caching in the buffer.
 
         Args:
-            use_cache: Whether to cache contents in memory.
+            use_cache: Whether to keep a cached copy in the buffer.
             allow_not_found: Whether to suppress missing-path errors.
 
         Returns:
             File contents as bytes.
         """
         if use_cache and self._buffer is not None:
-            buffer_value = self._buffer.getvalue()
-
-            if len(buffer_value) == self.content_length:
-                return buffer_value
-
+            cached = self._buffer.to_bytes()
+            if len(cached) == self.content_length:
+                return cached
             self._buffer.close()
             self._buffer = None
 
         data = self.read_byte_range(0, self.content_length, allow_not_found=allow_not_found)
 
-        # Keep size accurate even if backend didn't know it
+        # Keep size accurate even if the backend didn't know it upfront
         self.content_length = len(data)
 
         if use_cache and self._buffer is None:
-            self._buffer = io.BytesIO(data)
+            self._buffer = _Buffer(data)
             self._buffer.seek(self.position, io.SEEK_SET)
 
         return data
@@ -601,13 +547,9 @@ class DatabricksIO(ABC, IO):
         return self._write_flag and self._buffer is not None
 
     def flush(self):
-        """Flush buffered data to the remote path.
-
-        Returns:
-            None.
-        """
+        """Flush buffered writes to the remote path."""
         if self._need_flush():
-            self.write_all_bytes(data=self._buffer.getvalue())
+            self.write_all_bytes(data=self._buffer.to_bytes())
             self._write_flag = False
 
     def write(self, data: AnyStr) -> int:
@@ -687,9 +629,12 @@ class DatabricksIO(ABC, IO):
     # ---- format helpers ----
 
     def _reset_for_write(self):
+        """Reset the buffer to an empty writable state."""
         if self._buffer is not None:
             self._buffer.seek(0, io.SEEK_SET)
             self._buffer.truncate(0)
+        else:
+            self._buffer = _Buffer()
 
         self.position = 0
         self.content_length = 0
@@ -716,7 +661,7 @@ class DatabricksWorkspaceIO(DatabricksIO):
 
         sdk = self.workspace.workspace_client()
         client = sdk.workspace
-        full_path = self.path.workspace_full_path()
+        full_path = self.path.full_path()
 
         result = client.download(
             path=full_path,
@@ -743,10 +688,12 @@ class DatabricksWorkspaceIO(DatabricksIO):
         """
         sdk = self.workspace.workspace_client()
         workspace_client = sdk.workspace
-        full_path = self.path.workspace_full_path()
+        full_path = self.path.full_path()
 
         if isinstance(data, bytes):
             bsize = len(data)
+        elif isinstance(data, _Buffer):
+            bsize = data.size
         elif isinstance(data, io.BytesIO):
             bsize = len(data.getvalue())
         else:
@@ -767,7 +714,7 @@ class DatabricksWorkspaceIO(DatabricksIO):
                 overwrite=True
             )
         except (NotFound, ResourceDoesNotExist, BadRequest):
-            self.path.parent.make_workspace_dir(parents=True)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
             workspace_client.upload(
                 full_path,
@@ -816,7 +763,7 @@ class DatabricksVolumeIO(DatabricksIO):
 
         sdk = self.workspace.workspace_client()
         client = sdk.files
-        full_path = self.path.files_full_path()
+        full_path = self.path.full_path()
 
         try:
             resp = client.download(full_path)
@@ -847,7 +794,7 @@ class DatabricksVolumeIO(DatabricksIO):
         """Write bytes/stream to a volume file safely (BinaryIO upload)."""
         sdk = self.workspace.workspace_client()
         client = sdk.files
-        full_path = self.path.files_full_path()
+        full_path = self.path.full_path()
 
         LOGGER.debug("Writing all bytes in %s", self)
 
@@ -912,7 +859,7 @@ class DatabricksDBFSIO(DatabricksIO):
 
         sdk = self.workspace.workspace_client()
         client = sdk.dbfs
-        full_path = self.path.dbfs_full_path()
+        full_path = self.path.full_path()
 
         read_bytes = bytearray()
         bytes_to_read = length
@@ -952,7 +899,7 @@ class DatabricksDBFSIO(DatabricksIO):
         """
         sdk = self.workspace.workspace_client()
         client = sdk.dbfs
-        full_path = self.path.dbfs_full_path()
+        full_path = self.path.full_path()
 
         LOGGER.debug(
             "Writing all bytes in %s",

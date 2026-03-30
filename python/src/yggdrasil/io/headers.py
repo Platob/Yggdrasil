@@ -7,8 +7,9 @@ import socket
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 
-from yggdrasil.io import MimeType
+from yggdrasil.io import MimeTypes
 from yggdrasil.version import __version_info__, __version__
+
 from .buffer import BytesIO
 from .enums import Codec, MediaType
 
@@ -383,7 +384,7 @@ def normalize_headers(
                 codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
                 media_type = MediaType.parse(accept_value, codec=codec) if accept_value else None
 
-                out["Accept"] = "*/*" if media_type.mime_type == MimeType.OCTET_STREAM else media_type.mime_type.value
+                out["Accept"] = "*/*" if media_type.mime_type == MimeTypes.OCTET_STREAM else media_type.mime_type.value
 
                 if media_type.codec:
                     out["Accept-Encoding"] = codec.name

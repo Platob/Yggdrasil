@@ -16,7 +16,7 @@ from yggdrasil.io.enums.codec import (
     ZLIB,
     LZMA,
 )
-from yggdrasil.io.enums.mime_type import MimeType
+from yggdrasil.io.enums.mime_type import MimeType, MimeTypes
 
 
 # ----------------------------
@@ -67,7 +67,7 @@ def test_codec_parse_defaults():
 
 
 def test_codec_from_mime():
-    assert Codec.from_mime(MimeType.GZIP) is GZIP
+    assert Codec.from_mime(MimeTypes.GZIP) is GZIP
     assert Codec.from_mime("application/gzip") is GZIP
     assert Codec.from_mime("application/octet-stream") is None
 

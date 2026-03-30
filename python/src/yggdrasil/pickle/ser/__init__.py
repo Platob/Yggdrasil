@@ -72,6 +72,8 @@ def _dump_path(
     metadata: Mapping[bytes, bytes] | None = None,
     codec: int | None = None,
 ) -> bytes:
+    LOGGER.info("Dumping %s in %s", obj, path)
+
     try:
         with path.open("wb") as f:
             _dump(
@@ -79,11 +81,6 @@ def _dump_path(
                 f,
                 metadata=metadata,
                 codec=codec,
-            )
-
-            LOGGER.info(
-                "Dumped %s in %s",
-                obj, path
             )
             return None
     except (OSError, IOError):
@@ -97,12 +94,6 @@ def _dump_path(
                 f,
                 metadata=metadata,
                 codec=codec,
-            )
-
-            LOGGER.info(
-                "Dumped %s in %s",
-                obj,
-                path
             )
             return None
     except BaseException:

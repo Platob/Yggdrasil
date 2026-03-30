@@ -50,7 +50,11 @@ def test_cache_config_defaults() -> None:
 
     assert cfg.request_by == [
         "request_method",
-        "request_url_str",
+        "request_url_scheme",
+        "request_url_host",
+        "request_url_path",
+        "request_url_port",
+        "request_url_query",
         "request_content_length",
         "request_body_hash",
     ]
@@ -59,7 +63,7 @@ def test_cache_config_defaults() -> None:
     assert cfg.anonymize == "remove"
     assert cfg.received_from is None
     assert cfg.received_to is None
-    assert cfg.wait is False
+    assert cfg.wait == WaitingConfig.check_arg(False)
 
 
 def test_cache_config_coerces_received_datetimes_from_strings() -> None:

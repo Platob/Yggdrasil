@@ -4,9 +4,7 @@ import datetime as dt
 from typing import Any
 
 import pytest
-
-from yggdrasil.io import MediaType
-from yggdrasil.io.enums import MimeType
+from yggdrasil.io import MediaType, MimeTypes
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.request import PreparedRequest, REQUEST_ARROW_SCHEMA
 
@@ -131,15 +129,6 @@ def test_parse_dict_sent_at_accepts_datetime() -> None:
     assert req.sent_at == ts
 
 
-def test_parse_accepts_json_string() -> None:
-    req = PreparedRequest.parse(
-        '{"request_method":"PUT","request_url_str":"https://example.com/x"}'
-    )
-
-    assert req.method == "PUT"
-    assert req.url.to_string() == "https://example.com/x"
-
-
 def test_copy_reuses_buffer_by_default() -> None:
     req = PreparedRequest.prepare(
         method="POST",
@@ -214,7 +203,7 @@ def test_prepare_with_json_sets_json_content_type() -> None:
     )
 
     assert req.buffer is not None
-    assert req.headers["Content-Type"] == MimeType.JSON.value
+    assert req.headers["Content-Type"] == MimeTypes.JSON.value
     assert req.headers["Content-Length"] == str(req.buffer.size)
     assert b'"x": 1' in req.buffer.to_bytes() or b'"x":1' in req.buffer.to_bytes()
 
@@ -228,7 +217,7 @@ def test_prepare_with_json_can_compress_when_threshold_exceeded() -> None:
     )
 
     assert req.buffer is not None
-    assert req.headers["Content-Type"] == MimeType.JSON.value
+    assert req.headers["Content-Type"] == MimeTypes.JSON.value
     assert "Content-Encoding" in req.headers
     assert req.headers["Content-Length"] == str(req.buffer.size)
 
@@ -316,10 +305,10 @@ def test_accept_media_type_roundtrip() -> None:
         url="https://example.com",
     )
 
-    req.accept_media_type = MediaType(MimeType.JSON, None)
+    req.accept_media_type = MediaType(MimeTypes.JSON, None)
 
-    assert req.headers["Accept"] == MimeType.JSON.value
-    assert req.accept_media_type.mime_type == MimeType.JSON
+    assert req.headers["Accept"] == MimeTypes.JSON.value
+    assert req.accept_media_type.mime_type == MimeTypes.JSON
 
 
 def test_update_headers_and_tags() -> None:

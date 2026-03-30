@@ -14,6 +14,7 @@ from yggdrasil.dataclasses.expiring import (
     Expiring, ExpiringDict, RefreshResult,
     datetime_to_epoch_ns, now_utc_ns, timedelta_to_ns,
 )
+from yggdrasil.dataclasses import expiring as _expiring_mod
 
 _1s_ns = 1_000_000_000
 def _ns_from_now(s): return now_utc_ns() + int(s * _1s_ns)
@@ -342,5 +343,176 @@ class TestEDThreads(unittest.TestCase):
         for t in ts: t.join()
         self.assertEqual(errors,[])
 
+# ── ExpiringDict — _last_purge_ns / purge scheduling ─────
+class TestEDPurgeScheduling(unittest.TestCase):
+    """Tests for the background-purge gate: _last_purge_ns, _purge_pending,
+    and the double-checked-locking logic in _maybe_schedule_purge."""
+
+    _PURGE_NS = _expiring_mod._PURGE_INTERVAL_NS  # 15 min in ns
+
+    # ── construction ─────────────────────────────────────
+    def test_last_purge_ns_initialized_near_now(self):
+        """_last_purge_ns is set to approximately now_utc_ns() at construction."""
+        before = now_utc_ns()
+        d = ExpiringDict(default_ttl=10.0)
+        after = now_utc_ns()
+        self.assertGreaterEqual(d._last_purge_ns, before)
+        self.assertLessEqual(d._last_purge_ns, after)
+
+    def test_purge_pending_false_initially(self):
+        """_purge_pending starts as False."""
+        d = ExpiringDict(default_ttl=10.0)
+        self.assertFalse(d._purge_pending)
+
+    # ── fast-path (interval not elapsed) ─────────────────
+    def test_maybe_schedule_purge_noop_when_recent(self):
+        """No state changes when the purge interval has NOT elapsed."""
+        d = ExpiringDict(default_ttl=10.0)
+        ts = d._last_purge_ns
+        d._maybe_schedule_purge()
+        self.assertEqual(d._last_purge_ns, ts)
+        self.assertFalse(d._purge_pending)
+
+    def test_set_does_not_advance_last_purge_ns_when_fresh(self):
+        """set() calls _maybe_schedule_purge; fresh dict → no change."""
+        d = ExpiringDict(default_ttl=10.0)
+        ts = d._last_purge_ns
+        d.set("k", 1)
+        self.assertEqual(d._last_purge_ns, ts)
+        self.assertFalse(d._purge_pending)
+
+    def test_get_does_not_advance_last_purge_ns_when_fresh(self):
+        """get() calls _maybe_schedule_purge; fresh dict → no change."""
+        d = ExpiringDict(default_ttl=10.0)
+        d["k"] = 99
+        ts = d._last_purge_ns
+        _ = d.get("k")
+        self.assertEqual(d._last_purge_ns, ts)
+        self.assertFalse(d._purge_pending)
+
+    # ── slow-path (interval elapsed) ──────────────────────
+    def test_maybe_schedule_purge_updates_last_purge_ns_when_stale(self):
+        """`_last_purge_ns` is stamped forward when the interval has elapsed."""
+        d = ExpiringDict(default_ttl=10.0)
+        d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
+        old_ts = d._last_purge_ns
+        before = now_utc_ns()
+        d._maybe_schedule_purge()
+        self.assertGreater(d._last_purge_ns, old_ts)
+        self.assertGreaterEqual(d._last_purge_ns, before)
+
+    def test_maybe_schedule_purge_sets_pending_when_stale(self):
+        """`_purge_pending` becomes True when a background purge is claimed."""
+        d = ExpiringDict(default_ttl=10.0)
+        d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
+        # Prevent the Job from actually firing so we can inspect _purge_pending
+        original = d._background_purge
+        fired = []
+        def stub():
+            fired.append(1)
+            original()
+        d._background_purge = stub
+        d._maybe_schedule_purge()
+        # Immediately after claiming: pending is True (may flip False quickly)
+        # After stub runs: pending goes back to False
+        time.sleep(0.15)
+        self.assertFalse(d._purge_pending)   # background thread clears it
+        self.assertEqual(len(fired), 1)
+
+    def test_maybe_schedule_purge_no_double_fire(self):
+        """Double-checked locking: only one thread schedules the background purge."""
+        d = ExpiringDict(default_ttl=10.0)
+        d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
+
+        fire_count = []
+        original = d._background_purge
+        lock = threading.Lock()
+        def counting_purge():
+            with lock:
+                fire_count.append(1)
+            original()
+        d._background_purge = counting_purge
+
+        threads = [threading.Thread(target=d._maybe_schedule_purge) for _ in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        time.sleep(0.2)  # let background daemon finish
+
+        self.assertEqual(sum(fire_count), 1,
+                         "_background_purge must fire exactly once")
+
+    # ── _background_purge ─────────────────────────────────
+    def test_background_purge_clears_pending(self):
+        """`_background_purge` sets `_purge_pending` back to False."""
+        d = ExpiringDict(default_ttl=10.0)
+        d._purge_pending = True
+        d._background_purge()
+        self.assertFalse(d._purge_pending)
+
+    def test_background_purge_evicts_expired_entries(self):
+        """`_background_purge` removes expired keys from the store."""
+        d = ExpiringDict(default_ttl=10.0)
+        d._store["stale"] = (99, now_utc_ns() - 1)   # already expired
+        d._store["fresh"] = (1,  now_utc_ns() + 60 * _1s_ns)
+        d._purge_pending = True
+        d._background_purge()
+        self.assertNotIn("stale", d._store)
+        self.assertIn("fresh", d._store)
+
+    def test_background_purge_leaves_non_expiring_entries(self):
+        """`_background_purge` does not evict entries with expires_at=None."""
+        d = ExpiringDict(default_ttl=None)
+        d._store["forever"] = (42, None)
+        d._purge_pending = True
+        d._background_purge()
+        self.assertIn("forever", d._store)
+
+    # ── pickle / deepcopy ─────────────────────────────────
+    def test_pickle_restores_last_purge_ns_to_recent(self):
+        """After unpickling, _last_purge_ns is set near the time of pickling."""
+        d = ExpiringDict(default_ttl=60.0)
+        d["k"] = 1
+        before = now_utc_ns()
+        d2 = pickle.loads(pickle.dumps(d))
+        after = now_utc_ns()
+        self.assertGreaterEqual(d2._last_purge_ns, before)
+        self.assertLessEqual(d2._last_purge_ns, after)
+
+    def test_pickle_restores_purge_pending_false(self):
+        """After unpickling, _purge_pending is always False."""
+        d = ExpiringDict(default_ttl=60.0)
+        d["k"] = 1
+        d._purge_pending = True   # simulate in-progress purge at pickle time
+        d2 = pickle.loads(pickle.dumps(d))
+        self.assertFalse(d2._purge_pending)
+
+    def test_deepcopy_restores_purge_state(self):
+        """deepcopy produces independent purge counters."""
+        d = ExpiringDict(default_ttl=60.0)
+        d["k"] = 1
+        d2 = copy.deepcopy(d)
+        self.assertFalse(d2._purge_pending)
+        # Advancing d's counter must not affect d2
+        d._last_purge_ns = 0
+        self.assertGreater(d2._last_purge_ns, 0)
+
+    # ── end-to-end: stale dict auto-purges via set() ──────
+    def test_stale_dict_auto_purges_on_set(self):
+        """When _last_purge_ns is very old, calling set() eventually clears expired keys."""
+        d = ExpiringDict(default_ttl=10.0)
+        # Plant an expired key directly so we can confirm it gets evicted
+        d._store["zombie"] = (1, now_utc_ns() - 1)
+        # Force the purge interval to appear elapsed
+        d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
+        # set() → _maybe_schedule_purge → background thread
+        d.set("new", 2)
+        time.sleep(0.2)  # allow background daemon to run
+        self.assertNotIn("zombie", d._store)
+        self.assertIn("new", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

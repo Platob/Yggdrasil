@@ -7,10 +7,10 @@ import struct
 from pathlib import Path
 
 import pytest
-
+from yggdrasil.io import MimeTypes
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.config import BufferConfig
-from yggdrasil.io.enums import MediaType, MimeType
+from yggdrasil.io.enums import MediaType
 
 
 @pytest.fixture
@@ -452,7 +452,7 @@ def test_media_type_property_returns_media_type(cfg: BufferConfig) -> None:
 
 def test_media_io_delegates(cfg: BufferConfig) -> None:
     b = BytesIO(b"{}", config=cfg)
-    media = MediaType(MimeType.JSON)
+    media = MediaType(MimeTypes.JSON)
 
     io_obj = b.media_io(media)
 

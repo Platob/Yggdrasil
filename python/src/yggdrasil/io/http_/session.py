@@ -216,7 +216,7 @@ class HTTPSession(Session):
         result.buffer.truncate(size=0)
 
         arr = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
-        mt = MediaType(MimeType.ARROW_IPC)
+        mt = MediaType(MimeTypes.ARROW_IPC)
         mio = result.buffer.media_io(mt)
         mio.write_arrow_table(arr)
         result.set_media_type(mt, safe=False)

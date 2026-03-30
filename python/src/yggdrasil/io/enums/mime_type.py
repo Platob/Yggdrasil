@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ClassVar, IO, Mapping, Union
 
-__all__ = ["MimeType"]
+__all__ = ["MimeType", "MimeTypes"]
 
 MagicMatcher = Callable[[bytes], bool]
 
@@ -33,10 +33,10 @@ class MimeType:
     """
     Dataclass MIME descriptor + registries.
 
-    - extensions: dotless, lower-case keys (we normalize on registration anyway)
-    - magics: ordered matchers (usually prefix checks; can be any predicate)
-    - is_codec: compression / wrapper formats (gzip/zstd/...)
-    - is_tabular: row/tabular-ish formats (csv/tsv/ndjson/jsonl)
+    - extensions: dotless, lower-case keys
+    - magics: ordered matchers
+    - is_codec: compression / wrapper formats
+    - is_tabular: row/tabular-ish formats
     """
 
     name: str
@@ -52,14 +52,8 @@ class MimeType:
     _EXT_MAP: ClassVar[dict[str, "MimeType"]] = {}
     _MAGIC_ORDER: ClassVar[list["MimeType"]] = []
 
-    # -------- registration --------
     @classmethod
     def define(cls, mt: "MimeType") -> "MimeType":
-        """
-        Register a MimeType instance in the global registries.
-
-        Public on purpose (avoids "protected access" lint noise).
-        """
         cls._BY_NAME[mt.name.lower()] = mt
         cls._BY_VALUE[mt.value.lower()] = mt
 
@@ -77,15 +71,8 @@ class MimeType:
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}.{self.name}: {self.value!r}>"
 
-    # -------- lax resolution --------
     @classmethod
     def get(cls, value: object) -> "MimeType | None":
-        """
-        Lax lookup:
-          1) exact MIME value (case-insensitive)
-          2) name (case-insensitive)
-          3) stripped common prefixes then name match
-        """
         if not isinstance(value, str):
             return None
 
@@ -101,11 +88,10 @@ class MimeType:
 
         for prefix in ("application/", "text/", "image/", "audio/", "video/"):
             if s.startswith(prefix):
-                return cls._BY_NAME.get(s[len(prefix) :])
+                return cls._BY_NAME.get(s[len(prefix):])
 
         return None
 
-    # -------- parsing entrypoint --------
     @classmethod
     def parse(cls, obj: Any, default: "MimeType | None" = None) -> "MimeType | None":
         if isinstance(obj, cls):
@@ -119,57 +105,43 @@ class MimeType:
 
         return cls.parse_magic(obj, default=default)
 
-    # -------- magic parsing --------
     @classmethod
     def parse_magic(
         cls,
         magic: Union[bytes, bytearray, memoryview, IO[bytes], str, Path],
-        default: "MimeType | None" = None
+        default: "MimeType | None" = None,
     ) -> "MimeType | None":
         if not magic:
             return default
 
-        # ensure bytes (memoryview-safe)
         if not isinstance(magic, (bytes, bytearray)):
             from ..buffer import BytesIO
 
             if isinstance(magic, BytesIO):
-                # avoid copy for our own buffer type (common in parsing pipelines)
                 magic = bytes(magic.head(64))
             else:
                 with BytesIO(magic, copy=False).view(pos=0) as b:
                     magic = bytes(b.read(64))
 
-        # ordered scan (define codecs first)
         for mt in cls._MAGIC_ORDER:
             for matcher in mt.magics:
                 try:
                     if matcher(magic):
                         return mt
                 except Exception:
-                    # matcher bug shouldn't kill parsing
                     continue
 
-        # weak signals (fallback territory)
         if magic.startswith(b"{") or magic.startswith(b"["):
-            return cls.NDJSON if b"}\n{" in magic else cls.JSON
+            return MimeTypes.NDJSON if b"}\n{" in magic else MimeTypes.JSON
         if magic.startswith(b"<"):
-            return cls.XML  # could also be HTML; indistinguishable here
+            return MimeTypes.XML
 
         return default
 
-    # -------- string parsing --------
     @classmethod
     def parse_str(cls, value: str, default: "MimeType | None" = None) -> "MimeType | None":
-        """
-        Resolution order:
-          1) extension map (fast)
-          2) lax get() by value/name/prefix-stripped
-          3) tiny JSON literal heuristic
-        """
         candidate = value.strip()
 
-        # path-ish: use suffix
         if "." in candidate or "/" in candidate or "\\" in candidate:
             p = Path(candidate)
             ext = p.suffix.lstrip(".").lower()
@@ -178,7 +150,6 @@ class MimeType:
                 if hit is not None:
                     return hit
 
-        # bare ext or ".ext"
         bare = candidate.lstrip(".").lower()
         hit = cls._EXT_MAP.get(bare)
         if hit is not None:
@@ -189,11 +160,10 @@ class MimeType:
             return mt
 
         if candidate.startswith("{") or candidate.startswith("["):
-            return cls.NDJSON if "\n{" in candidate else cls.JSON
+            return MimeTypes.NDJSON if "\n{" in candidate else MimeTypes.JSON
 
         return default
 
-    # -------- runtime extension registry --------
     @classmethod
     def register_extension(
         cls,
@@ -204,7 +174,6 @@ class MimeType:
     ) -> None:
         key = ext.lstrip(".").lower()
 
-        resolved: MimeType | None
         if isinstance(mime, MimeType):
             resolved = mime
         else:
@@ -228,12 +197,11 @@ class MimeType:
         *,
         overwrite: bool = False,
     ) -> None:
-        # validate all entries first (all-or-nothing)
         resolved: list[tuple[str, MimeType]] = []
+
         for ext, mime in mapping.items():
             key = ext.lstrip(".").lower()
 
-            mt: MimeType | None
             if isinstance(mime, MimeType):
                 mt = mime
             else:
@@ -257,7 +225,6 @@ class MimeType:
 
     @classmethod
     def extensions_for(cls, mime: "MimeType | str") -> list[str]:
-        target: MimeType | None
         if isinstance(mime, MimeType):
             target = mime
         else:
@@ -278,275 +245,294 @@ class MimeType:
 
 
 # ----------------------------
-# Registry: definitions
-# Order matters for parse_magic: codecs first.
+# Namespace for declared mime constants
 # ----------------------------
+class MimeTypes:
+    """Singleton MIME definitions."""
 
-# --- Compression / codecs ---
-MimeType.GZIP = MimeType.define(
-    MimeType(
-        "GZIP",
-        "application/gzip",
-        extensions=("gz", "gzip", "tgz"),
-        magics=(magic_prefix(b"\x1f\x8b"),),
-        is_codec=True,
+    # --- Compression / codecs ---
+    GZIP = MimeType.define(
+        MimeType(
+            "GZIP",
+            "application/gzip",
+            extensions=("gz", "gzip", "tgz"),
+            magics=(magic_prefix(b"\x1f\x8b"),),
+            is_codec=True,
+        )
     )
-)
-MimeType.ZSTD = MimeType.define(
-    MimeType(
-        "ZSTD",
-        "application/zstd",
-        extensions=("zst", "zstd"),
-        magics=(magic_prefix(b"\x28\xb5\x2f\xfd"),),
-        is_codec=True,
+    ZSTD = MimeType.define(
+        MimeType(
+            "ZSTD",
+            "application/zstd",
+            extensions=("zst", "zstd"),
+            magics=(magic_prefix(b"\x28\xb5\x2f\xfd"),),
+            is_codec=True,
+        )
     )
-)
-MimeType.BROTLI = MimeType.define(
-    MimeType("BROTLI", "application/x-brotli", extensions=("br", "brotli"), is_codec=True)
-)
-MimeType.LZ4 = MimeType.define(
-    MimeType(
-        "LZ4",
-        "application/x-lz4",
-        extensions=("lz4",),
-        magics=(magic_prefix(b"\x04\x22\x4d\x18"),),
-        is_codec=True,
+    BROTLI = MimeType.define(
+        MimeType("BROTLI", "application/x-brotli", extensions=("br", "brotli"), is_codec=True)
     )
-)
-MimeType.SNAPPY = MimeType.define(
-    MimeType("SNAPPY", "application/x-snappy", extensions=("snappy", "sz"), is_codec=True)
-)
-MimeType.BZ2 = MimeType.define(
-    MimeType(
-        "BZ2",
-        "application/x-bzip2",
-        extensions=("bz2", "bzip2", "tbz2"),
-        magics=(magic_prefix(b"\x42\x5a\x68"),),
-        is_codec=True,
+    LZ4 = MimeType.define(
+        MimeType(
+            "LZ4",
+            "application/x-lz4",
+            extensions=("lz4",),
+            magics=(magic_prefix(b"\x04\x22\x4d\x18"),),
+            is_codec=True,
+        )
     )
-)
-MimeType.XZ = MimeType.define(
-    MimeType(
-        "XZ",
-        "application/x-xz",
-        extensions=("xz", "txz"),
-        magics=(magic_prefix(b"\xfd\x37\x7a\x58\x5a\x00"),),
-        is_codec=True,
+    SNAPPY = MimeType.define(
+        MimeType("SNAPPY", "application/x-snappy", extensions=("snappy", "sz"), is_codec=True)
     )
-)
-MimeType.ZLIB = MimeType.define(
-    MimeType(
-        "ZLIB",
-        "application/zlib",
-        extensions=("zlib",),
-        magics=(magic_prefix(b"\x78\x01"), magic_prefix(b"\x78\x9c"), magic_prefix(b"\x78\xda")),
-        is_codec=True,
+    BZ2 = MimeType.define(
+        MimeType(
+            "BZ2",
+            "application/x-bzip2",
+            extensions=("bz2", "bzip2", "tbz2"),
+            magics=(magic_prefix(b"\x42\x5a\x68"),),
+            is_codec=True,
+        )
     )
-)
-MimeType.LZMA = MimeType.define(MimeType("LZMA", "application/x-lzma", extensions=("lzma",), is_codec=True))
-MimeType.ZZIP = MimeType.define(MimeType("ZZIP", "application/x-compress", extensions=("z", "Z"), is_codec=True))
+    XZ = MimeType.define(
+        MimeType(
+            "XZ",
+            "application/x-xz",
+            extensions=("xz", "txz"),
+            magics=(magic_prefix(b"\xfd\x37\x7a\x58\x5a\x00"),),
+            is_codec=True,
+        )
+    )
+    ZLIB = MimeType.define(
+        MimeType(
+            "ZLIB",
+            "application/zlib",
+            extensions=("zlib",),
+            magics=(magic_prefix(b"\x78\x01"), magic_prefix(b"\x78\x9c"), magic_prefix(b"\x78\xda")),
+            is_codec=True,
+        )
+    )
+    LZMA = MimeType.define(
+        MimeType("LZMA", "application/x-lzma", extensions=("lzma",), is_codec=True)
+    )
+    ZZIP = MimeType.define(
+        MimeType("ZZIP", "application/x-compress", extensions=("z", "Z"), is_codec=True)
+    )
 
-# --- Containers / docs ---
-MimeType.ZIP = MimeType.define(
-    MimeType(
-        "ZIP",
-        "application/zip",
-        extensions=("zip",),
-        magics=(magic_prefix(b"PK\x03\x04"),),
+    # --- Containers / docs ---
+    ZIP = MimeType.define(
+        MimeType(
+            "ZIP",
+            "application/zip",
+            extensions=("zip",),
+            magics=(magic_prefix(b"PK\x03\x04"),),
+        )
     )
-)
-MimeType.PDF = MimeType.define(
-    MimeType(
-        "PDF",
-        "application/pdf",
-        extensions=("pdf",),
-        magics=(magic_prefix(b"%PDF-"),),
+    PDF = MimeType.define(
+        MimeType(
+            "PDF",
+            "application/pdf",
+            extensions=("pdf",),
+            magics=(magic_prefix(b"%PDF-"),),
+        )
     )
-)
-MimeType.TAR = MimeType.define(
-    MimeType(
-        "TAR",
-        "application/x-tar",
-        extensions=("tar",),
-        magics=(magic_prefix(b"\x75\x73\x74\x61\x72"),),
+    TAR = MimeType.define(
+        MimeType(
+            "TAR",
+            "application/x-tar",
+            extensions=("tar",),
+            magics=(magic_prefix(b"\x75\x73\x74\x61\x72"),),
+        )
     )
-)
-MimeType.SQLITE = MimeType.define(
-    MimeType(
-        "SQLITE",
-        "application/x-sqlite3",
-        extensions=("db", "sqlite", "sqlite3"),
-        magics=(magic_prefix(b"SQLite format 3\x00"),),
+    SQLITE = MimeType.define(
+        MimeType(
+            "SQLITE",
+            "application/x-sqlite3",
+            extensions=("db", "sqlite", "sqlite3"),
+            magics=(magic_prefix(b"SQLite format 3\x00"),),
+        )
     )
-)
-MimeType.HDF5 = MimeType.define(
-    MimeType(
-        "HDF5",
-        "application/x-hdf5",
-        extensions=("h5", "hdf5", "he5"),
-        magics=(magic_prefix(b"\x89HDF\r\n\x1a\n"),),
+    HDF5 = MimeType.define(
+        MimeType(
+            "HDF5",
+            "application/x-hdf5",
+            extensions=("h5", "hdf5", "he5"),
+            magics=(magic_prefix(b"\x89HDF\r\n\x1a\n"),),
+        )
     )
-)
-MimeType.XLSX = MimeType.define(
-    MimeType(
-        "XLSX",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        extensions=("xlsx", "xls"),
+    XLSX = MimeType.define(
+        MimeType(
+            "XLSX",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            extensions=("xlsx", "xls"),
+        )
     )
-)
-MimeType.DOCX = MimeType.define(
-    MimeType(
-        "DOCX",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        extensions=("docx",),
+    DOCX = MimeType.define(
+        MimeType(
+            "DOCX",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            extensions=("docx",),
+        )
     )
-)
 
-# --- Columnar / analytics ---
-MimeType.PARQUET = MimeType.define(
-    MimeType(
-        "PARQUET",
-        "application/vnd.apache.parquet",
-        extensions=("parquet", "pq"),
-        magics=(magic_parquet,),
+    # --- Columnar / analytics ---
+    PARQUET = MimeType.define(
+        MimeType(
+            "PARQUET",
+            "application/vnd.apache.parquet",
+            extensions=("parquet", "pq"),
+            magics=(magic_parquet,),
+        )
     )
-)
-MimeType.PARQUET_DELTA = MimeType.define(
-    MimeType("PARQUET_DELTA", "application/vnd.apache.parquet+delta")
-)
-MimeType.ARROW_IPC = MimeType.define(
-    MimeType(
-        "ARROW_IPC",
-        "application/vnd.apache.arrow.file",
-        extensions=("ipc", "feather"),
-        magics=(magic_prefix(b"ARROW1"),),
+    PARQUET_DELTA = MimeType.define(
+        MimeType("PARQUET_DELTA", "application/vnd.apache.parquet+delta")
     )
-)
-MimeType.ARROW_IPC_STREAM = MimeType.define(
-    MimeType(
-        "ARROW_IPC_STREAM",
-        "application/vnd.apache.arrow.stream",
-        extensions=("arrow", "arrows"),
+    ARROW_IPC = MimeType.define(
+        MimeType(
+            "ARROW_IPC",
+            "application/vnd.apache.arrow.file",
+            extensions=("ipc", "feather"),
+            magics=(magic_prefix(b"ARROW1"),),
+        )
     )
-)
+    ARROW_IPC_STREAM = MimeType.define(
+        MimeType(
+            "ARROW_IPC_STREAM",
+            "application/vnd.apache.arrow.stream",
+            extensions=("arrow", "arrows"),
+        )
+    )
+    ORC = MimeType.define(
+        MimeType(
+            "ORC",
+            "application/vnd.apache.orc",
+            extensions=("orc",),
+            magics=(magic_prefix(b"ORC"),),
+        )
+    )
+    AVRO = MimeType.define(
+        MimeType(
+            "AVRO",
+            "application/avro",
+            extensions=("avro",),
+            magics=(magic_prefix(b"Obj\x01"),),
+        )
+    )
+    ICEBERG = MimeType.define(
+        MimeType("ICEBERG", "application/vnd.apache.iceberg", extensions=("iceberg",))
+    )
+    DELTA = MimeType.define(
+        MimeType("DELTA", "application/vnd.delta", extensions=("delta", "deltatable"))
+    )
 
-MimeType.ORC = MimeType.define(
-    MimeType(
-        "ORC",
-        "application/vnd.apache.orc",
-        extensions=("orc",),
-        magics=(magic_prefix(b"ORC"),),
+    # --- Text / semi-structured ---
+    JSON = MimeType.define(MimeType("JSON", "application/json", extensions=("json",)))
+    NDJSON = MimeType.define(
+        MimeType(
+            "NDJSON",
+            "application/ld+json",
+            extensions=("jsonld", "ldjson"),
+            is_tabular=True,
+        )
     )
-)
-MimeType.AVRO = MimeType.define(
-    MimeType(
-        "AVRO",
-        "application/avro",
-        extensions=("avro",),
-        magics=(magic_prefix(b"Obj\x01"),),
+    CSV = MimeType.define(MimeType("CSV", "text/csv", extensions=("csv",), is_tabular=True))
+    TSV = MimeType.define(
+        MimeType("TSV", "text/tab-separated-values", extensions=("tsv",), is_tabular=True)
     )
-)
-MimeType.ICEBERG = MimeType.define(
-    MimeType("ICEBERG", "application/vnd.apache.iceberg", extensions=("iceberg",))
-)
-MimeType.DELTA = MimeType.define(
-    MimeType("DELTA", "application/vnd.delta", extensions=("delta", "deltatable"))
-)
+    XML = MimeType.define(MimeType("XML", "application/xml", extensions=("xml",)))
+    HTML = MimeType.define(MimeType("HTML", "text/html", extensions=("html", "htm")))
+    PLAIN = MimeType.define(MimeType("PLAIN", "text/plain", extensions=("txt", "text")))
+    YAML = MimeType.define(MimeType("YAML", "application/yaml", extensions=("yaml", "yml")))
+    TOML = MimeType.define(MimeType("TOML", "application/toml", extensions=("toml",)))
 
-# --- Text / semi-structured ---
-MimeType.JSON = MimeType.define(MimeType("JSON", "application/json", extensions=("json",)))
-MimeType.NDJSON = MimeType.define(
-    MimeType(
-        "NDJSON",
-        "application/ld+json",
-        extensions=("jsonld", "ldjson"),
-        is_tabular=True,
+    # --- Binary serialisation ---
+    MSGPACK = MimeType.define(
+        MimeType("MSGPACK", "application/msgpack", extensions=("msgpack", "mpk"))
     )
-)
-MimeType.CSV = MimeType.define(
-    MimeType("CSV", "text/csv", extensions=("csv",), is_tabular=True)
-)
-MimeType.TSV = MimeType.define(
-    MimeType("TSV", "text/tab-separated-values", extensions=("tsv",), is_tabular=True)
-)
-MimeType.XML = MimeType.define(MimeType("XML", "application/xml", extensions=("xml",)))
-MimeType.HTML = MimeType.define(MimeType("HTML", "text/html", extensions=("html", "htm")))
-MimeType.PLAIN = MimeType.define(MimeType("PLAIN", "text/plain", extensions=("txt", "text")))
-MimeType.YAML = MimeType.define(MimeType("YAML", "application/yaml", extensions=("yaml", "yml")))
-MimeType.TOML = MimeType.define(MimeType("TOML", "application/toml", extensions=("toml",)))
+    PROTOBUF = MimeType.define(
+        MimeType("PROTOBUF", "application/x-protobuf", extensions=("pb", "proto", "protobuf"))
+    )
+    FLATBUFFERS = MimeType.define(
+        MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("bin", "fbs"))
+    )
+    CBOR = MimeType.define(MimeType("CBOR", "application/cbor", extensions=("cbor",)))
+    BSON = MimeType.define(MimeType("BSON", "application/bson", extensions=("bson",)))
+    PICKLE = MimeType.define(
+        MimeType("PICKLE", "application/x-python-pickle", extensions=("pkl", "pickle"))
+    )
+    NUMPY = MimeType.define(
+        MimeType(
+            "NUMPY",
+            "application/x-npy",
+            extensions=("npy",),
+            magics=(magic_prefix(b"\x93NUMPY"),),
+        )
+    )
+    NUMPY_ARCHIVE = MimeType.define(
+        MimeType("NUMPY_ARCHIVE", "application/x-npz", extensions=("npz",))
+    )
 
-# --- Binary serialisation ---
-MimeType.MSGPACK = MimeType.define(MimeType("MSGPACK", "application/msgpack", extensions=("msgpack", "mpk")))
-MimeType.PROTOBUF = MimeType.define(MimeType("PROTOBUF", "application/x-protobuf", extensions=("pb", "proto", "protobuf")))
-MimeType.FLATBUFFERS = MimeType.define(MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("bin", "fbs")))
-MimeType.CBOR = MimeType.define(MimeType("CBOR", "application/cbor", extensions=("cbor",)))
-MimeType.BSON = MimeType.define(MimeType("BSON", "application/bson", extensions=("bson",)))
-MimeType.PICKLE = MimeType.define(MimeType("PICKLE", "application/x-python-pickle", extensions=("pkl", "pickle")))
-MimeType.NUMPY = MimeType.define(
-    MimeType(
-        "NUMPY",
-        "application/x-npy",
-        extensions=("npy",),
-        magics=(magic_prefix(b"\x93NUMPY"),),
+    # --- Images ---
+    PNG = MimeType.define(
+        MimeType(
+            "PNG",
+            "image/png",
+            extensions=("png",),
+            magics=(magic_prefix(b"\x89PNG\r\n\x1a\n"),),
+        )
     )
-)
-MimeType.NUMPY_ARCHIVE = MimeType.define(MimeType("NUMPY_ARCHIVE", "application/x-npz", extensions=("npz",)))
+    JPEG = MimeType.define(
+        MimeType(
+            "JPEG",
+            "image/jpeg",
+            extensions=("jpg", "jpeg"),
+            magics=(magic_prefix(b"\xff\xd8\xff"),),
+        )
+    )
+    GIF = MimeType.define(
+        MimeType(
+            "GIF",
+            "image/gif",
+            extensions=("gif",),
+            magics=(magic_prefix(b"GIF87a"), magic_prefix(b"GIF89a")),
+        )
+    )
+    WEBP = MimeType.define(
+        MimeType(
+            "WEBP",
+            "image/webp",
+            extensions=("webp",),
+            magics=(magic_riff_webp,),
+        )
+    )
+    TIFF = MimeType.define(
+        MimeType(
+            "TIFF",
+            "image/tiff",
+            extensions=("tif", "tiff"),
+            magics=(magic_prefix(b"II*\x00"), magic_prefix(b"MM\x00*")),
+        )
+    )
+    BMP = MimeType.define(
+        MimeType(
+            "BMP",
+            "image/bmp",
+            extensions=("bmp",),
+            magics=(magic_prefix(b"BM"),),
+        )
+    )
 
-# --- Images ---
-MimeType.PNG = MimeType.define(
-    MimeType(
-        "PNG",
-        "image/png",
-        extensions=("png",),
-        magics=(magic_prefix(b"\x89PNG\r\n\x1a\n"),),
+    # --- Fallback ---
+    OCTET_STREAM = MimeType.define(
+        MimeType("OCTET_STREAM", "application/octet-stream")
     )
-)
-MimeType.JPEG = MimeType.define(
-    MimeType(
-        "JPEG",
-        "image/jpeg",
-        extensions=("jpg", "jpeg"),
-        magics=(magic_prefix(b"\xff\xd8\xff"),),
-    )
-)
-MimeType.GIF = MimeType.define(
-    MimeType(
-        "GIF",
-        "image/gif",
-        extensions=("gif",),
-        magics=(magic_prefix(b"GIF87a"), magic_prefix(b"GIF89a")),
-    )
-)
-MimeType.WEBP = MimeType.define(
-    MimeType(
-        "WEBP",
-        "image/webp",
-        extensions=("webp",),
-        magics=(magic_riff_webp,),
-    )
-)
-MimeType.TIFF = MimeType.define(
-    MimeType(
-        "TIFF",
-        "image/tiff",
-        extensions=("tif", "tiff"),
-        magics=(magic_prefix(b"II*\x00"), magic_prefix(b"MM\x00*")),
-    )
-)
-MimeType.BMP = MimeType.define(
-    MimeType(
-        "BMP",
-        "image/bmp",
-        extensions=("bmp",),
-        magics=(magic_prefix(b"BM"),),
-    )
-)
 
-# --- Fallback ---
-MimeType.OCTET_STREAM = MimeType.define(
-    MimeType("OCTET_STREAM", "application/octet-stream")
-)
 
 # Seed container riders (XLSX/DOCX are ZIP containers)
-# Put these after all defines so we don't care about define order.
-MimeType.register_extensions({"xlsx": MimeType.XLSX, "xls": MimeType.XLSX, "docx": MimeType.DOCX}, overwrite=True)
+MimeType.register_extensions(
+    {
+        "xlsx": MimeTypes.XLSX,
+        "xls": MimeTypes.XLSX,
+        "docx": MimeTypes.DOCX,
+    },
+    overwrite=True,
+)

@@ -46,14 +46,17 @@ def _strip_trailing_dot(host: str) -> str:
     return host[:-1] if host.endswith(".") else host
 
 
-def _normalize_path(path: str) -> str:
+def _normalize_path(
+    path: str,
+    os_find: bool
+) -> str:
     if not path:
         return "/"
 
     elif path == "/":
         return path
 
-    elif not path.startswith("/"):
+    elif os_find:
         path = "/" + os.path.realpath(path).replace("\\", "/")
 
     return path
@@ -177,7 +180,7 @@ def _normalize_components(
     scheme_n = _lower_if(scheme)
     host_n = _strip_trailing_dot(_lower_if(host))
     port_n = _remove_default_port(scheme_n, host_n, port)
-    path_n = _normalize_path(path)
+    path_n = _normalize_path(path, os_find=scheme in (None, "", "file"))
     query_n = _normalize_query(query)
     fragment_n = fragment.lstrip("#")
 
@@ -484,8 +487,13 @@ class URL:
         port = _remove_default_port(self.scheme, host_text, _p(self.port))
         return self._replace(host=host_text, port=port or None)
 
-    def with_path(self, path: str | None) -> URL:
-        return self._replace(path=_normalize_path(_s(path)))
+    def with_path(
+        self,
+        path: str | None,
+        *,
+        os_find: bool = False
+    ) -> URL:
+        return self._replace(path=_normalize_path(_s(path), os_find=os_find))
 
     def with_query(self, query: str | None) -> URL:
         query_text = _s(query).lstrip("?")

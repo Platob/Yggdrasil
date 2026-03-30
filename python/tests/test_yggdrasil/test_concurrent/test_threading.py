@@ -6,10 +6,13 @@ import time
 
 import pytest
 
-# Change this import to match your project layout.
-# Example:
-#   from yggdrasil.concurrent.infinite_threadpool import Job, JobPoolExecutor
+# Legacy import path (shim) — must still work
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
+# Canonical import paths
+from yggdrasil.concurrent import AsyncJob, ThreadJob, JobResult
+from yggdrasil.concurrent.job import Job as JobDirect
+from yggdrasil.concurrent.job_result import JobResult as JobResultDirect
+from yggdrasil.concurrent.pool import JobPoolExecutor as PoolDirect
 
 
 def test_job_make_and_run_positional_and_kwargs():
@@ -226,3 +229,149 @@ def test_ordered_mode_uses_deque_inflight_and_yields_all():
     with JobPoolExecutor(max_workers=3, max_in_flight=4) as ex:
         out = list(_.result for _ in ex.as_completed(jobs, ordered=True))
         assert out == [i * i for i in range(15)]
+
+# ===========================================================================
+# ThreadJob — awaitable thread handle
+# ===========================================================================
+
+def test_thread_job_is_async_job_subclass():
+    handle = Job.make(lambda: None).fire_and_forget()
+    handle.wait()
+    assert isinstance(handle, AsyncJob)
+    assert isinstance(handle, ThreadJob)
+
+
+def test_fire_and_forget_returns_thread_job():
+    handle = Job.make(lambda: 42).fire_and_forget()
+    assert isinstance(handle, ThreadJob)
+
+
+def test_thread_method_returns_thread_job():
+    handle = Job.make(lambda: 99).thread()
+    assert isinstance(handle, ThreadJob)
+    assert handle.wait() == 99
+
+
+def test_thread_job_wait_indefinitely_returns_value():
+    handle = Job.make(lambda a, b: a * b, 6, 7).fire_and_forget()
+    assert handle.wait() == 42
+
+
+def test_thread_job_wait_true_blocks_until_done():
+    evt = threading.Event()
+    handle = Job.make(evt.set).fire_and_forget()
+    handle.wait(wait=True)
+    assert evt.is_set()
+    assert handle.is_done
+
+
+def test_thread_job_wait_false_nonblocking_poll():
+    barrier = threading.Event()
+    handle = Job.make(lambda: barrier.wait(timeout=5)).fire_and_forget()
+    # Thread is blocked on barrier → not done yet
+    result = handle.wait(wait=False)
+    assert result is None
+    assert not handle.is_done
+    barrier.set()
+    handle.wait()  # let it finish cleanly
+
+
+def test_thread_job_wait_numeric_timeout_raises_timeout_error():
+    handle = Job.make(time.sleep, 60).fire_and_forget()
+    with pytest.raises(TimeoutError):
+        handle.wait(wait=0.05, raise_error=True)
+
+
+def test_thread_job_wait_numeric_timeout_no_raise():
+    handle = Job.make(time.sleep, 60).fire_and_forget()
+    result = handle.wait(wait=0.05, raise_error=False)
+    assert result is None
+
+
+def test_thread_job_exception_propagates_on_wait():
+    def _boom():
+        raise ValueError("thread-bang")
+
+    handle = Job.make(_boom).fire_and_forget()
+    with pytest.raises(ValueError, match="thread-bang"):
+        handle.wait(raise_error=True)
+
+
+def test_thread_job_exception_suppressed_when_raise_error_false():
+    def _boom():
+        raise RuntimeError("silenced")
+
+    handle = Job.make(_boom).fire_and_forget()
+    handle.wait(wait=True, raise_error=False)  # must not raise
+    assert handle.is_done
+
+
+def test_thread_job_wait_multiple_times_idempotent():
+    handle = Job.make(lambda: 7).fire_and_forget()
+    assert handle.wait() == 7
+    assert handle.wait() == 7   # second call should still work
+    assert handle.is_done
+
+
+def test_thread_job_is_done_false_before_finish():
+    barrier = threading.Event()
+    handle = Job.make(lambda: barrier.wait(5)).fire_and_forget()
+    assert not handle.is_done
+    barrier.set()
+    handle.wait()
+    assert handle.is_done
+
+
+def test_thread_job_daemon_thread():
+    """Thread must be a daemon so it never prevents interpreter exit."""
+    handle = Job.make(time.sleep, 60).fire_and_forget()
+    assert handle._thread.daemon is True
+
+
+# ===========================================================================
+# JobResult — immutable outcome wrapper
+# ===========================================================================
+
+def test_job_result_ok_success():
+    handle = Job.make(lambda: 123).fire_and_forget()
+    handle.wait()
+    jr = handle.result()
+    assert isinstance(jr, JobResult)
+    assert jr.ok
+    assert bool(jr)
+    assert jr.get() == 123
+
+
+def test_job_result_ok_false_on_exception():
+    def _err():
+        raise KeyError("missing")
+
+    handle = Job.make(_err).fire_and_forget()
+    handle.wait(raise_error=False)
+    jr = handle.result()
+    assert not jr.ok
+    assert not bool(jr)
+    assert isinstance(jr.exception, KeyError)
+    with pytest.raises(KeyError, match="missing"):
+        jr.get()
+
+
+def test_job_result_none_before_done():
+    barrier = threading.Event()
+    handle = Job.make(lambda: barrier.wait(5)).fire_and_forget()
+    assert handle.result() is None   # not done yet
+    barrier.set()
+    handle.wait()
+    assert handle.result() is not None
+
+
+# ===========================================================================
+# Canonical import paths (split modules)
+# ===========================================================================
+
+def test_canonical_imports_are_same_objects():
+    """All import paths must resolve to the same classes."""
+    assert Job is JobDirect
+    assert JobResult is JobResultDirect
+    assert JobPoolExecutor is PoolDirect
+

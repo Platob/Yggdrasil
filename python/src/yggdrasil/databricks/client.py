@@ -11,21 +11,22 @@ from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callab
 from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
-
-from yggdrasil.environ import UserInfo, PyEnv, runtime_import_module
+from yggdrasil.concurrent.threading import Job
+from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
+from yggdrasil.dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
+from yggdrasil.environ import UserInfo, runtime_import_module
+from yggdrasil.io import BytesIO, MimeTypes
 from yggdrasil.io.url import URL, URLResource, url_resource_class
-from ..concurrent.threading import Job
-from ..dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
-from ..dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
-from ..io import BytesIO, MimeType
 
 if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
+    from .sql.tables import Tables
     from .sql.warehouse import SQLWarehouse
     from .compute.service import Compute
     from .secrets.service import Secrets
-    from .workspaces import Workspaces, Workspace, DatabricksPath
+    from .workspaces import Workspaces, Workspace
+    from .fs.path import DatabricksPath
 
 __all__ = [
     "DatabricksClient",
@@ -456,7 +457,7 @@ class DatabricksClient(URLResource):
         workspace_id = self.get_workspace_id()
 
         if local_cache.exists() and local_cache.stat().st_size > 0:
-            existing_data = buff.media_io(MimeType.PARQUET).read_polars_frame()
+            existing_data = buff.media_io(MimeTypes.PARQUET).read_polars_frame()
             filtered = existing_data.filter(pl.col("workspace_id") == workspace_id)
 
             for record in filtered.to_dicts():
@@ -476,7 +477,7 @@ class DatabricksClient(URLResource):
 
         buff.truncate()
         buff.seek(0)
-        buff.media_io(MimeType.PARQUET).write_arrow_table(new_data.to_arrow())
+        buff.media_io(MimeTypes.PARQUET).write_arrow_table(new_data.to_arrow())
         buff.close()
 
         filtered = new_data.filter(pl.col("workspace_id") == workspace_id)
@@ -572,7 +573,7 @@ class DatabricksClient(URLResource):
         Returns:
             A DatabricksPath instance.
         """
-        from .workspaces.path import DatabricksPath
+        from .fs.path import DatabricksPath
 
         return DatabricksPath.parse(
             obj=parts,
@@ -802,9 +803,20 @@ class DatabricksClient(URLResource):
             use_cache=True,
         )
 
+    @property
+    def tables(self) -> "Tables":
+        """Collection-level Unity Catalog table service for this client."""
+        from .sql.tables import Tables
+
+        return self.lazy_property(
+            self,
+            cache_attr="_tables",
+            factory=lambda: Tables(client=self),
+            use_cache=True,
+        )
+
     def spark_connect(
         self,
-        create: bool = False,
     ):
         try:
             import databricks.connect
@@ -954,6 +966,11 @@ class DatabricksService(ABC):
     def secrets(self) -> "Secrets":
         return self.client.secrets
 
+    @property
+    def tables(self) -> "Tables":
+        """Collection-level Unity Catalog table service (shorthand for ``client.tables``)."""
+        return self.client.tables
+
 
 @dataclass
 class DatabricksResource(ABC):
@@ -972,3 +989,9 @@ class DatabricksResource(ABC):
     @property
     def client(self) -> DatabricksClient:
         return self.service.client
+
+    @property
+    def sql(self) -> "SQLEngine":
+        """Shorthand for ``self.service.client.sql`` — the active :class:`SQLEngine`."""
+        return self.client.sql
+

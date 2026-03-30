@@ -19,6 +19,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
+from yggdrasil.io import SaveMode
 
 from .buffer import BytesIO
 from .request import PreparedRequest
@@ -282,7 +283,7 @@ class Session(ABC):
                 return local_response
 
         # --- 2. Check remote cache (slower, SQL-based) ---
-        if remote_cfg.remote_cache_enabled:
+        if remote_cfg.remote_cache_enabled and remote_cfg.mode == SaveMode.APPEND:
             remote_response = self._load_remote_cached_response(
                 request,
                 remote_cfg,
@@ -417,30 +418,31 @@ class Session(ABC):
             if not after_local:
                 continue
 
-            # --- 2. Batch lookup in remote cache ---
-            anonymized_batch = [
-                req.anonymize(mode=remote_cfg.anonymize)
-                for req in after_local
-            ]
-
-            query = remote_cfg.make_batch_lookup_sql(
-                table_name=remote_cfg.table.full_name(safe=True),
-                requests=anonymized_batch,
-            )
-
-            try:
-                cache_result = remote_cfg.table.sql.execute(query)
-            except Exception as exc:
-                if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                    remote_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                    cache_result = remote_cfg.table.sql.execute(query)
-                else:
-                    raise
-
             cache_map: dict[tuple[Any, ...], Response] = {}
-            for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
-                key = remote_cfg.request_tuple(response.request)
-                cache_map[key] = response
+
+            if remote_cfg.mode == SaveMode.APPEND:
+                anonymized_batch = [
+                    req.anonymize(mode=remote_cfg.anonymize)
+                    for req in after_local
+                ]
+
+                query = remote_cfg.make_batch_lookup_sql(
+                    table_name=remote_cfg.table.full_name(safe=True),
+                    requests=anonymized_batch,
+                )
+
+                try:
+                    cache_result = remote_cfg.table.sql.execute(query)
+                except Exception as exc:
+                    if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+                        remote_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                        cache_result = remote_cfg.table.sql.execute(query)
+                    else:
+                        raise
+
+                for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
+                    key = remote_cfg.request_tuple(response.request)
+                    cache_map[key] = response
 
             remote_hits: list[tuple[PreparedRequest, Response]] = []
             remote_misses: list[PreparedRequest] = []

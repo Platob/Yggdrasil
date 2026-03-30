@@ -54,7 +54,7 @@ class Column:
 
     def set_tags(
         self,
-        tags: Mapping[str, str],
+        tags: Mapping[str, str] | None,
     ):
         if tags:
             query = self.set_tags_ddl(tags)

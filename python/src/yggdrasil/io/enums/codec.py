@@ -9,7 +9,7 @@ from typing import IO, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..buffer import BytesIO
-    from .mime_type import MimeType
+    from .mime_type import MimeType, MimeTypes
 
 __all__ = [
     "Codec",
@@ -249,8 +249,8 @@ class _GzipCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.GZIP
+        from .mime_type import MimeTypes
+        return MimeTypes.GZIP
 
     def compress_bytes(self, data: bytes) -> bytes:
         import gzip
@@ -272,8 +272,8 @@ class _ZstdCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.ZSTD
+        from .mime_type import MimeTypes
+        return MimeTypes.ZSTD
 
     def compress_bytes(self, data: bytes) -> bytes:
         zstd = _runtime_import("zstandard", "zstandard")
@@ -295,8 +295,8 @@ class _Lz4Codec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.LZ4
+        from .mime_type import MimeTypes
+        return MimeTypes.LZ4
 
     def compress_bytes(self, data: bytes) -> bytes:
         lz4 = _runtime_import("lz4.frame", "lz4")
@@ -318,8 +318,8 @@ class _Bzip2Codec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.BZ2
+        from .mime_type import MimeTypes
+        return MimeTypes.BZ2
 
     def compress_bytes(self, data: bytes) -> bytes:
         import bz2
@@ -341,8 +341,8 @@ class _XzCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.XZ
+        from .mime_type import MimeTypes
+        return MimeTypes.XZ
 
     def compress_bytes(self, data: bytes) -> bytes:
         import lzma
@@ -364,8 +364,8 @@ class _SnappyCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.SNAPPY
+        from .mime_type import MimeTypes
+        return MimeTypes.SNAPPY
 
     def compress_bytes(self, data: bytes) -> bytes:
         cj = _runtime_import("cramjam", "cramjam")
@@ -384,8 +384,8 @@ class _BrotliCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.BROTLI
+        from .mime_type import MimeTypes
+        return MimeTypes.BROTLI
 
     def compress_bytes(self, data: bytes) -> bytes:
         brotli = _runtime_import("brotli", "brotli")
@@ -404,8 +404,8 @@ class _ZlibCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.ZLIB
+        from .mime_type import MimeTypes
+        return MimeTypes.ZLIB
 
     def compress_bytes(self, data: bytes) -> bytes:
         import zlib
@@ -494,8 +494,8 @@ class _LzmaCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from .mime_type import MimeType
-        return MimeType.LZMA
+        from .mime_type import MimeTypes
+        return MimeTypes.LZMA
 
     def compress_bytes(self, data: bytes) -> bytes:
         import lzma

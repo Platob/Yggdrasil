@@ -1,19 +1,22 @@
 """Casting options for Arrow- and engine-aware conversions."""
 
 import dataclasses
-from typing import Any, List, Optional, Union, TYPE_CHECKING
+from typing import Any, List, Optional, Union, TYPE_CHECKING, TypeVar
 
 import yggdrasil.arrow as pa
+from yggdrasil.pickle.serde import ObjectSerde
 
 if TYPE_CHECKING:
     import polars
     import pyspark
+    import pandas
 
 __all__ = [
     "CastOptions",
     "CastOptionsArg",
 ]
 
+S = TypeVar("S", bound=Any)
 CastOptionsArg = Union[
     "CastOptions",
     dict,
@@ -529,3 +532,57 @@ class CastOptions:
         if raise_error:
             raise NotImplementedError(f"Unsupported nested Arrow type: {source_type}")
         return None
+
+    def cast_table(
+        self,
+        obj: S
+    ) -> S:
+        if isinstance(obj, (pa.Table, pa.RecordBatch)):
+            return self.cast_arrow(obj)
+
+        ns, _ = ObjectSerde.module_and_name(obj)
+
+        if ns.startswith("pandas."):
+            return self.cast_pandas(obj)
+
+        if ns.startswith("polars."):
+            return self.cast_polars(obj)
+
+        if ns.startswith("pyspark."):
+            return self.cast_pyspark(obj)
+
+        raise ValueError(
+            f"Cannot cast table %s" % repr(obj)
+        )
+
+    def cast_arrow(
+        self,
+        obj: pa.Table | pa.RecordBatch,
+    ) -> pa.Table | pa.RecordBatch:
+        from yggdrasil.arrow.cast import cast_arrow_tabular
+
+        return cast_arrow_tabular(obj, self)
+
+    def cast_polars(
+        self,
+        obj: "polars.DataFrame"
+    ) -> "polars.DataFrame":
+        from yggdrasil.polars.cast import cast_polars_dataframe
+
+        return cast_polars_dataframe(obj, self)
+
+    def cast_pandas(
+        self,
+        obj: "pandas.DataFrame"
+    ):
+        from yggdrasil.pandas.cast import cast_pandas_dataframe
+
+        return cast_pandas_dataframe(obj, self)
+
+    def cast_pyspark(
+        self,
+        obj: "pyspark.sql.DataFrame"
+    ):
+        from yggdrasil.spark.cast import cast_spark_dataframe
+
+        return cast_spark_dataframe(obj, self)

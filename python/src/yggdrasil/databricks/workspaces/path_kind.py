@@ -1,14 +1,4 @@
-"""Enumerations for Databricks path namespaces."""
-
-from enum import Enum
-
+"""Backward-compatibility shim — canonical location is ``yggdrasil.databricks.fs.path_kind``."""
+from ..fs.path_kind import DatabricksPathKind  # noqa: F401
 
 __all__ = ["DatabricksPathKind"]
-
-
-class DatabricksPathKind(str, Enum):
-    """Supported Databricks path kinds for workspace, volumes, and DBFS."""
-    WORKSPACE = 1
-    VOLUME = 2
-    DBFS = 3
-    TABLE = 4

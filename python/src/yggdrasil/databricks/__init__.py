@@ -3,9 +3,13 @@
 from .lib import WorkspaceClient # noqa: F401
 from .workspaces import Workspace
 from .client import DatabricksClient
+from .fs import DatabricksPath, DatabricksPathKind, DatabricksIO
 
 
 __all__ = [
     "DatabricksClient",
     "Workspace",
+    "DatabricksPath",
+    "DatabricksPathKind",
+    "DatabricksIO",
 ]

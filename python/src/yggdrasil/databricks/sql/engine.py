@@ -21,26 +21,29 @@ Design goals:
 from __future__ import annotations
 
 import logging
-import random
-import string
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.enums import SaveMode, FileFormat
+from yggdrasil.io import BytesIO
+from yggdrasil.io.buffer.media_io import MediaIO
+from yggdrasil.io.buffer.parquet_io import ParquetOptions
+from yggdrasil.io.enums import SaveMode
+from yggdrasil.io.enums.media_type import MediaTypes
+
 from .statement_result import StatementResult
 from .table import Table
+from .tables import Tables
 from .types import quote_ident
 from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
-from ..workspaces import DatabricksPath
+from ..fs.path import DatabricksPath
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +98,20 @@ class SQLEngine(DatabricksService):
 
     _last_default_wh_check: int = field(default=0, init=False, repr=False, hash=False, compare=False)
     _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(default=ExpiringDict, init=False, repr=False, hash=False, compare=False)
-    
+
+    # -------------------------------------------------------------------------
+    # Sub-services
+    # -------------------------------------------------------------------------
+
+    @property
+    def tables(self) -> "Tables":
+        """Unity Catalog :class:`Tables` service scoped to this engine's catalog/schema."""
+        return Tables(
+            client=self.client,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
+
     def __call__(
         self,
         *,
@@ -125,56 +141,6 @@ class SQLEngine(DatabricksService):
         object.__setattr__(built, "_cached_queries", self._cached_queries)
 
         return built
-
-    # -------------------------------------------------------------------------------------
-    # Naming helpers
-    # -------------------------------------------------------------------------------------
-    def _catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """
-        Parse a catalog.schema.table string into components.
-
-        Supports partial names:
-        - table
-        - schema.table
-        - catalog.schema.table
-
-        Backticks are stripped from each part.
-
-        Args:
-            full_name:
-                Fully qualified or partial table name string.
-
-        Returns:
-            Tuple (catalog_name, schema_name, table_name), where missing parts may be None
-            and caller can fall back to engine defaults.
-        """
-        parts = [_.strip("`") for _ in full_name.split(".")]
-
-        # Unreachable for .split("."), but harmless and keeps intent explicit.
-        if len(parts) == 0:
-            return self.catalog_name, self.schema_name, None
-        if len(parts) == 1:
-            return self.catalog_name, self.schema_name, parts[0]
-        if len(parts) == 2:
-            return self.catalog_name, parts[0], parts[1]
-
-        catalog_name, schema_name, table_name = parts[-3], parts[-2], parts[-1]
-        return catalog_name or self.catalog_name, schema_name or self.schema_name, table_name
-
-    @staticmethod
-    def _random_suffix(prefix: str = "") -> str:
-        """
-        Generate a unique suffix for temporary resources.
-
-        Args:
-            prefix: Optional prefix to put before the suffix.
-
-        Returns:
-            String of the form "{prefix}{timestamp_ms}_{random8}".
-        """
-        unique = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-        timestamp = int(time.time() * 1000)
-        return f"{prefix}{timestamp}_{unique}"
 
     # -------------------------------------------------------------------------------------
     # Warehouse + AI session
@@ -379,18 +345,11 @@ class SQLEngine(DatabricksService):
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
     ):
-        _, catalog_name, schema_name, table_name = self._check_location_params(
+        return self.tables.table(
             location=location,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
-        )
-
-        return Table(
-            client=self.client,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name
         )
 
     # -------------------------------------------------------------------------------------
@@ -596,13 +555,13 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if table is None:
-            table = self.table(
-                location=location,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name,
-            )
+        table = Table.parse(
+            obj=location if table is None else table,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            service=self.tables
+        )
 
         table = table.ensure_created(data)
         location = table.full_name(safe=True)
@@ -627,11 +586,11 @@ class SQLEngine(DatabricksService):
             else DatabricksPath.parse(obj=temp_volume_path, client=self.client)
         )
 
-        temp_volume_path.write_table(
-            data,
-            file_format=FileFormat.PARQUET,
-            cast_options=cast_options,
-        )
+        with BytesIO() as buffer:
+            mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
+            mio.write_table(data, options=ParquetOptions(cast=cast_options))
+            mio.buffer.seek(0)
+            temp_volume_path.write_bytes(mio.buffer.memoryview())
 
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
@@ -966,52 +925,3 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             if_not_exists=True,
             **kwargs
         )
-
-    def _check_location_params(
-        self,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        safe_chars: bool = True,
-    ) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
-        """
-        Resolve (location OR catalog/schema/table) into a fully-qualified table identifier.
-
-        Args:
-            location:
-                Fully or partially-qualified table name string. Accepts:
-                - table
-                - schema.table
-                - catalog.schema.table
-            catalog_name:
-                Optional catalog override, or default when `location` doesn't provide it.
-            schema_name:
-                Optional schema override, or default when `location` doesn't provide it.
-            table_name:
-                Optional table override, or default when `location` doesn't provide it.
-            safe_chars:
-                If True, quotes identifiers using backticks.
-
-        Returns:
-            Tuple (location_fqn, catalog_name, schema_name, table_name) where:
-            - location_fqn is the resolved full name (quoted if safe_chars=True)
-            - the name components are resolved with engine defaults as needed
-        """
-        if location:
-            c, s, t = self._catalog_schema_table_names(location)
-            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
-
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
-
-        assert catalog_name, "No catalog name given"
-        assert schema_name, "No schema name given"
-        assert table_name, "No table name given"
-
-        if safe_chars:
-            location = f"{quote_ident(catalog_name)}.{quote_ident(schema_name)}.{quote_ident(table_name)}"
-        else:
-            location = f"{catalog_name}.{schema_name}.{table_name}"
-
-        return location, catalog_name or self.catalog_name, schema_name or self.schema_name, table_name

@@ -7,6 +7,7 @@ import zipfile
 import pytest
 
 import yggdrasil.pickle.json as json_mod
+from yggdrasil.io import MimeTypes
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.zip_io import ZipIO, ZipOptions
@@ -34,7 +35,7 @@ def _make_zip_bytes(members: dict[str, bytes], *, compresslevel: int = 8) -> byt
 
 def test_zipio_read_empty_returns_empty_table():
     buf = BytesIO()
-    io_ = MediaIO.make(buf, MimeType.ZIP)
+    io_ = MediaIO.make(buf, MimeTypes.ZIP)
 
     tb = io_.read_arrow_table()
     assert tb.num_rows == 0
@@ -42,7 +43,7 @@ def test_zipio_read_empty_returns_empty_table():
 
 def test_zipio_write_and_read_roundtrip_json_inner():
     buf = BytesIO()
-    io_ = MediaIO.make(buf, MimeType.ZIP)
+    io_ = MediaIO.make(buf, MimeTypes.ZIP)
 
     inp = pa.Table.from_pylist([{"a": 1}, {"a": 2}, {"a": 3}])
 
@@ -64,7 +65,7 @@ def test_zipio_read_concat_all_members_when_member_none():
     zbytes = _make_zip_bytes({"part1.json": m1, "part2.json": m2})
     buf = BytesIO(zbytes)
 
-    out = MediaIO.make(buf, MimeType.ZIP).read_arrow_table(options=ZipOptions(member=None))
+    out = MediaIO.make(buf, MimeTypes.ZIP).read_arrow_table(options=ZipOptions(member=None))
     assert out.to_pylist() == (t1 + t2)
 
 
@@ -75,7 +76,7 @@ def test_zipio_read_single_member_when_specified():
     zbytes = _make_zip_bytes({"a.json": m1, "b.json": m2})
     buf = BytesIO(zbytes)
 
-    out = MediaIO.make(buf, MimeType.ZIP).read_arrow_table(options=ZipOptions(member="b.json"))
+    out = MediaIO.make(buf, MimeTypes.ZIP).read_arrow_table(options=ZipOptions(member="b.json"))
     assert out.to_pylist() == [{"x": 999}]
 
 
@@ -84,13 +85,13 @@ def test_zipio_member_not_found_raises_keyerror():
     buf = BytesIO(zbytes)
 
     with pytest.raises(KeyError):
-        MediaIO.make(buf, MimeType.ZIP).read_arrow_table(options=ZipOptions(member="nope.json"))
+        MediaIO.make(buf, MimeTypes.ZIP).read_arrow_table(options=ZipOptions(member="nope.json"))
 
 
 def test_zipio_does_not_move_parent_cursor_on_read():
     zbytes = _make_zip_bytes({"a.json": json_mod.dumps([{"x": 1}])})
     buf = BytesIO(zbytes)
-    io_ = MediaIO.make(buf, MimeType.ZIP)
+    io_ = MediaIO.make(buf, MimeTypes.ZIP)
 
     buf.seek(7)
     before = buf.tell()
@@ -108,7 +109,7 @@ def test_zipio_read_infers_inner_media_from_extension_json():
     zbytes = _make_zip_bytes({"data.json": payload})
     buf = BytesIO(zbytes)
 
-    out = MediaIO.make(buf, MimeType.ZIP).read_arrow_table()
+    out = MediaIO.make(buf, MimeTypes.ZIP).read_arrow_table()
     assert out.to_pylist() == [{"k": "v"}]
 
 
@@ -118,7 +119,7 @@ def test_zipio_force_inner_media_overrides_inference():
     zbytes = _make_zip_bytes({"weirdname": payload})
     buf = BytesIO(zbytes)
 
-    out = MediaIO.make(buf, MimeType.ZIP).read_arrow_table(
+    out = MediaIO.make(buf, MimeTypes.ZIP).read_arrow_table(
         options=ZipOptions(member="weirdname", inner_media="json", force_inner_media=True)
     )
     assert out.to_pylist() == [{"a": 1}]

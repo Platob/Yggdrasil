@@ -52,15 +52,15 @@ class TestTags:
 class TestMimeTypeSerialized:
 
     @pytest.mark.parametrize("mt", [
-        MimeType.JSON,
-        MimeType.PARQUET,
-        MimeType.CSV,
-        MimeType.ARROW_IPC,
-        MimeType.OCTET_STREAM,
-        MimeType.GZIP,
-        MimeType.ZSTD,
+        MimeTypes.JSON,
+        MimeTypes.PARQUET,
+        MimeTypes.CSV,
+        MimeTypes.ARROW_IPC,
+        MimeTypes.OCTET_STREAM,
+        MimeTypes.GZIP,
+        MimeTypes.ZSTD,
         MimeType.PNG,
-        MimeType.XML,
+        MimeTypes.XML,
     ])
     def test_roundtrip(self, mt: MimeType):
         ser = MimeTypeSerialized.from_python_object(mt)
@@ -73,17 +73,17 @@ class TestMimeTypeSerialized:
         assert MimeTypeSerialized.from_python_object("not a mime") is None
 
     def test_value_property(self):
-        ser = MimeTypeSerialized.from_python_object(MimeType.JSON)
-        assert ser.value is MimeType.JSON
+        ser = MimeTypeSerialized.from_python_object(MimeTypes.JSON)
+        assert ser.value is MimeTypes.JSON
 
     def test_via_generic_from_python_object(self):
-        ser = Serialized.from_python_object(MimeType.PARQUET)
+        ser = Serialized.from_python_object(MimeTypes.PARQUET)
         assert isinstance(ser, MimeTypeSerialized)
-        assert ser.as_python() is MimeType.PARQUET
+        assert ser.as_python() is MimeTypes.PARQUET
 
     def test_binary_roundtrip(self):
         """Serialize → bytes → deserialize."""
-        original = MimeType.CSV
+        original = MimeTypes.CSV
         ser = MimeTypeSerialized.from_python_object(original)
         buf = ser.write_to()
         restored_ser = Serialized.read_from(buf, pos=0)
@@ -132,30 +132,30 @@ class TestCodecSerialized:
 class TestMediaTypeSerialized:
 
     def test_roundtrip_mime_only(self):
-        mt = MediaType(mime_type=MimeType.JSON)
+        mt = MediaType(mime_type=MimeTypes.JSON)
         ser = MediaTypeSerialized.from_python_object(mt)
         assert ser is not None
         assert ser.tag == Tags.MEDIA_TYPE
         restored = ser.as_python()
-        assert restored.mime_type is MimeType.JSON
+        assert restored.mime_type is MimeTypes.JSON
         assert restored.codec is None
 
     def test_roundtrip_mime_with_codec(self):
-        mt = MediaType(mime_type=MimeType.PARQUET, codec=GZIP)
+        mt = MediaType(mime_type=MimeTypes.PARQUET, codec=GZIP)
         ser = MediaTypeSerialized.from_python_object(mt)
         assert ser is not None
         restored = ser.as_python()
-        assert restored.mime_type is MimeType.PARQUET
+        assert restored.mime_type is MimeTypes.PARQUET
         assert restored.codec is not None
         assert restored.codec.name == "gzip"
 
     @pytest.mark.parametrize("mt", [
-        MediaType(MimeType.JSON),
-        MediaType(MimeType.CSV),
-        MediaType(MimeType.PARQUET, GZIP),
-        MediaType(MimeType.PARQUET, ZSTD),
-        MediaType(MimeType.ARROW_IPC),
-        MediaType(MimeType.OCTET_STREAM, LZ4),
+        MediaType(MimeTypes.JSON),
+        MediaType(MimeTypes.CSV),
+        MediaType(MimeTypes.PARQUET, GZIP),
+        MediaType(MimeTypes.PARQUET, ZSTD),
+        MediaType(MimeTypes.ARROW_IPC),
+        MediaType(MimeTypes.OCTET_STREAM, LZ4),
     ])
     def test_roundtrip_parametric(self, mt: MediaType):
         ser = MediaTypeSerialized.from_python_object(mt)
@@ -170,30 +170,30 @@ class TestMediaTypeSerialized:
         assert MediaTypeSerialized.from_python_object("nope") is None
 
     def test_via_generic_from_python_object(self):
-        mt = MediaType(MimeType.PARQUET, GZIP)
+        mt = MediaType(MimeTypes.PARQUET, GZIP)
         ser = Serialized.from_python_object(mt)
         assert isinstance(ser, MediaTypeSerialized)
         restored = ser.as_python()
-        assert restored.mime_type is MimeType.PARQUET
+        assert restored.mime_type is MimeTypes.PARQUET
 
     def test_binary_roundtrip(self):
-        original = MediaType(MimeType.JSON, ZSTD)
+        original = MediaType(MimeTypes.JSON, ZSTD)
         ser = MediaTypeSerialized.from_python_object(original)
         buf = ser.write_to()
         restored_ser = Serialized.read_from(buf, pos=0)
         assert isinstance(restored_ser, MediaTypeSerialized)
         restored = restored_ser.as_python()
-        assert restored.mime_type is MimeType.JSON
+        assert restored.mime_type is MimeTypes.JSON
         assert restored.codec.name == "zstd"
 
     def test_payload_format_no_codec(self):
-        mt = MediaType(MimeType.JSON)
+        mt = MediaType(MimeTypes.JSON)
         ser = MediaTypeSerialized.from_python_object(mt)
         payload = ser.decode()
         assert payload == b"JSON"
 
     def test_payload_format_with_codec(self):
-        mt = MediaType(MimeType.PARQUET, GZIP)
+        mt = MediaType(MimeTypes.PARQUET, GZIP)
         ser = MediaTypeSerialized.from_python_object(mt)
         payload = ser.decode()
         assert payload == b"PARQUET+gzip"

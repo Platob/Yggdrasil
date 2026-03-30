@@ -139,7 +139,7 @@ def _sniff_media_from_body(
     try:
         sniffed = body.media_type
     except Exception:
-        sniffed = MediaType(MimeType.OCTET_STREAM, content_codec)
+        sniffed = MediaType(MimeTypes.OCTET_STREAM, content_codec)
 
     return MediaType(sniffed.mime_type, codec=content_codec) if content_encoding else sniffed
 
@@ -195,10 +195,10 @@ def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str
     if headers is MISSING:
         headers = get_from_dict(obj, keys=("headers", "header", "hdrs", "response_headers"), prefix="")
 
-    if isinstance(headers, Mapping):
-        parsed = _string_dict(headers)
-        if parsed:
-            return parsed
+    if not isinstance(headers, Mapping):
+        headers = {} if headers is MISSING else dict(headers)
+
+    headers = _string_dict(headers)
 
     dumped_headers = {
         "Host": get_from_dict(obj, keys=("host",), prefix=prefix),
@@ -210,16 +210,13 @@ def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str
         "Content-Length": get_from_dict(obj, keys=("content_length",), prefix=prefix),
         "Content-Encoding": get_from_dict(obj, keys=("content_encoding",), prefix=prefix),
         "Transfer-Encoding": get_from_dict(obj, keys=("transfer_encoding",), prefix=prefix),
-        "Location": get_from_dict(obj, keys=("location",), prefix=prefix),
-        "ETag": get_from_dict(obj, keys=("etag",), prefix=prefix),
-        "Last-Modified": get_from_dict(obj, keys=("last_modified",), prefix=prefix),
     }
 
-    return {
-        header_name: str(value)
-        for header_name, value in dumped_headers.items()
-        if value is not MISSING and value not in (None, "")
-    }
+    for k, v in dumped_headers.items():
+        if v is not MISSING and v not in (None, ""):
+            headers[k] = v
+
+    return headers
 
 
 def _parse_tags(obj: Mapping[str, Any], *, prefix: str) -> dict[str, str]:
@@ -525,7 +522,7 @@ class Response:
         _ensure_media_headers(self.headers, self.buffer)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}<r={self.request} b={self.body!r}>"
+        return f"{self.__class__.__name__}<r={self.request} s={self.status_code} b={self.body!r}>"
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -981,7 +978,7 @@ class Response:
                     yield from _iter_batches(inner)
 
         for rb in _iter_batches(batch):
-            for info in rb.to_pylist():
+            for info in rb.to_pylist(maps_as_pydicts="lossy"):
                 yield cls.parse_mapping(info, normalize=False)
 
     # ------------------------------------------------------------------

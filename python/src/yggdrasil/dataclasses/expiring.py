@@ -60,6 +60,9 @@ _IntLike = Union[int, str]
 
 _MISSING = object()
 
+# 15 minutes expressed in nanoseconds — the background-purge check interval.
+_PURGE_INTERVAL_NS: int = 15 * 60 * 1_000_000_000
+
 
 # ═══════════════════════════════════════════════════════════
 # Time utilities  (shared by both Expiring and ExpiringDict)
@@ -405,9 +408,11 @@ class ExpiringDict(Generic[K, V]):
         self._default_ttl_ns: Optional[int] = self._parse_ttl(default_ttl)
         self._max_size = max_size
         self._refresher = refresher
-        # {key: (value, expires_at_ns)}  — expires_at_ns is epoch ns or None
         self._store: Dict[K, Tuple[V, Optional[int]]] = {}
         self._lock: RLock = RLock()
+        # Background-purge tracking (ns epoch integers — GIL-atomic reads on CPython)
+        self._last_purge_ns: int = now_utc_ns()
+        self._purge_pending: bool = False
 
     # ── serialization ────────────────────────────────────────
 
@@ -423,6 +428,7 @@ class ExpiringDict(Generic[K, V]):
                     for k, (v, exp) in self._store.items()
                     if exp is None or now < exp
                 },
+                "last_purge_ns": now,
             }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -431,6 +437,46 @@ class ExpiringDict(Generic[K, V]):
         self._refresher = None
         self._store = state.get("store", {})
         self._lock = RLock()
+        self._last_purge_ns = int(state.get("last_purge_ns", now_utc_ns()))
+        self._purge_pending = False
+
+    # ── background purge ──────────────────────────────────────
+
+    def _background_purge(self) -> None:
+        """Evict all expired keys; runs in a background daemon thread."""
+        with self._lock:
+            self._evict_expired_locked()
+            self._purge_pending = False
+
+    def _maybe_schedule_purge(self) -> None:
+        """Schedule an async background sweep if ``_PURGE_INTERVAL_NS`` has elapsed.
+
+        Uses **double-checked locking** for a near-zero hot-path cost:
+
+        1. **Outer check** — lock-free integer comparison (CPython GIL makes
+           single-int reads atomic).  Exits immediately on the common path
+           (interval not elapsed).
+        2. **Inner check** — under ``RLock`` to atomically verify the condition
+           and claim the purge slot, preventing duplicate threads.
+
+        The background thread is a daemon :class:`~yggdrasil.concurrent.threading.ThreadJob`
+        so it never blocks interpreter shutdown.
+        """
+        # Fast path — no lock (effectively atomic in CPython via the GIL)
+        if now_utc_ns() - self._last_purge_ns < _PURGE_INTERVAL_NS:
+            return
+
+        # Slow path — claim the purge slot under the lock
+        now = now_utc_ns()
+        with self._lock:
+            if self._purge_pending or (now - self._last_purge_ns) < _PURGE_INTERVAL_NS:
+                return  # another thread beat us or interval not yet elapsed
+            self._purge_pending = True
+            self._last_purge_ns = now
+
+        # Spawn outside the lock so we don't hold it while creating the thread
+        from yggdrasil.concurrent.job import Job  # lazy import — avoids circular deps
+        Job.make(self._background_purge).fire_and_forget()
 
     # ── core helpers ─────────────────────────────────────────
 
@@ -493,36 +539,44 @@ class ExpiringDict(Generic[K, V]):
         value: V,
         ttl: Any = _MISSING,
     ) -> None:
-        """
-        Insert or overwrite *key*.
+        """Insert or overwrite *key*.
 
         ``ttl`` accepts seconds (``float``), nanoseconds (``int``),
         ``timedelta``, or ``None`` (no expiry).  Omitting ``ttl`` uses the
-        instance default.
+        instance default.  Schedules a background purge every 15 minutes.
         """
         exp = self._expires_at_ns(ttl)
         with self._lock:
-            self._evict_expired_locked()
             self._put_locked(key, value, exp)
+        self._maybe_schedule_purge()
 
     def __setitem__(self, key: K, value: V) -> None:
         self.set(key, value)
 
     def get(self, key: K, default: Any = None) -> Optional[V]:
         """Return value for *key*, or *default* if missing / expired."""
+        refresher_key: Any = _MISSING  # sentinel: _MISSING → don't run refresher
+
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
-                return default
-            value, expires_at = entry
-            if not self._is_expired(expires_at):
-                return value
-            del self._store[key]
+                result = default
+            else:
+                value, expires_at = entry
+                if not self._is_expired(expires_at):
+                    result = value
+                else:
+                    del self._store[key]
+                    result = default
+                    refresher_key = key  # expired — may need refresher
 
-        # Expired — try refresher if configured
-        if self._refresher is not None:
+        # Check purge interval on every get (lock-free fast path)
+        self._maybe_schedule_purge()
+
+        # Expired key — try refresher if configured
+        if refresher_key is not _MISSING and self._refresher is not None:
             try:
-                rr = self._refresher(key)
+                rr = self._refresher(refresher_key)
             except Exception:
                 return default
             exp = rr.expires_at_ns
@@ -530,10 +584,10 @@ class ExpiringDict(Generic[K, V]):
                 created = rr.created_at_ns or now_utc_ns()
                 exp = created + rr.ttl_ns
             with self._lock:
-                self._put_locked(key, rr.value, exp)
+                self._put_locked(refresher_key, rr.value, exp)
             return rr.value
 
-        return default
+        return result
 
     def __getitem__(self, key: K) -> V:
         val = self.get(key, _MISSING)
@@ -564,7 +618,6 @@ class ExpiringDict(Generic[K, V]):
 
     def __len__(self) -> int:
         with self._lock:
-            self._evict_expired_locked()
             return len(self._store)
 
     def __iter__(self) -> Iterator[K]:
@@ -588,9 +641,9 @@ class ExpiringDict(Generic[K, V]):
         """Atomically insert multiple key-value pairs sharing a TTL."""
         exp = self._expires_at_ns(ttl)
         with self._lock:
-            self._evict_expired_locked()
             for key, value in mapping.items():
                 self._put_locked(key, value, exp)
+        self._maybe_schedule_purge()
 
     def update(
         self,
@@ -626,7 +679,7 @@ class ExpiringDict(Generic[K, V]):
         if isinstance(other, ExpiringDict):
             snapshot_ts = now_utc_ns()
             with other._lock:
-                source_raw: list = list(other._store.items())  # [(key, (value, exp))]
+                source_raw: list = list(other._store.items())
             is_expiring_dict = True
         elif other is not None:
             if hasattr(other, "items"):
@@ -639,21 +692,16 @@ class ExpiringDict(Generic[K, V]):
             is_expiring_dict = False
 
         with self._lock:
-            self._evict_expired_locked()
-
             for key, raw in source_raw:
                 if is_expiring_dict:
                     value, src_exp = raw
-                    # Skip source keys that had already expired at snapshot time
                     if src_exp is not None and snapshot_ts >= src_exp:
                         continue
                     if explicit_ttl:
                         exp = self._expires_at_ns(ttl)
                     elif src_exp is None:
-                        # Source key is non-expiring; apply instance default
                         exp = self._expires_at_ns(_MISSING)
                     else:
-                        # Carry over the remaining duration faithfully
                         remaining_ns = src_exp - snapshot_ts
                         exp = now_utc_ns() + remaining_ns
                 else:
@@ -663,6 +711,8 @@ class ExpiringDict(Generic[K, V]):
 
             for key, value in kwargs.items():
                 self._put_locked(key, value, self._expires_at_ns(ttl))
+
+        self._maybe_schedule_purge()
 
     def get_many(self, keys: Iterable[K]) -> Dict[K, V]:
         """Return ``{key: value}`` for all live keys in *keys*."""
@@ -797,7 +847,8 @@ class ExpiringDict(Generic[K, V]):
             value = default() if callable(default) else default
             exp = self._expires_at_ns(ttl)
             self._put_locked(key, value, exp)
-            return value
+        self._maybe_schedule_purge()
+        return value
 
     # ── RefreshResult convenience ─────────────────────────────
 
@@ -813,3 +864,5 @@ class ExpiringDict(Generic[K, V]):
             exp = created + ttl_ns_val
         with self._lock:
             self._put_locked(key, rr.value, exp)
+        self._maybe_schedule_purge()
+

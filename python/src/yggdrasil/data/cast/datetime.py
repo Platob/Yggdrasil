@@ -17,7 +17,6 @@ except Exception:  # pragma: no cover
 
 __all__ = [
     "CURRENT_TZINFO",
-    "resolve_current_tzinfo",
     "normalize_fractional_seconds",
     "str_to_date",
     "str_to_time",
@@ -88,14 +87,7 @@ _STRPTIME_FORMATS = (
 )
 
 
-def resolve_current_tzinfo() -> dt.tzinfo:
-    try:
-        return _DATETIME.now().astimezone().tzinfo or _UTC
-    except Exception:  # pragma: no cover
-        return _UTC
-
-
-CURRENT_TZINFO: dt.tzinfo = resolve_current_tzinfo()
+CURRENT_TZINFO: dt.tzinfo = _UTC
 
 
 def normalize_fractional_seconds(value: str) -> str:

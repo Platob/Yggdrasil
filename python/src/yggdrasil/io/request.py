@@ -8,13 +8,14 @@ from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
+from yggdrasil.data import any_to_datetime
 from yggdrasil.dataclasses.dataclass import get_from_dict
-from yggdrasil.io import MediaType
+from yggdrasil.io import MediaType, MimeTypes
+
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
 from .url import URL
-from ..data import any_to_datetime
 
 if TYPE_CHECKING:
     from .response import Response
@@ -599,7 +600,7 @@ class PreparedRequest:
             request_body = BytesIO(body, copy=False)
         elif json is not None:
             request_body = BytesIO(json_module.dumps(json).encode("utf-8"), copy=False)
-            out_headers["Content-Type"] = MimeType.JSON.value
+            out_headers["Content-Type"] = MimeTypes.JSON.value
 
             if compress_threshold and request_body.size > compress_threshold:
                 request_body = request_body.compress(codec=compress_codec)
@@ -721,9 +722,9 @@ class PreparedRequest:
     @property
     def accept_media_type(self) -> MediaType:
         if not self.headers:
-            return MediaType(MimeType.OCTET_STREAM, None)
+            return MediaType(MimeTypes.OCTET_STREAM, None)
 
-        accept = MimeType.parse(self.headers.get("Accept"), default=MimeType.OCTET_STREAM)
+        accept = MimeType.parse(self.headers.get("Accept"), default=MimeTypes.OCTET_STREAM)
         codec = Codec.parse(self.headers.get("Accept-Encoding"), default=None)
         return MediaType(accept, codec)
 

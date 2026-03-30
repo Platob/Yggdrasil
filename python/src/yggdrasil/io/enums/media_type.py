@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import IO, Union
 
 from .codec import Codec
-from .mime_type import MimeType
+from .mime_type import MimeType, MimeTypes
 
-__all__ = ["MediaType"]
+__all__ = ["MediaType", "MediaTypes"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,7 +21,7 @@ class MediaType:
     def __post_init__(self):
         if self.mime_type.is_codec:
             codec = Codec.from_mime(self.mime_type)
-            object.__setattr__(self, "mime_type", MimeType.OCTET_STREAM)
+            object.__setattr__(self, "mime_type", MimeTypes.OCTET_STREAM)
             object.__setattr__(self, "codec", codec)
 
     def __repr__(self) -> str:
@@ -51,7 +51,7 @@ class MediaType:
             mime, codec = obj
             mt = MimeType.parse(mime)
             if mt is None:
-                return default or cls(mime_type=MimeType.OCTET_STREAM)
+                return default or cls(mime_type=MimeTypes.OCTET_STREAM)
             c = Codec.parse(codec) if codec is not None else None
             return cls(mime_type=mt, codec=c)
 
@@ -59,7 +59,7 @@ class MediaType:
             return cls(mime_type=obj, codec=None)
 
         if isinstance(obj, Codec):
-            return cls(mime_type=MimeType.OCTET_STREAM, codec=obj)
+            return cls(mime_type=MimeTypes.OCTET_STREAM, codec=obj)
 
         if isinstance(obj, str):
             if "+" in obj:
@@ -71,7 +71,7 @@ class MediaType:
                 if codec is not None:
                     if inner is None:
                         if default is None:
-                            return cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
+                            return cls(mime_type=MimeTypes.OCTET_STREAM, codec=codec)
                         return default.with_codec(codec)
                     return cls(mime_type=inner.mime_type, codec=codec)
 
@@ -80,7 +80,7 @@ class MediaType:
         mt = MimeType.parse(obj)
 
         if mt is None:
-            return default or cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
+            return default or cls(mime_type=MimeTypes.OCTET_STREAM, codec=codec)
 
         if mt.is_codec:
             from ..buffer import BytesIO
@@ -103,7 +103,7 @@ class MediaType:
 
             if inner is None:
                 if default is None:
-                    return cls(mime_type=MimeType.OCTET_STREAM, codec=codec)
+                    return cls(mime_type=MimeTypes.OCTET_STREAM, codec=codec)
                 return default.with_codec(codec)
 
             assert not inner.mime_type.is_codec, "Inner MIME type cannot be a codec"
@@ -113,11 +113,11 @@ class MediaType:
 
     @property
     def is_octet(self):
-        return self.mime_type == MimeType.OCTET_STREAM
+        return self.mime_type == MimeTypes.OCTET_STREAM
 
     @property
     def is_json(self):
-        return self.mime_type == MimeType.JSON
+        return self.mime_type == MimeTypes.JSON
 
     def full_mime_type(self, concat_codec: bool = True) -> MimeType:
         if not concat_codec or self.codec is None:
@@ -146,3 +146,8 @@ class MediaType:
 
     def without_codec(self) -> "MediaType":
         return MediaType(mime_type=self.mime_type, codec=None)
+
+
+class MediaTypes:
+    PARQUET = MediaType(mime_type=MimeTypes.PARQUET, codec=None)
+    JSON = MediaType(mime_type=MimeTypes.JSON, codec=None)

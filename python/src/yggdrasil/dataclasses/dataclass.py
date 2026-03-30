@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, Field, fields, is_dataclass
 from inspect import isclass
-from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional, Callable, TypeVar
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -15,9 +15,12 @@ __all__ = [
     "serialize_dataclass_state",
     "restore_dataclass_state",
     "default_value",
+    "lazy_property"
 ]
 
 DATACLASS_ARROW_FIELD_CACHE: dict[type, "pa.Field"] = {}
+S = TypeVar("S")
+T = TypeVar("T")
 
 
 def dataclass_to_arrow_field(cls_or_instance: Any) -> "pa.Field":
@@ -167,3 +170,22 @@ def restore_dataclass_state(obj: Any, state: Any) -> None:
         value = default_value(f)
         if value is not MISSING:
             object.__setattr__(obj, name, value)
+
+
+def lazy_property(
+    self: S,
+    *,
+    cache_attr: str,
+    factory: Callable[[S], T],
+    use_cache: bool,
+) -> T:
+    if use_cache:
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+
+        created = factory(self)
+        object.__setattr__(self, cache_attr, created)
+        return created
+
+    return factory(self)

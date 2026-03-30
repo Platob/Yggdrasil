@@ -1,20 +1,19 @@
-# tests/io/buffer/test_json_io.py
 from __future__ import annotations
 
 import io
 
+import pyarrow as pa
 import pytest
-
 import yggdrasil.pickle.json as json_mod
+from yggdrasil.io import MimeTypes
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.buffer.media_io import MediaIO
-from yggdrasil.io.buffer.json_io import JsonIO
-from yggdrasil.io.enums import MimeType
+from yggdrasil.io.enums import GZIP, MediaType
 
 
 def test_jsonio_read_pylist_empty_returns_empty_list():
     buf = BytesIO()
-    io_ = MediaIO.make(buf, MimeType.JSON)
+    io_ = MediaIO.make(buf, MimeTypes.JSON)
 
     assert buf.size == 0
     assert io_.read_pylist() == []
@@ -22,7 +21,7 @@ def test_jsonio_read_pylist_empty_returns_empty_list():
 
 def test_jsonio_read_pylist_wraps_non_list_payload():
     buf = BytesIO()
-    io_ = MediaIO.make(buf, MimeType.JSON)
+    io_ = MediaIO.make(buf, MimeTypes.JSON)
 
     # Manually write a single JSON object (not a list)
     buf.write_bytes(b'{"a": 1, "b": "x"}')
@@ -46,7 +45,7 @@ def test_bytesio_view_does_not_close_parent_on_exit():
 
 def test_jsonio_write_pylist_and_read_back_roundtrip():
     buf = BytesIO()
-    io_ = MediaIO.make(buf, MimeType.JSON)
+    io_ = MediaIO.make(buf, MimeTypes.JSON)
 
     payload = [{"a": 1}, {"a": 2, "b": "ok"}, {"nested": {"k": 7}}]
 
@@ -62,6 +61,56 @@ def test_jsonio_write_pylist_and_read_back_roundtrip():
     # And reading should return the same list
     out = io_.read_pylist()
     assert out == payload
+
+
+def test_jsonio_gzip_write_arrow_table_and_read_pylist_roundtrip():
+    buf = BytesIO()
+    io_ = MediaIO.make(buf, MediaType(MimeTypes.JSON, codec=GZIP))
+
+    table = pa.table(
+        {
+            "a": [1, 2],
+            "b": ["x", "y"],
+        }
+    )
+
+    io_.write_arrow_table(table)
+
+    # Buffer payload should be compressed, not plain JSON text
+    raw = buf.to_bytes()
+    assert raw
+    assert not raw.startswith(b"[{")
+    assert not raw.startswith(b'{"')
+
+    out = io_.read_pylist()
+    assert out == [
+        {"a": 1, "b": "x"},
+        {"a": 2, "b": "y"},
+    ]
+
+
+def test_jsonio_gzip_read_pylist_from_write_arrow_table_is_repeatable():
+    buf = BytesIO()
+    io_ = MediaIO.make(buf, MediaType(MimeTypes.JSON, codec=GZIP))
+
+    table = pa.table(
+        {
+            "id": [10, 20],
+            "name": ["aa", "bb"],
+        }
+    )
+
+    io_.write_arrow_table(table)
+
+    out1 = io_.read_pylist()
+    out2 = io_.read_pylist()
+
+    expected = [
+        {"id": 10, "name": "aa"},
+        {"id": 20, "name": "bb"},
+    ]
+    assert out1 == expected
+    assert out2 == expected
 
 
 def test_bytesio_view_is_seekable_and_reusable_for_json_load():
@@ -101,3 +150,65 @@ def test_bytesio_view_start_length_behavior(start, length, expected):
         parsed = json_mod.load(f)
 
     assert parsed == expected
+
+
+def test_jsonio_gzip_write_arrow_table_and_read_pylist_roundtrip_nested_types():
+    buf = BytesIO()
+    io_ = MediaIO.make(buf, MediaType(MimeTypes.JSON, codec=GZIP))
+
+    table = pa.table(
+        {
+            "id": [1, 2],
+            "tags": [
+                ["a", "b"],
+                ["x"],
+            ],
+            "attrs": [
+                [("k1", 10), ("k2", 20)],
+                [("only", 99)],
+            ],
+            "meta": [
+                {"name": "row1", "active": True},
+                {"name": "row2", "active": False},
+            ],
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("tags", pa.list_(pa.string())),
+                pa.field("attrs", pa.map_(pa.string(), pa.int64())),
+                pa.field(
+                    "meta",
+                    pa.struct(
+                        [
+                            pa.field("name", pa.string()),
+                            pa.field("active", pa.bool_()),
+                        ]
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    io_.write_arrow_table(table)
+
+    raw = buf.to_bytes()
+    assert raw
+    assert not raw.startswith(b"[{")
+    assert not raw.startswith(b'{"')
+
+    out = io_.read_pylist()
+    assert out == [
+        {
+            "id": 1,
+            "tags": ["a", "b"],
+            "attrs": [["k1", 10], ["k2", 20]],
+            "meta": {"name": "row1", "active": True},
+        },
+        {
+            "id": 2,
+            "tags": ["x"],
+            "attrs": [["only", 99]],
+            "meta": {"name": "row2", "active": False},
+        },
+    ]

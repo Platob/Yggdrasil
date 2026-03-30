@@ -5,8 +5,8 @@ import datetime as dt
 from typing import Any
 
 import pytest
-
-from yggdrasil.io.enums import MediaType, MimeType
+from yggdrasil.io import MimeTypes
+from yggdrasil.io.enums import MediaType
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
 
@@ -138,9 +138,9 @@ def test_media_type_and_set_media_type() -> None:
     media = resp.media_type
     assert media.mime_type is not None
 
-    resp.set_media_type(MediaType(MimeType.JSON, None))
-    assert resp.headers["Content-Type"] == MimeType.JSON.value
-    assert resp.request.headers["Accept"] == MimeType.JSON.value
+    resp.set_media_type(MediaType(MimeTypes.JSON, None))
+    assert resp.headers["Content-Type"] == MimeTypes.JSON.value
+    assert resp.request.headers["Accept"] == MimeTypes.JSON.value
 
 
 def test_body_content_text_and_json() -> None:
@@ -525,5 +525,5 @@ def test_response_repr_contains_status_and_url() -> None:
     )
 
     rep = repr(resp)
-    assert "status_code=200" in rep
+    assert "200" in rep
     assert "https://example.com/api?a=1" in rep

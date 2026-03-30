@@ -124,8 +124,8 @@ class MediaTypeSerialized(Serialized[MediaType]):
 
     Examples::
 
-        MediaType(MimeType.JSON)             → b"JSON"
-        MediaType(MimeType.PARQUET, GZIP)    → b"PARQUET+gzip"
+        MediaType(MimeTypes.JSON)             → b"JSON"
+        MediaType(MimeTypes.PARQUET, GZIP)    → b"PARQUET+gzip"
     """
 
     TAG: ClassVar[int] = Tags.MEDIA_TYPE
