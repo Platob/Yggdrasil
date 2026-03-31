@@ -32,8 +32,8 @@ def test_check_arg_scalar_sets_timeout(arg, expected_timeout):
     assert isinstance(wc, WaitingConfig)
     assert wc.timeout == expected_timeout
     # other defaults in your check_arg() fallback path
-    assert wc.interval == 1.0
-    assert wc.backoff == 2.0
+    assert wc.interval == 0.5
+    assert wc.backoff == 1.5
     assert wc.max_interval == 10.0
 
 
@@ -91,8 +91,8 @@ def test_check_arg_dict_deadline_and_timeout_raises():
 def test_check_arg_bool_is_treated_as_int_due_to_type_order(arg, expected_timeout):
     wc = WaitingConfig.check_arg(arg)
     assert wc.timeout == expected_timeout
-    assert wc.interval == 1.0
-    assert wc.backoff == 2.0
+    assert wc.interval == 0.5
+    assert wc.backoff == 1.5
     assert wc.max_interval == 15.0
 
 
@@ -179,6 +179,25 @@ def test_sleep_with_start_caps_to_remaining(monkeypatch):
 
     wc.sleep(iteration=0, start=base)  # computed 4, capped to remaining 2
     assert seen == [2.0]
+
+
+def test_sleep_with_start_switches_to_slow_window_every_5_seconds(monkeypatch):
+    wc = WaitingConfig(timeout=30, interval=0.5, backoff=1, max_interval=0)
+    base = 1000.0
+
+    def fake_time():
+        return base + 6.0  # elapsed=6 => slow window => min cadence is 5s
+
+    seen = []
+
+    def fake_sleep(s):
+        seen.append(s)
+
+    monkeypatch.setattr(time, "time", fake_time)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    wc.sleep(iteration=0, start=base)
+    assert seen == [5.0]
 
 
 def test_sleep_with_start_raises_timeout_when_out_of_time(monkeypatch):

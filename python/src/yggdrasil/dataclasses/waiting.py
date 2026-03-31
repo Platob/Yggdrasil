@@ -13,6 +13,7 @@ def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
 
 
 DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
+WAIT_STRATEGY_PHASE_SECONDS = 5.0
 WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 
 
@@ -204,13 +205,14 @@ class WaitingConfig:
         """
         iteration is 0-based (first wait => iteration=0)
 
-        Smoother growth than pure exponential:
+        Backoff sleep strategy:
         - interval == 0 => no sleep
-        - backoff >= 1 => interval * backoff**f(iteration), where f is softened
+        - backoff >= 1 => interval * backoff**iteration
         - max_interval == 0 => no cap, else cap sleep to max_interval
         - if start is provided and timeout > 0:
             * raise TimeoutError if already out of time
             * cap sleep so we don't oversleep past timeout
+            * alternate fast/slow windows every 5s of elapsed time
         """
         if iteration < 0:
             raise ValueError(f"iteration must be >= 0, got {iteration}")
@@ -218,9 +220,7 @@ class WaitingConfig:
         if self.interval == 0:
             return
 
-        # Smooth exponent growth (0, 1, ~1.41, ~1.73, 2, ...)
-        # Compared to pure exponential (0,1,2,3,4,...), this grows much less aggressively.
-        growth_exp = self.backoff ** 2 * iteration
+        growth_exp = self.backoff ** iteration
 
         sleep_s = self.interval * growth_exp
 
@@ -235,6 +235,14 @@ class WaitingConfig:
             remaining = self.timeout - elapsed
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
+
+            # Alternate fast and slow polling windows every 5 seconds.
+            # Fast window: use the computed backoff sleep.
+            # Slow window: force at least a 5s cadence to reduce request pressure.
+            if elapsed >= 0:
+                in_slow_window = int(elapsed // WAIT_STRATEGY_PHASE_SECONDS) % 2 == 1
+                if in_slow_window:
+                    sleep_s = max(sleep_s, WAIT_STRATEGY_PHASE_SECONDS)
             sleep_s = min(sleep_s, remaining)
 
         if sleep_s <= 0:
