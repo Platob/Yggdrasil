@@ -82,3 +82,21 @@ black .                 # format
 - **Version** is in `src/yggdrasil/version.py` as a `VersionInfo` named tuple; bump there and in `pyproject.toml`.
 - **pyarrow is the only hard runtime dependency** — everything else is optional and guarded.
 
+
+## LLM Agent Playbook (Repository-Specific)
+- Start by reading this `AGENTS.md`, then skim `README.md` + `python/README.md` to align terminology before changing code.
+- Prefer **Polars-first implementations** for dataframe logic (lazy plans, expression pushdown, reduced memory pressure). Add pandas/Spark fallbacks only when required by public API or optional dependency boundaries.
+- Treat Arrow schema/metadata as the contract surface. New helpers should preserve field names, nullability, and metadata unless explicitly documented otherwise.
+- When adding optional dependencies, follow the existing lazy import pattern (`lib.py` or runtime guard) to keep the base install lightweight.
+- Keep cross-version compatibility explicit (Python 3.10–3.13): avoid syntax or stdlib assumptions that drop 3.10 support.
+
+### Skills usage guidance for coding agents
+- Use **`skill-creator`** only when the task is to author or revise reusable Codex skills/workflows.
+- Use **`skill-installer`** only when the task asks to install/list skills into `$CODEX_HOME/skills`.
+- If neither applies, proceed with normal repository workflows and do not force skill usage.
+
+### Optional Rust acceleration guidance
+- Rust should be introduced as an **optional fast path**, never a hard dependency for importing `yggdrasil`.
+- Start with small, measurable kernels that are expensive in Python (string transforms, metadata scans, hashing, vectorized scalar transforms).
+- Provide a Python fallback with identical behavior and tests that pass with and without the native module.
+- Place experimental native code under `python/rust/` and expose it through a thin Python wrapper module.
