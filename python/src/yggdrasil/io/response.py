@@ -715,6 +715,19 @@ class Response:
         self.headers["Content-Length"] = str(self.buffer.size)
         return self
 
+    @property
+    def content_disposition(self) -> str | None:
+        return self.headers.get("Content-Disposition")
+
+    @property
+    def filename(self) -> str | None:
+        cd = self.content_disposition
+
+        if not cd:
+            return None
+
+        return cd.split("filename=")[-1].split(";")[0]
+
     # ------------------------------------------------------------------
     # Body accessors
     # ------------------------------------------------------------------

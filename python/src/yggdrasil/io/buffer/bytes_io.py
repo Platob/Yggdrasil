@@ -636,6 +636,102 @@ class BytesIO(io.RawIOBase):
 
         return self.write_bytes(bytes(b))
 
+    def write_into(
+        self,
+        dst: IO[bytes] | str | os.PathLike[str],
+        *,
+        batch_size: int = _COPY_CHUNK_SIZE,
+        overwrite: bool = True,
+    ) -> int:
+        """
+        Write the current payload into another sink.
+
+        Parameters
+        ----------
+        dst:
+            Destination sink. Can be:
+            - a writable binary file-like object
+            - a ``str`` or ``PathLike`` file path
+        batch_size:
+            Chunk size used when copying spilled content to file-like sinks.
+        overwrite:
+            Only applies to path-like destinations. If False and the path exists,
+            ``FileExistsError`` is raised.
+
+        Returns
+        -------
+        int
+            Number of bytes written.
+        """
+        if self._closed:
+            raise ValueError("I/O operation on closed BytesIO")
+
+        if isinstance(dst, (str, os.PathLike)):
+            path = Path(dst)
+
+            if path.exists() and not overwrite:
+                raise FileExistsError(f"Destination already exists: {path}")
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            if self._buf is not None:
+                payload = memoryview(self._buf)[: self._size]
+                path.write_bytes(payload.tobytes() if not payload.contiguous else payload)
+                return self._size
+
+            if self._path is None or self.size == 0:
+                path.write_bytes(b"")
+                return 0
+
+            if self._path == path:
+                return self.size
+
+            shutil.copyfile(self._path, path)
+            return self.size
+
+        if not hasattr(dst, "write"):
+            raise TypeError(
+                f"write_into() expected a writable binary IO or path-like destination, got {type(dst)!r}"
+            )
+
+        writable = getattr(dst, "writable", None)
+        if callable(writable) and not writable():
+            raise ValueError("Destination IO is not writable")
+
+        total = 0
+
+        if self._buf is not None:
+            payload = memoryview(self._buf)[: self._size]
+            out = dst.write(payload)
+            written = self._size if out is None else int(out)
+            if written != self._size:
+                raise io.BlockingIOError(
+                    f"Short write while writing in-memory payload: expected {self._size}, got {written}"
+                )
+            total = written
+        elif self._path is not None and self.size:
+            with self._path.open("rb") as src:
+                while True:
+                    chunk = src.read(batch_size)
+                    if not chunk:
+                        break
+                    out = dst.write(chunk)
+                    written = len(chunk) if out is None else int(out)
+                    if written != len(chunk):
+                        raise io.BlockingIOError(
+                            f"Short write while streaming spilled payload: expected {len(chunk)}, got {written}"
+                        )
+                    total += written
+        else:
+            out = dst.write(b"")
+            total = 0 if out is None else int(out)
+
+        flush = getattr(dst, "flush", None)
+        if callable(flush):
+            flush()
+
+        return total
+
     def write_linebreak(self, newline: str = "\n") -> int:
         return self.write(newline)
 
