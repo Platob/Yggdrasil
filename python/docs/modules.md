@@ -1,35 +1,50 @@
-# Yggdrasil Python — module reference
+# Yggdrasil Python module index
+
+This page is a short module map.
+For examples from basic to advanced, read [`python/docs/README.md`](README.md).
 
 ## Core
 
-| Module | What it does |
-|---|---|
-| [`yggdrasil.arrow`](modules/arrow/README.md) | Infer Arrow fields/schemas from Python type hints |
-| [`yggdrasil.data.cast`](modules/types/README.md) | `CastOptions`, `convert`, `register_converter` |
-| [`yggdrasil.arrow.cast`](modules/types/cast/README.md) | Table-level casting: Arrow, pandas, Polars, Spark |
-| [`yggdrasil.dataclasses`](modules/dataclasses/README.md) | `dataclass_to_arrow_field` |
-| [`yggdrasil.pyutils`](modules/pyutils/README.md) | `retry`, `parallelize` |
-| [`yggdrasil.concurrent`](modules/concurrent/README.md) | `JobPoolExecutor`, `Job` |
-| [`yggdrasil.requests`](modules/requests/README.md) | `YGGSession` — retry-enabled HTTP |
-| [`yggdrasil.io`](modules/io/README.md) | `BytesIO`, `Codec`, `MediaType` |
-| [`yggdrasil.deltalake`](modules/deltalake/README.md) | `DeltaTable` — no Spark required |
+- `yggdrasil.data.cast` - converter registry and `CastOptions`
+- `yggdrasil.data.enums` - timezone, currency, geozone enums
+- `yggdrasil.arrow` - Python type hints to Arrow fields
+- `yggdrasil.dataclasses` - dataclass to Arrow field
+
+## Engines
+
+- `yggdrasil.polars`
+- `yggdrasil.pandas`
+- `yggdrasil.spark`
+
+## IO and transport
+
+- `yggdrasil.io`
+- `yggdrasil.io.http_`
+- `yggdrasil.io.buffer`
+- `yggdrasil.requests`
 
 ## Databricks
 
-| Module | What it does |
-|---|---|
-| [`yggdrasil.databricks`](modules/databricks/README.md) | Overview and patterns |
-| [`yggdrasil.databricks.workspaces`](modules/databricks/workspaces/README.md) | Paths + files across DBFS / Workspace / Volumes |
-| [`yggdrasil.databricks.sql`](modules/databricks/sql/README.md) | `SQLEngine`, `StatementResult` |
-| [`yggdrasil.databricks.compute`](modules/databricks/compute/README.md) | `Cluster`, `ExecutionContext` |
-| [`yggdrasil.databricks.compute.remote`](modules/databricks/compute/remote/README.md) | `@databricks_remote_compute` |
-| [`yggdrasil.databricks.jobs`](modules/databricks/jobs/README.md) | `NotebookConfig` — typed widget params |
+- `yggdrasil.databricks`
+- `yggdrasil.databricks.account`
+- `yggdrasil.databricks.compute`
+- `yggdrasil.databricks.fs`
+- `yggdrasil.databricks.iam`
+- `yggdrasil.databricks.jobs`
+- `yggdrasil.databricks.secrets`
+- `yggdrasil.databricks.sql`
+- `yggdrasil.databricks.workspaces`
 
-## Onboarding path
+## AI, API, and tools
 
-1. **`data.cast`** → understand `CastOptions` and `convert`
-2. **`arrow`** / **`arrow.cast`** → schema inference and table casting
-3. **`pyutils`** → wrap IO/network calls with `@retry`, fan-out with `@parallelize`
-4. **`databricks.workspaces`** + **`databricks.sql`** → Databricks pipelines
-5. **`databricks.jobs`** → typed notebook contracts
-6. **`concurrent`** + **`io`** → advanced streaming and buffering
+- `yggdrasil.ai`
+- `yggdrasil.fastapi`
+- `yggdrasil.pyutils`
+- `yggdrasil.concurrent`
+- `yggdrasil.environ`
+- `yggdrasil.mongo`
+- `yggdrasil.mongoengine`
+- `yggdrasil.pickle`
+- `yggdrasil.fxrates`
+- `yggdrasil.blake3`
+- `yggdrasil.xxhash`
