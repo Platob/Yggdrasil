@@ -141,6 +141,8 @@ class Tags:
     LOGGING_HANDLER: int = 217
     LOGGING_FORMATTER: int = 218
     LOGGING_LOG_RECORD: int = 219
+    GENERIC_OBJECT: int = 220
+    RUNTIME_RESOURCE: int = 221
 
     # ------------------------------------------------------------------
     # framework-specific internal objects
