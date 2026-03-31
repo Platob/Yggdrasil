@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, Any, AnyStr, Mapping
 
 import pyarrow as pa
 from yggdrasil.arrow.cast import any_to_arrow_schema
+from yggdrasil.data.cast import CastOptions, convert
 
 from .field import Field, _normalize_metadata, _to_bytes
 
 if TYPE_CHECKING:
     import polars as pl
+    import pyspark.sql.types as pst
 
 
 __all__ = [
@@ -59,32 +61,32 @@ class Schema(MutableMapping[str, Field]):
         if not self.metadata:
             return None
 
-        return {
-            k[2:]: v
-            for k, v in self.metadata.items()
-            if k.startswith(b"t:")
-        }
+        return {k[2:]: v for k, v in self.metadata.items() if k.startswith(b"t:")}
 
     @tags.setter
     def tags(self, value: dict[AnyStr, AnyStr] | None):
         if value:
             if self.metadata is None:
                 self.metadata = {}
-            self.metadata.update({
-                b"t:" + _to_bytes(k): _to_bytes(v)
-                for k, v in value.items()
-                if k and v
-            })
+            self.metadata.update(
+                {
+                    b"t:" + _to_bytes(k): _to_bytes(v)
+                    for k, v in value.items()
+                    if k and v
+                }
+            )
 
     def update_tags(self, value: dict[AnyStr, AnyStr] | None):
         if value:
             if self.metadata is None:
                 self.metadata = {}
-            self.metadata.update({
-                b"t:" + _to_bytes(k): _to_bytes(v)
-                for k, v in value.items()
-                if k and v
-            })
+            self.metadata.update(
+                {
+                    b"t:" + _to_bytes(k): _to_bytes(v)
+                    for k, v in value.items()
+                    if k and v
+                }
+            )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -142,10 +144,7 @@ class Schema(MutableMapping[str, Field]):
     ) -> "Schema":
         return Schema(
             inner_fields=(
-                OrderedDict(
-                    (field.name, Field.from_any(field))
-                    for field in fields
-                )
+                OrderedDict((field.name, Field.from_any(field)) for field in fields)
                 if fields is not None
                 else OrderedDict(
                     (name, field.copy()) for name, field in self.inner_fields.items()
@@ -351,15 +350,11 @@ class Schema(MutableMapping[str, Field]):
         *,
         metadata: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Schema":
-        try:
-            import polars as pl
-        except ImportError as exc:
-            raise RuntimeError("polars is required for Schema.from_polars()") from exc
+        from yggdrasil.polars.lib import polars as pl
 
         if isinstance(obj, pl.Schema):
             fields = [
-                Field.from_polars(name=name, dtype=dtype)
-                for name, dtype in obj.items()
+                Field.from_polars(name=name, dtype=dtype) for name, dtype in obj.items()
             ]
             return cls.from_fields(fields, metadata=metadata)
 
@@ -383,10 +378,7 @@ class Schema(MutableMapping[str, Field]):
         )
 
     def to_polars_schema(self) -> "pl.Schema":
-        try:
-            import polars as pl
-        except ImportError as exc:
-            raise RuntimeError("polars is required for Schema.to_polars_schema()") from exc
+        from yggdrasil.polars.lib import polars as pl
 
         return pl.Schema(
             {
@@ -394,3 +386,46 @@ class Schema(MutableMapping[str, Field]):
                 for field in self.inner_fields.values()
             }
         )
+
+    @classmethod
+    def from_pyspark(
+        cls,
+        obj: "pst.StructType | Any",
+        *,
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+    ) -> "Schema":
+        from yggdrasil.spark.cast import spark_schema_to_arrow_schema
+        from yggdrasil.spark.lib import pyspark_sql
+
+        if isinstance(obj, pyspark_sql.types.StructType):
+            arrow_schema = spark_schema_to_arrow_schema(obj)
+            merged_metadata = (
+                _normalize_metadata(metadata, tags=tags)
+                if (metadata is not None or tags is not None)
+                else (dict(arrow_schema.metadata) if arrow_schema.metadata else None)
+            )
+            return cls.from_fields(arrow_schema, metadata=merged_metadata)
+
+        return cls.from_any(obj).copy(metadata=metadata, tags=tags)
+
+    def to_pyspark_schema(self) -> "pst.StructType":
+        from yggdrasil.spark.cast import arrow_schema_to_spark_schema
+
+        return arrow_schema_to_spark_schema(self.to_arrow_schema())
+
+    def cast_table(self, obj: Any, *, safe: bool = True) -> Any:
+        return CastOptions(
+            target_field=self.to_arrow_schema(),
+            safe=safe,
+        ).cast_table(obj)
+
+    def cast_unstructured(
+        self,
+        obj: Any,
+        *,
+        as_type: type = pa.Table,
+        safe: bool = True,
+    ) -> Any:
+        options = CastOptions(target_field=self.to_arrow_schema(), safe=safe)
+        return convert(obj, target_hint=as_type, options=options)

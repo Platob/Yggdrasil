@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 from yggdrasil.arrow.cast import any_to_arrow_field
+from yggdrasil.data.cast import CastOptions, convert
 
 if TYPE_CHECKING:
     import polars as pl
+    import pyspark.sql.types as pst
 
 
 __all__ = [
@@ -45,11 +47,13 @@ def _normalize_metadata(
     }
 
     if tags:
-        normalized.update({
-            b"t:" + _to_bytes(key): _to_bytes(value)
-            for key, value in tags.items()
-            if key and value is not None
-        })
+        normalized.update(
+            {
+                b"t:" + _to_bytes(key): _to_bytes(value)
+                for key, value in tags.items()
+                if key and value is not None
+            }
+        )
 
     return normalized or None
 
@@ -133,11 +137,7 @@ class Field:
         if not self.metadata:
             return {}
 
-        return {
-            k[2:]: v
-            for k, v in self.metadata.items()
-            if k.startswith(b"t:")
-        }
+        return {k[2:]: v for k, v in self.metadata.items() if k.startswith(b"t:")}
 
     def copy(
         self,
@@ -193,7 +193,11 @@ class Field:
             inferred["kind"] = "string"
         elif pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
             inferred["kind"] = "binary"
-        elif pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        elif (
+            pa.types.is_list(dtype)
+            or pa.types.is_large_list(dtype)
+            or pa.types.is_fixed_size_list(dtype)
+        ):
             inferred["kind"] = "list"
             inferred["nested"] = True
         elif pa.types.is_struct(dtype):
@@ -222,7 +226,11 @@ class Field:
         if name == "id" or name.endswith("_id") or name.endswith("id"):
             inferred.setdefault("role", "identifier")
 
-        if name in {"ts", "timestamp"} or name.endswith("_ts") or name.endswith("_timestamp"):
+        if (
+            name in {"ts", "timestamp"}
+            or name.endswith("_ts")
+            or name.endswith("_timestamp")
+        ):
             inferred["temporal"] = True
             inferred.setdefault("role", "event_time")
 
@@ -252,14 +260,23 @@ class Field:
             inferred.setdefault("role", "price")
             inferred["numeric"] = True
 
-        if any(token in name for token in ("qty", "quantity", "volume", "count", "size", "amount")):
+        if any(
+            token in name
+            for token in ("qty", "quantity", "volume", "count", "size", "amount")
+        ):
             inferred.setdefault("role", "measure")
             inferred["numeric"] = True
 
-        if any(token in name for token in ("name", "label", "desc", "description", "comment")):
+        if any(
+            token in name
+            for token in ("name", "label", "desc", "description", "comment")
+        ):
             inferred.setdefault("role", "attribute")
 
-        if any(token in name for token in ("country", "region", "area", "zone", "market", "book", "desk")):
+        if any(
+            token in name
+            for token in ("country", "region", "area", "zone", "market", "book", "desk")
+        ):
             inferred.setdefault("role", "dimension")
 
         if self.partition_by:
@@ -340,3 +357,44 @@ class Field:
         from yggdrasil.polars.cast import arrow_field_to_polars_field
 
         return arrow_field_to_polars_field(self.to_arrow_field())
+
+    @classmethod
+    def from_pyspark(
+        cls,
+        obj: Any = None,
+        *,
+        name: str | None = None,
+        dtype: "pst.DataType | None" = None,
+        nullable: bool = True,
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+    ) -> "Field":
+        if obj is not None:
+            from yggdrasil.spark.cast import spark_field_to_arrow_field
+            from yggdrasil.spark.lib import pyspark_sql
+
+            if isinstance(obj, pyspark_sql.types.StructField):
+                return cls.from_arrow(spark_field_to_arrow_field(obj))
+            return cls.from_arrow(any_to_arrow_field(obj))
+
+        if name is None or dtype is None:
+            raise ValueError("name and dtype are required when obj is not provided")
+
+        from yggdrasil.spark.cast import spark_type_to_arrow_type
+
+        return cls(
+            name=name,
+            arrow_type=spark_type_to_arrow_type(dtype),
+            nullable=nullable,
+            metadata=_normalize_metadata(metadata, tags=tags),
+        )
+
+    def to_pyspark_field(self) -> "pst.StructField":
+        from yggdrasil.spark.cast import arrow_field_to_spark_field
+
+        return arrow_field_to_spark_field(self.to_arrow_field())
+
+    def cast(self, value: Any, *, safe: bool = True) -> Any:
+        options = CastOptions(target_field=self.to_arrow_field(), safe=safe)
+        scalar: pa.Scalar = convert(value, target_hint=pa.Scalar, options=options)
+        return scalar.as_py()
