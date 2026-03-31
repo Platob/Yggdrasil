@@ -935,6 +935,16 @@ class FunctionSerialized(ComplexSerialized[Callable[..., object]]):
     def value(self) -> Callable[..., object]:
         return _load_function_payload(self.decode())
 
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Make the serialized function directly callable.
+
+        Delegates to the deserialized function so that code receiving a
+        ``FunctionSerialized`` instead of a plain function can still invoke
+        it transparently (e.g. ``_f(*_a, **_k)`` in remote execution
+        snippets).
+        """
+        return self.as_cache_python()(*args, **kwargs)
+
     @classmethod
     def build_function(
         cls,
@@ -965,6 +975,15 @@ class MethodSerialized(FunctionSerialized):
     def value(self) -> MethodType:
         return _load_method_payload(self.decode())
 
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Make the serialized method directly callable.
+
+        Delegates to the deserialized bound method so that code receiving a
+        ``MethodSerialized`` instead of a plain bound method can still invoke
+        it transparently.
+        """
+        return self.as_cache_python()(*args, **kwargs)
+
     @classmethod
     def build_method(
         cls,
@@ -980,4 +999,3 @@ class MethodSerialized(FunctionSerialized):
             data=_dump_method_payload(method),
             codec=codec,
         )
-

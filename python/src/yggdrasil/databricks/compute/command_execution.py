@@ -35,11 +35,9 @@ FAILED_STATES = {
     CommandStatus.ERROR, CommandStatus.CANCELLED
 }
 
-
 __all__ = [
     "CommandExecution"
 ]
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -193,6 +191,7 @@ class CommandExecution:
             context=self.context.create(language=language_to_execute),
             command=command_to_execute,
             language=language_to_execute,
+            pyfunc=self.pyfunc,
             ephemeral=True
         )
         temp._local_checks = self._local_checks
@@ -418,7 +417,7 @@ class CommandExecution:
         self._details = value
 
         if value is not None:
-            assert isinstance(value, CommandStatusResponse), "%s.details must be CommandStatusResponse, got %s" %(
+            assert isinstance(value, CommandStatusResponse), "%s.details must be CommandStatusResponse, got %s" % (
                 self,
                 type(value)
             )

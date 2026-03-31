@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import TYPE_CHECKING, Optional, Any, Callable, Dict, Union, Literal, TypeVar, \
     Mapping
 
@@ -68,20 +68,20 @@ EXCLUDED_ENV_EXACT_KEYS = frozenset([
     'USERDOMAIN_ROAMINGPROFILE', 'USERNAME', 'USERPROFILE', 'USE_LOW_IMPACT_MONITORING', 'VIRTUAL_ENV',
     'VIRTUAL_ENV_PROMPT', 'WINDIR', 'ZES_ENABLE_SYSMAN', '_JB_PPRINT_PRIMITIVES', '_OLD_VIRTUAL_PATH',
     '_OLD_VIRTUAL_PROMPT', '_PIP_USE_IMPORTLIB_METADATA', '_RJEM_MALLOC_CONF', 'container',
-    "UV", "UV_PATH", "UV_BIN", "UV_RUN_RECURSION_DEPTH"
+    "UV", "UV_PATH", "UV_BIN", "UV_RUN_RECURSION_DEPTH",
 ])
 
 EXCLUDED_ENV_PREFIXES = (
     "ARM_",
     "DATABRICKS_",
-    "SPARK_",
-    "PYSPARK_",
-    "PYTHON_",
-    "PYTEST_",
-    "PYDEVD_",
-    "PYCHARM_",
-    "VSCODE_",
-    "MLFLOW_",
+    "SPARK",
+    "PYSPARK",
+    "PYTHON",
+    "PYTEST",
+    "PYDEVD",
+    "PYCHARM",
+    "VSCODE",
+    "MLFLOW",
     "TS_",
     "EFC_",
     "GIT_",
@@ -148,18 +148,36 @@ def _normalize_call_args(
     if _only_var:
         return tuple(args), dict(kwargs)
 
-    bound = sig.bind(*args, **kwargs)
-    bound.apply_defaults()
+    try:
+        # Use partial binding so we only normalize arguments already supplied.
+        # This avoids manufacturing a local TypeError for callables that still
+        # rely on runtime-provided args or decorator/partial behavior.
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+    except TypeError:
+        # Signature expansion is best-effort only. If introspection disagrees
+        # with the callable's real invocation behavior, preserve the original
+        # call shape and let the remote execution raise the underlying error.
+        return tuple(args), dict(kwargs)
 
     out_args: list = []
     out_kwargs: dict = {}
 
     for name, param in sig.parameters.items():
+        if name not in bound.arguments and param.kind not in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
         if param.kind is inspect.Parameter.POSITIONAL_ONLY:
             out_args.append(bound.arguments[name])
 
         elif param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
-            out_args.append(bound.arguments[name])
+            if name in kwargs:
+                out_kwargs[name] = bound.arguments[name]
+            else:
+                out_args.append(bound.arguments[name])
 
         elif param.kind is inspect.Parameter.VAR_POSITIONAL:
             out_args.extend(bound.arguments.get(name, ()))
@@ -374,7 +392,7 @@ class ExecutionContext:
 
                 try:
                     created = fut.result(timeout=10).response
-                except TimeoutError:
+                except FuturesTimeoutError:
                     self.cluster.ensure_running(wait=True)
 
                     created = client.create(
@@ -558,12 +576,12 @@ for _k, _v in _env.items():
             language = Language.PYTHON
             command_str = f"""
 import subprocess, sys, shlex, pathlib
-
+ 
 cmd = shlex.split({str(command_str)!r})
 cmd = [str(pathlib.Path(arg).expanduser()) if arg.startswith("~/") else arg for arg in cmd]
-
+ 
 p = subprocess.run(cmd, text=True, capture_output=True)
-
+ 
 if p.returncode != 0:
     raise RuntimeError(
         f"Command {{cmd}} failed with exit code {{p.returncode}}:\\n"
@@ -600,6 +618,14 @@ if p.returncode != 0:
         # to see (*args, **kwargs) and skip default expansion.
         func = pyfunc if pyfunc is not None else serfunc.as_cache_python()
         args, kwargs = _normalize_call_args(func, args=args, kwargs=kwargs)
+
+        # Use the pre-serialized function (serfunc) in the payload instead of
+        # re-serializing the live callable.  serfunc was created via
+        # serialize(pyfunc) and is already a FunctionSerialized/MethodSerialized
+        # that round-trips correctly.  Re-serializing `func` from scratch can
+        # produce a broken payload when the callable is a wrapper, partial, or
+        # other non-plain FunctionType (falls through to PickleSerialized which
+        # may deserialize as a tuple on the remote cluster).
         payload: str = dumps([serfunc, args, kwargs], b64=True)
         remote_payload_path: Optional[str] = None
 
@@ -624,28 +650,27 @@ if p.returncode != 0:
 
         cmd = f"""\
 {self.syspath_lines(environ)}
-
+ 
 from yggdrasil.pickle.ser import loads, dumps
 _DBXPATH_PREFIX = "DBXPATH:"
 _MAX_INLINE = 900000
 _raw = {payload_literal!r}
-
+ 
 if _raw.startswith(_DBXPATH_PREFIX):
     from yggdrasil.databricks.client import DatabricksClient as _DBC
     _client = _DBC.current()
     _path = _raw[len(_DBXPATH_PREFIX):]
     _raw = _client.dbfs_path(_path, temporary=True).read_bytes().decode("ascii")
-
+ 
 _f, _a, _k = loads(_raw)
-_r = dumps(_f(*_a, **_k), b64=True)
-
+_r = dumps(_f(*list(_a), **_k), b64=True)
+ 
 if len(_r) > _MAX_INLINE:
     from yggdrasil.databricks.client import DatabricksClient as _DBC
     _client = _DBC.current()
     _tmp = _client.tmp_path(suffix="-pyresult", extension="b64", max_lifetime=3600)
     _tmp.write_bytes(_r.encode("ascii") if isinstance(_r, str) else _r)
     _r = _DBXPATH_PREFIX + str(_tmp)
-    
 print({tag!r} + _r, flush=True)
 """
         return cmd, remote_payload_path

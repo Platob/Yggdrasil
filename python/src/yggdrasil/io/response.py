@@ -8,10 +8,10 @@ from dataclasses import MISSING, dataclass, replace, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import pyarrow as pa
+
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data import any_to_datetime, field as schema_field, schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
-
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeTypes
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
