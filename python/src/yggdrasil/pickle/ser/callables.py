@@ -20,8 +20,9 @@ import symtable
 import textwrap
 from dataclasses import dataclass
 from types import CodeType, FunctionType, MethodType
-from typing import Callable, ClassVar, Generic, Mapping
+from typing import Callable, ClassVar, Mapping
 
+from yggdrasil.environ import PyEnv
 from yggdrasil.pickle.ser.libs import (
     _BUILTINS_KEY,
     _FORMAT_VERSION,
@@ -60,6 +61,7 @@ _FULL_FUNCTION_CACHE: dict[
     tuple[str | None, str, str | None, str | None], Callable[..., object]
 ] = {}
 _MODULE_IMPORT_BINDINGS_CACHE: dict[str, frozenset[str]] = {}
+_IN_DATABRICKS = PyEnv.in_databricks()
 
 # ---------------------------------------------------------------------------
 # function payload format constants
@@ -145,9 +147,6 @@ def _dump_function_code_payload(fn: Callable[..., object]) -> tuple[
     bytes | None,
     str | None,
 ]:
-    marshal_code: bytes | None = None
-    source_code: str | None = None
-
     try:
         marshal_code = marshal.dumps(fn.__code__)
     except Exception:
@@ -161,7 +160,7 @@ def _dump_function_code_payload(fn: Callable[..., object]) -> tuple[
     if marshal_code is None and source_code is None:
         raise TypeError(f"Unable to serialize function code for {fn!r}")
 
-    return (_PYTHON_VERSION, marshal_code, source_code)
+    return _PYTHON_VERSION, marshal_code, source_code
 
 
 # ---------------------------------------------------------------------------

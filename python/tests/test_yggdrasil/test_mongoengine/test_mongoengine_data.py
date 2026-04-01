@@ -45,7 +45,7 @@ def resolver():
 
 @with_mongo_connection(
     aliases=["GenCast"],
-    databricks="https://dbc-82edd6f4-1e97.cloud.databricks.com/",
+    databricks="https://dbc-xxx.cloud.databricks.com/",
     resolver=resolver
 )
 def get_plant_data():

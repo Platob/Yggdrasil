@@ -15,8 +15,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union, TypeVar, \
-    TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.client_types import ClientType
@@ -31,7 +30,8 @@ from databricks.sdk.service.compute import (
     Library,
     LibraryInstallStatus,
     PythonPyPiLibrary,
-    State, )
+    State,
+)
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
@@ -39,6 +39,7 @@ from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
+
 from .execution_context import ExecutionContext
 from .service import Clusters, PYTHON_BY_DBR
 from ..client import DatabricksResource
@@ -56,6 +57,7 @@ _EDIT_ARG_NAMES = set(inspect.signature(ClustersAPI.edit).parameters.keys())
 
 _CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context", "_contexts"})
 _CLUSTER_SKIP_IF_NONE = frozenset({"_details", "cluster_name"})
+_GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
 
 
 def _library_sig(lib: Library) -> tuple:
@@ -76,7 +78,7 @@ class Cluster(DatabricksResource):
     service: Clusters = dataclasses.field(
         default_factory=Clusters.current,
         repr=False,
-        compare=False
+        compare=False,
     )
     cluster_id: Optional[str] = None
     cluster_name: Optional[str] = None
@@ -90,7 +92,8 @@ class Cluster(DatabricksResource):
 
         if self.cluster_name and not self.cluster_id:
             found = self.service.find_cluster(
-                cluster_name=self.cluster_name, raise_error=True
+                cluster_name=self.cluster_name,
+                raise_error=True,
             )
 
             object.__setattr__(self, "cluster_id", found.cluster_id)
@@ -103,10 +106,13 @@ class Cluster(DatabricksResource):
         return self.url().to_string()
 
     def url(self) -> URL:
-        return URL.parse_str("%s/compute/clusters/%s" % (
-            self.client.base_url.to_string().rstrip("/"),
-            self.cluster_id or "unknown"
-        ))
+        return URL.parse_str(
+            "%s/compute/clusters/%s"
+            % (
+                self.client.base_url.to_string().rstrip("/"),
+                self.cluster_id or "unknown",
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # Details caching
@@ -143,7 +149,6 @@ class Cluster(DatabricksResource):
 
             if self.cluster_id and details.cluster_id != self.cluster_id:
                 object.__setattr__(self, "cluster_name", None)
-
         else:
             object.__setattr__(self, "_details_refresh_time", 0.0)
             object.__setattr__(self, "_details", None)
@@ -163,7 +168,12 @@ class Cluster(DatabricksResource):
 
     @property
     def is_pending(self):
-        return self.state in (State.PENDING, State.RESIZING, State.RESTARTING, State.TERMINATING)
+        return self.state in (
+            State.PENDING,
+            State.RESIZING,
+            State.RESTARTING,
+            State.TERMINATING,
+        )
 
     @property
     def is_error(self):
@@ -235,14 +245,21 @@ class Cluster(DatabricksResource):
     ) -> "Cluster":
         self.install_libraries(libraries=libraries, wait=False, raise_error=False)
 
-        existing_details = {k: v for k, v in self.details.as_shallow_dict().items() if k in _EDIT_ARG_NAMES}
+        existing_details = {
+            k: v
+            for k, v in self.details.as_shallow_dict().items()
+            if k in _EDIT_ARG_NAMES
+        }
 
         update_details = {
-            k: v for k, v in self.service.check_details(
-                update=True, details=self.details,
+            k: v
+            for k, v in self.service.check_details(
+                update=True,
+                details=self.details,
                 single_user_name=single_user_name,
-                **cluster_spec
-            ).as_shallow_dict().items() if k in _EDIT_ARG_NAMES
+                **cluster_spec,
+            ).as_shallow_dict().items()
+            if k in _EDIT_ARG_NAMES
         }
 
         same = dicts_equal(existing_details, update_details, keys=_EDIT_ARG_NAMES)
@@ -261,7 +278,7 @@ class Cluster(DatabricksResource):
 
     def update_permissions(
         self,
-        permissions: Optional[list[str | ClusterAccessControlRequest]] = None
+        permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
     ):
         if not permissions:
             return self
@@ -269,9 +286,11 @@ class Cluster(DatabricksResource):
         permissions = self._check_permission(permissions)
 
         try:
-            self.clusters_client().update_permissions(cluster_id=self.cluster_id, access_control_list=permissions)
+            self.clusters_client().update_permissions(
+                cluster_id=self.cluster_id,
+                access_control_list=permissions,
+            )
         except ResourceDoesNotExist as e:
-            _GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
             m = _GROUPNAME_RE.search(str(e))
             group_name = m.group("group") if m else None
 
@@ -280,13 +299,12 @@ class Cluster(DatabricksResource):
                     self.client.iam.groups.create(
                         name=group_name,
                         members=[self.client.iam.users.current_user],
-                        client_type=ClientType.ACCOUNT
+                        client_type=ClientType.ACCOUNT,
                     )
                 except Exception as inner_e:
                     raise inner_e from e
                 return self.update_permissions(permissions)
-            else:
-                raise
+            raise
 
         return self
 
@@ -401,7 +419,7 @@ class Cluster(DatabricksResource):
             environ=environ,
             func=func,
             language=language,
-            context=context
+            context=context,
         )
 
     # ------------------------------------------------------------------ #
@@ -412,16 +430,20 @@ class Cluster(DatabricksResource):
         libraries: Optional[List[Union[str, Library]]] = None,
         wait: WaitingConfigArg = True,
         pip_settings: Optional[PipIndexSettings] = None,
+        remove_failed: bool = True,
         raise_error: bool = True,
     ) -> "Cluster":
         if not libraries:
             return self
 
         wsdk = self.client.workspace_client()
-
         pip_settings = PipIndexSettings.current() if pip_settings is None else pip_settings
 
-        normalized: list[Library] = [self._check_library(_, pip_settings=pip_settings) for _ in libraries if _]
+        normalized: list[Library] = [
+            self._check_library(_, pip_settings=pip_settings)
+            for _ in libraries
+            if _
+        ]
 
         if normalized:
             existing_sigs = {
@@ -433,12 +455,21 @@ class Cluster(DatabricksResource):
 
         if normalized:
             wsdk.libraries.install(cluster_id=self.cluster_id, libraries=normalized)
-            self.wait_installed_libraries(wait=wait, raise_error=raise_error)
+            self.wait_installed_libraries(wait=wait, raise_error=raise_error, remove_failed=remove_failed)
 
         return self
 
     def installed_library_statuses(self):
         return self.client.workspace_client().libraries.cluster_status(cluster_id=self.cluster_id)
+
+    def _uninstall_libraries(self, libraries: list[Library]) -> None:
+        if not libraries:
+            return
+
+        self.client.workspace_client().libraries.uninstall(
+            cluster_id=self.cluster_id,
+            libraries=libraries,
+        )
 
     def uninstall_libraries(
         self,
@@ -448,15 +479,20 @@ class Cluster(DatabricksResource):
     ):
         if libraries is None:
             to_remove = [
-                lib.library
-                for lib in self.installed_library_statuses()
-                if self._filter_lib(lib, pypi_packages=pypi_packages, default_filter=False)
+                status.library
+                for status in self.installed_library_statuses()
+                if status.library is not None
+                and self._filter_lib(
+                    status.library,
+                    pypi_packages=pypi_packages,
+                    default_filter=False,
+                )
             ]
         else:
             to_remove = libraries
 
         if to_remove:
-            self.client.workspace_client().libraries.uninstall(cluster_id=self.cluster_id, libraries=to_remove)
+            self._uninstall_libraries(to_remove)
 
             if restart:
                 self.restart()
@@ -464,7 +500,11 @@ class Cluster(DatabricksResource):
         return self
 
     @staticmethod
-    def _filter_lib(lib: Optional[Library], pypi_packages: Optional[list[str]] = None, default_filter: bool = False):
+    def _filter_lib(
+        lib: Optional[Library],
+        pypi_packages: Optional[list[str]] = None,
+        default_filter: bool = False,
+    ):
         if lib is None:
             return False
 
@@ -478,6 +518,7 @@ class Cluster(DatabricksResource):
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
+        remove_failed: bool = True
     ):
         if not self.is_running:
             return self
@@ -489,18 +530,39 @@ class Cluster(DatabricksResource):
             start, iteration = time.time(), 0
 
             while True:
-                failed = [_.library for _ in statuses if _.library and _.status == LibraryInstallStatus.FAILED]
+                failed = [
+                    status.library
+                    for status in statuses
+                    if status.library and status.status == LibraryInstallStatus.FAILED
+                ]
 
                 if failed:
+                    if remove_failed:
+                        try:
+                            self._uninstall_libraries(failed)
+                        except Exception:
+                            LOGGER.exception(
+                                "Failed to uninstall broken libraries %s from %s",
+                                failed,
+                                self,
+                            )
+
+                    msg = "Libraries %s in %s failed to install" % (failed, self)
+
                     if raise_error:
-                        raise DatabricksError("Libraries %s in %s failed to install" % (failed, self))
-                    LOGGER.exception("Libraries %s in %s failed to install", failed, self)
+                        raise DatabricksError(msg)
+
+                    LOGGER.error(msg)
+                    return self
 
                 running = [
-                    _
-                    for _ in statuses
-                    if _.status
-                    in (LibraryInstallStatus.INSTALLING, LibraryInstallStatus.PENDING, LibraryInstallStatus.RESOLVING)
+                    status
+                    for status in statuses
+                    if status.status in (
+                        LibraryInstallStatus.INSTALLING,
+                        LibraryInstallStatus.PENDING,
+                        LibraryInstallStatus.RESOLVING,
+                    )
                 ]
 
                 if not running:
@@ -515,35 +577,36 @@ class Cluster(DatabricksResource):
     @staticmethod
     def _check_library(value, pip_settings: Optional[PipIndexSettings] = None) -> Library:
         if isinstance(value, Library):
-            return value
+            library = value
+        elif isinstance(value, str):
+            if value.endswith(".jar"):
+                library = Library(jar=value)
+            elif value.endswith("requirements.txt"):
+                library = Library(requirements=value)
+            elif value.endswith(".whl"):
+                library = Library(whl=value)
+            else:
+                library = Library(pypi=PythonPyPiLibrary(package=value))
+        else:
+            raise ValueError(f"Cannot build Library object from {type(value)}")
 
         pip_settings = PipIndexSettings.current() if pip_settings is None else pip_settings
 
-        if isinstance(value, str):
-            # Now value is either a dbfs:/ path or plain package name
-            if value.endswith(".jar"):
-                return Library(jar=value)
-            if value.endswith("requirements.txt"):
-                return Library(requirements=value)
-            if value.endswith(".whl"):
-                return Library(whl=value)
-
-            repo = None
-
-            if pip_settings.extra_index_url and (
-                value.startswith("datamanagement")
-                or value.startswith("TSSecrets")
-                or value.startswith("TSMails")
-                or value.startswith("tgp_")
-                or value.startswith("wma-data")
-            ):
-                repo = pip_settings.extra_index_url
-
-            return Library(
-                pypi=PythonPyPiLibrary(
-                    package=value,
-                    repo=repo,
+        package = getattr(library.pypi, "package", None)
+        if (
+            package
+            and library.pypi.repo is None
+            and pip_settings.extra_index_url
+            and package.startswith(
+                (
+                    "datamanagement",
+                    "TSSecrets",
+                    "TSMails",
+                    "tgp_",
+                    "wma-data",
                 )
             )
+        ):
+            library.pypi.repo = pip_settings.extra_index_url
 
-        raise ValueError(f"Cannot build Library object from {type(value)}")
+        return library

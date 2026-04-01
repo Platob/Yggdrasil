@@ -16,12 +16,12 @@ from databricks.sdk.errors import InternalError, PermissionDenied, ResourceDoesN
 from databricks.sdk.service.compute import (
     Language, CommandStatusResponse, CommandStatus, ResultType
 )
+
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg, serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
 from yggdrasil.pickle.ser import serialize, Serialized, loads
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
-
 from .exceptions import ClientTerminatedSession, CommandExecutionError
 from .execution_context import ExecutionContext
 
@@ -33,6 +33,127 @@ PENDING_STATES = {CommandStatus.RUNNING, CommandStatus.QUEUED}
 
 FAILED_STATES = {
     CommandStatus.ERROR, CommandStatus.CANCELLED
+}
+
+ALREADY_LIBS = {
+    "Cython",
+    "Deprecated",
+    "GitPython",
+    "PyGObject",
+    "Send2Trash",
+    "annotated-doc",
+    "arro3-core",
+    "async-lru",
+    "autocommand",
+    "azure-common",
+    "azure-core",
+    "azure-identity",
+    "azure-mgmt-core",
+    "azure-mgmt-web",
+    "azure-storage-blob",
+    "azure-storage-file-datalake",
+    "backports.tarfile",
+    "black",
+    "databricks-agents",
+    "databricks-sdk",
+    "dbus-python",
+    "deltalake",
+    "distlib",
+    "docstring-to-markdown",
+    "facets-overview",
+    "fastapi",
+    "fqdn",
+    "google-api-core",
+    "google-cloud-core",
+    "google-cloud-storage",
+    "google-crc32c",
+    "google-resumable-media",
+    "googleapis-common-protos",
+    "grpcio-status",
+    "hf-xet",
+    "httplib2",
+    "huggingface_hub",
+    "importlib_metadata",
+    "inflect",
+    "ipyflow-core",
+    "ipython-genutils",
+    "isodate",
+    "isoduration",
+    "jaraco.collections",
+    "jaraco.context",
+    "jaraco.functools",
+    "jaraco.text",
+    "jiter",
+    "jsonpatch",
+    "jupyter-events",
+    "jupyter-lsp",
+    "jupyter_server_terminals",
+    "jupyterlab_server",
+    "langchain-core",
+    "langchain-openai",
+    "langsmith",
+    "launchpadlib",
+    "lazr.restfulclient",
+    "lazr.uri",
+    "litellm",
+    "markdown-it-py",
+    "marshmallow",
+    "mccabe",
+    "mdurl",
+    "mlflow-skinny",
+    "mmh3",
+    "msal",
+    "msal-extensions",
+    "mypy-extensions",
+    "nodeenv",
+    "oauthlib",
+    "opentelemetry-api",
+    "opentelemetry-proto",
+    "opentelemetry-sdk",
+    "opentelemetry-semantic-conventions",
+    "orjson",
+    "pathspec",
+    "patsy",
+    "plotly",
+    "prometheus_client",
+    "propcache",
+    "proto-plus",
+    "psycopg2",
+    "pyasn1-modules",
+    "pyccolo",
+    "pyflakes",
+    "pyiceberg",
+    "pyodbc",
+    "pyright",
+    "pyroaring",
+    "python-dotenv",
+    "python-lsp-jsonrpc",
+    "python-lsp-server",
+    "pytoolconfig",
+    "requests-toolbelt",
+    "rich",
+    "rope",
+    "rpds-py",
+    "s3transfer",
+    "scikit-learn",
+    "shellingham",
+    "ssh-import-id",
+    "strictyaml",
+    "threadpoolctl",
+    "tiktoken",
+    "tokenize_rt",
+    "tokenizers",
+    "typeguard",
+    "typer-slim",
+    "typing-inspect",
+    "unattended-upgrades",
+    "uri-template",
+    "uuid_utils",
+    "wadllib",
+    "whatthepatch",
+    "whenever",
+    "yggdrasil",
+    "ygg"
 }
 
 __all__ = [
@@ -49,6 +170,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class _ModuleUploadCacheKey:
     cluster_id: str
+    context_key: str
     remote_libs: str
     local_root: Path
 
@@ -80,7 +202,6 @@ class CommandExecution:
 
     _ser_pyfunc: Optional[Serialized] = field(default=None, repr=False, compare=False, hash=False)
     _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _local_checks: dict[Path, float] = field(default_factory=dict, init=False, repr=False, compare=False, hash=False)
     _remote_payload_path: Optional[str] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     def __post_init__(self):
@@ -95,9 +216,6 @@ class CommandExecution:
 
         if self.language is None:
             self.language = Language.PYTHON if self.pyfunc is not None else self.context.language
-
-        if self._local_checks is None:
-            self._local_checks = {}
 
         if self.wait_config is not None:
             self.wait_config = WaitingConfig.check_arg(self.wait_config)
@@ -157,18 +275,12 @@ class CommandExecution:
                 if callable(to_decorate):
                     decorated = self.pyfunc(to_decorate)
 
-                    # Track dependency for change detection
-                    root_module = self._get_local_module_path(to_decorate)
-                    self._local_checks[root_module] = 0
-
                     built = CommandExecution(
                         context=self.context,
                         pyfunc=decorated,
                         environ=self.environ,
                         language=Language.PYTHON
                     )
-
-                    built._local_checks.update(self._local_checks)
                     return built
 
             # Create command
@@ -194,17 +306,11 @@ class CommandExecution:
             pyfunc=self.pyfunc,
             ephemeral=True
         )
-        temp._local_checks = self._local_checks
         temp._remote_payload_path = remote_payload_path
 
         if install_modules:
             for m in install_modules:
                 temp.install_module(m, auto_pip=False)
-
-        # Check local dependencies
-        for local_root in temp._local_checks.keys():
-            if "site-packages" not in local_root.parts:
-                temp.install_module(local_root=local_root, check_diffs=True)
 
         try:
             return temp.start().result(raise_error=True)
@@ -663,6 +769,7 @@ class CommandExecution:
     def _module_upload_cache_key(self, local_root: Path) -> _ModuleUploadCacheKey:
         return _ModuleUploadCacheKey(
             cluster_id=str(self.cluster_id),
+            context_key=str(self.context.context_key),
             remote_libs=self.context.remote_metadata.libs_path.rstrip("/"),
             local_root=local_root.resolve(),
         )
@@ -673,7 +780,7 @@ class CommandExecution:
         *,
         auto_pip: bool = True,
         check_diffs: bool = False
-    ) -> str:
+    ) -> str | None:
         local_root = self._get_local_module_path(obj=local_root)
         module_name = local_root.name
         remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
@@ -681,8 +788,10 @@ class CommandExecution:
 
         if auto_pip and any(part == "site-packages" for part in local_root.parts):
             spec = _get_local_distribution_compatible_spec(
-                module_name=module_name, raise_error=False
+                module_name=module_name, raise_error=True,
+                exclude_modules=ALREADY_LIBS
             )
+
             return self._remote_pip_install(
                 spec,
                 upgrade=True,
@@ -691,18 +800,9 @@ class CommandExecution:
         current_mtime = _get_tree_mtime(local_root)
         cache_key = self._module_upload_cache_key(local_root)
 
-        # instance-level diff shortcut
-        if check_diffs:
-            last_mtime = self._local_checks.get(local_root, 0)
-            if current_mtime <= last_mtime:
-                self._local_checks[local_root] = current_mtime
-                return remote_libs
-
-        # module-level cross-instance cache shortcut
         with _MODULE_UPLOAD_CACHE_LOCK:
             cached = _MODULE_UPLOAD_CACHE.get(cache_key)
-            if cached is not None and cached.tree_mtime >= current_mtime:
-                self._local_checks[local_root] = current_mtime
+            if check_diffs and cached is not None and cached.tree_mtime >= current_mtime:
                 LOGGER.debug(
                     "Skipping upload for unchanged local module '%s' -> '%s' (module cache hit)",
                     local_root,
@@ -750,8 +850,6 @@ print(remote_libs, flush=True)
             .result()
         )
 
-        self._local_checks[local_root] = current_mtime
-
         with _MODULE_UPLOAD_CACHE_LOCK:
             _MODULE_UPLOAD_CACHE[cache_key] = _ModuleUploadCacheEntry(
                 tree_mtime=current_mtime,
@@ -774,9 +872,6 @@ print(remote_libs, flush=True)
         editable: bool = False,
         quiet: bool = True,
     ) -> list[tuple[str, str]]:
-        import re
-
-        # Safe to skip on most Databricks runtimes
         BLACKLIST_EXACT = {
             "pyspark",
             "pandas",
@@ -786,7 +881,6 @@ print(remote_libs, flush=True)
             "sklearn",
         }
 
-        # Only skip if you KNOW your Databricks image/runtime already has them
         BLACKLIST_OPTIONAL = {
             "polars",
             "fastapi",
@@ -798,7 +892,7 @@ print(remote_libs, flush=True)
             "transformers",
         }
 
-        BLACKLIST = BLACKLIST_EXACT | BLACKLIST_OPTIONAL  # trim if needed
+        BLACKLIST = BLACKLIST_EXACT | BLACKLIST_OPTIONAL
 
         def normalize_pkg_name(spec: str) -> str:
             spec = str(spec).strip().lower()
@@ -815,105 +909,19 @@ print(remote_libs, flush=True)
         if not pkgs:
             return []
 
-        remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
-
-        bootstrap = f"""
-import os
-import sys
-import importlib
-
-remote_libs = os.path.expanduser({remote_libs!r})
-packages = {pkgs!r}
-
-def is_importable(pkg_name: str) -> bool:
-    try:
-        importlib.import_module(pkg_name)
-        return True
-    except ImportError:
-        return False
-
-packages_to_install = [p for p in packages if not is_importable(p)]
-
-os.makedirs(remote_libs, exist_ok=True)
-
-import subprocess
-import shlex
-import json
-
-if packages_to_install:
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        *packages_to_install,
-        "--target",
-        remote_libs,
-        "--disable-pip-version-check",
-        "--no-input",
-    ]
-
-    if {upgrade!r}:
-        cmd.append("--upgrade")
-    if {editable!r}:
-        cmd.append("--editable")
-    if {quiet!r}:
-        cmd.append("--quiet")
-
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-    )
-
-    if proc.stdout:
-        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Remote pip install failed\n"
-            f"command: {{shlex.join(cmd)}}\n"
-            f"stdout:\n{{proc.stdout}}\n"
-            f"stderr:\n{{proc.stderr}}"
-        )
-
-# --- List installed packages ---
-list_cmd = [
-    sys.executable,
-    "-m",
-    "pip",
-    "list",
-    "--format=json",
-    "--path",
-    remote_libs,
-    "--disable-pip-version-check",
-]
-
-listed = subprocess.run(
-    list_cmd,
-    text=True,
-    capture_output=True,
-    check=True,
-)
-
-parsed_list = json.loads(listed.stdout)
-
-print("__CALL_RESULT__" + listed.stdout, flush=True)
-"""
-
-        r = (
-            self.context
-            .command(language=Language.PYTHON, command=bootstrap)
-            .start()
-            .result()
+        self.context.cluster.install_libraries(
+            libraries=packages,
+            raise_error=True,
+            remove_failed=True
         )
 
         LOGGER.info(
             "Installed packages '%s' to remote libs path '%s'",
             pkgs,
-            remote_libs
+            packages
         )
 
-        return r
+        return packages
 
 
 def raise_error_from_response(
@@ -940,32 +948,36 @@ def raise_error_from_response(
 
 def _get_local_distribution_compatible_spec(
     module_name: str,
-    raise_error: bool
-) -> str:
+    raise_error: bool,
+    exclude_modules: set[str] | None = None,
+) -> str | None:
     import importlib.metadata as im
 
+    exclude_modules = exclude_modules or set()
     root_module = module_name.split(".", 1)[0]
 
-    pkg_map = im.packages_distributions()
-    dist_names = pkg_map.get(root_module)
+    if root_module in exclude_modules:
+        return None if not raise_error else _raise_excluded(module_name)
 
-    if not dist_names:
-        dist_names = [root_module]
+    pkg_map = im.packages_distributions()
+    dist_names = pkg_map.get(root_module) or [root_module]
 
     last_err: Exception | None = None
 
     for dist_name in dist_names:
         try:
             version = im.version(dist_name)
-            parts = str(version).split(".")
-            major = parts[0] if len(parts) > 0 else "0"
-            minor = parts[1] if len(parts) > 1 else "0"
-            return f"{dist_name}~={major}.{minor}"
         except Exception as e:
             last_err = e
+            continue
+
+        parts = str(version).split(".")
+        major = parts[0] if len(parts) > 0 else "0"
+        minor = parts[1] if len(parts) > 1 else "0"
+        return f"{dist_name}~={major}.{minor}"
 
     if not raise_error:
-        return dist_names[0]
+        return None
 
     if last_err is not None:
         raise RuntimeError(
@@ -974,6 +986,12 @@ def _get_local_distribution_compatible_spec(
 
     raise RuntimeError(
         f"Cannot resolve installed distribution/version for module '{module_name}'"
+    )
+
+
+def _raise_excluded(module_name: str) -> None:
+    raise RuntimeError(
+        f"Module '{module_name}' is excluded from local distribution resolution"
     )
 
 
