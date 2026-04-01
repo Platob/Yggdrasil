@@ -286,20 +286,14 @@ class Serialized(ABC, Generic[T]):
             return out
 
         from yggdrasil.pickle.ser.handlers import SensitiveObjectSerialized
-
-        out = SensitiveObjectSerialized.from_python_object(obj, metadata=metadata, codec=codec)
-        if out is not None:
-            if is_obj:
-                Tags.register_class(out.__class__, pytype=type(obj))
-            return out
-
         from yggdrasil.pickle.ser.pickles import AnyObjectSerialized, PickleSerialized
 
-        out = AnyObjectSerialized.from_python_object(obj, metadata=metadata, codec=codec)
-        if out is not None:
-            if is_obj:
-                Tags.register_class(out.__class__, pytype=type(obj))
-            return out
+        for serializer_cls in (SensitiveObjectSerialized, AnyObjectSerialized):
+            out = serializer_cls.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
 
         out = PickleSerialized.from_python_object(obj, metadata=metadata, codec=codec)
 

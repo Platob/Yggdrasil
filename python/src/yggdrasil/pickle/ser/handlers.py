@@ -15,18 +15,15 @@ __all__ = [
 ]
 
 
-def _sensitive_types() -> tuple[type[object], ...]:
-    lock_t = type(threading.Lock())
-    rlock_t = type(threading.RLock())
-    return (
-        socket.socket,
-        lock_t,
-        rlock_t,
-    )
+_SENSITIVE_TYPES: tuple[type[object], ...] = (
+    socket.socket,
+    type(threading.Lock()),
+    type(threading.RLock()),
+)
 
 
 def is_sensitive_object(obj: object) -> bool:
-    if isinstance(obj, _sensitive_types()):
+    if isinstance(obj, _SENSITIVE_TYPES):
         return True
 
     mod = type(obj).__module__
