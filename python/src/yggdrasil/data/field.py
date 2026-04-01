@@ -370,10 +370,10 @@ class Field:
         tags: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Field":
         if obj is not None:
+            from pyspark.sql.types import StructField
             from yggdrasil.spark.cast import spark_field_to_arrow_field
-            from yggdrasil.spark.lib import pyspark_sql
 
-            if isinstance(obj, pyspark_sql.types.StructField):
+            if isinstance(obj, StructField):
                 return cls.from_arrow(spark_field_to_arrow_field(obj))
             return cls.from_arrow(any_to_arrow_field(obj))
 

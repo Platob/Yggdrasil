@@ -396,7 +396,7 @@ class Schema(MutableMapping[str, Field]):
         tags: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Schema":
         from yggdrasil.spark.cast import spark_schema_to_arrow_schema
-        from yggdrasil.spark.lib import pyspark_sql
+        import pysparl.sql as pyspark_sql
 
         if isinstance(obj, pyspark_sql.types.StructType):
             arrow_schema = spark_schema_to_arrow_schema(obj)

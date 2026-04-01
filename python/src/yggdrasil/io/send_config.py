@@ -132,7 +132,7 @@ class _ConfigBase:
 
                 values["spark_session"] = PyEnv.spark_session(
                     create=True,
-                    install_spark=True,
+                    install_spark=False,
                     import_error=True,
                 )
             else:

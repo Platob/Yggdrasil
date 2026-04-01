@@ -1367,7 +1367,7 @@ class PyEnv:
                     self._checked_modules.add(module_name)
                 return imported
             except ModuleNotFoundError:
-                if not install:
+                if "pyspark" in module_name or not install:
                     raise
 
         try:

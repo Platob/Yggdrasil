@@ -805,7 +805,7 @@ def any_to_arrow_table(
                 obj = pandas_dataframe_to_arrow_table(obj, options)
 
             if namespace.startswith("pyspark."):
-                from yggdrasil.spark.lib import pyspark_sql
+                import pysparl.sql as pyspark_sql
                 from yggdrasil.spark.cast import any_to_spark_dataframe
 
                 obj: pyspark_sql.DataFrame = any_to_spark_dataframe(obj, options)

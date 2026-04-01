@@ -646,17 +646,10 @@ class Table(DatabricksResource):
         spark_session: "SparkSession | None" = None,
     ) -> "delta.tables.DeltaTable":
         """Return a Delta ``DeltaTable`` handle for this table."""
-        try:
-            from delta.tables import DeltaTable
-        except ImportError:
-            from yggdrasil.environ import runtime_import_module
-            m = runtime_import_module(
-                module_name="delta.tables", pip_name="delta-spark", install=True,
-            )
-            DeltaTable = m.DeltaTable
+        from delta.tables import DeltaTable
 
         session = spark_session or PyEnv.spark_session(
-            create=True, import_error=True, install_spark=True,
+            create=True, import_error=True, install_spark=False,
         )
         return DeltaTable.forName(sparkSession=session, tableOrViewName=self.full_name(safe=True))
 

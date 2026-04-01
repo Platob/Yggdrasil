@@ -290,7 +290,7 @@ class SQLEngine(DatabricksService):
         if engine == "spark":
             spark_session = PyEnv.spark_session(
                 create=True,
-                install_spark=True,
+                install_spark=False,
                 import_error=True
             ) if spark_session is None else spark_session
 
