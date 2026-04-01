@@ -153,8 +153,17 @@ def test_mappingproxy_roundtrip():
     src = {"a": 1, "b": 2}
     proxy = MappingProxyType(src)
     ser, value = _roundtrip(proxy)
-    assert ser.tag == m.Tags.MAPPING
-    assert value == {"a": 1, "b": 2}
+    assert ser.tag == m.Tags.MAPPING_PROXY
+    assert isinstance(ser, m.MappingProxySerialized)
+    assert isinstance(value, MappingProxyType)
+    assert dict(value) == {"a": 1, "b": 2}
+
+
+def test_mappingproxy_is_read_only_after_roundtrip():
+    src = {"a": 1}
+    _, value = _roundtrip(MappingProxyType(src))
+    with pytest.raises(TypeError):
+        value["b"] = 2
 
 
 def test_generator_roundtrip():
@@ -187,7 +196,7 @@ def test_generator_is_consumed_on_serialization():
     ser = m.CollectionSerialized.from_python_object(g)
     assert ser is not None
     assert events == ["start", "end"]
-    assert list(ser.as_python()) == [1, 2, 3][:2]
+    assert list(ser.as_python()) == [1, 2]
 
 
 def test_iter_property_items_on_list():
@@ -228,6 +237,31 @@ def test_mapping_iter_yields_flat_sequence():
     assert flat == ["a", 1]
 
 
+def test_mappingproxy_iter_entries():
+    ser = m.CollectionSerialized.from_python_object(MappingProxyType({"a": 1, "b": 2}))
+    assert ser is not None
+    assert isinstance(ser, m.MappingProxySerialized)
+    entries = list(ser.iter_entries())
+    decoded = [(k.as_python(), v.as_python()) for k, v in entries]
+    assert decoded == [("a", 1), ("b", 2)]
+
+
+def test_mappingproxy_entries_property():
+    ser = m.CollectionSerialized.from_python_object(MappingProxyType({"a": 1, "b": 2}))
+    assert ser is not None
+    assert isinstance(ser, m.MappingProxySerialized)
+    decoded = [(k.as_python(), v.as_python()) for k, v in ser.entries]
+    assert decoded == [("a", 1), ("b", 2)]
+
+
+def test_mappingproxy_iter_yields_flat_sequence():
+    ser = m.CollectionSerialized.from_python_object(MappingProxyType({"a": 1}))
+    assert ser is not None
+    assert isinstance(ser, m.MappingProxySerialized)
+    flat = [x.as_python() for x in ser.iter_()]
+    assert flat == ["a", 1]
+
+
 def test_payload_buffer_codec_none():
     ser = m.CollectionSerialized.from_python_object([1, 2, 3], codec=m.CODEC_NONE)
     assert ser is not None
@@ -255,6 +289,7 @@ def test_tags_registered_for_core_types():
     assert m.Tags.get_class(m.Tags.SET) is m.SetSerialized
     assert m.Tags.get_class(m.Tags.FROZENSET) is m.FrozenSetSerialized
     assert m.Tags.get_class(m.Tags.MAPPING) is m.MappingSerialized
+    assert m.Tags.get_class(m.Tags.MAPPING_PROXY) is m.MappingProxySerialized
     assert m.Tags.get_class(m.Tags.DEQUE) is m.DequeSerialized
     assert m.Tags.get_class(m.Tags.ARRAY) is m.ArraySerialized
 
@@ -265,6 +300,7 @@ def test_type_registry_for_core_types():
     assert m.Tags.get_class_from_type(set) is m.SetSerialized
     assert m.Tags.get_class_from_type(frozenset) is m.FrozenSetSerialized
     assert m.Tags.get_class_from_type(dict) is m.MappingSerialized
+    assert m.Tags.get_class_from_type(MappingProxyType) is m.MappingProxySerialized
     assert m.Tags.get_class_from_type(deque) is m.DequeSerialized
     assert m.Tags.get_class_from_type(array) is m.ArraySerialized
 
@@ -279,6 +315,7 @@ def test_type_registry_for_core_types():
         (lambda: deque([1, 2]), lambda m: m.Tags.DEQUE),
         (lambda: array("i", [1, 2]), lambda m: m.Tags.ARRAY),
         (lambda: {"a": 1}, lambda m: m.Tags.MAPPING),
+        (lambda: MappingProxyType({"a": 1}), lambda m: m.Tags.MAPPING_PROXY),
     ],
 )
 def test_expected_small_tags(factory, expected_tag):
@@ -319,6 +356,10 @@ def test_large_builder_uses_large_tags(monkeypatch):
     assert ser is not None
     assert ser.tag == m.Tags.LARGE_MAPPING
 
+    ser = m.CollectionSerialized.from_python_object(MappingProxyType({"a": 1}))
+    assert ser is not None
+    assert ser.tag == m.Tags.LARGE_MAPPING_PROXY
+
 
 def test_large_generator_tag(monkeypatch):
     monkeypatch.setattr(m, "_is_large_count", lambda count: True)
@@ -338,6 +379,16 @@ def test_large_iterator_tag(monkeypatch):
     ser = m.CollectionSerialized.from_python_object(iter([1, 2]))
     assert ser is not None
     assert ser.tag == m.Tags.LARGE_ITERATOR
+
+
+def test_large_mappingproxy_roundtrip(monkeypatch):
+    monkeypatch.setattr(m, "_is_large_count", lambda count: True)
+
+    ser, value = _roundtrip(MappingProxyType({"a": 1, "b": 2}))
+    assert ser.tag == m.Tags.LARGE_MAPPING_PROXY
+    assert isinstance(ser, m.LargeMappingProxySerialized)
+    assert isinstance(value, MappingProxyType)
+    assert dict(value) == {"a": 1, "b": 2}
 
 
 def test_generator_value_is_reiterable_only_once_per_returned_generator():
@@ -364,3 +415,10 @@ def test_mapping_with_non_string_keys_roundtrip():
     obj = {1: "a", (2, 3): "b"}
     _, value = _roundtrip(obj)
     assert value == obj
+
+
+def test_mappingproxy_with_non_string_keys_roundtrip():
+    obj = MappingProxyType({1: "a", (2, 3): "b"})
+    _, value = _roundtrip(obj)
+    assert isinstance(value, MappingProxyType)
+    assert dict(value) == {1: "a", (2, 3): "b"}

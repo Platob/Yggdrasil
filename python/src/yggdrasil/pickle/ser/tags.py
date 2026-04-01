@@ -100,22 +100,24 @@ class Tags:
     ARRAY: int = 100
     LIST: int = 101
     MAPPING: int = 102
-    TUPLE: int = 103
-    SET: int = 104
-    GENERATOR: int = 105
-    ITERATOR: int = 106
-    FROZENSET: int = 107
-    DEQUE: int = 108
+    MAPPING_PROXY: int = 103
+    TUPLE: int = 104
+    SET: int = 105
+    GENERATOR: int = 106
+    ITERATOR: int = 107
+    FROZENSET: int = 108
+    DEQUE: int = 109
 
     LARGE_ARRAY: int = 160
     LARGE_LIST: int = 161
     LARGE_MAPPING: int = 162
-    LARGE_TUPLE: int = 163
-    LARGE_SET: int = 164
-    LARGE_GENERATOR: int = 165
-    LARGE_ITERATOR: int = 166
-    LARGE_FROZENSET: int = 167
-    LARGE_DEQUE: int = 168
+    LARGE_MAPPING_PROXY: int = 163
+    LARGE_TUPLE: int = 164
+    LARGE_SET: int = 165
+    LARGE_GENERATOR: int = 166
+    LARGE_ITERATOR: int = 167
+    LARGE_FROZENSET: int = 168
+    LARGE_DEQUE: int = 169
 
     # ------------------------------------------------------------------
     # system / complex
@@ -396,5 +398,4 @@ def _build_tag_to_name() -> dict[int, str]:
     return out
 
 
-Tags.TAG_TO_NAME = _build_tag_to_name()
 Tags.TAG_TO_NAME = _build_tag_to_name()

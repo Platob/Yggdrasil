@@ -6,6 +6,7 @@ from collections.abc import Generator as AbcGenerator
 from collections.abc import Iterator as AbcIterator
 from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import ClassVar, Generic, Iterator, Mapping
 
 from yggdrasil.io import BytesIO
@@ -30,6 +31,8 @@ __all__ = [
     "LargeDequeSerialized",
     "MappingSerialized",
     "LargeMappingSerialized",
+    "MappingProxySerialized",
+    "LargeMappingProxySerialized",
     "GeneratorSerialized",
     "LargeGeneratorSerialized",
     "IteratorSerialized",
@@ -150,6 +153,8 @@ def _build_sequence_serialized(
 
 def _build_mapping_serialized(
     *,
+    tag_small: int,
+    tag_large: int,
     items: Iterator[tuple[object, object]],
     count: int,
     metadata: Mapping[bytes, bytes] | None,
@@ -158,7 +163,7 @@ def _build_mapping_serialized(
     large = _is_large_count(count)
     payload = _build_mapping_payload(items, count=count, large=large)
     return Serialized.build(
-        tag=Tags.LARGE_MAPPING if large else Tags.MAPPING,
+        tag=tag_large if large else tag_small,
         data=payload.to_bytes(),
         metadata=metadata,
         codec=codec,
@@ -288,8 +293,21 @@ class CollectionSerialized(Serialized[T], Generic[T]):
         # ------------------------------------------------------------------
         if isinstance(obj, dict):
             return _build_mapping_serialized(
+                tag_small=Tags.MAPPING,
+                tag_large=Tags.LARGE_MAPPING,
                 items=iter(obj.items()),
                 count=len(obj),
+                metadata=metadata,
+                codec=codec,
+            )
+
+        if isinstance(obj, MappingProxyType):
+            items = tuple(obj.items())
+            return _build_mapping_serialized(
+                tag_small=Tags.MAPPING_PROXY,
+                tag_large=Tags.LARGE_MAPPING_PROXY,
+                items=iter(items),
+                count=len(items),
                 metadata=metadata,
                 codec=codec,
             )
@@ -297,6 +315,8 @@ class CollectionSerialized(Serialized[T], Generic[T]):
         if isinstance(obj, AbcMapping):
             items = tuple(obj.items())
             return _build_mapping_serialized(
+                tag_small=Tags.MAPPING,
+                tag_large=Tags.LARGE_MAPPING,
                 items=iter(items),
                 count=len(items),
                 metadata=metadata,
@@ -508,12 +528,15 @@ class _BaseMappingSerialized(CollectionSerialized[dict[object, object]]):
     def entries(self) -> tuple[tuple[Serialized[object], Serialized[object]], ...]:
         return tuple(self.iter_entries())
 
-    @property
-    def value(self) -> dict[object, object]:
+    def _as_dict(self) -> dict[object, object]:
         return {
             key.as_python(): value.as_python()
             for key, value in self.iter_entries()
         }
+
+    @property
+    def value(self) -> dict[object, object]:
+        return self._as_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,6 +550,27 @@ class LargeMappingSerialized(
     LargeCollectionSerialized[dict[object, object]],
 ):
     TAG: ClassVar[int] = Tags.LARGE_MAPPING
+
+
+@dataclass(frozen=True, slots=True)
+class MappingProxySerialized(_BaseMappingSerialized):
+    TAG: ClassVar[int] = Tags.MAPPING_PROXY
+
+    @property
+    def value(self) -> MappingProxyType:
+        return MappingProxyType(self._as_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class LargeMappingProxySerialized(
+    _BaseMappingSerialized,
+    LargeCollectionSerialized[dict[object, object]],
+):
+    TAG: ClassVar[int] = Tags.LARGE_MAPPING_PROXY
+
+    @property
+    def value(self) -> MappingProxyType:
+        return MappingProxyType(self._as_dict())
 
 
 # ============================================================================
@@ -550,5 +594,6 @@ for t, cls in (
     (dict, MappingSerialized),
     (deque, DequeSerialized),
     (array, ArraySerialized),
+    (MappingProxyType, MappingProxySerialized),
 ):
     Tags.register_class(cls, pytype=t)

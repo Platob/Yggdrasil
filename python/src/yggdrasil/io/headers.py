@@ -100,6 +100,7 @@ CANONICAL_HEADER_NAMES = {
     "content-length": "Content-Length",
     "content-type": "Content-Type",
     "content-encoding": "Content-Encoding",
+    "content-disposition": "Content-Disposition",
     "cookie": "Cookie",
     "etag": "ETag",
     "host": "Host",

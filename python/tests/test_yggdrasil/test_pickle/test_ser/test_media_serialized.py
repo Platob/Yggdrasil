@@ -5,7 +5,7 @@ import pytest
 
 from yggdrasil.io.enums.codec import Codec, GZIP, ZSTD, LZ4, BROTLI
 from yggdrasil.io.enums.media_type import MediaType
-from yggdrasil.io.enums.mime_type import MimeType
+from yggdrasil.io.enums.mime_type import MimeType, MimeTypes
 from yggdrasil.pickle.ser.media import (
     CodecSerialized,
     MediaTypeSerialized,
@@ -59,7 +59,7 @@ class TestMimeTypeSerialized:
         MimeTypes.OCTET_STREAM,
         MimeTypes.GZIP,
         MimeTypes.ZSTD,
-        MimeType.PNG,
+        MimeTypes.PNG,
         MimeTypes.XML,
     ])
     def test_roundtrip(self, mt: MimeType):
