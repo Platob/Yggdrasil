@@ -50,16 +50,41 @@ The `io/` package is the primary HTTP and binary-buffer layer:
 - `environ/` — `PyEnv` for runtime module import/install, dependency metadata; also exports `runtime_import_module()` as a standalone function
 - `blake3/`, `xxhash/` — hash library wrappers following the `lib.py` guard pattern
 - `fastapi/` — optional REST API layer (entry point: `ygg-api`), with routers/services/schemas for Python, system, Databricks, and Excel execution
+- `rs.py` — Rust acceleration bridge; imports from `yggrs.<submodule>` with pure-Python fallbacks; exposes `HAS_RS` flag
 
 ## Development Setup
+
+`ygg` (the Python package) uses **setuptools** as its build backend and is
+**pure Python** — it installs everywhere without Rust.  The optional Rust
+extension is a *separate* PyPI project (`yggrs`) built with **maturin**.
+
 ```bash
 cd python
 uv venv .venv
 .venv\Scripts\activate      # Windows
 # source .venv/bin/activate  # Linux/Mac
+```
+
+**Standard dev install (no Rust required):**
+```bash
 uv pip install -e .[dev]
 ```
-Install only the extras you need: `.[polars]`, `.[databricks]`, `.[bigdata]`, `.[pickle]`, `.[api]`, `.[http]`, `.[data]`.
+
+**With Rust — also compile the native extension locally:**
+```bash
+uv pip install -e .[dev]
+cd rust
+maturin develop --release   # compiles yggrs and installs it into the venv
+cd ..
+```
+
+**Activate pre-built native wheels from PyPI:**
+```bash
+pip install ygg[native]     # installs yggrs>=<version> from PyPI
+```
+
+Install only the extras you need: `.[polars]`, `.[databricks]`, `.[bigdata]`,
+`.[pickle]`, `.[api]`, `.[http]`, `.[data]`, `.[native]`.
 
 ## Testing
 ```bash
@@ -96,7 +121,50 @@ black .                 # format
 - If neither applies, proceed with normal repository workflows and do not force skill usage.
 
 ### Optional Rust acceleration guidance
-- Rust should be introduced as an **optional fast path**, never a hard dependency for importing `yggdrasil`.
-- Start with small, measurable kernels that are expensive in Python (string transforms, metadata scans, hashing, vectorized scalar transforms).
-- Provide a Python fallback with identical behavior and tests that pass with and without the native module.
-- Place experimental native code under `python/rust/` and expose it through a thin Python wrapper module.
+
+Rust lives in `rust/` (crate name `yggrs`).  The Python bridge
+is `yggdrasil/rs.py`.  The **key invariant**: every Rust submodule name must
+match a Python package under `src/yggdrasil/`.
+
+#### Naming & layout rules
+
+| Python package          | Rust file                    | PyO3 submodule           |
+|-------------------------|------------------------------|--------------------------|
+| `yggdrasil/data/`       | `rust/src/data.rs`           | `yggdrasil.rust.data`    |
+| `yggdrasil/io/`         | `rust/src/io.rs`             | `yggdrasil.rust.io`      |
+| `yggdrasil/arrow/`      | `rust/src/arrow.rs`          | `yggdrasil.rust.arrow`   |
+| `yggdrasil/polars/`     | `rust/src/polars_.rs`        | `yggdrasil.rust.polars_` |
+
+(Append `_` to Rust file names that clash with reserved keywords, e.g. `polars`.)
+
+#### Adding a new Rust kernel — checklist
+
+1. **Pick the right submodule** — `yggrs/src/<package>.rs` where `<package>`
+   matches the Python package the kernel accelerates.  Create the file if it
+   does not exist.
+2. **Write the `#[pyfunction]`** inside the submodule.
+3. **Expose a `pub fn register()`** in the same file that calls
+   `module.add_function(...)` for every public function.
+4. **Declare the module** in `lib.rs` with `mod <package>;` and add a
+   `PyModule::new` + `register()` call inside `#[pymodule] fn yggrs(...)`.
+5. **Update the Python bridge** `yggdrasil/rs.py`:
+   - Add a `try/except` import from `yggdrasil.rust.<package>` for the new symbol.
+   - Add a pure-Python fallback with identical behaviour.
+   - Export the new symbol in `__all__`.
+6. **Write tests** in `tests/test_yggdrasil/test_rs/test_rs.py` that pass
+   both with *and without* the native wheel (the fallback must keep them green).
+7. **Never import** `yggrs` directly anywhere except `yggdrasil/rs.py` —
+   all callers go through the Python bridge.
+
+#### Invariants to maintain
+
+- Rust should be an **optional fast path**, never a hard import dependency.
+- `ygg` (the main PyPI package) uses **setuptools** — `pip install ygg`
+  works everywhere without Rust.  Native wheels are the separate `yggrs`
+  package built from `rust/` and published by `publish-native.yml`.
+- `HAS_RS` in `yggdrasil.rs` is the canonical flag for feature detection.
+- Rust source files use the *same* names as the Python packages they mirror so
+  locating the implementation is trivial for future agents.
+- Pure-Python fallbacks must be **behaviourally identical** and tested in CI
+  without a native build (the default).
+

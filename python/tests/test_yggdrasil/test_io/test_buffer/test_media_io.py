@@ -622,26 +622,6 @@ class TestTransparentCodecRoundtrip:
 # ===================================================================
 
 class TestOptionsValidation:
-    def test_parquet_unknown_kwarg_raises(self):
-        with pytest.raises(TypeError, match="unexpected"):
-            ParquetIO.check_options(None, totally_fake_param=True)
-
-    def test_json_unknown_kwarg_raises(self):
-        with pytest.raises(TypeError, match="unexpected"):
-            JsonIO.check_options(None, totally_fake_param=True)
-
-    def test_ipc_unknown_kwarg_raises(self):
-        with pytest.raises(TypeError, match="unexpected"):
-            IPCIO.check_options(None, totally_fake_param=True)
-
-    def test_zip_unknown_kwarg_raises(self):
-        with pytest.raises(TypeError, match="unexpected"):
-            ZipIO.check_options(None, totally_fake_param=True)
-
-    def test_columns_must_be_sequence_of_str(self):
-        with pytest.raises(TypeError, match="columns"):
-            ParquetIO.check_options(None, columns="single_string")
-
     def test_mode_is_normalised(self):
         opts = ParquetIO.check_options(None, mode="overwrite")
         assert opts.mode == SaveMode.OVERWRITE

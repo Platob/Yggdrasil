@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import ClassVar, Generic, Mapping
 
+from yggdrasil.pickle.ser.primitives import BytesSerialized as _PrimBytesSerialized
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
 from yggdrasil.io.url import URL
@@ -1029,9 +1030,10 @@ class ComplexNumberSerialized(LogicalSerialized[complex]):
 
 
 @dataclass(frozen=True, slots=True)
-class BytesSerialized(LogicalSerialized[bytes | bytearray | memoryview]):
+class BytesSerialized(_PrimBytesSerialized):
     """
-    Bytes payload:
+    Enhanced bytes payload: also handles bytearray and memoryview.
+
         payload = raw bytes
         metadata:
             k = b | ba | mv
@@ -1052,6 +1054,37 @@ class BytesSerialized(LogicalSerialized[bytes | bytearray | memoryview]):
             return memoryview(raw)
 
         raise ValueError(f"Invalid BYTES metadata kind: {kind!r}")
+
+    @classmethod
+    def from_python_object(
+        cls,
+        obj: object,
+        *,
+        metadata: Mapping[bytes, bytes] | None = None,
+        codec: int | None = None,
+    ) -> "Serialized[object] | None":
+        if isinstance(obj, memoryview):
+            return Serialized.build(
+                tag=Tags.BYTES,
+                data=obj.tobytes(),
+                metadata=_metadata_merge(metadata, {M_KIND: K_MEMORYVIEW}),
+                codec=codec,
+            )
+        if isinstance(obj, bytearray):
+            return Serialized.build(
+                tag=Tags.BYTES,
+                data=bytes(obj),
+                metadata=_metadata_merge(metadata, {M_KIND: K_BYTEARRAY}),
+                codec=codec,
+            )
+        if isinstance(obj, bytes):
+            return Serialized.build(
+                tag=Tags.BYTES,
+                data=obj,
+                metadata=_metadata_merge(metadata, {M_KIND: K_BYTES}),
+                codec=codec,
+            )
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1259,6 +1292,11 @@ class URLSerialized(LogicalSerialized[str]):
 for cls in LogicalSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
 
+# BytesSerialized extends primitives.BytesSerialized (not LogicalSerialized), so
+# it is not in LogicalSerialized.__subclasses__(); register it explicitly so that
+# Tags.CLASSES[BYTES] is always the richer logicals version.
+Tags.register_class(BytesSerialized, tag=Tags.BYTES)
+
 for t, cls in (
     (date, DateSerialized),
     (datetime, DatetimeSerialized),
@@ -1267,9 +1305,6 @@ for t, cls in (
     (Decimal, DecimalSerialized),
     (uuid.UUID, UUIDSerialized),
     (complex, ComplexNumberSerialized),
-    (bytes, BytesSerialized),
-    (bytearray, BytesSerialized),
-    (memoryview, BytesSerialized),
     (Path, PathSerialized),
     (URL, URLSerialized),
     (ipaddress.IPv4Address, IPAddressSerialized),
@@ -1281,6 +1316,11 @@ for t, cls in (
     (timezone, TimezoneSerialized),
 ):
     Tags.register_class(cls, pytype=t)
+
+# Force bytes/bytearray/memoryview to the richer logicals version (overrides
+# the simpler primitives.BytesSerialized that primitives.py may have registered).
+for _bytes_type in (bytes, bytearray, memoryview):
+    Tags.TYPES[_bytes_type] = BytesSerialized
 
 if ZoneInfo is not None:
     Tags.register_class(TimezoneSerialized, pytype=ZoneInfo)

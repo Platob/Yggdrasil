@@ -100,6 +100,6 @@ mypy
 4. Submit a PR describing the change and any new examples added to the docs.
 
 ## Experimental native acceleration
-For hot paths, an optional Rust extension scaffold lives in [`rust/`](rust/README.md).
-Use `yggdrasil.rust_accel` to access the fast path with a built-in Python fallback so
+For hot paths, an optional Rust extension scaffold lives in [`rust/`](../rust/README.md).
+Use `yggdrasil.rs` to access the fast path with a built-in Python fallback so
 base installs remain pure-Python compatible.

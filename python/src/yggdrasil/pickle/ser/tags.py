@@ -32,6 +32,7 @@ class Tags:
 
     CLASSES: ClassVar[dict[int, type["Serialized[object]"]]] = {}
     TYPES: ClassVar[dict[type, type["Serialized[object]"]]] = {}
+    _IMPORTED_CATEGORIES: ClassVar[set[int]] = set()
 
     TAG_TO_NAME: ClassVar[dict[int, str]]
 
@@ -284,9 +285,23 @@ class Tags:
         """
         Import serializer modules lazily by tag category.
 
-        This keeps import graphs lighter and reduces circular import drama.
+        Idempotent: a class-level set tracks which category IDs have already
+        been imported so that repeated calls (e.g., on every TYPES cache miss)
+        pay only a single ``set.__contains__`` check rather than re-entering
+        the import machinery each time.
+
+        Parameters
+        ----------
+        tag:
+            Any integer tag whose category should be imported.  The category
+            is derived as ``tag // CATEGORY_SIZE`` (e.g., tag 101 → cid 1 →
+            collections).  Callers may also pass a category base directly
+            (``cid * CATEGORY_SIZE``); both forms are equivalent.
         """
         cid = cls._category_id(tag)
+
+        if cid in cls._IMPORTED_CATEGORIES:
+            return
 
         if cid == 0:
             from yggdrasil.pickle.ser.primitives import PrimitiveSerialized  # noqa: F401
@@ -309,6 +324,8 @@ class Tags:
             from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
         elif cid == 7:
             from yggdrasil.pickle.ser.pyspark import PySparkSerialized  # noqa: F401
+
+        cls._IMPORTED_CATEGORIES.add(cid)
 
     # ------------------------------------------------------------------
     # class resolution
@@ -342,15 +359,20 @@ class Tags:
             direct TYPES lookup
 
         Slow path:
-            force-load known categories, then retry
+            force-load all core categories, then retry.
+            This is safe because Python's import machinery is idempotent —
+            already-imported modules are served from sys.modules instantly.
+            The old guard ``if not cls.TYPES`` was broken: if collections.py
+            was imported first it populated TYPES with 8 entries, so the guard
+            was never triggered and primitives (including NoneType) were never
+            registered, causing None to fall through to PickleSerialized.
         """
         existing = cls.TYPES.get(pytype)
         if existing is not None:
             return existing
 
-        if not cls.TYPES:
-            for cid in (0, 1, 2, 4):
-                cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
+        for cid in (0, 1, 2, 4):
+            cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
 
         return cls.TYPES.get(pytype)
 

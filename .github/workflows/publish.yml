@@ -1,38 +1,37 @@
 # ============================================================================
-# publish-pypi.yml
+# publish.yml
 #
-# Publishes the `ygg` Python package to PyPI with smart change detection:
-#
-#   • Path filter  – only runs when python/ sources actually change
-#   • Version gate – skips if pyproject.toml version is already on PyPI
-#   • Tag shortcut – vX.Y.Z tags bypass the branch path filter
-#   • Force flag   – manual dispatch can override the version gate
+# Builds and publishes the `ygg` pure-Python package to PyPI.
+# Versioned from the single source of truth: python/pyproject.toml.
 #
 # Jobs
 # ----
-#   detect  → reads version, queries PyPI, decides whether to publish
-#   build   → builds sdist + wheel (gated on detect)
-#   publish → uploads to PyPI via OIDC trusted publishing (gated on build)
-#   tag     → creates a vX.Y.Z git tag + GitHub Release after a successful publish
-#   skip    → posts a clear summary when publish is intentionally skipped
+#   detect         → reads version, checks ygg on PyPI, decides
+#   build-python   → sdist + pure-Python wheel (uv / setuptools)
+#   publish-python → uploads ygg dist to PyPI
+#   tag            → creates vX.Y.Z git tag + GitHub Release
+#   skip           → summary when publish is intentionally skipped
+#
+# PyPI setup required
+# -------------------
+# environment "pypi" with trusted publisher OR secret PYPI_API_TOKEN.
+# Set repo variable PYPI_TRUSTED_PUBLISHING = 'true' to opt into OIDC;
+# otherwise the token-based fallback is used automatically.
 # ============================================================================
 
-name: 🐸 Publish to PyPI
+name: 🚀 Publish ygg
 
 on:
   push:
     branches:
       - main
     paths:
-      # Python package source & metadata
       - "python/src/**"
       - "python/pyproject.toml"
       - "python/README.md"
       - "python/LICENSE"
-      # Workflow itself
-      - ".github/workflows/publish-pypi.yml"
+      - ".github/workflows/publish.yml"
     tags:
-      # vX.Y.Z tags always trigger (path filter does not apply to tags)
       - "v[0-9]+.[0-9]+.[0-9]+"
 
   workflow_dispatch:
@@ -46,19 +45,17 @@ on:
           - "false"
           - "true"
 
-# Serialise publishes so we never race
 concurrency:
-  group: publish-pypi
+  group: publish
   cancel-in-progress: false
 
-# Minimal default permissions; publish job broadens id-token for OIDC
 permissions:
   contents: read
 
 jobs:
 
   # --------------------------------------------------------------------------
-  # detect — read the version from pyproject.toml, check PyPI, decide.
+  # detect — version gate
   # --------------------------------------------------------------------------
   detect:
     name: Detect version & decide
@@ -66,7 +63,6 @@ jobs:
 
     outputs:
       version:        ${{ steps.meta.outputs.version }}
-      already_on_pypi: ${{ steps.pypi.outputs.exists }}
       should_publish: ${{ steps.decision.outputs.should_publish }}
 
     steps:
@@ -75,8 +71,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Read version string from pyproject.toml (no extra dependencies needed)
-      - name: Extract version
+      - name: Extract version from python/pyproject.toml
         id: meta
         run: |
           VERSION=$(python3 - <<'PY'
@@ -87,27 +82,24 @@ jobs:
           PY
           )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "📦 Package version: $VERSION"
+          echo "📦 Version: $VERSION"
 
-      # Query PyPI JSON API – 200 means the exact version already exists
-      - name: Check version against PyPI
+      - name: Check ygg on PyPI
         id: pypi
         env:
-          PKG: ygg
           VER: ${{ steps.meta.outputs.version }}
         run: |
           STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-            "https://pypi.org/pypi/${PKG}/${VER}/json" || echo "000")
+            "https://pypi.org/pypi/ygg/${VER}/json" || echo "000")
           if [ "$STATUS" = "200" ]; then
             echo "exists=true"  >> "$GITHUB_OUTPUT"
-            echo "⚠️  v${VER} is already on PyPI."
+            echo "⚠️  ygg v${VER} is already on PyPI."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "✅ v${VER} is not on PyPI yet."
+            echo "✅ ygg v${VER} is not on PyPI yet."
           fi
 
-      # Publish when: version is new  OR  caller forced it  OR  it's a tag push
-      - name: Decide whether to publish
+      - name: Decide
         id: decision
         env:
           EXISTS: ${{ steps.pypi.outputs.exists }}
@@ -116,17 +108,17 @@ jobs:
         run: |
           if [ "$EXISTS" = "false" ] || [ "$FORCE" = "true" ] || [ "$IS_TAG" = "true" ]; then
             echo "should_publish=true"  >> "$GITHUB_OUTPUT"
-            echo "🚀 Will publish v${{ steps.meta.outputs.version }}."
+            echo "🚀 Will publish ygg v${{ steps.meta.outputs.version }}."
           else
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             echo "⏭️  Skipping – version already on PyPI and force=false."
           fi
 
   # --------------------------------------------------------------------------
-  # build — build sdist + wheel; upload as a workflow artifact.
+  # build-python — pure-Python sdist + wheel
   # --------------------------------------------------------------------------
-  build:
-    name: Build distribution
+  build-python:
+    name: Build ygg (pure Python)
     runs-on: ubuntu-latest
     needs: detect
     if: needs.detect.outputs.should_publish == 'true'
@@ -155,27 +147,25 @@ jobs:
       - name: Verify dist contents
         run: ls -lh dist/
 
-      - name: Upload dist artifacts
+      - name: Upload python dist artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ needs.detect.outputs.version }}
+          name: python-dist-${{ needs.detect.outputs.version }}
           path: python/dist/
           retention-days: 7
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # publish — push to PyPI.
-  #   Primary:  OIDC trusted publishing (no token required, set up once on PyPI)
-  #   Fallback: UV_PUBLISH_TOKEN secret (backwards compatible)
+  # publish-python — upload ygg to PyPI
   # --------------------------------------------------------------------------
-  publish:
-    name: Publish to PyPI
+  publish-python:
+    name: Publish ygg to PyPI
     runs-on: ubuntu-latest
-    needs: [detect, build]
+    needs: [detect, build-python]
     if: needs.detect.outputs.should_publish == 'true'
 
     permissions:
-      id-token: write   # required for OIDC trusted publishing
+      id-token: write
       contents: read
 
     environment:
@@ -183,13 +173,12 @@ jobs:
       url: https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/
 
     steps:
-      - name: Download dist artifacts
+      - name: Download python dist artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist-${{ needs.detect.outputs.version }}
+          name: python-dist-${{ needs.detect.outputs.version }}
           path: dist/
 
-      # Preferred: OIDC trusted publishing (no API token in repo secrets)
       - name: Publish via trusted publishing (OIDC)
         if: vars.PYPI_TRUSTED_PUBLISHING == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -198,7 +187,6 @@ jobs:
           print-hash: true
           verbose: true
 
-      # Fallback: classic API token stored in PYPI_API_TOKEN secret
       - name: Install uv (for token-based fallback)
         if: vars.PYPI_TRUSTED_PUBLISHING != 'true'
         uses: astral-sh/setup-uv@v4
@@ -217,27 +205,18 @@ jobs:
             echo "## ✅ Published \`ygg\` v${{ needs.detect.outputs.version }}"
             echo ""
             echo "🔗 https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/"
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Version | \`${{ needs.detect.outputs.version }}\` |"
-            echo "| Triggered by | \`${{ github.event_name }}\` |"
-            echo "| Ref | \`${{ github.ref }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
-  # tag — create a vX.Y.Z git tag + GitHub Release for the published version.
-  #   Runs only after a successful publish and only when the push was NOT
-  #   already triggered by a tag (avoids creating a tag that already exists).
-  #   The release includes auto-generated notes and the built dist artifacts.
+  # tag — git tag + GitHub Release containing ygg dist files
   # --------------------------------------------------------------------------
   tag:
     name: Tag & Release
     runs-on: ubuntu-latest
-    needs: [detect, publish]
+    needs: [detect, publish-python]
     if: >-
       needs.detect.outputs.should_publish == 'true'
+      && needs.publish-python.result == 'success'
       && !startsWith(github.ref, 'refs/tags/v')
 
     permissions:
@@ -264,19 +243,22 @@ jobs:
             echo "🏷️  Created and pushed tag $TAG"
           fi
 
-      - name: Download dist artifacts
+      - name: Download python dist artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist-${{ needs.detect.outputs.version }}
-          path: dist/
+          name: python-dist-${{ needs.detect.outputs.version }}
+          path: release/
+
+      - name: List release assets
+        run: ls -lh release/
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.detect.outputs.version }}
+          VERSION:  ${{ needs.detect.outputs.version }}
         run: |
           TAG="v${VERSION}"
-          gh release create "$TAG" dist/* \
+          gh release create "$TAG" release/* \
             --title "Release ${TAG}" \
             --generate-notes \
             --verify-tag
@@ -293,12 +275,12 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Tag | \`v${VERSION}\` |"
-            echo "| PyPI | https://pypi.org/project/ygg/${VERSION}/ |"
+            echo "| PyPI (\`ygg\`) | https://pypi.org/project/ygg/${VERSION}/ |"
             echo "| Commit | \`${{ github.sha }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
-  # skip-summary — clear explanation when the publish was skipped
+  # skip-summary — posted when nothing needs to be published
   # --------------------------------------------------------------------------
   skip-summary:
     name: Skip summary
@@ -308,13 +290,14 @@ jobs:
 
     steps:
       - name: Write skip summary
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
         run: |
           {
-            echo "## ⏭️ Publish skipped"
+            echo "## ⏭️ Skipped — nothing to publish"
             echo ""
-            echo "Version **\`${{ needs.detect.outputs.version }}\`** is already"
-            echo "published on PyPI."
+            echo "\`ygg\` v${VERSION} is already on PyPI."
             echo ""
-            echo "To publish anyway, re-run this workflow with **force_publish = true**,"
-            echo "or push a version bump to \`python/pyproject.toml\`."
+            echo "Re-run with **force_publish = true** to override."
           } >> "$GITHUB_STEP_SUMMARY"
+

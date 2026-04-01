@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import urllib3
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
-from yggdrasil.io import BytesIO, MediaType, MimeType
+from yggdrasil.io import BytesIO, MediaType, MimeTypes
 from .response import HTTPResponse
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session
+
+if TYPE_CHECKING:
+    from .browser import BrowserHTTPSession
 
 __all__ = ["HTTPSession"]
 
@@ -62,6 +65,58 @@ class HTTPSession(Session):
                     self._http_pool = self._build_http_pool()
         return self._http_pool
 
+    # ------------------------------------------------------------------
+    # Extensibility hooks
+    # ------------------------------------------------------------------
+
+    def _build_request_headers(
+        self,
+        request: PreparedRequest,
+    ) -> Optional[dict[str, str]]:
+        """Return the headers dict to merge into *request* before sending.
+
+        Subclasses may override this to inject per-request headers without
+        replacing the entire :attr:`send_headers` mapping.  The default
+        implementation returns :attr:`send_headers` unchanged.
+        """
+        return self.send_headers
+
+    def to_browser(
+        self,
+        *,
+        user_agent: Optional[str] = None,
+        accept_language: str = "en-US,en;q=0.9",
+        ua_seed: Optional[int] = None,
+    ) -> "BrowserHTTPSession":
+        """Return a :class:`~yggdrasil.io.http_.browser.BrowserHTTPSession`
+        that inherits this session's connection settings.
+
+        Parameters
+        ----------
+        user_agent:
+            Explicit ``User-Agent`` string.  ``None`` (default) = auto-generate.
+        accept_language:
+            ``Accept-Language`` header value for browser requests.
+        ua_seed:
+            Optional integer seed for deterministic user-agent generation.
+
+        Returns
+        -------
+        BrowserHTTPSession
+        """
+        from .browser import BrowserHTTPSession
+
+        return BrowserHTTPSession(
+            base_url=self.base_url,
+            verify=self.verify,
+            pool_maxsize=self.pool_maxsize,
+            send_headers=dict(self.send_headers) if self.send_headers else None,
+            waiting=self.waiting,
+            user_agent=user_agent,
+            accept_language=accept_language,
+            ua_seed=ua_seed,
+        )
+
     def _local_send(
         self,
         request: PreparedRequest,
@@ -71,7 +126,7 @@ class HTTPSession(Session):
 
         request = request.prepare_to_send(
             sent_at=None,
-            headers=self.send_headers,
+            headers=self._build_request_headers(request),
         )
 
         raw_resp = self.http_pool.request(

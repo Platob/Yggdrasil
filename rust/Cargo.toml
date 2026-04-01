@@ -1,0 +1,13 @@
+[package]
+name = "yggrs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "yggrs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py310: build a single stable-ABI wheel that works on Python 3.10+.
+# This means one wheel per OS/arch instead of one per Python version.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }

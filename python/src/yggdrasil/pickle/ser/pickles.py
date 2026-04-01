@@ -181,6 +181,13 @@ class GenericObjectSerialized(Serialized[Any]):
         if not module_name or not qualname or "<locals>" in qualname:
             return None
 
+        # Typing constructs (TypeVar, ParamSpec, TypeVarTuple, …) use __reduce__
+        # for pickling and their C-level __new__ requires positional arguments
+        # that are not exposed via __getnewargs__/__getnewargs_ex__.  Let them
+        # fall through to PickleSerialized which calls pickle.dumps directly.
+        if module_name in ("typing", "typing_extensions"):
+            return None
+
         try:
             new_args: tuple[object, ...] = ()
             new_kwargs: dict[str, object] = {}

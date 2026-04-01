@@ -180,7 +180,10 @@ def _normalize_components(
     scheme_n = _lower_if(scheme)
     host_n = _strip_trailing_dot(_lower_if(host))
     port_n = _remove_default_port(scheme_n, host_n, port)
-    path_n = _normalize_path(path, os_find=scheme in (None, "", "file"))
+    # Only resolve local filesystem paths for explicit file:// URLs.
+    # An empty scheme means a schemaless HTTP-like URL (e.g. "example.com/path"),
+    # NOT a local path — calling os.path.realpath() on those would corrupt them.
+    path_n = _normalize_path(path, os_find=scheme_n == "file")
     query_n = _normalize_query(query)
     fragment_n = fragment.lstrip("#")
 
@@ -254,12 +257,23 @@ class URL:
         split = urlsplit(raw)
         userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
 
-        scheme = default_scheme or split.scheme
+        scheme = split.scheme
+
+        # A single-letter "scheme" is a Windows drive letter (e.g. C:/path).
+        # Treat it as no scheme and let the caller's default_scheme take over.
+        if scheme and len(scheme) == 1 and scheme.isalpha():
+            scheme = ""
+
+        scheme = default_scheme or scheme
+
         path = _decode_maybe(split.path, decode)
         query = _decode_maybe(split.query, decode)
         fragment = _decode_maybe(split.fragment, decode)
 
-        if scheme not in ("file", None) and not host and path:
+        # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
+        # but NOT for schemaless strings — those would incorrectly extract the
+        # first path segment as the host.
+        if scheme and scheme not in ("file",) and not host and path:
             if "/" in path:
                 host, path = path.split("/", 1)
                 path = "/" + path.lstrip("/")

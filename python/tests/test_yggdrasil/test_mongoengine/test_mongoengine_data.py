@@ -2,7 +2,9 @@ import os
 from unittest import TestCase
 
 import pandas as pd
-from mongoengine import connect, Document, StringField, FloatField, DateTimeField
+from mongoengine import Document, StringField, FloatField, DateTimeField
+
+from yggdrasil.mongoengine import with_mongo_connection, connect
 
 
 class Plants(Document):
@@ -34,43 +36,41 @@ class Plants(Document):
         ],
     }
 
+def resolver():
+    return connect(
+        alias="GenCast",
+        db="GenCast",
+        host=os.environ["MONGODB_URI"]
+    )
+
+@with_mongo_connection(
+    aliases=["GenCast"],
+    databricks="https://dbc-82edd6f4-1e97.cloud.databricks.com/",
+    resolver=resolver
+)
+def get_plant_data():
+    pipeline = [
+        {"$sort": {"as_of": -1}},
+        {"$group": {
+            "_id": {
+                "plant_name": "$plant_name",
+                "plant_type": "$plant_type",
+                "plant_subtype": "$plant_subtype",
+                "country": "$country",
+            },
+            "latest_update": {"$first": "$$ROOT"},
+        }},
+        {"$replaceRoot": {"newRoot": "$latest_update"}},
+    ]
+
+    result = Plants.objects().aggregate(*pipeline)
+    data = pd.DataFrame(result)
+    data["_id"] = data.index
+    return data
+
 
 class MongoCase(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        mongo_uri = os.environ["MONGODB_URI"]
-        cls.client = connect(
-            db="GenCast",
-            alias="GenCast",
-            host=mongo_uri,
-            serverSelectionTimeoutMS=10000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=30000,
-            retryWrites=True,
-            retryReads=True,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.client is not None:
-            cls.client.close()
 
     def test_plants(self):
-        pipeline = [
-            {"$sort": {"as_of": -1}},
-            {"$group": {
-                "_id": {
-                    "plant_name": "$plant_name",
-                    "plant_type": "$plant_type",
-                    "plant_subtype": "$plant_subtype",
-                    "country": "$country",
-                },
-                "latest_update": {"$first": "$$ROOT"},
-            }},
-            {"$replaceRoot": {"newRoot": "$latest_update"}},
-        ]
-
-        result = Plants.objects().aggregate(*pipeline)
-        data = pd.DataFrame(result)
-        data["_id"] = data.index
+        data = get_plant_data()
         assert not data.empty

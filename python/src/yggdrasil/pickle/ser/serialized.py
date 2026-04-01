@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from abc import ABC
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -105,9 +106,9 @@ class Serialized(ABC, Generic[T]):
         pickling.
         """
         try:
-            return (_restore_serialized_from_wire, (self.write_to().to_bytes(),))
+            return _restore_serialized_from_wire, (self.write_to().to_bytes(),)
         except Exception:
-            return (self.__class__, (self.head, self.data))
+            return self.__class__, (self.head, self.data)
 
     @staticmethod
     def module_and_name(obj: Any, *, fallback: str = "") -> tuple[str, str]:
@@ -209,11 +210,7 @@ class Serialized(ABC, Generic[T]):
                 if result is not None:
                     return result
 
-        # isinstance-based routing for logging objects whose concrete type may
-        # be a third-party subclass (e.g. pip's VerboseLogger) that is not
-        # registered in TYPES and whose __module__ is not "logging".
-        import logging as _logging
-        if isinstance(obj, (_logging.Logger, _logging.Handler, _logging.Formatter, _logging.LogRecord)):
+        if isinstance(obj, (logging.Logger, logging.Handler, logging.Formatter, logging.LogRecord)):
             from yggdrasil.pickle.ser.logging import LoggingSerialized as _LoggingSerialized
             out = _LoggingSerialized.from_python_object(obj, metadata=metadata, codec=codec)
             if out is not None:

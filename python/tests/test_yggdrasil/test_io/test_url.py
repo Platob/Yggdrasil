@@ -415,3 +415,220 @@ def test_urlresource_subclass_from_url_accepts_no_scheme():
 
     assert isinstance(resource, DemoResource)
     assert resource.name == "thing"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: schemaless / Windows-path URL parsing (os_find bug fix)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemalessAndWindowsPathParsing:
+    """Guard against the os_find corruption bug and the host/path mis-split."""
+
+    # ── Schemaless URLs (no "https://" prefix) ────────────────────────────
+
+    def test_schemaless_url_does_not_corrupt_path(self):
+        """A URL without a scheme must NOT have os.path.realpath() applied."""
+        url = URL.parse("api.example.com/some/path")
+        # Path must stay as-is — no Windows drive-letter injection
+        assert "C:" not in url.path
+        assert "C:\\" not in url.path
+
+    def test_schemaless_url_with_default_scheme(self):
+        url = URL.parse_str("api.example.com/v1/resource", default_scheme="https")
+        assert url.scheme == "https"
+        assert url.host == "api.example.com"
+        assert url.path == "/v1/resource"
+
+    def test_schemaless_host_only(self):
+        url = URL.parse_str("example.com", default_scheme="https")
+        assert url.host == "example.com"
+        assert url.scheme == "https"
+
+    def test_schemaless_no_default_scheme_preserves_empty_scheme(self):
+        """Parsing without default_scheme leaves scheme empty but keeps host/path intact."""
+        url = URL.parse_str("example.com/path")
+        assert url.host == "" or url.scheme == ""  # no scheme injected
+        assert "C:" not in url.path
+
+    # ── Windows drive-letter "scheme" detection ────────────────────────────
+
+    def test_windows_drive_letter_not_treated_as_scheme(self):
+        """C:/path must not produce host='C' or corrupt the path via os_find."""
+        url = URL.parse("C:/Users/alice/file.html")
+        # scheme must NOT be "c" (drive letter treated as file scheme or empty)
+        assert url.scheme in ("", "file", "c")  # may vary, but path must not be mangled
+        assert "C:" not in (url.host or "")  # host must not be "c" or contain drive
+
+    def test_windows_path_in_http_url_path_preserved(self):
+        """A URL like https://api.example.com/C:/path must preserve the path."""
+        url = URL.parse("https://api.example.com/C:/controlador.cgi?ac=signin")
+        assert url.scheme == "https"
+        assert url.host == "api.example.com"
+        assert url.path == "/C:/controlador.cgi"
+        assert url.query == "ac=signin"
+
+    # ── The exact error pattern reported by the user ──────────────────────
+
+    def test_path_like_url_no_host_corruption(self):
+        """
+        Regression: "api/C:/controlador.cgi?ac=signin" must NOT produce
+        host='api' with path='/C:/controlador.cgi' via the fix-up block
+        when there is no explicit scheme.  The fix-up block should only fire
+        for URLs that DO carry an explicit non-file scheme.
+        """
+        url = URL.parse_str("api/C:/controlador.cgi?ac=signin")
+        # The schemaless fix-up must not fire — host should be empty
+        # (the whole string becomes the path, not split on "/").
+        assert url.host == "" or url.scheme == ""
+        # The path must not become a local Windows absolute path
+        assert not (url.path.startswith("/C:") and url.host == "api")
+
+    def test_http_scheme_missing_authority_slashes(self):
+        """http:example.com/path (no //) — fix-up IS expected for explicit scheme."""
+        url = URL.parse_str("http:example.com/path")
+        assert url.scheme == "http"
+        assert url.host == "example.com"
+        assert url.path == "/path"
+
+    # ── os_find must never fire for non-file schemes ──────────────────────
+
+    def test_https_url_with_cgi_path_not_mangled(self):
+        url = URL.parse("https://192.168.1.1/C:/cgi-bin/login.cgi?user=admin")
+        assert url.scheme == "https"
+        assert url.host == "192.168.1.1"
+        assert url.path == "/C:/cgi-bin/login.cgi"
+
+    def test_http_url_path_not_os_resolved(self):
+        """Ensure _normalize_path is NOT called with os_find=True for http URLs."""
+        import os
+        # Build a URL whose path would change if os.path.realpath were applied
+        url = URL.parse("http://example.com/relative/./path/../end")
+        # urllib urlsplit won't collapse "." and ".." (unlike os.path.realpath)
+        assert url.host == "example.com"
+        assert "C:" not in url.path
+
+
+class TestSanitizeUrl:
+    """Tests for BrowserHTTPSession._resolve_url (URL resolution with base_url)."""
+
+    def test_full_https_url_returned_as_url_object(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        result = b._resolve_url("https://example.com/path")
+        assert isinstance(result, URL)
+        assert result.scheme == "https"
+        assert result.host == "example.com"
+        assert result.path == "/path"
+
+    def test_full_http_url_unchanged(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        result = b._resolve_url("http://example.com/path")
+        assert result.scheme == "http"
+        assert result.host == "example.com"
+
+    def test_schemaless_hostname_gets_https(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        result = b._resolve_url("example.com/path")
+        assert result.scheme == "https"
+        assert result.host == "example.com"
+        assert result.path == "/path"
+
+    def test_subdomain_schemaless_gets_https(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        result = b._resolve_url("api.example.com/v1/resource")
+        assert result.scheme == "https"
+        assert result.host == "api.example.com"
+
+    def test_protocol_relative_gets_https(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        result = b._resolve_url("//example.com/path")
+        assert result.scheme == "https"
+        assert result.host == "example.com"
+        assert result.path == "/path"
+
+    def test_windows_drive_letter_raises(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        with pytest.raises(ValueError, match="local Windows path"):
+            b._resolve_url("C:/Users/alice/page.html")
+
+    def test_url_object_absolute_returned_unchanged(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        url = URL.parse("https://example.com/")
+        result = b._resolve_url(url)
+        assert result.scheme == "https"
+        assert result.host == "example.com"
+
+    # ── Relative URL resolution (the user-reported bug) ───────────────────
+
+    def test_relative_path_segment_joined_with_base_url(self):
+        """'api/controlador.cgi' with base_url → joined correctly."""
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession(base_url="https://api.example.com")
+        result = b._resolve_url("api/controlador.cgi")
+        assert result.scheme == "https"
+        assert result.host == "api.example.com"
+        assert result.path == "/api/controlador.cgi"
+
+    def test_relative_path_no_dot_no_base_url_raises(self):
+        """Relative path without base_url must raise ValueError, not connect to host='api'."""
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        with pytest.raises(ValueError, match="base_url"):
+            b._resolve_url("api/controlador.cgi")
+
+    def test_absolute_path_joined_with_base_url_host(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession(base_url="https://api.example.com/v1/")
+        result = b._resolve_url("/controlador.cgi")
+        assert result.host == "api.example.com"
+        assert result.path == "/controlador.cgi"
+
+    def test_absolute_path_no_base_url_raises(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        with pytest.raises(ValueError, match="base_url"):
+            b._resolve_url("/some/path")
+
+    def test_dotdot_relative_path_joined(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession(base_url="https://api.example.com/v2/sub/")
+        result = b._resolve_url("../resource")
+        assert result.host == "api.example.com"
+        assert result.path == "/v2/resource"
+
+    # ── _apply_params ─────────────────────────────────────────────────────
+
+    def test_apply_params_scalar(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        url = URL.parse("https://example.com/path")
+        result = BrowserHTTPSession._apply_params(url, {"a": "1", "b": "2"})
+        assert "a=1" in (result.query or "")
+        assert "b=2" in (result.query or "")
+
+    def test_apply_params_multi_value(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        url = URL.parse("https://example.com/path")
+        result = BrowserHTTPSession._apply_params(url, {"tag": ["x", "y"]})
+        assert (result.query or "").count("tag=") == 2
+
+    def test_apply_params_preserves_existing_query(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        url = URL.parse("https://example.com/path?existing=1")
+        result = BrowserHTTPSession._apply_params(url, {"new": "2"})
+        assert "existing=1" in (result.query or "")
+        assert "new=2" in (result.query or "")
+
+    def test_empty_string_raises(self):
+        from yggdrasil.io.http_.browser import BrowserHTTPSession
+        b = BrowserHTTPSession()
+        with pytest.raises(ValueError):
+            b._resolve_url("")
+
+

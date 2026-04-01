@@ -1,11 +1,13 @@
 [build-system]
-# bump setuptools so type-info files are handled sanely
+# Pure-Python package — installs everywhere without Rust.
+# The optional Rust extension is published separately as `yggrs` (see rust/).
+# Install with `pip install ygg[native]` to pull in the pre-built extension.
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.5.40"
+version = "0.6.0"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -38,8 +40,14 @@ dev = [
   "black",
   "ruff",
   "mypy",
-  "build",
+  "maturin>=1.7",
   "twine",
+]
+
+# Optional Rust acceleration: installs the pre-built yggrs native extension.
+# yggdrasil/rs.py falls back to pure Python when yggrs is absent.
+native = [
+  "yggrs>=0.5.40",
 ]
 
 http = [
@@ -87,6 +95,7 @@ Documentation = "https://github.com/Platob/Yggdrasil"
 [project.scripts]
 ygg-api = "yggdrasil.fastapi.main:main"
 
+# ── setuptools ────────────────────────────────────────────────────────────────
 [tool.setuptools]
 package-dir = { "" = "src" }
 license-files = ["LICENSE"]
