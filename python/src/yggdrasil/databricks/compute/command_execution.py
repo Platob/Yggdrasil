@@ -774,59 +774,119 @@ print(remote_libs, flush=True)
         editable: bool = False,
         quiet: bool = True,
     ) -> list[tuple[str, str]]:
-        pkgs = [str(p).strip() for p in packages if str(p).strip()]
+        import re
+
+        # Safe to skip on most Databricks runtimes
+        BLACKLIST_EXACT = {
+            "pyspark",
+            "pandas",
+            "numpy",
+            "pyarrow",
+            "scikit-learn",
+            "sklearn",
+        }
+
+        # Only skip if you KNOW your Databricks image/runtime already has them
+        BLACKLIST_OPTIONAL = {
+            "polars",
+            "fastapi",
+            "daft",
+            "mlflow",
+            "xgboost",
+            "torch",
+            "tensorflow",
+            "transformers",
+        }
+
+        BLACKLIST = BLACKLIST_EXACT | BLACKLIST_OPTIONAL  # trim if needed
+
+        def normalize_pkg_name(spec: str) -> str:
+            spec = str(spec).strip().lower()
+            m = re.match(r"^[a-z0-9_.-]+", spec)
+            return m.group(0) if m else ""
+
+        pkgs = [
+            pkg
+            for raw in packages
+            if (pkg := str(raw).strip())
+               and normalize_pkg_name(pkg) not in BLACKLIST
+        ]
+
         if not pkgs:
             return []
 
         remote_libs = self.context.remote_metadata.libs_path.rstrip("/")
 
         bootstrap = f"""
-import json
 import os
-import shlex
-import subprocess
 import sys
+import importlib
 
 remote_libs = os.path.expanduser({remote_libs!r})
 packages = {pkgs!r}
 
+# Filter out packages that can already be imported
+def is_importable(pkg_name: str) -> bool:
+    try:
+        importlib.import_module(pkg_name)
+        return True
+    except ImportError:
+        return False
+
+packages_to_install = [p for p in packages if not is_importable(p)]
+
+# Check Python executable
+if not sys.executable or not os.path.isfile(sys.executable):
+    raise RuntimeError(f"Invalid Python executable: {{sys.executable}}")
+
+# Check target directory
+if not os.access(os.path.dirname(remote_libs) or ".", os.W_OK):
+    raise RuntimeError(f"Cannot write to target directory: {{remote_libs}}")
+
 os.makedirs(remote_libs, exist_ok=True)
 
-cmd = [
-    sys.executable,
-    "-m",
-    "pip",
-    "install",
-    *packages,
-    "--target",
-    remote_libs,
-    "--disable-pip-version-check",
-    "--no-input",
-]
+import subprocess
+import shlex
+import json
 
-if {upgrade!r}:
-    cmd.append("--upgrade")
-if {editable!r}:
-    cmd.append("--editable")
-if {quiet!r}:
-    cmd.append("--quiet")
+# --- Install missing packages if any ---
+if packages_to_install:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        *packages_to_install,
+        "--target",
+        remote_libs,
+        "--disable-pip-version-check",
+        "--no-input",
+    ]
 
-proc = subprocess.run(
-    cmd,
-    text=True,
-    capture_output=True,
-)
+    if {upgrade!r}:
+        cmd.append("--upgrade")
+    if {editable!r}:
+        cmd.append("--editable")
+    if {quiet!r}:
+        cmd.append("--quiet")
 
-if proc.stdout:
-    print(proc.stdout, end="" if proc.stdout.endswith("\\n") else "\\n")
-if proc.returncode != 0:
-    raise RuntimeError(
-        "Remote pip install failed\\n"
-        f"command: {{shlex.join(cmd)}}\\n"
-        f"stdout:\\n{{proc.stdout}}\\n"
-        f"stderr:\\n{{proc.stderr}}"
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
     )
 
+    if proc.stdout:
+        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Remote pip install failed\n"
+            f"command: {{shlex.join(cmd)}}\n"
+            f"stdout:\n{{proc.stdout}}\n"
+            f"stderr:\n{{proc.stderr}}"
+        )
+
+# --- List installed packages ---
 list_cmd = [
     sys.executable,
     "-m",
@@ -844,6 +904,8 @@ listed = subprocess.run(
     capture_output=True,
     check=True,
 )
+
+parsed_list = json.loads(listed.stdout)
 
 print("__CALL_RESULT__" + listed.stdout, flush=True)
 """

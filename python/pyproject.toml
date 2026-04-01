@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.6.1"
+version = "0.6.2"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -42,12 +42,6 @@ dev = [
   "mypy",
   "maturin>=1.7",
   "twine",
-]
-
-# Optional Rust acceleration: installs the pre-built yggrs native extension.
-# yggdrasil/rs.py falls back to pure Python when yggrs is absent.
-native = [
-  "yggrs>=0.5.40",
 ]
 
 http = [
