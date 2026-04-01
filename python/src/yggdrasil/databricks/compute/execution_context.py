@@ -338,7 +338,7 @@ class ExecutionContext:
         if self._requirements is not None:
             return self._requirements
 
-        command = f"uv pip --directory {str(self.remote_metadata.libs_path)!r} list --format=json"
+        command = f"uv pip list --format=json"
 
         try:
             reqs = self.command(

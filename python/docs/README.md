@@ -98,7 +98,7 @@ Always import optional engines from `lib.py` guards.
 ```python
 from yggdrasil.polars.lib import polars
 from yggdrasil.pandas.lib import pandas
-import pysparl.sql as pyspark_sql
+import pyspark.sql as pyspark_sql
 ```
 
 Polars cast example:

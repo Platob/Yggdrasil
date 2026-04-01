@@ -35,13 +35,13 @@ from databricks.sdk.service.compute import (
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
+from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
+from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
 from .execution_context import ExecutionContext
 from .service import Clusters, PYTHON_BY_DBR
 from ..client import DatabricksResource
-from ...io.headers import DEFAULT_HOSTNAME
-from ...pyutils.equality import dicts_equal
 
 if TYPE_CHECKING:
     from .command_execution import CommandExecution

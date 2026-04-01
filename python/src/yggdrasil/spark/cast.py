@@ -53,7 +53,7 @@ from yggdrasil.arrow.cast import (
 from yggdrasil.arrow.python_defaults import default_arrow_scalar, default_python_scalar
 from yggdrasil.data.cast import CastOptions, CastOptionsArg, register_converter
 from yggdrasil.pickle.serde import ObjectSerde
-import pysparl.sql as pyspark_sql
+import pyspark.sql as pyspark_sql
 
 __all__ = [
     # Type-level converters

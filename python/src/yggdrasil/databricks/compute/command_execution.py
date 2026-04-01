@@ -825,7 +825,6 @@ import importlib
 remote_libs = os.path.expanduser({remote_libs!r})
 packages = {pkgs!r}
 
-# Filter out packages that can already be imported
 def is_importable(pkg_name: str) -> bool:
     try:
         importlib.import_module(pkg_name)
@@ -835,21 +834,12 @@ def is_importable(pkg_name: str) -> bool:
 
 packages_to_install = [p for p in packages if not is_importable(p)]
 
-# Check Python executable
-if not sys.executable or not os.path.isfile(sys.executable):
-    raise RuntimeError(f"Invalid Python executable: {{sys.executable}}")
-
-# Check target directory
-if not os.access(os.path.dirname(remote_libs) or ".", os.W_OK):
-    raise RuntimeError(f"Cannot write to target directory: {{remote_libs}}")
-
 os.makedirs(remote_libs, exist_ok=True)
 
 import subprocess
 import shlex
 import json
 
-# --- Install missing packages if any ---
 if packages_to_install:
     cmd = [
         sys.executable,

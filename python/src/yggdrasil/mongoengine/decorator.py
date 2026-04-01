@@ -122,6 +122,10 @@ def with_mongo_connection(
         if c and c.get("host") and c["host"] not in ("", "localhost")
     ]
 
+    databricks = databricks or os.getenv("DATABRICKS_HOST")
+    if callable(databricks):
+        databricks = databricks()
+
     if databricks is None:
         if cluster is not None:
             from yggdrasil.databricks import DatabricksClient
