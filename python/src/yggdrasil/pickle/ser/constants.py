@@ -32,8 +32,8 @@ def is_valid_magic(value: bytes) -> bool:
 
         if PyEnv.in_databricks():
             raise RuntimeError(
-                "Yggdrasil<0.6.5 cannot be used in databricks, "
-                "update with uv pip install ygg[data,databricks,pickle]>=0.6.5"
+                "Yggdrasil<0.6.6 cannot be used in databricks, "
+                "update with uv pip install ygg[data,databricks,pickle]>=0.6.6"
             )
         return True
     return False

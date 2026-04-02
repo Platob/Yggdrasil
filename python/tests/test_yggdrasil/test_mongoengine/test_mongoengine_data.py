@@ -7,34 +7,37 @@ from mongoengine import Document, StringField, FloatField, DateTimeField
 from yggdrasil.mongoengine import with_mongo_connection, connect
 
 
-class Plants(Document):
-    plant_name = StringField(required=True)
-    plant_type = StringField(required=True)
-    plant_subtype = StringField(required=True)
-    capacity = FloatField(required=True)
-    lat = FloatField(required=True)
-    lon = FloatField(required=True)
-    country = StringField(required=True)
-    as_of = DateTimeField(required=True)
+def plantss_class():
+    class Plantss(Document):
+        plant_name = StringField(required=True)
+        plant_type = StringField(required=True)
+        plant_subtype = StringField(required=True)
+        capacity = FloatField(required=True)
+        lat = FloatField(required=True)
+        lon = FloatField(required=True)
+        country = StringField(required=True)
+        as_of = DateTimeField(required=True)
 
-    meta = {
-        "db_alias": "GenCast",
-        "indexes": [
-            {
-                "fields": [
-                    "-as_of",
-                    "-country",
-                    "-plant_type",
-                    "-plant_subtype",
-                    "lat",
-                    "lon",
-                    "-capacity",
-                    "plant_name",
-                ],
-                "unique": True,
-            }
-        ],
-    }
+        meta = {
+            "db_alias": "GenCast",
+            "indexes": [
+                {
+                    "fields": [
+                        "-as_of",
+                        "-country",
+                        "-plant_type",
+                        "-plant_subtype",
+                        "lat",
+                        "lon",
+                        "-capacity",
+                        "plant_name",
+                    ],
+                    "unique": True,
+                }
+            ],
+        }
+
+    return Plantss
 
 def resolver():
     return connect(
@@ -63,7 +66,7 @@ def get_plant_data():
         {"$replaceRoot": {"newRoot": "$latest_update"}},
     ]
 
-    result = Plants.objects().aggregate(*pipeline)
+    result = plantss_class().objects().aggregate(*pipeline)
     data = pd.DataFrame(result)
     data["_id"] = data.index
     return data

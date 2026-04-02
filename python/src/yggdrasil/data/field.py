@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
-from yggdrasil.arrow.cast import any_to_arrow_field
-from yggdrasil.data.cast import CastOptions, convert
 
 if TYPE_CHECKING:
     import polars as pl
@@ -153,7 +151,7 @@ class Field:
             arrow_type=self.arrow_type if arrow_type is None else arrow_type,
             nullable=self.nullable if nullable is None else nullable,
             metadata=(
-                dict(self.metadata)
+                (dict(self.metadata) if self.metadata is not None else None)
                 if metadata is None and tags is None
                 else _normalize_metadata(metadata, tags=tags)
             ),
@@ -305,11 +303,14 @@ class Field:
         if isinstance(obj, cls):
             return obj
 
+        from yggdrasil.arrow.cast import any_to_arrow_field
+
         return cls.from_arrow(any_to_arrow_field(obj))
 
     @classmethod
     def from_arrow(cls, value: pa.Field) -> "Field":
         if not isinstance(value, pa.Field):
+            from yggdrasil.arrow.cast import any_to_arrow_field
             value = any_to_arrow_field(value)
 
         return cls(
@@ -339,6 +340,7 @@ class Field:
         tags: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Field":
         if obj is not None:
+            from yggdrasil.arrow.cast import any_to_arrow_field
             return cls.from_arrow(any_to_arrow_field(obj))
 
         if name is None or dtype is None:
@@ -375,6 +377,8 @@ class Field:
 
             if isinstance(obj, StructField):
                 return cls.from_arrow(spark_field_to_arrow_field(obj))
+
+            from yggdrasil.arrow.cast import any_to_arrow_field
             return cls.from_arrow(any_to_arrow_field(obj))
 
         if name is None or dtype is None:
@@ -393,8 +397,3 @@ class Field:
         from yggdrasil.spark.cast import arrow_field_to_spark_field
 
         return arrow_field_to_spark_field(self.to_arrow_field())
-
-    def cast(self, value: Any, *, safe: bool = True) -> Any:
-        options = CastOptions(target_field=self.to_arrow_field(), safe=safe)
-        scalar: pa.Scalar = convert(value, target_hint=pa.Scalar, options=options)
-        return scalar.as_py()

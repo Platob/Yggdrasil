@@ -6,10 +6,10 @@ import pytest
 from yggdrasil.data.field import Field
 from yggdrasil.data.schema import Schema
 
-T = pytest.importorskip("pyspark.sql.types")
 
 
 def test_field_from_to_pyspark() -> None:
+    T = pytest.importorskip("pyspark.sql.types")
     field = Field.from_pyspark(name="id", dtype=T.IntegerType(), nullable=False)
 
     assert field.name == "id"
@@ -22,12 +22,8 @@ def test_field_from_to_pyspark() -> None:
     assert spark_field.nullable is False
 
 
-def test_field_cast_scalar() -> None:
-    field = Field(name="qty", arrow_type=pa.int64(), nullable=False)
-    assert field.cast("42") == 42
-
-
 def test_schema_from_to_pyspark() -> None:
+    T = pytest.importorskip("pyspark.sql.types")
     spark_schema = T.StructType(
         [
             T.StructField("id", T.IntegerType(), False),

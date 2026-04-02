@@ -368,7 +368,7 @@ class Schema(MutableMapping[str, Field]):
         if isinstance(obj, pl.LazyFrame):
             fields = [
                 Field.from_polars(name=name, dtype=dtype)
-                for name, dtype in obj.schema.items()
+                for name, dtype in obj.collect_schema().items()
             ]
             return cls.from_fields(fields, metadata=metadata)
 
