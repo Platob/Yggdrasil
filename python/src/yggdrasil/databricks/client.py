@@ -11,10 +11,11 @@ from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callab
 from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
-from yggdrasil.environ import UserInfo, runtime_import_module
+from yggdrasil.environ import UserInfo
 from yggdrasil.io import BytesIO, MimeTypes
 from yggdrasil.io.url import URL, URLResource, url_resource_class
 
@@ -818,15 +819,6 @@ class DatabricksClient(URLResource):
     def spark_connect(
         self,
     ):
-        try:
-            import databricks.connect
-        except ImportError:
-            runtime_import_module(
-                module_name="databricks.connect",
-                pip_name="databricks-connect",
-                install=True
-            )
-
         from databricks.connect import DatabricksSession
 
         session = (

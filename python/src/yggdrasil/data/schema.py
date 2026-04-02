@@ -6,8 +6,6 @@ from dataclasses import dataclass, field as dc_field
 from typing import TYPE_CHECKING, Any, AnyStr, Mapping
 
 import pyarrow as pa
-from yggdrasil.arrow.cast import any_to_arrow_schema
-from yggdrasil.data.cast import CastOptions, convert
 
 from .field import Field, _normalize_metadata, _to_bytes
 
@@ -297,6 +295,7 @@ class Schema(MutableMapping[str, Field]):
         if isinstance(obj, cls):
             return obj
 
+        from yggdrasil.arrow.cast import any_to_arrow_schema
         return cls.from_arrow(any_to_arrow_schema(obj))
 
     @classmethod
@@ -321,6 +320,7 @@ class Schema(MutableMapping[str, Field]):
     @classmethod
     def from_arrow(cls, value: pa.Schema) -> "Schema":
         if not isinstance(value, pa.Schema):
+            from yggdrasil.arrow.cast import any_to_arrow_schema
             value = any_to_arrow_schema(value)
 
         inner_fields: OrderedDict[str, Field] = OrderedDict()
@@ -415,6 +415,7 @@ class Schema(MutableMapping[str, Field]):
         return arrow_schema_to_spark_schema(self.to_arrow_schema())
 
     def cast_table(self, obj: Any, *, safe: bool = True) -> Any:
+        from yggdrasil.data.cast import CastOptions
         return CastOptions(
             target_field=self.to_arrow_schema(),
             safe=safe,
@@ -427,5 +428,6 @@ class Schema(MutableMapping[str, Field]):
         as_type: type = pa.Table,
         safe: bool = True,
     ) -> Any:
+        from yggdrasil.data.cast import CastOptions, convert
         options = CastOptions(target_field=self.to_arrow_schema(), safe=safe)
         return convert(obj, target_hint=as_type, options=options)

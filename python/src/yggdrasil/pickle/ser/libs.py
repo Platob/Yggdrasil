@@ -22,7 +22,7 @@ import hashlib
 import sys
 from dataclasses import dataclass, is_dataclass
 from types import FunctionType, MethodType, ModuleType
-from typing import Callable, ClassVar, Generic, Mapping
+from typing import ClassVar, Generic, Mapping
 
 from yggdrasil.environ import runtime_import_module
 from yggdrasil.io import BytesIO
