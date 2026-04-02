@@ -116,79 +116,67 @@ def _normalize_call_args(
 ) -> tuple[tuple, dict]:
     args = tuple(args or ())
     kwargs = dict(kwargs or {})
-
-    # For bound methods the normal inspect.unwrap() does not cross the
-    # MethodType boundary, so __wrapped__ on __func__ is never followed.
-    # Unwrap __func__ explicitly so that @wraps-decorated methods expose
-    # the original function's signature (with real defaults), not the
-    # wrapper's generic (*args, **kwargs).
+    # --- unwrap target (handle bound methods correctly) ---
     from types import MethodType as _MethodType  # noqa: PLC0415
     if isinstance(func, _MethodType):
         unwrapped_func = inspect.unwrap(func.__func__)
-        # Re-bind so inspect.signature strips the leading `self` correctly.
         target = _MethodType(unwrapped_func, func.__self__)
     else:
         target = inspect.unwrap(func)
-
     try:
         sig = inspect.signature(target)
     except (ValueError, TypeError):
-        # Signature not introspectable – pass args through unchanged.
-        return tuple(args), dict(kwargs)
-
-    # If the effective signature is only (*args, **kwargs) we cannot expand
-    # defaults (wrapper whose inner signature is unknown at this point).
-    # Return as-is; the remote function still has its own defaults stored in
-    # the payload (fixed in _dump_function_payload to use inner_fn's defaults).
-    _params = list(sig.parameters.values())
-    _only_var = all(
+        return args, kwargs
+    params = list(sig.parameters.values())
+    # If only (*args, **kwargs), nothing to normalize
+    if all(
         p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-        for p in _params
-    )
-    if _only_var:
-        return tuple(args), dict(kwargs)
-
+        for p in params
+    ):
+        return args, kwargs
+    # --- bind partially ---
     try:
-        # Use partial binding so we only normalize arguments already supplied.
-        # This avoids manufacturing a local TypeError for callables that still
-        # rely on runtime-provided args or decorator/partial behavior.
         bound = sig.bind_partial(*args, **kwargs)
-        bound.apply_defaults()
     except TypeError:
-        # Signature expansion is best-effort only. If introspection disagrees
-        # with the callable's real invocation behavior, preserve the original
-        # call shape and let the remote execution raise the underlying error.
-        return tuple(args), dict(kwargs)
-
+        return args, kwargs
+    # Track which params were originally passed positionally
+    positional_param_names = []
+    arg_index = 0
+    for p in params:
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            if arg_index < len(args):
+                positional_param_names.append(p.name)
+                arg_index += 1
+        elif p.kind is inspect.Parameter.VAR_POSITIONAL:
+            break
+    # Apply defaults AFTER tracking original intent
+    bound.apply_defaults()
     out_args: list = []
     out_kwargs: dict = {}
-
-    for name, param in sig.parameters.items():
-        if name not in bound.arguments and param.kind not in (
+    for p in params:
+        name = p.name
+        if name not in bound.arguments and p.kind not in (
             inspect.Parameter.VAR_POSITIONAL,
             inspect.Parameter.VAR_KEYWORD,
         ):
             continue
-
-        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+        if p.kind is inspect.Parameter.POSITIONAL_ONLY:
             out_args.append(bound.arguments[name])
-
-        elif param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
-            if name in kwargs:
-                out_kwargs[name] = bound.arguments[name]
-            else:
+        elif p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            if name in positional_param_names:
                 out_args.append(bound.arguments[name])
-
-        elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+            else:
+                out_kwargs[name] = bound.arguments[name]
+        elif p.kind is inspect.Parameter.VAR_POSITIONAL:
             out_args.extend(bound.arguments.get(name, ()))
-
-        elif param.kind is inspect.Parameter.KEYWORD_ONLY:
+        elif p.kind is inspect.Parameter.KEYWORD_ONLY:
             if name in bound.arguments:
                 out_kwargs[name] = bound.arguments[name]
-
-        elif param.kind is inspect.Parameter.VAR_KEYWORD:
+        elif p.kind is inspect.Parameter.VAR_KEYWORD:
             out_kwargs.update(bound.arguments.get(name, {}))
-
     return tuple(out_args), out_kwargs
 
 
