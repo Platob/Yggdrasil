@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import base64
-import binascii
 
 import pytest
 
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser import dump, dumps, load, loads
-from yggdrasil.pickle.ser.constants import FORMAT_VERSION, MAGIC
+from yggdrasil.pickle.ser.constants import MAGIC
 from yggdrasil.pickle.ser.errors import SerializationError, HeaderDecodeError
 from yggdrasil.pickle.ser.serialized import Serialized
 
 
 def test_magic_matches_format_version() -> None:
-    assert FORMAT_VERSION == 1
-    assert MAGIC == b"YGG1"
+    assert MAGIC == b"YgD1"
 
 
 def test_dumps_returns_bytes_with_magic_prefix() -> None:

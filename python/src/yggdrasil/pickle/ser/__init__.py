@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping, IO
 
 from yggdrasil.io import BytesIO
-from yggdrasil.pickle.ser.constants import MAGIC
+from yggdrasil.pickle.ser.constants import is_valid_magic, MAGIC_LENGTH, MAGIC
 from yggdrasil.pickle.ser.errors import (
     HeaderDecodeError,
     InvalidCodecError,
@@ -163,8 +163,8 @@ def load(
 ) -> Any:
     buffer = BytesIO(fp, copy=False)
 
-    mag = buffer.read(len(MAGIC))
-    if mag != MAGIC:
+    mag = buffer.read(MAGIC_LENGTH)
+    if not is_valid_magic(mag):
         if isinstance(fp, (str, Path)):
             p = Path(fp)
 

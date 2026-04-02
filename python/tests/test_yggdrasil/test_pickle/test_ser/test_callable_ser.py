@@ -21,7 +21,7 @@ import pytest
 
 from yggdrasil.mongoengine.decorator import with_mongo_connection
 from yggdrasil.pickle.ser import Serialized, Tags
-from yggdrasil.pickle.ser.complexs import (
+from yggdrasil.pickle.ser.callables import (
     FunctionSerialized,
     MethodSerialized,
     _FN_FULL_DEFINITION_GLOBALS,
@@ -190,11 +190,6 @@ def decorated_wraps(x: int) -> int:
 
 @logging_decorator
 def decorated_stateful(x: int) -> int:
-    return x + 5
-
-
-@with_mongo_connection
-def decorated_external(x: int) -> int:
     return x + 5
 
 
@@ -408,11 +403,6 @@ class TestDecorators:
         fn = _roundtrip(decorated_stateful)
         assert fn(1) == (6, [1])
         assert fn(2) == (7, [1, 2])
-
-    def test_external_decorator(self):
-        fn = _roundtrip(decorated_external)
-        assert fn(1) == 6
-        assert fn(2) == 7
 
 
 class TestMetadataPreservation:

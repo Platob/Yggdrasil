@@ -5,13 +5,16 @@ from dataclasses import dataclass, field, is_dataclass
 from types import ModuleType
 
 import pytest
+
 from yggdrasil.pickle.ser import Serialized, Tags
 from yggdrasil.pickle.ser.complexs import (
     BaseExceptionSerialized,
     ClassSerialized,
     ComplexSerialized,
-    DataclassSerialized,
     ModuleSerialized,
+)
+from yggdrasil.pickle.ser.dataclasses import (
+    DataclassSerialized,
     _dump_dataclass_payload,
     _load_dataclass_payload,
 )
