@@ -10,7 +10,7 @@ import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import ClassVar, Generic, Mapping
@@ -48,7 +48,7 @@ __all__ = [
 # ============================================================================
 
 EPOCH_DATE = date(1970, 1, 1)
-EPOCH_DATETIME = datetime(1970, 1, 1, tzinfo=UTC)
+EPOCH_DATETIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
 DAY_MICROS = 86_400 * 1_000_000
 
 MAX_INLINE_DIR_BYTES = 1024 * 1024  # 1 MiB
@@ -210,7 +210,7 @@ def _unit_to_micros(value: int, unit: str, *, tag_name: str) -> int:
 
 def _datetime_from_epoch(value: int, unit: str) -> datetime:
     if unit == U_S:
-        return datetime.fromtimestamp(value, tz=UTC)
+        return datetime.fromtimestamp(value, tz=timezone.utc)
     if unit == U_MS:
         return EPOCH_DATETIME + timedelta(milliseconds=value)
     if unit == U_US:
@@ -260,7 +260,7 @@ def _tz_to_text(tz: tzinfo | None, ref_dt: datetime | None = None) -> str | None
     if tz is None:
         return None
 
-    if tz is UTC:
+    if tz is timezone.utc:
         return "UTC"
 
     if ZoneInfo is not None and isinstance(tz, ZoneInfo):
@@ -290,7 +290,7 @@ def _load_tzinfo(metadata: Mapping[bytes, bytes] | None) -> tzinfo | None:
         return None
 
     if tz_name == "UTC":
-        return UTC
+        return timezone.utc
 
     if tz_name.startswith(("+", "-")):
         sign = 1 if tz_name[0] == "+" else -1
@@ -626,9 +626,9 @@ class LogicalSerialized(Serialized[T], Generic[T]):
             merged = _metadata_merge(metadata) or {}
 
             if obj.tzinfo is None:
-                dt_utc = obj.replace(tzinfo=UTC)
+                dt_utc = obj.replace(tzinfo=timezone.utc)
             else:
-                dt_utc = obj.astimezone(UTC)
+                dt_utc = obj.astimezone(timezone.utc)
                 tz_text = _tz_to_text(obj.tzinfo, obj)
                 if tz_text:
                     merged.setdefault(M_TZ, tz_text.encode("utf-8"))
