@@ -509,8 +509,9 @@ class LargeIteratorSerialized(LargeCollectionSerialized[Iterator[object]]):
 # mapping serializers
 # ============================================================================
 
-@dataclass(frozen=True, slots=True)
-class _BaseMappingSerialized(CollectionSerialized[dict[object, object]]):
+class _MappingMixin:
+    """Mixin providing mapping iteration / materialisation helpers."""
+
     def _iter_entry_pairs(self) -> Iterator[tuple[Serialized[object], Serialized[object]]]:
         buf = self._payload_buffer()
         count = self._read_count(buf)
@@ -540,15 +541,22 @@ class _BaseMappingSerialized(CollectionSerialized[dict[object, object]]):
 
 
 @dataclass(frozen=True, slots=True)
+class _BaseMappingSerialized(_MappingMixin, CollectionSerialized[dict[object, object]]):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _LargeBaseMappingSerialized(_MappingMixin, LargeCollectionSerialized[dict[object, object]]):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class MappingSerialized(_BaseMappingSerialized):
     TAG: ClassVar[int] = Tags.MAPPING
 
 
 @dataclass(frozen=True, slots=True)
-class LargeMappingSerialized(
-    _BaseMappingSerialized,
-    LargeCollectionSerialized[dict[object, object]],
-):
+class LargeMappingSerialized(_LargeBaseMappingSerialized):
     TAG: ClassVar[int] = Tags.LARGE_MAPPING
 
 
@@ -562,10 +570,7 @@ class MappingProxySerialized(_BaseMappingSerialized):
 
 
 @dataclass(frozen=True, slots=True)
-class LargeMappingProxySerialized(
-    _BaseMappingSerialized,
-    LargeCollectionSerialized[dict[object, object]],
-):
+class LargeMappingProxySerialized(_LargeBaseMappingSerialized):
     TAG: ClassVar[int] = Tags.LARGE_MAPPING_PROXY
 
     @property
@@ -584,6 +589,9 @@ for cls in LargeCollectionSerialized.__subclasses__():
     Tags.register_class(cls)
 
 for cls in _BaseMappingSerialized.__subclasses__():
+    Tags.register_class(cls)
+
+for cls in _LargeBaseMappingSerialized.__subclasses__():
     Tags.register_class(cls)
 
 for t, cls in (
