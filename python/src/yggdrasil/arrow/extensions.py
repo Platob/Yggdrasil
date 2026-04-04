@@ -1,5 +1,5 @@
 import os
-from .lib import pyarrow
+import pyarrow
 
 if os.name == "nt":
     try:

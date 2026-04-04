@@ -12,7 +12,7 @@ from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.zip_io import ZipIO, ZipOptions
 from yggdrasil.io.enums import MimeType
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 
 
 def _make_zip_bytes(members: dict[str, bytes], *, compresslevel: int = 8) -> bytes:

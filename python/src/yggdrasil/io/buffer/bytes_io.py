@@ -885,7 +885,7 @@ class BytesIO(io.RawIOBase):
     # ------------------------------------------------------------------
 
     def xxh3_64(self) -> "xxhash.xxh3_64":
-        from yggdrasil.xxhash import xxh3_64
+        from xxhash import xxh3_64
 
         h = xxh3_64()
         h.update(self.memoryview())
@@ -896,9 +896,9 @@ class BytesIO(io.RawIOBase):
         return u if u < 2**63 else u - 2**64
 
     def blake3(self) -> "blake3.blake3":
-        from yggdrasil.blake3 import blake3
+        import blake3
 
-        h = blake3(max_threads=blake3.AUTO)
+        h = blake3.blake3(max_threads=blake3.blake3.AUTO)
 
         if self._buf is not None:
             if self._size:
@@ -1003,7 +1003,7 @@ class BytesIO(io.RawIOBase):
         return self._path.open("rb")
 
     def to_arrow_io(self, mode: str = "r"):
-        from yggdrasil.arrow.lib import pyarrow as pa
+        import pyarrow as pa
 
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")

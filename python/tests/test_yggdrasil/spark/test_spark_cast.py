@@ -34,13 +34,16 @@ them by name to keep coverage explicit.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("pyspark")
+
 import json
 
 import pyarrow as pa
 import pyarrow.types as pat
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
-import pytest
 from pyspark.sql import SparkSession
 
 # ---------------------------------------------------------------------------

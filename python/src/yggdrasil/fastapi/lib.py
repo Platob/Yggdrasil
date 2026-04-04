@@ -1,10 +1,4 @@
-try:
-    import fastapi
-except ImportError:
-    from yggdrasil.environ import PyEnv
-
-    fastapi = PyEnv.runtime_import_module(module_name="fastapi", pip_name="fastapi", install=True)
-
+import fastapi
 
 __all__ = [
     "fastapi"

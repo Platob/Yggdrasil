@@ -25,7 +25,7 @@ def _make_cfg(tmp_path: Path) -> BufferConfig:
 
 def _pa():
     # single import point (your project uses yggdrasil.arrow.lib.pyarrow)
-    from yggdrasil.arrow.lib import pyarrow as pa
+    import pyarrow as pa
 
     return pa
 

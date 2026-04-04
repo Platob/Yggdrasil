@@ -442,7 +442,7 @@ class Clusters(DatabricksService):
         cluster_id: Optional[str] = None,
         *,
         cluster_name: Optional[str] = None,
-        raise_error: Optional[bool] = None,
+        raise_error: bool = False,
     ) -> Optional["Cluster"]:
         if not cluster_name and not cluster_id:
             raise ValueError("Either name or cluster_id must be provided")

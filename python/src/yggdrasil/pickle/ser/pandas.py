@@ -4,13 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Generic, Mapping, TypeVar
 
-from yggdrasil.pandas.lib import pandas as pd
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 
 from yggdrasil.io import BytesIO
+from yggdrasil.pandas.lib import pandas as pd
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
-
 from .pyarrow import (
     _merge_metadata,
     _table_from_ipc_file_buffer,

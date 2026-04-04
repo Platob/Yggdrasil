@@ -7,7 +7,8 @@ import json as json_module
 from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
+
 from yggdrasil.data import any_to_datetime, field as schema_field, schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType, MimeTypes

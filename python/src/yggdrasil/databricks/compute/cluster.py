@@ -35,7 +35,6 @@ from databricks.sdk.service.compute import (
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
-from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
@@ -54,9 +53,6 @@ __all__ = ["Cluster"]
 LOGGER = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 _EDIT_ARG_NAMES = set(inspect.signature(ClustersAPI.edit).parameters.keys())
-
-_CLUSTER_RUNTIME_FIELDS = frozenset({"_system_context", "_contexts"})
-_CLUSTER_SKIP_IF_NONE = frozenset({"_details", "cluster_name"})
 _GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
 
 
@@ -85,7 +81,6 @@ class Cluster(DatabricksResource):
 
     _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _details_refresh_time: float = dataclasses.field(default=0.0, repr=False, hash=False, compare=False)
-    _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -100,7 +95,7 @@ class Cluster(DatabricksResource):
             object.__setattr__(self, "_details", found._details)
 
     def __repr__(self):
-        return "%s(url=%s)" % (self.__class__.__name__, self.url())
+        return "%s<url='%s'>" % (self.__class__.__name__, self.url())
 
     def __str__(self):
         return self.url().to_string()
@@ -179,9 +174,6 @@ class Cluster(DatabricksResource):
     def is_error(self):
         return self.state == State.ERROR
 
-    @property
-    def requirements(self):
-        return self.context(context_key="system").requirements
 
     def raise_for_status(self):
         if self.is_error:
@@ -375,25 +367,15 @@ class Cluster(DatabricksResource):
         self,
         *,
         language: Optional[Language] = None,
-        context_id: Optional[str] = None,
         context_key: Optional[str] = None,
+        temporary: bool = False,
     ) -> "ExecutionContext":
-        if context_key:
-            existing = self._contexts.get(context_key)
-            if existing is None:
-                existing = self._contexts[context_key] = ExecutionContext(
-                    cluster=self,
-                    language=language,
-                    context_id=context_id,
-                    context_key=context_key,
-                )
-            return existing
-
-        return ExecutionContext(
+        """Return a pooled execution context for this cluster."""
+        return ExecutionContext.get_or_create(
             cluster=self,
-            language=language,
-            context_id=context_id,
+            language=language or Language.PYTHON,
             context_key=context_key,
+            temporary=temporary,
         )
 
     def command(
@@ -406,21 +388,63 @@ class Cluster(DatabricksResource):
         command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
         context_key: Optional[str] = None,
+        temporary: bool = False,
     ) -> "CommandExecution":
-        language = Language.PYTHON if language is None else language
-        context_key = context_key or DEFAULT_HOSTNAME
-
-        context = self.context(language=language, context_key=context_key)
-
-        return context.command(
+        ctx = self.context(
+            language=language or Language.PYTHON,
+            context_key=context_key,
+            temporary=temporary,
+        )
+        return ctx.command(
             command=command,
             command_str=command_str,
             command_id=command_id,
             environ=environ,
             func=func,
             language=language,
-            context=context,
+            context=ctx,
         )
+
+    def decorate(
+        self,
+        func: Optional[Callable] = None,
+        *,
+        environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
+        language: Optional[Language] = None,
+        context_key: Optional[str] = None,
+    ) -> Callable:
+        """
+        Return a decorator that executes *func* on this cluster.
+
+        Supports both bare and parameterised forms::
+
+            @cluster.decorate
+            def compute(x: int) -> int:
+                return x * 2
+
+            @cluster.decorate(environ=["MY_SECRET"])
+            def fetch(key: str) -> dict:
+                ...
+        """
+        import functools
+
+        def decorator(fn: Callable) -> Callable:
+            cmd = self.command(
+                func=fn,
+                environ=environ,
+                language=language,
+                context_key=context_key,
+            )
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                return cmd(*args, **kwargs)
+
+            return wrapper
+
+        if func is not None:
+            return decorator(func)
+        return decorator
 
     # ------------------------------------------------------------------ #
     # Libraries

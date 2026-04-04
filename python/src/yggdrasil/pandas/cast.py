@@ -3,7 +3,7 @@
 from typing import Optional
 
 from yggdrasil.arrow.cast import cast_arrow_array, cast_arrow_tabular
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.pandas.lib import pandas

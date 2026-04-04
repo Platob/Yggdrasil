@@ -12,17 +12,7 @@ if TYPE_CHECKING:
     from pymongo import MongoClient
     from pymongo.database import Database
 
-try:
-    import mongoengine
-except ImportError:
-    from yggdrasil.environ import runtime_import_module
-
-    mongoengine = runtime_import_module(
-        module_name="mongoengine",
-        pip_name="mongoengine",
-        install=True,
-    )
-
+import mongoengine
 from mongoengine import *  # type: ignore  # noqa: F401,F403
 
 __all__ = [

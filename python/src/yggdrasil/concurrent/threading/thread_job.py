@@ -58,7 +58,11 @@ class ThreadJob(AsyncJob[T]):
         )
         self._thread = t
         t.start()
-        LOGGER.debug("ThreadJob started: %s", func_name)
+        try:
+            LOGGER.debug("ThreadJob started: %s", func_name)
+        except Exception:
+            # Stream may already be closed during interpreter shutdown.
+            pass
 
     # ------------------------------------------------------------------
     # Thread body
@@ -68,10 +72,16 @@ class ThreadJob(AsyncJob[T]):
         func_name = getattr(self.job.func, "__qualname__", repr(self.job.func))
         try:
             self._result = self.job.run()
-            LOGGER.debug("ThreadJob finished ok: %s", func_name)
+            try:
+                LOGGER.debug("ThreadJob finished ok: %s", func_name)
+            except Exception:
+                pass
         except BaseException as exc:  # noqa: BLE001
             self._exception = exc
-            LOGGER.debug("ThreadJob raised %r: %s", exc, func_name)
+            try:
+                LOGGER.debug("ThreadJob raised %r: %s", exc, func_name)
+            except Exception:
+                pass
         finally:
             self._done.set()
 

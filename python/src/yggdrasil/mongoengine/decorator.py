@@ -187,7 +187,10 @@ def with_mongo_connection(
                 if not exclude_env_key(k)
             })
 
-            final_decorator = cl.command(func=decorator, environ=environ)
+            final_decorator = cl.command(
+                func=decorator, environ=environ,
+                temporary=True
+            )
         except Exception as e:
             raise MongoDatabricksRoutingError(
                 "Failed to route MongoDB execution through Databricks.\n"

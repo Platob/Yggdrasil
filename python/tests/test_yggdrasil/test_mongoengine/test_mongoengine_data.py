@@ -3,12 +3,13 @@ from unittest import TestCase
 
 import pandas as pd
 from mongoengine import Document, StringField, FloatField, DateTimeField
+from wma import connect_to_db_gencast
 
-from yggdrasil.mongoengine import with_mongo_connection, connect
+from yggdrasil.mongoengine import connect
 
 
-def plantss_class():
-    class Plantss(Document):
+def plants_class():
+    class Plants(Document):
         plant_name = StringField(required=True)
         plant_type = StringField(required=True)
         plant_subtype = StringField(required=True)
@@ -37,8 +38,9 @@ def plantss_class():
             ],
         }
 
-    return Plantss
+    return Plants
 
+os.environ["GENCAST_MONGO_HOST"] = "mongodb+srv://mats-weather-prod-rw:q53qqmAjCgcz7NHX@mats-weather-prod-rs0-pl-2.3vnse1.mongodb.net"
 def resolver():
     return connect(
         alias="GenCast",
@@ -46,11 +48,7 @@ def resolver():
         host=os.environ["MONGODB_URI"]
     )
 
-@with_mongo_connection(
-    aliases=["GenCast"],
-    databricks="https://dbc-xxx.cloud.databricks.com/",
-    resolver=resolver
-)
+@connect_to_db_gencast
 def get_plant_data():
     pipeline = [
         {"$sort": {"as_of": -1}},
@@ -66,7 +64,7 @@ def get_plant_data():
         {"$replaceRoot": {"newRoot": "$latest_update"}},
     ]
 
-    result = plantss_class().objects().aggregate(*pipeline)
+    result = plants_class().objects().aggregate(*pipeline)
     data = pd.DataFrame(result)
     data["_id"] = data.index
     return data
@@ -75,5 +73,6 @@ def get_plant_data():
 class MongoCase(TestCase):
 
     def test_plants(self):
-        data = get_plant_data()
+        for i in range(3):
+            data = get_plant_data()
         assert not data.empty

@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 
 O = TypeVar("O", bound=MediaOptions)
 
-__all__ = ["MediaIO"]
+__all__ = ["MediaIO", "MediaOptions"]
 
 
 @dataclass(slots=True)

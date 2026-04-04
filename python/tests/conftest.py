@@ -12,6 +12,23 @@ if str(SRC_ROOT) not in sys.path:
 
 logger = logging.getLogger("yggdrasil")
 
+
+class _ShutdownSafeStreamHandler(logging.StreamHandler):
+    """StreamHandler that silently drops records when the underlying stream is
+    already closed (typically during interpreter shutdown / atexit teardown).
+    Without this guard, any LOGGER call made from an atexit handler prints a
+    noisy "--- Logging error ---" banner even though the error is benign."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except ValueError:
+            # "I/O operation on closed file" — stream closed during shutdown.
+            pass
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(level: int = logging.INFO) -> None:
     # Avoid duplicate handlers if this gets called twice (common in notebooks/tests)
     if logger.handlers:
@@ -20,7 +37,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     logger.setLevel(level)
     logger.propagate = False  # keep it from double-logging via root
 
-    handler = logging.StreamHandler(sys.stdout)
+    handler = _ShutdownSafeStreamHandler(sys.stdout)
     handler.setLevel(level)
 
     fmt = (
