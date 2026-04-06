@@ -964,7 +964,6 @@ class DatabricksService(ABC):
         return self.client.tables
 
 
-@dataclass
 class DatabricksResource(ABC):
     service: DatabricksService
 

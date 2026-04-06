@@ -7,12 +7,12 @@ This module provides:
 - Module / class cache helpers
 - Hashing helpers
 - Annotation helpers
-- Exception serialization
 - Base Serialized sub-classes: ComplexSerialized, ModuleSerialized,
-  ClassSerialized, and BaseExceptionSerialized
+  ClassSerialized
 
 FunctionSerialized / MethodSerialized live in callables.py.
 DataclassSerialized lives in dataclasses.py.
+BaseExceptionSerialized lives in exceptions.py.
 complexs.py re-exports everything for backward compatibility.
 """
 
@@ -33,7 +33,6 @@ __all__ = [
     "ComplexSerialized",
     "ModuleSerialized",
     "ClassSerialized",
-    "BaseExceptionSerialized",
 ]
 
 # ---------------------------------------------------------------------------
@@ -71,16 +70,6 @@ _ANN_REPR = "r"
 
 _CLASS_REF_MODULE = 0
 _CLASS_REF_QUALNAME = 1
-
-# ---------------------------------------------------------------------------
-# exception payload indices
-# ---------------------------------------------------------------------------
-
-_EXC_VERSION = 0
-_EXC_CLASS = 1
-_EXC_ARGS = 2
-_EXC_STATE = 3
-
 
 # ---------------------------------------------------------------------------
 # validation helpers
@@ -374,47 +363,6 @@ def _load_class_ref(data: bytes) -> type[object]:
 
 
 # ---------------------------------------------------------------------------
-# exception helpers
-# ---------------------------------------------------------------------------
-
-def _dump_exception_payload(exc: BaseException) -> bytes:
-    return _serialize_nested(
-        (
-            _FORMAT_VERSION,
-            type(exc),
-            exc.args,
-            _dump_object_state(exc),
-        )
-    )
-
-
-def _load_exception_payload(data: bytes) -> BaseException:
-    payload = _require_tuple_len(
-        _deserialize_nested(data), name="Exception payload", expected=4
-    )
-
-    version = payload[_EXC_VERSION]
-    if version != _FORMAT_VERSION:
-        raise ValueError(f"Unsupported exception payload version: {version!r}")
-
-    exc_cls_obj = payload[_EXC_CLASS]
-    if not isinstance(exc_cls_obj, type) or not issubclass(exc_cls_obj, BaseException):
-        raise TypeError("Decoded exception class is not a BaseException subclass")
-
-    args_obj = _require_tuple(payload[_EXC_ARGS], name="Decoded exception args")
-    state_payload = payload[_EXC_STATE]
-
-    try:
-        exc = exc_cls_obj(*args_obj)
-    except Exception:
-        exc = BaseException.__new__(exc_cls_obj)
-        exc.args = args_obj
-
-    _restore_object_state(exc, state_payload)
-    return exc
-
-
-# ---------------------------------------------------------------------------
 # base serializer classes
 # ---------------------------------------------------------------------------
 
@@ -438,7 +386,7 @@ class ComplexSerialized(Serialized[T], Generic[T]):
         codec: int | None = None,
     ) -> Serialized[object] | None:
         # Lazy imports to avoid circular dependencies with callables.py /
-        # dataclasses.py, which both import from this module.
+        # dataclasses.py / exceptions.py, which all import from this module.
         if isinstance(obj, MethodType):
             from yggdrasil.pickle.ser.callables import MethodSerialized  # noqa: PLC0415
             return MethodSerialized.build_method(obj, codec=codec)
@@ -452,6 +400,7 @@ class ComplexSerialized(Serialized[T], Generic[T]):
             return DataclassSerialized.build_dataclass(obj, codec=codec)
 
         if isinstance(obj, BaseException):
+            from yggdrasil.pickle.ser.exceptions import BaseExceptionSerialized  # noqa: PLC0415
             return BaseExceptionSerialized.build_exception(obj, codec=codec)
 
         if isinstance(obj, type):
@@ -504,28 +453,6 @@ class ClassSerialized(ComplexSerialized[type[object]]):
         return cls.build(
             tag=cls.TAG,
             data=_dump_class_ref(klass),
-            codec=codec,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class BaseExceptionSerialized(ComplexSerialized[BaseException]):
-    TAG: ClassVar[int] = Tags.BASE_EXCEPTION
-
-    @property
-    def value(self) -> BaseException:
-        return _load_exception_payload(self.decode())
-
-    @classmethod
-    def build_exception(
-        cls,
-        exc: BaseException,
-        *,
-        codec: int | None = None,
-    ) -> Serialized[object]:
-        return cls.build(
-            tag=cls.TAG,
-            data=_dump_exception_payload(exc),
             codec=codec,
         )
 

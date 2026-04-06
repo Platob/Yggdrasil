@@ -1,10 +1,11 @@
 """
 Backward-compatible re-export façade for the complex serialization layer.
 
-The implementation has been split into three focused modules:
+The implementation has been split into four focused modules:
     libs.py        — shared utilities and base serializer classes
     callables.py   — FunctionSerialized / MethodSerialized + helpers
     dataclasses.py — DataclassSerialized + helpers
+    exceptions.py  — BaseExceptionSerialized + traceback helpers
 
 Everything that was previously in this file is re-exported here so that all
 existing import paths (``from yggdrasil.pickle.ser.complexs import …``) keep
@@ -31,8 +32,10 @@ from yggdrasil.pickle.ser.callables import (
 from yggdrasil.pickle.ser.dataclasses import (
     DataclassSerialized,
 )
-from yggdrasil.pickle.ser.libs import (
+from yggdrasil.pickle.ser.exceptions import (
     BaseExceptionSerialized,
+)
+from yggdrasil.pickle.ser.libs import (
     ClassSerialized,
     ComplexSerialized,
     ModuleSerialized,

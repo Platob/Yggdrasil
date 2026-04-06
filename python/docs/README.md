@@ -163,22 +163,7 @@ print(result)
 
 ---
 
-## 9) AI SQL workflow
-
-```python
-from yggdrasil.ai.sql_session import SQLSession
-from yggdrasil.ai.sql_flavor import SQLFlavor
-
-sql = SQLSession().to_sql(
-    prompt="Top 10 customers by revenue last month",
-    flavor=SQLFlavor.POSTGRESQL,
-)
-print(sql)
-```
-
----
-
-## 10) Full module and submodule map
+## 9) Full module and submodule map
 
 ### Core data and schema
 - `yggdrasil.data.cast` - converter registry, dispatch, `CastOptions`.
