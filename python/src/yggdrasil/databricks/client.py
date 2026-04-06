@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
     from .fs.path import DatabricksPath
+    from .ai.genie import Genie
 
 __all__ = [
     "DatabricksClient",
@@ -810,6 +811,18 @@ class DatabricksClient(URLResource):
             use_cache=True,
         )
 
+    @property
+    def genie(self) -> "Genie":
+        """Genie conversation and space management helper for this client."""
+        from .ai.genie import Genie
+
+        return self.lazy_property(
+            self,
+            cache_attr="_genie",
+            factory=lambda: Genie(client=self),
+            use_cache=True,
+        )
+
     def spark_connect(
         self,
     ):
@@ -956,6 +969,11 @@ class DatabricksService(ABC):
     def tables(self) -> "Tables":
         """Collection-level Unity Catalog table service (shorthand for ``client.tables``)."""
         return self.client.tables
+
+    @property
+    def genie(self) -> "Genie":
+        """Genie service (shorthand for ``client.genie``)."""
+        return self.client.genie
 
 
 @dataclass
