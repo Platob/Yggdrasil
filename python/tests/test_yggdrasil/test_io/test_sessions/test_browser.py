@@ -655,7 +655,7 @@ class TestGetPostWithParams:
 
 import os
 
-REAL_HTTP = os.getenv("REAL_HTTP", "0") == "1"
+REAL_HTTP = os.getenv("REAL_HTTP", "1") == "1"
 
 network_mark = pytest.mark.skipif(
     not REAL_HTTP,
@@ -679,7 +679,7 @@ class TestBrowserHTTPSessionNetwork:
             user_agent="Mozilla/5.0 TestBrowser/1.0"
         )
         resp = b.navigate("https://httpbin.org/get")
-        data = resp.to_json()
+        data = resp.json()
         ua_echo = data.get("headers", {}).get("User-Agent", "")
         assert "TestBrowser" in ua_echo
 
@@ -689,7 +689,7 @@ class TestBrowserHTTPSessionNetwork:
         b = BrowserHTTPSession()
         b.set_cookie("mycookie", "hello")
         resp = b.navigate("https://httpbin.org/cookies")
-        data = resp.to_json()
+        data = resp.json()
         assert data.get("cookies", {}).get("mycookie") == "hello"
 
     def test_follow_link_updates_referrer(self):
@@ -708,6 +708,6 @@ class TestBrowserHTTPSessionNetwork:
             {"username": "alice", "password": "s3cr3t"},
         )
         assert resp.status_code == 200
-        data = resp.to_json()
+        data = resp.json()
         assert data["form"]["username"] == "alice"
 

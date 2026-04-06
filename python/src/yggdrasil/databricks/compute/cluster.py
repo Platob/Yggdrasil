@@ -101,19 +101,14 @@ def _library_sig(lib: Library) -> tuple[str, Any]:
 #: Databricks cluster.  Doing so risks destabilising the Spark/ML runtime.
 PIP_INSTALL_BLACKLIST: frozenset[str] = frozenset({
     "daft",
+    "flask",
     "fastapi",
-    "mlflow",
+    "dash",
     "numpy",
     "pandas",
     "polars",
     "pyarrow",
     "pyspark",
-    "scikit-learn",
-    "sklearn",
-    "tensorflow",
-    "torch",
-    "transformers",
-    "xgboost",
 })
 
 

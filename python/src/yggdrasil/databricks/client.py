@@ -15,7 +15,6 @@ from databricks.sdk.config import Config
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
-from yggdrasil.environ import UserInfo
 from yggdrasil.io import BytesIO, MimeTypes
 from yggdrasil.io.url import URL, URLResource, url_resource_class
 
@@ -294,10 +293,11 @@ class DatabricksClient(URLResource):
     def config(self):
         if self._workspace_config is None or self._account_config is None:
             config = self.make_config()
+            ct = getattr(config, "client_type", ClientType.WORKSPACE)
 
-            if config.client_type == ClientType.WORKSPACE:
+            if ct == ClientType.WORKSPACE:
                 object.__setattr__(self, "_workspace_config", config)
-            elif config.client_type == ClientType.ACCOUNT:
+            elif ct == ClientType.ACCOUNT:
                 object.__setattr__(self, "_account_config", config)
             else:
                 raise ValueError(f"Unexpected client_type in config: {config.client_type}")
@@ -514,17 +514,11 @@ class DatabricksClient(URLResource):
         if update:
             base = dict()
         else:
-            userinfo = UserInfo.current()
-
             base = {
                 k: self.safe_tag_value(v)
                 for k, v in (
                     ("Product", self.product),
                     ("ProductVersion", self.product_version),
-                    ("UserMail", userinfo.email),
-                    ("UserHost", userinfo.hostname),
-                    ("UserURL", userinfo.url),
-                    ("GitURL", userinfo.git_url),
                 )
                 if v
             }
@@ -964,6 +958,7 @@ class DatabricksService(ABC):
         return self.client.tables
 
 
+@dataclass
 class DatabricksResource(ABC):
     service: DatabricksService
 

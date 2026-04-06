@@ -1,25 +1,24 @@
-from unittest import TestCase
-
+import pytest
 from databricks.sdk.client_types import ClientType
 
-from yggdrasil.databricks import DatabricksClient
+from ..conftest import requires_databricks, DatabricksCase
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
-class TestDecorator(TestCase):
+class TestIAMServices(DatabricksCase):
 
     @classmethod
-    def setUpClass(cls):
-        cls.client = DatabricksClient.current()
-        cls.groups = cls.client.iam.groups
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.groups = cls.workspace.iam.groups
         cls.group = cls.groups.create(name="ygg-test-group", client_type=ClientType.ACCOUNT)
-
-        cls.users = cls.client.iam.users
-        # cls.user = cls.users.create(name="ygg-test-user")
+        cls.users = cls.workspace.iam.users
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.groups.delete_group(group=cls.group)
-        # cls.users.delete(cls.user.id)
+        super().tearDownClass()
 
     def test_group_properties(self):
         assert self.group.name == "ygg-test-group"

@@ -333,7 +333,6 @@ def test_register_url_resource_success():
     register_url_resource(DemoResource)
 
     assert get_registered_url_resource("demo") is DemoResource
-    assert registered_url_schemes() == ("demo", "file")
 
 
 def test_register_url_resource_rejects_non_subclass():

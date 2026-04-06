@@ -27,7 +27,6 @@ from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.send_config import SendConfig
 from yggdrasil.io.url import URL
 from yggdrasil.io.user_agents import UserAgentGenerator
-
 from .response import HTTPResponse
 from .session import HTTPSession
 

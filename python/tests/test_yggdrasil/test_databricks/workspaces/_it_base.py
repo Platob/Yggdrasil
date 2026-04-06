@@ -1,56 +1,52 @@
+"""Shared base class for Databricks workspaces integration tests.
+
+Requires ``DATABRICKS_HOST`` to be set — skipped automatically otherwise.
+
+Optional env vars:
+  DATABRICKS_TEST_DBFS_BASE:      default "/tmp/yggdrasil_databricks_path_it"
+  DATABRICKS_TEST_WORKSPACE_BASE: default "/Users/<me>/yggdrasil_databricks_path_it"
+  DATABRICKS_TEST_VOLUME_BASE:    e.g. "/Volumes/<catalog>/<schema>/<volume>/yggdrasil_databricks_path_it"
+"""
+from __future__ import annotations
+
 import os
-import unittest
 
 from yggdrasil.databricks.workspaces import DatabricksPath
+from .._base import DatabricksCase
 
 
-class DatabricksIntegrationBase(unittest.TestCase):
+class DatabricksIntegrationBase(DatabricksCase):
     """
-    Real integration tests. No fakes, no mocks.
+    Real integration tests — no fakes, no mocks.
 
-    Requirements:
-      - Databricks auth configured for databricks-sdk (env vars / config file)
-      - The cluster / workspace must allow DBFS + Workspace API.
-      - Volume tests require an existing UC volume base path.
-
-    Optional env vars:
-      - DATABRICKS_TEST_DBFS_BASE:    default "/tmp/yggdrasil_databricks_path_it"
-      - DATABRICKS_TEST_WORKSPACE_BASE: default "/Users/<me>/yggdrasil_databricks_path_it"
-      - DATABRICKS_TEST_VOLUME_BASE:  e.g. "/Volumes/<catalog>/<schema>/<volume>/yggdrasil_databricks_path_it"
+    Provides ``self.dbfs_base``, ``self.ws_base``, and ``self.vol_base``
+    as :class:`~yggdrasil.databricks.workspaces.DatabricksPath` instances.
     """
 
     @classmethod
-    def setUpClass(cls):
-        from yggdrasil.databricks.workspaces.workspace import Workspace
-
-        cls.workspace = Workspace()
-
-        # hard gate: if auth/network is broken, skip all tests in this file
-        try:
-            cls.workspace.workspace_client().current_user.me()
-        except Exception as e:
-            raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
+    def setUpClass(cls) -> None:
+        super().setUpClass()  # env-var guard + workspace connection
 
         cls.dbfs_root = os.getenv("DATABRICKS_TEST_DBFS_BASE", "/tmp/yggdrasil_databricks_path_it")
         cls.workspace_root = os.getenv(
             "DATABRICKS_TEST_WORKSPACE_BASE",
             f"/Users/{cls.workspace.iam.users.current_user.username}/yggdrasil_databricks_path_it",
         )
-        cls.schema_root = os.getenv(
-            "DATABRICKS_TEST_VOLUME_BASE",
-            "/Volumes/trading/unittest"
-        )  # may be None
+        cls.schema_root = os.getenv("DATABRICKS_TEST_VOLUME_BASE", "/Volumes/trading/unittest")
 
-    def setUp(self):
-        # Unique per test so parallel runs don’t punch each other
+    def setUp(self) -> None:
         self.test_id = "unittest"
+        self.dbfs_base = DatabricksPath(
+            f"{self.dbfs_root}/{self.test_id}", _client=self.workspace
+        )
+        self.ws_base = DatabricksPath(
+            f"{self.workspace_root}/{self.test_id}", _client=self.workspace
+        )
+        self.vol_base = DatabricksPath(
+            f"{self.schema_root}/{self.test_id}", _client=self.workspace
+        )
 
-        self.dbfs_base = DatabricksPath(f"{self.dbfs_root}/{self.test_id}", _client=self.workspace)
-        self.ws_base = DatabricksPath(f"{self.workspace_root}/{self.test_id}", _client=self.workspace)
-        self.vol_base = DatabricksPath(f"{self.schema_root}/{self.test_id}", _client=self.workspace)
-
-    def tearDown(self):
-        # Best-effort cleanup; don’t fail teardown
+    def tearDown(self) -> None:
         for p in (self.vol_base, self.ws_base, self.dbfs_base):
             if p is None:
                 continue
@@ -58,3 +54,4 @@ class DatabricksIntegrationBase(unittest.TestCase):
                 p.rmdir(recursive=True)
             except Exception:
                 pass
+

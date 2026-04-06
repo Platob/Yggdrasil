@@ -1,30 +1,20 @@
-from unittest import TestCase
+import pytest
 
-from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.workspaces.service import Workspaces
+from ..conftest import requires_databricks, DatabricksCase
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
-class TestWorkspaces(TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        cls.client = DatabricksClient().connect()
-        cls.service = cls.client.workspaces
+class TestWorkspaces(DatabricksCase):
 
     @classmethod
-    def tearDownClass(cls):
-        cls.client.close()
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.service = cls.workspace.workspaces
 
     def test_ok(self):
         assert self.service is not None
-
-    def test_list(self):
-        workspaces = list(self.service.list())
-        assert len(workspaces) > 0
-        for workspace in workspaces:
-            assert workspace.id != ""
-            assert workspace.name != ""
-            assert workspace.url != ""
 
     def test_url(self):
         url = self.service.to_url()

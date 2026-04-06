@@ -1,18 +1,19 @@
 import datetime as dt
-import unittest
 
 import pyarrow as pa
 import pytest
 
 from yggdrasil.databricks.sql.exceptions import SqlStatementError
-from yggdrasil.databricks.workspaces import Workspace
+from ..conftest import requires_databricks, DatabricksCase
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
-class TestSQLEngine(unittest.TestCase):
+class TestSQLEngine(DatabricksCase):
 
     @classmethod
-    def setUpClass(cls):
-        cls.workspace = Workspace().connect()
+    def setUpClass(cls) -> None:
+        super().setUpClass()
         cls.engine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
 
     def test_insert_read_same(self):

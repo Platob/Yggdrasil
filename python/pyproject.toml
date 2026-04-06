@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.6.12"
+version = "0.6.13"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -90,6 +90,12 @@ Documentation = "https://github.com/Platob/Yggdrasil"
 ygg-api = "yggdrasil.fastapi.main:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+markers = [
+  "integration: marks tests that require a live Databricks workspace (skipped when DATABRICKS_HOST is not set)",
+]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 license-files = ["LICENSE"]

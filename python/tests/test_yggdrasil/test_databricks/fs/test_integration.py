@@ -1,7 +1,7 @@
 """Integration tests — real Databricks API calls.
 
 These require a live Databricks workspace with auth configured.
-Skip automatically when auth is unavailable.
+Skipped automatically when DATABRICKS_HOST is not set.
 """
 from __future__ import annotations
 
@@ -9,9 +9,12 @@ import unittest
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
-from yggdrasil.databricks.fs.path import DatabricksPath
 from ._it_base import DatabricksIntegrationBase
+from ..conftest import requires_databricks
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
 # ══════════════════════════════════════════════════════════════════════════

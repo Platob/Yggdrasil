@@ -1,13 +1,13 @@
-import unittest
-
 import pytest
 from databricks.sdk.errors import ResourceDoesNotExist
 
-from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.secrets.resource import Scope, Secret
+from ..conftest import requires_databricks, DatabricksCase
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
-class TestSecrets(unittest.TestCase):
+class TestSecrets(DatabricksCase):
     """
     Real-world integration tests (no mocking).
 
@@ -18,16 +18,12 @@ class TestSecrets(unittest.TestCase):
       - DATABRICKS_TEST_SCOPE: scope name to use (default: yggdrasil_it_<uuid8>)
       - DATABRICKS_TEST_PRINCIPAL: principal for ACL tests (default: skip ACL tests)
       - DATABRICKS_TEST_NO_CLEANUP=1 to keep created resources for debugging
-
-    Notes:
-      - These tests create a secrets scope + secret key in your workspace.
-      - get_secret may be restricted depending on environment; tests handle that gracefully.
     """
 
     @classmethod
-    def setUpClass(cls):
-        cls.client = DatabricksClient.current()
-        cls.secrets = cls.client.secrets
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.secrets = cls.workspace.secrets
 
     def test_crud(self):
         self.secrets["ygg-test-scope/ygg-test-key"] = "test-value"

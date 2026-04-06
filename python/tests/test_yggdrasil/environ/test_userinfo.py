@@ -30,7 +30,7 @@ def test_cache(userinfo, monkeypatch):
     monkeypatch.setattr(
         userinfo,
         "_current_compute_url",
-        lambda hostname, cwd: calls.__setitem__("url", calls["url"] + 1) or userinfo.URL.parse_str("local://hostA/tmp/x"),
+        lambda *, hostname, cwd: calls.__setitem__("url", calls["url"] + 1) or None,
     )
 
     a = userinfo.get_user_info()

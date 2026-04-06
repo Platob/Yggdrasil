@@ -1,49 +1,36 @@
 # tests/integration/test_databricks_path_integration.py
 from __future__ import annotations
 
-import unittest
-
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
-from yggdrasil.databricks.workspaces import Workspace, DatabricksPath
+from yggdrasil.databricks.workspaces import DatabricksPath
+from ..conftest import requires_databricks, DatabricksCase
+
+pytestmark = [requires_databricks, pytest.mark.integration]
 
 
-class DatabricksIntegrationBase(unittest.TestCase):
-    """
-    Real integration tests. No fakes, no mocks.
-
-    Requirements:
-      - Databricks auth configured for databricks-sdk (env vars / config file)
-      - The cluster / workspace must allow DBFS + Workspace API.
-      - Volume tests require an existing UC volume base path.
-
-    Optional env vars:
-      - DATABRICKS_TEST_DBFS_BASE:    default "/tmp/yggdrasil_databricks_path_it"
-      - DATABRICKS_TEST_WORKSPACE_BASE: default "/Users/<me>/yggdrasil_databricks_path_it"
-      - DATABRICKS_TEST_VOLUME_BASE:  e.g. "/Volumes/<catalog>/<schema>/<volume>/yggdrasil_databricks_path_it"
-    """
+class _PathBase(DatabricksCase):
+    """Path-test base: adds DBFS / Workspace / Volume path fixtures."""
 
     @classmethod
-    def setUpClass(cls):
-        cls.workspace = Workspace().connect()
-
-        # hard gate: if auth/network is broken, skip all tests in this file
-        try:
-            _ = cls.workspace.iam.users.current_user
-        except Exception as e:
-            raise unittest.SkipTest(f"Databricks auth not configured or API not reachable: {e}")
-
-        # Unique per test so parallel runs don’t punch each other
+    def setUpClass(cls) -> None:
+        super().setUpClass()
         cls.test_id = "unittest"
-
-        cls.dbfs_base = DatabricksPath.parse(f"/dbfs/tmp/unittest/{cls.test_id}", client=cls.workspace)
-        cls.ws_base = DatabricksPath.parse(f"/Workspace/Users/{cls.workspace.iam.users.current_user.email}/unittest/{cls.test_id}", client=cls.workspace)
-        cls.vol_base = DatabricksPath.parse(f"/Volumes/trading/unittest/{cls.test_id}", client=cls.workspace)
+        cls.dbfs_base = DatabricksPath.parse(
+            f"/dbfs/tmp/unittest/{cls.test_id}", client=cls.workspace
+        )
+        cls.ws_base = DatabricksPath.parse(
+            f"/Workspace/Users/{cls.workspace.iam.users.current_user.email}/unittest/{cls.test_id}",
+            client=cls.workspace,
+        )
+        cls.vol_base = DatabricksPath.parse(
+            f"/Volumes/trading/unittest/{cls.test_id}", client=cls.workspace
+        )
 
     @classmethod
-    def tearDownClass(cls):
-        # Best-effort cleanup; don’t fail teardown
+    def tearDownClass(cls) -> None:
         for p in (cls.vol_base, cls.ws_base, cls.dbfs_base):
             if p is None:
                 continue
@@ -51,9 +38,10 @@ class DatabricksIntegrationBase(unittest.TestCase):
                 p.rmdir(recursive=True)
             except Exception as e:
                 print(e)
+        super().tearDownClass()
 
 
-class TestDatabricksPathIntegrationDBFS(DatabricksIntegrationBase):
+class TestDatabricksPathIntegrationDBFS(_PathBase):
     def test_dbfs_roundtrip_text(self):
         d = self.dbfs_base / "dir"
         f = d / "hello.txt"
@@ -108,7 +96,7 @@ class TestDatabricksPathIntegrationDBFS(DatabricksIntegrationBase):
         assert len(files) == 0
 
 
-class TestDatabricksPathIntegrationWorkspace(DatabricksIntegrationBase):
+class TestDatabricksPathIntegrationWorkspace(_PathBase):
     def test_workspace_roundtrip_text(self):
         # nested path tests the "parent folder does not exist" retry logic
         d = self.ws_base / "a" / "b"
@@ -160,8 +148,7 @@ class TestDatabricksPathIntegrationWorkspace(DatabricksIntegrationBase):
         d.rmdir()
 
 
-class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
-
+class TestDatabricksPathIntegrationVolumes(_PathBase):
     def test_volume_roundtrip_text(self):
         # Ensure parent directory exists (Files API won’t auto-create parents on upload)
         d = self.vol_base / "nested"
@@ -221,10 +208,12 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         d = self.vol_base / "datafolder"
         f = d / "data.parquet"
 
-        table = pa.table({
-            "col1": [1, 2, 3],
-            "col2": ["a", "b", "c"]
-        })
+        table = pa.table(
+            {
+                "col1": [1, 2, 3],
+                "col2": ["a", "b", "c"],
+            }
+        )
 
         with f.open("wb") as out:
             pq.write_table(table, out)
@@ -240,10 +229,12 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
         filepath = self.vol_base / "file.parquet"
         folder_path = self.vol_base / "folder.parquet/"
 
-        my_arrow_table = pa.table({
-            "col1": [1, 2, 3],
-            "col2": ["a", "b", "c"]
-        })
+        my_arrow_table = pa.table(
+            {
+                "col1": [1, 2, 3],
+                "col2": ["a", "b", "c"],
+            }
+        )
 
         filepath.write_table(my_arrow_table)
         folder_path.write_table(my_arrow_table)
@@ -264,10 +255,12 @@ class TestDatabricksPathIntegrationVolumes(DatabricksIntegrationBase):
     def test_pyarrow_filesystem(self):
         folder_path = self.vol_base / "arrow_dataset"
 
-        my_arrow_table = pa.table({
-            "col1": [1, 2, 3],
-            "col2": ["a", "b", "c"]
-        })
+        my_arrow_table = pa.table(
+            {
+                "col1": [1, 2, 3],
+                "col2": ["a", "b", "c"],
+            }
+        )
 
         folder_path.mkdir()
 

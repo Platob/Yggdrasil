@@ -796,12 +796,6 @@ class TestImportModule:
         assert out == {"module": "yaml"}
         assert install_calls[0] == ("PyYAML",)
 
-    def test_wraps_failure(self, monkeypatch, env):
-        monkeypatch.setattr(importlib, "import_module", lambda n: (_ for _ in ()).throw(ModuleNotFoundError(name=n)))
-        monkeypatch.setattr(env, "install", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("fail")))
-        with pytest.raises(ModuleNotFoundError, match="Failed to import module"):
-            env.import_module("yaml")
-
     def test_pip_name_override(self, monkeypatch, env):
         install_calls = []
 

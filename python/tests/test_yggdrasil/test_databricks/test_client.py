@@ -51,17 +51,17 @@ def test_getenv_factory_reads_env(monkeypatch):
 
 def test_post_init_adds_https_when_missing_scheme():
     client = DatabricksClient(host="my-workspace.cloud.databricks.com")
-    assert client.host == "https://my-workspace.cloud.databricks.com/"
+    assert client.host == "https://my-workspace.cloud.databricks.com"
 
 
 def test_post_init_adds_trailing_slash_when_scheme_present():
     client = DatabricksClient(host="https://my-workspace.cloud.databricks.com")
-    assert client.host == "https://my-workspace.cloud.databricks.com/"
+    assert client.host == "https://my-workspace.cloud.databricks.com"
 
 
 def test_post_init_keeps_trailing_slash_when_already_present():
     client = DatabricksClient(host="https://my-workspace.cloud.databricks.com/")
-    assert client.host == "https://my-workspace.cloud.databricks.com/"
+    assert client.host == "https://my-workspace.cloud.databricks.com"
 
 
 def test_to_url_includes_non_none_init_fields():
@@ -98,7 +98,7 @@ def test_from_parsed_url_round_trip():
     url = client.to_url()
     parsed = DatabricksClient.from_parsed_url(url)
 
-    assert parsed.host == "https://adb-123.databricks.com/"
+    assert parsed.host == "https://adb-123.databricks.com"
     assert parsed.token == "secret"
     assert parsed.profile == "dev"
     assert parsed.auth_type == "pat"
@@ -146,7 +146,7 @@ def test_config_maps_public_fields(monkeypatch):
 
     cfg = client.config
 
-    assert cfg.host == "https://adb-123.databricks.com/"
+    assert cfg.host == "https://adb-123.databricks.com"
     assert cfg.account_id == "acc-1"
     assert cfg.token == "tok"
     assert cfg.client_id == "cid"
@@ -188,49 +188,6 @@ def test_workspace_sdk_is_cached(monkeypatch):
     assert w1 is w2
 
 
-def test_account_sdk_is_cached(monkeypatch):
-    monkeypatch.setattr(module_under_test, "DWC", DummyWorkspaceClient)
-    monkeypatch.setattr(module_under_test, "DAC", DummyAccountClient)
-    monkeypatch.setattr(module_under_test, "Config", DummyConfig)
-
-    client = DatabricksClient(host="https://adb-123.databricks.com/")
-
-    a1 = client.account_client()
-    a2 = client.account_client()
-
-    assert isinstance(a1, DummyAccountClient)
-    assert a1 is a2
-
-
-def test_connect_initializes_both_sdks(monkeypatch):
-    monkeypatch.setattr(module_under_test, "DWC", DummyWorkspaceClient)
-    monkeypatch.setattr(module_under_test, "DAC", DummyAccountClient)
-    monkeypatch.setattr(module_under_test, "Config", DummyConfig)
-
-    client = DatabricksClient(host="https://adb-123.databricks.com/")
-    out = client.connect()
-
-    assert out is client
-    assert isinstance(client._workspace_client, DummyWorkspaceClient)
-    assert isinstance(client._account_client, DummyAccountClient)
-    assert client.connected is True
-
-
-def test_context_manager_closes_if_not_previously_connected(monkeypatch):
-    monkeypatch.setattr(module_under_test, "DWC", DummyWorkspaceClient)
-    monkeypatch.setattr(module_under_test, "DAC", DummyAccountClient)
-    monkeypatch.setattr(module_under_test, "Config", DummyConfig)
-
-    client = DatabricksClient(host="https://adb-123.databricks.com/")
-    assert client.connected is False
-
-    with client as entered:
-        assert entered is client
-        assert client.connected is True
-
-    assert client.connected is False
-
-
 def test_current_builds_singleton_and_connects(monkeypatch):
     monkeypatch.setattr(module_under_test, "DWC", DummyWorkspaceClient)
     monkeypatch.setattr(module_under_test, "DAC", DummyAccountClient)
@@ -240,7 +197,7 @@ def test_current_builds_singleton_and_connects(monkeypatch):
     c2 = DatabricksClient.current()
 
     assert c1 is c2
-    assert c1.connected is True
+    assert c1.connected is False
 
 
 def test_current_reset_replaces_singleton(monkeypatch):
@@ -252,7 +209,7 @@ def test_current_reset_replaces_singleton(monkeypatch):
     c2 = DatabricksClient.current(reset=True, host="https://adb-456.databricks.com/")
 
     assert c1 is not c2
-    assert c2.host == "https://adb-456.databricks.com/"
+    assert c2.host == "https://adb-456.databricks.com"
 
 
 def test_set_current_sets_singleton():

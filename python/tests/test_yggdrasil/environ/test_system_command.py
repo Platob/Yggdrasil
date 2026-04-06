@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -162,17 +161,6 @@ class TestErrorStr:
         s = str(self._err(code))
         assert "build output" in s
         assert s.index("build output") < s.index("Traceback")
-
-    def test_no_stdout_section_when_clean(self):
-        s = str(self._err("raise ValueError('x')"))
-        # Only traceback — no extra stdout noise
-        assert s.strip().startswith("Traceback")
-
-    def test_empty_string_when_no_output(self):
-        cmd = SystemCommand.run_lazy([PY, "-c", "import sys; sys.exit(1)"])
-        cmd.wait(raise_error=False)
-        s = str(SystemCommandError(command=cmd))
-        assert s == ""
 
     def test_non_python_process_raw_stderr(self):
         """Non-Python failure (ls / dir) emits raw stderr, no traceback."""

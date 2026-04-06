@@ -439,7 +439,7 @@ class Table(DatabricksResource):
         target_file_size: Optional[int] = None,
         column_mapping_mode: Optional[str] = None,
         wait_result: bool = True,
-        auto_tag: bool = True,
+        auto_tag: bool = False,
     ) -> "Table":
         """Generate and execute a ``CREATE TABLE`` DDL statement."""
         schema = Schema.from_any(description)
