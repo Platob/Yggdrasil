@@ -21,19 +21,21 @@ __all__ = [
 ]
 
 
-def _to_bytes(value: object) -> bytes:
+def _to_bytes(value: Any) -> bytes:
     if value is None:
         return b""
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):
         return value.encode("utf-8")
+    if isinstance(value, bool):
+        return b"true" if value else b"false"
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _normalize_metadata(
-    metadata: dict[bytes | str, bytes | str | object] | None,
-    tags: dict[bytes | str, bytes | str | object] | None,
+    metadata: dict[Any, Any] | None,
+    tags: dict[Any, Any] | None,
 ) -> dict[bytes, bytes] | None:
     if not metadata and not tags:
         return None
@@ -131,11 +133,32 @@ class Field:
         return False
 
     @property
+    def primary_key(self) -> bool:
+        if self.metadata:
+            v = self.metadata.get(b"t:primary_key")
+            if v:
+                return v.startswith(b"t")
+        return False
+
+    @property
+    def foreign_key(self) -> str | None:
+        """Dotted FK reference ``catalog.schema.table.column`` stored in
+        ``t:foreign_key`` field metadata, or ``None`` when not set."""
+        if self.metadata:
+            v = self.metadata.get(b"t:foreign_key")
+            if v:
+                return v.decode("utf-8") if isinstance(v, bytes) else str(v)
+        return None
+
+    @property
     def tags(self) -> dict[bytes, bytes]:
         if not self.metadata:
             return {}
 
         return {k[2:]: v for k, v in self.metadata.items() if k.startswith(b"t:")}
+
+    def is_timestamp(self):
+        return pa.types.is_timestamp(self.arrow_type) or pa.types.is_date(self.arrow_type)
 
     def copy(
         self,
@@ -163,125 +186,19 @@ class Field:
         name = self.name.lower()
         dtype = self.arrow_type
 
-        # ---- dtype family tags
-        if pa.types.is_boolean(dtype):
-            inferred["kind"] = "boolean"
-        elif pa.types.is_integer(dtype):
-            inferred["kind"] = "integer"
-            inferred["numeric"] = True
-        elif pa.types.is_floating(dtype):
-            inferred["kind"] = "float"
-            inferred["numeric"] = True
-        elif pa.types.is_decimal(dtype):
-            inferred["kind"] = "decimal"
-            inferred["numeric"] = True
-        elif pa.types.is_timestamp(dtype):
-            inferred["kind"] = "timestamp"
-            inferred["temporal"] = True
-        elif pa.types.is_date(dtype):
-            inferred["kind"] = "date"
-            inferred["temporal"] = True
-        elif pa.types.is_time(dtype):
-            inferred["kind"] = "time"
-            inferred["temporal"] = True
-        elif pa.types.is_duration(dtype):
-            inferred["kind"] = "duration"
-            inferred["temporal"] = True
-        elif pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-            inferred["kind"] = "string"
-        elif pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
-            inferred["kind"] = "binary"
-        elif (
-            pa.types.is_list(dtype)
-            or pa.types.is_large_list(dtype)
-            or pa.types.is_fixed_size_list(dtype)
-        ):
-            inferred["kind"] = "list"
-            inferred["nested"] = True
-        elif pa.types.is_struct(dtype):
-            inferred["kind"] = "struct"
-            inferred["nested"] = True
-        elif pa.types.is_map(dtype):
-            inferred["kind"] = "map"
-            inferred["nested"] = True
-        else:
-            inferred["kind"] = str(dtype)
-
-        inferred["nullable"] = self.nullable
-
-        # ---- timezone from Arrow timestamp type
-        if pa.types.is_timestamp(dtype):
-            unit = getattr(dtype, "unit", None)
-
-            if unit:
-                inferred["unit"] = str(unit)
-
-            tz = getattr(dtype, "tz", None)
-            if tz:
-                inferred["tz"] = tz
-
         # ---- semantic name tags
-        if name == "id" or name.endswith("_id") or name.endswith("id"):
-            inferred.setdefault("role", "identifier")
-
-        if (
-            name in {"ts", "timestamp"}
-            or name.endswith("_ts")
-            or name.endswith("_timestamp")
-        ):
-            inferred["temporal"] = True
-            inferred.setdefault("role", "event_time")
-
-        if name == "date" or name.endswith("_date"):
-            inferred["temporal"] = True
-            inferred.setdefault("role", "date")
-
-        if name == "dt" or name.endswith("_dt"):
-            inferred["temporal"] = True
-
-        if "created_at" in name:
-            inferred["temporal"] = True
-            inferred["role"] = "created_at"
-
-        if "updated_at" in name:
-            inferred["temporal"] = True
-            inferred["role"] = "updated_at"
-
-        if "deleted_at" in name:
-            inferred["temporal"] = True
-            inferred["role"] = "deleted_at"
-
-        if name.startswith("is_") or name.startswith("has_") or name.endswith("_flag"):
-            inferred.setdefault("role", "flag")
-
-        if "price" in name:
-            inferred.setdefault("role", "price")
-            inferred["numeric"] = True
-
-        if any(
-            token in name
-            for token in ("qty", "quantity", "volume", "count", "size", "amount")
-        ):
-            inferred.setdefault("role", "measure")
-            inferred["numeric"] = True
-
-        if any(
-            token in name
-            for token in ("name", "label", "desc", "description", "comment")
-        ):
-            inferred.setdefault("role", "attribute")
-
-        if any(
-            token in name
-            for token in ("country", "region", "area", "zone", "market", "book", "desk")
-        ):
-            inferred.setdefault("role", "dimension")
+        if not self.primary_key:
+            if name == "id" and pa.types.is_integer(dtype):
+                inferred["primary_key"] = True
 
         if self.partition_by:
             inferred["partition_by"] = True
 
         if self.cluster_by:
             inferred["cluster_by"] = True
+
+        if self.primary_key:
+            inferred["primary_key"] = True
 
         # explicit existing tags win
         merged_tags: dict[bytes, bytes] = {
@@ -295,7 +212,10 @@ class Field:
             name=self.name,
             arrow_type=self.arrow_type,
             nullable=self.nullable,
-            metadata=_merge_metadata_and_tags(self.metadata, merged_tags),
+            metadata=_merge_metadata_and_tags(
+                self.metadata,
+                _normalize_metadata(None, tags=merged_tags)
+            ),
         )
 
     @classmethod

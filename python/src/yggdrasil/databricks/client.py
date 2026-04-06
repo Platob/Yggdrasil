@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
     from .sql.tables import Tables
+    from .sql.columns import Columns
+    from .sql.catalogs import Catalogs
     from .sql.warehouse import SQLWarehouse
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -812,6 +814,37 @@ class DatabricksClient(URLResource):
         )
 
     @property
+    def columns(self) -> "Columns":
+        """Collection-level Unity Catalog column service for this client."""
+        from .sql.columns import Columns
+
+        return self.lazy_property(
+            self,
+            cache_attr="_columns_svc",
+            factory=lambda: Columns(client=self),
+            use_cache=True,
+        )
+
+    @property
+    def catalogs(self) -> "Catalogs":
+        """Collection-level Unity Catalog hierarchy service for this client.
+
+        Provides dict-like access to catalogs, schemas, and tables::
+
+            client.catalogs["main"]                   # Catalog
+            client.catalogs["main"]["sales"]          # Schema
+            client.catalogs["main"]["sales"]["orders"]  # Table
+        """
+        from .sql.catalogs import Catalogs
+
+        return self.lazy_property(
+            self,
+            cache_attr="_catalogs",
+            factory=lambda: Catalogs(client=self),
+            use_cache=True,
+        )
+
+    @property
     def genie(self) -> "Genie":
         """Genie conversation and space management helper for this client."""
         from .ai.genie import Genie
@@ -969,6 +1002,11 @@ class DatabricksService(ABC):
     def tables(self) -> "Tables":
         """Collection-level Unity Catalog table service (shorthand for ``client.tables``)."""
         return self.client.tables
+
+    @property
+    def catalogs(self) -> "Catalogs":
+        """Collection-level Unity Catalog hierarchy service (shorthand for ``client.catalogs``)."""
+        return self.client.catalogs
 
     @property
     def genie(self) -> "Genie":

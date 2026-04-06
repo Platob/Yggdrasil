@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Iterator
+from typing import Optional, Iterator, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
@@ -30,6 +30,10 @@ from yggdrasil.databricks.sql.types import quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .table import Table
+
+if TYPE_CHECKING:
+    from .catalog import Catalog
+    from .schema import Schema
 
 __all__ = ["Tables"]
 
@@ -119,6 +123,48 @@ class Tables(DatabricksService):
             catalog_name=catalog_name or self.catalog_name,
             schema_name=schema_name or self.schema_name,
             table_name=table_name or self.table_name,
+        )
+
+    def catalog(self, name: Optional[str] = None) -> "Catalog":
+        """Return a :class:`Catalog` using this service's client.
+
+        Args:
+            name: Catalog name (falls back to ``self.catalog_name``).
+        """
+        from .catalog import Catalog as _Catalog
+        from .catalogs import Catalogs
+        return _Catalog(
+            service=Catalogs(client=self.client),
+            catalog_name=name or self.catalog_name,
+        )
+
+    def schema(
+        self,
+        name: Optional[str] = None,
+        *,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+    ) -> "Schema":
+        """Return a :class:`Schema` using this service's client.
+
+        Args:
+            name:         Two-part ``"catalog.schema"`` name (optional if
+                          *catalog_name* / *schema_name* are provided).
+            catalog_name: Override catalog (falls back to ``self.catalog_name``).
+            schema_name:  Override schema (falls back to ``self.schema_name``).
+        """
+        from .schema import Schema as _Schema
+        from .catalogs import Catalogs
+
+        if name and "." in name:
+            parts = [p.strip().strip("`") for p in name.split(".", 1)]
+            catalog_name = catalog_name or parts[0]
+            schema_name = schema_name or parts[1]
+
+        return _Schema(
+            service=Catalogs(client=self.client),
+            catalog_name=catalog_name or self.catalog_name,
+            schema_name=schema_name or self.schema_name,
         )
 
     # -------------------------------------------------------------------------

@@ -423,7 +423,7 @@ class PreparedRequest:
         return f"{self.__class__.__name__}<{self.method} {self.url.to_string()!r}>"
 
     def __str__(self) -> str:
-        return self.__repr__()
+        return self.url.to_string()
 
     @classmethod
     def parse(

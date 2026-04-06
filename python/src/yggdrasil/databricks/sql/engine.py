@@ -1,21 +1,93 @@
 """
-Databricks SQL engine utilities and helpers.
+Databricks SQL engine utilities.
 
-This module provides a thin “do the right thing” layer over:
-- Databricks SQL Statement Execution API (warehouse)
-- Spark SQL / Delta Lake (when running inside a Spark-enabled context)
+This module provides a thin execution and table-management layer across two
+Databricks runtimes:
 
-It includes helpers to:
-- Build fully-qualified table names
-- Execute SQL via Spark or Databricks SQL API
-- Insert Arrow/Spark/tabular data into Delta tables (append/overwrite/merge)
-- Generate DDL from Arrow schemas
+- Spark SQL / Delta Lake, when a SparkSession is available
+- Databricks SQL Statement Execution API, when running outside Spark
 
-Design goals:
-- Prefer Spark execution when running inside Databricks with an active SparkSession.
-- Otherwise, use the Warehouse Statement Execution API.
-- Keep behavior consistent between Spark and SQL paths (especially MERGE semantics).
-- Be safe by default: quote identifiers, escape SQL strings, validate column references.
+It is designed to keep read and write behavior as consistent as possible
+between both paths, especially for Delta insert and merge workflows.
+
+Core capabilities
+-----------------
+- Resolve catalog/schema-scoped table handles
+- Execute SQL through Spark or Databricks SQL warehouses
+- Insert Arrow, Spark, pandas, polars, dict/list, and similar tabular inputs
+  into Delta tables
+- Support append, overwrite, and merge-style upsert semantics
+- Create tables from schemas or input data when needed
+
+Execution model
+---------------
+The engine chooses the execution backend as follows:
+
+1. If `engine="spark"` is explicitly requested, Spark SQL is used
+2. If `engine="api"` is explicitly requested, the Databricks SQL API is used
+3. If no engine is provided:
+   - Spark is used when an active SparkSession is available
+   - otherwise the Databricks SQL warehouse API is used
+
+Write paths
+-----------
+Two write strategies are supported:
+
+Spark path
+    Used when a SparkSession is available or when the input is already a Spark
+    DataFrame. Data is written directly into Delta tables and MERGE semantics
+    are implemented through Delta APIs.
+
+Warehouse SQL path
+    Used when Spark is not available. Input data is converted to Parquet,
+    staged into a temporary Databricks volume, and then inserted or merged into
+    the target Delta table through SQL.
+
+Save modes
+----------
+- `append`
+    Insert-only behavior. When `match_by` is provided, only non-matching rows
+    are inserted.
+
+- `overwrite`
+    Full replacement behavior. The target table is dropped first, then data is
+    written back with plain insert/append logic.
+
+- `truncate`
+    In-place replacement behavior.  The table structure is preserved.
+
+    * Without ``match_by``: ``TRUNCATE TABLE`` empties the table, then all
+      rows from the input are inserted.
+    * With ``match_by``: a targeted ``DELETE`` removes every existing row
+      whose key appears in the input, then all rows from the input are
+      inserted.  This avoids a full table scan while keeping the schema intact.
+
+- `auto`
+    Default behavior. When `match_by` is provided, matching rows are updated
+    and new rows are inserted.
+
+Merge semantics
+---------------
+When `match_by` is provided, merge conditions are built using Databricks
+null-safe equality (`<=>`) by default so NULL matches NULL.
+
+- `append` + `match_by`
+    Insert-only merge
+
+- `auto` + `match_by`
+    Upsert merge
+
+- `overwrite`
+    Table is dropped first, so merge logic is skipped
+
+Safety and consistency
+----------------------
+This module is intended to be safe by default:
+
+- SQL identifiers are quoted
+- merge conditions are generated from explicit key columns
+- schemas are aligned through cast options before writing
+- Spark and SQL paths follow the same overwrite and merge rules
 """
 
 from __future__ import annotations
@@ -23,13 +95,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Union, Any, Dict, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.dataclasses import ExpiringDict, WaitingConfigArg, WaitingConfig
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import BytesIO
 from yggdrasil.io.buffer.media_io import MediaIO
@@ -40,17 +112,18 @@ from yggdrasil.io.enums.media_type import MediaTypes
 from .statement_result import StatementResult
 from .table import Table
 from .tables import Tables
-from .types import quote_ident
-from .warehouse import SQLWarehouse, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+from .types import quote_ident, PrimaryKeySpec, ForeignKeySpec
+from .warehouse import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME, SQLWarehouse
 from ..client import DatabricksService
 from ..fs.path import DatabricksPath
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    import pyspark
     import pandas
     import polars
+    import pyspark
+    from pyspark.sql import SparkSession
 
 __all__ = [
     "SQLEngine",
@@ -66,20 +139,24 @@ def _build_match_condition(
     null_safe: bool = True,
 ) -> str:
     """
-    Build a join/match condition for merge keys.
+    Build a SQL equality condition for merge keys.
+
+    Each key is compared between the left and right aliases using either
+    null-safe equality (`<=>`) or standard equality (`=`).
 
     Args:
         match_by:
-            Key columns used for matching.
+            Column names used as merge keys.
         left_alias:
-            SQL alias for the target/left side.
+            Alias for the target relation.
         right_alias:
-            SQL alias for the source/right side.
+            Alias for the source relation.
         null_safe:
-            If True, use Databricks SQL null-safe equality (<=>), so NULL matches NULL.
+            When True, use Databricks null-safe equality so NULL matches NULL.
 
     Returns:
-        SQL condition string like:
+        SQL predicate joined with `AND`, for example:
+
             t.`id` <=> s.`id` AND t.`ts` <=> s.`ts`
     """
     op = "<=>" if null_safe else "="
@@ -91,21 +168,65 @@ def _build_match_condition(
 
 @dataclass(frozen=True)
 class SQLEngine(DatabricksService):
-    """Execute SQL statements and manage tables via Databricks SQL / Spark."""
+    """
+    Unified SQL execution and Delta table write engine for Databricks.
+
+    `SQLEngine` provides a single interface for:
+
+    - executing SQL through Spark or Databricks SQL warehouses
+    - resolving catalog/schema-scoped tables
+    - inserting tabular data into Delta tables
+    - applying append, overwrite, or merge/upsert semantics
+    - performing optional post-write maintenance such as OPTIMIZE or VACUUM
+
+    The engine prefers Spark execution when a SparkSession is available and
+    falls back to the Databricks SQL Statement Execution API otherwise.
+
+    Scope
+    -----
+    An engine instance may be bound to a default catalog, schema, and warehouse.
+    The instance is lightweight and can be re-scoped by calling it:
+
+        engine(catalog_name="main", schema_name="analytics")
+
+    This returns a new engine sharing the same client and query cache.
+
+    Notes
+    -----
+    - Spark and warehouse paths are intended to behave consistently
+    - overwrite mode always drops the table before reinserting
+    - merge behavior is enabled only when `match_by` is provided
+    """
+
     catalog_name: Optional[str] = None
     schema_name: Optional[str] = None
-    default_warehouse: Optional[SQLWarehouse] = field(default=None, repr=False, hash=False, compare=False)
+    default_warehouse: Optional[SQLWarehouse] = field(
+        default=None,
+        repr=False,
+        hash=False,
+        compare=False,
+    )
 
-    _last_default_wh_check: int = field(default=0, init=False, repr=False, hash=False, compare=False)
-    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(default=ExpiringDict, init=False, repr=False, hash=False, compare=False)
-
-    # -------------------------------------------------------------------------
-    # Sub-services
-    # -------------------------------------------------------------------------
+    _last_default_wh_check: int = field(
+        default=0,
+        init=False,
+        repr=False,
+        hash=False,
+        compare=False,
+    )
+    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(
+        default=ExpiringDict,
+        init=False,
+        repr=False,
+        hash=False,
+        compare=False,
+    )
 
     @property
-    def tables(self) -> "Tables":
-        """Unity Catalog :class:`Tables` service scoped to this engine's catalog/schema."""
+    def tables(self) -> Tables:
+        """
+        Return the `Tables` service scoped to this engine's catalog and schema.
+        """
         return Tables(
             client=self.client,
             catalog_name=self.catalog_name,
@@ -117,13 +238,34 @@ class SQLEngine(DatabricksService):
         *,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
-        warehouse: Optional[SQLWarehouse | str] = None
-    ):
+        warehouse: Optional[SQLWarehouse | str] = None,
+    ) -> SQLEngine:
+        """
+        Return a re-scoped engine.
+
+        If no scope changes are provided, the current instance is returned.
+        If the requested scope is identical to the current scope, the current
+        instance is also returned.
+
+        Args:
+            catalog_name:
+                Catalog override for the returned engine.
+            schema_name:
+                Schema override for the returned engine.
+            warehouse:
+                Default warehouse override. May be a warehouse instance or a
+                warehouse name.
+
+        Returns:
+            A new `SQLEngine` sharing the same client and query cache, or the
+            current instance if no change is needed.
+        """
         if catalog_name is None and schema_name is None and warehouse is None:
             return self
 
         if (
-            catalog_name == self.catalog_name and schema_name == self.schema_name
+            catalog_name == self.catalog_name
+            and schema_name == self.schema_name
             and warehouse == self.default_warehouse
         ):
             return self
@@ -135,16 +277,11 @@ class SQLEngine(DatabricksService):
             client=self.client,
             catalog_name=catalog_name,
             schema_name=schema_name,
-            default_warehouse= warehouse
+            default_warehouse=warehouse,
         )
 
         object.__setattr__(built, "_cached_queries", self._cached_queries)
-
         return built
-
-    # -------------------------------------------------------------------------------------
-    # Warehouse + AI session
-    # -------------------------------------------------------------------------------------
 
     def warehouse(
         self,
@@ -152,21 +289,22 @@ class SQLEngine(DatabricksService):
         warehouse_name: Optional[str] = None,
     ) -> SQLWarehouse:
         """
-        Resolve and cache a Databricks SQL warehouse.
+        Resolve the warehouse used by this engine.
 
         Behavior:
-        - If no warehouse is cached, try to find one (including a starter warehouse).
-        - If none found, create or update a warehouse according to workspace policy.
-        - Always returns a resolved warehouse (or raises if resolution fails).
+        - If no default warehouse is cached, resolve one and cache it
+        - If a warehouse override is provided, resolve that warehouse directly
+        - If the cached default is the all-purpose serverless placeholder,
+          periodically refresh it
 
         Args:
             warehouse_id:
-                Optional explicit warehouse ID to resolve.
+                Explicit warehouse ID to resolve.
             warehouse_name:
-                Optional warehouse name to resolve.
+                Explicit warehouse name to resolve.
 
         Returns:
-            Resolved :class:`SQLWarehouse`.
+            A resolved `SQLWarehouse` instance.
         """
         if self.default_warehouse is None:
             wh = SQLWarehouse(
@@ -176,32 +314,35 @@ class SQLEngine(DatabricksService):
             )
 
             object.__setattr__(self, "_last_default_wh_check", time.time())
-            object.__setattr__(self, "default_warehouse", wh.find_warehouse(
-                warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name,
-                find_default=True,
-                raise_error=True
-            ))
-
+            object.__setattr__(
+                self,
+                "default_warehouse",
+                wh.find_warehouse(
+                    warehouse_id=warehouse_id,
+                    warehouse_name=warehouse_name,
+                    find_default=True,
+                    raise_error=True,
+                ),
+            )
             return self.default_warehouse
 
         if warehouse_id or warehouse_name:
             return self.warehouses.find_warehouse(
                 warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name
+                warehouse_name=warehouse_name,
             )
 
         if self.default_warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
             now_s = time.time()
             if (now_s - self._last_default_wh_check) > 30:
-                object.__setattr__(self, "default_warehouse", self.default_warehouse.find_default())
+                object.__setattr__(
+                    self,
+                    "default_warehouse",
+                    self.default_warehouse.find_default(),
+                )
                 object.__setattr__(self, "_last_default_wh_check", now_s)
 
         return self.default_warehouse
-
-    # -------------------------------------------------------------------------------------
-    # Execution
-    # -------------------------------------------------------------------------------------
 
     def execute(
         self,
@@ -217,56 +358,69 @@ class SQLEngine(DatabricksService):
         warehouse_name: Optional[str] = None,
         byte_limit: Optional[int] = None,
         cache_for: WaitingConfigArg = None,
-        spark_session: Optional["SparkSession"] = None
+        spark_session: Optional["SparkSession"] = None,
     ) -> StatementResult:
         """
-        Execute a SQL statement using either Spark SQL or the Databricks SQL Statement Execution API.
+        Execute a SQL statement through Spark or the Databricks SQL API.
 
-        Engine selection:
-          - If `engine="spark"`, executes using the active SparkSession.
-          - If `engine="api"`, executes using the SQL warehouse API.
-          - If `engine` is None, defaults to Spark when running inside Databricks with a Spark environment;
-            otherwise uses the warehouse API.
+        Engine selection
+        ----------------
+        - `engine="spark"` forces Spark SQL
+        - `engine="api"` forces warehouse API execution
+        - `engine=None` auto-selects Spark when a SparkSession is available,
+          otherwise falls back to the warehouse API
 
-        Waiting behavior (API engine only):
-          - `wait=True` blocks until the statement reaches a terminal state.
-          - `wait=False` returns immediately with a handle; callers can wait later via `StatementResult.wait()`.
+        Cache behavior
+        --------------
+        When `cache_for` is provided, results are cached by the normalized SQL
+        statement text for the specified TTL.
 
         Args:
             statement:
-                SQL statement to execute.
+                SQL text to execute.
             row_limit:
-                Optional row limit applied (Spark: `df.limit()`, API: forwarded to API if supported).
+                Optional row limit. Applied through `limit()` on Spark results
+                or forwarded to the SQL API.
             catalog_name:
-                Optional catalog override for API engine context.
+                Catalog override for warehouse API execution context.
             schema_name:
-                Optional schema override for API engine context.
+                Schema override for warehouse API execution context.
             wait:
-                Whether to wait for completion (API engine only).
+                Waiting configuration for API execution.
+            raise_error:
+                Whether execution errors should be raised.
             engine:
-                Execution engine override: "spark" or "api".
+                Explicit engine override: `"spark"` or `"api"`.
             warehouse_id:
-                Warehouse ID override (API engine).
+                Warehouse ID override for API execution.
             warehouse_name:
-                Warehouse name override (API engine).
+                Warehouse name override for API execution.
             byte_limit:
-                Optional maximum bytes returned for results (API engine only).
+                Optional response byte limit for API execution.
             cache_for:
-                Optional cache time
+                Optional TTL for statement result caching.
+            spark_session:
+                Explicit SparkSession override.
 
         Returns:
-            StatementResult:
-                Unified wrapper over either a Spark DataFrame result or a warehouse API statement result.
+            A `StatementResult` wrapping either a Spark result or a warehouse API
+            statement execution result.
 
         Raises:
             ValueError:
-                If `engine="spark"` is selected but there is no active SparkSession.
+                If Spark execution is requested and no SparkSession can be
+                resolved.
         """
-        # --- Engine auto-detection ---
         if not engine:
-            spark_session = PyEnv.spark_session(
-                create=False, import_error=False, install_spark=False
-            ) if spark_session is None else spark_session
+            spark_session = (
+                PyEnv.spark_session(
+                    create=False,
+                    import_error=False,
+                    install_spark=False,
+                )
+                if spark_session is None
+                else spark_session
+            )
 
             if spark_session is not None:
                 engine = "spark"
@@ -280,19 +434,20 @@ class SQLEngine(DatabricksService):
 
         if cache_for is not None:
             cache_for = WaitingConfig.check_arg(cache_for)
-
             existing = self._cached_queries.get(statement)
-
             if existing is not None:
                 return existing
 
-        # --- Spark path ---
         if engine == "spark":
-            spark_session = PyEnv.spark_session(
-                create=True,
-                install_spark=False,
-                import_error=True
-            ) if spark_session is None else spark_session
+            spark_session = (
+                PyEnv.spark_session(
+                    create=True,
+                    install_spark=False,
+                    import_error=True,
+                )
+                if spark_session is None
+                else spark_session
+            )
 
             df = spark_session.sql(statement)
             if row_limit:
@@ -304,10 +459,8 @@ class SQLEngine(DatabricksService):
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
             )
-
             result.persist(data=df)
         else:
-            # --- Warehouse API path ---
             wh = self.warehouse(
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
@@ -327,15 +480,12 @@ class SQLEngine(DatabricksService):
 
         if cache_for is not None:
             self._cached_queries.set(
-                key=statement, value=result,
-                ttl=cache_for.timeout_total_seconds
+                key=statement,
+                value=result,
+                ttl=cache_for.timeout_total_seconds,
             )
 
         return result
-
-    # -------------------------------------------------------------------------------------
-    # Delta table handle (Spark required)
-    # -------------------------------------------------------------------------------------
 
     def table(
         self,
@@ -344,7 +494,23 @@ class SQLEngine(DatabricksService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-    ):
+    ) -> Table:
+        """
+        Resolve a table handle.
+
+        Args:
+            location:
+                Fully qualified table name.
+            catalog_name:
+                Catalog override when `location` is not fully specified.
+            schema_name:
+                Schema override when `location` is not fully specified.
+            table_name:
+                Table name override when `location` is not provided.
+
+        Returns:
+            A `Table` handle.
+        """
         return self.tables.table(
             location=location,
             catalog_name=catalog_name,
@@ -352,15 +518,15 @@ class SQLEngine(DatabricksService):
             table_name=table_name,
         )
 
-    # -------------------------------------------------------------------------------------
-    # Insert routing
-    # -------------------------------------------------------------------------------------
-
     def insert_into(
         self,
         data: Union[
-            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
-            dict, list, str,
+            pa.Table,
+            pa.RecordBatch,
+            pa.RecordBatchReader,
+            dict,
+            list,
+            str,
             "pandas.DataFrame",
             "polars.DataFrame",
             "pyspark.sql.DataFrame",
@@ -374,58 +540,77 @@ class SQLEngine(DatabricksService):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
+        update_cols: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-        ## Databricks specific
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        table: Optional["Table"] = None,
+        table: Optional[Table] = None,
+        primary_keys: "list[str] | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> None:
         """
-        Insert data into a Delta table.
+        Insert data into a Delta table using the most appropriate backend.
 
-        Routing strategy:
-          - If a SparkSession is available (or `data` is a Spark DataFrame), uses :meth:`spark_insert_into`.
-          - Otherwise uses :meth:`arrow_insert_into` which stages Parquet to a temp volume and executes SQL.
+        Routing behavior
+        ----------------
+        - If a SparkSession is available, use the Spark write path
+        - Otherwise, use the warehouse SQL path with staged Parquet
 
         Args:
             data:
-                Input data. Supported (path-dependent) inputs include:
-                  - Arrow: `pa.Table`, `pa.RecordBatch`, `pa.RecordBatchReader`
-                  - Spark: `pyspark.sql.DataFrame`
-                  - Tabular Python: dict/list, pandas.DataFrame, polars.DataFrame (convertible)
-                  - str: path or special locator (only if your conversion utilities support it)
+                Input data. Supported inputs include Arrow objects, Spark
+                DataFrames, pandas/polars DataFrames, dict/list tabular values,
+                and other project-supported convertible types.
             mode:
-                Save mode/semantics (auto/append/overwrite). Parsed via `SaveMode.from_any`.
+                Save mode controlling append / overwrite / merge semantics.
             location:
-                Fully qualified table name override (catalog.schema.table).
+                Fully qualified destination table.
             catalog_name:
-                Optional catalog override (used when `location` not provided or partial).
+                Catalog override.
             schema_name:
-                Optional schema override (used when `location` not provided or partial).
+                Schema override.
             table_name:
-                Optional table name (used when `location` not provided).
+                Table name override.
             cast_options:
-                Casting rules for aligning input columns to the destination schema.
+                Casting rules used to align input data to the destination schema.
             overwrite_schema:
-                Spark-only: if True, sets write option `overwriteSchema=true`.
+                Spark writer option. When True, writes with
+                `overwriteSchema=true`.
             match_by:
-                Merge key columns. Enables MERGE semantics (upsert/insert-only/overwrite-by-key).
+                Merge key columns enabling key-based insert or upsert behavior.
+            update_cols:
+                Columns to update when a merge key match is found (``mode=auto``
+                only).  ``None`` updates all non-key columns (default).
+                An empty list disables the UPDATE clause entirely (insert-only
+                for matched rows).
             wait:
-                Waiting completion configuration
+                Waiting configuration for the warehouse SQL path.
+            raise_error:
+                Whether write errors should be raised on the warehouse SQL path.
             zorder_by:
-                Columns for Z-ORDER optimization after write (path-dependent support).
+                Optional ZORDER columns for post-write optimization.
             optimize_after_merge:
-                If True, run OPTIMIZE after merge (and ZORDER where supported).
+                Whether to run optimize after merge-related writes.
             vacuum_hours:
-                If set, run VACUUM with the given retention (hours).
+                Optional retention window for VACUUM.
             spark_session:
-                Optional SparkSession override. If not provided, uses active session when available.
+                Explicit SparkSession override.
             spark_options:
-                Optional Spark DataFrameWriter options.
+                Additional Spark DataFrameWriter options.
+            table:
+                Optional pre-resolved table handle.
+            primary_keys:
+                Column name(s) to set as primary key when the table is created
+                by this call.  Composite keys: ``["trade_date", "instrument_id"]``.
+                ``None`` reads from field metadata automatically.
+            foreign_keys:
+                FK constraints to apply when the table is created.
+                Accepts a ``{col: "cat.sch.tbl.col"}`` dict or a list of
+                :class:`~yggdrasil.databricks.sql.types.ForeignKeySpec`.
 
         Returns:
             None.
@@ -437,7 +622,7 @@ class SQLEngine(DatabricksService):
                 spark_session = PyEnv.spark_session(
                     create=False,
                     import_error=False,
-                    install_spark=False
+                    install_spark=False,
                 )
 
         if spark_session is not None:
@@ -451,46 +636,41 @@ class SQLEngine(DatabricksService):
                 cast_options=cast_options,
                 overwrite_schema=overwrite_schema,
                 match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 spark_options=spark_options,
-                table=table
-            )
-        else:
-            return self.arrow_insert_into(
-                data=data,
-                location=location,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name,
-                mode=mode,
-                cast_options=cast_options,
-                overwrite_schema=overwrite_schema,
-                match_by=match_by,
-                wait=wait,
-                raise_error=raise_error,
-                zorder_by=zorder_by,
-                optimize_after_merge=optimize_after_merge,
-                vacuum_hours=vacuum_hours,
-                table=table
+                table=table,
+                primary_keys=primary_keys,
+                foreign_keys=foreign_keys,
             )
 
-    # -------------------------------------------------------------------------------------
-    # Warehouse SQL insert path
-    # -------------------------------------------------------------------------------------
+        return self.arrow_insert_into(
+            data=data,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            mode=mode,
+            cast_options=cast_options,
+            overwrite_schema=overwrite_schema,
+            match_by=match_by,
+            update_cols=update_cols,
+            wait=wait,
+            raise_error=raise_error,
+            zorder_by=zorder_by,
+            optimize_after_merge=optimize_after_merge,
+            vacuum_hours=vacuum_hours,
+            table=table,
+            primary_keys=primary_keys,
+            foreign_keys=foreign_keys,
+        )
 
     def arrow_insert_into(
         self,
-        data: Union[
-            pa.Table,
-            pa.RecordBatch,
-            pa.RecordBatchReader,
-            dict,
-            list,
-            "pandas.DataFrame",
-            "polars.DataFrame",
-        ],
+        data,
         location: Optional[str] = None,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
@@ -499,77 +679,102 @@ class SQLEngine(DatabricksService):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
+        update_cols: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
-        table: Optional["Table"] = None,
-        temp_volume_path: Optional[Union[str, DatabricksPath]] = None,
+        table: Optional[Table] = None,
+        temp_volume_path=None,
+        primary_keys: "list[str] | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> None:
         """
-        Insert data using the warehouse SQL path by staging Parquet files to a temporary volume, then executing
-        SQL INSERT/MERGE into the target Delta table.
+        Insert data through the warehouse SQL path.
 
-        Notes:
-          - If the table does not exist, it is created from the input schema (best-effort) via :meth:`create_table`.
-          - If `match_by` is provided, uses MERGE semantics:
-              * mode=overwrite: delete matching keys, then insert batch (overwrite-by-key)
-              * mode=append: insert-only (no updates)
-              * mode=auto/other: full upsert (update matched + insert new)
-          - If `match_by` is not provided:
-              * mode=overwrite: INSERT OVERWRITE
-              * otherwise: INSERT INTO
-          - Rows with NULL in any match key are filtered out (mirrors Spark path).
+        Implementation
+        --------------
+        - Ensure the destination table exists
+        - Convert input data to Parquet
+        - Stage the Parquet file to a temporary Databricks volume
+        - Execute INSERT INTO or MERGE INTO against the target table
+        - Optionally run OPTIMIZE, ZORDER, and VACUUM
+
+        Behavior
+        --------
+        - `overwrite` drops the target table before inserting
+        - `truncate` (no ``match_by``): ``TRUNCATE TABLE`` then ``INSERT INTO``
+        - `truncate` (with ``match_by``): ``DELETE`` rows whose keys appear in
+          the input, then ``INSERT INTO`` — keeps the schema intact
+        - `match_by` without overwrite/truncate enables MERGE semantics:
+          ``append`` → insert-only; ``auto`` → upsert
+        - rows with NULL in match columns are expected to follow the same merge
+          behavior as the Spark path
 
         Args:
             data:
-                Input data (Arrow or convertible). Non-Arrow inputs may be converted by project utilities.
+                Arrow or Arrow-convertible tabular data.
             location:
-                Fully qualified table name override (catalog.schema.table).
+                Fully qualified destination table.
             catalog_name:
-                Optional catalog override (used when `location` not provided/partial).
+                Catalog override.
             schema_name:
-                Optional schema override (used when `location` not provided/partial).
+                Schema override.
             table_name:
-                Optional table name (used when `location` not provided).
+                Table name override.
             mode:
-                Save mode/semantics (auto/append/overwrite) parsed via `SaveMode.from_any`.
+                Save mode controlling append / overwrite / merge semantics.
             cast_options:
-                Casting rules for aligning staged Parquet columns to destination schema.
+                Casting rules used to align staged data to the destination
+                schema.
             overwrite_schema:
-                Reserved for parity with Spark path (unused in SQL staging path).
+                Reserved for API parity with the Spark path.
             match_by:
-                Merge key columns enabling MERGE behavior.
+                Merge key columns.
+            update_cols:
+                Columns to update when a merge key match is found (``mode=auto``
+                only).  ``None`` updates all non-key columns (default).
+                An empty list disables the UPDATE clause entirely.
             wait:
-                Waiting completion configuration
+                Waiting configuration for statement execution.
+            raise_error:
+                Whether statement execution errors should be raised.
             zorder_by:
-                If set, runs `OPTIMIZE ... ZORDER BY (...)` after inserting.
+                Columns used for `OPTIMIZE ... ZORDER BY (...)`.
             optimize_after_merge:
-                If True and `match_by` is set, runs `OPTIMIZE <table>` after merge (in addition to ZORDER).
+                Whether to run `OPTIMIZE` after merge operations.
             vacuum_hours:
-                If set, runs `VACUUM <table> RETAIN <hours> HOURS`.
+                Optional retention window for `VACUUM`.
+            table:
+                Optional pre-resolved table handle.
             temp_volume_path:
-                Optional staging path override. If not provided, a temp volume path is allocated.
+                Optional explicit staging volume path.
 
         Returns:
             None.
         """
+        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+
         table = Table.parse(
             obj=location if table is None else table,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name,
-            service=self.tables
+            service=self.tables,
         )
 
-        table = table.ensure_created(data)
+        if mode == SaveMode.OVERWRITE:
+            table.delete(wait=True, raise_error=False)
+
+        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
         location = table.full_name(safe=True)
         catalog_name, schema_name = table.catalog_name, table.schema_name
         existing_schema = table.arrow_schema
+
         cast_options = CastOptions.check_arg(
             options=cast_options,
-            target_field=existing_schema
+            target_field=existing_schema,
         )
 
         logger.debug("Inserting %s into %s", data, location)
@@ -592,15 +797,48 @@ class SQLEngine(DatabricksService):
             mio.buffer.seek(0)
             temp_volume_path.write_bytes(mio.buffer.memoryview())
 
-        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
-
         columns = list(existing_schema.names)
-        cols_quoted = ", ".join([quote_ident(c) for c in columns])
+        cols_quoted = ", ".join(quote_ident(c) for c in columns)
 
         statements: list[str] = []
 
-        if match_by:
-            source_sql = f"SELECT {cols_quoted} FROM parquet.{quote_ident(str(temp_volume_path))}"
+        if mode == SaveMode.TRUNCATE:
+            source_sql = (
+                f"SELECT {cols_quoted} "
+                f"FROM parquet.{quote_ident(str(temp_volume_path))}"
+            )
+            insert_sql = f"""INSERT INTO {location} ({cols_quoted})
+{source_sql}""".strip()
+
+            if match_by:
+                # Delete every existing row whose key appears in the incoming
+                # batch, then insert all rows from that batch.
+                key_cols = ", ".join(quote_ident(k) for k in match_by)
+                on_condition = _build_match_condition(
+                    match_by,
+                    left_alias="T",
+                    right_alias="S",
+                    null_safe=True,
+                )
+                delete_sql = f"""DELETE FROM {location} AS T
+USING (
+SELECT DISTINCT {key_cols}
+FROM parquet.{quote_ident(str(temp_volume_path))}
+) AS S
+ON {on_condition}""".strip()
+                statements.extend([delete_sql, insert_sql])
+            else:
+                # Wipe the table in-place (schema kept), then insert all rows.
+                statements.extend([
+                    f"TRUNCATE TABLE {location}",
+                    insert_sql,
+                ])
+
+        elif match_by and mode != SaveMode.OVERWRITE:
+            source_sql = (
+                f"SELECT {cols_quoted} "
+                f"FROM parquet.{quote_ident(str(temp_volume_path))}"
+            )
             on_condition = _build_match_condition(
                 match_by,
                 left_alias="T",
@@ -608,25 +846,10 @@ class SQLEngine(DatabricksService):
                 null_safe=True,
             )
 
-            if mode == SaveMode.OVERWRITE:
-                key_cols = ", ".join([quote_ident(k) for k in match_by])
-
-                delete_sql = f"""DELETE FROM {location} AS T
-USING (
-SELECT DISTINCT {key_cols}
-FROM parquet.{quote_ident(str(temp_volume_path))}
-) AS S
-ON {on_condition}""".strip()
-
-                insert_sql = f"""INSERT INTO {location} ({cols_quoted})
-{source_sql}""".strip()
-
-                statements.extend([delete_sql, insert_sql])
-
-            elif mode == SaveMode.APPEND:
+            if mode == SaveMode.APPEND:
                 insert_clause = (
                     f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                    f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
+                    f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
                 )
 
                 merge_sql = f"""MERGE INTO {location} AS T
@@ -637,17 +860,23 @@ ON {on_condition}
 {insert_clause}""".strip()
 
                 statements.append(merge_sql)
-
             else:
-                update_cols = [c for c in columns if c not in match_by]
+                update_cols_effective = (
+                    update_cols
+                    if update_cols is not None
+                    else [c for c in columns if c not in match_by]
+                )
                 update_clause = ""
-                if update_cols:
-                    update_set = ", ".join([f"T.{quote_ident(c)} = S.{quote_ident(c)}" for c in update_cols])
+                if update_cols_effective:
+                    update_set = ", ".join(
+                        f"T.{quote_ident(c)} = S.{quote_ident(c)}"
+                        for c in update_cols_effective
+                    )
                     update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
 
                 insert_clause = (
                     f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                    f"VALUES ({', '.join([f'S.{quote_ident(c)}' for c in columns])})"
+                    f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
                 )
 
                 merge_sql = f"""MERGE INTO {location} AS T
@@ -659,14 +888,8 @@ ON {on_condition}
 {insert_clause}""".strip()
 
                 statements.append(merge_sql)
-
         else:
-            if mode == SaveMode.OVERWRITE:
-                insert_sql = f"""INSERT OVERWRITE {location}
-SELECT {cols_quoted}
-FROM parquet.{quote_ident(str(temp_volume_path))}"""
-            else:
-                insert_sql = f"""INSERT INTO {location} ({cols_quoted})
+            insert_sql = f"""INSERT INTO {location} ({cols_quoted})
 SELECT {cols_quoted}
 FROM parquet.{quote_ident(str(temp_volume_path))}"""
             statements.append(insert_sql)
@@ -678,19 +901,15 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 else:
                     for stmt in statements[:-1]:
                         self.execute(stmt, wait=True, raise_error=raise_error)
-
                     self.execute(statements[-1], wait=wait, raise_error=raise_error)
         finally:
             if wait:
-                Job.make(
-                    temp_volume_path.remove,
-                    recursive=True,
-                ).fire_and_forget()
+                temp_volume_path.remove()
 
         logger.info("Arrow inserted into %s", location)
 
         if zorder_by:
-            zorder_cols = ", ".join([quote_ident(c) for c in zorder_by])
+            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
             self.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
 
         if optimize_after_merge and match_by:
@@ -700,10 +919,6 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             self.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
 
         return None
-
-    # -------------------------------------------------------------------------------------
-    # Spark insert path
-    # -------------------------------------------------------------------------------------
 
     def spark_insert_into(
         self,
@@ -717,58 +932,78 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
+        update_cols: Optional[list[str]] = None,
+        wait: WaitingConfigArg = True,
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        table: Optional["Table"] = None,
+        table: Optional[Table] = None,
+        primary_keys: "list[str] | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> None:
         """
         Insert data into a Delta table using Spark.
 
-        Accepts a Spark DataFrame or any input convertible to a Spark DataFrame via
-        your project's `any_to_spark_dataframe()` utility.
+        Implementation
+        --------------
+        - Convert input to a Spark DataFrame
+        - Ensure the destination table exists
+        - Write using append or Delta MERGE semantics
+        - Optionally run optimize / ZORDER / vacuum maintenance
 
-        Behavior:
-          - If destination table does not exist: creates it via `saveAsTable(mode="overwrite")`.
-          - If `match_by` is provided: uses Delta MERGE semantics.
-              * mode=overwrite: overwrite-by-key (delete matching keys, then append)
-              * mode=append: insert-only (whenNotMatchedInsertAll)
-              * mode=auto/other: upsert (whenMatchedUpdate + whenNotMatchedInsertAll)
-          - If no `match_by`: uses DataFrameWriter `saveAsTable()` with append/overwrite.
-
-        Notes:
-          - Rows with NULL in any match key are filtered out (mirrors SQL path).
-          - `optimize_after_merge` will only run ZORDER when `zorder_by` is provided.
-          - If `overwrite_schema` is True, sets Spark option `overwriteSchema=true`.
+        Behavior
+        --------
+        - `overwrite` drops the target table before writing
+        - `truncate` (no ``match_by``): ``DeltaTable.delete()`` empties the
+          table in-place, then data is appended
+        - `truncate` (with ``match_by``): Delta MERGE deletes rows whose keys
+          appear in the input, then data is appended
+        - `append` + `match_by` performs insert-only merge
+        - `auto` + `match_by` performs upsert merge; ``update_cols`` controls
+          which columns are updated (default: all non-key columns)
+        - without `match_by`, data is appended directly
+        - ``wait=False`` submits the entire write to a background thread and
+          returns immediately; errors are logged but not re-raised
 
         Args:
             data:
-                Input data convertible to Spark DataFrame.
+                Input data convertible to a Spark DataFrame.
             mode:
-                Save mode/semantics (auto/append/overwrite) parsed via `SaveMode.from_any`.
+                Save mode controlling append / overwrite / merge semantics.
             location:
-                Fully qualified table name override (catalog.schema.table).
+                Fully qualified destination table.
             catalog_name:
-                Optional catalog override (used when `location` not provided/partial).
+                Catalog override.
             schema_name:
-                Optional schema override (used when `location` not provided/partial).
+                Schema override.
             table_name:
-                Optional table name (used when `location` not provided).
+                Table name override.
             cast_options:
-                Casting rules for aligning input columns to destination schema.
+                Casting rules used to align input data to the destination
+                schema.
             overwrite_schema:
-                If True, sets writer option `overwriteSchema=true` (Spark path).
+                When True, passes `overwriteSchema=true` to the Spark writer.
             match_by:
-                Merge key columns enabling MERGE behavior.
+                Merge key columns.
+            update_cols:
+                Columns to update when a merge key match is found (``mode=auto``
+                only).  ``None`` updates all non-key columns (default).
+                An empty list disables the UPDATE clause entirely.
+            wait:
+                When ``True`` (default) the call blocks until the write
+                completes.  When ``False`` the write is submitted to a
+                background thread and the method returns immediately.
             zorder_by:
-                Z-ORDER columns for optimize after merge (requires `optimize_after_merge=True`).
+                Columns used for Delta ZORDER optimization.
             optimize_after_merge:
-                If True and `zorder_by` is provided, runs Delta optimize ZORDER after merge/write.
+                Whether to run optimize after merge-style writes.
             vacuum_hours:
-                If set, runs Delta vacuum with given retention hours.
+                Optional retention window for Delta vacuum.
             spark_options:
-                Spark DataFrameWriter options dict (e.g., {"mergeSchema": "true"}).
+                Additional Spark writer options.
+            table:
+                Optional pre-resolved table handle.
 
         Returns:
             None.
@@ -777,12 +1012,15 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         import pyspark.sql.functions as F
 
         logger.info(
-            "Spark insert into %s (mode=%s, match_by=%s, overwrite_schema=%s)",
+            "Spark insert into %s (mode=%s, match_by=%s, overwrite_schema=%s, wait=%s)",
             location,
             mode,
             match_by,
             overwrite_schema,
+            wait,
         )
+
+        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
 
         if table is None:
             table = self.table(
@@ -792,81 +1030,113 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 table_name=table_name,
             )
 
-        table = table.ensure_created(data)
+        # OVERWRITE: drop before background thread so the slot is freed
+        # synchronously and callers can re-create the table immediately.
+        if mode == SaveMode.OVERWRITE:
+            table.delete(wait=True, raise_error=False)
+
+        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
 
         existing_schema = table.arrow_schema
-        cast_options = CastOptions.check_arg(options=cast_options, target_field=existing_schema)
+        cast_options = CastOptions.check_arg(
+            options=cast_options,
+            target_field=existing_schema,
+        )
         data_df = any_to_spark_dataframe(data, cast_options)
         target = table.delta_spark()
-        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
-        spark_options = spark_options if spark_options else {}
+
+        _spark_options = spark_options if spark_options else {}
         if overwrite_schema:
-            spark_options["overwriteSchema"] = "true"
+            _spark_options["overwriteSchema"] = "true"
 
-        if match_by:
-            cond = _build_match_condition(
-                match_by,
-                left_alias="t",
-                right_alias="s",
-                null_safe=True,
-            )
+        def _run() -> None:
+            if mode == SaveMode.TRUNCATE:
+                cond = _build_match_condition(
+                    match_by,
+                    left_alias="t",
+                    right_alias="s",
+                    null_safe=True,
+                ) if match_by else None
 
-            if mode == SaveMode.OVERWRITE:
-                data_df = data_df.cache()
-                distinct_keys = data_df.select([f"{quote_ident(k)}" for k in match_by]).distinct()
+                if match_by:
+                    logger.info(
+                        "Spark truncate (match_by=%s): Delta delete matching keys", match_by
+                    )
+                    distinct_keys = data_df.select(list(match_by)).distinct()
+                    (
+                        target.alias("t")
+                        .merge(distinct_keys.alias("s"), cond)
+                        .whenMatchedDelete()
+                        .execute()
+                    )
+                else:
+                    logger.info("Spark truncate: Delta delete all rows")
+                    target.delete()
 
+                logger.info("Spark write saveAsTable mode=append (after truncate)")
                 (
-                    target.alias("t")
-                    .merge(distinct_keys.alias("s"), cond)
-                    .whenMatchedDelete()
-                    .execute()
-                )
-
-                (
-                    data_df.write.format("delta")
+                    data_df.write
+                    .format("delta")
                     .mode("append")
-                    .options(**spark_options)
-                    .saveAsTable(location)
+                    .options(**_spark_options)
+                    .saveAsTable(table.full_name())
                 )
 
-            elif mode == SaveMode.APPEND:
-                (
-                    target.alias("t")
-                    .merge(data_df.alias("s"), cond)
-                    .whenNotMatchedInsertAll()
-                    .execute()
+            elif match_by and mode != SaveMode.OVERWRITE:
+                cond = _build_match_condition(
+                    match_by,
+                    left_alias="t",
+                    right_alias="s",
+                    null_safe=True,
                 )
 
+                if mode == SaveMode.APPEND:
+                    (
+                        target.alias("t")
+                        .merge(data_df.alias("s"), cond)
+                        .whenNotMatchedInsertAll()
+                        .execute()
+                    )
+                else:
+                    update_cols_effective = (
+                        update_cols
+                        if update_cols is not None
+                        else [c for c in data_df.columns if c not in match_by]
+                    )
+                    set_expr = {
+                        c: F.expr(f"s.{quote_ident(c)}")
+                        for c in update_cols_effective
+                    }
+                    builder = target.alias("t").merge(data_df.alias("s"), cond)
+                    if set_expr:
+                        builder = builder.whenMatchedUpdate(set=set_expr)
+                    (
+                        builder
+                        .whenNotMatchedInsertAll()
+                        .execute()
+                    )
             else:
-                update_cols = [c for c in data_df.columns if c not in match_by]
-                set_expr = {c: F.expr(f"s.{quote_ident(c)}") for c in update_cols}
-
+                logger.info("Spark write saveAsTable mode=append")
                 (
-                    target.alias("t")
-                    .merge(data_df.alias("s"), cond)
-                    .whenMatchedUpdate(set=set_expr)
-                    .whenNotMatchedInsertAll()
-                    .execute()
+                    data_df.write
+                    .format("delta")
+                    .mode("append")
+                    .options(**_spark_options)
+                    .saveAsTable(table.full_name())
                 )
 
+            if optimize_after_merge and zorder_by:
+                logger.info("Delta optimize + zorder (%s)", zorder_by)
+                target.optimize().executeZOrderBy(*zorder_by)
+
+            if vacuum_hours is not None:
+                logger.info("Delta vacuum retain=%s hours", vacuum_hours)
+                target.vacuum(vacuum_hours)
+
+        if wait:
+            _run()
         else:
-            spark_mode = "overwrite" if mode == SaveMode.OVERWRITE else "append"
-            logger.info("Spark write saveAsTable mode=%s", spark_mode)
-            data_df.write.mode(spark_mode).options(**spark_options).saveAsTable(location)
-
-        if optimize_after_merge and zorder_by:
-            logger.info("Delta optimize + zorder (%s)", zorder_by)
-            target.optimize().executeZOrderBy(*zorder_by)
-
-        if vacuum_hours is not None:
-            logger.info("Delta vacuum retain=%s hours", vacuum_hours)
-            target.vacuum(vacuum_hours)
-
-        return None
-
-    # -------------------------------------------------------------------------------------
-    # Schema + table management
-    # -------------------------------------------------------------------------------------
+            Job.make(_run).fire_and_forget()
 
     def drop_table(
         self,
@@ -876,22 +1146,24 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
         wait: WaitingConfigArg = True,
-        raise_error: bool = True
+        raise_error: bool = True,
     ) -> None:
         """
         Drop a table if it exists.
 
         Args:
             location:
-                Optional fully qualified table name (catalog.schema.table).
+                Fully qualified destination table.
             catalog_name:
-                Optional catalog override (used when `location` not provided/partial).
+                Catalog override when `location` is not fully specified.
             schema_name:
-                Optional schema override (used when `location` not provided/partial).
+                Schema override when `location` is not fully specified.
             table_name:
-                Optional table name (used when `location` not provided).
+                Table name override when `location` is not provided.
             wait:
-                Whether to block until the DROP finishes (API engine only).
+                Waiting configuration for the drop operation.
+            raise_error:
+                Whether drop errors should be raised.
 
         Returns:
             None.
@@ -900,7 +1172,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             location,
             catalog_name=catalog_name,
             schema_name=schema_name,
-            table_name=table_name
+            table_name=table_name,
         ).delete(wait=wait, raise_error=raise_error)
 
     def create_table(
@@ -911,8 +1183,53 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         table_name: Optional[str] = None,
-        **kwargs
-    ) -> "Table":
+        primary_keys: "list[str] | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        **kwargs,
+    ) -> Table:
+        """
+        Create a table if it does not already exist.
+
+        Primary and foreign key constraints are applied after the table is
+        created via ``ALTER TABLE``, in the order PK → FK.
+
+        Constraint sources (in priority order):
+
+        1. Explicit ``primary_keys`` / ``foreign_keys`` parameters.
+        2. Field-level metadata tags ``t:primary_key`` / ``t:foreign_key``
+           on the supplied *definition* schema.
+
+        Args:
+            definition:
+                Table definition — an Arrow field, Arrow schema, or any
+                project-supported schema-like object.
+            full_name:
+                Fully qualified destination table (``catalog.schema.table``).
+            catalog_name:
+                Catalog override.
+            schema_name:
+                Schema override.
+            table_name:
+                Table name override.
+            primary_keys:
+                Column name(s) to mark as primary key, or a full
+                :class:`~yggdrasil.databricks.sql.types.PrimaryKeySpec`.
+                Composite keys are expressed as a list of column names:
+                ``primary_keys=["trade_date", "instrument_id"]``.
+                When ``None``, fields carrying ``t:primary_key`` metadata are
+                used automatically.
+            foreign_keys:
+                A list of
+                :class:`~yggdrasil.databricks.sql.types.ForeignKeySpec`
+                objects, or a ``{col_name: "cat.sch.tbl.col"}`` dict.
+                When ``None``, fields carrying ``t:foreign_key`` metadata are
+                used automatically.
+            **kwargs:
+                Additional arguments forwarded to :meth:`Table.create`.
+
+        Returns:
+            The created or existing :class:`Table` handle.
+        """
         table = self.table(
             location=full_name,
             catalog_name=catalog_name,
@@ -923,5 +1240,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         return table.create(
             definition=definition,
             if_not_exists=True,
-            **kwargs
+            primary_keys=primary_keys,
+            foreign_keys=foreign_keys,
+            **kwargs,
         )
+

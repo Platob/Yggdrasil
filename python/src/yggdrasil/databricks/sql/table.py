@@ -47,8 +47,12 @@ from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg
 from .column import Column
 from .types import (
-    arrow_field_to_column_info, arrow_field_to_ddl, quote_ident,
+    arrow_field_to_column_info,
+    arrow_field_to_ddl,
+    quote_ident,
     escape_sql_string,
+    PrimaryKeySpec,
+    ForeignKeySpec,
 )
 
 if TYPE_CHECKING:
@@ -56,6 +60,9 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.sql.tables import Tables
+    from yggdrasil.databricks.sql.catalog import Catalog
+    from yggdrasil.databricks.sql.schema import Schema as UCSchema
+    from yggdrasil.databricks.sql.columns import Columns
 
 __all__ = ["Table"]
 
@@ -69,6 +76,101 @@ def _needs_column_mapping(col_name: str) -> bool:
 
 
 # ===========================================================================
+# Constraint resolution helpers  (used by Table.sql_create / api_create)
+# ===========================================================================
+
+def _resolve_pk_spec(
+    schema: Schema,
+    primary_keys: "list[str] | str | PrimaryKeySpec | None",
+) -> "PrimaryKeySpec | None":
+    """Derive an effective :class:`PrimaryKeySpec` from the caller's input.
+
+    Resolution order:
+
+    1. ``PrimaryKeySpec`` passed directly → returned as-is.
+    2. ``list[str]`` or ``str`` → wrapped in a bare ``PrimaryKeySpec``.
+    3. ``None`` → falls back to fields carrying ``t:primary_key`` metadata.
+    4. Returns ``None`` when no PK columns are found at all.
+    """
+    if isinstance(primary_keys, PrimaryKeySpec):
+        return primary_keys
+    if isinstance(primary_keys, str):
+        return PrimaryKeySpec(columns=[primary_keys])
+    if isinstance(primary_keys, list):
+        return PrimaryKeySpec(columns=primary_keys) if primary_keys else None
+
+    pk_cols = [f.name for f in schema.primary_keys]
+
+    if not pk_cols:
+        return None
+
+    pk_timeserie = [
+        f.name for f in schema.primary_keys if f.is_timestamp
+        if f.is_timestamp()
+    ]
+
+    return PrimaryKeySpec(
+        columns=pk_cols,
+        timeseries=pk_timeserie[0] if len(pk_timeserie) == 0 else None
+    ) if pk_cols else None
+
+
+def _resolve_fk_specs(
+    schema: Schema,
+    foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None",
+) -> "list[ForeignKeySpec]":
+    """Derive an effective list of :class:`ForeignKeySpec` from the caller's input.
+
+    Resolution order:
+
+    1. ``list[ForeignKeySpec]`` passed directly → returned as-is.
+    2. ``dict[str, str]`` mapping ``{col_name: dotted_ref}`` → converted.
+    3. ``None`` → falls back to fields carrying ``t:foreign_key`` metadata.
+    4. Returns ``[]`` when no FK specs are found.
+    """
+    if isinstance(foreign_keys, dict):
+        return [ForeignKeySpec(column=k, ref=v) for k, v in foreign_keys.items() if k and v]
+    if isinstance(foreign_keys, list):
+        return foreign_keys
+
+    return [ForeignKeySpec(column=f.name, ref=f.foreign_key) for f in schema.foreign_keys]
+
+
+def _parse_fk_ref(ref: str) -> tuple[str, list[str]]:
+    """Parse ``catalog.schema.table.col`` or ``catalog.schema.table.col1,col2``.
+
+    Returns:
+        (fully-qualified referenced table name, referenced column names)
+
+    Examples:
+        "main.core.parent.id"
+        -> ("main.core.parent", ["id"])
+
+        "main.core.parent.id,sub_id"
+        -> ("main.core.parent", ["id", "sub_id"])
+    """
+    if not ref or not isinstance(ref, str):
+        raise ValueError(f"Invalid foreign key ref: {ref!r}")
+
+    parts = [p.strip() for p in ref.split(".") if p.strip()]
+    if len(parts) < 4:
+        raise ValueError(
+            "Foreign key ref must be "
+            "'catalog.schema.table.column' or "
+            "'catalog.schema.table.col1,col2,...', "
+            f"got {ref!r}"
+        )
+
+    ref_table = ".".join(parts[:3])
+    ref_cols_expr = ".".join(parts[3:])
+    ref_cols = [c.strip() for c in ref_cols_expr.split(",") if c.strip()]
+    if not ref_cols:
+        raise ValueError(f"No referenced columns found in foreign key ref: {ref!r}")
+
+    return ref_table, ref_cols
+
+
+# ===========================================================================
 # Table — per-table resource
 # ===========================================================================
 
@@ -76,11 +178,14 @@ def _needs_column_mapping(col_name: str) -> bool:
 class Table(DatabricksResource):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
-    table_name: Optional[str] = None
+    catalog_name: str = "default"
+    schema_name: str = "default"
+    table_name: str = "default"
 
-    # TTL for the _infos cache (seconds).  Set to None to disable expiry.
+    @property
+    def name(self):
+        return self.table_name
+
     _infos_ttl: Optional[float] = field(default=1800.0, repr=False, compare=False, hash=False)
 
     _infos: Optional[TableInfo] = field(
@@ -151,8 +256,26 @@ class Table(DatabricksResource):
 
     @property
     def sql(self) -> "SQLEngine":
-        """Shorthand for the :class:`SQLEngine` attached to this table's client."""
         return self.client.sql
+
+    @property
+    def catalog(self) -> "Catalog":
+        from .catalog import Catalog as _Catalog
+        from .catalogs import Catalogs
+        return _Catalog(
+            service=Catalogs(client=self.client),
+            catalog_name=self.catalog_name,
+        )
+
+    @property
+    def schema(self) -> "UCSchema":
+        from .schema import Schema as _Schema
+        from .catalogs import Catalogs
+        return _Schema(
+            service=Catalogs(client=self.client),
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
 
     # =========================================================================
     # Identity / repr
@@ -162,7 +285,6 @@ class Table(DatabricksResource):
         return f"{self.catalog_name}.{self.schema_name}"
 
     def full_name(self, safe: str | bool | None = None) -> str:
-        """Return the three-part table name, optionally backtick-quoted."""
         if safe:
             q = safe if isinstance(safe, str) else "`"
             return (
@@ -186,13 +308,11 @@ class Table(DatabricksResource):
     # =========================================================================
 
     def _reset_cache(self) -> None:
-        """Evict all cached instance state (``_infos``, ``_columns``, ``_infos_fetched_at``)."""
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
 
     def clear(self) -> "Table":
-        """Public alias for :meth:`_reset_cache`; returns ``self``."""
         self._reset_cache()
         return self
 
@@ -201,7 +321,6 @@ class Table(DatabricksResource):
     # =========================================================================
 
     def _fetch_columns_remote(self) -> list[Column]:
-        """Derive :class:`Column` objects from current ``infos``."""
         return [
             Column.from_api(table=self, infos=col_info)
             for col_info in self.infos.columns
@@ -225,10 +344,8 @@ class Table(DatabricksResource):
 
     @property
     def infos(self) -> TableInfo:
-        """TableInfo — local cache first (TTL-guarded), then remote on miss."""
         now = time.time()
 
-        # 1. Local cache — valid when present and within TTL
         if self._infos is not None:
             age = now - (self._infos_fetched_at or 0.0)
             if self._infos_ttl is None or age < self._infos_ttl:
@@ -242,14 +359,12 @@ class Table(DatabricksResource):
                 self.full_name(), age, self._infos_ttl,
             )
 
-        # 2. Remote fetch
         infos = self.client.tables.find_table_remote(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
             table_name=self.table_name,
         )
 
-        # 3. Update cache + record fetch timestamp
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
         return self._infos
@@ -269,8 +384,6 @@ class Table(DatabricksResource):
 
     @property
     def columns(self) -> list[Column]:
-        """Column list — local cache first, then remote on miss."""
-        # 1. Local cache
         if self._columns is not None:
             logger.debug(
                 "Cache hit [Table._columns] table=%s count=%d",
@@ -278,17 +391,25 @@ class Table(DatabricksResource):
             )
             return self._columns
 
-        # 2. Remote fetch + update cache
         columns = self._fetch_columns_remote()
         object.__setattr__(self, "_columns", columns)
         return self._columns
 
     def column(self, name: str) -> Column:
-        """Return a :class:`Column` by name (case-sensitive)."""
         for col in self.columns:
             if col.name == name:
                 return col
         raise ValueError(f"Column {name!r} not found in {self!r}")
+
+    @property
+    def columns_service(self) -> "Columns":
+        from .columns import Columns
+        return Columns(
+            client=self.client,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+        )
 
     @property
     def arrow_fields(self) -> list[pa.Field]:
@@ -300,7 +421,6 @@ class Table(DatabricksResource):
 
     @property
     def arrow_field(self) -> pa.Field:
-        """This table as a single Arrow struct field (useful for nested schemas)."""
         return pa.field(
             self.full_name(),
             pa.struct(self.arrow_fields),
@@ -313,12 +433,10 @@ class Table(DatabricksResource):
 
     @staticmethod
     def _sql_str(value: str) -> str:
-        """Escape a string for use as a SQL string literal."""
         return "'" + Table._safe_str(value).replace("'", "''") + "'"
 
     @staticmethod
     def _safe_str(value: AnyStr) -> str:
-        """Escape a string for use as an unquoted SQL identifier."""
         if not value:
             return ""
 
@@ -329,6 +447,73 @@ class Table(DatabricksResource):
             return value.decode()
 
         return str(value)
+
+    # =========================================================================
+    # Constraint helpers — public ALTER TABLE DDL builders
+    # =========================================================================
+
+    def add_primary_key_ddl(
+        self,
+        columns: "list[str] | str",
+        *,
+        constraint_name: Optional[str] = None,
+        rely: bool = False,
+        timeseries: Optional[str] = None,
+    ) -> str:
+        if isinstance(columns, str):
+            columns = [columns]
+        col_exprs = [
+            f"`{c}` TIMESERIES" if timeseries == c else f"`{c}`"
+            for c in columns
+        ]
+        cname = constraint_name or f"{self.table_name}_{'_'.join(columns)}_pk"
+        rely_clause = " RELY" if rely else ""
+        return (
+            f"ALTER TABLE {self.full_name(safe=True)} "
+            f"ADD CONSTRAINT `{cname}` "
+            f"PRIMARY KEY ({', '.join(col_exprs)}) NOT ENFORCED"
+            f"{rely_clause}"
+        )
+
+    def set_primary_key(
+        self,
+        columns: "list[str] | str",
+        *,
+        constraint_name: Optional[str] = None,
+        rely: bool = False,
+        timeseries: Optional[str] = None,
+    ) -> "Table":
+        self.sql.execute(
+            self.add_primary_key_ddl(
+                columns,
+                constraint_name=constraint_name,
+                rely=rely,
+                timeseries=timeseries,
+            )
+        )
+        return self
+
+    def drop_primary_key_ddl(
+        self,
+        *,
+        if_exists: bool = True,
+        cascade: bool = False,
+    ) -> str:
+        if_exists_clause = " IF EXISTS" if if_exists else ""
+        cascade_clause = " CASCADE" if cascade else ""
+        return (
+            f"ALTER TABLE {self.full_name(safe=True)} "
+            f"DROP PRIMARY KEY{if_exists_clause}{cascade_clause}"
+        )
+
+    def drop_primary_key(
+        self,
+        *,
+        if_exists: bool = True,
+        cascade: bool = False,
+    ) -> "Table":
+        self.sql.execute(self.drop_primary_key_ddl(if_exists=if_exists, cascade=cascade))
+        return self
 
     def set_tags_ddl(self, tags: Mapping[str, str] | None) -> str:
         pairs: list[str] = []
@@ -350,6 +535,89 @@ class Table(DatabricksResource):
         return self
 
     # =========================================================================
+    # Constraint helpers — inline CREATE TABLE constraint rendering
+    # =========================================================================
+
+    def _build_pk_constraint_sql(
+        self,
+        pk_spec: "PrimaryKeySpec | None",
+    ) -> str | None:
+        """Render a table-level PRIMARY KEY clause for CREATE TABLE."""
+        if not pk_spec or not pk_spec.columns:
+            return None
+
+        cols: list[str] = []
+        for c in pk_spec.columns:
+            col_sql = quote_ident(c)
+            if pk_spec.timeseries == c:
+                col_sql += " TIMESERIES"
+            cols.append(col_sql)
+
+        parts: list[str] = []
+        if pk_spec.constraint_name:
+            parts.append(f"CONSTRAINT {quote_ident(pk_spec.constraint_name)}")
+
+        parts.append(f"PRIMARY KEY ({', '.join(cols)})")
+        parts.append("NOT ENFORCED")
+
+        if pk_spec.rely:
+            parts.append("RELY")
+
+        return " ".join(parts)
+
+    def _build_fk_constraint_sql(
+        self,
+        fk: "ForeignKeySpec",
+    ) -> str:
+        """Render a table-level FOREIGN KEY clause for CREATE TABLE.
+
+        Supported `fk.ref` formats:
+            - "catalog.schema.table.column"
+            - "catalog.schema.table.col1,col2"
+        """
+        ref_table, ref_columns = _parse_fk_ref(fk.ref)
+
+        parts: list[str] = []
+        if fk.constraint_name:
+            parts.append(f"CONSTRAINT {quote_ident(fk.constraint_name)}")
+
+        parts.append(f"FOREIGN KEY ({quote_ident(fk.column)})")
+        parts.append(f"REFERENCES {_quote_ident(ref_table)}")
+
+        if ref_columns:
+            parts.append("(" + ", ".join(quote_ident(c) for c in ref_columns) + ")")
+
+        parts.append("NOT ENFORCED")
+
+        if fk.rely:
+            parts.append("RELY")
+        if fk.match_full:
+            parts.append("MATCH FULL")
+        if fk.on_update_no_action:
+            parts.append("ON UPDATE NO ACTION")
+        if fk.on_delete_no_action:
+            parts.append("ON DELETE NO ACTION")
+
+        return " ".join(parts)
+
+    def _build_table_constraints_sql(
+        self,
+        pk_spec: "PrimaryKeySpec | None",
+        fk_specs: "list[ForeignKeySpec]",
+    ) -> list[str]:
+        """Render all inline CREATE TABLE table constraints."""
+        constraints: list[str] = []
+
+        pk_sql = self._build_pk_constraint_sql(pk_spec)
+        if pk_sql:
+            constraints.append(pk_sql)
+
+        for fk in fk_specs:
+            constraints.append(self._build_fk_constraint_sql(fk))
+
+        return constraints
+
+    # =========================================================================
     # Lifecycle — create / ensure / delete
     # =========================================================================
 
@@ -362,11 +630,12 @@ class Table(DatabricksResource):
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
+        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
-        """Create the table if it does not exist, then return ``self``."""
         if not self.exists:
             if definition is None:
-                _ = self.infos  # surface a meaningful error
+                _ = self.infos
             self.create(
                 definition=definition,
                 storage_location=storage_location,
@@ -375,6 +644,8 @@ class Table(DatabricksResource):
                 table_type=table_type,
                 data_source_format=data_source_format,
                 if_not_exists=True,
+                primary_keys=primary_keys,
+                foreign_keys=foreign_keys,
             )
         return self
 
@@ -389,8 +660,18 @@ class Table(DatabricksResource):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True,
+        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
-        """Create the table, routing to SQL DDL or the Unity Catalog REST API."""
+        """Create the table, routing to SQL DDL or the Unity Catalog REST API.
+
+        SQL path:
+            - inlines PK/FK constraints directly in CREATE TABLE
+
+        API path:
+            - creates the table first
+            - then applies PK/FK via ALTER TABLE fallback
+        """
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
@@ -400,6 +681,8 @@ class Table(DatabricksResource):
                 comment=comment,
                 partition_by=partition_by,
                 if_not_exists=if_not_exists,
+                primary_keys=primary_keys,
+                foreign_keys=foreign_keys,
             )
         else:
             if table_type == TableType.EXTERNAL and not storage_location:
@@ -415,6 +698,8 @@ class Table(DatabricksResource):
                 table_type=table_type,
                 data_source_format=data_source_format,
                 if_not_exists=if_not_exists,
+                primary_keys=primary_keys,
+                foreign_keys=foreign_keys,
             )
 
         self._reset_cache()
@@ -439,20 +724,48 @@ class Table(DatabricksResource):
         target_file_size: Optional[int] = None,
         column_mapping_mode: Optional[str] = None,
         wait_result: bool = True,
-        auto_tag: bool = False,
+        auto_tag: bool = True,
+        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
-        """Generate and execute a ``CREATE TABLE`` DDL statement."""
+        """Generate and execute a CREATE TABLE DDL statement.
+
+        PK/FK constraints are rendered directly inside CREATE TABLE for the SQL path.
+        PK columns are forced to NOT NULL in the column definition to match
+        Databricks requirements for primary keys.
+        """
         schema = Schema.from_any(description)
+        if auto_tag:
+            schema = schema.autotag()
         arrow_fields = schema.arrow_fields
         partition_by = partition_by or schema.partition_by
         cluster_by = cluster_by or schema.cluster_by
+        primary_keys = primary_keys or schema.primary_key_names
+        foreign_keys = foreign_keys or schema.foreign_key_names
         comment = comment or schema.comment
 
-        any_invalid = any(_needs_column_mapping(f.name) for f in arrow_fields)
+        pk_spec = _resolve_pk_spec(schema, primary_keys)
+        fk_specs = _resolve_fk_specs(schema, foreign_keys)
+        pk_col_set: set[str] = set(pk_spec.columns) if pk_spec else set()
+
+        effective_fields: list[pa.Field] = []
+        for af in arrow_fields:
+            if af.name in pk_col_set and af.nullable:
+                logger.warning(
+                    "Column %r is a primary key but nullable=True — "
+                    "forcing NOT NULL in CREATE TABLE DDL",
+                    af.name,
+                )
+                af = pa.field(af.name, af.type, nullable=False, metadata=af.metadata)
+            effective_fields.append(af)
+
+        any_invalid = any(_needs_column_mapping(f.name) for f in effective_fields)
         if column_mapping_mode is None:
             column_mapping_mode = "name" if any_invalid else "none"
 
-        column_definitions = [arrow_field_to_ddl(child) for child in arrow_fields]
+        column_definitions = [arrow_field_to_ddl(child) for child in effective_fields]
+        constraint_definitions = self._build_table_constraints_sql(pk_spec, fk_specs)
+        table_definitions = column_definitions + constraint_definitions
 
         if or_replace and if_not_exists:
             raise ValueError("Use either or_replace or if_not_exists, not both.")
@@ -466,7 +779,7 @@ class Table(DatabricksResource):
 
         sql_parts: list[str] = [
             f"{create_kw} {self.full_name(safe=True)} (",
-            "  " + ",\n  ".join(column_definitions),
+            "  " + ",\n  ".join(table_definitions),
             ")",
             f"USING {data_source_format.value}",
         ]
@@ -524,18 +837,14 @@ class Table(DatabricksResource):
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 self.sql.execute(
-                    f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema_name)}", wait=True
+                    f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema_name)}",
+                    wait=True,
                 )
                 self.sql.execute(statement, wait=wait_result)
             else:
                 raise
 
         self._reset_cache()
-
-        if auto_tag:
-            schema.autotag(tags={
-                b"format": data_source_format.value
-            })
 
         self.set_tags(schema.tags)
 
@@ -555,17 +864,25 @@ class Table(DatabricksResource):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = False,
+        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
-        """Create table via the Unity Catalog REST API (supports EXTERNAL tables)."""
-        definition = Schema.from_any(definition).to_arrow_schema()
+        """Create table via the Unity Catalog REST API.
 
-        if not comment and definition.metadata:
-            raw = definition.metadata.get(b"comment") or definition.metadata.get(b"description")
+        Constraints are still applied afterward via ALTER TABLE because this
+        implementation uses the table-create REST payload and not the dedicated
+        table-constraints API.
+        """
+        ygg_schema = Schema.from_any(definition)
+        arrow_schema = ygg_schema.to_arrow_schema()
+
+        if not comment and arrow_schema.metadata:
+            raw = arrow_schema.metadata.get(b"comment") or arrow_schema.metadata.get(b"description")
             comment = raw.decode("utf-8") if isinstance(raw, bytes) else raw
 
         columns = [
             arrow_field_to_column_info(field=f, position=pos)
-            for pos, f in enumerate(definition)
+            for pos, f in enumerate(arrow_schema)
         ]
 
         body: dict[str, Any] = {
@@ -608,7 +925,64 @@ class Table(DatabricksResource):
                 raise
 
         self._reset_cache()
+
+        pk_spec = _resolve_pk_spec(ygg_schema, primary_keys)
+        fk_specs = _resolve_fk_specs(ygg_schema, foreign_keys)
+        self._apply_constraints(pk_spec, fk_specs)
+
         return self
+
+    def _apply_constraints(
+        self,
+        pk_spec: "PrimaryKeySpec | None",
+        fk_specs: "list[ForeignKeySpec]",
+    ) -> None:
+        """Apply PK then FK constraints via ALTER TABLE.
+
+        Used as the fallback path for REST/API-based creation.
+        Failures are logged and do not abort the successful table create.
+        """
+        if pk_spec and pk_spec.columns:
+            try:
+                self.set_primary_key(
+                    pk_spec.columns,
+                    constraint_name=pk_spec.constraint_name,
+                    rely=pk_spec.rely,
+                    timeseries=pk_spec.timeseries,
+                )
+                logger.debug(
+                    "Applied PRIMARY KEY %r on %s",
+                    pk_spec.columns, self.full_name(),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to apply PRIMARY KEY %r on %s — "
+                    "the table was created; add the constraint manually.",
+                    pk_spec.columns, self.full_name(),
+                    exc_info=True,
+                )
+
+        for fk in fk_specs:
+            try:
+                self.column(fk.column).set_foreign_key(
+                    fk.ref,
+                    constraint_name=fk.constraint_name,
+                    rely=fk.rely,
+                    match_full=fk.match_full,
+                    on_update_no_action=fk.on_update_no_action,
+                    on_delete_no_action=fk.on_delete_no_action,
+                )
+                logger.debug(
+                    "Applied FOREIGN KEY %r → %r on %s",
+                    fk.column, fk.ref, self.full_name(),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to apply FOREIGN KEY %r → %r on %s — "
+                    "add the constraint manually.",
+                    fk.column, fk.ref, self.full_name(),
+                    exc_info=True,
+                )
 
     def delete(
         self,
@@ -616,13 +990,6 @@ class Table(DatabricksResource):
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> "Table":
-        """Delete this table from Unity Catalog.
-
-        Args:
-            wait:        Block until deletion completes (``True``) or fire-and-
-                         forget in a background :class:`Job` (``False``).
-            raise_error: Re-raise :exc:`DatabricksError` on failure.
-        """
         uc = self.client.workspace_client().tables
 
         if wait:
@@ -644,9 +1011,8 @@ class Table(DatabricksResource):
     def delta_spark(
         self,
         spark_session: "SparkSession | None" = None,
-    ) -> "delta.tables.DeltaTable":
-        """Return a Delta ``DeltaTable`` handle for this table."""
-        from delta.tables import DeltaTable
+    ) -> "delta.tables.DeltaTable":  # noqa
+        from delta.tables import DeltaTable  # noqa
 
         session = spark_session or PyEnv.spark_session(
             create=True, import_error=True, install_spark=False,
@@ -657,7 +1023,6 @@ class Table(DatabricksResource):
         self,
         spark_session: Optional["SparkSession"] = None,
     ) -> "SparkDataFrame":
-        """Return the table as a Spark DataFrame via Delta."""
         return self.delta_spark(spark_session=spark_session).toDF()
 
     # =========================================================================
@@ -671,7 +1036,6 @@ class Table(DatabricksResource):
         wait: WaitingConfigArg = True,
         cache_for: WaitingConfigArg = None,
     ):
-        """Execute ``SELECT *`` (optionally filtered) and return an Arrow dataset."""
         statement = f"SELECT * FROM {self.full_name(safe=True)}"
         if filters:
             predicates = [_build_predicate(c, o, v) for c, o, v in filters]
@@ -696,11 +1060,6 @@ class Table(DatabricksResource):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
     ) -> None:
-        """Insert data into this table.
-
-        Delegates to :meth:`SQLEngine.insert_into` which routes between the
-        Spark and warehouse-SQL paths automatically.
-        """
         return self.sql.insert_into(
             data,
             mode=mode,
@@ -742,7 +1101,6 @@ class Table(DatabricksResource):
         return self.infos.storage_location
 
     def credentials(self, operation: TableOperation = TableOperation.READ):
-        """Generate temporary table credentials for direct S3/GCS access."""
         return (
             self.client.workspace_client()
             .temporary_table_credentials
@@ -758,7 +1116,6 @@ class Table(DatabricksResource):
         operation: TableOperation = TableOperation.READ_WRITE,
         expiring: bool = False,
     ) -> Union[FileSystem, "TableFilesystem"]:
-        """Return a credentialed :class:`S3FileSystem` for direct Parquet I/O."""
         created_at = time.time_ns()
         creds = self.credentials(operation=operation)
         assert creds.aws_temp_credentials, "Cannot get AWS credentials"
@@ -799,7 +1156,7 @@ class TableFilesystem(Expiring[FileSystem]):
     def _refresh(self) -> RefreshResult[FileSystem]:
         value = self.table.arrow_filesystem(operation=self.operation, expiring=False)
         created_ns = time.time_ns()
-        ttl_ns = 3_600_000_000_000  # 1 hour
+        ttl_ns = 3_600_000_000_000
         return RefreshResult(
             value=value,
             created_at_ns=created_ns,
@@ -870,4 +1227,3 @@ def _build_predicate(col: str, op: str, val: Any) -> str:
         return f"{col_sql} {op_norm} ({', '.join(_sql_literal(x) for x in items)})"
 
     return f"{col_sql} {op_norm} {_sql_literal(val)}"
-

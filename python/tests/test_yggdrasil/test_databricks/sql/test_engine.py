@@ -23,7 +23,7 @@ class TestSQLEngine(DatabricksCase):
             pa.array([{"q": dt.datetime.now(dt.timezone.utc), "v": 1.0}, None, None]),
             pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
-        ], names=["c0", "c1", "c2", "c3", "map column"])
+        ], names=["c0", "id", "c2", "c3", "map column"])
 
         self.engine.insert_into(data, table_name="test_insert", mode="overwrite")
 
@@ -32,7 +32,7 @@ class TestSQLEngine(DatabricksCase):
             pa.array([{"q": dt.datetime.now(dt.timezone.utc)}, None, None]),
             pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
-        ], names=["c1", "c2", "c3", "map column"])
+        ], names=["id", "c2", "c3", "map column"])
 
         self.engine.insert_into(
             data,

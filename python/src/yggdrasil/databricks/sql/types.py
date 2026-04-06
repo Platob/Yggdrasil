@@ -2,6 +2,7 @@
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Union
 
 import pyarrow as pa
@@ -13,6 +14,60 @@ from yggdrasil.arrow.cast import (
     is_arrow_type_list_like,
     is_arrow_type_string_like,
 )
+
+
+# ---------------------------------------------------------------------------
+# Constraint specs — used by Table.sql_create / create / ensure_created
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class PrimaryKeySpec:
+    """Specification for a table-level primary key constraint.
+
+    Pass to :meth:`~yggdrasil.databricks.sql.table.Table.sql_create` /
+    :meth:`~yggdrasil.databricks.sql.table.Table.create` to add a primary key
+    after table creation.
+
+    ``columns`` may list multiple column names for composite keys.
+    ``timeseries`` names the column that acts as the time series component
+    (see Databricks ``PRIMARY KEY (…) TIMESERIES`` syntax).
+
+    Example::
+
+        PrimaryKeySpec(columns=["trade_date", "instrument_id"], rely=True)
+    """
+
+    columns: list[str]
+    constraint_name: str | None = None
+    rely: bool = False
+    timeseries: str | None = None   # name of the TIMESERIES column, if any
+
+
+@dataclass(frozen=True, slots=True)
+class ForeignKeySpec:
+    """Specification for a single-column foreign key constraint.
+
+    Pass a list of these to :meth:`~yggdrasil.databricks.sql.table.Table.sql_create` /
+    :meth:`~yggdrasil.databricks.sql.table.Table.create`.
+
+    ``column``  — local column name.
+    ``ref``     — dotted reference accepted by
+      :meth:`~yggdrasil.databricks.sql.columns.Columns.parse_location`:
+      ``"catalog.schema.table.column"``, ``"schema.table.column"``,
+      ``"table.column"``, or ``"column"`` (defaults to own table).
+
+    Example::
+
+        ForeignKeySpec(column="customer_id", ref="main.sales.customers.id")
+    """
+
+    column: str
+    ref: str
+    constraint_name: str | None = None
+    rely: bool = False
+    match_full: bool = False
+    on_update_no_action: bool = False
+    on_delete_no_action: bool = False
 
 STRING_TYPE_MAP = {
     # boolean

@@ -327,8 +327,6 @@ BASE_SCHEMA["response_status_code"] = schema_field(
     tags={
         "entity": "response",
         "group": "status",
-        "semantic_type": "http_status_code",
-        "dimension": "low_cardinality",
     },
 )
 
@@ -342,7 +340,6 @@ BASE_SCHEMA["response_host"] = schema_field(
     tags={
         "entity": "response",
         "group": "headers",
-        "semantic_type": "host_header",
     },
 )
 
@@ -548,6 +545,8 @@ class Response:
     tags: MutableMapping[str, str] = field(compare=False, hash=False, repr=False)
     buffer: BytesIO = field(compare=False, hash=False, repr=False)
     received_at: dt.datetime = field(compare=False, hash=False, repr=False)
+
+    _id_cache: int | None = field(default=None, init=False, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
         self.status_code = int(self.status_code)

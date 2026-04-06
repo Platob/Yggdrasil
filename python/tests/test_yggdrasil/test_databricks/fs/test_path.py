@@ -335,6 +335,132 @@ class TestExtension(unittest.TestCase):
         self.assertEqual(p.extension, "")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Shutdown-hook registration for temporary paths
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestShutdownHook(unittest.TestCase):
+    """Verify that temporary paths register / unregister the shutdown exiter."""
+
+    def _registry(self):
+        from yggdrasil.environ.shutdown import shutdown_registry
+        return shutdown_registry
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _make_temp(self, path: str = "/dbfs/tmp/ygg_test_temp") -> DBFSPath:
+        """Parse a non-temporary path and return a temporary copy via dc.replace."""
+        import dataclasses as dc
+        p = DatabricksPath.parse(path)
+        # Use dc.replace so __post_init__ is called with temporary=True
+        return dc.replace(p, temporary=True)
+
+    # ── tests ─────────────────────────────────────────────────────────────
+
+    def test_non_temporary_no_hook(self):
+        """Non-temporary paths must not register a shutdown hook."""
+        p = DatabricksPath.parse("/dbfs/tmp/normal")
+        self.assertIsNone(p._shutdown_hook)
+        self.assertFalse(self._registry().is_registered(p._unsafe_remove))
+
+    def test_temporary_parse_registers_hook(self):
+        """parse(temporary=True) registers a shutdown hook."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_shutdown_test", temporary=True)
+        try:
+            self.assertIsNotNone(p._shutdown_hook)
+            self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+        finally:
+            p._unregister_shutdown_remove()
+
+    def test_dataclass_replace_temporary_registers_hook(self):
+        """dc.replace(…, temporary=True) triggers __post_init__ and registers a hook."""
+        p = self._make_temp()
+        try:
+            self.assertIsNotNone(p._shutdown_hook)
+            self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+        finally:
+            p._unregister_shutdown_remove()
+
+    def test_remove_unregisters_hook(self):
+        """Calling remove() must unregister the shutdown hook before any I/O."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_remove_unregister", temporary=True)
+        self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+
+        # Patch is_file / is_dir to avoid real API calls
+        p._is_file = False
+        p._is_dir = False
+        p.remove()
+
+        self.assertIsNone(p._shutdown_hook)
+        self.assertFalse(self._registry().is_registered(p._unsafe_remove))
+
+    def test_close_wait_unregisters_hook(self):
+        """close(wait=True) delegates to remove(), which unregisters the hook."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_close_wait", temporary=True)
+        self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+
+        p._is_file = False
+        p._is_dir = False
+        p.close(wait=True)
+
+        self.assertFalse(self._registry().is_registered(p._unsafe_remove))
+
+    def test_close_nowait_unregisters_hook_immediately(self):
+        """close(wait=False) must unregister the hook synchronously before spawning a thread."""
+        import time
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_close_nowait", temporary=True)
+        self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+
+        p._is_file = False
+        p._is_dir = False
+        p.close(wait=False)
+
+        # Hook must be gone immediately (not after thread completion)
+        self.assertIsNone(p._shutdown_hook)
+        self.assertFalse(self._registry().is_registered(p._unsafe_remove))
+        time.sleep(0.05)  # let background thread finish cleanly
+
+    def test_parse_upgrades_existing_path_to_temporary(self):
+        """parse() called on an already-parsed path with temporary=True arms the hook."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_upgrade")
+        self.assertIsNone(p._shutdown_hook)
+
+        p2 = DatabricksPath.parse(p, temporary=True)
+        try:
+            self.assertIs(p2, p)  # parse() returns the same object
+            self.assertTrue(p.temporary)
+            self.assertIsNotNone(p._shutdown_hook)
+            self.assertTrue(self._registry().is_registered(p._unsafe_remove))
+        finally:
+            p._unregister_shutdown_remove()
+
+    def test_double_register_is_idempotent(self):
+        """Calling _register_shutdown_remove() twice must not create two hooks."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_double", temporary=True)
+        hook_first = p._shutdown_hook
+        p._register_shutdown_remove()  # second call — must be a no-op
+        try:
+            self.assertIs(p._shutdown_hook, hook_first)
+        finally:
+            p._unregister_shutdown_remove()
+
+    def test_unregister_idempotent(self):
+        """Calling _unregister_shutdown_remove() twice must not raise."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_unreg2", temporary=True)
+        p._unregister_shutdown_remove()
+        p._unregister_shutdown_remove()  # second call — must be harmless
+
+    def test_parent_is_not_temporary(self):
+        """parent property must never inherit the temporary flag or hook."""
+        p = DatabricksPath.parse("/dbfs/tmp/ygg_parent_test", temporary=True)
+        try:
+            parent = p.parent
+            self.assertFalse(parent.temporary)
+            self.assertIsNone(parent._shutdown_hook)
+        finally:
+            p._unregister_shutdown_remove()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -3,13 +3,10 @@
 import base64
 import io
 import logging
-import os
 import time
 from abc import ABC, abstractmethod
 from threading import Thread
 from typing import TYPE_CHECKING, Optional, IO, AnyStr, Union, BinaryIO
-
-from yggdrasil.io.buffer import BytesIO as _Buffer  # spill-to-disk buffer
 
 from databricks.sdk.errors import InternalError
 from databricks.sdk.errors.platform import (
@@ -19,6 +16,7 @@ from databricks.sdk.errors.platform import (
 )
 from databricks.sdk.service.workspace import ImportFormat, ExportFormat
 
+from yggdrasil.io.buffer import BytesIO as _Buffer  # spill-to-disk buffer
 from .path_kind import DatabricksPathKind
 from ...pyutils.retry import retry
 

@@ -73,7 +73,11 @@ def _encode_userinfo(userinfo: str) -> str:
 
 
 def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
-    return quote(path, safe=safe + "%")
+    if safe:
+        if " " not in path:
+            safe = safe + "%"
+
+    return quote(path, safe=safe or "")
 
 
 def _encode_query(query: str) -> str:

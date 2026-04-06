@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from ..types.cast.cast_options import CastOptionsArg
+from . import CastOptionsArg
 
 if TYPE_CHECKING:
     from .statement_result import StatementResult

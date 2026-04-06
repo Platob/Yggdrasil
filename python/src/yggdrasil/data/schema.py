@@ -107,6 +107,26 @@ class Schema(MutableMapping[str, Field]):
         return [_ for _ in self.inner_fields.values() if _.cluster_by]
 
     @property
+    def primary_keys(self) -> list[Field]:
+        """Return fields that carry the ``t:primary_key`` metadata tag."""
+        return [f for f in self.inner_fields.values() if f.primary_key]
+
+    @property
+    def primary_key_names(self) -> list[str]:
+        """Return fields that carry the ``t:primary_key`` metadata tag."""
+        return [f.name for f in self.inner_fields.values() if f.primary_key]
+
+    @property
+    def foreign_keys(self) -> list[Field]:
+        """Return fields that carry the ``t:foreign_key`` metadata tag."""
+        return [f for f in self.inner_fields.values() if f.foreign_key]
+
+    @property
+    def foreign_key_names(self) -> list[Field]:
+        """Return fields that carry the ``t:foreign_key`` metadata tag."""
+        return [f.name for f in self.inner_fields.values() if f.foreign_key]
+
+    @property
     def comment(self):
         if not self.metadata:
             return None

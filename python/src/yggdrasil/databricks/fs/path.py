@@ -21,14 +21,17 @@ from __future__ import annotations
 import dataclasses as dc
 import datetime as dt
 import fnmatch
+import logging
 import stat as stat_mod
 import time
 from abc import ABC, abstractmethod
 from threading import Thread
 from typing import (
-    ClassVar, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING,
+    Any, ClassVar, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING,
 )
 from urllib.parse import urlparse
+
+from yggdrasil.environ import shutdown as yg_shutdown
 
 from databricks.sdk.errors import InternalError
 from databricks.sdk.errors.platform import (
@@ -49,6 +52,8 @@ from .volumes_path import get_volume_status, get_volume_metadata
 
 if TYPE_CHECKING:
     from ..client import DatabricksClient
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DatabricksPath",
@@ -164,6 +169,15 @@ class DatabricksPath(ABC):
         repr=False, hash=False, compare=False, default=None,
     )
 
+    # Shutdown-hook handle — populated when temporary=True
+    _shutdown_hook: Any = dc.field(
+        default=None, init=False, repr=False, hash=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.temporary:
+            self._register_shutdown_remove()
+
     # ================================================================== #
     # Abstract — implement per namespace                                  #
     # ================================================================== #
@@ -210,6 +224,7 @@ class DatabricksPath(ABC):
                 obj._client = client
             if temporary and not obj.temporary:
                 obj.temporary = True
+                obj._register_shutdown_remove()
             return obj
 
         hostname: Optional[str] = None
@@ -416,6 +431,7 @@ class DatabricksPath(ABC):
         recursive: bool = True,
         allow_not_found: bool = True,
     ) -> "DatabricksPath":
+        self._unregister_shutdown_remove()
         if self.is_file():
             self._remove_file_impl(allow_not_found=allow_not_found)
         elif self.is_dir():
@@ -632,11 +648,54 @@ class DatabricksPath(ABC):
         self._client = self.workspace.connect()
         return self
 
+    def _register_shutdown_remove(self) -> None:
+        """Register a process-exit hook that removes this temporary path."""
+        if self._shutdown_hook is not None or not self.temporary:
+            return
+        try:
+            self._shutdown_hook = yg_shutdown.register(self._unsafe_remove)
+        except Exception:
+            logger.debug(
+                "Failed to register shutdown handler for temporary path %s",
+                self.full_path(),
+                exc_info=True,
+            )
+
+    def _unregister_shutdown_remove(self) -> None:
+        """Remove the process-exit hook registered by :meth:`_register_shutdown_remove`."""
+        hook = self._shutdown_hook
+        self._shutdown_hook = None
+        if hook is None:
+            return
+        try:
+            try:
+                yg_shutdown.unregister(hook)
+            except Exception:
+                yg_shutdown.unregister(self._unsafe_remove)
+        except Exception:
+            logger.debug(
+                "Failed to unregister shutdown handler for path %s",
+                self.full_path(),
+                exc_info=True,
+            )
+
+    def _unsafe_remove(self) -> None:
+        """Best-effort removal used as the atexit / signal shutdown callback."""
+        try:
+            self.remove(recursive=True, allow_not_found=True)
+        except Exception:
+            logger.debug(
+                "Shutdown cleanup of temporary path %s failed",
+                self.full_path(),
+                exc_info=True,
+            )
+
     def close(self, wait: bool = True) -> None:
         if self.temporary:
             if wait:
                 self.remove(recursive=True)
             else:
+                self._unregister_shutdown_remove()
                 Thread(target=self.remove, kwargs={"recursive": True}).start()
 
     # ================================================================== #

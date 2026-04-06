@@ -645,10 +645,11 @@ class SendManyConfig(_ConfigBase):
         with_remote_cache: bool = True,
         with_local_cache: bool = True,
         with_spark: bool = False,
+        raise_error: bool | None = None
     ) -> SendConfig:
         return SendConfig(
             wait=self.wait,
-            raise_error=self.raise_error,
+            raise_error=self.raise_error if raise_error is None else raise_error,
             stream=self.stream,
             remote_cache=self.remote_cache if with_remote_cache else CacheConfig(),
             local_cache=self.local_cache if with_local_cache else CacheConfig(),

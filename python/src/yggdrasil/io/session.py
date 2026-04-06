@@ -461,7 +461,7 @@ class Session(ABC):
                     "Batch remote cache: %s/%s hits (table=%s)",
                     len(remote_hits),
                     len(after_local),
-                    remote_cfg.table.full_name(safe=True),
+                    remote_cfg.table,
                 )
             for remote_hit in remote_hits:
                 if local_cfg.local_cache_enabled:
@@ -476,6 +476,7 @@ class Session(ABC):
                 with_remote_cache=False,
                 with_local_cache=True,
                 with_spark=False,
+                raise_error=False
             )
             to_insert: list[Response] = []
             failed: list[Response] = []
@@ -529,6 +530,7 @@ class Session(ABC):
             with_remote_cache=False,
             with_local_cache=True,
             with_spark=False,
+            raise_error=False
         )
 
         for result in pool.as_completed(
