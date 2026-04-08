@@ -7,6 +7,7 @@ Focused module pages (updated for current implementation):
 - [engine cast helpers](types/cast/README.md)
 - [dataclasses](dataclasses/README.md)
 - [io](io/README.md)
+- [io.http_](io/http_/README.md)
 - [requests](requests/README.md)
 - [pyutils](pyutils/README.md)
 - [concurrent](concurrent/README.md)

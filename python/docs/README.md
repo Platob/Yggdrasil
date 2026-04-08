@@ -146,15 +146,10 @@ print(legacy.get("https://example.com", timeout=10).status_code)
 ## 8) Databricks SQL workflow
 
 ```python
-from yggdrasil.databricks.workspaces import Workspace
-from yggdrasil.databricks.sql import SQLEngine
+from yggdrasil.databricks import DatabricksClient
 
-ws = Workspace(host="https://<workspace>", token="<token>")
-engine = SQLEngine(client=ws)
-
-stmt = engine.execute("SELECT current_timestamp() AS ts")
-result_table = stmt.to_arrow_table()
-print(result_table)
+stmt = DatabricksClient(host="https://<workspace>", token="<token>").sql.execute("SELECT current_timestamp() AS ts")
+print(stmt.to_arrow_table())
 ```
 
 ---
