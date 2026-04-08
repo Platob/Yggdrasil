@@ -42,6 +42,12 @@ dev = [
   "mypy",
   "maturin>=1.7",
   "twine",
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.30",
+  "mkdocs-gen-files>=0.5",
+  "mkdocs-literate-nav>=0.6",
+  "mkdocs-section-index>=0.3",
 ]
 
 http = [
@@ -84,7 +90,7 @@ mongo = [
 [project.urls]
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
-Documentation = "https://github.com/Platob/Yggdrasil"
+Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
 ygg-api = "yggdrasil.fastapi.main:main"
