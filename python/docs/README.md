@@ -1,9 +1,8 @@
-# Yggdrasil Python docs
+# Yggdrasil Python documentation
 
-Clean guide for `yggdrasil`.
-Short phrases. Fast start. Clear module map.
+This guide is intentionally ordered from the easiest feature to the most advanced implementation patterns used in the current codebase.
 
-## 1) Install
+## 1) Setup
 
 ```bash
 cd python
@@ -12,7 +11,7 @@ source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
-Install only what you need:
+Optional extras:
 
 ```bash
 uv pip install -e .[polars]
@@ -24,110 +23,104 @@ uv pip install -e .[api]
 
 ---
 
-## 2) Easiest use case: cast one value
+## 2) Easiest: convert a scalar
 
 ```python
 from yggdrasil.data.cast.registry import convert
 
-age = convert("42", int)
-active = convert("true", bool)
-print(age, active)
+print(convert("42", int))
+print(convert("true", bool))
 ```
 
 ---
 
-## 3) Cast dict -> dataclass
+## 3) Convert dictionaries into typed dataclasses
 
 ```python
 from dataclasses import dataclass
 from yggdrasil.data.cast.registry import convert
 
 @dataclass
-class User:
+class Order:
     id: int
-    email: str
-    active: bool
+    amount: float
 
-raw = {"id": "7", "email": "a@x.com", "active": "false"}
-user = convert(raw, User)
-print(user)
+order = convert({"id": "10", "amount": "99.5"}, Order)
+print(order)
 ```
 
 ---
 
-## 4) Build Arrow schema from type hints
+## 4) Infer Arrow fields from Python type hints
 
 ```python
-from dataclasses import dataclass
 from yggdrasil.arrow import arrow_field_from_hint
 
-@dataclass
-class Event:
-    ts: str
-    value: float
-
-field = arrow_field_from_hint(Event, name="event")
+field = arrow_field_from_hint(dict[str, list[int]], name="payload")
 print(field)
 ```
 
 ---
 
-## 5) Cast table with schema options
+## 5) Cast tabular Arrow data with `CastOptions`
 
 ```python
-import pyarrow as pa
-from yggdrasil.data.cast import CastOptions
+import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions
 
-raw = pa.table({"id": ["1", "2"], "score": ["1.2", "2.3"]})
+raw = pa.table({"id": ["1", "2"], "score": ["3.14", "2.71"]})
+
 target = pa.schema([
     pa.field("id", pa.int64(), nullable=False),
     pa.field("score", pa.float64(), nullable=False),
 ])
 
-out = cast_arrow_tabular(raw, CastOptions(target_field=target, strict_match_names=True))
+opts = CastOptions(target_field=target, strict_match_names=True)
+out = cast_arrow_tabular(raw, opts)
 print(out.schema)
 ```
 
 ---
 
-## 6) Optional engines (safe imports)
+## 6) Engine-specific casting (Polars / pandas / Spark)
 
-Always import optional engines from `lib.py` guards.
+Always import optional dependencies through their `lib.py` guard modules:
 
 ```python
 from yggdrasil.polars.lib import polars
 from yggdrasil.pandas.lib import pandas
-import pyspark.sql as pyspark_sql
+from yggdrasil.spark.lib import pyspark_sql
 ```
 
 Polars cast example:
 
 ```python
+import yggdrasil.arrow as pa
 from yggdrasil.polars.cast import cast_polars_dataframe
 from yggdrasil.data.cast import CastOptions
+from yggdrasil.polars.lib import polars
 
-pl_df = polars.DataFrame({"id": ["1"], "name": ["Ada"]})
-# opts can be pa.Schema, pa.Field, pa.DataType, dict, or CastOptions
-opts = CastOptions.check_arg(None)
-out = cast_polars_dataframe(pl_df, opts)
+source_df = polars.DataFrame({"id": ["1"], "value": ["4.2"]})
+target = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.float64())])
+out_df = cast_polars_dataframe(source_df, CastOptions(target_field=target))
 ```
 
 ---
 
-## 7) IO and HTTP sessions
+## 7) IO and HTTP subsystem
 
-Preferred HTTP client:
+Preferred client for new HTTP behavior:
 
 ```python
-from yggdrasil.io.http_.session import HTTPSession
+from yggdrasil.io.http_ import HTTPSession
 
 session = HTTPSession()
-response = session.get("https://example.com")
-print(response.status)
+resp = session.get("https://example.com")
+print(resp.status)
 ```
 
-Buffer + media type detection:
+Buffer / media detection:
 
 ```python
 from yggdrasil.io import BytesIO
@@ -135,16 +128,17 @@ from yggdrasil.io import BytesIO
 with BytesIO() as buf:
     buf.write(b"hello")
     buf.seek(0)
+    print(buf.compression)
     print(buf.media_type)
 ```
 
-Legacy retry session:
+Legacy retry-only session:
 
 ```python
 from yggdrasil.requests import YGGSession
 
-s = YGGSession(num_retry=3)
-print(s.get("https://example.com", timeout=10).status_code)
+legacy = YGGSession(num_retry=3)
+print(legacy.get("https://example.com", timeout=10).status_code)
 ```
 
 ---
@@ -156,63 +150,33 @@ from yggdrasil.databricks.workspaces import Workspace
 from yggdrasil.databricks.sql import SQLEngine
 
 ws = Workspace(host="https://<workspace>", token="<token>")
-engine = SQLEngine(workspace=ws)
-result = engine.execute("SELECT 1 AS value")
-print(result)
+engine = SQLEngine(client=ws)
+
+stmt = engine.execute("SELECT current_timestamp() AS ts")
+result_table = stmt.to_arrow_table()
+print(result_table)
 ```
 
 ---
 
-## 9) Full module and submodule map
+## 9) Advanced: reuse `CastOptions.check_arg` in custom helpers
 
-### Core data and schema
-- `yggdrasil.data.cast` - converter registry, dispatch, `CastOptions`.
-- `yggdrasil.data.enums` - timezone, currency, geozone helpers.
-- `yggdrasil.arrow` - Python type hint -> Arrow field/schema.
-- `yggdrasil.dataclasses` - dataclass -> Arrow field helpers.
+```python
+from yggdrasil.data.cast import CastOptions
 
-### Dataframe engines
-- `yggdrasil.polars` - Polars converters, extensions, guarded import.
-- `yggdrasil.pandas` - pandas converters, extensions, guarded import.
-- `yggdrasil.spark` - Spark converters, extensions, guarded import.
 
-### IO and transport
-- `yggdrasil.io` - URL, request/response models, buffers, codecs.
-- `yggdrasil.io.http_` - `HTTPSession` (preferred modern HTTP client).
-- `yggdrasil.io.buffer` - Arrow IPC, Parquet, JSON, ZIP buffer readers.
-- `yggdrasil.requests` - `YGGSession` and `MSALSession` (legacy/simple HTTP).
-
-### Databricks
-- `yggdrasil.databricks` - root package.
-- `yggdrasil.databricks.workspaces` - workspace client + paths/files.
-- `yggdrasil.databricks.sql` - SQL engine and statement results.
-- `yggdrasil.databricks.compute` - cluster and remote compute helpers.
-- `yggdrasil.databricks.jobs` - typed notebook parameter contracts.
-- `yggdrasil.databricks.account` / `iam` / `secrets` / `fs` - account APIs.
-
-### AI and API
-- `yggdrasil.ai` - OpenAI-backed sessions and SQL generation sessions.
-- `yggdrasil.fastapi` - optional REST API routers/services/schemas.
-
-### Utilities
-- `yggdrasil.pyutils` - `retry`, `parallelize`, misc helpers.
-- `yggdrasil.concurrent` - bounded job executor.
-- `yggdrasil.environ` - runtime import/install helpers.
-- `yggdrasil.mongo` and `yggdrasil.mongoengine` - MongoDB integrations.
-- `yggdrasil.pickle` - custom serialization and serde helpers.
-- `yggdrasil.fxrates` - FX-related helpers.
-- `yggdrasil.blake3` / `yggdrasil.xxhash` - hash wrappers.
+def normalize_options(options=None, target_field=None) -> CastOptions:
+    return CastOptions.check_arg(options, target_field=target_field, strict_match_names=True)
+```
 
 ---
 
-## 11) Learning path (easy -> advanced)
+## 10) Module map
 
-1. `data.cast.registry.convert`
-2. `arrow_field_from_hint`
-3. `CastOptions` + `arrow.cast`
-4. Polars/pandas/Spark casts
-5. `io.http_.HTTPSession` + `io.buffer`
-6. Databricks SQL + jobs
-7. AI SQL generation
-8. FastAPI and platform integrations
+- Core casting: `yggdrasil.data.cast`, `yggdrasil.arrow`, `yggdrasil.dataclasses`
+- Engines: `yggdrasil.polars`, `yggdrasil.pandas`, `yggdrasil.spark`
+- IO / HTTP: `yggdrasil.io`, `yggdrasil.io.http_`, `yggdrasil.requests`
+- Databricks: `yggdrasil.databricks.*`
+- Utilities: `yggdrasil.pyutils`, `yggdrasil.concurrent`, `yggdrasil.environ`, `yggdrasil.pickle`, `yggdrasil.mongo`, `yggdrasil.mongoengine`
 
+For per-module pages, see `python/docs/modules/` and `python/docs/modules.md`.

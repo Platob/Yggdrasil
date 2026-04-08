@@ -1,21 +1,15 @@
 # Yggdrasil
 
-Yggdrasil is a collection of schema-aware utilities for data interchange across Python types, Apache Arrow, pandas, Polars, Spark, and Databricks. The main deliverable today is the Python package in [`python/`](python/), published to PyPI as **`ygg`** with the import namespace **`yggdrasil`**.
+Yggdrasil is a schema-aware data interchange toolkit. The primary deliverable is the Python package in [`python/`](python/), published on PyPI as **`ygg`** and imported as **`yggdrasil`**.
 
-## What you can do with it
-- **Type-safe casting** between primitives, containers, enums, and dataclasses via a registry of converters.
-- **Arrow schema inference** from Python type hints (including dataclasses and `typing.Annotated`).
-- **Databricks helpers** for workspace config, SQL execution, and Arrow/Spark conversions.
-- **Operational utilities** such as retry-enabled HTTP sessions and simple parallelization helpers.
+## What it does
 
-## Install
-Quick install from PyPI:
+- Registry-driven casting across Python values, dataclasses, Arrow, Polars, pandas, Spark, and Databricks flows.
+- Arrow schema inference from Python hints.
+- Databricks workspace / SQL / compute helpers.
+- IO utilities (`BytesIO`, URL/HTTP abstractions) and operational helpers (`retry`, `parallelize`, bounded job execution).
 
-```bash
-pip install ygg
-```
-
-For development, create a local environment and install the package in editable mode:
+## Quick start
 
 ```bash
 cd python
@@ -24,84 +18,64 @@ source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
-## Code examples
+## Examples (easy → advanced)
 
-### 1) Convert values and dataclasses
+### 1) Scalar conversion
+
+```python
+from yggdrasil.data.cast.registry import convert
+
+print(convert("42", int))
+print(convert("true", bool))
+```
+
+### 2) Dict to dataclass conversion
 
 ```python
 from dataclasses import dataclass
-
-from yggdrasil.types import convert
+from yggdrasil.data.cast.registry import convert
 
 @dataclass
 class User:
     id: int
     email: str
-    active: bool = True
 
-raw = {"id": "42", "email": "ada@example.com", "active": "false"}
-user = convert(raw, User)
-print(user)
+print(convert({"id": "1", "email": "ada@example.com"}, User))
 ```
 
-### 2) Build Arrow schema fields from type hints
+### 3) Arrow cast with `CastOptions`
 
 ```python
-from dataclasses import dataclass
+import yggdrasil.arrow as pa
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions
 
-from yggdrasil.dataclasses import dataclass_to_arrow_field
-from yggdrasil.types import arrow_field_from_hint
+raw = pa.table({"id": ["1"], "score": ["3.14"]})
+opts = CastOptions(target_field=pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("score", pa.float64()),
+]))
 
-
-@dataclass
-class Event:
-    ts: str
-    value: float
-
-
-print(arrow_field_from_hint(list[int], name="counts"))
-print(dataclass_to_arrow_field(Event))
+print(cast_arrow_tabular(raw, opts).schema)
 ```
 
-### 3) Run Databricks SQL and retrieve Arrow results
+### 4) Databricks SQL
 
 ```python
-from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.workspaces import Workspace
+from yggdrasil.databricks.sql import SQLEngine
 
-engine = SQLEngine(Workspace(host="https://<workspace>", token="<token>"))
-result = engine.execute("SELECT 1 AS value")
-print(result.to_arrow_table().to_pandas())
-```
-
-### 4) Retryable HTTP sessions and simple parallel work
-
-```python
-from yggdrasil.requests import YGGSession
-from yggdrasil.pyutils import parallelize, retry
-
-session = YGGSession(num_retry=3)
-
-@parallelize(max_workers=4)
-def square(x: int) -> int:
-    return x * x
-
-@retry(tries=3, delay=0.1, backoff=2)
-def flaky(value: int) -> int:
-    return value
-
-print(list(square(range(4))))
+client = Workspace(host="https://<workspace>", token="<token>")
+engine = SQLEngine(client=client)
+print(engine.execute("SELECT 1 AS value").to_arrow_table())
 ```
 
 ## Repository map
-- [`python/`](python/) — Python package source, docs, and tests.
-- [`python/README.md`](python/README.md) — Package-specific setup and usage.
-- [`python/docs/`](python/docs/README.md) — Detailed documentation and module references.
 
-## Development notes
-- The package requires Python **3.10+**.
-- Entry point `yggenv` is available after installation for environment helpers.
-- Run tests from the `python/` directory with `pytest`.
+- [`python/README.md`](python/README.md) — package-level guide.
+- [`python/docs/README.md`](python/docs/README.md) — progressive docs with snippets.
+- [`python/docs/modules.md`](python/docs/modules.md) — module index.
 
 ## License
-Licensed under the terms in [LICENSE](LICENSE).
+
+See [LICENSE](LICENSE).
