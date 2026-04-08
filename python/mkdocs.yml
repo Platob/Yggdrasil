@@ -1,0 +1,83 @@
+site_name: Yggdrasil Python Docs
+site_description: Schema-aware data interchange for Python, Arrow, Polars, pandas, Spark, and Databricks.
+site_url: https://platob.github.io/Yggdrasil/
+repo_url: https://github.com/Platob/Yggdrasil
+repo_name: Platob/Yggdrasil
+edit_uri: edit/main/python/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            show_source: false
+            show_root_heading: true
+            show_signature_annotations: true
+            inherited_members: true
+            docstring_style: google
+  - gen-files:
+      scripts:
+        - docs/_scripts/gen_ref_pages.py
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Guides:
+      - guides/architecture.md
+      - guides/casting.md
+      - guides/io-http.md
+      - guides/databricks.md
+      - guides/development.md
+  - Module Walkthrough:
+      - README.md
+      - modules.md
+      - modules/README.md
+      - modules/arrow/README.md
+      - modules/types/README.md
+      - modules/types/cast/README.md
+      - modules/dataclasses/README.md
+      - modules/io/README.md
+      - modules/io/http_/README.md
+      - modules/requests/README.md
+      - modules/pyutils/README.md
+      - modules/concurrent/README.md
+      - modules/databricks/README.md
+      - modules/libs/README.md
+      - modules/libs/extensions/README.md
+  - API Reference: api/index.md
+
+watch:
+  - src/yggdrasil
+  - docs

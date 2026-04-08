@@ -148,6 +148,11 @@ print(list(square(range(5))))
 - `docs/modules.md` – concise module index.
 - `docs/modules/*` – focused module pages for core APIs.
 
+## Documentation website
+
+- GitHub Pages docs (MkDocs): https://platob.github.io/Yggdrasil/
+- Source docs: `python/docs/`
+
 ## Development checks
 
 ```bash
