@@ -943,54 +943,6 @@ class PyEnv:
 
         return [str(uv_ref)]
 
-    # ---------------------------------------------------------------------
-    # Package management
-    # ---------------------------------------------------------------------
-
-    def requirements(
-        self,
-        prefer_uv: bool | None = None,
-        *,
-        with_system: bool = False,
-    ) -> list[tuple[str, str]]:
-        """
-        Return installed packages as ``(name, version)`` tuples, sorted by name.
-        """
-        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["list", "--format=json"]
-
-        res = subprocess.run(
-            cmd,
-            cwd=str(self.cwd),
-            env=dict(os.environ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        pkgs = json.loads(res.stdout or "[]")
-        if not isinstance(pkgs, list):
-            raise ValueError("Unexpected pip output: expected JSON list")
-
-        out: list[tuple[str, str]] = []
-        for item in pkgs:
-            if not isinstance(item, dict):
-                continue
-
-            name = str(item.get("name", "")).strip()
-            version = str(item.get("version", "")).strip()
-            if not name or not version:
-                continue
-
-            name_l = name.lower()
-            if not with_system:
-                if name_l in SYSTEM_LIBS:
-                    continue
-                if name_l.startswith(("test-", "test_", "win32", "pywin32")):
-                    continue
-
-            out.append((name, version))
-
-        return sorted(out, key=lambda x: x[0].lower())
-
     def _run_pip_internal(self, *args: str) -> None:
         """
         Run pip through its internal API as a private fallback.

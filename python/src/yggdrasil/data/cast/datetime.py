@@ -90,6 +90,36 @@ _STRPTIME_FORMATS = (
 CURRENT_TZINFO: dt.tzinfo = _UTC
 
 
+def _coerce_target_tzinfo(tz: Any = None, opts: Any = None) -> dt.tzinfo | None:
+    """
+    Accept tz as:
+      - tzinfo
+      - str like 'UTC' or 'Europe/Paris'
+      - timedelta offset
+
+    Falls back to opts for backward compatibility if tz is not provided.
+    """
+    candidate = tz if tz is not None else opts
+    if candidate is None:
+        return None
+    if isinstance(candidate, dt.tzinfo):
+        return candidate
+    if isinstance(candidate, str):
+        return str_to_tzinfo(candidate, opts)
+    if isinstance(candidate, _TIMEDELTA):
+        return timedelta_to_tzinfo(candidate, opts)
+    raise TypeError(f"Cannot interpret timezone from {type(candidate).__name__}")
+
+
+def _apply_target_tz(value: dt.datetime, tz: Any = None, opts: Any = None) -> dt.datetime:
+    target_tz = _coerce_target_tzinfo(tz=tz, opts=opts)
+    if target_tz is None:
+        return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_UTC)
+    return value.astimezone(target_tz)
+
+
 def normalize_fractional_seconds(value: str) -> str:
     """Normalize fractional seconds to microsecond precision for fromisoformat()."""
     match = _RE_FRACTIONAL_SECONDS.search(value)
@@ -145,17 +175,17 @@ def normalize_datetime_string(value: str) -> str:
 
 @register_converter(str, dt.date)
 def str_to_date(value: str, opts: Any = None) -> dt.date:
-    return str_to_datetime(value, opts).date()
+    return str_to_datetime(value, opts=opts).date()
 
 
 @register_converter(str, dt.datetime)
-def str_to_datetime(value: str, opts: Any = None) -> dt.datetime:
+def str_to_datetime(value: str, opts: Any = None, tz: Any = None) -> dt.datetime:
     s = value.strip()
 
     if s == "utcnow":
-        return _DATETIME.now(tz=_UTC)
+        return _apply_target_tz(_DATETIME.now(tz=_UTC), tz=tz, opts=opts)
     if s == "now":
-        return _DATETIME.now(tz=CURRENT_TZINFO)
+        return _apply_target_tz(_DATETIME.now(tz=CURRENT_TZINFO), tz=tz, opts=opts)
 
     s = normalize_datetime_string(s)
 
@@ -175,7 +205,7 @@ def str_to_datetime(value: str, opts: Any = None) -> dt.datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_UTC)
 
-    return parsed
+    return _apply_target_tz(parsed, tz=tz, opts=opts)
 
 
 @register_converter(str, dt.time)
@@ -252,19 +282,27 @@ def datetime_to_time(value: dt.datetime, opts: Any = None) -> dt.time:
 
 
 @register_converter(dt.date, dt.datetime)
-def date_to_datetime(value: dt.date, opts: Any = None) -> dt.datetime:
-    return _DATETIME(value.year, value.month, value.day, tzinfo=CURRENT_TZINFO)
+def date_to_datetime(value: dt.date, opts: Any = None, tz: Any = None) -> dt.datetime:
+    return _apply_target_tz(
+        _DATETIME(value.year, value.month, value.day, tzinfo=CURRENT_TZINFO),
+        tz=tz,
+        opts=opts,
+    )
 
 
 @register_converter(dt.time, dt.datetime)
-def time_to_datetime(value: dt.time, opts: Any = None) -> dt.datetime:
-    tz = value.tzinfo if value.tzinfo is not None else CURRENT_TZINFO
-    return _DATETIME(1970, 1, 1, value.hour, value.minute, value.second, value.microsecond, tzinfo=tz)
+def time_to_datetime(value: dt.time, opts: Any = None, tz: Any = None) -> dt.datetime:
+    src_tz = value.tzinfo if value.tzinfo is not None else CURRENT_TZINFO
+    return _apply_target_tz(
+        _DATETIME(1970, 1, 1, value.hour, value.minute, value.second, value.microsecond, tzinfo=src_tz),
+        tz=tz,
+        opts=opts,
+    )
 
 
 @register_converter(dt.datetime, dt.datetime)
-def datetime_to_datetime(value: dt.datetime, opts: Any = None) -> dt.datetime:
-    return value
+def datetime_to_datetime(value: dt.datetime, opts: Any = None, tz: Any = None) -> dt.datetime:
+    return _apply_target_tz(value, tz=tz, opts=opts)
 
 
 def _numeric_timestamp_to_seconds(value: int | float) -> float:
@@ -279,8 +317,6 @@ def _numeric_timestamp_to_seconds(value: int | float) -> float:
     #   seconds      ~ 1e9
     #   milliseconds ~ 1e12
     #   microseconds ~ 1e15
-    #
-    # Use current epoch magnitude with cheap branch-only inference.
     if x < now_s * 100.0:
         return v
     if x < now_s * 100_000.0:
@@ -288,18 +324,22 @@ def _numeric_timestamp_to_seconds(value: int | float) -> float:
     return v * 1e-6
 
 
-def _numeric_to_datetime(value: int | float) -> dt.datetime:
-    return _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
+def _numeric_to_datetime(value: int | float, opts: Any = None, tz: Any = None) -> dt.datetime:
+    return _apply_target_tz(
+        _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC),
+        tz=tz,
+        opts=opts,
+    )
 
 
 @register_converter(int, dt.datetime)
-def int_to_datetime(value: int, opts: Any = None) -> dt.datetime:
-    return _numeric_to_datetime(value)
+def int_to_datetime(value: int, opts: Any = None, tz: Any = None) -> dt.datetime:
+    return _numeric_to_datetime(value, opts=opts, tz=tz)
 
 
 @register_converter(float, dt.datetime)
-def float_to_datetime(value: float, opts: Any = None) -> dt.datetime:
-    return _numeric_to_datetime(value)
+def float_to_datetime(value: float, opts: Any = None, tz: Any = None) -> dt.datetime:
+    return _numeric_to_datetime(value, opts=opts, tz=tz)
 
 
 @register_converter(int, dt.date)
@@ -336,23 +376,23 @@ def tzinfo_to_timedelta(value: dt.tzinfo, opts: Any = None) -> dt.timedelta:
 
 
 @register_converter(Any, dt.datetime)
-def any_to_datetime(value: Any, opts: Any = None) -> dt.datetime:
+def any_to_datetime(value: Any, opts: Any = None, tz: Any = None) -> dt.datetime:
     if value is None:
         raise TypeError("Cannot convert None.")
     if isinstance(value, _DATETIME):
-        return value
+        return datetime_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, str):
-        return str_to_datetime(value, opts)
+        return str_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, bool):
         raise TypeError("Refusing to treat bool as epoch seconds for datetime conversion.")
     if isinstance(value, int):
-        return int_to_datetime(value, opts)
+        return int_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, float):
-        return float_to_datetime(value, opts)
+        return float_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, _DATE):
-        return date_to_datetime(value, opts)
+        return date_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, _TIME):
-        return time_to_datetime(value, opts)
+        return time_to_datetime(value, opts=opts, tz=tz)
     raise TypeError(f"No conversion path for {type(value).__name__} -> datetime")
 
 

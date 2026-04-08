@@ -12,6 +12,7 @@ from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
 
+from yggdrasil.version import __version__ as ygg_version
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
@@ -124,8 +125,8 @@ class DatabricksClient(URLResource):
     rate_limit: Optional[int] = field(default=None, repr=False)
 
     # Extras
-    product: Optional[str] = field(default=None, repr=False)
-    product_version: Optional[str] = field(default=None, repr=False)
+    product: Optional[str] = field(default="yggdrasil", repr=False)
+    product_version: Optional[str] = field(default=ygg_version, repr=False)
     custom_tags: Optional[dict] = field(default=None, repr=False)
 
     # Internal cached SDK clients

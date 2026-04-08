@@ -51,7 +51,7 @@ def _normalize_metadata(
             {
                 b"t:" + _to_bytes(key): _to_bytes(value)
                 for key, value in tags.items()
-                if key and value is not None
+                if key and value
             }
         )
 

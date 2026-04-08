@@ -220,7 +220,24 @@ class Serialized(ABC, Generic[T]):
 
         mod, _ = cls.module_and_name(obj, fallback="unknown")
 
+        if mod.startswith("yggdrasil.data"):
+            from yggdrasil.pickle.ser.data import DataSerialized
+
+            out = DataSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
+
         if mod.startswith("yggdrasil.io"):
+            from yggdrasil.pickle.ser.http_ import HttpSerialized
+
+            out = HttpSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
+
             from yggdrasil.pickle.ser.media import (
                 MediaTypeSerialized as _MTS,
                 MimeTypeSerialized as _MiTS,

@@ -25,7 +25,6 @@ __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
     "request_method",
-    "request_url_scheme",
     "request_url_host",
     "request_url_path",
     "request_url_port",
@@ -264,7 +263,7 @@ class CacheConfig(_ConfigBase):
         return self.table is not None
 
     @property
-    def by(self) -> list[str]:
+    def match_by(self) -> list[str]:
         return [
             *(self.request_by or ()),
             *(self.response_by or ()),
@@ -491,7 +490,7 @@ class CacheConfig(_ConfigBase):
         if where_clause != "1=1":
             base_query += f" WHERE {where_clause}"
 
-        identity_cols = list(identity_by) if identity_by is not None else self.by
+        identity_cols = list(identity_by) if identity_by is not None else self.match_by
         if identity_cols:
             partition_by = ", ".join(identity_cols)
             return (
@@ -529,7 +528,7 @@ class CacheConfig(_ConfigBase):
         if where_parts:
             base_query += " WHERE " + " AND ".join(where_parts)
 
-        identity_cols = list(identity_by) if identity_by is not None else self.by
+        identity_cols = list(identity_by) if identity_by is not None else self.match_by
         if identity_cols:
             partition_by = ", ".join(identity_cols)
             return (

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Response",
     "BASE_SCHEMA",
+    "RESPONSE_SCHEMA",
     "RESPONSE_ARROW_SCHEMA",
 ]
 
@@ -101,16 +102,6 @@ def _parse_content_encoding(headers: Mapping[str, str] | None) -> str | None:
     return ",".join(parts) or None
 
 
-def _parse_content_length(headers: Mapping[str, str] | None) -> int | None:
-    value = _get_header(headers, "Content-Length")
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return None
-
-
 def _is_probably_placeholder_content_type(value: str | None) -> bool:
     if not value:
         return True
@@ -163,9 +154,7 @@ def _ensure_media_headers(
     if not declared_encoding and media.codec is not None:
         headers["Content-Encoding"] = media.codec.name
 
-    if _parse_content_length(headers) is None:
-        headers["Content-Length"] = str(body.size)
-
+    headers["Content-Length"] = str(body.size)
     return media
 
 
@@ -517,7 +506,8 @@ BASE_SCHEMA["response_received_at"] = schema_field(
     },
 )
 
-RESPONSE_ARROW_SCHEMA = (REQUEST_ARROW_SCHEMA + BASE_SCHEMA).to_arrow_schema()
+RESPONSE_SCHEMA = REQUEST_ARROW_SCHEMA + BASE_SCHEMA
+RESPONSE_ARROW_SCHEMA = RESPONSE_SCHEMA.to_arrow_schema()
 
 _RESPONSE_FIELD_NAMES: frozenset[str] = frozenset(RESPONSE_ARROW_SCHEMA.names)
 _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (

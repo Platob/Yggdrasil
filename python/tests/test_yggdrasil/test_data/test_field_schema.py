@@ -38,7 +38,7 @@ def test_schema_from_to_pyspark() -> None:
     assert schema["id"].nullable is False
     assert schema["name"].arrow_type == pa.string()
 
-    restored = schema.to_pyspark_schema()
+    restored = schema.to_spark_schema()
     assert restored.fieldNames() == ["id", "name"]
     assert isinstance(restored["id"].dataType, T.IntegerType)
     assert restored["id"].nullable is False

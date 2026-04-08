@@ -76,9 +76,19 @@ def _capture_arrow_sqls(engine: SQLEngine, table: MagicMock):
     ``SQLEngine`` is a frozen dataclass, so we patch at the *class* level.
     """
     fake_path = MagicMock()
-    fake_path.__str__ = lambda _: "/Volumes/main/sales/tmp/staged.parquet"
+    fake_path.__str__ = lambda _: (
+        "/Volumes/main/sales/tmp/.sql/main/sales/test_update_cols/"
+        "tmp-1774938955-1774942555-5ba89ace.parquet"
+    )
     fake_path.write_bytes = MagicMock()
     fake_path.remove = MagicMock()
+    fake_path.parent = MagicMock()
+    fake_path.parent.mkdir = MagicMock()
+
+    fake_staging = MagicMock()
+    fake_staging.path = fake_path
+    fake_staging.register_shutdown_cleanup = MagicMock()
+    fake_staging.cleanup = MagicMock()
 
     mock_mio = MagicMock()
     mock_mio.buffer.memoryview.return_value = b""
@@ -95,7 +105,7 @@ def _capture_arrow_sqls(engine: SQLEngine, table: MagicMock):
         return MagicMock()
 
     with (
-        patch.object(engine.client, "tmp_path", return_value=fake_path),
+        patch("yggdrasil.databricks.sql.engine.StagingPath.for_table", return_value=fake_staging),
         patch("yggdrasil.databricks.sql.engine.BytesIO", return_value=mock_bio_instance),
         patch("yggdrasil.databricks.sql.engine.MediaIO") as mock_MediaIO,
         patch("yggdrasil.databricks.sql.engine.Job"),

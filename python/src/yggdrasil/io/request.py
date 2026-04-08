@@ -18,6 +18,7 @@ from .url import URL
 
 if TYPE_CHECKING:
     from .response import Response
+    from .send_config import CacheConfig
 
 
 __all__ = ["PreparedRequest", "REQUEST_SCHEMA", "REQUEST_ARROW_SCHEMA"]
@@ -45,7 +46,6 @@ REQUEST_SCHEMA["request_method"] = schema_field(
     nullable=False,
     metadata={
         "comment": "HTTP method (GET, POST, etc.)",
-        "partition_by": "true",
     },
     tags={
         "entity": "request",
@@ -104,6 +104,7 @@ REQUEST_SCHEMA["request_url_host"] = schema_field(
     tags={
         "entity": "request",
         "group": "url",
+        "partition_by": True
     },
 )
 
@@ -131,6 +132,7 @@ REQUEST_SCHEMA["request_url_path"] = schema_field(
     tags={
         "entity": "request",
         "group": "url",
+        "partition_by": True
     },
 )
 
@@ -344,7 +346,6 @@ REQUEST_SCHEMA["request_sent_at"] = schema_field(
     tags={
         "entity": "request",
         "group": "timing",
-        "timezone": "UTC",
     },
 )
 
@@ -393,6 +394,19 @@ class PreparedRequest:
     tags: MutableMapping[str, str]
     buffer: Optional[BytesIO]
     sent_at: dt.datetime
+
+    # Per-request cache-config overrides.  When set they take precedence over
+    # the session-level CacheConfig for this individual request only.
+    local_cache_config: Optional["CacheConfig"] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    remote_cache_config: Optional["CacheConfig"] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = field(
         default=None,
@@ -608,6 +622,8 @@ class PreparedRequest:
         tags: Optional[Mapping[str, str]] = None,
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
         after_received: Optional[Callable[["Response"], "Response"]] = None,
+        local_cache_config: Optional[CacheConfig] = None,
+        remote_cache_config: Optional[CacheConfig] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True,
@@ -646,6 +662,8 @@ class PreparedRequest:
             tags=_string_dict(tags),
             buffer=request_body,
             sent_at=0,
+            local_cache_config=local_cache_config,
+            remote_cache_config=remote_cache_config,
         )
         built.before_send = before_send
         built.prepare_response = after_received
@@ -662,6 +680,8 @@ class PreparedRequest:
         sent_at: Optional[int] = None,
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
         prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
+        local_cache_config: Optional["CacheConfig"] = ...,
+        remote_cache_config: Optional["CacheConfig"] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
@@ -684,6 +704,8 @@ class PreparedRequest:
             tags=new_tags,
             buffer=new_buffer,
             sent_at=self.sent_at if sent_at is None else any_to_datetime(sent_at),
+            local_cache_config=self.local_cache_config if local_cache_config is ... else local_cache_config,
+            remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
         )
 
         built.before_send = self.before_send if before_send is ... else before_send

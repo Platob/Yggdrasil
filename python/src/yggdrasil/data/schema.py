@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, MutableMapping
 from dataclasses import dataclass, field as dc_field
-from typing import TYPE_CHECKING, Any, AnyStr, Mapping
+from typing import TYPE_CHECKING, Any, AnyStr, Mapping, overload
 
 import pyarrow as pa
 
@@ -58,7 +58,6 @@ class Schema(MutableMapping[str, Field]):
     def tags(self):
         if not self.metadata:
             return None
-
         return {k[2:]: v for k, v in self.metadata.items() if k.startswith(b"t:")}
 
     @tags.setter
@@ -94,6 +93,80 @@ class Schema(MutableMapping[str, Field]):
     def fields(self) -> tuple[Field, ...]:
         return tuple(self.inner_fields.values())
 
+    def field_at(self, index: int, raise_error: bool = True) -> Field | None:
+        if -len(self.inner_fields) <= index < len(self.inner_fields):
+            return next(iter(self.inner_fields.values())) if len(self.inner_fields) == 1 and index in (0, -1) else self.fields[index]
+        if raise_error:
+            raise IndexError(index)
+        return None
+
+    def name_at(self, index: int, raise_error: bool = True) -> str | None:
+        if -len(self.inner_fields) <= index < len(self.inner_fields):
+            return self.names[index]
+        if raise_error:
+            raise IndexError(index)
+        return None
+
+    def index(self, key: str, *, case_sensitive: bool = False) -> int:
+        resolved = self._resolve_name(key, case_sensitive=case_sensitive)
+        return self.names.index(resolved)
+
+    def _find_case_insensitive_name(self, key: str) -> str | None:
+        key_lower = key.lower()
+        matches = [name for name in self.inner_fields if name.lower() == key_lower]
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        # Ambiguous on purpose. Exact match is already tried before this path.
+        raise KeyError(
+            f"Ambiguous field name {key!r}; case-insensitive matches: {matches}"
+        )
+
+    def _resolve_name(
+        self,
+        key: str,
+        *,
+        case_sensitive: bool = False,
+        raise_error: bool = True,
+    ) -> str | None:
+        if key in self.inner_fields:
+            return key
+
+        if not case_sensitive:
+            match = self._find_case_insensitive_name(key)
+            if match is not None:
+                return match
+
+        if raise_error:
+            raise KeyError(key)
+        return None
+
+    def _resolve_key(
+        self,
+        key: int | str,
+        *,
+        case_sensitive: bool = False,
+        raise_error: bool = True,
+    ) -> str | None:
+        if isinstance(key, int):
+            return self.name_at(key, raise_error=raise_error)
+
+        if isinstance(key, str):
+            return self._resolve_name(
+                key,
+                case_sensitive=case_sensitive,
+                raise_error=raise_error,
+            )
+
+        if raise_error:
+            raise TypeError(
+                f"Schema keys must be int or str; got {type(key).__name__}"
+            )
+        return None
+
     @property
     def arrow_fields(self):
         return [_.to_arrow_field() for _ in self.inner_fields.values()]
@@ -108,22 +181,18 @@ class Schema(MutableMapping[str, Field]):
 
     @property
     def primary_keys(self) -> list[Field]:
-        """Return fields that carry the ``t:primary_key`` metadata tag."""
         return [f for f in self.inner_fields.values() if f.primary_key]
 
     @property
     def primary_key_names(self) -> list[str]:
-        """Return fields that carry the ``t:primary_key`` metadata tag."""
         return [f.name for f in self.inner_fields.values() if f.primary_key]
 
     @property
     def foreign_keys(self) -> list[Field]:
-        """Return fields that carry the ``t:foreign_key`` metadata tag."""
         return [f for f in self.inner_fields.values() if f.foreign_key]
 
     @property
-    def foreign_key_names(self) -> list[Field]:
-        """Return fields that carry the ``t:foreign_key`` metadata tag."""
+    def foreign_key_names(self) -> list[str]:
         return [f.name for f in self.inner_fields.values() if f.foreign_key]
 
     @property
@@ -132,10 +201,8 @@ class Schema(MutableMapping[str, Field]):
             return None
 
         c = self.metadata.get(b"comment") or self.metadata.get(b"description")
-
         if not c:
             return None
-
         return c.decode("utf-8")
 
     @staticmethod
@@ -189,17 +256,29 @@ class Schema(MutableMapping[str, Field]):
             out[field.name] = field
         return out
 
-    def __getitem__(self, key: str) -> Field:
-        return self.inner_fields[key]
+    @overload
+    def __getitem__(self, key: int) -> Field: ...
+    @overload
+    def __getitem__(self, key: str) -> Field: ...
+
+    def __getitem__(self, key: int | str) -> Field:
+        resolved = self._resolve_key(key)
+        return self.inner_fields[resolved]
 
     def __setitem__(self, key: str, value: Field | pa.Field) -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Schema assignment key must be str; got {type(key).__name__}"
+            )
+
         field = Field.from_any(value)
         if field.name != key:
             field = field.copy(name=key)
         self.inner_fields[key] = field
 
-    def __delitem__(self, key: str) -> None:
-        del self.inner_fields[key]
+    def __delitem__(self, key: int | str) -> None:
+        resolved = self._resolve_key(key)
+        del self.inner_fields[resolved]
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.inner_fields)
@@ -208,7 +287,69 @@ class Schema(MutableMapping[str, Field]):
         return len(self.inner_fields)
 
     def __contains__(self, key: object) -> bool:
-        return key in self.inner_fields
+        if isinstance(key, int):
+            return -len(self.inner_fields) <= key < len(self.inner_fields)
+
+        if isinstance(key, str):
+            return self._resolve_name(key, raise_error=False) is not None
+
+        return False
+
+    @overload
+    def get(self, key: int, default: None = None) -> Field | None: ...
+    @overload
+    def get(self, key: str, default: None = None) -> Field | None: ...
+    @overload
+    def get(self, key: int | str, default: Any = None) -> Any: ...
+
+    def get(self, key: int | str, default: Any = None) -> Any:
+        resolved = self._resolve_key(key, raise_error=False)
+        if resolved is None:
+            return default
+        return self.inner_fields[resolved]
+
+    @overload
+    def pop(self, key: int) -> Field: ...
+    @overload
+    def pop(self, key: str) -> Field: ...
+    @overload
+    def pop(self, key: int | str, default: Any) -> Field | Any: ...
+
+    def pop(self, key: int | str, default: Any = ...):
+        resolved = self._resolve_key(key, raise_error=False)
+        if resolved is None:
+            if default is ...:
+                if isinstance(key, int):
+                    raise IndexError(key)
+                raise KeyError(key)
+            return default
+        return self.inner_fields.pop(resolved)
+
+    def setdefault(self, key: str, default: Field | pa.Field | None = None) -> Field:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Schema.setdefault key must be str; got {type(key).__name__}"
+            )
+
+        resolved = self._resolve_name(key, raise_error=False)
+        if resolved is not None:
+            return self.inner_fields[resolved]
+
+        if default is None:
+            raise ValueError("Schema.setdefault requires a Field default for new keys")
+
+        field = Field.from_any(default)
+        if field.name != key:
+            field = field.copy(name=key)
+
+        self.inner_fields[key] = field
+        return field
+
+    def popitem(self, last: bool = True) -> tuple[str, Field]:
+        return self.inner_fields.popitem(last=last)
+
+    def clear(self) -> None:
+        self.inner_fields.clear()
 
     def __add__(self, other: Any) -> "Schema":
         other = self._coerce_other(other)
@@ -429,16 +570,20 @@ class Schema(MutableMapping[str, Field]):
 
         return cls.from_any(obj).copy(metadata=metadata, tags=tags)
 
-    def to_pyspark_schema(self) -> "pst.StructType":
+    def to_spark_schema(self) -> "pst.StructType":
         from yggdrasil.spark.cast import arrow_schema_to_spark_schema
-
         return arrow_schema_to_spark_schema(self.to_arrow_schema())
 
-    def cast_table(self, obj: Any, *, safe: bool = True) -> Any:
+    def cast_options(self, *, safe: bool = True):
         from yggdrasil.data.cast import CastOptions
         return CastOptions(
             target_field=self.to_arrow_schema(),
             safe=safe,
+        )
+
+    def cast_table(self, obj: Any, *, safe: bool = True) -> Any:
+        return self.cast_options(
+            safe=safe
         ).cast_table(obj)
 
     def cast_unstructured(

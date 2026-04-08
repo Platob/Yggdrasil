@@ -50,7 +50,6 @@ def test_cache_config_defaults() -> None:
 
     assert cfg.request_by == [
         "request_method",
-        "request_url_scheme",
         "request_url_host",
         "request_url_path",
         "request_url_port",
@@ -104,7 +103,7 @@ def test_cache_config_by_combines_request_and_response_keys() -> None:
         response_by=["response_status_code"],
     )
 
-    assert cfg.by == ["request_method", "response_status_code"]
+    assert cfg.match_by == ["request_method", "response_status_code"]
 
 
 def test_cache_config_sql_literal() -> None:

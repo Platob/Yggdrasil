@@ -3,6 +3,7 @@ import datetime as dt
 import pyarrow as pa
 import pytest
 
+from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.sql.exceptions import SqlStatementError
 from ..conftest import requires_databricks, DatabricksCase
 
@@ -14,7 +15,7 @@ class TestSQLEngine(DatabricksCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.engine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
+        cls.engine: SQLEngine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
 
     def test_insert_read_same(self):
         data = pa.table([

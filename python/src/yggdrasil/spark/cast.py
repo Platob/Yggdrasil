@@ -1507,9 +1507,20 @@ def any_to_spark_dataframe(
             raise ValueError(
                 f"Cannot convert {type(obj)} to pyspark.sql.DataFrame"
             )
+    elif namespace.startswith("yggdrasil."):
+        from yggdrasil.spark.frame import DynamicFrame
+
+        if isinstance(obj, DynamicFrame):
+            schema = opts.target_schema
+
+            df = obj.df if schema is None else obj.cast(schema=schema)
+        else:
+            raise ValueError(
+                f"Cannot create spark dataframe from {type(obj)}"
+            )
     else:
         # Route through Polars as the intermediate representation for arbitrary inputs.
-        from ..polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
+        from yggdrasil.polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
 
         arrow_table = polars_dataframe_to_arrow_table(
             any_to_polars_dataframe(obj, opts), opts

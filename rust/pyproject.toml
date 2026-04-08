@@ -7,7 +7,7 @@ name = "yggrs"
 # Keep in sync with python/pyproject.toml [project] version.
 # The publish-native.yml CI workflow overwrites this with the canonical
 # version read from python/pyproject.toml before running maturin.
-version = "0.6.14"
+version = "0.6.15"
 description = "Optional Rust acceleration kernels for yggdrasil"
 readme = { file = "../README.md", content-type = "text/markdown" }
 license = { file = "./LICENSE" }

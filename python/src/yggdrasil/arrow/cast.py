@@ -1799,6 +1799,17 @@ def any_to_arrow_field(
 
             if options.source_field:
                 obj = merge_arrow_fields(options.source_field, obj)
+        elif namespace.startswith("yggdrasil."):
+            from yggdrasil.data import Field, Schema
+
+            if isinstance(obj, Field):
+                obj = obj.to_arrow_field()
+            elif isinstance(obj, Schema):
+                obj = obj.to_arrow_schema()
+            else:
+                raise ValueError(
+                    f"Cannot convert {type(obj)} to arrow field"
+                )
         else:
             from yggdrasil.polars.lib import polars
             from yggdrasil.polars.cast import any_to_polars_dataframe, any_polars_to_arrow_field

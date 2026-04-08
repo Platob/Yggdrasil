@@ -1,11 +1,12 @@
 import dataclasses as dc
 import inspect
 import logging
+import random
 import time
 from typing import Optional, Sequence, Any, Type, TypeVar, Union, List
 
 from databricks.sdk import WarehousesAPI
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import ResourceDoesNotExist, DeadlineExceeded
 from databricks.sdk.service.sql import (
     State, EndpointInfo,
     EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
@@ -139,6 +140,37 @@ def _copy_common_fields(src: Any, dst_cls: Type[T], *, skip: set[str] = frozense
             continue
         payload[name] = getattr(src, name, None)
     return payload
+
+
+def _jitter_sleep_seconds(
+    wait: WaitingConfig,
+    *,
+    iteration: int,
+    remaining: Optional[float],
+) -> float:
+    """
+    Exponential backoff with jitter, capped by remaining deadline.
+
+    - base interval comes from wait.interval
+    - backoff factor comes from wait.backoff
+    - max_interval caps the pre-jitter delay
+    - jitter uses full jitter in [0, delay]
+    """
+    base = float(wait.interval or 1.0)
+    backoff = max(float(wait.backoff or 1.0), 1.0)
+
+    delay = base * (backoff ** iteration)
+
+    if wait.max_interval:
+        delay = min(delay, float(wait.max_interval))
+
+    # Full jitter: random sleep in [0, delay]
+    delay = random.uniform(0.0, delay)
+
+    if remaining is not None:
+        delay = min(delay, max(0.0, remaining))
+
+    return max(0.0, delay)
 
 
 @dc.dataclass(frozen=True)
@@ -795,36 +827,9 @@ class SQLWarehouse(DatabricksService):
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
         wait: WaitingConfigArg = True,
+        submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
     ) -> StatementResult:
-        """Execute a SQL statement via Spark or Databricks SQL Statement Execution API.
-
-        Engine resolution:
-        - If `engine` is not provided and a Spark session is active -> uses Spark.
-        - Otherwise uses Databricks SQL API (warehouse).
-
-        Waiting behavior (`wait_result`):
-        - If True (default): returns a StatementResult in terminal state (SUCCEEDED/FAILED/CANCELED).
-        - If False: returns immediately with the initial handle (caller can `.wait()` later).
-
-        Args:
-            statement: SQL statement to execute. If None, a `SELECT *` is generated from the table params.
-            warehouse_id: Warehouse override (for API engine).
-            warehouse_name: Warehouse name override (for API engine).
-            byte_limit: Optional byte limit for results.
-            disposition: Result disposition mode (API engine).
-            format: Result format (API engine).
-            on_wait_timeout: Timeout behavior for waiting (API engine).
-            parameters: Optional statement parameters (API engine).
-            row_limit: Optional row limit for results (API engine).
-            wait_timeout: API wait timeout value.
-            catalog_name: Optional catalog override for API engine.
-            schema_name: Optional schema override for API engine.
-            wait: Whether to block until completion (API engine).
-
-        Returns:
-            StatementResult
-        """
         if format is None:
             format = Format.ARROW_STREAM
 
@@ -833,29 +838,89 @@ class SQLWarehouse(DatabricksService):
         elif format in (Format.CSV, Format.ARROW_STREAM):
             disposition = Disposition.EXTERNAL_LINKS
 
-        instance = self.find_warehouse(warehouse_id=warehouse_id, warehouse_name=warehouse_name)
+        wait = WaitingConfig.check_arg(wait)
+
+        if submit_wait is None:
+            submit_wait = WaitingConfig(
+                timeout=300,
+                interval=1.0,
+                backoff=1.8,
+                max_interval=8.0,
+            )
+        else:
+            submit_wait = WaitingConfig.check_arg(submit_wait)
+
+        instance = self.find_warehouse(
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name
+        )
         warehouse_id = warehouse_id or instance.warehouse_id
         client = instance.client.workspace_client().statement_execution
 
         LOGGER.debug(
             "Executing SQL on warehouse %s (%s):\n%s",
-            instance.warehouse_name, warehouse_id,
-            statement,
+            instance.warehouse_name, warehouse_id, statement,
         )
 
-        response = client.execute_statement(
-            statement=statement,
-            warehouse_id=warehouse_id,
-            byte_limit=byte_limit,
-            disposition=disposition,
-            format=format,
-            on_wait_timeout=on_wait_timeout,
-            parameters=parameters,
-            row_limit=row_limit,
-            wait_timeout=wait_timeout,
-            catalog=catalog_name,
-            schema=schema_name,
+        started_at = time.monotonic()
+        deadline = (
+            started_at + submit_wait.timeout
+            if submit_wait and submit_wait.timeout
+            else None
         )
+
+        response = None
+        iteration = 0
+
+        while True:
+            try:
+                response = client.execute_statement(
+                    statement=statement,
+                    warehouse_id=warehouse_id,
+                    byte_limit=byte_limit,
+                    disposition=disposition,
+                    format=format,
+                    on_wait_timeout=on_wait_timeout,
+                    parameters=parameters,
+                    row_limit=row_limit,
+                    wait_timeout=wait_timeout,
+                    catalog=catalog_name,
+                    schema=schema_name,
+                )
+                break
+
+            except DeadlineExceeded:
+                remaining = None if deadline is None else (deadline - time.monotonic())
+
+                if remaining is not None and remaining <= 0:
+                    LOGGER.error(
+                        "Submit deadline exceeded for warehouse %s (%s) after %.2fs and %d retries",
+                        instance.warehouse_name,
+                        warehouse_id,
+                        time.monotonic() - started_at,
+                        iteration,
+                    )
+                    raise
+
+                sleep_for = _jitter_sleep_seconds(
+                    submit_wait,
+                    iteration=iteration,
+                    remaining=remaining,
+                )
+
+                LOGGER.warning(
+                    "Warehouse %s (%s) is busy; execute submit hit DeadlineExceeded. "
+                    "Retrying in %.2fs (attempt=%d)",
+                    instance.warehouse_name,
+                    warehouse_id,
+                    sleep_for,
+                    iteration + 1,
+                )
+
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+                iteration += 1
 
         execution = StatementResult(
             client=self.client,

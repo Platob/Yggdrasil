@@ -110,6 +110,7 @@ from yggdrasil.io.enums import SaveMode
 from yggdrasil.io.enums.media_type import MediaTypes
 
 from .statement_result import StatementResult
+from .staging import StagingPath
 from .table import Table
 from .tables import Tables
 from .types import quote_ident, PrimaryKeySpec, ForeignKeySpec
@@ -777,19 +778,23 @@ class SQLEngine(DatabricksService):
             target_field=existing_schema,
         )
 
-        logger.debug("Inserting %s into %s", data, location)
+        logger.debug("Inserting %s into %s", type(data), location)
 
-        temp_volume_path = (
-            self.client.tmp_path(
+        staging: Optional[StagingPath] = None
+        if temp_volume_path is None:
+            staging = StagingPath.for_table(
+                client=self.client,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
-                volume_name="tmp",
-                extension="parquet",
+                table_name=table.table_name,
                 max_lifetime=3600,
             )
-            if temp_volume_path is None
-            else DatabricksPath.parse(obj=temp_volume_path, client=self.client)
-        )
+            staging.register_shutdown_cleanup()
+            temp_volume_path = staging.path
+        else:
+            temp_volume_path = DatabricksPath.parse(obj=temp_volume_path, client=self.client)
+
+        temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
 
         with BytesIO() as buffer:
             mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
@@ -904,7 +909,10 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                     self.execute(statements[-1], wait=wait, raise_error=raise_error)
         finally:
             if wait:
-                temp_volume_path.remove()
+                if staging is not None:
+                    staging.cleanup(allow_not_found=True, unregister=True)
+                else:
+                    temp_volume_path.remove()
 
         logger.info("Arrow inserted into %s", location)
 

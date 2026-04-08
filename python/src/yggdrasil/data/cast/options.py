@@ -259,6 +259,15 @@ class CastOptions:
         object.__setattr__(self, "_target_spark_field", None)
 
     @property
+    def target_schema(self):
+        if self.target_arrow_field is None:
+            return None
+
+        from yggdrasil.data import Schema
+
+        return Schema.from_arrow(self.target_arrow_field)
+
+    @property
     def target_field_name(self) -> Optional[str]:
         """Effective target field name, falling back to the source field name."""
         if self.target_field is None:
