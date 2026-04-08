@@ -1,16 +1,15 @@
 # Yggdrasil Python module index
 
-This page is a short module map.
-For examples from basic to advanced, read [`python/docs/README.md`](README.md).
+This index reflects the current package layout under `python/src/yggdrasil`.
 
-## Core
+## Core data and schema
 
-- `yggdrasil.data.cast` - converter registry and `CastOptions`
-- `yggdrasil.data.enums` - timezone, currency, geozone enums
-- `yggdrasil.arrow` - Python type hints to Arrow fields
-- `yggdrasil.dataclasses` - dataclass to Arrow field
+- `yggdrasil.data.cast` — converter registry, dispatch, and `CastOptions`.
+- `yggdrasil.data.enums` — timezone, currency, and geozone enums.
+- `yggdrasil.arrow` — Arrow type inference and Arrow casting helpers.
+- `yggdrasil.dataclasses` — dataclass helpers (`dataclass_to_arrow_field`, waiting/expiring utilities).
 
-## Engines
+## Dataframe engines
 
 - `yggdrasil.polars`
 - `yggdrasil.pandas`
@@ -23,7 +22,7 @@ For examples from basic to advanced, read [`python/docs/README.md`](README.md).
 - `yggdrasil.io.buffer`
 - `yggdrasil.requests`
 
-## Databricks
+## Databricks integrations
 
 - `yggdrasil.databricks`
 - `yggdrasil.databricks.account`
@@ -34,17 +33,21 @@ For examples from basic to advanced, read [`python/docs/README.md`](README.md).
 - `yggdrasil.databricks.secrets`
 - `yggdrasil.databricks.sql`
 - `yggdrasil.databricks.workspaces`
+- `yggdrasil.databricks.ai`
 
-## AI, API, and tools
+## Platform and utilities
 
-- `yggdrasil.ai`
-- `yggdrasil.fastapi`
 - `yggdrasil.pyutils`
 - `yggdrasil.concurrent`
 - `yggdrasil.environ`
+- `yggdrasil.fastapi`
+- `yggdrasil.pickle`
 - `yggdrasil.mongo`
 - `yggdrasil.mongoengine`
-- `yggdrasil.pickle`
-- `yggdrasil.fxrates`
 - `yggdrasil.blake3`
 - `yggdrasil.xxhash`
+- `yggdrasil.fxrates`
+
+## Focused docs
+
+See `python/docs/modules/README.md` for links to focused module pages and examples.

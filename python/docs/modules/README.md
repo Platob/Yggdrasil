@@ -1,8 +1,17 @@
 # Module docs
 
-Use the main docs page for clean examples and progression:
+Focused module pages (updated for current implementation):
 
-- [Python docs home](../README.md)
-- [Flat module index](../modules.md)
+- [arrow](arrow/README.md)
+- [data.cast](types/README.md)
+- [engine cast helpers](types/cast/README.md)
+- [dataclasses](dataclasses/README.md)
+- [io](io/README.md)
+- [requests](requests/README.md)
+- [pyutils](pyutils/README.md)
+- [concurrent](concurrent/README.md)
+- [databricks](databricks/README.md)
+- [optional libs and extensions](libs/README.md), [extensions](libs/extensions/README.md)
 
-Legacy per-module pages in this folder are kept for reference.
+Notes:
+- The `deltalake` page is retained only as a status note because `yggdrasil.deltalake` is not part of the current package tree.

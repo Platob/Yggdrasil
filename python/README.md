@@ -1,105 +1,150 @@
-# Yggdrasil (Python)
+# Yggdrasil (Python package)
 
-Type-friendly utilities for moving data between Python objects, Arrow, Polars, pandas, Spark, and Databricks. The package bundles enhanced dataclasses, casting utilities, and lightweight wrappers around Databricks and HTTP clients so Python/data engineers can focus on schemas instead of plumbing.
+Yggdrasil (`ygg` on PyPI, `yggdrasil` in imports) is a schema-aware data interchange library. It centers on an Arrow-first conversion registry that can cast values across Python types, Arrow, Polars, pandas, Spark, and Databricks-oriented workflows.
 
-## When to use this package
-Use Yggdrasil when you need to:
-- Convert payloads across dataframe engines without rewriting type logic for each backend.
-- Define dataclasses that auto-coerce inputs, expose defaults, and surface Arrow schemas.
-- Run Databricks SQL jobs or manage clusters with minimal boilerplate.
-- Add resilient retries, concurrency helpers, and dependency guards to data pipelines.
-
-## Prerequisites
-- Python **3.10+**
-- [uv](https://docs.astral.sh/uv/) for virtualenv and dependency management.
-
-Optional extras:
-- `polars`, `pandas`, `pyarrow`, and `pyspark` for engine-specific conversions.
-- `databricks-sdk` for workspace, SQL, jobs, and compute helpers.
-- `msal` for Azure AD authentication when using `MSALSession`.
-
-## Installation
-From the `python/` directory:
+## Install
 
 ```bash
+cd python
 uv venv .venv
 source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
-Extras are grouped by engine:
-- `.[polars]`, `.[pandas]`, `.[spark]`, `.[databricks]` – install only the integrations you need.
-- `.[dev]` – adds testing, linting, and typing tools (`pytest`, `ruff`, `black`, `mypy`).
+Install optional integrations only when needed:
 
-### Databricks example
-Install the `databricks` extra and run SQL with typed results:
+```bash
+uv pip install -e .[polars]
+uv pip install -e .[pandas]
+uv pip install -e .[spark]
+uv pip install -e .[databricks]
+uv pip install -e .[api]
+uv pip install -e .[pickle]
+```
+
+## Progressive examples (easy → advanced)
+
+### 1) Cast a scalar value
+
+```python
+from yggdrasil.data.cast.registry import convert
+
+age = convert("42", int)
+active = convert("true", bool)
+print(age, active)  # 42 True
+```
+
+### 2) Cast a dictionary into a dataclass
+
+```python
+from dataclasses import dataclass
+from yggdrasil.data.cast.registry import convert
+
+@dataclass
+class User:
+    id: int
+    email: str
+    active: bool = True
+
+payload = {"id": "7", "email": "ada@example.com", "active": "false"}
+user = convert(payload, User)
+print(user)  # User(id=7, email='ada@example.com', active=False)
+```
+
+### 3) Infer Arrow schema from Python hints
+
+```python
+import yggdrasil.arrow as pa
+from yggdrasil.arrow import arrow_field_from_hint
+
+field = arrow_field_from_hint(list[int], name="scores")
+schema = pa.schema([field])
+print(schema)
+```
+
+### 4) Cast Arrow table with explicit `CastOptions`
+
+```python
+import yggdrasil.arrow as pa
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions
+
+raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
+target = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("score", pa.float64(), nullable=False),
+])
+
+out = cast_arrow_tabular(raw, CastOptions(target_field=target, strict_match_names=True))
+print(out.schema)
+```
+
+### 5) Use lazy optional dependency guards (`lib.py` pattern)
+
+```python
+from yggdrasil.polars.lib import polars
+from yggdrasil.pandas.lib import pandas
+from yggdrasil.spark.lib import pyspark_sql
+
+pl_df = polars.DataFrame({"id": [1, 2]})
+pd_df = pandas.DataFrame({"id": [1, 2]})
+```
+
+### 6) Use IO buffers + HTTP session
+
+```python
+from yggdrasil.io import BytesIO
+from yggdrasil.io.http_ import HTTPSession
+
+with BytesIO() as buf:
+    buf.write(b"hello")
+    buf.seek(0)
+    print(buf.media_type)
+
+session = HTTPSession()
+response = session.get("https://example.com")
+print(response.status)
+```
+
+### 7) Databricks SQL execution (Arrow-first results)
 
 ```python
 from yggdrasil.databricks.workspaces import Workspace
 from yggdrasil.databricks.sql import SQLEngine
 
-ws = Workspace(host="https://<workspace-url>", token="<token>")
-engine = SQLEngine(workspace=ws)
-
+ws = Workspace(host="https://<workspace>", token="<token>")
+engine = SQLEngine(client=ws)
 stmt = engine.execute("SELECT 1 AS value")
-result = stmt.wait(engine)
-tbl = result.arrow_table()
-print(tbl.to_pandas())
+print(stmt.to_arrow_table())
 ```
 
-### Parallel processing and retries
+### 8) Utility decorators for retries and concurrency
 
 ```python
-from yggdrasil.pyutils import parallelize, retry
+from yggdrasil.pyutils import retry, parallelize
+
+@retry(tries=3, delay=0.1, backoff=2)
+def flaky(x: int) -> int:
+    return x
 
 @parallelize(max_workers=4)
-def square(x):
+def square(x: int) -> int:
     return x * x
-
-@retry(tries=5, delay=0.2, backoff=2)
-def sometimes_fails(value: int) -> int:
-    ...
 
 print(list(square(range(5))))
 ```
 
-## Project layout
-- `yggdrasil/dataclasses` – `yggdataclass` decorator plus Arrow schema helpers.
-- `yggdrasil/types` – casting registry (`convert`, `register_converter`), Arrow inference, and default generators.
-- `yggdrasil/libs` – optional bridges to Polars, pandas, Spark, and Databricks SDK types.
-- `yggdrasil/databricks` – workspace, SQL, jobs, and compute helpers built on the Databricks SDK.
-- `yggdrasil/requests` – retry-capable HTTP sessions and Azure MSAL auth helpers.
-- `yggdrasil/pyutils` – concurrency and retry decorators.
-- `yggdrasil/ser` – serialization helpers and dependency inspection utilities.
-- `tests/` – pytest-based coverage for conversions, dataclasses, requests, and platform helpers.
+## Documentation map
 
-## Testing
-From `python/`:
+- `docs/README.md` – full Python docs walkthrough.
+- `docs/modules.md` – concise module index.
+- `docs/modules/*` – focused module pages for core APIs.
+
+## Development checks
 
 ```bash
+cd python
 pytest
-```
-
-Optional checks when developing:
-
-```bash
 ruff check
 black .
-mypy
 ```
-
-## Troubleshooting and common pitfalls
-- **Missing optional dependency**: Install the matching extra (e.g., `uv pip install -e .[polars]`) or wrap calls with `require_polars`/`require_pyspark` from `yggdrasil.libs`.
-- **Schema mismatches**: Use `arrow_field_from_hint` and `CastOptions` to enforce expected Arrow metadata when casting.
-- **Databricks auth**: Provide `host` and `token` to `Workspace`. For Azure, ensure environment variables align with your workspace deployment.
-
-## Contributing
-1. Fork and branch.
-2. Install with `uv pip install -e .[dev]`.
-3. Run tests and linters.
-4. Submit a PR describing the change and any new examples added to the docs.
-
-## Experimental native acceleration
-For hot paths, an optional Rust extension scaffold lives in [`rust/`](../rust/README.md).
-Use `yggdrasil.rs` to access the fast path with a built-in Python fallback so
-base installs remain pure-Python compatible.

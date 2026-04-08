@@ -1,117 +1,48 @@
 # yggdrasil.data.cast
 
-The casting registry: convert Python values between types, configure how tables are cast to schemas.
+Registry-driven conversion system used across the package.
 
-## Key exports
+## Key symbols
 
-| Symbol | Module | Purpose |
-|---|---|---|
-| `CastOptions` | `yggdrasil.data.cast` | Configure casting behavior |
-| `convert` | `yggdrasil.data.cast.registry` | Convert a value to a target type |
-| `register_converter` | `yggdrasil.data.cast.registry` | Register a custom converter |
+- `convert` — convert any value into a target type.
+- `register_converter` — register custom converters.
+- `CastOptions` — option object reused by Arrow/engine cast paths.
 
----
-
-## Bootstrap: dict → dataclass
+## Scalar + dataclass conversion
 
 ```python
 from dataclasses import dataclass
 from yggdrasil.data.cast.registry import convert
 
 @dataclass
-class Order:
+class User:
     id: int
-    amount: float
     active: bool
 
-obj = convert({"id": "42", "amount": "19.99", "active": "true"}, Order)
-print(obj)  # Order(id=42, amount=19.99, active=True)
+print(convert("3", int))
+print(convert({"id": "7", "active": "true"}, User))
 ```
 
----
-
-## Bootstrap: scalar conversions
+## Register a converter
 
 ```python
-from yggdrasil.data.cast.registry import convert
-import datetime
-
-convert("2024-01-15", datetime.date)   # datetime.date(2024, 1, 15)
-convert("3.14", float)                 # 3.14
-convert("true", bool)                  # True
-convert(42, str)                       # "42"
-```
-
----
-
-## Bootstrap: register a custom converter
-
-```python
-from yggdrasil.data.cast.registry import register_converter, convert
 from decimal import Decimal
+from yggdrasil.data.cast.registry import register_converter, convert
 
 @register_converter(str, Decimal)
 def str_to_decimal(value: str, options=None) -> Decimal:
-    return Decimal(value).quantize(Decimal("0.01"))
+    return Decimal(value)
 
-convert("3.14159", Decimal)   # Decimal('3.14')
+print(convert("19.95", Decimal))
 ```
 
----
-
-## CastOptions reference
+## `CastOptions.check_arg` normalization
 
 ```python
+import yggdrasil.arrow as pa
 from yggdrasil.data.cast import CastOptions
-import pyarrow as pa
 
-# Minimal — just set target schema
-opts = CastOptions(target_field=pa.schema([
-    pa.field("id", pa.int64()),
-    pa.field("name", pa.string()),
-]))
-
-# Full options (with defaults)
-opts = CastOptions(
-    safe=False,                  # True: only safe Arrow casts
-    add_missing_columns=True,    # fill missing columns with type defaults
-    strict_match_names=False,    # False: case-insensitive + positional match
-    allow_add_columns=False,     # True: keep extra source columns
-    eager=False,
-    datetime_patterns=None,      # e.g. ["%Y/%m/%d", "%d-%m-%Y"]
-    merge=False,
-    target_field=None,           # pa.Schema | pa.Field | pa.DataType
-)
+schema = pa.schema([pa.field("id", pa.int64())])
+opts = CastOptions.check_arg(schema, strict_match_names=True)
+print(opts.target_field)
 ```
-
-`target_field` accepts `pa.Schema`, `pa.Field`, or `pa.DataType` — normalized internally.
-
----
-
-## Bootstrap: strict schema enforcement
-
-```python
-import pyarrow as pa
-from yggdrasil.data.cast import CastOptions
-from yggdrasil.arrow.cast import cast_arrow_tabular
-
-target = pa.schema([
-    pa.field("id", pa.int64(), nullable=False),
-    pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
-])
-
-opts = CastOptions(
-    target_field=target,
-    strict_match_names=True,    # exact column name match
-    add_missing_columns=False,  # raise if column missing
-)
-
-out = cast_arrow_tabular(raw_table, opts)
-```
-
----
-
-## Related
-
-- [arrow.cast](cast/README.md) — apply `CastOptions` to tables and dataframes
-- [arrow](../arrow/README.md) — infer Arrow fields from Python type hints

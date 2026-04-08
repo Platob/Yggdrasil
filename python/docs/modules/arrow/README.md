@@ -1,121 +1,48 @@
 # yggdrasil.arrow
 
-Infer Arrow fields and schemas directly from Python type hints and dataclasses.
+Arrow utilities for:
+- inferring Arrow fields from Python hints
+- normalizing Arrow types across engines
+- casting Arrow arrays/tables/readers via `yggdrasil.arrow.cast`
 
-## Type map
-
-| Python | Arrow |
-|---|---|
-| `str` | `pa.string()` |
-| `int` | `pa.int64()` |
-| `float` | `pa.float64()` |
-| `bool` | `pa.bool_()` |
-| `bytes` | `pa.binary()` |
-| `datetime.datetime` | `pa.timestamp('us', tz='UTC')` |
-| `datetime.date` | `pa.date32()` |
-| `datetime.time` | `pa.time64('us')` |
-| `datetime.timedelta` | `pa.duration('us')` |
-| `uuid.UUID` | `pa.binary(16)` |
-| `decimal.Decimal` | `pa.decimal128(38, 18)` |
-| `Optional[T]` | nullable version of `T` |
-| `list[T]` | `pa.list_(T)` |
-| `dict[K, V]` | `pa.map_(K, V)` |
-| dataclass | `pa.struct(...)` |
-
----
-
-## Bootstrap: single field from a hint
+## Basic inference
 
 ```python
 from yggdrasil.arrow import arrow_field_from_hint
-import datetime
 
-field = arrow_field_from_hint(int, name="user_id")
-# user_id: int64 not null
-
-field = arrow_field_from_hint(datetime.datetime, name="ts")
-# ts: timestamp[us, tz=UTC] not null
-
-field = arrow_field_from_hint(str | None, name="note")
-# note: string
+print(arrow_field_from_hint(int, name="id"))
+print(arrow_field_from_hint(list[str], name="tags"))
+print(arrow_field_from_hint(dict[str, float], name="metrics"))
 ```
 
----
-
-## Bootstrap: schema from a dataclass
+## Dataclass to Arrow struct field
 
 ```python
 from dataclasses import dataclass
-from typing import Optional
-from yggdrasil.arrow import arrow_field_from_hint
+from yggdrasil.dataclasses import dataclass_to_arrow_field
 
 @dataclass
-class Trade:
+class Event:
     id: int
-    symbol: str
-    price: float
-    quantity: float
-    note: Optional[str] = None
+    score: float
 
-field = arrow_field_from_hint(Trade)
-schema = field.type.to_schema()
-print(schema)
-# id: int64 not null
-# symbol: string not null
-# price: double not null
-# quantity: double not null
-# note: string
+print(dataclass_to_arrow_field(Event))
 ```
 
----
-
-## Bootstrap: nested structs
+## Tabular cast through Arrow
 
 ```python
-from dataclasses import dataclass
-from yggdrasil.arrow import arrow_field_from_hint
+import yggdrasil.arrow as pa
+from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.data.cast import CastOptions
 
-@dataclass
-class Address:
-    city: str
-    country: str
+raw = pa.table({"id": ["1", "2"], "ts": ["2024-01-01", "2024-01-02"]})
 
-@dataclass
-class Customer:
-    id: int
-    name: str
-    address: Address
+target = pa.schema([
+    pa.field("id", pa.int64()),
+    pa.field("ts", pa.timestamp("us", tz="UTC")),
+])
 
-field = arrow_field_from_hint(Customer)
-# struct<id: int64, name: string, address: struct<city: string, country: string>>
+out = cast_arrow_tabular(raw, CastOptions(target_field=target))
+print(out.schema)
 ```
-
----
-
-## Bootstrap: generic containers
-
-```python
-from yggdrasil.arrow import arrow_field_from_hint
-
-# list
-field = arrow_field_from_hint(list[int], name="scores")
-# scores: list<item: int64> not null
-
-# dict (map)
-field = arrow_field_from_hint(dict[str, float], name="metrics")
-# metrics: map<string, double> not null
-```
-
----
-
-## API
-
-```python
-from yggdrasil.arrow import arrow_field_from_hint
-
-arrow_field_from_hint(hint, name=None, index=None) -> pa.Field
-```
-
-- `hint` — any Python type annotation
-- `name` — override the field name (default: derived from the type)
-- `index` — positional index used when no name is available
