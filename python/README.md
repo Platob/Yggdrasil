@@ -106,15 +106,23 @@ response = session.get("https://example.com")
 print(response.status)
 ```
 
+Batch + prepared requests:
+
+```python
+from yggdrasil.io.http_ import HTTPSession
+
+http = HTTPSession()
+req = http.prepare_request("POST", "https://httpbin.org/post", json={"x": 1})
+resp = http.send(req)
+print(resp.status, resp.json().get("json"))
+```
+
 ### 7) Databricks SQL execution (Arrow-first results)
 
 ```python
-from yggdrasil.databricks.workspaces import Workspace
-from yggdrasil.databricks.sql import SQLEngine
+from yggdrasil.databricks import DatabricksClient
 
-ws = Workspace(host="https://<workspace>", token="<token>")
-engine = SQLEngine(client=ws)
-stmt = engine.execute("SELECT 1 AS value")
+stmt = DatabricksClient(host="https://<workspace>", token="<token>").sql.execute("SELECT 1 AS value")
 print(stmt.to_arrow_table())
 ```
 
