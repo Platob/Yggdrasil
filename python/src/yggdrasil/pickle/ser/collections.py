@@ -605,3 +605,37 @@ for t, cls in (
     (MappingProxyType, MappingProxySerialized),
 ):
     Tags.register_class(cls, pytype=t)
+
+ArraySerialized = Tags.get_class(Tags.ARRAY) or ArraySerialized
+LargeArraySerialized = Tags.get_class(Tags.LARGE_ARRAY) or LargeArraySerialized
+ListSerialized = Tags.get_class(Tags.LIST) or ListSerialized
+LargeListSerialized = Tags.get_class(Tags.LARGE_LIST) or LargeListSerialized
+TupleSerialized = Tags.get_class(Tags.TUPLE) or TupleSerialized
+LargeTupleSerialized = Tags.get_class(Tags.LARGE_TUPLE) or LargeTupleSerialized
+SetSerialized = Tags.get_class(Tags.SET) or SetSerialized
+LargeSetSerialized = Tags.get_class(Tags.LARGE_SET) or LargeSetSerialized
+FrozenSetSerialized = Tags.get_class(Tags.FROZENSET) or FrozenSetSerialized
+LargeFrozenSetSerialized = Tags.get_class(Tags.LARGE_FROZENSET) or LargeFrozenSetSerialized
+DequeSerialized = Tags.get_class(Tags.DEQUE) or DequeSerialized
+LargeDequeSerialized = Tags.get_class(Tags.LARGE_DEQUE) or LargeDequeSerialized
+MappingSerialized = Tags.get_class(Tags.MAPPING) or MappingSerialized
+LargeMappingSerialized = Tags.get_class(Tags.LARGE_MAPPING) or LargeMappingSerialized
+MappingProxySerialized = Tags.get_class(Tags.MAPPING_PROXY) or MappingProxySerialized
+LargeMappingProxySerialized = Tags.get_class(Tags.LARGE_MAPPING_PROXY) or LargeMappingProxySerialized
+GeneratorSerialized = Tags.get_class(Tags.GENERATOR) or GeneratorSerialized
+LargeGeneratorSerialized = Tags.get_class(Tags.LARGE_GENERATOR) or LargeGeneratorSerialized
+IteratorSerialized = Tags.get_class(Tags.ITERATOR) or IteratorSerialized
+LargeIteratorSerialized = Tags.get_class(Tags.LARGE_ITERATOR) or LargeIteratorSerialized
+
+for t, cls in (
+    (list, ListSerialized),
+    (tuple, TupleSerialized),
+    (set, SetSerialized),
+    (frozenset, FrozenSetSerialized),
+    (dict, MappingSerialized),
+    (deque, DequeSerialized),
+    (array, ArraySerialized),
+    (MappingProxyType, MappingProxySerialized),
+):
+    Tags.TYPES[t] = cls
+

@@ -7,6 +7,7 @@ from yggdrasil.pickle.ser.pandas import (
     PandasDataFrameSerialized,
     PandasIndexSerialized,
     PandasSeriesSerialized,
+    PandasTimestampSerialized,
 )
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
@@ -73,22 +74,68 @@ def test_pandas_index_roundtrip() -> None:
     pd.testing.assert_index_equal(out, idx)
 
 
+def test_pandas_timestamp_roundtrip() -> None:
+    ts = pd.Timestamp(year=1, month=1, day=1)
+
+    ser, out = _roundtrip(ts)
+
+    assert isinstance(ser, PandasTimestampSerialized)
+    assert ser.tag == Tags.PANDAS_TIMESTAMP
+
+    metadata = ser.metadata or {}
+    assert metadata.get(b"u") == b"us"
+
+    assert isinstance(out, pd.Timestamp)
+    out_ts: pd.Timestamp = out
+    assert out_ts == ts
+
+
+def test_pandas_timestamp_timezone_roundtrip() -> None:
+    ts = pd.Timestamp("2020-01-01 07:34:56.123456789", tz="US/Eastern")
+
+    ser, out = _roundtrip(ts)
+
+    assert isinstance(ser, PandasTimestampSerialized)
+    assert ser.tag == Tags.PANDAS_TIMESTAMP
+
+    metadata = ser.metadata or {}
+    assert metadata.get(b"u") == b"ns"
+    assert metadata.get(b"z") == b"US/Eastern"
+
+    assert isinstance(out, pd.Timestamp)
+    out_ts: pd.Timestamp = out
+    assert out_ts == ts
+    assert str(out_ts.tz) == str(ts.tz)
+
+
+def test_pandas_nat_roundtrip() -> None:
+    ser, out = _roundtrip(pd.NaT)
+
+    assert isinstance(ser, PandasTimestampSerialized)
+    assert ser.tag == Tags.PANDAS_TIMESTAMP
+    assert out is pd.NaT
+
+
 def test_pandas_tag_category_and_resolution() -> None:
     assert Tags.get_category(Tags.PANDAS_DATAFRAME) == Tags.CATEGORY_PANDAS
     assert Tags.get_category(Tags.PANDAS_SERIES) == Tags.CATEGORY_PANDAS
     assert Tags.get_category(Tags.PANDAS_INDEX) == Tags.CATEGORY_PANDAS
+    assert Tags.get_category(Tags.PANDAS_TIMESTAMP) == Tags.CATEGORY_PANDAS
 
     assert Tags.is_pandas(Tags.PANDAS_DATAFRAME)
     assert Tags.is_pandas(Tags.PANDAS_SERIES)
     assert Tags.is_pandas(Tags.PANDAS_INDEX)
+    assert Tags.is_pandas(Tags.PANDAS_TIMESTAMP)
 
     assert Tags.get_name(Tags.PANDAS_DATAFRAME) == "PANDAS_DATAFRAME"
     assert Tags.get_name(Tags.PANDAS_SERIES) == "PANDAS_SERIES"
     assert Tags.get_name(Tags.PANDAS_INDEX) == "PANDAS_INDEX"
+    assert Tags.get_name(Tags.PANDAS_TIMESTAMP) == "PANDAS_TIMESTAMP"
 
     assert Tags.get_class(Tags.PANDAS_DATAFRAME) is PandasDataFrameSerialized
     assert Tags.get_class(Tags.PANDAS_SERIES) is PandasSeriesSerialized
     assert Tags.get_class(Tags.PANDAS_INDEX) is PandasIndexSerialized
+    assert Tags.get_class(Tags.PANDAS_TIMESTAMP) is PandasTimestampSerialized
 
 
 def test_pandas_dataframe_falls_back_to_python_serialized_for_unarrowable_object_dtype(

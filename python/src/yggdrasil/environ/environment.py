@@ -1411,7 +1411,7 @@ class PyEnv:
         """
         Build the base pip invocation prefix.
 
-        * prefer_uv=True  -> ``uv pip --python <python>``
+        * prefer_uv=True  -> ``uv run --python <python> python -m pip``
         * prefer_uv=False -> ``<python> -m pip``
         """
         prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
@@ -1419,7 +1419,7 @@ class PyEnv:
 
         if prefer_uv:
             try:
-                return [*self._uv_base_cmd(install_runtime=True), "pip", "--python", str(p)]
+                return [*self._uv_base_cmd(install_runtime=True), "run", "--python", str(p), "python", "-m", "pip"]
             except Exception:
                 logger.warning(
                     "PyEnv._pip_cmd_args: uv unavailable for %s, falling back to pip",

@@ -278,3 +278,8 @@ class BaseExceptionSerialized(ComplexSerialized[BaseException]):
             codec=codec,
         )
 
+
+Tags.register_class(BaseExceptionSerialized, tag=BaseExceptionSerialized.TAG)
+BaseExceptionSerialized = Tags.get_class(Tags.BASE_EXCEPTION) or BaseExceptionSerialized
+
+

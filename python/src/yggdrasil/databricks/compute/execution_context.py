@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import datetime as dt
 import base64
 import dataclasses as dc
+import datetime as dt
 import gzip
 import inspect
 import json
@@ -19,8 +19,6 @@ from databricks.sdk.service.compute import Language
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import (
     WaitingConfigArg,
-    restore_dataclass_state,
-    serialize_dataclass_state,
 )
 from yggdrasil.environ import shutdown as yg_shutdown
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
@@ -357,23 +355,6 @@ class ExecutionContext:
     )
     _created_at: float = dc.field(default=0.0, init=False, repr=False, compare=False, hash=False)
     _last_used_at: float = dc.field(default=0.0, init=False, repr=False, compare=False, hash=False)
-
-    # ------------------------------------------------------------------
-    # Serialization
-    # ------------------------------------------------------------------
-
-    def __getstate__(self):
-        """
-        Serialize dataclass state while excluding runtime-only lock objects.
-        """
-        return serialize_dataclass_state(self)
-
-    def __setstate__(self, state):
-        """
-        Restore dataclass state and recreate the local synchronization lock.
-        """
-        restore_dataclass_state(self, state)
-        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Context manager

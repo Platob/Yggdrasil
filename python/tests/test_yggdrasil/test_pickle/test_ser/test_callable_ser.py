@@ -201,6 +201,46 @@ def annotated_fn(
     return (x + y) * scale
 
 
+class _BadReduceAnnotation:
+    def __reduce_ex__(self, protocol: int):
+        raise RecursionError("annotation reduce recursion")
+
+    def __repr__(self) -> str:
+        return "BadReduceAnnotation()"
+
+
+class _BadReduceAndReprAnnotation:
+    def __reduce_ex__(self, protocol: int):
+        raise RecursionError("annotation reduce recursion")
+
+    def __repr__(self) -> str:
+        raise RecursionError("annotation repr recursion")
+
+
+BAD_REDUCE_ANNOTATION = _BadReduceAnnotation()
+BAD_REDUCE_AND_REPR_ANNOTATION = _BadReduceAndReprAnnotation()
+
+
+def fn_with_bad_annotation(x):
+    return x
+
+
+fn_with_bad_annotation.__annotations__ = {
+    "x": BAD_REDUCE_ANNOTATION,
+    "return": int,
+}
+
+
+def fn_with_bad_annotation_and_bad_repr(x):
+    return x
+
+
+fn_with_bad_annotation_and_bad_repr.__annotations__ = {
+    "x": BAD_REDUCE_AND_REPR_ANNOTATION,
+    "return": int,
+}
+
+
 def fn_no_args() -> str:
     return "hello"
 
@@ -421,6 +461,20 @@ class TestMetadataPreservation:
     def test_annotations(self):
         fn = _roundtrip(annotated_fn)
         assert fn.__annotations__ == annotated_fn.__annotations__
+
+    def test_unserializable_annotation_falls_back_to_repr(self):
+        fn = _roundtrip(fn_with_bad_annotation)
+        assert fn(5) == 5
+        assert fn.__annotations__["return"] is int
+        assert isinstance(fn.__annotations__["x"], str)
+        assert "BadReduceAnnotation" in fn.__annotations__["x"]
+
+    def test_recursive_annotation_and_repr_does_not_fail_roundtrip(self):
+        fn = _roundtrip(fn_with_bad_annotation_and_bad_repr)
+        assert fn(9) == 9
+        assert fn.__annotations__["return"] is int
+        assert isinstance(fn.__annotations__["x"], str)
+        assert "unrepresentable" in fn.__annotations__["x"]
 
     def test_defaults_are_used(self):
         fn = _roundtrip(annotated_fn)
@@ -1301,3 +1355,4 @@ class TestSourceFallback:
         calc = Calculator(base=7)
         restored = _load_method_payload(_corrupt_method_function_marshal(calc.decorated_uses_global_factor))
         assert restored(5) == 7 + 5
+

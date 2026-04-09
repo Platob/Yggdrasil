@@ -2,52 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.pickle.ser.constants import CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD, CODEC_ZLIB, CODEC_ZSTD
-from yggdrasil.pickle.ser.primitives import BytesSerialized, UInt32Serialized, UInt8Serialized
+from yggdrasil.pickle.ser.constants import CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD
+from yggdrasil.pickle.ser.primitives import UInt32Serialized, UInt8Serialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
-
-
-def test_serialized_build_small_payload_stays_uncompressed() -> None:
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=b"abc",
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec == CODEC_NONE
-    assert ser.to_bytes() == b"abc"
-    assert ser.decode() == b"abc"
-    assert ser.as_python() == b"abc"
-
-
-def test_serialized_build_large_payload_auto_compresses() -> None:
-    payload = b"a" * (COMPRESS_THRESHOLD + 1024)
-
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=payload,
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec in (CODEC_NONE, CODEC_GZIP, CODEC_ZSTD, CODEC_ZLIB)
-    assert ser.decode() == payload
-
-    if ser.codec == CODEC_GZIP:
-        assert ser.to_bytes() != payload
-
-
-def test_serialized_build_exact_threshold_auto_compresses_or_keeps_raw_if_not_smaller() -> None:
-    payload = b"a" * COMPRESS_THRESHOLD
-
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=payload,
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec in (CODEC_NONE, CODEC_GZIP, CODEC_ZSTD, CODEC_ZLIB)
-    assert ser.decode() == payload
 
 
 def test_serialized_build_explicit_codec_none() -> None:
@@ -62,21 +20,6 @@ def test_serialized_build_explicit_codec_none() -> None:
     assert ser.codec == CODEC_NONE
     assert ser.to_bytes() == payload
     assert ser.decode() == payload
-
-
-def test_serialized_build_explicit_codec_gzip() -> None:
-    payload = b"compress-me-" * 1000
-
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=payload,
-        codec=CODEC_GZIP,
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec == CODEC_GZIP
-    assert ser.decode() == payload
-    assert ser.to_bytes() != payload
 
 
 def test_serialized_build_preserves_metadata() -> None:
@@ -190,12 +133,6 @@ def test_serialized_to_bytes_returns_wire_payload_not_decoded_payload() -> None:
 
     assert ser.decode() == payload
     assert ser.to_bytes() != payload
-
-
-def test_serialized_from_python_object_bytes() -> None:
-    ser = Serialized.from_python_object(b"hello")
-    assert isinstance(ser, BytesSerialized)
-    assert ser.as_python() == b"hello"
 
 
 def test_serialized_from_python_object_int_dispatches_uint32() -> None:

@@ -325,24 +325,15 @@ def _hash_text(data: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _safe_dump_annotation(annotation: object) -> tuple[str, object]:
-    try:
-        return (_ANN_VALUE, _serialize_nested(annotation))
-    except Exception:
-        return (_ANN_REPR, repr(annotation))
+    from yggdrasil.pickle.ser.annotations import _safe_dump_annotation as _impl
+
+    return _impl(annotation)
 
 
 def _safe_load_annotation(payload: object) -> object:
-    tag, value = _require_tuple_len(payload, name="Annotation payload", expected=2)
-    kind = _require_str(tag, name="Annotation payload kind")
+    from yggdrasil.pickle.ser.annotations import _safe_load_annotation as _impl
 
-    if kind == _ANN_VALUE:
-        blob = _require_bytes(value, name="Annotation payload value")
-        return _deserialize_nested(blob)
-
-    if kind == _ANN_REPR:
-        return _require_str(value, name="Annotation payload value")
-
-    raise ValueError(f"Unsupported annotation payload kind: {kind!r}")
+    return _impl(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -455,4 +446,14 @@ class ClassSerialized(ComplexSerialized[type[object]]):
             data=_dump_class_ref(klass),
             codec=codec,
         )
+
+
+for _cls in (ModuleSerialized, ClassSerialized):
+    Tags.register_class(_cls, tag=_cls.TAG)
+
+Tags.register_class(ModuleSerialized, pytype=ModuleType)
+
+ModuleSerialized = Tags.get_class(Tags.MODULE) or ModuleSerialized
+ClassSerialized = Tags.get_class(Tags.CLASS) or ClassSerialized
+
 

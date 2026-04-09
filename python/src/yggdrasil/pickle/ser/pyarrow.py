@@ -664,3 +664,15 @@ class ArrowTensorSerialized(ArrowSerialized[pa.Tensor]):
 
 for cls in ArrowSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
+
+ArrowTableSerialized = Tags.get_class(Tags.ARROW_TABLE) or ArrowTableSerialized
+ArrowRecordBatchSerialized = Tags.get_class(Tags.ARROW_RECORD_BATCH) or ArrowRecordBatchSerialized
+ArrowStreamSerialized = Tags.get_class(Tags.ARROW_STREAM) or ArrowStreamSerialized
+ArrowDatasetSerialized = Tags.get_class(Tags.ARROW_DATASET) or ArrowDatasetSerialized
+ArrowSchemaSerialized = Tags.get_class(Tags.ARROW_SCHEMA) or ArrowSchemaSerialized
+ArrowFieldSerialized = Tags.get_class(Tags.ARROW_FIELD) or ArrowFieldSerialized
+ArrowDataTypeSerialized = Tags.get_class(Tags.ARROW_DATA_TYPE) or ArrowDataTypeSerialized
+ArrowArraySerialized = Tags.get_class(Tags.ARROW_ARRAY) or ArrowArraySerialized
+ArrowChunkedArraySerialized = Tags.get_class(Tags.ARROW_CHUNKED_ARRAY) or ArrowChunkedArraySerialized
+ArrowScalarSerialized = Tags.get_class(Tags.ARROW_SCALAR) or ArrowScalarSerialized
+ArrowTensorSerialized = Tags.get_class(Tags.ARROW_TENSOR) or ArrowTensorSerialized

@@ -11,7 +11,6 @@ __all__ = [
     "PrimitiveSerialized",
     "NoneSerialized",
     "BoolSerialized",
-    "BytesSerialized",
     "Utf8StringSerialized",
     "Latin1StringSerialized",
     "UInt8Serialized",
@@ -157,15 +156,6 @@ class BoolSerialized(PrimitiveSerialized[bool]):
 
 
 @dataclass(frozen=True, slots=True)
-class BytesSerialized(PrimitiveSerialized[bytes]):
-    TAG: ClassVar[int] = Tags.BYTES
-
-    @property
-    def value(self) -> bytes:
-        return self.decode()
-
-
-@dataclass(frozen=True, slots=True)
 class Utf8StringSerialized(PrimitiveSerialized[str]):
     TAG: ClassVar[int] = Tags.UTF8_STRING
 
@@ -287,9 +277,34 @@ for cls in PrimitiveSerialized.__subclasses__():
 for t, cls in (
     (type(None), NoneSerialized),
     (bool, BoolSerialized),
-    (bytes, BytesSerialized),
     (str, Utf8StringSerialized),
     (int, Int64Serialized),
     (float, Float64Serialized),
 ):
     Tags.register_class(cls, pytype=t)
+
+NoneSerialized = Tags.get_class(Tags.NONE) or NoneSerialized
+BoolSerialized = Tags.get_class(Tags.BOOL) or BoolSerialized
+Utf8StringSerialized = Tags.get_class(Tags.UTF8_STRING) or Utf8StringSerialized
+Latin1StringSerialized = Tags.get_class(Tags.LATIN1_STRING) or Latin1StringSerialized
+UInt8Serialized = Tags.get_class(Tags.UINT8) or UInt8Serialized
+Int8Serialized = Tags.get_class(Tags.INT8) or Int8Serialized
+UInt16Serialized = Tags.get_class(Tags.UINT16) or UInt16Serialized
+Int16Serialized = Tags.get_class(Tags.INT16) or Int16Serialized
+UInt32Serialized = Tags.get_class(Tags.UINT32) or UInt32Serialized
+Int32Serialized = Tags.get_class(Tags.INT32) or Int32Serialized
+UInt64Serialized = Tags.get_class(Tags.UINT64) or UInt64Serialized
+Int64Serialized = Tags.get_class(Tags.INT64) or Int64Serialized
+Float16Serialized = Tags.get_class(Tags.FLOAT16) or Float16Serialized
+Float32Serialized = Tags.get_class(Tags.FLOAT32) or Float32Serialized
+Float64Serialized = Tags.get_class(Tags.FLOAT64) or Float64Serialized
+
+for t, cls in (
+    (type(None), NoneSerialized),
+    (bool, BoolSerialized),
+    (str, Utf8StringSerialized),
+    (int, Int64Serialized),
+    (float, Float64Serialized),
+):
+    Tags.TYPES[t] = cls
+

@@ -15,10 +15,9 @@ from decimal import Decimal
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import ClassVar, Generic, Mapping
 
-from yggdrasil.pickle.ser.primitives import BytesSerialized as _PrimBytesSerialized
+from yggdrasil.io.url import URL
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
-from yggdrasil.io.url import URL
 
 try:
     from zoneinfo import ZoneInfo
@@ -1030,7 +1029,7 @@ class ComplexNumberSerialized(LogicalSerialized[complex]):
 
 
 @dataclass(frozen=True, slots=True)
-class BytesSerialized(_PrimBytesSerialized):
+class BytesSerialized(LogicalSerialized[bytes]):
     """
     Enhanced bytes payload: also handles bytearray and memoryview.
 
@@ -1324,3 +1323,19 @@ for _bytes_type in (bytes, bytearray, memoryview):
 
 if ZoneInfo is not None:
     Tags.register_class(TimezoneSerialized, pytype=ZoneInfo)
+
+DecimalSerialized = Tags.get_class(Tags.DECIMAL) or DecimalSerialized
+DatetimeSerialized = Tags.get_class(Tags.DATETIME) or DatetimeSerialized
+DateSerialized = Tags.get_class(Tags.DATE) or DateSerialized
+TimeSerialized = Tags.get_class(Tags.TIME) or TimeSerialized
+TimedeltaSerialized = Tags.get_class(Tags.TIMEDELTA) or TimedeltaSerialized
+TimezoneSerialized = Tags.get_class(Tags.TIMEZONE) or TimezoneSerialized
+UUIDSerialized = Tags.get_class(Tags.UUID) or UUIDSerialized
+ComplexNumberSerialized = Tags.get_class(Tags.COMPLEX) or ComplexNumberSerialized
+BytesSerialized = Tags.get_class(Tags.BYTES) or BytesSerialized
+PathSerialized = Tags.get_class(Tags.PATH) or PathSerialized
+IPAddressSerialized = Tags.get_class(Tags.IPADDRESS) or IPAddressSerialized
+URLSerialized = Tags.get_class(Tags.URL) or URLSerialized
+
+for _bytes_type in (bytes, bytearray, memoryview):
+    Tags.TYPES[_bytes_type] = BytesSerialized

@@ -4,35 +4,10 @@ import pickle
 
 import pytest
 
-from yggdrasil.pickle.ser.constants import CODEC_ZSTD, CODEC_GZIP, CODEC_NONE, COMPRESS_THRESHOLD, CODEC_ZLIB
-from yggdrasil.pickle.ser.primitives import BytesSerialized, UInt32Serialized
+from yggdrasil.pickle.ser.constants import CODEC_NONE, COMPRESS_THRESHOLD
+from yggdrasil.pickle.ser.primitives import UInt32Serialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
-
-
-def test_serialized_build_small_payload_stays_uncompressed() -> None:
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=b"abc",
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec == CODEC_NONE
-    assert ser.decode() == b"abc"
-    assert ser.as_python() == b"abc"
-
-
-def test_serialized_build_large_payload_auto_compresses() -> None:
-    payload = b"a" * (COMPRESS_THRESHOLD + 1024)
-
-    ser = Serialized.build(
-        tag=Tags.BYTES,
-        data=payload,
-    )
-
-    assert isinstance(ser, BytesSerialized)
-    assert ser.codec in (CODEC_NONE, CODEC_GZIP, CODEC_ZSTD, CODEC_ZLIB)
-    assert ser.decode() == payload
 
 
 def test_serialized_build_explicit_codec_none() -> None:

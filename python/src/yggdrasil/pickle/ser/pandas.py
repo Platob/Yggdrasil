@@ -16,6 +16,16 @@ from .pyarrow import (
     _table_from_ipc_file_buffer,
     _table_to_ipc_file_buffer,
 )
+from .logicals import (
+    M_TZ,
+    M_UNIT,
+    _load_tzinfo,
+    _metadata_merge,
+    _metadata_text,
+    _pack_i64,
+    _tz_to_text,
+    _unpack_i64,
+)
 
 __all__ = [
     "TPandas",
@@ -23,11 +33,39 @@ __all__ = [
     "PandasDataFrameSerialized",
     "PandasSeriesSerialized",
     "PandasIndexSerialized",
+    "PandasTimestampSerialized",
 ]
 
 TPandas = TypeVar("TPandas", bound=object)
 
 _SENTINEL_FIELD_NAME = "__ygg_value__"
+
+
+def _timestamp_unit(ts: object) -> str:
+    unit = getattr(ts, "unit", None)
+    if isinstance(unit, str) and unit:
+        return unit
+
+    dtype = getattr(getattr(ts, "asm8", None), "dtype", None)
+    if dtype is not None:
+        text = str(dtype)
+        if text.startswith("datetime64[") and text.endswith("]"):
+            return text[len("datetime64["):-1]
+
+    return "ns"
+
+
+def _timestamp_tz_text(ts: pd.Timestamp) -> str | None:
+    tz = getattr(ts, "tz", None)
+    if tz is None:
+        return None
+
+    for attr in ("key", "zone"):
+        value = getattr(tz, attr, None)
+        if isinstance(value, str) and value:
+            return value
+
+    return _tz_to_text(tz, ts)
 
 
 def _dataframe_to_arrow_table(df: pd.DataFrame) -> pa.Table:
@@ -226,6 +264,13 @@ class PandasSerialized(Serialized[TPandas], Generic[TPandas]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> Serialized[object] | None:
+        if obj is pd.NaT or isinstance(obj, pd.Timestamp):
+            return PandasTimestampSerialized.from_value(
+                obj,
+                metadata=metadata,
+                codec=codec,
+            )
+
         if isinstance(obj, pd.DataFrame):
             return PandasDataFrameSerialized.from_value(
                 obj,
@@ -248,6 +293,47 @@ class PandasSerialized(Serialized[TPandas], Generic[TPandas]):
             )
 
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class PandasTimestampSerialized(PandasSerialized[object]):
+    TAG: ClassVar[int] = Tags.PANDAS_TIMESTAMP
+
+    @property
+    def value(self) -> object:
+        unit = _metadata_text(self.metadata, M_UNIT, "ns") or "ns"
+        value = _unpack_i64(self.decode(), tag_name="PANDAS_TIMESTAMP")
+        if value == pd.NaT.value:
+            return pd.NaT
+
+        tz = _load_tzinfo(self.metadata)
+        if tz is not None:
+            return pd.Timestamp(value, unit=unit, tz=tz)
+        return pd.Timestamp(value, unit=unit)
+
+    @classmethod
+    def from_value(
+        cls,
+        value: object,
+        *,
+        metadata: Mapping[bytes, bytes] | None = None,
+        codec: int | None = None,
+    ) -> Serialized[object]:
+        ts = pd.NaT if value is pd.NaT else pd.Timestamp(value)
+        unit = _timestamp_unit(ts)
+        merged = _metadata_merge(metadata, {M_UNIT: unit.encode("ascii")}) or {}
+
+        if ts is not pd.NaT:
+            tz_text = _timestamp_tz_text(ts)
+            if tz_text:
+                merged.setdefault(M_TZ, tz_text.encode("utf-8"))
+
+        return cls.build(
+            tag=cls.TAG,
+            data=_pack_i64(int(ts.asm8.view("i8"))),
+            metadata=merged,
+            codec=codec,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,3 +488,18 @@ class PandasIndexSerialized(PandasSerialized[pd.Index]):
 
 for cls in PandasSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
+
+for t, cls in (
+    (pd.Timestamp, PandasTimestampSerialized),
+    (type(pd.NaT), PandasTimestampSerialized),
+    (pd.DataFrame, PandasDataFrameSerialized),
+    (pd.Series, PandasSeriesSerialized),
+    (pd.Index, PandasIndexSerialized),
+):
+    Tags.register_class(cls, pytype=t)
+
+PandasTimestampSerialized = Tags.get_class(Tags.PANDAS_TIMESTAMP) or PandasTimestampSerialized
+PandasDataFrameSerialized = Tags.get_class(Tags.PANDAS_DATAFRAME) or PandasDataFrameSerialized
+PandasSeriesSerialized = Tags.get_class(Tags.PANDAS_SERIES) or PandasSeriesSerialized
+PandasIndexSerialized = Tags.get_class(Tags.PANDAS_INDEX) or PandasIndexSerialized
+

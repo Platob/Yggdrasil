@@ -20,14 +20,11 @@ from databricks.sdk.service.compute import CommandStatus, CommandStatusResponse,
 from yggdrasil.dataclasses import (
     WaitingConfig,
     WaitingConfigArg,
-    restore_dataclass_state,
-    serialize_dataclass_state,
 )
 from yggdrasil.environ import PyEnv, shutdown as yg_shutdown
 from yggdrasil.io.url import URL
 from yggdrasil.pickle.ser import Serialized, loads, serialize
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
-
 from .exceptions import ClientTerminatedSession, CommandExecutionError
 from .execution_context import ExecutionContext
 
@@ -87,7 +84,6 @@ class CommandExecution:
     language: Optional[Language] = field(default=None, repr=False, compare=False, hash=False)
     command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
 
-    pexit: bool = field(default=False, repr=False, compare=False, hash=False)
     pyfunc: Optional[Callable] = field(default=None, repr=False, compare=False, hash=False)
     environ: Optional[Mapping] = field(default=None, repr=False, compare=False, hash=False)
 
@@ -111,13 +107,6 @@ class CommandExecution:
                 if self.pyfunc is not None
                 else (self.context.language or Language.PYTHON)
             )
-
-    def __getstate__(self):
-        return serialize_dataclass_state(self)
-
-    def __setstate__(self, state):
-        restore_dataclass_state(self, state)
-        self.__post_init__()
 
     @property
     def client(self):

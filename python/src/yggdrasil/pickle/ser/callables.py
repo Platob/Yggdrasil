@@ -44,6 +44,18 @@ from yggdrasil.pickle.ser.libs import (
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
+def _dump_callable_annotations_payload(annotations: object) -> tuple[int, dict[str, tuple[str, object]]]:
+    from yggdrasil.pickle.ser.annotations import dump_function_annotations
+
+    return dump_function_annotations(annotations if isinstance(annotations, Mapping) else None)
+
+
+def _load_callable_annotations_payload(payload: object) -> dict[str, object]:
+    from yggdrasil.pickle.ser.annotations import load_function_annotations
+
+    return load_function_annotations(payload)
+
+
 __all__ = [
     "FunctionSerialized",
     "MethodSerialized",
@@ -727,6 +739,9 @@ def _dump_function_payload(fn: Callable[..., object]) -> bytes:
     # override correct.  When inner_fn is outer_fn (no decoration) the values
     # are identical, so behaviour is unchanged for plain functions.
     _sig_fn = inner_fn  # prefer inner (real) function's signature metadata
+    safe_annotations = _dump_callable_annotations_payload(
+        getattr(_sig_fn, "__annotations__", None)
+    )
 
     payload = (
         _FORMAT_VERSION,
@@ -736,7 +751,7 @@ def _dump_function_payload(fn: Callable[..., object]) -> bytes:
         outer_fn.__qualname__,
         _sig_fn.__defaults__,
         _sig_fn.__kwdefaults__,
-        _sig_fn.__annotations__,
+        safe_annotations,
         runtime_globals,
         definition_globals,
         nonlocals_dict,
@@ -803,7 +818,7 @@ def _load_function_payload(data: bytes) -> Callable[..., object]:
 
     defaults = payload[_FN_FULL_DEFAULTS]
     kwdefaults = payload[_FN_FULL_KWDEFAULTS]
-    annotations = payload[_FN_FULL_ANNOTATIONS]
+    annotations = _load_callable_annotations_payload(payload[_FN_FULL_ANNOTATIONS])
 
     globals_obj = _require_dict(payload[_FN_FULL_GLOBALS], name="Function payload globals")
     definition_globals_obj = _require_dict(
@@ -998,3 +1013,11 @@ class MethodSerialized(FunctionSerialized):
             data=_dump_method_payload(method),
             codec=codec,
         )
+
+
+for _cls in (FunctionSerialized, MethodSerialized):
+    Tags.register_class(_cls, tag=_cls.TAG)
+
+FunctionSerialized = Tags.get_class(Tags.FUNCTION) or FunctionSerialized
+MethodSerialized = Tags.get_class(Tags.METHOD) or MethodSerialized
+

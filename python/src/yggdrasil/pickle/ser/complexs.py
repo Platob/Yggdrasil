@@ -55,14 +55,48 @@ __all__ = [
     "DataclassSerialized",
 ]
 
+
+def _iter_subclasses(cls: type) -> set[type]:
+    """
+    Return all transitive subclasses of ``cls``.
+
+    Using a visited set avoids duplicate traversal and guards against any
+    accidental weirdness from repeated imports / dynamic class creation.
+    """
+    seen: set[type] = set()
+    stack = [cls]
+
+    while stack:
+        current = stack.pop()
+        for subcls in current.__subclasses__():
+            if subcls not in seen:
+                seen.add(subcls)
+                stack.append(subcls)
+
+    return seen
+
+
+def _safe_register_class(serializer_cls: type, *, pytype: type | None = None) -> None:
+    """
+    Register a serializer class with Tags.
+
+    This wrapper keeps registration logic centralized and makes it easier to
+    harden behavior if Tags becomes stricter later.
+    """
+    if pytype is None:
+        Tags.register_class(serializer_cls)
+    else:
+        Tags.register_class(serializer_cls, pytype=pytype)
+
+
 # ---------------------------------------------------------------------------
 # Tags registration
 # ---------------------------------------------------------------------------
 
 from yggdrasil.pickle.ser.tags import Tags  # noqa: E402 — must come after class definitions
 
-for _cls in ComplexSerialized.__subclasses__():
-    Tags.register_class(_cls)
+for _cls in _iter_subclasses(ComplexSerialized):
+    _safe_register_class(_cls)
 
 for _pytype, _cls in (
     (ModuleType, ModuleSerialized),
@@ -70,7 +104,13 @@ for _pytype, _cls in (
     (MethodType, MethodSerialized),
     (BaseException, BaseExceptionSerialized),
 ):
-    Tags.register_class(_cls, pytype=_pytype)
+    _safe_register_class(_cls, pytype=_pytype)
+
+ModuleSerialized = Tags.get_class(Tags.MODULE) or ModuleSerialized
+ClassSerialized = Tags.get_class(Tags.CLASS) or ClassSerialized
+FunctionSerialized = Tags.get_class(Tags.FUNCTION) or FunctionSerialized
+MethodSerialized = Tags.get_class(Tags.METHOD) or MethodSerialized
+BaseExceptionSerialized = Tags.get_class(Tags.BASE_EXCEPTION) or BaseExceptionSerialized
+DataclassSerialized = Tags.get_class(Tags.DATACLASS) or DataclassSerialized
 
 del _cls, _pytype
-

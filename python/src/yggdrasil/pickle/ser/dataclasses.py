@@ -429,3 +429,8 @@ class DataclassSerialized(ComplexSerialized[object]):
             codec=codec,
         )
 
+
+Tags.register_class(DataclassSerialized, tag=DataclassSerialized.TAG)
+DataclassSerialized = Tags.get_class(Tags.DATACLASS) or DataclassSerialized
+
+

@@ -389,3 +389,10 @@ Tags.register_class(RuntimeResourceSerialized, tag=RuntimeResourceSerialized.TAG
 Tags.register_class(GenericObjectSerialized, tag=GenericObjectSerialized.TAG)
 for cls in PickleSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
+
+RuntimeResourceSerialized = Tags.get_class(Tags.RUNTIME_RESOURCE) or RuntimeResourceSerialized
+GenericObjectSerialized = Tags.get_class(Tags.GENERIC_OBJECT) or GenericObjectSerialized
+StdlibPickleSerialized = Tags.get_class(Tags.PICKLE) or StdlibPickleSerialized
+DillSerialized = Tags.get_class(Tags.DILL) or DillSerialized
+CloudPickleSerialized = Tags.get_class(Tags.CLOUDPICKLE) or CloudPickleSerialized
+

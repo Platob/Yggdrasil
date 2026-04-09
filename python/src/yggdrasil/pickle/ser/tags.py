@@ -9,37 +9,10 @@ if TYPE_CHECKING:
 
 
 class Tags:
-    """
-    Stable wire tags for serialized payload kinds.
-
-    These integers are part of the binary protocol and must remain stable.
-
-    Layout by reserved ranges
-    -------------------------
-    0..99    : primitive / logical scalars
-    100..199 : collections
-    200..299 : system / complex / runtime objects  (logging: 216–219)
-    300..399 : framework-specific internal objects
-    400..499 : pyarrow
-    500..599 : pandas
-    600..699 : polars
-    700..799 : pyspark
-    800..899 : databricks
-    """
-
-    # ------------------------------------------------------------------
-    # runtime registries
-    # ------------------------------------------------------------------
-
     CLASSES: ClassVar[dict[int, type["Serialized[object]"]]] = {}
     TYPES: ClassVar[dict[type, type["Serialized[object]"]]] = {}
     _IMPORTED_CATEGORIES: ClassVar[set[int]] = set()
-
     TAG_TO_NAME: ClassVar[dict[int, str]]
-
-    # ------------------------------------------------------------------
-    # category labels
-    # ------------------------------------------------------------------
 
     CATEGORY_UNKNOWN: ClassVar[str] = "unknown"
     CATEGORY_PRIMITIVE: ClassVar[str] = "primitive"
@@ -52,10 +25,6 @@ class Tags:
     CATEGORY_PYSPARK: ClassVar[str] = "pyspark"
     CATEGORY_DATABRICKS: ClassVar[str] = "databricks"
 
-    # ------------------------------------------------------------------
-    # category ranges
-    # ------------------------------------------------------------------
-
     PRIMITIVE_BASE: ClassVar[int] = 0
     COLLECTION_BASE: ClassVar[int] = 100
     SYSTEM_BASE: ClassVar[int] = 200
@@ -66,10 +35,6 @@ class Tags:
     PYSPARK_BASE: ClassVar[int] = 700
     DATABRICKS_BASE: ClassVar[int] = 800
     CATEGORY_SIZE: ClassVar[int] = 100
-
-    # ------------------------------------------------------------------
-    # primitives / logical scalars
-    # ------------------------------------------------------------------
 
     NONE: int = 0
     UTF8_STRING: int = 1
@@ -97,10 +62,6 @@ class Tags:
     COMPLEX: int = 23
     IPADDRESS: int = 24
 
-    # ------------------------------------------------------------------
-    # collections
-    # ------------------------------------------------------------------
-
     ARRAY: int = 100
     LIST: int = 101
     MAPPING: int = 102
@@ -122,10 +83,6 @@ class Tags:
     LARGE_ITERATOR: int = 167
     LARGE_FROZENSET: int = 168
     LARGE_DEQUE: int = 169
-
-    # ------------------------------------------------------------------
-    # system / complex
-    # ------------------------------------------------------------------
 
     MODULE: int = 200
     CLASS: int = 201
@@ -152,19 +109,11 @@ class Tags:
     PREPARED_REQUEST: int = 222
     RESPONSE: int = 223
 
-    # ------------------------------------------------------------------
-    # framework-specific internal objects
-    # ------------------------------------------------------------------
-
     MEDIA_TYPE: int = 300
     MIME_TYPE: int = 301
     CODEC: int = 302
     YGG_FIELD: int = 303
     YGG_SCHEMA: int = 304
-
-    # ------------------------------------------------------------------
-    # arrow
-    # ------------------------------------------------------------------
 
     ARROW_TABLE: int = 400
     ARROW_RECORD_BATCH: int = 401
@@ -178,17 +127,10 @@ class Tags:
     ARROW_SCALAR: int = 409
     ARROW_TENSOR: int = 410
 
-    # ------------------------------------------------------------------
-    # pandas
-    # ------------------------------------------------------------------
-
     PANDAS_DATAFRAME: int = 500
     PANDAS_SERIES: int = 501
     PANDAS_INDEX: int = 502
-
-    # ------------------------------------------------------------------
-    # polars
-    # ------------------------------------------------------------------
+    PANDAS_TIMESTAMP: int = 503
 
     POLARS_DATAFRAME: int = 600
     POLARS_SERIES: int = 601
@@ -196,10 +138,6 @@ class Tags:
     POLARS_EXPR: int = 603
     POLARS_SCHEMA: int = 604
     POLARS_DATATYPE: int = 605
-
-    # ------------------------------------------------------------------
-    # pyspark
-    # ------------------------------------------------------------------
 
     PYSPARK_DATAFRAME: int = 700
     PYSPARK_ROW: int = 701
@@ -209,21 +147,130 @@ class Tags:
     PYSPARK_RDD: int = 705
     PYSPARK_SESSION: int = 706
 
-    # ------------------------------------------------------------------
-    # databricks
-    # ------------------------------------------------------------------
-
     DATABRICKS_CONFIG: int = 800
     DATABRICKS_WORKSPACE_CLIENT: int = 801
     DATABRICKS_ACCOUNT_CLIENT: int = 802
-
-    # ------------------------------------------------------------------
-    # category helpers
-    # ------------------------------------------------------------------
+    DATABRICKS_CLIENT: int = 803
+    DATABRICKS_EXECUTION_CONTEXT: int = 804
+    DATABRICKS_COMMAND_EXECUTION: int = 805
 
     @classmethod
     def _category_id(cls, tag: int) -> int:
         return -1 if tag < 0 else tag // cls.CATEGORY_SIZE
+
+    @classmethod
+    def get_name(cls, tag: int) -> str | None:
+        return cls.TAG_TO_NAME.get(tag)
+
+    @classmethod
+    def _ensure_category_imported(cls, tag: int) -> None:
+        cid = cls._category_id(tag)
+        if cid in cls._IMPORTED_CATEGORIES or cid < 0:
+            return
+
+        if cid == 0:
+            from yggdrasil.pickle.ser.primitives import PrimitiveSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.logicals import LogicalSerialized  # noqa: F401
+        elif cid == 1:
+            from yggdrasil.pickle.ser.collections import CollectionSerialized  # noqa: F401
+        elif cid == 2:
+            from yggdrasil.pickle.ser.complexs import ComplexSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.ios import IOSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.pickles import PickleSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.logicals import PathSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.logging import LoggingSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.http_ import HttpSerialized  # noqa: F401
+        elif cid == 3:
+            from yggdrasil.pickle.ser.media import MediaTypeSerialized  # noqa: F401
+            from yggdrasil.pickle.ser.data import DataSerialized  # noqa: F401
+        elif cid == 4:
+            from yggdrasil.pickle.ser.pyarrow import ArrowSerialized  # noqa: F401
+        elif cid == 5:
+            from yggdrasil.pickle.ser.pandas import PandasSerialized  # noqa: F401
+        elif cid == 6:
+            from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
+        elif cid == 7:
+            from yggdrasil.pickle.ser.pyspark import PySparkSerialized  # noqa: F401
+        elif cid == 8:
+            from yggdrasil.pickle.ser.databricks import DatabricksSerialized  # noqa: F401
+        else:
+            return
+
+        cls._IMPORTED_CATEGORIES.add(cid)
+
+    @classmethod
+    def get_class(cls, tag: int) -> type["Serialized[object]"] | None:
+        existing = cls.CLASSES.get(tag)
+        if existing is not None:
+            return existing
+
+        cls._ensure_category_imported(tag)
+        return cls.CLASSES.get(tag)
+
+    @classmethod
+    def get_class_from_type(cls, pytype: type) -> type["Serialized[object]"] | None:
+        existing = cls.TYPES.get(pytype)
+        if existing is not None:
+            return existing
+
+        for cid in range(0, 9):
+            cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
+
+        existing = cls.TYPES.get(pytype)
+        if existing is not None:
+            return existing
+
+        for base in pytype.__mro__[1:]:
+            existing = cls.TYPES.get(base)
+            if existing is not None:
+                return existing
+
+        return None
+
+    @classmethod
+    def register_class(
+        cls,
+        serialized_cls: type["Serialized[object]"],
+        *,
+        tag: int | None = None,
+        pytype: type | None = None,
+    ) -> None:
+        if serialized_cls.__name__ == "Serialized":
+            raise ValueError(
+                f"Cannot register {serialized_cls} with tag={tag} and pytype={pytype!r} "
+                f"because it is the base class for all serializers, not a concrete implementation"
+            )
+
+        if tag is None:
+            tag = getattr(serialized_cls, "TAG", None)
+
+        def _same_class(a: type, b: type) -> bool:
+            if a is b:
+                return True
+            return (
+                getattr(a, "__module__", None) == getattr(b, "__module__", None)
+                and getattr(a, "__qualname__", None) == getattr(b, "__qualname__", None)
+            )
+
+        if isinstance(tag, int) and tag >= 0:
+            existing = cls.CLASSES.get(tag)
+            if existing is not None and not _same_class(existing, serialized_cls):
+                raise ValueError(
+                    f"Conflicting serializer registration for tag {tag} "
+                    f"({cls.get_name(tag) or 'UNKNOWN'}): {existing!r} vs {serialized_cls!r}"
+                )
+            if existing is None:
+                cls.CLASSES[tag] = serialized_cls
+
+        if pytype is not None:
+            existing = cls.TYPES.get(pytype)
+            if existing is not None and not _same_class(existing, serialized_cls):
+                raise ValueError(
+                    f"Conflicting serializer registration for Python type {pytype!r}: "
+                    f"{existing!r} vs {serialized_cls!r}"
+                )
+            if existing is None:
+                cls.TYPES[pytype] = serialized_cls
 
     @classmethod
     def get_category(cls, tag: int) -> str:
@@ -284,154 +331,6 @@ class Tags:
     @classmethod
     def is_databricks(cls, tag: int) -> bool:
         return 800 <= tag < 900
-
-    # ------------------------------------------------------------------
-    # lookup helpers
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def get_name(cls, tag: int) -> str | None:
-        return cls.TAG_TO_NAME.get(tag)
-
-    @classmethod
-    def is_known(cls, tag: int) -> bool:
-        return tag in cls.TAG_TO_NAME or tag in cls.CLASSES
-
-    # ------------------------------------------------------------------
-    # lazy import routing
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def _ensure_category_imported(cls, tag: int) -> None:
-        """
-        Import serializer modules lazily by tag category.
-
-        Idempotent: a class-level set tracks which category IDs have already
-        been imported so that repeated calls (e.g., on every TYPES cache miss)
-        pay only a single ``set.__contains__`` check rather than re-entering
-        the import machinery each time.
-
-        Parameters
-        ----------
-        tag:
-            Any integer tag whose category should be imported.  The category
-            is derived as ``tag // CATEGORY_SIZE`` (e.g., tag 101 → cid 1 →
-            collections).  Callers may also pass a category base directly
-            (``cid * CATEGORY_SIZE``); both forms are equivalent.
-        """
-        cid = cls._category_id(tag)
-
-        if cid in cls._IMPORTED_CATEGORIES:
-            return
-
-        if cid == 0:
-            from yggdrasil.pickle.ser.primitives import PrimitiveSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.logicals import LogicalSerialized  # noqa: F401
-        elif cid == 1:
-            from yggdrasil.pickle.ser.collections import CollectionSerialized  # noqa: F401
-        elif cid == 2:
-            from yggdrasil.pickle.ser.complexs import ComplexSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.ios import IOSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.pickles import PickleSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.logicals import PathSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.logging import LoggingSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.http_ import HttpSerialized  # noqa: F401
-        elif cid == 3:
-            from yggdrasil.pickle.ser.media import MediaTypeSerialized  # noqa: F401
-            from yggdrasil.pickle.ser.data import DataSerialized  # noqa: F401
-        elif cid == 4:
-            from yggdrasil.pickle.ser.pyarrow import ArrowSerialized  # noqa: F401
-        elif cid == 5:
-            from yggdrasil.pickle.ser.pandas import PandasSerialized  # noqa: F401
-        elif cid == 6:
-            from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
-        elif cid == 7:
-            from yggdrasil.pickle.ser.pyspark import PySparkSerialized  # noqa: F401
-        elif cid == 8:
-            from yggdrasil.pickle.ser.databricks import DatabricksSerialized  # noqa: F401
-
-        cls._IMPORTED_CATEGORIES.add(cid)
-
-    # ------------------------------------------------------------------
-    # class resolution
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def get_class(cls, tag: int) -> type["Serialized[object]"]:
-        """
-        Resolve the concrete Serialized subclass registered for a wire tag.
-        """
-        existing = cls.CLASSES.get(tag)
-        if existing is not None:
-            return existing
-
-        cls._ensure_category_imported(tag)
-        existing = cls.CLASSES.get(tag)
-
-        if existing is None:
-            raise NotImplementedError(
-                f"Tag {tag} ({cls.get_name(tag) or 'UNKNOWN'}) is not registered "
-                f"with a Serialized class"
-            )
-        return existing
-
-    @classmethod
-    def get_class_from_type(cls, pytype: type) -> type["Serialized[object]"] | None:
-        """
-        Resolve the serializer class for a Python runtime type.
-
-        Fast path:
-            direct TYPES lookup
-
-        Slow path:
-            force-load all core categories, then retry.
-            This is safe because Python's import machinery is idempotent —
-            already-imported modules are served from sys.modules instantly.
-            The old guard ``if not cls.TYPES`` was broken: if collections.py
-            was imported first it populated TYPES with 8 entries, so the guard
-            was never triggered and primitives (including NoneType) were never
-            registered, causing None to fall through to PickleSerialized.
-        """
-        existing = cls.TYPES.get(pytype)
-        if existing is not None:
-            return existing
-
-        for cid in (0, 1, 2, 4, 8):
-            cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
-
-        return cls.TYPES.get(pytype)
-
-    @classmethod
-    def resolve_class(cls, tag: int) -> type["Serialized[object]"]:
-        return cls.get_class(tag)
-
-    # ------------------------------------------------------------------
-    # registration
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def register_class(
-        cls,
-        serialized_cls: type["Serialized[object]"],
-        *,
-        tag: int | None = None,
-        pytype: type | None = None,
-    ) -> None:
-        """
-        Register a Serialized subclass by wire tag and/or Python type.
-        """
-        if tag is None:
-            tag = getattr(serialized_cls, "TAG", None)
-
-        if isinstance(tag, int) and tag >= 0:
-            cls.CLASSES[tag] = serialized_cls
-
-        if pytype is not None:
-            existing = cls.TYPES.get(pytype)
-
-            if existing is None:
-                cls.TYPES[pytype] = serialized_cls
-
 
 def _build_tag_to_name() -> dict[int, str]:
     out: dict[int, str] = {}

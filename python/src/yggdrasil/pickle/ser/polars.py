@@ -783,3 +783,11 @@ class PolarsDataTypeSerialized(
 
 for cls in PolarsSerialized.__subclasses__():
     Tags.register_class(cls, tag=cls.TAG)
+
+PolarsDataFrameSerialized = Tags.get_class(Tags.POLARS_DATAFRAME) or PolarsDataFrameSerialized
+PolarsSeriesSerialized = Tags.get_class(Tags.POLARS_SERIES) or PolarsSeriesSerialized
+PolarsLazyFrameSerialized = Tags.get_class(Tags.POLARS_LAZYFRAME) or PolarsLazyFrameSerialized
+PolarsExprSerialized = Tags.get_class(Tags.POLARS_EXPR) or PolarsExprSerialized
+PolarsSchemaSerialized = Tags.get_class(Tags.POLARS_SCHEMA) or PolarsSchemaSerialized
+PolarsDataTypeSerialized = Tags.get_class(Tags.POLARS_DATATYPE) or PolarsDataTypeSerialized
+

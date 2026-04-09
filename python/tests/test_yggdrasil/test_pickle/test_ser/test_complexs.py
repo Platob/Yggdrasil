@@ -70,6 +70,25 @@ def test_class_serialized_write_to_roundtrip() -> None:
     assert reread.as_python() is DemoClass
 
 
+def test_tags_duplicate_same_name_registration_keeps_original_class() -> None:
+    original = Tags.get_class(Tags.CLASS)
+
+    DuplicateClassSerialized = type(
+        "ClassSerialized",
+        (Serialized,),
+        {
+            "TAG": Tags.CLASS,
+            "__module__": ClassSerialized.__module__,
+            "__qualname__": ClassSerialized.__qualname__,
+        },
+    )
+
+    Tags.register_class(DuplicateClassSerialized, tag=Tags.CLASS)
+
+    assert Tags.get_class(Tags.CLASS) is original
+    assert Tags.get_class(Tags.CLASS) is ClassSerialized
+
+
 def test_serialized_from_python_object_dispatches_module() -> None:
     ser = Serialized.from_python_object(math)
 

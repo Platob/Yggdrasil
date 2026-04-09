@@ -7,6 +7,7 @@ import threading
 import pandas
 
 from yggdrasil.pickle.ser.constants import CODEC_GZIP
+from yggdrasil.pickle.ser.pandas import PandasTimestampSerialized
 from yggdrasil.pickle.ser.pickles import (
     GenericObjectSerialized,
     RuntimeResourceSerialized,
@@ -38,7 +39,8 @@ def test_pandas() -> None:
     obj = pandas.Timestamp(year=1, month=1, day=1)
     ser = Serialized.from_python_object(obj)
 
-    assert isinstance(ser, GenericObjectSerialized)
+    assert isinstance(ser, PandasTimestampSerialized)
+    assert ser.tag == Tags.PANDAS_TIMESTAMP
     out = ser.as_python()
     assert isinstance(out, pandas.Timestamp)
     assert out.year == 1
