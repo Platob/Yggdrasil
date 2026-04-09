@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Mapping
 
 from yggdrasil.io import BytesIO
@@ -16,7 +15,11 @@ __all__ = [
 ]
 
 Metadata = dict[bytes, bytes] | None
-
+MAX_META_SIZE = 128 * 1024 * 1024
+MAX_PAYLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_METADATA_ENTRIES = 10_000
+MAX_METADATA_KEY_SIZE = 64 * 1024
+MAX_METADATA_VALUE_SIZE = 16 * 1024 * 1024
 
 def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
     """Encode metadata as length-prefixed key/value pairs.
@@ -42,19 +45,26 @@ def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
 
 
 def decode_metadata(blob: bytes) -> Metadata:
-    """Decode length-prefixed metadata bytes into a dict."""
     if not blob:
         return None
 
     pos = 0
     size = len(blob)
     out: dict[bytes, bytes] = {}
+    entries = 0
 
     while pos < size:
+        entries += 1
+        if entries > MAX_METADATA_ENTRIES:
+            raise MetadataDecodeError("Too many metadata entries")
+
         if pos + 4 > size:
             raise MetadataDecodeError("Unexpected EOF while reading metadata key length")
         k_len = int.from_bytes(blob[pos : pos + 4], "big")
         pos += 4
+
+        if k_len > MAX_METADATA_KEY_SIZE:
+            raise MetadataDecodeError(f"Metadata key too large: {k_len}")
 
         if pos + k_len > size:
             raise MetadataDecodeError("Unexpected EOF while reading metadata key")
@@ -66,6 +76,9 @@ def decode_metadata(blob: bytes) -> Metadata:
         v_len = int.from_bytes(blob[pos : pos + 4], "big")
         pos += 4
 
+        if v_len > MAX_METADATA_VALUE_SIZE:
+            raise MetadataDecodeError(f"Metadata value too large: {v_len}")
+
         if pos + v_len > size:
             raise MetadataDecodeError("Unexpected EOF while reading metadata value")
         value = blob[pos : pos + v_len]
@@ -76,7 +89,6 @@ def decode_metadata(blob: bytes) -> Metadata:
     return out
 
 
-@dataclass(frozen=True, slots=True)
 class Header:
     """Binary header for a serialized payload.
 
@@ -89,24 +101,23 @@ class Header:
         payload:size bytes
     """
 
-    tag: int
-    codec: int
-    size: int
-    meta_size: int
-    start: int
-    metadata: Metadata = None
+    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata")
 
-    def __post_init__(self) -> None:
-        if self.tag < 0:
-            raise ValueError("tag must be >= 0")
-        if self.codec < 0:
-            raise ValueError("codec must be >= 0")
-        if self.size < 0:
-            raise ValueError("size must be >= 0")
-        if self.meta_size < 0:
-            raise ValueError("meta_size must be >= 0")
-        if self.start < 0:
-            raise ValueError("start must be >= 0")
+    def __init__(
+        self,
+        tag: int,
+        codec: int,
+        size: int,
+        meta_size: int,
+        start: int,
+        metadata: Metadata = None,
+    ) -> None:
+        self.tag = tag
+        self.codec = codec
+        self.size = size
+        self.meta_size = meta_size
+        self.start = start
+        self.metadata = metadata
 
     @property
     def header_start(self) -> int:
@@ -158,6 +169,12 @@ class Header:
         codec = int.from_bytes(fixed[2:4], "big")
         size = int.from_bytes(fixed[4:8], "big")
         meta_size = int.from_bytes(fixed[8:12], "big")
+
+        if meta_size > MAX_META_SIZE:
+            raise HeaderDecodeError(f"Metadata too large: {meta_size}")
+
+        if size > MAX_PAYLOAD_SIZE:
+            raise HeaderDecodeError(f"Payload too large: {size}")
 
         meta_blob = b""
         if meta_size:

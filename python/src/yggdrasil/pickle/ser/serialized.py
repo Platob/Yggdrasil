@@ -53,7 +53,6 @@ class Serialized(ABC, Generic[T]):
 
     @staticmethod
     def _resolve_type(tag: int) -> type["Serialized[object]"]:
-        from yggdrasil.pickle.ser.tags import Tags
         return Tags.get_class(tag) or Serialized
 
     @property
@@ -351,16 +350,17 @@ class Serialized(ABC, Generic[T]):
             metadata=metadata,
         )
         buf = head.write_to(encoded)
+        payload = head.payload_view(buf)
 
+        # Resolve the concrete subclass once, then instantiate directly.
+        # Avoids a second Header.read_from() round-trip that read_from() would
+        # perform — critical for high-frequency primitive serialisation paths.
         if cls is Serialized:
-            from yggdrasil.pickle.ser.tags import Tags
+            target = Tags.get_class(tag) or cls
+        else:
+            target = cls
 
-            found = Tags.get_class(head.tag)
-            if found is not None:
-                return found.read_from(buf, pos=0)
-            return cls.read_from(buf, pos=0)
-
-        return cls.read_from(buf, pos=0)
+        return target(head=head, data=payload)
 
     @classmethod
     def read_from(
@@ -369,7 +369,6 @@ class Serialized(ABC, Generic[T]):
         *,
         pos: int | None = None,
     ) -> "Serialized[object]":
-        from yggdrasil.pickle.ser.tags import Tags
 
         head = Header.read_from(buffer, pos=pos)
         found = Tags.get_class(head.tag)

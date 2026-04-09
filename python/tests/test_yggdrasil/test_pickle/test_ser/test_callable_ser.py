@@ -19,7 +19,6 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from yggdrasil.mongoengine.decorator import with_mongo_connection
 from yggdrasil.pickle.ser import Serialized, Tags
 from yggdrasil.pickle.ser.callables import (
     FunctionSerialized,

@@ -39,5 +39,5 @@ class VersionInfo(NamedTuple):
         return base
 
 
-__version_info__ = VersionInfo.from_string("0.6.17")
+__version_info__ = VersionInfo.from_string("0.6.18")
 __version__ = str(__version_info__)
