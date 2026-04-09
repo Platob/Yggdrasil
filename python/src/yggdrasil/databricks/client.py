@@ -297,14 +297,17 @@ class DatabricksClient(URLResource):
     def config(self):
         if self._workspace_config is None or self._account_config is None:
             config = self.make_config()
-            ct = getattr(config, "client_type", ClientType.WORKSPACE)
+            ct = config.client_type
 
             if ct == ClientType.WORKSPACE:
                 object.__setattr__(self, "_workspace_config", config)
             elif ct == ClientType.ACCOUNT:
                 object.__setattr__(self, "_account_config", config)
             else:
-                raise ValueError(f"Unexpected client_type in config: {config.client_type}")
+                try:
+                    return self.workspace_config
+                except:
+                    return self.account_config
         return self._workspace_config or self._account_config
 
     @property

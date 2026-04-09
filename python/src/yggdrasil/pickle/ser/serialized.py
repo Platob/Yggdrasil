@@ -250,6 +250,14 @@ class Serialized(ABC, Generic[T]):
                         Tags.register_class(out.__class__, pytype=type(obj))
                     return out
 
+        if mod.startswith("databricks.sdk"):
+            from yggdrasil.pickle.ser.databricks import DatabricksSerialized
+
+            out = DatabricksSerialized.from_python_object(obj, metadata=metadata, codec=codec)
+            if out is not None:
+                if is_obj:
+                    Tags.register_class(out.__class__, pytype=type(obj))
+                return out
         if mod.startswith("pyarrow"):
             from yggdrasil.pickle.ser.pyarrow import ArrowSerialized
 

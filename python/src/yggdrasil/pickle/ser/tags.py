@@ -24,6 +24,7 @@ class Tags:
     500..599 : pandas
     600..699 : polars
     700..799 : pyspark
+    800..899 : databricks
     """
 
     # ------------------------------------------------------------------
@@ -49,6 +50,7 @@ class Tags:
     CATEGORY_PANDAS: ClassVar[str] = "pandas"
     CATEGORY_POLARS: ClassVar[str] = "polars"
     CATEGORY_PYSPARK: ClassVar[str] = "pyspark"
+    CATEGORY_DATABRICKS: ClassVar[str] = "databricks"
 
     # ------------------------------------------------------------------
     # category ranges
@@ -62,6 +64,7 @@ class Tags:
     PANDAS_BASE: ClassVar[int] = 500
     POLARS_BASE: ClassVar[int] = 600
     PYSPARK_BASE: ClassVar[int] = 700
+    DATABRICKS_BASE: ClassVar[int] = 800
     CATEGORY_SIZE: ClassVar[int] = 100
 
     # ------------------------------------------------------------------
@@ -207,6 +210,14 @@ class Tags:
     PYSPARK_SESSION: int = 706
 
     # ------------------------------------------------------------------
+    # databricks
+    # ------------------------------------------------------------------
+
+    DATABRICKS_CONFIG: int = 800
+    DATABRICKS_WORKSPACE_CLIENT: int = 801
+    DATABRICKS_ACCOUNT_CLIENT: int = 802
+
+    # ------------------------------------------------------------------
     # category helpers
     # ------------------------------------------------------------------
 
@@ -234,6 +245,8 @@ class Tags:
             return cls.CATEGORY_POLARS
         if cid == 7:
             return cls.CATEGORY_PYSPARK
+        if cid == 8:
+            return cls.CATEGORY_DATABRICKS
         return cls.CATEGORY_UNKNOWN
 
     @classmethod
@@ -267,6 +280,10 @@ class Tags:
     @classmethod
     def is_pyspark(cls, tag: int) -> bool:
         return 700 <= tag < 800
+
+    @classmethod
+    def is_databricks(cls, tag: int) -> bool:
+        return 800 <= tag < 900
 
     # ------------------------------------------------------------------
     # lookup helpers
@@ -330,6 +347,8 @@ class Tags:
             from yggdrasil.pickle.ser.polars import PolarsSerialized  # noqa: F401
         elif cid == 7:
             from yggdrasil.pickle.ser.pyspark import PySparkSerialized  # noqa: F401
+        elif cid == 8:
+            from yggdrasil.pickle.ser.databricks import DatabricksSerialized  # noqa: F401
 
         cls._IMPORTED_CATEGORIES.add(cid)
 
@@ -377,7 +396,7 @@ class Tags:
         if existing is not None:
             return existing
 
-        for cid in (0, 1, 2, 4):
+        for cid in (0, 1, 2, 4, 8):
             cls._ensure_category_imported(cid * cls.CATEGORY_SIZE)
 
         return cls.TYPES.get(pytype)

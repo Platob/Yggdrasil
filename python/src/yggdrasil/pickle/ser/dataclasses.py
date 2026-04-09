@@ -20,7 +20,7 @@ from dataclasses import (
     is_dataclass,
     make_dataclass,
 )
-from typing import ClassVar, Generic
+from typing import ClassVar
 
 from yggdrasil.pickle.ser.libs import (
     _FORMAT_VERSION,
@@ -338,8 +338,9 @@ def _dump_dataclass_payload(obj: object) -> bytes:
 
         if f.init:
             init_values[f.name] = value
-        else:
-            non_init_values[f.name] = value
+        # Skip heavy non init values
+        # else:
+        #     non_init_values[f.name] = value
 
     raw_state = _dump_object_state(obj)
 

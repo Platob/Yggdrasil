@@ -1,11 +1,11 @@
-# yggdrasil/data/cast/datetime.py
 from __future__ import annotations
 
 import datetime as dt
 import math
 import re
 import time
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional
 
 from .registry import register_converter
 
@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
 __all__ = [
     "CURRENT_TZINFO",
     "normalize_fractional_seconds",
+    "normalize_datetime_string",
     "str_to_date",
     "str_to_time",
     "str_to_datetime",
@@ -41,10 +42,10 @@ __all__ = [
     "any_to_datetime",
     "any_to_timedelta",
     "any_to_tzinfo",
+    "truncate_datetime",
+    "iter_datetime_ranges",
 ]
 
-
-# ---- cached globals / compiled regexes ----
 
 _UTC = dt.timezone.utc
 _DATETIME = dt.datetime
@@ -67,12 +68,25 @@ _RE_COMPACT_DATETIME = re.compile(
     r"(?:(Z)|([+-]\d{2}:?\d{2}))?$"
 )
 _RE_TIMEDELTA_HMS = re.compile(
-    r"(?:(\d+)d\s+)?"
-    r"(\d{1,2}):(\d{1,2})"
-    r"(?::(\d{1,2})(?:\.(\d{1,6}))?)?"
+    r"(?:(?P<days>-?\d+)d\s+)?"
+    r"(?P<hours>\d{1,2}):(?P<minutes>\d{1,2})"
+    r"(?::(?P<seconds>\d{1,2})(?:\.(?P<fraction>\d{1,6}))?)?$"
 )
-_RE_TIMEDELTA_UNIT = re.compile(r"(-?\d+(?:\.\d+)?)([smhd])")
-_RE_TZ_OFFSET = re.compile(r"([+-])(\d{2})(?::?(\d{2}))?")
+_RE_TIMEDELTA_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
+_RE_TZ_OFFSET = re.compile(r"([+-])(\d{2})(?::?(\d{2}))?$")
+_RE_ISO_DURATION = re.compile(
+    r"^(?P<sign>[+-])?P"
+    r"(?:(?P<years>\d+(?:\.\d+)?)Y)?"
+    r"(?:(?P<months>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<weeks>\d+(?:\.\d+)?)W)?"
+    r"(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:T"
+    r"(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?"
+    r")?$",
+    re.IGNORECASE,
+)
 
 _STRPTIME_FORMATS = (
     "%Y-%m-%d %H:%M%z",
@@ -86,19 +100,39 @@ _STRPTIME_FORMATS = (
     "%Y-%m-%d",
 )
 
-
 CURRENT_TZINFO: dt.tzinfo = _UTC
 
 
-def _coerce_target_tzinfo(tz: Any = None, opts: Any = None) -> dt.tzinfo | None:
-    """
-    Accept tz as:
-      - tzinfo
-      - str like 'UTC' or 'Europe/Paris'
-      - timedelta offset
+@dataclass(frozen=True, slots=True)
+class _IntervalSpec:
+    raw: str
+    months: int = 0
+    days: int = 0
+    seconds: int = 0
+    microseconds: int = 0
 
-    Falls back to opts for backward compatibility if tz is not provided.
-    """
+    @property
+    def is_calendar(self) -> bool:
+        return self.months != 0
+
+    @property
+    def is_fixed(self) -> bool:
+        return self.months == 0 and (
+            self.days != 0 or self.seconds != 0 or self.microseconds != 0
+        )
+
+    @property
+    def fixed_delta(self) -> dt.timedelta:
+        if self.months:
+            raise ValueError("Calendar interval cannot be represented as timedelta.")
+        return _TIMEDELTA(
+            days=self.days,
+            seconds=self.seconds,
+            microseconds=self.microseconds,
+        )
+
+
+def _coerce_target_tzinfo(tz: Any = None, opts: Any = None) -> dt.tzinfo | None:
     candidate = tz if tz is not None else opts
     if candidate is None:
         return None
@@ -121,7 +155,6 @@ def _apply_target_tz(value: dt.datetime, tz: Any = None, opts: Any = None) -> dt
 
 
 def normalize_fractional_seconds(value: str) -> str:
-    """Normalize fractional seconds to microsecond precision for fromisoformat()."""
     match = _RE_FRACTIONAL_SECONDS.search(value)
     if not match:
         return value
@@ -131,9 +164,6 @@ def normalize_fractional_seconds(value: str) -> str:
 
 
 def normalize_datetime_string(value: str) -> str:
-    """
-    Normalize common datetime string variants into something fromisoformat() likes.
-    """
     s = value.strip()
 
     if s.endswith("Z"):
@@ -157,10 +187,7 @@ def normalize_datetime_string(value: str) -> str:
     if HH is None:
         return date_part
 
-    if frac is None:
-        frac_part = ""
-    else:
-        frac_part = "." + frac[:6].ljust(6, "0")
+    frac_part = "" if frac is None else "." + frac[:6].ljust(6, "0")
 
     if z:
         tz_part = "+00:00"
@@ -197,7 +224,7 @@ def str_to_datetime(value: str, opts: Any = None, tz: Any = None) -> dt.datetime
             try:
                 parsed = _DATETIME.strptime(s, fmt)
                 break
-            except ValueError as e:  # pragma: no cover
+            except ValueError as e:
                 last = e
         else:
             raise last or ValueError(f"Cannot parse datetime from {value!r}")
@@ -219,24 +246,41 @@ def str_to_timedelta(value: str, opts: Any = None) -> dt.timedelta:
 
     m = _RE_TIMEDELTA_HMS.fullmatch(s)
     if m:
-        days = int(m.group(1)) if m.group(1) else 0
-        hours = int(m.group(2))
-        minutes = int(m.group(3))
-        seconds = int(m.group(4)) if m.group(4) else 0
-        micro = int((m.group(5) or "0").ljust(6, "0"))
-        return _TIMEDELTA(days=days, hours=hours, minutes=minutes, seconds=seconds, microseconds=micro)
+        days = int(m.group("days")) if m.group("days") else 0
+        hours = int(m.group("hours"))
+        minutes = int(m.group("minutes"))
+        seconds = int(m.group("seconds")) if m.group("seconds") else 0
+        micro = int((m.group("fraction") or "0").ljust(6, "0"))
+        return _TIMEDELTA(
+            days=days,
+            hours=hours,
+            minutes=minutes,
+            seconds=seconds,
+            microseconds=micro,
+        )
 
     m = _RE_TIMEDELTA_UNIT.fullmatch(s)
     if m:
         val = float(m.group(1))
-        unit = m.group(2)
+        unit = m.group(2).lower()
         if unit == "s":
             return _TIMEDELTA(seconds=val)
         if unit == "m":
-            return _TIMEDELTA(seconds=val * 60.0)
+            return _TIMEDELTA(minutes=val)
         if unit == "h":
-            return _TIMEDELTA(seconds=val * 3600.0)
-        return _TIMEDELTA(seconds=val * 86400.0)
+            return _TIMEDELTA(hours=val)
+        if unit == "d":
+            return _TIMEDELTA(days=val)
+        if unit == "w":
+            return _TIMEDELTA(weeks=val)
+
+    iso = _parse_iso_duration(s)
+    if iso is not None:
+        if iso.months:
+            raise ValueError(
+                f"Cannot convert calendar duration {value!r} to timedelta without a reference date."
+            )
+        return iso.fixed_delta
 
     try:
         return _TIMEDELTA(seconds=float(s))
@@ -249,9 +293,9 @@ def str_to_tzinfo(value: str, opts: Any = None) -> dt.tzinfo:
     s = value.strip()
     u = s.upper()
 
-    if u == "UTC" or u == "Z":
+    if u in {"UTC", "Z"}:
         return _UTC
-    if u == "LOCAL" or u == "CURRENT" or u == "NOW":
+    if u in {"LOCAL", "CURRENT", "NOW"}:
         return CURRENT_TZINFO
 
     m = _RE_TZ_OFFSET.fullmatch(s)
@@ -294,7 +338,16 @@ def date_to_datetime(value: dt.date, opts: Any = None, tz: Any = None) -> dt.dat
 def time_to_datetime(value: dt.time, opts: Any = None, tz: Any = None) -> dt.datetime:
     src_tz = value.tzinfo if value.tzinfo is not None else CURRENT_TZINFO
     return _apply_target_tz(
-        _DATETIME(1970, 1, 1, value.hour, value.minute, value.second, value.microsecond, tzinfo=src_tz),
+        _DATETIME(
+            1970,
+            1,
+            1,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            tzinfo=src_tz,
+        ),
         tz=tz,
         opts=opts,
     )
@@ -313,10 +366,6 @@ def _numeric_timestamp_to_seconds(value: int | float) -> float:
     x = -v if v < 0.0 else v
     now_s = _NOW_TS()
 
-    # Heuristic:
-    #   seconds      ~ 1e9
-    #   milliseconds ~ 1e12
-    #   microseconds ~ 1e15
     if x < now_s * 100.0:
         return v
     if x < now_s * 100_000.0:
@@ -464,3 +513,271 @@ def any_to_tzinfo(value: Any, opts: Any = None) -> dt.tzinfo:
     if isinstance(value, float):
         return timedelta_to_tzinfo(float_to_timedelta(value, opts), opts)
     raise TypeError(f"No conversion path for {type(value).__name__} -> tzinfo")
+
+
+def truncate_datetime(
+    value: Any,
+    interval: str | dt.timedelta,
+    tz: str | dt.tzinfo | dt.timedelta | None = None,
+    add_interval: bool = False,
+) -> dt.datetime:
+    """
+    Truncate a datetime-like value to the boundary defined by `interval`.
+
+    Supported interval examples:
+        - dt.timedelta(seconds=15)
+        - dt.timedelta(minutes=5)
+        - dt.timedelta(hours=4)
+        - dt.timedelta(days=7)
+        - "PT15S", "PT15M", "PT4H"
+        - "P1D", "P1W", "P1M", "P3M", "P1Y"
+
+    Rules:
+        - timedelta and fixed-width ISO intervals truncate from Unix epoch.
+        - Calendar intervals (months/years) truncate from calendar boundaries.
+        - If add_interval=True and value is not already aligned, return the next boundary.
+    """
+    dt_value = any_to_datetime(value, tz=tz)
+    spec = _coerce_interval(interval)
+    truncated = _truncate_datetime_value(dt_value, spec)
+
+    if add_interval and truncated != dt_value:
+        return _add_interval(truncated, spec)
+
+    return truncated
+
+
+def iter_datetime_ranges(
+    start: Any,
+    end: Any,
+    interval: str | dt.timedelta,
+    tz: str | dt.tzinfo | dt.timedelta | None = None,
+) -> Iterator[tuple[dt.datetime, dt.datetime]]:
+    """
+    Iterate over aligned datetime ranges between `start` and `end`.
+
+    Supported interval examples:
+        - dt.timedelta(seconds=30)
+        - dt.timedelta(minutes=15)
+        - dt.timedelta(hours=4)
+        - dt.timedelta(days=1)
+        - "PT1S", "PT30S"
+        - "PT1M", "PT15M"
+        - "PT1H", "PT4H"
+        - "P1D", "P7D"
+        - "P1W"
+        - "P1M", "P3M"
+        - "P1Y"
+    """
+    start_dt = any_to_datetime(start, tz=tz)
+    end_dt = any_to_datetime(end, tz=tz)
+
+    if start_dt >= end_dt:
+        return
+
+    spec = _coerce_interval(interval)
+    current = _truncate_datetime_value(start_dt, spec)
+
+    while current < end_dt:
+        nxt = _add_interval(current, spec)
+        yield current, nxt
+        current = nxt
+
+
+def _coerce_interval(interval: str | dt.timedelta) -> _IntervalSpec:
+    if isinstance(interval, _TIMEDELTA):
+        return _interval_spec_from_timedelta(interval)
+    if isinstance(interval, str):
+        return _parse_interval(interval)
+    raise TypeError(
+        f"Unsupported interval type {type(interval).__name__}. "
+        "Expected str or datetime.timedelta."
+    )
+
+
+def _interval_spec_from_timedelta(value: dt.timedelta) -> _IntervalSpec:
+    if value <= _TIMEDELTA(0):
+        raise ValueError(f"Interval must be positive: {value!r}")
+
+    total_days = value.days
+    total_seconds = value.seconds
+    micros = value.microseconds
+
+    return _IntervalSpec(
+        raw=repr(value),
+        days=total_days,
+        seconds=total_seconds,
+        microseconds=micros,
+    )
+
+
+def _parse_iso_duration(value: str) -> _IntervalSpec | None:
+    m = _RE_ISO_DURATION.fullmatch(value.strip())
+    if not m:
+        return None
+
+    sign = -1 if m.group("sign") == "-" else 1
+
+    years = float(m.group("years") or 0.0)
+    months = float(m.group("months") or 0.0)
+    weeks = float(m.group("weeks") or 0.0)
+    days = float(m.group("days") or 0.0)
+    hours = float(m.group("hours") or 0.0)
+    minutes = float(m.group("minutes") or 0.0)
+    seconds = float(m.group("seconds") or 0.0)
+
+    if not years.is_integer():
+        raise ValueError(f"Fractional years are not supported: {value!r}")
+    if not months.is_integer():
+        raise ValueError(f"Fractional months are not supported: {value!r}")
+
+    total_months = int(years) * 12 + int(months)
+
+    total_seconds = (
+        weeks * 7.0 * 86400.0
+        + days * 86400.0
+        + hours * 3600.0
+        + minutes * 60.0
+        + seconds
+    )
+
+    whole_seconds = math.floor(abs(total_seconds))
+    micros = round((abs(total_seconds) - whole_seconds) * 1_000_000)
+
+    if micros == 1_000_000:
+        whole_seconds += 1
+        micros = 0
+
+    total_days, rem_seconds = divmod(whole_seconds, 86400)
+
+    return _IntervalSpec(
+        raw=value,
+        months=sign * total_months,
+        days=sign * int(total_days),
+        seconds=sign * int(rem_seconds),
+        microseconds=sign * micros,
+    )
+
+
+def _parse_interval(interval: str) -> _IntervalSpec:
+    spec = _parse_iso_duration(interval)
+    if spec is None:
+        raise ValueError(
+            f"Unsupported interval {interval!r}. "
+            "Examples: 'PT1S', 'PT15M', 'PT4H', 'P1D', 'P1W', 'P1M', 'P1Y'."
+        )
+
+    if spec.months == 0 and spec.days == 0 and spec.seconds == 0 and spec.microseconds == 0:
+        raise ValueError(f"Interval must be non-zero: {interval!r}")
+
+    if spec.months != 0 and (spec.days != 0 or spec.seconds != 0 or spec.microseconds != 0):
+        raise ValueError(
+            f"Mixed calendar/fixed interval not supported for truncation/iteration: {interval!r}"
+        )
+
+    if spec.months < 0 or spec.days < 0 or spec.seconds < 0 or spec.microseconds < 0:
+        raise ValueError(f"Negative intervals are not supported: {interval!r}")
+
+    return spec
+
+
+def _truncate_datetime_value(value: dt.datetime, spec: _IntervalSpec) -> dt.datetime:
+    if spec.is_calendar:
+        months = spec.months
+        if months % 12 == 0:
+            years = months // 12
+            return _truncate_to_year_boundary(value, years)
+        return _truncate_to_month_boundary(value, months)
+
+    return _truncate_from_epoch(value, spec.fixed_delta)
+
+
+def _add_interval(value: dt.datetime, spec: _IntervalSpec) -> dt.datetime:
+    if spec.is_calendar:
+        return _add_months(value, spec.months)
+    return value + spec.fixed_delta
+
+
+def _truncate_to_year_boundary(value: dt.datetime, years: int) -> dt.datetime:
+    if years <= 0:
+        raise ValueError(f"Invalid year interval: {years}")
+
+    year = (value.year // years) * years
+    if year < 1:
+        year = 1
+
+    return value.replace(
+        year=year,
+        month=1,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _truncate_to_month_boundary(value: dt.datetime, months: int) -> dt.datetime:
+    if months <= 0:
+        raise ValueError(f"Invalid month interval: {months}")
+
+    total_months = value.year * 12 + (value.month - 1)
+    truncated_total = (total_months // months) * months
+    year = truncated_total // 12
+    month = (truncated_total % 12) + 1
+
+    return value.replace(
+        year=year,
+        month=month,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _truncate_from_epoch(value: dt.datetime, step: dt.timedelta) -> dt.datetime:
+    step_us = _timedelta_to_microseconds(step)
+    if step_us <= 0:
+        raise ValueError(f"Invalid fixed interval: {step!r}")
+
+    if value.tzinfo is None:
+        epoch = _DATETIME(1970, 1, 1)
+        delta = value - epoch
+        delta_us = _timedelta_to_microseconds(delta)
+        truncated_us = (delta_us // step_us) * step_us
+        return epoch + _TIMEDELTA(microseconds=truncated_us)
+
+    epoch_utc = _DATETIME(1970, 1, 1, tzinfo=_UTC)
+    value_utc = value.astimezone(_UTC)
+    delta = value_utc - epoch_utc
+    delta_us = _timedelta_to_microseconds(delta)
+    truncated_us = (delta_us // step_us) * step_us
+    truncated_utc = epoch_utc + _TIMEDELTA(microseconds=truncated_us)
+    return truncated_utc.astimezone(value.tzinfo)
+
+
+def _timedelta_to_microseconds(value: dt.timedelta) -> int:
+    return (
+        (value.days * 86400 + value.seconds) * 1_000_000
+        + value.microseconds
+    )
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 2:
+        is_leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return 29 if is_leap else 28
+    if month in (4, 6, 9, 11):
+        return 30
+    return 31
+
+
+def _add_months(value: dt.datetime, months: int) -> dt.datetime:
+    total_months = value.year * 12 + (value.month - 1) + months
+    year = total_months // 12
+    month = (total_months % 12) + 1
+    day = min(value.day, _days_in_month(year, month))
+
+    return value.replace(year=year, month=month, day=day)
