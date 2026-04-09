@@ -1,16 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Mapping
 
 from yggdrasil.databricks import lib as databricks_lib
-from yggdrasil.pickle.ser.libs import (
-    _FORMAT_VERSION,
-    _deserialize_nested,
-    _require_dict,
-    _require_tuple_len,
-    _serialize_nested,
-)
+from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -49,16 +44,30 @@ def _merge_metadata(
     return out
 
 
+def _serialize_json_payload(obj: object) -> bytes:
+    return json.dumps(obj).encode("utf-8")
+
+
+def _deserialize_json_payload(data: bytes) -> object:
+    return json.loads(data.decode("utf-8"))
+
+
 def _extract_config_kwargs(config: Config) -> dict[str, object]:
     kwargs = dict(config.as_dict())
 
     scopes = getattr(config, "scopes", None)
     if scopes is not None:
-        kwargs["scopes"] = list(scopes)
+        kwargs["scopes"] = scopes
 
     authorization_details = getattr(config, "authorization_details", None)
     if authorization_details is not None:
-        kwargs["authorization_details"] = authorization_details
+        if isinstance(authorization_details, list):
+            kwargs["authorization_details"] = [
+                dict(d) if hasattr(d, "__dict__") else d
+                for d in authorization_details
+            ]
+        else:
+            kwargs["authorization_details"] = authorization_details
 
     custom_headers = getattr(config, "_custom_headers", None)
     if custom_headers:
@@ -75,40 +84,59 @@ def _extract_config_kwargs(config: Config) -> dict[str, object]:
 
 
 def _dump_config_payload(config: Config) -> bytes:
-    return _serialize_nested((_FORMAT_VERSION, _extract_config_kwargs(config)))
+    return _serialize_json_payload({"version": 1, "kwargs": _extract_config_kwargs(config)})
 
 
 def _load_config_payload(data: bytes) -> Config:
-    payload = _require_tuple_len(
-        _deserialize_nested(data),
-        name="Databricks Config payload",
-        expected=2,
-    )
-    version, kwargs_obj = payload
+    payload_obj = _deserialize_json_payload(data)
+    if not isinstance(payload_obj, dict):
+        raise ValueError(f"Expected dict payload, got {type(payload_obj)!r}")
 
-    if version != _FORMAT_VERSION:
+    version = payload_obj.get("version")
+    if version != 1:
         raise ValueError(f"Unsupported Databricks Config payload version: {version!r}")
 
-    kwargs = _require_dict(kwargs_obj, name="Databricks Config kwargs")
-    return _DBXConfig(**kwargs)
+    kwargs_obj = payload_obj.get("kwargs")
+    if not isinstance(kwargs_obj, dict):
+        raise ValueError(
+            f"Databricks Config payload kwargs must be dict, got {type(kwargs_obj)!r}"
+        )
+
+    return _DBXConfig(**kwargs_obj)
 
 
 def _dump_client_payload(client: WorkspaceClient | AccountClient) -> bytes:
-    return _serialize_nested((_FORMAT_VERSION, client.config))
+    with BytesIO() as buf:
+        config_ser = Serialized.from_python_object(client.config)
+        if config_ser is None:
+            raise ValueError(f"Cannot serialize client config: {client.config!r}")
+        config_ser.write_to(buf)
+        buf.seek(0)
+        config_bytes = buf.read()
+    return json.dumps({"version": 1, "config": config_bytes.hex()}).encode("utf-8")
 
 
 def _load_client_config(data: bytes) -> Config:
-    payload = _require_tuple_len(
-        _deserialize_nested(data),
-        name="Databricks client payload",
-        expected=2,
-    )
-    version, config = payload
+    payload_obj = json.loads(data.decode("utf-8"))
+    if not isinstance(payload_obj, dict):
+        raise ValueError(f"Expected dict payload, got {type(payload_obj)!r}")
 
-    if version != _FORMAT_VERSION:
+    version = payload_obj.get("version")
+    if version != 1:
         raise ValueError(f"Unsupported Databricks client payload version: {version!r}")
+
+    config_hex = payload_obj.get("config")
+    if not isinstance(config_hex, str):
+        raise ValueError(
+            f"config must be hex string, got {type(config_hex)!r}"
+        )
+
+    config_bytes = bytes.fromhex(config_hex)
+    with BytesIO(config_bytes, copy=False) as buf:
+        config_ser = Serialized.read_from(buf, pos=0)
+        config = config_ser.as_python()
     if not isinstance(config, _DBXConfig):
-        raise TypeError(f"Databricks client payload must contain Config, got {type(config)!r}")
+        raise TypeError(f"Deserialized config must be Config, got {type(config)!r}")
     return config
 
 
