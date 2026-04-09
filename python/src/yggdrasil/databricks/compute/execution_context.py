@@ -1065,7 +1065,7 @@ if _raw.startswith(_DBXPATH_PREFIX):
     _path = _raw[len(_DBXPATH_PREFIX):]
     _raw = _client.dbfs_path(_path, temporary=True).read_bytes().decode("ascii")
 _f, _a, _k = loads(_raw)
-_r = dumps(_f(*list(_a), **_k), b64=True)
+_r = dumps(_f(*_a, **_k), b64=True)
 if len(_r) > _MAX_INLINE:
     from yggdrasil.databricks.client import DatabricksClient as _DBC
     _client = _DBC.current()

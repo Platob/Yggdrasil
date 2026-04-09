@@ -12,12 +12,11 @@ from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
 
-from yggdrasil.version import __version__ as ygg_version
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
-from yggdrasil.dataclasses.dataclass import serialize_dataclass_state, restore_dataclass_state
 from yggdrasil.io import BytesIO, MimeTypes
 from yggdrasil.io.url import URL, URLResource, url_resource_class
+from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
     from .iam import IAM
@@ -25,7 +24,7 @@ if TYPE_CHECKING:
     from .sql.tables import Tables
     from .sql.columns import Columns
     from .sql.catalogs import Catalogs
-    from .sql.warehouse import SQLWarehouse
+    from .sql.service import Warehouses
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
@@ -144,19 +143,6 @@ class DatabricksClient(URLResource):
         if self.host:
             normalized = self.host.split("://")[-1].split("/")[0]
             object.__setattr__(self, "host", f"https://{normalized}")
-
-    def __getstate__(self):
-        state = serialize_dataclass_state(self)
-
-        auth_type = state.get("auth_type")
-        if auth_type in {"runtime", "databricks-cli", "external-browser"}:
-            del state["auth_type"]
-
-        return state
-
-    def __setstate__(self, state):
-        restore_dataclass_state(self, state)
-        self.__post_init__()
 
     # -------------------------------------------------------------------------
     # URLResource
@@ -760,13 +746,13 @@ class DatabricksClient(URLResource):
         )
 
     @property
-    def warehouses(self) -> "SQLWarehouse":
-        from .sql.warehouse import SQLWarehouse
+    def warehouses(self) -> "Warehouses":
+        from .sql.service import Warehouses
 
         return self.lazy_property(
             self,
             cache_attr="_warehouses",
-            factory=lambda: SQLWarehouse(client=self),
+            factory=lambda: Warehouses(client=self),
             use_cache=True,
         )
 
@@ -908,13 +894,6 @@ class DatabricksService(ABC):
     def __post_init__(self):
         pass
 
-    def __getstate__(self):
-        return serialize_dataclass_state(self)
-
-    def __setstate__(self, state):
-        restore_dataclass_state(self, state)
-        self.__post_init__()
-
     @staticmethod
     def check_client(
         client: Optional[DatabricksClient] = None,
@@ -991,7 +970,7 @@ class DatabricksService(ABC):
         return self.client.sql
 
     @property
-    def warehouses(self) -> "SQLWarehouse":
+    def warehouses(self) -> "Warehouses":
         return self.client.warehouses
 
     @property
@@ -1024,13 +1003,6 @@ class DatabricksResource(ABC):
 
     def __post_init__(self):
         pass
-
-    def __getstate__(self):
-        return serialize_dataclass_state(self)
-
-    def __setstate__(self, state):
-        restore_dataclass_state(self, state)
-        self.__post_init__()
 
     @property
     def client(self) -> DatabricksClient:

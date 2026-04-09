@@ -11,26 +11,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
+
 import yggdrasil.pickle.ser as pickle
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.dataclasses import restore_dataclass_state, serialize_dataclass_state
+from yggdrasil.data import Schema
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
     WaitingConfigArg,
 )
 from yggdrasil.io import SaveMode
-
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 from .send_config import CacheConfig, SendConfig, SendManyConfig
 from .url import URL
-from ..data import Schema
 
 if TYPE_CHECKING:
-    from yggdrasil.spark.frame import DynamicFrame
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
+    from yggdrasil.spark.frame import DynamicFrame
 
 __all__ = ["Session", "CacheConfig", "SendConfig", "SendManyConfig"]
 
@@ -61,13 +60,6 @@ class Session(ABC):
             self._lock = threading.RLock()
         if self.pool_maxsize <= 0:
             self.pool_maxsize = 8
-
-    def __getstate__(self) -> dict[str, Any]:
-        return serialize_dataclass_state(self)
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        restore_dataclass_state(self, state)
-        self.__post_init__()
 
     def __enter__(self) -> "Session":
         return self

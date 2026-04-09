@@ -114,7 +114,8 @@ from .staging import StagingPath
 from .table import Table
 from .tables import Tables
 from .types import quote_ident, PrimaryKeySpec, ForeignKeySpec
-from .warehouse import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME, SQLWarehouse
+from .warehouse import SQLWarehouse
+from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
 from ..fs.path import DatabricksPath
 
@@ -308,17 +309,11 @@ class SQLEngine(DatabricksService):
             A resolved `SQLWarehouse` instance.
         """
         if self.default_warehouse is None:
-            wh = SQLWarehouse(
-                client=self.client,
-                warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name,
-            )
-
             object.__setattr__(self, "_last_default_wh_check", time.time())
             object.__setattr__(
                 self,
                 "default_warehouse",
-                wh.find_warehouse(
+                self.warehouses.find_warehouse(
                     warehouse_id=warehouse_id,
                     warehouse_name=warehouse_name,
                     find_default=True,
@@ -339,7 +334,7 @@ class SQLEngine(DatabricksService):
                 object.__setattr__(
                     self,
                     "default_warehouse",
-                    self.default_warehouse.find_default(),
+                    self.warehouses.find_default(),
                 )
                 object.__setattr__(self, "_last_default_wh_check", now_s)
 

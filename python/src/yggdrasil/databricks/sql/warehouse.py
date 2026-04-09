@@ -1,264 +1,169 @@
-import dataclasses as dc
-import inspect
-import logging
-import random
-import time
-from typing import Optional, Sequence, Any, Type, TypeVar, Union, List
+"""
+Databricks SQL Warehouse resource – individual warehouse lifecycle management.
 
-from databricks.sdk import WarehousesAPI
-from databricks.sdk.errors import ResourceDoesNotExist, DeadlineExceeded
+This module exposes the :class:`SQLWarehouse` resource, a lightweight wrapper
+around a single Databricks SQL Warehouse that provides:
+
+- property-based status checks (running, pending, serverless)
+- lifecycle helpers: start, stop, delete, wait_for_status
+- configuration updates and permission management
+- SQL statement execution with retry / back-off logic
+
+Collection-level operations (listing, finding, creating warehouses) live in the
+companion :mod:`~yggdrasil.databricks.sql.service` module.
+"""
+
+from __future__ import annotations
+
+import dataclasses as dc
+import logging
+import time
+from typing import Optional, List, Union
+
+from databricks.sdk.errors import DeadlineExceeded
 from databricks.sdk.service.sql import (
     State, EndpointInfo,
-    EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
-    GetWarehouseResponse, GetWarehouseResponseWarehouseType,
     Disposition, Format,
     ExecuteStatementRequestOnWaitTimeout, StatementParameterListItem,
-    WarehouseAccessControlRequest, WarehousePermissionLevel
+    WarehouseAccessControlRequest,
 )
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
+from .service import (
+    Warehouses,
+    DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
+    DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+    _EDIT_ARG_NAMES,
+    _jitter_sleep_seconds,
+    safeEndpointInfo,
+)
 from .statement_result import StatementResult
-from ..client import DatabricksService, DatabricksClient
-
-_CREATE_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
-_EDIT_ARG_NAMES = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
+from ..client import DatabricksResource
 
 __all__ = [
     "SQLWarehouse",
     "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
-    "DEFAULT_ALL_PURPOSE_CLASSIC_NAME"
+    "DEFAULT_ALL_PURPOSE_CLASSIC_NAME",
 ]
 
-
 LOGGER = logging.getLogger(__name__)
-CACHE_MAP: dict[str, ExpiringDict[str, "SQLWarehouse"]] = {}
-T = TypeVar("T")
 
 
-def safeGetWarehouseResponse(src: Union[GetWarehouseResponse, EndpointInfo]) -> GetWarehouseResponse:
-    if isinstance(src, GetWarehouseResponse):
-        return src
+@dc.dataclass
+class SQLWarehouse(DatabricksResource):
+    """
+    High-level Databricks SQL Warehouse resource.
 
-    payload = _copy_common_fields(src, GetWarehouseResponse, skip={"warehouse_type"})
+    Parameters
+    ----------
+    service:
+        Parent :class:`~yggdrasil.databricks.sql.service.Warehouses` service.
+    warehouse_id:
+        Databricks warehouse id.
+    warehouse_name:
+        Warehouse display name.  When provided without ``warehouse_id`` the
+        warehouse is resolved by name during construction.
 
-    payload["warehouse_type"] = _safe_map_enum(
-        GetWarehouseResponseWarehouseType,
-        getattr(src, "warehouse_type", None),
+    Notes
+    -----
+    ``SQLWarehouse`` caches ``EndpointInfo`` details and refreshes them
+    lazily.  Use :meth:`refresh` to force a reload.
+    """
+
+    service: Warehouses = dc.field(
+        default_factory=Warehouses.current,
+        repr=False,
+        compare=False,
     )
-
-    return GetWarehouseResponse(**payload)
-
-
-def safeEndpointInfo(src: Union[GetWarehouseResponse, EndpointInfo]) -> EndpointInfo:
-    if isinstance(src, EndpointInfo):
-        return src
-
-    payload = _copy_common_fields(src, EndpointInfo, skip={"warehouse_type"})
-
-    payload["warehouse_type"] = _safe_map_enum(
-        EndpointInfoWarehouseType,
-        getattr(src, "warehouse_type", None),
-    )
-
-    return EndpointInfo(**payload)
-
-
-def set_cached_warehouse(
-    client: DatabricksClient,
-    warehouse: "SQLWarehouse"
-) -> None:
-    host = client.base_url.to_string()
-    existing = CACHE_MAP.get(host)
-
-    if existing is None:
-        existing = CACHE_MAP[host] = ExpiringDict(default_ttl=3600)
-
-    existing[warehouse.warehouse_name] = warehouse
-
-
-def get_cached_warehouse(
-    client: DatabricksClient,
-    warehouse_name: str,
-) -> Optional["SQLWarehouse"]:
-    host = client.base_url.to_string()
-    existing = CACHE_MAP.get(host)
-
-    return existing.get(warehouse_name) if existing else None
-
-
-
-def _safe_map_enum(dst_enum: Type[T], src_val: Any) -> Optional[T]:
-    """
-    Best-effort mapping:
-      - if src_val is already a dst_enum member -> return it
-      - try dst_enum(src_val) for value-based enums
-      - try dst_enum(src_val.value) if src is enum-like
-      - try dst_enum[src_val.name] if src is enum-like
-      - try dst_enum[str(src_val)] as a last resort
-    If nothing works -> None
-    """
-    if src_val is None:
-        return None
-
-    # already the right type
-    if isinstance(src_val, dst_enum):
-        return src_val
-
-    # direct constructor (works if src_val is value-compatible)
-    try:
-        return dst_enum(src_val)  # type: ignore[misc]
-    except Exception:
-        pass
-
-    # enum-like: .value
-    try:
-        return dst_enum(src_val.value)  # type: ignore[misc]
-    except Exception:
-        pass
-
-    # enum-like: .name
-    try:
-        return dst_enum[src_val.name]  # type: ignore[index]
-    except Exception:
-        pass
-
-    # string fallback
-    try:
-        return dst_enum(str(src_val))  # type: ignore[misc]
-    except Exception:
-        return None
-
-
-def _copy_common_fields(src: Any, dst_cls: Type[T], *, skip: set[str] = frozenset()) -> dict:
-    dst_field_names = {f.name for f in dc.fields(dst_cls)}
-    payload = {}
-    for name in dst_field_names:
-        if name in skip:
-            continue
-        payload[name] = getattr(src, name, None)
-    return payload
-
-
-def _jitter_sleep_seconds(
-    wait: WaitingConfig,
-    *,
-    iteration: int,
-    remaining: Optional[float],
-) -> float:
-    """
-    Exponential backoff with jitter, capped by remaining deadline.
-
-    - base interval comes from wait.interval
-    - backoff factor comes from wait.backoff
-    - max_interval caps the pre-jitter delay
-    - jitter uses full jitter in [0, delay]
-    """
-    base = float(wait.interval or 1.0)
-    backoff = max(float(wait.backoff or 1.0), 1.0)
-
-    delay = base * (backoff ** iteration)
-
-    if wait.max_interval:
-        delay = min(delay, float(wait.max_interval))
-
-    # Full jitter: random sleep in [0, delay]
-    delay = random.uniform(0.0, delay)
-
-    if remaining is not None:
-        delay = min(delay, max(0.0, remaining))
-
-    return max(0.0, delay)
-
-
-@dc.dataclass(frozen=True)
-class SQLWarehouse(DatabricksService):
     warehouse_id: Optional[str] = None
     warehouse_name: Optional[str] = None
 
-    _details: Optional[EndpointInfo] = dc.field(default=None, repr=False, hash=False, compare=False)
+    _details: Optional[EndpointInfo] = dc.field(
+        default=None, repr=False, hash=False, compare=False,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        if self.warehouse_name and not self.warehouse_id:
+            found = self.service.find_warehouse(warehouse_name=self.warehouse_name)
+            object.__setattr__(self, "warehouse_id", found.warehouse_id)
+            object.__setattr__(self, "warehouse_name", found.warehouse_name)
+            object.__setattr__(self, "_details", found._details)
 
     def __call__(
         self,
         *,
         warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None
-    ):
+        warehouse_name: Optional[str] = None,
+    ) -> "SQLWarehouse":
         if not warehouse_id and not warehouse_name:
             return self
-
         if warehouse_id == self.warehouse_id or warehouse_name == self.warehouse_name:
             return self
-
-        return self.find_warehouse(
+        return self.service.find_warehouse(
             warehouse_id=warehouse_id,
             warehouse_name=warehouse_name,
-            raise_error=True
+            raise_error=True,
         )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"warehouse_name={self.warehouse_name!r}, "
+            f"warehouse_id={self.warehouse_id!r})"
+        )
 
-        if self.warehouse_name and not self.warehouse_id:
-            found = self.find_warehouse(warehouse_name=self.warehouse_name)
-
-            object.__setattr__(self, "warehouse_id", found.warehouse_id)
-            object.__setattr__(self, "warehouse_name", found.warehouse_name)
-            object.__setattr__(self, "_details", found._details)
-
-    @classmethod
-    def service_name(cls):
-        return "sqlwh"
+    # ------------------------------------------------------------------ #
+    # Details caching and state
+    # ------------------------------------------------------------------ #
 
     @property
     def details(self) -> EndpointInfo:
+        """Return cached warehouse details, fetching them lazily if needed."""
         if self._details is None:
             self.refresh()
         return self._details
 
     def latest_details(self):
+        """Return freshly fetched warehouse details from the API."""
         return self.client.workspace_client().warehouses.get(id=self.warehouse_id)
 
-    def refresh(self):
+    def refresh(self) -> "SQLWarehouse":
+        """Refresh cached details from the API and return self."""
         checked = safeEndpointInfo(self.latest_details())
         object.__setattr__(self, "_details", checked)
         return self
 
     @property
     def state(self):
+        """Return the current warehouse state (always hits the API)."""
         return self.latest_details().state
 
     @property
-    def is_serverless(self):
+    def is_serverless(self) -> bool:
         return self.details.enable_serverless_compute
 
     @property
-    def is_running(self):
+    def is_running(self) -> bool:
         return self.state == State.RUNNING
 
     @property
-    def is_pending(self):
-        return self.state in {
-            State.DELETING, State.STARTING, State.STOPPING
-        }
+    def is_pending(self) -> bool:
+        return self.state in {State.DELETING, State.STARTING, State.STOPPING}
 
-    def wait_for_status(
-        self,
-        wait: WaitingConfigArg = None
-    ):
-        """
-        Polls until not pending, using wait.sleep(iteration, start).
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
 
-        WaitingConfig:
-          - timeout: total wall-clock seconds (0 => no timeout)
-          - interval: base sleep seconds (0 => busy/no-sleep)
-          - backoff: exponential factor (>= 1)
-          - max_interval: cap for sleep seconds (0 => no cap)
-
-        Returns self.
-        """
+    def wait_for_status(self, wait: WaitingConfigArg = None) -> "SQLWarehouse":
+        """Poll until the warehouse leaves any pending state."""
         wait = WaitingConfig.default() if wait is None else WaitingConfig.check_arg(wait)
 
         start = time.time()
@@ -282,8 +187,9 @@ class SQLWarehouse(DatabricksService):
     def start(
         self,
         wait: WaitingConfigArg = True,
-        raise_error: bool = True
-    ):
+        raise_error: bool = True,
+    ) -> "SQLWarehouse":
+        """Start the warehouse if it is not already running."""
         client = self.client.workspace_client().warehouses
 
         if self.warehouse_id:
@@ -315,6 +221,7 @@ class SQLWarehouse(DatabricksService):
         return self
 
     def stop(self):
+        """Stop the warehouse if it is running."""
         if self.is_running:
             LOGGER.debug(
                 "Stopping warehouse %s (%s)",
@@ -329,358 +236,34 @@ class SQLWarehouse(DatabricksService):
             return result
         return self
 
-    def find_warehouse(
-        self,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
-        find_default: bool = False,
-        raise_error: bool = True,
-    ):
-        if warehouse_id:
-            if warehouse_id == self.warehouse_id:
-                LOGGER.debug("find_warehouse: cache hit id=%s", warehouse_id)
-                return self
-
-            LOGGER.debug("find_warehouse: resolving by id=%s", warehouse_id)
-            return SQLWarehouse(
-                client=self.client,
-                warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name
+    def delete(self) -> None:
+        """Delete the warehouse."""
+        if self.warehouse_id:
+            LOGGER.debug(
+                "Deleting warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
             )
-        elif warehouse_name:
-            warehouse_name = warehouse_name or self.warehouse_name
-
-            cached = get_cached_warehouse(
-                client=self.client,
-                warehouse_name=warehouse_name
+            self.client.workspace_client().warehouses.delete(id=self.warehouse_id)
+            LOGGER.info(
+                "Deleted warehouse %s (%s)",
+                self.warehouse_name, self.warehouse_id,
             )
 
-            if cached is not None:
-                LOGGER.debug("find_warehouse: cache hit name=%r id=%s", warehouse_name, cached.warehouse_id)
-                return cached
-
-            LOGGER.debug("find_warehouse: listing warehouses to resolve name=%r", warehouse_name)
-            for warehouse in self.list_warehouses():
-                if warehouse.warehouse_name == warehouse_name:
-                    set_cached_warehouse(
-                        client=self.client,
-                        warehouse=warehouse
-                    )
-
-                    if warehouse_name == self.warehouse_name:
-                        object.__setattr__(self, "warehouse_id", warehouse.warehouse_id)
-                        object.__setattr__(self, "_details", warehouse._details)
-                        return self
-
-                    return warehouse
-
-            LOGGER.warning("find_warehouse: warehouse %r not found", warehouse_name)
-            if raise_error:
-                raise ResourceDoesNotExist(
-                    f"Cannot find SQL warehouse {warehouse_name!r}"
-                )
-
-            return None
-        elif self.warehouse_id:
-            return self
-        elif self.warehouse_name:
-            return self.find_warehouse(
-                warehouse_name=self.warehouse_name,
-                raise_error=raise_error,
-                find_default=False
-            )
-
-        if find_default:
-            return self.find_default(raise_error=raise_error)
-        if raise_error:
-            raise ResourceDoesNotExist(
-                f"Cannot find SQL warehouse, no parameters given"
-            )
-        return None
-
-    def find_default(self, raise_error: bool = True):
-        classic = get_cached_warehouse(
-            client=self.client,
-            warehouse_name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME
-        )
-
-        if classic is not None:
-            if classic.state not in {State.RUNNING, State.STARTING, State.STOPPING}:
-                classic.start(wait=False, raise_error=False)
-            else:
-                return classic
-
-        serverless = get_cached_warehouse(
-            client=self.client,
-            warehouse_name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
-        )
-
-        if serverless is not None:
-            return serverless
-
-        first_found = None
-
-        for warehouse in self.list_warehouses():
-            if first_found is None:
-                first_found = warehouse
-
-            if warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
-                classic = warehouse
-
-                set_cached_warehouse(
-                    client=self.client,
-                    warehouse=classic
-                )
-
-                if classic._details.state == State.RUNNING:
-                    return classic
-                elif classic._details.state != State.STARTING:
-                    classic.start(wait=False, raise_error=False)
-
-                if serverless is not None:
-                    return serverless
-            elif warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
-                serverless = warehouse
-
-                set_cached_warehouse(
-                    client=self.client,
-                    warehouse=serverless
-                )
-
-                if classic is not None:
-                    return serverless
-
-        if serverless is None:
-            try:
-                created = self.create(
-                    name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
-                    permissions=["users"],
-                )
-
-                set_cached_warehouse(client=self.client, warehouse=created)
-
-                return created
-            except:
-                pass
-
-        if classic is None:
-            Job.make(
-                self.create,
-                name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
-                permissions=["users"],
-            ).fire_and_forget()
-
-        if serverless is not None:
-            return serverless
-
-        if first_found is not None:
-            return first_found
-
-        if raise_error:
-            raise ResourceDoesNotExist(
-                f"Cannot find default SQL warehouse, no parameters given"
-            )
-
-        return self.create_or_update(
-            name=self.warehouse_name or DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
-            permissions=["users"]
-        )
-
-    def list_warehouses(self):
-        client = self.client.workspace_client().warehouses
-
-        for info in client.list():
-            warehouse = SQLWarehouse(
-                client=self.client,
-                warehouse_id=info.id,
-                warehouse_name=info.name,
-            )
-
-            object.__setattr__(warehouse, "_details", safeEndpointInfo(info))
-
-            yield warehouse
-
-    def _check_details(
-        self,
-        keys: Sequence[str],
-        update: bool,
-        details: Optional[EndpointInfo] = None,
-        **warehouse_specs
-    ):
-        if details is None:
-            details = EndpointInfo(**{
-                k: v
-                for k, v in warehouse_specs.items()
-                if k in keys
-            })
-        else:
-            kwargs = {
-                **details.as_shallow_dict(),
-                **warehouse_specs
-            }
-
-            details = EndpointInfo(
-                **{
-                    k: v
-                    for k, v in kwargs.items()
-                    if k in keys
-                },
-            )
-
-        if details.cluster_size is None:
-            details.cluster_size = "Small"
-
-        if details.warehouse_type is None:
-            details.warehouse_type = EndpointInfoWarehouseType.PRO
-
-        if not details.name:
-            if details.enable_serverless_compute:
-                details.name = DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
-            else:
-                details.name = DEFAULT_ALL_PURPOSE_CLASSIC_NAME
-
-        if details.enable_serverless_compute is None:
-            if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
-                details.enable_serverless_compute = False
-            elif details.name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
-                details.enable_serverless_compute = True
-            else:
-                details.enable_serverless_compute = "verless" in details.name.lower()
-
-        if details.enable_serverless_compute:
-            details.warehouse_type = EndpointInfoWarehouseType.PRO
-
-        if not details.auto_stop_mins:
-            if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
-                details.auto_stop_mins = 30
-
-        default_tags = self.client.default_tags(update=update)
-
-        if details.tags is None:
-            details.tags = EndpointTags(custom_tags=[
-                EndpointTagPair(key=k, value=v)
-                for k, v in default_tags.items()
-            ])
-        else:
-            tags = {
-                pair.key: pair.value
-                for pair in details.tags.custom_tags
-            }
-
-            tags.update(default_tags)
-
-        if details.tags is not None and not isinstance(details.tags, EndpointTags):
-            details.tags = EndpointTags(custom_tags=[
-                EndpointTagPair(key=k, value=v)
-                for k, v in default_tags.items()
-            ])
-
-        if not details.max_num_clusters:
-            details.max_num_clusters = 8
-
-        return details
-
-    def create_or_update(
-        self,
-        warehouse_id: Optional[str] = None,
-        name: Optional[str] = None,
-        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
-        wait: Optional[WaitingConfig] = None,
-        **warehouse_specs
-    ):
-        name = name or self.warehouse_name
-        found = self.find_warehouse(
-            warehouse_id=warehouse_id,
-            warehouse_name=name,
-            raise_error=False,
-        )
-
-        if found is not None:
-            LOGGER.debug("create_or_update: updating existing warehouse %r (%s)", name, found.warehouse_id)
-            return found.update(
-                name=name,
-                permissions=permissions,
-                wait=wait,
-                **warehouse_specs
-            )
-
-        LOGGER.debug("create_or_update: warehouse %r not found — creating", name)
-        return self.create(
-            name=name,
-            permissions=permissions,
-            wait=wait,
-            **warehouse_specs
-        )
-
-    def create(
-        self,
-        name: Optional[str] = None,
-        *,
-        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
-        wait: WaitingConfigArg = None,
-        **warehouse_specs
-    ):
-        client = self.client.workspace_client().warehouses
-        name = name or self.warehouse_name
-        wait = WaitingConfig.check_arg(wait)
-
-        details = self._check_details(
-            keys=_CREATE_ARG_NAMES,
-            update=False,
-            name=name,
-            **warehouse_specs
-        )
-
-        LOGGER.debug(
-            "Creating warehouse name=%r serverless=%s cluster_size=%s",
-            details.name,
-            details.enable_serverless_compute,
-            details.cluster_size,
-        )
-
-        update_details = {
-            k: v
-            for k, v in details.as_shallow_dict().items()
-            if k in _CREATE_ARG_NAMES
-        }
-
-        if wait or permissions:
-            info = client.create_and_wait(
-                timeout=wait.timeout_timedelta,
-                **update_details
-            )
-        else:
-            info = client.create(**update_details)
-
-            update_details["id"] = info.response.id
-
-            info = EndpointInfo(**update_details)
-
-        self.update_permissions(permissions=permissions, wait=wait)
-
-        created = SQLWarehouse(
-            client=self.client,
-            warehouse_id=info.id,
-            warehouse_name=info.name,
-            _details=info
-        )
-
-        LOGGER.info(
-            "Created warehouse %r (%s) serverless=%s",
-            created.warehouse_name, created.warehouse_id,
-            details.enable_serverless_compute,
-        )
-
-        return created
+    # ------------------------------------------------------------------ #
+    # Update
+    # ------------------------------------------------------------------ #
 
     def update(
         self,
         wait: WaitingConfigArg = None,
-        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
-        **warehouse_specs
-    ):
+        permissions: Optional[List[Union[WarehouseAccessControlRequest, str]]] = None,
+        **warehouse_specs,
+    ) -> "SQLWarehouse":
+        """Apply spec changes to this warehouse, skipping the API when already up-to-date."""
         if not warehouse_specs:
-            LOGGER.debug("update: no specs provided for %s — skipping", self.warehouse_name)
+            LOGGER.debug(
+                "update: no specs provided for %s — skipping", self.warehouse_name,
+            )
             return self
 
         wait = WaitingConfig.check_arg(wait)
@@ -694,11 +277,11 @@ class SQLWarehouse(DatabricksService):
         update_details = {
             k: v
             for k, v in (
-                self._check_details(
+                self.service._check_details(
                     details=self.details,
                     update=True,
                     keys=_EDIT_ARG_NAMES,
-                    **warehouse_specs
+                    **warehouse_specs,
                 )
                 .as_shallow_dict()
                 .items()
@@ -706,11 +289,7 @@ class SQLWarehouse(DatabricksService):
             if k in _EDIT_ARG_NAMES
         }
 
-        same = dicts_equal(
-            existing_details,
-            update_details,
-            keys=_EDIT_ARG_NAMES,
-        )
+        same = dicts_equal(existing_details, update_details, keys=_EDIT_ARG_NAMES)
 
         if not same:
             LOGGER.debug(
@@ -718,18 +297,15 @@ class SQLWarehouse(DatabricksService):
                 self.warehouse_name, self.warehouse_id, update_details,
             )
 
-            client = self.client.workspace_client().warehouses
+            sdk_client = self.client.workspace_client().warehouses
 
             if wait.timeout:
-                new_details = (
-                    client
-                    .edit_and_wait(
-                        timeout=wait.timeout_timedelta,
-                        **update_details
-                    )
+                new_details = sdk_client.edit_and_wait(
+                    timeout=wait.timeout_timedelta,
+                    **update_details,
                 )
             else:
-                _ = client.edit(**update_details)
+                _ = sdk_client.edit(**update_details)
                 new_details = EndpointInfo(**update_details)
 
             object.__setattr__(self, "_details", safeEndpointInfo(new_details))
@@ -739,77 +315,57 @@ class SQLWarehouse(DatabricksService):
                 self.warehouse_name, self.warehouse_id,
             )
 
-        self.update_permissions(permissions=permissions, wait=wait)
+        if permissions:
+            self.update_permissions(permissions=permissions, wait=wait)
 
         LOGGER.info("Updated warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
-
         return self
+
+    # ------------------------------------------------------------------ #
+    # Permissions
+    # ------------------------------------------------------------------ #
 
     def update_permissions(
         self,
-        permissions: Optional[List[WarehouseAccessControlRequest | str]] = None,
+        permissions: Optional[List[Union[WarehouseAccessControlRequest, str]]] = None,
         *,
         wait: WaitingConfigArg = True,
-        warehouse_id: Optional[str] = None
-    ):
-        client = self.client.workspace_client().warehouses
+        warehouse_id: Optional[str] = None,
+    ) -> "SQLWarehouse":
+        """Apply ACL entries to this warehouse."""
+        sdk_client = self.client.workspace_client().warehouses
         warehouse_id = warehouse_id or self.warehouse_id
 
-        permissions = [
-            self.check_permission(_)
-            for _ in permissions
+        checked = [
+            self.service.check_permission(p)
+            for p in permissions
         ] if permissions else []
 
-        if permissions and warehouse_id:
+        if checked and warehouse_id:
             if wait:
-                client.update_permissions(
+                sdk_client.update_permissions(
                     warehouse_id=warehouse_id,
-                    access_control_list=permissions
+                    access_control_list=checked,
                 )
             else:
                 Job.make(
-                    client.update_permissions,
+                    sdk_client.update_permissions,
                     warehouse_id=warehouse_id,
-                    access_control_list=permissions
+                    access_control_list=checked,
                 ).fire_and_forget()
 
         return self
 
     @staticmethod
     def check_permission(
-        permission: WarehouseAccessControlRequest | str
-    ):
-        if isinstance(permission, str):
-            if permission == "users":
-                return WarehouseAccessControlRequest(
-                    group_name=permission,
-                    permission_level=WarehousePermissionLevel.CAN_USE
-                )
-            elif "@" in permission:
-                return WarehouseAccessControlRequest(
-                    user_name=permission,
-                    permission_level=WarehousePermissionLevel.CAN_USE
-                )
-            else:
-                return WarehouseAccessControlRequest(
-                    group_name=permission,
-                    permission_level=WarehousePermissionLevel.CAN_MANAGE
-                )
+        permission: Union[WarehouseAccessControlRequest, str],
+    ) -> WarehouseAccessControlRequest:
+        """Delegate to :meth:`Warehouses.check_permission` (kept for back-compat)."""
+        return Warehouses.check_permission(permission)
 
-        return permission
-
-    def delete(self):
-        if self.warehouse_id:
-            LOGGER.debug(
-                "Deleting warehouse %s (%s)",
-                self.warehouse_name, self.warehouse_id,
-            )
-            client = self.client.workspace_client().warehouses
-            client.delete(id=self.warehouse_id)
-            LOGGER.info(
-                "Deleted warehouse %s (%s)",
-                self.warehouse_name, self.warehouse_id,
-            )
+    # ------------------------------------------------------------------ #
+    # SQL execution
+    # ------------------------------------------------------------------ #
 
     def execute(
         self,
@@ -830,6 +386,7 @@ class SQLWarehouse(DatabricksService):
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
     ) -> StatementResult:
+        """Execute a SQL statement on this (or another) warehouse."""
         if format is None:
             format = Format.ARROW_STREAM
 
@@ -850,16 +407,21 @@ class SQLWarehouse(DatabricksService):
         else:
             submit_wait = WaitingConfig.check_arg(submit_wait)
 
-        instance = self.find_warehouse(
-            warehouse_id=warehouse_id,
-            warehouse_name=warehouse_name
-        )
-        warehouse_id = warehouse_id or instance.warehouse_id
-        client = instance.client.workspace_client().statement_execution
+        # Resolve the target warehouse (self by default)
+        if warehouse_id or warehouse_name:
+            instance = self.service.find_warehouse(
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name,
+            )
+        else:
+            instance = self
+
+        resolved_wh_id = warehouse_id or instance.warehouse_id
+        sdk_client = instance.client.workspace_client().statement_execution
 
         LOGGER.debug(
             "Executing SQL on warehouse %s (%s):\n%s",
-            instance.warehouse_name, warehouse_id, statement,
+            instance.warehouse_name, resolved_wh_id, statement,
         )
 
         started_at = time.monotonic()
@@ -874,9 +436,9 @@ class SQLWarehouse(DatabricksService):
 
         while True:
             try:
-                response = client.execute_statement(
+                response = sdk_client.execute_statement(
                     statement=statement,
-                    warehouse_id=warehouse_id,
+                    warehouse_id=resolved_wh_id,
                     byte_limit=byte_limit,
                     disposition=disposition,
                     format=format,
@@ -890,31 +452,29 @@ class SQLWarehouse(DatabricksService):
                 break
 
             except DeadlineExceeded:
-                remaining = None if deadline is None else (deadline - time.monotonic())
+                remaining = (
+                    None if deadline is None
+                    else (deadline - time.monotonic())
+                )
 
                 if remaining is not None and remaining <= 0:
                     LOGGER.error(
-                        "Submit deadline exceeded for warehouse %s (%s) after %.2fs and %d retries",
-                        instance.warehouse_name,
-                        warehouse_id,
-                        time.monotonic() - started_at,
-                        iteration,
+                        "Submit deadline exceeded for warehouse %s (%s) "
+                        "after %.2fs and %d retries",
+                        instance.warehouse_name, resolved_wh_id,
+                        time.monotonic() - started_at, iteration,
                     )
                     raise
 
                 sleep_for = _jitter_sleep_seconds(
-                    submit_wait,
-                    iteration=iteration,
-                    remaining=remaining,
+                    submit_wait, iteration=iteration, remaining=remaining,
                 )
 
                 LOGGER.warning(
                     "Warehouse %s (%s) is busy; execute submit hit DeadlineExceeded. "
                     "Retrying in %.2fs (attempt=%d)",
-                    instance.warehouse_name,
-                    warehouse_id,
-                    sleep_for,
-                    iteration + 1,
+                    instance.warehouse_name, resolved_wh_id,
+                    sleep_for, iteration + 1,
                 )
 
                 if sleep_for > 0:
@@ -924,7 +484,7 @@ class SQLWarehouse(DatabricksService):
 
         execution = StatementResult(
             client=self.client,
-            warehouse_id=warehouse_id,
+            warehouse_id=resolved_wh_id,
             statement_id=response.statement_id,
             disposition=disposition,
             _response=response,
@@ -932,11 +492,8 @@ class SQLWarehouse(DatabricksService):
 
         LOGGER.info(
             "Executed SQL statement_id=%s on warehouse %s (%s)",
-            execution.statement_id, instance.warehouse_name, warehouse_id,
+            execution.statement_id, instance.warehouse_name, resolved_wh_id,
         )
 
         return execution.wait(wait=wait, raise_error=raise_error)
 
-
-DEFAULT_ALL_PURPOSE_CLASSIC_NAME = "Yggdrasil All Purpose"
-DEFAULT_ALL_PURPOSE_SERVERLESS_NAME = DEFAULT_ALL_PURPOSE_CLASSIC_NAME + " Serverless"
