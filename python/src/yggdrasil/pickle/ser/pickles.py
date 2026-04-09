@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
 from yggdrasil.pickle.ser.libs import (
-    _dump_object_state,
     _module_cache_get_or_load,
     _resolve_qualname,
     _restore_object_state,
@@ -25,7 +24,8 @@ __all__ = [
 ]
 
 
-_GENERIC_OBJECT_VERSION = 1
+_GENERIC_OBJECT_VERSION = 1   # legacy v1: (ver, module, qualname, new_args, new_kwargs, state)
+_GENERIC_OBJECT_V2 = 2        # v2: (ver, fn_module, fn_qualname, args_bytes, state_bytes, list_bytes, dict_bytes)
 _RESOURCE_VERSION = 1
 _RESOURCE_LOCK = "thread_lock"
 _RESOURCE_RLOCK = "thread_rlock"
@@ -124,9 +124,18 @@ class GenericObjectSerialized(Serialized[Any]):
     """
     Structured fallback for importable Python objects.
 
-    Unlike pickle opcode streams, this stores class identity + constructor args
-    + object state using existing ygg nested serializations, which is generally
-    more robust across Python runtime versions.
+    Uses the standard ``__reduce_ex__`` protocol (v2 payload) so C-extension
+    and Cython types that supply custom ``__reduce__`` implementations (e.g.
+    ``pandas.Timestamp``) are handled correctly.
+
+    Payload versions
+    ----------------
+    v1 (legacy): (version, module, qualname, new_args, new_kwargs, state_payload)
+        Written by old code; still decoded on load.
+    v2 (current): (version, fn_module, fn_qualname, args_bytes,
+                   state_bytes, list_bytes, dict_bytes)
+        Stores the reduction callable by module+qualname and the args/state as
+        inner pickle blobs so class references embedded in args survive intact.
     """
 
     TAG: ClassVar[int] = Tags.GENERIC_OBJECT
@@ -134,30 +143,80 @@ class GenericObjectSerialized(Serialized[Any]):
     def loads(self) -> Any:
         payload = pickle.loads(self.decode())
 
-        if not isinstance(payload, tuple) or len(payload) != 6:
-            raise TypeError("Generic object payload must be a 6-item tuple")
+        if not isinstance(payload, tuple) or len(payload) not in (6, 7):
+            raise TypeError(
+                f"Generic object payload must be a 6- or 7-item tuple, got {len(payload)}"
+            )
 
-        version, module_name, qualname, new_args, new_kwargs, state_payload = payload
-        if version != _GENERIC_OBJECT_VERSION:
-            raise ValueError(f"Unsupported generic object payload version: {version!r}")
-        if not isinstance(module_name, str) or not isinstance(qualname, str):
-            raise TypeError("Generic object payload module/qualname must be strings")
-        if not isinstance(new_args, tuple):
-            raise TypeError("Generic object payload new_args must be a tuple")
-        if not isinstance(new_kwargs, dict):
-            raise TypeError("Generic object payload new_kwargs must be a dict")
+        version = payload[0]
 
-        klass = _resolve_qualname(_module_cache_get_or_load(module_name), qualname)
-        if not isinstance(klass, type):
-            raise TypeError("Generic object payload class reference did not resolve to a type")
+        # ------------------------------------------------------------------
+        # v1 legacy path
+        # ------------------------------------------------------------------
+        if version == _GENERIC_OBJECT_VERSION:
+            _, module_name, qualname, new_args, new_kwargs, state_payload = payload
+            if not isinstance(module_name, str) or not isinstance(qualname, str):
+                raise TypeError("Generic object payload module/qualname must be strings")
+            if not isinstance(new_args, tuple):
+                raise TypeError("Generic object payload new_args must be a tuple")
+            if not isinstance(new_kwargs, dict):
+                raise TypeError("Generic object payload new_kwargs must be a dict")
 
-        try:
-            obj = klass.__new__(klass, *new_args, **new_kwargs)
-        except Exception:
-            obj = klass.__new__(klass)
+            klass = _resolve_qualname(_module_cache_get_or_load(module_name), qualname)
+            if not isinstance(klass, type):
+                raise TypeError(
+                    "Generic object payload class reference did not resolve to a type"
+                )
 
-        _restore_object_state(obj, state_payload)
-        return obj
+            try:
+                obj = klass.__new__(klass, *new_args, **new_kwargs)
+            except Exception:
+                obj = klass.__new__(klass)
+
+            _restore_object_state(obj, state_payload)
+            return obj
+
+        # ------------------------------------------------------------------
+        # v2 reduce-based path
+        # ------------------------------------------------------------------
+        if version == _GENERIC_OBJECT_V2:
+            if len(payload) != 7:
+                raise TypeError("V2 generic object payload must have 7 items")
+            _, fn_module, fn_qualname, args_bytes, state_bytes, list_bytes, dict_bytes = payload
+
+            fn = _resolve_qualname(_module_cache_get_or_load(fn_module), fn_qualname)
+            reduce_args = pickle.loads(args_bytes)
+            obj = fn(*reduce_args)
+
+            if state_bytes is not None:
+                state = pickle.loads(state_bytes)
+                if state is not None:
+                    if hasattr(obj, "__setstate__"):
+                        obj.__setstate__(state)
+                    elif isinstance(state, dict):
+                        try:
+                            obj.__dict__.update(state)
+                        except AttributeError:
+                            for k, v in state.items():
+                                try:
+                                    object.__setattr__(obj, k, v)
+                                except Exception:
+                                    pass
+
+            if list_bytes is not None:
+                items = pickle.loads(list_bytes)
+                if items is not None:
+                    for item in items:
+                        obj.append(item)  # type: ignore[union-attr]
+
+            if dict_bytes is not None:
+                items = pickle.loads(dict_bytes)
+                if items is not None:
+                    obj.update(items)  # type: ignore[union-attr]
+
+            return obj
+
+        raise ValueError(f"Unsupported generic object payload version: {version!r}")
 
     @property
     def value(self) -> Any:
@@ -181,40 +240,50 @@ class GenericObjectSerialized(Serialized[Any]):
         if not module_name or not qualname or "<locals>" in qualname:
             return None
 
-        # Typing constructs (TypeVar, ParamSpec, TypeVarTuple, …) use __reduce__
-        # for pickling and their C-level __new__ requires positional arguments
-        # that are not exposed via __getnewargs__/__getnewargs_ex__.  Let them
-        # fall through to PickleSerialized which calls pickle.dumps directly.
+        # Typing constructs (TypeVar, ParamSpec, …) use __reduce__ for pickling
+        # but their C-level __new__ is not generally reconstructable this way.
         if module_name in ("typing", "typing_extensions"):
             return None
 
         try:
-            new_args: tuple[object, ...] = ()
-            new_kwargs: dict[str, object] = {}
+            rv = obj.__reduce_ex__(4)  # type: ignore[union-attr]
+        except Exception:
+            return None
 
-            if hasattr(obj, "__getnewargs_ex__"):
-                args_ex = obj.__getnewargs_ex__()
-                if (
-                    isinstance(args_ex, tuple)
-                    and len(args_ex) == 2
-                    and isinstance(args_ex[0], tuple)
-                    and isinstance(args_ex[1], dict)
-                ):
-                    new_args = args_ex[0]
-                    new_kwargs = args_ex[1]
-            elif hasattr(obj, "__getnewargs__"):
-                args = obj.__getnewargs__()
-                if isinstance(args, tuple):
-                    new_args = args
+        # String result means "import this name" — not our job.
+        if isinstance(rv, str):
+            return None
 
-            state_payload = _dump_object_state(obj)
+        if not isinstance(rv, tuple) or len(rv) < 2:
+            return None
+
+        fn = rv[0]
+        reduce_args: tuple[object, ...] = rv[1] if rv[1] is not None else ()
+        state = rv[2] if len(rv) > 2 else None
+        # rv[3] / rv[4] are iterators for list/dict subclasses — consume eagerly
+        list_items = list(rv[3]) if len(rv) > 3 and rv[3] is not None else None
+        dict_items = list(rv[4]) if len(rv) > 4 and rv[4] is not None else None
+
+        fn_module = getattr(fn, "__module__", None)
+        fn_qualname = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+
+        if not fn_module or not fn_qualname or "<locals>" in fn_qualname:
+            return None
+
+        try:
+            args_bytes = pickle.dumps(reduce_args, protocol=4)
+            state_bytes = pickle.dumps(state, protocol=4) if state is not None else None
+            list_bytes = pickle.dumps(list_items, protocol=4) if list_items is not None else None
+            dict_bytes = pickle.dumps(dict_items, protocol=4) if dict_items is not None else None
+
             payload = (
-                _GENERIC_OBJECT_VERSION,
-                module_name,
-                qualname,
-                new_args,
-                new_kwargs,
-                state_payload,
+                _GENERIC_OBJECT_V2,
+                fn_module,
+                fn_qualname,
+                args_bytes,
+                state_bytes,
+                list_bytes,
+                dict_bytes,
             )
             data = pickle.dumps(payload, protocol=4)
             return Serialized.build(tag=cls.TAG, data=data, metadata=metadata, codec=codec)

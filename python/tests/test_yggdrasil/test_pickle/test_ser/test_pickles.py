@@ -4,6 +4,8 @@ import pickle
 import socket
 import threading
 
+import pandas
+
 from yggdrasil.pickle.ser.constants import CODEC_GZIP
 from yggdrasil.pickle.ser.pickles import (
     GenericObjectSerialized,
@@ -30,6 +32,18 @@ class _Point:
     def __setstate__(self, state):
         self.x = state["x"]
         self.y = state["y"]
+
+
+def test_pandas() -> None:
+    obj = pandas.Timestamp(year=1, month=1, day=1)
+    ser = Serialized.from_python_object(obj)
+
+    assert isinstance(ser, GenericObjectSerialized)
+    out = ser.as_python()
+    assert isinstance(out, pandas.Timestamp)
+    assert out.year == 1
+    assert out.month == 1
+    assert out.day == 1
 
 
 def test_generic_object_serialized_roundtrip() -> None:
