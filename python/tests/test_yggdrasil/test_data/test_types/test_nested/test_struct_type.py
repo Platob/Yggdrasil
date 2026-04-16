@@ -1114,3 +1114,254 @@ def test_struct_type_merge_with_same_id_raises_for_non_struct_type(
         left._merge_with_same_id(
             DataType.from_arrow_type(pa.int64()),
         )
+
+# ---------------------------------------------------------------------------
+# Construction / conversion surface
+# ---------------------------------------------------------------------------
+
+
+def test_struct_type_post_init_coerces_list_to_tuple(int64_type: IntegerType) -> None:
+    dtype = StructType(fields=[
+        Field(name="a", dtype=int64_type, nullable=True),
+        Field(name="b", dtype=int64_type, nullable=True),
+    ])
+
+    assert isinstance(dtype.fields, tuple)
+
+
+def test_struct_type_children_fields_mirror_fields(int64_type: IntegerType) -> None:
+    fields = (
+        Field(name="a", dtype=int64_type, nullable=True),
+        Field(name="b", dtype=int64_type, nullable=True),
+    )
+    dtype = StructType(fields=fields)
+
+    assert dtype.children_fields == dtype.fields
+
+
+def test_struct_type_handles_arrow_type() -> None:
+    assert StructType.handles_arrow_type(pa.struct([pa.field("a", pa.int64())])) is True
+    assert StructType.handles_arrow_type(pa.int64()) is False
+    assert StructType.handles_arrow_type(pa.list_(pa.int64())) is False
+
+
+def test_struct_type_from_arrow_type_rejects_non_struct() -> None:
+    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+        StructType.from_arrow_type(pa.int64())
+
+
+def test_struct_type_from_arrow_type_roundtrip(int64_type: IntegerType) -> None:
+    arrow_struct = pa.struct(
+        [
+            pa.field("x", pa.int64(), nullable=True),
+            pa.field("y", pa.string(), nullable=False),
+        ]
+    )
+
+    dtype = StructType.from_arrow_type(arrow_struct)
+
+    assert isinstance(dtype, StructType)
+    assert [f.name for f in dtype.fields] == ["x", "y"]
+    produced = dtype.to_arrow()
+    assert pa.types.is_struct(produced)
+    assert produced.num_fields == 2
+    assert produced.field(0).name == "x"
+    assert produced.field(1).name == "y"
+    assert produced.field(1).nullable is False
+
+
+def test_struct_type_handles_dict() -> None:
+    from yggdrasil.data.types.id import DataTypeId
+
+    assert StructType.handles_dict({"id": int(DataTypeId.STRUCT)}) is True
+    assert StructType.handles_dict({"name": "STRUCT"}) is True
+    assert StructType.handles_dict({"name": "struct"}) is True
+    assert StructType.handles_dict({"name": "ARRAY"}) is False
+
+
+def test_struct_type_from_dict_roundtrip(int64_type: IntegerType) -> None:
+    original = StructType(
+        fields=[
+            Field(name="a", dtype=int64_type, nullable=True),
+            Field(name="b", dtype=int64_type, nullable=False),
+        ]
+    )
+
+    rebuilt = StructType.from_dict(original.to_dict())
+
+    assert isinstance(rebuilt, StructType)
+    assert [f.name for f in rebuilt.fields] == ["a", "b"]
+    assert [f.nullable for f in rebuilt.fields] == [True, False]
+
+
+def test_struct_type_from_dict_empty_fields_returns_empty_struct() -> None:
+    rebuilt = StructType.from_dict({"name": "STRUCT"})
+
+    assert isinstance(rebuilt, StructType)
+    assert rebuilt.fields == ()
+
+
+def test_struct_type_to_dict_contains_fields(int64_type: IntegerType) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="a", dtype=int64_type, nullable=True),
+        ]
+    )
+
+    payload = dtype.to_dict()
+
+    assert payload["name"] == "STRUCT"
+    assert payload["fields"][0]["name"] == "a"
+
+
+def test_struct_type_default_pyobj_variants(int64_type: IntegerType) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="a", dtype=int64_type, nullable=True),
+            Field(name="b", dtype=int64_type, nullable=False),
+        ]
+    )
+
+    assert dtype.default_pyobj(nullable=True) is None
+
+    default = dtype.default_pyobj(nullable=False)
+    assert isinstance(default, dict)
+    assert set(default.keys()) == {"a", "b"}
+
+
+def test_struct_type_to_databricks_ddl_quotes_field_names(int64_type: IntegerType) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="plain", dtype=int64_type, nullable=True),
+        ]
+    )
+
+    ddl = dtype.to_databricks_ddl()
+
+    assert ddl.startswith("STRUCT<")
+    assert ddl.endswith(">")
+    assert "`plain`:" in ddl
+
+
+def test_struct_type_to_databricks_ddl_escapes_embedded_backticks(
+    int64_type: IntegerType,
+) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="we`ird", dtype=int64_type, nullable=True),
+        ]
+    )
+
+    ddl = dtype.to_databricks_ddl()
+
+    # Embedded backticks must be doubled (standard SQL-style escaping)
+    # so the quoted identifier survives parsing by Databricks/Spark.
+    assert "`we``ird`:" in ddl
+
+
+def test_struct_type_with_fields_not_inplace_returns_new_instance(
+    int64_type: IntegerType,
+) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="a", dtype=int64_type, nullable=True),
+        ]
+    )
+
+    replacement = [Field(name="b", dtype=int64_type, nullable=True)]
+
+    new_dtype = dtype.with_fields(replacement, safe=True, inplace=False)
+
+    assert new_dtype is not dtype
+    assert [f.name for f in dtype.fields] == ["a"]
+    assert [f.name for f in new_dtype.fields] == ["b"]
+
+
+def test_struct_type_with_fields_inplace_mutates(int64_type: IntegerType) -> None:
+    dtype = StructType(
+        fields=[
+            Field(name="a", dtype=int64_type, nullable=True),
+        ]
+    )
+
+    replacement = [Field(name="b", dtype=int64_type, nullable=True)]
+
+    same = dtype.with_fields(replacement, safe=True, inplace=True)
+
+    assert same is dtype
+    assert [f.name for f in dtype.fields] == ["b"]
+
+
+def test_struct_type_with_fields_non_safe_coerces_inputs(int64_type: IntegerType) -> None:
+    from yggdrasil.data.types.id import DataTypeId
+
+    dtype = StructType(fields=[])
+
+    dtype = dtype.with_fields(
+        [{"name": "a", "dtype": {"id": int(DataTypeId.INTEGER)}, "nullable": True}],
+        safe=False,
+        inplace=False,
+    )
+
+    assert len(dtype.fields) == 1
+    assert dtype.fields[0].name == "a"
+    assert dtype.fields[0].dtype.type_id == DataTypeId.INTEGER
+
+
+def test_struct_type_to_struct_returns_self_when_already_struct(
+    int64_type: IntegerType,
+) -> None:
+    dtype = StructType(
+        fields=[Field(name="a", dtype=int64_type, nullable=True)]
+    )
+
+    assert dtype.to_struct() is dtype
+
+
+def test_cast_arrow_struct_array_returns_original_when_target_is_none() -> None:
+    arrow_struct = pa.struct([pa.field("a", pa.int64())])
+    array = pa.array([{"a": 1}], type=arrow_struct)
+
+    source_field = Field(
+        name="src",
+        dtype=StructType(
+            fields=[
+                Field(name="a", dtype=IntegerType(byte_size=8, signed=True), nullable=True),
+            ]
+        ),
+        nullable=True,
+    )
+
+    options = CastOptions(source_field=source_field, target_field=None)
+
+    result = cast_arrow_struct_array(array, options)
+
+    assert result is array
+
+
+def test_cast_arrow_struct_array_rejects_non_struct_source() -> None:
+    array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
+
+    source_field = Field(
+        name="src",
+        dtype=ArrayType.from_item_field(
+            IntegerType(byte_size=8, signed=True).to_field(name="item"),
+            safe=True,
+        ),
+        nullable=True,
+    )
+
+    target_field = Field(
+        name="tgt",
+        dtype=StructType(
+            fields=[
+                Field(name="a", dtype=IntegerType(byte_size=8, signed=True), nullable=True),
+            ]
+        ),
+        nullable=True,
+    )
+
+    options = CastOptions(source_field=source_field, target_field=target_field)
+
+    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+        cast_arrow_struct_array(array, options)
