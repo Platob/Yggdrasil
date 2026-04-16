@@ -3,7 +3,7 @@
 Inner type: ``struct<lat: float64, lon: float64>``.
 
 Handles flexible input formats on cast:
-- struct arrays with lat/lon (or latitude/longitude) fields → passthrough
+- struct arrays with lat/lon (or latitude/longitude) fields -> passthrough
 - string arrays with coordinate pairs: ``"48.8566, 2.3522"``,
   ``"48.8566 2.3522"``, ``"48.8566|2.3522"``, ``"48.8566;2.3522"``
 - dict-like rows: ``{"lat": 48.8, "lon": 2.35}``
@@ -11,6 +11,9 @@ Handles flexible input formats on cast:
 
 When ``safe=False`` (default), unparseable values become null.
 When ``safe=True``, unparseable values raise ValueError.
+
+All bulk operations use vectorized Arrow compute — no Python iteration
+over array elements.
 
 Databricks DDL follows the native ``GEOGRAPHY`` type spec::
 
@@ -55,16 +58,16 @@ GEOGRAPHY_ARROW_TYPE: pa.DataType = pa.struct(
     ]
 )
 
-# Matches "lat, lon" / "lat lon" / "lat|lon" / "lat;lon" coordinate strings.
-_COORD_RE = re.compile(
-    r"^\s*"
-    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
-    r"\s*[,;|\s]\s*"
-    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
-    r"\s*$"
+# Arrow-compute regex that captures two decimal numbers separated by
+# comma, space, pipe, or semicolon.  Groups: (lat_str)(lon_str).
+_COORD_PATTERN = (
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*[,;| ]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
 )
 
-# Common field name aliases → canonical (lat, lon).
+# Python-side regex (same pattern, for convert_pyobj single-value path).
+_COORD_RE = re.compile(_COORD_PATTERN)
+
+# Field name aliases.
 _LAT_ALIASES = frozenset({"lat", "latitude", "LAT", "LATITUDE", "Lat", "Latitude"})
 _LON_ALIASES = frozenset(
     {
@@ -92,7 +95,7 @@ _LON_ALIASES = frozenset(
 def _normalize_srid(value: int | str | None) -> int | str:
     """Normalize an SRID value.
 
-    Accepts None (→ 4326), ints, numeric strings, ``"ANY"``,
+    Accepts None (-> 4326), ints, numeric strings, ``"ANY"``,
     or named CRS references like ``"OGC:CRS84"``.
     """
     if value is None:
@@ -118,20 +121,8 @@ def _normalize_srid(value: int | str | None) -> int | str:
 
 
 # ---------------------------------------------------------------------------
-# Coordinate parsing helpers
+# Struct field name resolution
 # ---------------------------------------------------------------------------
-
-
-def _parse_coord_string(s: str) -> tuple[float, float] | None:
-    """Try to parse ``"lat, lon"`` from a string. Returns None on failure."""
-    m = _COORD_RE.match(s)
-    if m is None:
-        return None
-    lat = float(m.group(1))
-    lon = float(m.group(2))
-    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
-        return (lat, lon)
-    return None
 
 
 def _resolve_struct_field_names(
@@ -150,7 +141,7 @@ def _resolve_struct_field_names(
 
 
 # ---------------------------------------------------------------------------
-# Bulk Arrow parsing — strings → struct<lat, lon>
+# Vectorized Arrow parsing — strings -> struct<lat, lon>
 # ---------------------------------------------------------------------------
 
 
@@ -161,6 +152,8 @@ def parse_geography_arrow(
 ) -> pa.Array | pa.ChunkedArray:
     """Parse an Arrow string array of coordinate pairs into struct<lat, lon>.
 
+    Uses vectorized Arrow compute — no Python iteration over elements.
+
     Accepted string formats: ``"48.8, 2.3"``, ``"48.8 2.3"``,
     ``"48.8|2.3"``, ``"48.8;2.3"``.
 
@@ -169,51 +162,78 @@ def parse_geography_arrow(
     array
         Arrow string array to parse.
     safe
-        When True, raise on unparseable values.
+        When True, raise on the first unparseable value.
         When False (default), unparseable values become null.
     """
     if isinstance(array, pa.ChunkedArray):
-        chunks = [_parse_coords_flat(c, safe=safe) for c in array.chunks]
+        chunks = [_parse_coords_vectorized(c, safe=safe) for c in array.chunks]
         return pa.chunked_array(chunks, type=GEOGRAPHY_ARROW_TYPE)
-    return _parse_coords_flat(array, safe=safe)
+    return _parse_coords_vectorized(array, safe=safe)
 
 
-def _parse_coords_flat(array: pa.Array, *, safe: bool) -> pa.StructArray:
-    lats: list[float | None] = []
-    lons: list[float | None] = []
-    valid: list[bool] = []
+# Regex with named groups for vectorized Arrow extract_regex.
+# Matches "lat<sep>lon" where sep is comma, space, pipe, semicolon, or tab.
+_ARROW_COORD_PATTERN = (
+    r"^\s*(?P<lat>[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    r"\s*[,;| \t]\s*"
+    r"(?P<lon>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
+)
 
-    for i in range(len(array)):
-        py = array[i].as_py()
-        if py is None:
-            lats.append(None)
-            lons.append(None)
-            valid.append(False)
-            continue
 
-        coord = _parse_coord_string(str(py))
-        if coord is not None:
-            lats.append(coord[0])
-            lons.append(coord[1])
-            valid.append(True)
-        else:
-            if safe:
-                raise ValueError(
-                    f"Cannot parse coordinate from {py!r} at index {i}. "
-                    f"Expected 'lat, lon' format (e.g. '48.8566, 2.3522'). "
-                    f"Pass safe=False to null out unparseable values."
-                )
-            lats.append(None)
-            lons.append(None)
-            valid.append(False)
+def _parse_coords_vectorized(array: pa.Array, *, safe: bool) -> pa.StructArray:
+    """Vectorized coordinate parsing — all Arrow compute, no Python loop.
 
-    lat_arr = pa.array(lats, type=pa.float64())
-    lon_arr = pa.array(lons, type=pa.float64())
-    mask = pa.array([not v for v in valid], type=pa.bool_())
+    Uses ``pc.extract_regex`` to pull lat/lon strings in one shot, then
+    casts to float64 and validates ranges, all vectorized.
+    """
+    n = len(array)
+    if n == 0:
+        return pa.StructArray.from_arrays(
+            [pa.array([], type=pa.float64()), pa.array([], type=pa.float64())],
+            names=["lat", "lon"],
+        )
+
+    # extract_regex returns struct<lat: string, lon: string>.
+    # Non-matching rows (bad format or null input) become null structs.
+    extracted = pc.extract_regex(array, pattern=_ARROW_COORD_PATTERN)
+
+    lat_str = pc.struct_field(extracted, "lat")
+    lon_str = pc.struct_field(extracted, "lon")
+
+    # Cast to float64 — nulls propagate cleanly.
+    lat = pc.cast(lat_str, pa.float64(), safe=False)
+    lon = pc.cast(lon_str, pa.float64(), safe=False)
+
+    # Validate ranges: lat in [-90, 90], lon in [-180, 180].
+    lat_valid = pc.and_(pc.greater_equal(lat, -90.0), pc.less_equal(lat, 90.0))
+    lon_valid = pc.and_(pc.greater_equal(lon, -180.0), pc.less_equal(lon, 180.0))
+    in_range = pc.and_(lat_valid, lon_valid)
+
+    # Null out rows that are out of range.
+    lat = pc.if_else(in_range, lat, None)
+    lon = pc.if_else(in_range, lon, None)
+
+    # Build the validity mask: both lat and lon must be non-null.
+    struct_valid = pc.and_(pc.is_valid(lat), pc.is_valid(lon))
+
+    if safe:
+        orig_valid = pc.is_valid(array)
+        failed = pc.and_(orig_valid, pc.invert(struct_valid))
+        if pc.any(failed).as_py():
+            failed_indices = pc.indices_nonzero(failed)
+            idx = failed_indices[0].as_py()
+            raw = array[idx].as_py()
+            raise ValueError(
+                f"Cannot parse coordinate from {raw!r} at index {idx}. "
+                f"Expected 'lat, lon' format (e.g. '48.8566, 2.3522'). "
+                f"Pass safe=False to null out unparseable values."
+            )
+
+    struct_mask = pc.invert(struct_valid)
     return pa.StructArray.from_arrays(
-        [lat_arr, lon_arr],
+        [lat, lon],
         names=["lat", "lon"],
-        mask=mask,
+        mask=struct_mask,
     )
 
 
@@ -222,7 +242,10 @@ def parse_geography_polars(
     *,
     safe: bool = False,
 ) -> "polars.Series":
-    """Parse a Polars string series of coordinate pairs into struct<lat, lon>."""
+    """Parse a Polars string series of coordinate pairs into struct<lat, lon>.
+
+    Goes through Arrow compute for the heavy lifting — no Python loops.
+    """
     pl = get_polars()
     arrow = series.to_arrow()
     parsed = parse_geography_arrow(arrow, safe=safe)
@@ -244,9 +267,9 @@ class GeographyType(DataType):
 
     Handles flexible input on cast:
 
-    - **struct** with lat/lon (or latitude/longitude) fields → passthrough
-    - **string** ``"48.8566, 2.3522"`` → parsed into lat/lon
-    - **float pairs** in struct form → kept as-is
+    - **struct** with lat/lon (or latitude/longitude) fields -> passthrough
+    - **string** ``"48.8566, 2.3522"`` -> parsed into lat/lon (vectorized)
+    - **float pairs** in struct form -> kept as-is
     - **dicts** ``{"lat": 48.8, "lon": 2.3}`` via convert_pyobj
     - **tuples** ``(48.8, 2.3)`` via convert_pyobj
 
@@ -383,7 +406,7 @@ class GeographyType(DataType):
         return self
 
     # ------------------------------------------------------------------
-    # Cast — flexible input → struct<lat, lon>
+    # Cast — flexible input -> struct<lat, lon> (vectorized)
     # ------------------------------------------------------------------
     def _cast_arrow_array(
         self,
@@ -393,10 +416,10 @@ class GeographyType(DataType):
         """Cast an Arrow array into struct<lat, lon>.
 
         Handles:
-        - struct with lat/lon fields → passthrough (rename if needed)
-        - struct with latitude/longitude → rename to lat/lon
-        - string → parse "lat, lon" coordinate pairs
-        - numeric → not meaningful for a point, null out (safe=False)
+        - struct with lat/lon fields -> passthrough (rename if needed)
+        - struct with latitude/longitude -> rename to lat/lon
+        - string -> vectorized parse of "lat, lon" coordinate pairs
+        - numeric -> cast to string then parse
         """
         safe = getattr(options, "safe", False)
 
@@ -404,7 +427,6 @@ class GeographyType(DataType):
         if pa.types.is_struct(array.type):
             lat_name, lon_name = _resolve_struct_field_names(array.type)
             if lat_name is not None and lon_name is not None:
-                # Already has lat/lon fields — extract and rebuild canonical.
                 if (
                     lat_name == "lat"
                     and lon_name == "lon"
@@ -418,7 +440,7 @@ class GeographyType(DataType):
                     names=["lat", "lon"],
                 )
 
-        # -- string → parse coordinate pairs --
+        # -- string -> vectorized coordinate parsing --
         if pa.types.is_string(array.type) or pa.types.is_large_string(array.type):
             return parse_geography_arrow(array, safe=safe)
 
@@ -512,15 +534,24 @@ class GeographyType(DataType):
 
 
 # ---------------------------------------------------------------------------
-# Python object → {lat, lon} dict
+# Python object -> {lat, lon} dict (single-value path, not bulk)
 # ---------------------------------------------------------------------------
 
 
-def _pyobj_to_latlon(value: Any) -> dict[str, float] | None:
-    """Try every reasonable format to extract lat/lon from a Python value.
+def _parse_coord_string(s: str) -> tuple[float, float] | None:
+    """Parse ``"lat, lon"`` from a string. Returns None on failure."""
+    m = _COORD_RE.match(s)
+    if m is None:
+        return None
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return (lat, lon)
+    return None
 
-    Returns ``{"lat": ..., "lon": ...}`` or None if nothing works.
-    """
+
+def _pyobj_to_latlon(value: Any) -> dict[str, float] | None:
+    """Try every reasonable format to extract lat/lon from a Python value."""
     # dict with lat/lon keys
     if isinstance(value, dict):
         lat = _dict_get_lat(value)
