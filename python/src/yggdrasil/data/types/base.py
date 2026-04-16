@@ -503,8 +503,12 @@ class DataType(BaseChildrenFields, ABC):
                 return cls.from_parsed(parsed.value_type)
             return StringType()
 
-        if parsed.type_id in {DataTypeId.JSON, DataTypeId.OBJECT}:
+        if parsed.type_id == DataTypeId.JSON:
             return StringType()
+
+        if parsed.type_id == DataTypeId.OBJECT:
+            from .extensions.obj import ObjectType
+            return ObjectType()
 
         if parsed.type_id == DataTypeId.EXTENSION:
             # If extension metadata carries a name, try to resolve it from the
@@ -858,6 +862,10 @@ class DataType(BaseChildrenFields, ABC):
 
         if hint is Any:
             return StringType()
+
+        if hint is object:
+            from .extensions.obj import ObjectType
+            return ObjectType()
 
         if is_dataclass(hint):
             return cls.from_dataclass(hint)
