@@ -41,9 +41,7 @@ def table(client, sql):
         table_name="trades",
         name="trades",
         full_name=lambda safe=False: (
-            "`main`.`analytics`.`trades`"
-            if safe
-            else "main.analytics.trades"
+            "`main`.`analytics`.`trades`" if safe else "main.analytics.trades"
         ),
     )
 
@@ -58,9 +56,7 @@ def ref_table(client, sql):
         table_name="books",
         name="books",
         full_name=lambda safe=False: (
-            "`main`.`refined`.`books`"
-            if safe
-            else "main.refined.books"
+            "`main`.`refined`.`books`" if safe else "main.refined.books"
         ),
     )
 
@@ -191,16 +187,14 @@ def test_set_primary_key_executes(column, executed):
 def test_drop_primary_key_ddl_default(column):
     query = column.drop_primary_key_ddl()
     assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP PRIMARY KEY IF EXISTS"
+        "ALTER TABLE `main`.`analytics`.`trades` " "DROP PRIMARY KEY IF EXISTS"
     )
 
 
 def test_drop_primary_key_ddl_variation(column):
     query = column.drop_primary_key_ddl(if_exists=False, cascade=True)
     assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP PRIMARY KEY CASCADE"
+        "ALTER TABLE `main`.`analytics`.`trades` " "DROP PRIMARY KEY CASCADE"
     )
 
 
@@ -208,8 +202,7 @@ def test_unset_primary_key_executes(column, executed):
     result = column.unset_primary_key(if_exists=False, cascade=True)
     assert result is column
     assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP PRIMARY KEY CASCADE"
+        "ALTER TABLE `main`.`analytics`.`trades` " "DROP PRIMARY KEY CASCADE"
     ]
 
 
@@ -273,8 +266,7 @@ def test_drop_foreign_key_ddl_default(column):
 def test_drop_foreign_key_ddl_variation(column):
     query = column.drop_foreign_key_ddl(if_exists=False)
     assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP FOREIGN KEY (`trade_id`)"
+        "ALTER TABLE `main`.`analytics`.`trades` " "DROP FOREIGN KEY (`trade_id`)"
     )
 
 
@@ -282,8 +274,7 @@ def test_unset_foreign_key_executes(column, executed):
     result = column.unset_foreign_key(if_exists=False)
     assert result is column
     assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP FOREIGN KEY (`trade_id`)"
+        "ALTER TABLE `main`.`analytics`.`trades` " "DROP FOREIGN KEY (`trade_id`)"
     ]
 
 
@@ -615,3 +606,90 @@ def test_from_api_catalog_column_info_parses_deeply_nested_struct(table):
     assert col.field.metadata[b"catalog_name"] == b"main"
     assert col.field.metadata[b"schema_name"] == b"analytics"
     assert col.field.metadata[b"table_name"] == b"trades"
+
+
+# ---------------------------------------------------------------------------
+# GEOGRAPHY type — Databricks native geography DDL parsing
+# ---------------------------------------------------------------------------
+
+
+def test_geography_type_text_parses_to_geography_type(table):
+    """Databricks type_text ``GEOGRAPHY(4326)`` should parse to GeographyType."""
+    from yggdrasil.data.types.extensions.geography import GeographyType
+
+    info = SQLColumnInfo(
+        name="location",
+        type_text="GEOGRAPHY(4326)",
+        type_name="GEOGRAPHY",
+        position=0,
+    )
+
+    col = Column.from_api(table, info)
+
+    assert col.name == "location"
+    assert col.field.name == "location"
+    assert isinstance(col.field.dtype, GeographyType)
+    assert col.field.dtype.srid == 4326
+
+
+def test_geography_type_text_any_srid(table):
+    """Databricks ``GEOGRAPHY(ANY)`` parses with srid='ANY'."""
+    from yggdrasil.data.types.extensions.geography import GeographyType
+
+    info = SQLColumnInfo(
+        name="geo_col",
+        type_text="GEOGRAPHY(ANY)",
+        type_name="GEOGRAPHY",
+        position=0,
+    )
+
+    col = Column.from_api(table, info)
+
+    assert isinstance(col.field.dtype, GeographyType)
+    assert col.field.dtype.srid == "ANY"
+
+
+def test_geography_type_text_bare(table):
+    """Bare ``GEOGRAPHY`` without SRID defaults to 4326."""
+    from yggdrasil.data.types.extensions.geography import GeographyType
+
+    info = SQLColumnInfo(
+        name="geo_col",
+        type_text="GEOGRAPHY",
+        type_name="GEOGRAPHY",
+        position=0,
+    )
+
+    col = Column.from_api(table, info)
+
+    assert isinstance(col.field.dtype, GeographyType)
+    assert col.field.dtype.srid == 4326
+
+
+def test_geography_type_round_trip_ddl():
+    """GeographyType.to_databricks_ddl() matches what Databricks expects."""
+    from yggdrasil.data.types.extensions.geography import GeographyType
+
+    assert GeographyType().to_databricks_ddl() == "GEOGRAPHY(4326)"
+    assert GeographyType(srid=3857).to_databricks_ddl() == "GEOGRAPHY(3857)"
+    assert GeographyType(srid="ANY").to_databricks_ddl() == "GEOGRAPHY(ANY)"
+
+
+def test_geography_catalog_column_info(table):
+    """CatalogColumnInfo with GEOGRAPHY type_text also parses correctly."""
+    from yggdrasil.data.types.extensions.geography import GeographyType
+
+    info = CatalogColumnInfo(
+        name="delivery_point",
+        type_text="GEOGRAPHY(4326)",
+        type_name="GEOGRAPHY",
+        position=0,
+        nullable=True,
+    )
+
+    col = Column.from_api(table, info)
+
+    assert col.name == "delivery_point"
+    assert isinstance(col.field.dtype, GeographyType)
+    assert col.field.dtype.srid == 4326
+    assert col.field.nullable is True

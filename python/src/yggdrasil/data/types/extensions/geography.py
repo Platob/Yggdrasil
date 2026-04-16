@@ -4,6 +4,12 @@ Stores geography identifiers as strings (ISO codes, country names, region
 codes, EIC codes, coordinates) and normalizes them through the GeoZone
 catalog on cast.
 
+Databricks DDL follows the native ``GEOGRAPHY`` type spec::
+
+    GEOGRAPHY          → GEOGRAPHY(4326)   -- WGS 84 default
+    GEOGRAPHY(4326)    → explicit SRID
+    GEOGRAPHY(ANY)     → accepts any SRID
+
 Cast behavior:
 - Input strings are resolved through GeoZoneCatalog (codes, aliases,
   fuzzy name matching, coordinate strings).
@@ -11,9 +17,6 @@ Cast behavior:
   or key).
 - When ``safe=True``: unparseable values raise ValueError.
 - When ``safe=False`` (default): unparseable values become null.
-
-Databricks mapping: STRING — geography data lives as plain strings in SQL
-tables and dashboards, which is the most portable representation.
 """
 
 from __future__ import annotations
@@ -35,6 +38,9 @@ if TYPE_CHECKING:
 __all__ = ["GeographyType"]
 
 LOGGER = logging.getLogger(__name__)
+
+# WGS 84 — the default SRID for Databricks GEOGRAPHY columns.
+DEFAULT_SRID: int = 4326
 
 
 def _get_catalog(catalog: "GeoZoneCatalog | None" = None) -> "GeoZoneCatalog":
@@ -63,6 +69,37 @@ def _zone_to_code(zone: "GeoZone | None") -> str | None:
     if zone is None:
         return None
     return zone.code
+
+
+# ---------------------------------------------------------------------------
+# SRID normalization
+# ---------------------------------------------------------------------------
+
+
+def _normalize_srid(value: int | str | None) -> int | str:
+    """Normalize an SRID value to either an int or the string ``"ANY"``.
+
+    Accepts ``None`` (→ default 4326), ints, numeric strings, and the
+    literal ``"ANY"`` (case-insensitive).
+    """
+    if value is None:
+        return DEFAULT_SRID
+
+    if isinstance(value, int):
+        return value
+
+    text = str(value).strip().upper()
+    if text == "ANY":
+        return "ANY"
+
+    try:
+        return int(text)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid SRID value {value!r}. "
+            f"Pass an integer SRID (e.g. 4326), 'ANY', or None for the "
+            f"default (WGS 84 / 4326)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +152,7 @@ def parse_geography_arrow(
 
 def _parse_geography_flat(
     array: pa.Array,
-    catalog: GeoZoneCatalog,
+    catalog: "GeoZoneCatalog",
     *,
     safe: bool,
     output: str,
@@ -147,7 +184,7 @@ def _parse_geography_flat(
     return pa.array(results, type=pa.string())
 
 
-def _extract_field(zone: GeoZone, output: str) -> str | None:
+def _extract_field(zone: "GeoZone", output: str) -> str | None:
     """Pull the requested field from a resolved GeoZone."""
     if output == "code":
         return zone.code
@@ -171,12 +208,12 @@ def _extract_field(zone: GeoZone, output: str) -> str | None:
 
 
 def parse_geography_polars(
-    series: polars.Series,
+    series: "polars.Series",
     *,
     catalog: "GeoZoneCatalog | None" = None,
     safe: bool = False,
     output: str = "code",
-) -> polars.Series:
+) -> "polars.Series":
     """Parse a Polars string series into normalized geography codes.
 
     Same semantics as :func:`parse_geography_arrow` but operates on Polars
@@ -206,19 +243,26 @@ class GeographyType(ExtensionType):
     the GeoZone catalog.  Resolved values are canonical codes (region_iso
     or country_iso or key).
 
-    The ``output`` parameter controls what field is extracted from resolved
-    zones: ``"code"`` (default), ``"name"``, ``"country_iso"``,
-    ``"region_iso"``, ``"key"``, ``"ccy"``, ``"gtype"``.
+    Parameters
+    ----------
+    srid : int | str
+        Spatial Reference System Identifier.  Default is ``4326`` (WGS 84).
+        Pass ``"ANY"`` to accept any SRID.  This controls the Databricks
+        DDL output: ``GEOGRAPHY(4326)``, ``GEOGRAPHY(ANY)``, etc.
+    output : str
+        What field to extract from resolved zones: ``"code"`` (default),
+        ``"name"``, ``"country_iso"``, ``"region_iso"``, ``"key"``,
+        ``"ccy"``, ``"gtype"``.
 
     Example::
 
-        geo = GeographyType()
-        geo = GeographyType(output="country_iso")
-        geo = GeographyType(output="name")
+        geo = GeographyType()               # GEOGRAPHY(4326), output=code
+        geo = GeographyType(srid="ANY")      # GEOGRAPHY(ANY)
+        geo = GeographyType(srid=4326, output="country_iso")
 
     Casting an Arrow array through this type normalizes every element::
 
-        arr = pa.array(["France", "DE", "zuerich", "nope"])
+        arr = pa.array(["France", "DE", "zuerich", "xyzzy"])
         result = geo._cast_arrow_array(arr, options)
         # → ["FR IDF", "DE BE", "CH ZH", null]  (with safe=False)
     """
@@ -226,21 +270,50 @@ class GeographyType(ExtensionType):
     extension_name: ClassVar[str] = "yggdrasil.geography"
     storage_type: ClassVar[pa.DataType] = pa.string()
 
+    srid: int | str = DEFAULT_SRID
     output: str = "code"
 
-    # ------------------------------------------------------------------
-    # Serialization — omit output field when it's the default "code"
-    # ------------------------------------------------------------------
-    def _own_field_values(self) -> dict[str, Any]:
-        if self.output == "code":
-            return {}
-        return {"output": self.output}
+    def __post_init__(self) -> None:
+        # Normalize srid so "4326", 4326, "any", "ANY" all land correctly.
+        object.__setattr__(self, "srid", _normalize_srid(self.srid))
 
     # ------------------------------------------------------------------
-    # Databricks DDL — geography is just a string column in SQL
+    # Serialization — omit default values to keep metadata compact
+    # ------------------------------------------------------------------
+    def _own_field_values(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.srid != DEFAULT_SRID:
+            # Store as string so "ANY" survives JSON round-trip.
+            out["srid"] = str(self.srid) if isinstance(self.srid, int) else self.srid
+        if self.output != "code":
+            out["output"] = self.output
+        return out
+
+    @classmethod
+    def deserialize_metadata(cls, serialized: bytes) -> "GeographyType":
+        """Reconstruct from Arrow IPC metadata bytes."""
+        if not serialized:
+            return cls()
+        import json
+
+        payload = json.loads(serialized)
+        srid_raw = payload.pop("srid", None)
+        srid = _normalize_srid(srid_raw)
+        output = payload.get("output", "code")
+        return cls(srid=srid, output=output)
+
+    # ------------------------------------------------------------------
+    # Databricks DDL — native GEOGRAPHY type
     # ------------------------------------------------------------------
     def to_databricks_ddl(self) -> str:
-        return "STRING"
+        """Produce Databricks-compatible ``GEOGRAPHY(srid)`` DDL.
+
+        Default SRID is 4326 (WGS 84).  ``"ANY"`` produces
+        ``GEOGRAPHY(ANY)``.
+        """
+        if isinstance(self.srid, str):
+            return f"GEOGRAPHY({self.srid})"
+        return f"GEOGRAPHY({self.srid})"
 
     # ------------------------------------------------------------------
     # Casting — the main show
@@ -347,11 +420,17 @@ class GeographyType(ExtensionType):
     # Repr
     # ------------------------------------------------------------------
     def __repr__(self) -> str:
+        parts: list[str] = []
+        if self.srid != DEFAULT_SRID:
+            parts.append(f"srid={self.srid!r}")
         if self.output != "code":
-            return f"GeographyType(output={self.output!r})"
-        return "GeographyType()"
+            parts.append(f"output={self.output!r}")
+        return f"GeographyType({', '.join(parts)})"
 
     def __str__(self) -> str:
+        srid_str = str(self.srid)
         if self.output != "code":
-            return f"geography[{self.output}]"
+            return f"geography({srid_str})[{self.output}]"
+        if self.srid != DEFAULT_SRID:
+            return f"geography({srid_str})"
         return "geography"

@@ -2,12 +2,13 @@
 
 Covers:
 - Extension registration and type_id
+- SRID parameter (default, explicit, ANY, normalization)
+- Databricks DDL: GEOGRAPHY(srid) syntax
 - Arrow conversion (to_arrow, from_arrow_type, handles_arrow_type)
 - Arrow IPC round-trip
 - Polars fallback to storage type (string)
-- Databricks DDL
-- Dict round-trip
-- Serialization metadata round-trip
+- Dict round-trip with srid
+- Serialization metadata round-trip with srid
 - Merge behavior
 - Cast: Arrow array normalization with safe=True and safe=False
 - Cast: handles various input formats (ISO codes, names, aliases, coords)
@@ -18,8 +19,7 @@ Covers:
 - Python object conversion
 - Default values
 - Repr / str
-- DataType.from_str("geography") integration
-- DataType.from_str("geo") integration
+- DataType.from_str("geography"), "geography(4326)", "geography(ANY)"
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from yggdrasil.data.types.extensions.base import (
     get_extension_type,
 )
 from yggdrasil.data.types.extensions.geography import (
+    DEFAULT_SRID,
     GeographyType,
     parse_geography_arrow,
     parse_geography_polars,
@@ -60,14 +61,92 @@ class TestRegistration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# SRID parameter
+# ---------------------------------------------------------------------------
+
+
+class TestSRID(unittest.TestCase):
+    def test_default_srid(self):
+        self.assertEqual(GeographyType().srid, DEFAULT_SRID)
+        self.assertEqual(GeographyType().srid, 4326)
+
+    def test_explicit_srid_int(self):
+        geo = GeographyType(srid=3857)
+        self.assertEqual(geo.srid, 3857)
+
+    def test_srid_any(self):
+        geo = GeographyType(srid="ANY")
+        self.assertEqual(geo.srid, "ANY")
+
+    def test_srid_any_case_insensitive(self):
+        self.assertEqual(GeographyType(srid="any").srid, "ANY")
+        self.assertEqual(GeographyType(srid="Any").srid, "ANY")
+
+    def test_srid_string_numeric(self):
+        geo = GeographyType(srid="4326")
+        self.assertEqual(geo.srid, 4326)
+
+    def test_srid_none_defaults(self):
+        geo = GeographyType(srid=None)
+        self.assertEqual(geo.srid, DEFAULT_SRID)
+
+    def test_invalid_srid_raises(self):
+        with self.assertRaisesRegex(ValueError, "Invalid SRID"):
+            GeographyType(srid="BOGUS")
+
+    def test_equality_same_srid(self):
+        self.assertEqual(GeographyType(srid=4326), GeographyType(srid=4326))
+        self.assertEqual(GeographyType(srid="ANY"), GeographyType(srid="ANY"))
+
+    def test_equality_different_srid(self):
+        self.assertNotEqual(GeographyType(srid=4326), GeographyType(srid=3857))
+        self.assertNotEqual(GeographyType(srid=4326), GeographyType(srid="ANY"))
+
+
+# ---------------------------------------------------------------------------
+# Databricks DDL
+# ---------------------------------------------------------------------------
+
+
+class TestDatabricksDDL(unittest.TestCase):
+    def test_ddl_default(self):
+        self.assertEqual(GeographyType().to_databricks_ddl(), "GEOGRAPHY(4326)")
+
+    def test_ddl_explicit_srid(self):
+        self.assertEqual(
+            GeographyType(srid=3857).to_databricks_ddl(), "GEOGRAPHY(3857)"
+        )
+
+    def test_ddl_any(self):
+        self.assertEqual(
+            GeographyType(srid="ANY").to_databricks_ddl(), "GEOGRAPHY(ANY)"
+        )
+
+    def test_ddl_with_output_still_geography(self):
+        self.assertEqual(
+            GeographyType(output="name").to_databricks_ddl(), "GEOGRAPHY(4326)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Serialization metadata
 # ---------------------------------------------------------------------------
 
 
 class TestSerialization(unittest.TestCase):
-    def test_serialize_default_output(self):
-        # Default output="code" — no extra fields, empty metadata.
+    def test_serialize_default(self):
+        # Default srid=4326, output="code" — empty metadata.
         self.assertEqual(GeographyType().serialize_metadata(), b"")
+
+    def test_serialize_custom_srid(self):
+        raw = GeographyType(srid=3857).serialize_metadata()
+        payload = json.loads(raw)
+        self.assertEqual(payload["srid"], "3857")
+
+    def test_serialize_srid_any(self):
+        raw = GeographyType(srid="ANY").serialize_metadata()
+        payload = json.loads(raw)
+        self.assertEqual(payload["srid"], "ANY")
 
     def test_serialize_custom_output(self):
         raw = GeographyType(output="name").serialize_metadata()
@@ -78,13 +157,24 @@ class TestSerialization(unittest.TestCase):
         restored = GeographyType.deserialize_metadata(b"")
         self.assertEqual(restored, GeographyType())
 
-    def test_deserialize_with_output(self):
-        raw = json.dumps({"output": "ccy"}).encode()
+    def test_deserialize_with_srid(self):
+        raw = json.dumps({"srid": "3857"}).encode()
         restored = GeographyType.deserialize_metadata(raw)
-        self.assertEqual(restored.output, "ccy")
+        self.assertEqual(restored.srid, 3857)
 
-    def test_round_trip(self):
-        original = GeographyType(output="country_iso")
+    def test_deserialize_srid_any(self):
+        raw = json.dumps({"srid": "ANY"}).encode()
+        restored = GeographyType.deserialize_metadata(raw)
+        self.assertEqual(restored.srid, "ANY")
+
+    def test_round_trip_srid(self):
+        original = GeographyType(srid=3857, output="country_iso")
+        raw = original.serialize_metadata()
+        restored = GeographyType.deserialize_metadata(raw)
+        self.assertEqual(restored, original)
+
+    def test_round_trip_any(self):
+        original = GeographyType(srid="ANY")
         raw = original.serialize_metadata()
         restored = GeographyType.deserialize_metadata(raw)
         self.assertEqual(restored, original)
@@ -117,9 +207,10 @@ class TestArrowConversion(ArrowTestCase):
         self.assertFalse(GeographyType.handles_arrow_type(pa.string()))
 
     def test_from_arrow_type_dispatch(self):
-        arrow_type = GeographyType(output="name").to_arrow()
+        arrow_type = GeographyType(srid=3857, output="name").to_arrow()
         restored = ExtensionType.from_arrow_type(arrow_type)
         self.assertIsInstance(restored, GeographyType)
+        self.assertEqual(restored.srid, 3857)
         self.assertEqual(restored.output, "name")
 
     def test_arrow_round_trip_default(self):
@@ -127,8 +218,8 @@ class TestArrowConversion(ArrowTestCase):
         restored = ExtensionType.from_arrow_type(original.to_arrow())
         self.assertEqual(restored, original)
 
-    def test_arrow_round_trip_with_output(self):
-        original = GeographyType(output="region_iso")
+    def test_arrow_round_trip_with_srid_any(self):
+        original = GeographyType(srid="ANY", output="region_iso")
         restored = ExtensionType.from_arrow_type(original.to_arrow())
         self.assertEqual(restored, original)
 
@@ -141,7 +232,7 @@ class TestArrowConversion(ArrowTestCase):
 class TestArrowIPC(ArrowTestCase):
     def test_ipc_roundtrip(self):
         pa = self.pa
-        geo = GeographyType(output="name")
+        geo = GeographyType(srid=3857, output="name")
         arrow_type = geo.to_arrow()
         storage = pa.array(["France", "Germany"], type=pa.string())
         arr = pa.ExtensionArray.from_storage(arrow_type, storage)
@@ -159,7 +250,9 @@ class TestArrowIPC(ArrowTestCase):
         self.assertIsInstance(col_type, pa.ExtensionType)
         self.assertEqual(col_type.extension_name, "yggdrasil.geography")
         raw = col_type.__arrow_ext_serialize__()
-        self.assertEqual(json.loads(raw)["output"], "name")
+        payload = json.loads(raw)
+        self.assertEqual(payload["srid"], "3857")
+        self.assertEqual(payload["output"], "name")
 
 
 # ---------------------------------------------------------------------------
@@ -174,19 +267,6 @@ class TestPolarsConversion(PolarsTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Databricks DDL
-# ---------------------------------------------------------------------------
-
-
-class TestDatabricksDDL(unittest.TestCase):
-    def test_ddl_is_string(self):
-        self.assertEqual(GeographyType().to_databricks_ddl(), "STRING")
-
-    def test_ddl_with_output(self):
-        self.assertEqual(GeographyType(output="name").to_databricks_ddl(), "STRING")
-
-
-# ---------------------------------------------------------------------------
 # Dict round-trip
 # ---------------------------------------------------------------------------
 
@@ -196,20 +276,30 @@ class TestDictRoundTrip(unittest.TestCase):
         d = GeographyType().to_dict()
         self.assertEqual(d["id"], int(DataTypeId.EXTENSION))
         self.assertEqual(d["extension_name"], "yggdrasil.geography")
+        self.assertNotIn("srid", d)
         self.assertNotIn("output", d)
+
+    def test_to_dict_custom_srid(self):
+        d = GeographyType(srid=3857).to_dict()
+        self.assertEqual(d["srid"], "3857")
+
+    def test_to_dict_srid_any(self):
+        d = GeographyType(srid="ANY").to_dict()
+        self.assertEqual(d["srid"], "ANY")
 
     def test_to_dict_custom_output(self):
         d = GeographyType(output="name").to_dict()
         self.assertEqual(d["output"], "name")
 
     def test_from_dict_dispatch(self):
-        d = GeographyType(output="ccy").to_dict()
+        d = GeographyType(srid="ANY", output="ccy").to_dict()
         restored = ExtensionType.from_dict(d)
         self.assertIsInstance(restored, GeographyType)
+        self.assertEqual(restored.srid, "ANY")
         self.assertEqual(restored.output, "ccy")
 
     def test_full_round_trip(self):
-        original = GeographyType(output="country_iso")
+        original = GeographyType(srid=3857, output="country_iso")
         restored = ExtensionType.from_dict(original.to_dict())
         self.assertEqual(restored, original)
 
@@ -362,7 +452,6 @@ class TestCastArrow(ArrowTestCase):
     def test_cast_from_int_array(self):
         pa = self.pa
         geo = GeographyType()
-        # Integers can't be geography codes, but we should handle gracefully.
         arr = pa.array([42, 99], type=pa.int64())
 
         class _Opts:
@@ -370,7 +459,6 @@ class TestCastArrow(ArrowTestCase):
 
         result = geo._cast_arrow_array(arr, _Opts())
         codes = result.storage.to_pylist()
-        # No catalog match — should be null.
         self.assertIsNone(codes[0])
         self.assertIsNone(codes[1])
 
@@ -388,7 +476,6 @@ class TestCastArrow(ArrowTestCase):
     def test_cast_coordinate_string(self):
         pa = self.pa
         geo = GeographyType()
-        # Zurich coordinates
         arr = pa.array(["47.3769, 8.5417"], type=pa.string())
 
         class _Opts:
@@ -520,16 +607,34 @@ class TestRepr(unittest.TestCase):
     def test_repr_default(self):
         self.assertEqual(repr(GeographyType()), "GeographyType()")
 
+    def test_repr_custom_srid(self):
+        self.assertEqual(repr(GeographyType(srid=3857)), "GeographyType(srid=3857)")
+
+    def test_repr_srid_any(self):
+        self.assertEqual(repr(GeographyType(srid="ANY")), "GeographyType(srid='ANY')")
+
     def test_repr_custom_output(self):
         self.assertEqual(
             repr(GeographyType(output="name")), "GeographyType(output='name')"
         )
 
+    def test_repr_both(self):
+        self.assertEqual(
+            repr(GeographyType(srid=3857, output="name")),
+            "GeographyType(srid=3857, output='name')",
+        )
+
     def test_str_default(self):
         self.assertEqual(str(GeographyType()), "geography")
 
+    def test_str_custom_srid(self):
+        self.assertEqual(str(GeographyType(srid=3857)), "geography(3857)")
+
+    def test_str_srid_any(self):
+        self.assertEqual(str(GeographyType(srid="ANY")), "geography(ANY)")
+
     def test_str_custom_output(self):
-        self.assertEqual(str(GeographyType(output="ccy")), "geography[ccy]")
+        self.assertEqual(str(GeographyType(output="ccy")), "geography(4326)[ccy]")
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +646,22 @@ class TestFromStr(unittest.TestCase):
     def test_from_str_geography(self):
         result = DataType.from_str("geography")
         self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 4326)
+
+    def test_from_str_geography_srid(self):
+        result = DataType.from_str("geography(4326)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 4326)
+
+    def test_from_str_geography_srid_3857(self):
+        result = DataType.from_str("geography(3857)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 3857)
+
+    def test_from_str_geography_any(self):
+        result = DataType.from_str("geography(ANY)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, "ANY")
 
     def test_from_str_geo(self):
         result = DataType.from_str("geo")
@@ -554,6 +675,11 @@ class TestFromStr(unittest.TestCase):
         result = DataType.from_str("geolocation")
         self.assertIsInstance(result, GeographyType)
 
+    def test_from_str_GEOGRAPHY_uppercase(self):
+        result = DataType.from_str("GEOGRAPHY(4326)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 4326)
+
 
 # ---------------------------------------------------------------------------
 # DataType.from_any / from_dict integration
@@ -565,12 +691,19 @@ class TestFromAny(unittest.TestCase):
         result = DataType.from_any("geography")
         self.assertIsInstance(result, GeographyType)
 
+    def test_from_any_string_with_srid(self):
+        result = DataType.from_any("geography(3857)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 3857)
+
     def test_from_dict_dispatch(self):
         d = {
             "id": int(DataTypeId.EXTENSION),
             "extension_name": "yggdrasil.geography",
+            "srid": "3857",
             "output": "name",
         }
         result = DataType.from_dict(d)
         self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 3857)
         self.assertEqual(result.output, "name")

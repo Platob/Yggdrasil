@@ -524,8 +524,9 @@ class DataType(BaseChildrenFields, ABC):
             # Parser-level canonical names for known extension types.
             parsed_name = (meta.name or "").lower()
             if parsed_name in {"geography", "geo", "geozone", "geolocation"}:
-                from .extensions.geography import GeographyType
-                return GeographyType()
+                from .extensions.geography import GeographyType, _normalize_srid
+                srid_arg = meta.args[0] if meta.args else None
+                return GeographyType(srid=_normalize_srid(srid_arg))
 
             return StringType()
 
