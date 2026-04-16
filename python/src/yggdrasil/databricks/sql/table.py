@@ -53,6 +53,7 @@ from .grants import GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
     _build_table_constraints_sql,
+    _qualify_fk_ref,
     _safe_constraint_name,
     _safe_str,
     databricks_tag_literal,
@@ -443,6 +444,56 @@ class Table(DatabricksResource, GrantsMixin):
         self.sql.execute(self.drop_primary_key_ddl(if_exists=if_exists, cascade=cascade))
         return self
 
+    def set_foreign_keys(
+        self,
+        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | Any | None" = None,
+        *,
+        schema: Any = None,
+        raise_error: bool = False,
+    ) -> "Table":
+        """Apply foreign-key constraints, reading from schema metadata by default.
+
+        ``foreign_keys`` accepts anything :meth:`ForeignKeySpec.from_any` handles
+        (a dict ``{column: ref}``, a list of specs, a single spec, a schema, …).
+        When ``foreign_keys`` is omitted, the constraints are read from
+        ``schema`` (each field's ``foreign_key`` tag).
+
+        Each spec is applied via ``ALTER TABLE``; partial refs such as
+        ``"ref_table.col"`` are resolved against this table's catalog/schema.
+        Failures are logged and skipped unless ``raise_error`` is set.
+        """
+        fk_specs = ForeignKeySpec.from_any(foreign_keys, schema=schema)
+
+        for fk in fk_specs:
+            ref = _qualify_fk_ref(
+                fk.ref,
+                default_catalog=self.catalog_name,
+                default_schema=self.schema_name,
+            )
+            try:
+                self.column(fk.column).set_foreign_key(
+                    ref,
+                    constraint_name=fk.constraint_name,
+                    rely=fk.rely,
+                    match_full=fk.match_full,
+                    on_update_no_action=fk.on_update_no_action,
+                    on_delete_no_action=fk.on_delete_no_action,
+                )
+                logger.debug(
+                    "Applied FOREIGN KEY %r → %r on %s",
+                    fk.column, ref, self.full_name(),
+                )
+            except Exception:
+                if raise_error:
+                    raise
+                logger.warning(
+                    "Failed to apply FOREIGN KEY %r → %r on %s",
+                    fk.column, ref, self.full_name(),
+                    exc_info=True,
+                )
+
+        return self
+
     def set_tags_ddl(
         self,
         tags: Mapping[str, str] | None,
@@ -681,7 +732,6 @@ class Table(DatabricksResource, GrantsMixin):
         partition_by = partition_by or schema_info.partition_by
         cluster_by = cluster_by or schema_info.cluster_by
         primary_keys = primary_keys or schema_info.primary_key_names
-        foreign_keys = foreign_keys or schema_info.foreign_key_names
         comment = comment or schema_info.comment
 
         pk_spec = PrimaryKeySpec.from_any(primary_keys, schema=schema_info)
@@ -703,6 +753,8 @@ class Table(DatabricksResource, GrantsMixin):
             self.table_name,
             pk_spec,
             fk_specs,
+            default_catalog=self.catalog_name,
+            default_schema=self.schema_name,
         )
         table_definitions = column_definitions + constraint_definitions
 

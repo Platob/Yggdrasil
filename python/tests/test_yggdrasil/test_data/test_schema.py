@@ -184,6 +184,7 @@ def test_partition_cluster_primary_foreign_key_properties():
     assert s.primary_key_names == ["book_id", "trade_id"]
     assert [f.name for f in s.foreign_keys] == ["counterparty_id"]
     assert s.foreign_key_names == ["counterparty_id"]
+    assert s.foreign_key_refs == {"counterparty_id": "dim_counterparty.id"}
 
 
 def test_copy_preserves_fields_and_metadata_but_deep_copies_field_objects():

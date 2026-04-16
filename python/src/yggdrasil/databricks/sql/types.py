@@ -35,7 +35,11 @@ class PrimaryKeySpec:
 
         if timeseries is None:
             for f in fields:
-                if pa.types.is_timestamp(f.type):
+                arrow_type = getattr(f, "type", None)
+                if arrow_type is None and hasattr(f, "dtype"):
+                    to_arrow = getattr(f.dtype, "to_arrow", None)
+                    arrow_type = to_arrow() if callable(to_arrow) else None
+                if arrow_type is not None and pa.types.is_timestamp(arrow_type):
                     timeseries = f.name
                     break
 
@@ -147,7 +151,7 @@ class ForeignKeySpec:
         info = Schema.from_any(schema)
         return [
             cls(column=column, ref=ref)
-            for column, ref in info.foreign_key_names.items()
+            for column, ref in info.foreign_key_refs.items()
         ]
 
     @classmethod

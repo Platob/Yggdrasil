@@ -12,6 +12,7 @@ __all__ = [
     "_build_fk_constraint_sql",
     "_build_pk_constraint_sql",
     "_build_table_constraints_sql",
+    "_qualify_fk_ref",
     "databricks_tag_literal",
     "normalize_databricks_collation",
     "_safe_constraint_name",
@@ -151,16 +152,36 @@ def databricks_tag_literal(
     return f"{literal} COLLATE {normalized}"
 
 
-def _parse_fk_ref(ref: str) -> tuple[str, list[str]]:
+def _parse_fk_ref(
+    ref: str,
+    *,
+    default_catalog: str | None = None,
+    default_schema: str | None = None,
+) -> tuple[str, list[str]]:
+    """Parse a foreign-key ref into ``(ref_table, ref_columns)``.
+
+    Accepts 2-, 3-, or 4-part dotted refs; missing catalog/schema segments are
+    filled from ``default_catalog`` / ``default_schema`` when available:
+
+        - ``"table.col"``                          (needs both defaults)
+        - ``"schema.table.col"``                   (needs default_catalog)
+        - ``"catalog.schema.table.col"``           (fully qualified)
+        - ``"catalog.schema.table.col1,col2,..."`` (composite ref)
+    """
     if not ref or not isinstance(ref, str):
         raise ValueError(f"Invalid foreign key ref: {ref!r}")
 
     parts = [part.strip() for part in ref.split(".") if part.strip()]
+    if len(parts) == 2 and default_catalog and default_schema:
+        parts = [default_catalog, default_schema, *parts]
+    elif len(parts) == 3 and default_catalog:
+        parts = [default_catalog, *parts]
+
     if len(parts) < 4:
         raise ValueError(
-            "Foreign key ref must be "
+            "Foreign key ref must resolve to "
             "'catalog.schema.table.column' or "
-            "'catalog.schema.table.col1,col2,...', "
+            "'catalog.schema.table.col1,col2,...'; "
             f"got {ref!r}"
         )
 
@@ -171,6 +192,21 @@ def _parse_fk_ref(ref: str) -> tuple[str, list[str]]:
         raise ValueError(f"No referenced columns found in foreign key ref: {ref!r}")
 
     return ref_table, ref_cols
+
+
+def _qualify_fk_ref(
+    ref: str,
+    *,
+    default_catalog: str | None = None,
+    default_schema: str | None = None,
+) -> str:
+    """Normalize a foreign-key ref to the ``catalog.schema.table.col[,col]`` form."""
+    ref_table, ref_cols = _parse_fk_ref(
+        ref,
+        default_catalog=default_catalog,
+        default_schema=default_schema,
+    )
+    return f"{ref_table}.{','.join(ref_cols)}"
 
 
 def _build_pk_constraint_sql(pk_spec: Any) -> str | None:
@@ -196,8 +232,18 @@ def _build_pk_constraint_sql(pk_spec: Any) -> str | None:
     return " ".join(parts)
 
 
-def _build_fk_constraint_sql(table_name: str, fk: Any) -> str:
-    ref_table, ref_columns = _parse_fk_ref(fk.ref)
+def _build_fk_constraint_sql(
+    table_name: str,
+    fk: Any,
+    *,
+    default_catalog: str | None = None,
+    default_schema: str | None = None,
+) -> str:
+    ref_table, ref_columns = _parse_fk_ref(
+        fk.ref,
+        default_catalog=default_catalog,
+        default_schema=default_schema,
+    )
 
     parts: list[str] = []
     cname = _safe_constraint_name(
@@ -229,6 +275,9 @@ def _build_table_constraints_sql(
     table_name: str,
     pk_spec: Any,
     fk_specs: list[Any],
+    *,
+    default_catalog: str | None = None,
+    default_schema: str | None = None,
 ) -> list[str]:
     constraints: list[str] = []
 
@@ -237,7 +286,14 @@ def _build_table_constraints_sql(
         constraints.append(pk_sql)
 
     for fk in fk_specs:
-        constraints.append(_build_fk_constraint_sql(table_name, fk))
+        constraints.append(
+            _build_fk_constraint_sql(
+                table_name,
+                fk,
+                default_catalog=default_catalog,
+                default_schema=default_schema,
+            )
+        )
 
     return constraints
 
