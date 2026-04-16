@@ -491,7 +491,7 @@ def test_cast_spark_list_column_to_map_converts_entries(
         cast_spark_list_column_to_map(F.col("source_entries"), options).alias("target_map")
     )
 
-    assert [_normalize_map_like(v) for v in result.toArrow()["target_map"].tolist()] == [
+    assert [_normalize_map_like(v) for v in result.toArrow()["target_map"].to_pylist()] == [
         {"a": "1", "b": "2"},
         {"x": "3"},
         None,
