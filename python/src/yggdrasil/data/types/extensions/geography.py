@@ -1,26 +1,28 @@
-"""GeographyType — first-class data type for geographic zone data.
+"""GeographyType — first-class data type for geographic coordinates.
 
-Stores geography as ``struct<lat: float64 not null, lon: float64 not null>``.
-On cast, input strings (ISO codes, country names, aliases, coordinate strings)
-are resolved through the GeoZone catalog into lat/lon coordinates.
+Inner type: ``struct<lat: float64, lon: float64>``.
+
+Handles flexible input formats on cast:
+- struct arrays with lat/lon (or latitude/longitude) fields → passthrough
+- string arrays with coordinate pairs: ``"48.8566, 2.3522"``,
+  ``"48.8566 2.3522"``, ``"48.8566|2.3522"``, ``"48.8566;2.3522"``
+- dict-like rows: ``{"lat": 48.8, "lon": 2.35}``
+- Python tuples/lists: ``(48.8, 2.35)``
+
+When ``safe=False`` (default), unparseable values become null.
+When ``safe=True``, unparseable values raise ValueError.
 
 Databricks DDL follows the native ``GEOGRAPHY`` type spec::
 
-    GEOGRAPHY              -> GEOGRAPHY(4326)
-    GEOGRAPHY(4326)        -> explicit SRID
-    GEOGRAPHY(ANY)         -> accepts any SRID
-    GEOGRAPHY(OGC:CRS84, SPHERICAL) -> named CRS with model
-
-Cast behavior:
-- Input strings are resolved through GeoZoneCatalog.
-- Resolved zones produce ``{lat, lon}`` struct values.
-- When ``safe=True``: unparseable values raise ValueError.
-- When ``safe=False`` (default): unparseable values become null structs.
+    GEOGRAPHY(4326)                  -- WGS 84 default
+    GEOGRAPHY(ANY)                   -- accepts any SRID
+    GEOGRAPHY(OGC:CRS84, SPHERICAL) -- named CRS with model
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,8 +39,6 @@ if TYPE_CHECKING:
     import pyspark.sql.types as pst
     from yggdrasil.data.cast.options import CastOptions
     from yggdrasil.data.data_field import Field
-    from yggdrasil.data.enums.geozone.base import GeoZone
-    from yggdrasil.data.enums.geozone.catalog import GeoZoneCatalog
 
 __all__ = ["GeographyType"]
 
@@ -55,26 +55,33 @@ GEOGRAPHY_ARROW_TYPE: pa.DataType = pa.struct(
     ]
 )
 
+# Matches "lat, lon" / "lat lon" / "lat|lon" / "lat;lon" coordinate strings.
+_COORD_RE = re.compile(
+    r"^\s*"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    r"\s*[,;|\s]\s*"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    r"\s*$"
+)
 
-def _get_catalog(catalog: "GeoZoneCatalog | None" = None) -> "GeoZoneCatalog":
-    if catalog is not None:
-        return catalog
-    from yggdrasil.data.enums.geozone.load import load_geozones
-
-    return load_geozones()
-
-
-def _resolve_zone(
-    value: str | None,
-    catalog: "GeoZoneCatalog",
-) -> "GeoZone | None":
-    """Parse a single string value into a GeoZone, or None if unresolvable."""
-    if value is None:
-        return None
-    stripped = str(value).strip()
-    if not stripped:
-        return None
-    return catalog.parse_str(stripped)
+# Common field name aliases → canonical (lat, lon).
+_LAT_ALIASES = frozenset({"lat", "latitude", "LAT", "LATITUDE", "Lat", "Latitude"})
+_LON_ALIASES = frozenset(
+    {
+        "lon",
+        "lng",
+        "long",
+        "longitude",
+        "LON",
+        "LNG",
+        "LONG",
+        "LONGITUDE",
+        "Lon",
+        "Lng",
+        "Long",
+        "Longitude",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -85,36 +92,24 @@ def _resolve_zone(
 def _normalize_srid(value: int | str | None) -> int | str:
     """Normalize an SRID value.
 
-    Returns an int for numeric SRIDs, or a string for named references.
-
-    Accepted inputs:
-    - ``None`` -> default 4326
-    - int -> kept as-is
-    - ``"ANY"`` (case-insensitive) -> ``"ANY"``
-    - ``"4326"`` (numeric string) -> ``4326``
-    - ``"OGC:CRS84"`` or other named CRS references -> kept as uppercase string
+    Accepts None (→ 4326), ints, numeric strings, ``"ANY"``,
+    or named CRS references like ``"OGC:CRS84"``.
     """
     if value is None:
         return DEFAULT_SRID
-
     if isinstance(value, int):
         return value
 
     text = str(value).strip()
     upper = text.upper()
-
     if upper == "ANY":
         return "ANY"
-
     try:
         return int(text)
     except (ValueError, TypeError):
         pass
-
-    # Named CRS references like OGC:CRS84 — keep as uppercase string.
     if text:
         return upper
-
     raise ValueError(
         f"Invalid SRID value {value!r}. "
         f"Pass an integer SRID (e.g. 4326), 'ANY', a named CRS "
@@ -123,89 +118,98 @@ def _normalize_srid(value: int | str | None) -> int | str:
 
 
 # ---------------------------------------------------------------------------
-# Bulk parsing utilities — resolve to lat/lon struct arrays
+# Coordinate parsing helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_coord_string(s: str) -> tuple[float, float] | None:
+    """Try to parse ``"lat, lon"`` from a string. Returns None on failure."""
+    m = _COORD_RE.match(s)
+    if m is None:
+        return None
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+        return (lat, lon)
+    return None
+
+
+def _resolve_struct_field_names(
+    dtype: pa.StructType,
+) -> tuple[str | None, str | None]:
+    """Find the lat and lon field names in a struct, tolerating aliases."""
+    lat_name: str | None = None
+    lon_name: str | None = None
+    for i in range(dtype.num_fields):
+        name = dtype.field(i).name
+        if name in _LAT_ALIASES and lat_name is None:
+            lat_name = name
+        elif name in _LON_ALIASES and lon_name is None:
+            lon_name = name
+    return lat_name, lon_name
+
+
+# ---------------------------------------------------------------------------
+# Bulk Arrow parsing — strings → struct<lat, lon>
 # ---------------------------------------------------------------------------
 
 
 def parse_geography_arrow(
     array: pa.Array | pa.ChunkedArray,
     *,
-    catalog: "GeoZoneCatalog | None" = None,
     safe: bool = False,
 ) -> pa.Array | pa.ChunkedArray:
-    """Parse an Arrow string array into a struct<lat, lon> array.
+    """Parse an Arrow string array of coordinate pairs into struct<lat, lon>.
+
+    Accepted string formats: ``"48.8, 2.3"``, ``"48.8 2.3"``,
+    ``"48.8|2.3"``, ``"48.8;2.3"``.
 
     Parameters
     ----------
     array
-        Arrow array of strings to parse (country names, ISO codes, aliases,
-        coordinate strings, etc.).
-    catalog
-        GeoZone catalog to resolve against.  Uses the default catalog when
-        ``None``.
+        Arrow string array to parse.
     safe
-        When ``True``, raise ``ValueError`` on the first unparseable value.
-        When ``False`` (default), unparseable values become null.
-
-    Returns
-    -------
-    pa.Array or pa.ChunkedArray
-        StructArray with ``lat`` and ``lon`` float64 fields.
+        When True, raise on unparseable values.
+        When False (default), unparseable values become null.
     """
-    cat = _get_catalog(catalog)
-    is_chunked = isinstance(array, pa.ChunkedArray)
-
-    if is_chunked:
-        chunks = [
-            _parse_geography_flat(chunk, cat, safe=safe) for chunk in array.chunks
-        ]
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [_parse_coords_flat(c, safe=safe) for c in array.chunks]
         return pa.chunked_array(chunks, type=GEOGRAPHY_ARROW_TYPE)
+    return _parse_coords_flat(array, safe=safe)
 
-    return _parse_geography_flat(array, cat, safe=safe)
 
-
-def _parse_geography_flat(
-    array: pa.Array,
-    catalog: "GeoZoneCatalog",
-    *,
-    safe: bool,
-) -> pa.StructArray:
-    """Parse a flat (non-chunked) Arrow string array into struct<lat, lon>."""
+def _parse_coords_flat(array: pa.Array, *, safe: bool) -> pa.StructArray:
     lats: list[float | None] = []
     lons: list[float | None] = []
     valid: list[bool] = []
 
     for i in range(len(array)):
-        if array[i].as_py() is None:
+        py = array[i].as_py()
+        if py is None:
             lats.append(None)
             lons.append(None)
             valid.append(False)
             continue
 
-        raw = str(array[i].as_py())
-        zone = _resolve_zone(raw, catalog)
-
-        if zone is None:
+        coord = _parse_coord_string(str(py))
+        if coord is not None:
+            lats.append(coord[0])
+            lons.append(coord[1])
+            valid.append(True)
+        else:
             if safe:
                 raise ValueError(
-                    f"Cannot resolve geography value {raw!r} at index {i}. "
-                    "No matching zone found in the catalog. "
-                    "Pass safe=False to null out unparseable values, "
-                    "or check your input data / catalog."
+                    f"Cannot parse coordinate from {py!r} at index {i}. "
+                    f"Expected 'lat, lon' format (e.g. '48.8566, 2.3522'). "
+                    f"Pass safe=False to null out unparseable values."
                 )
             lats.append(None)
             lons.append(None)
             valid.append(False)
-            continue
-
-        lats.append(zone.lat)
-        lons.append(zone.lon)
-        valid.append(True)
 
     lat_arr = pa.array(lats, type=pa.float64())
     lon_arr = pa.array(lons, type=pa.float64())
     mask = pa.array([not v for v in valid], type=pa.bool_())
-
     return pa.StructArray.from_arrays(
         [lat_arr, lon_arr],
         names=["lat", "lon"],
@@ -216,17 +220,12 @@ def _parse_geography_flat(
 def parse_geography_polars(
     series: "polars.Series",
     *,
-    catalog: "GeoZoneCatalog | None" = None,
     safe: bool = False,
 ) -> "polars.Series":
-    """Parse a Polars string series into a struct<lat, lon> series.
-
-    Same semantics as :func:`parse_geography_arrow` but operates on Polars
-    Series.  Goes through Arrow internally for catalog resolution.
-    """
+    """Parse a Polars string series of coordinate pairs into struct<lat, lon>."""
     pl = get_polars()
     arrow = series.to_arrow()
-    parsed = parse_geography_arrow(arrow, catalog=catalog, safe=safe)
+    parsed = parse_geography_arrow(arrow, safe=safe)
     if isinstance(parsed, pa.ChunkedArray):
         parsed = parsed.combine_chunks()
     return pl.Series(name=series.name, values=parsed)
@@ -241,32 +240,22 @@ def parse_geography_polars(
 class GeographyType(DataType):
     """First-class data type for geographic coordinates.
 
-    Inner type: ``struct<lat: float64 not null, lon: float64 not null>``.
+    Inner type: ``struct<lat: float64, lon: float64>``.
 
-    On cast, input strings are resolved through the GeoZone catalog into
-    lat/lon coordinate pairs.  The struct representation makes geographic
-    data directly usable in Arrow analytics and Databricks dashboards.
+    Handles flexible input on cast:
+
+    - **struct** with lat/lon (or latitude/longitude) fields → passthrough
+    - **string** ``"48.8566, 2.3522"`` → parsed into lat/lon
+    - **float pairs** in struct form → kept as-is
+    - **dicts** ``{"lat": 48.8, "lon": 2.3}`` via convert_pyobj
+    - **tuples** ``(48.8, 2.3)`` via convert_pyobj
 
     Parameters
     ----------
     srid : int | str
-        Spatial Reference System Identifier.  Default is ``4326`` (WGS 84).
-        Pass ``"ANY"`` to accept any SRID, or a named CRS like
-        ``"OGC:CRS84"``.  Controls the Databricks DDL output.
+        Spatial Reference System Identifier.  Default ``4326`` (WGS 84).
     model : str | None
-        Coordinate model.  ``None`` (default) omits it from DDL.
-        ``"SPHERICAL"`` produces ``GEOGRAPHY(srid, SPHERICAL)``.
-
-    Example::
-
-        geo = GeographyType()
-        geo = GeographyType(srid="OGC:CRS84", model="SPHERICAL")
-
-    Casting a string array through this type resolves to lat/lon::
-
-        arr = pa.array(["France", "CH-ZH", "bogus"])
-        result = geo._cast_arrow_array(arr, options)
-        # -> [{lat: 46.2276, lon: 2.2137}, {lat: 47.3769, lon: 8.5417}, null]
+        Coordinate model (e.g. ``"SPHERICAL"``).  None omits from DDL.
     """
 
     srid: int | str = DEFAULT_SRID
@@ -296,12 +285,10 @@ class GeographyType(DataType):
         ]
 
     # ------------------------------------------------------------------
-    # Arrow — struct<lat: float64 not null, lon: float64 not null>
+    # Arrow — struct<lat: float64, lon: float64>
     # ------------------------------------------------------------------
     @classmethod
     def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
-        # We don't claim arbitrary structs — GeographyType must be created
-        # explicitly or via from_str / from_dict / from_parsed.
         return False
 
     @classmethod
@@ -396,95 +383,99 @@ class GeographyType(DataType):
         return self
 
     # ------------------------------------------------------------------
-    # Cast — resolve strings to lat/lon struct via GeoZone catalog
+    # Cast — flexible input → struct<lat, lon>
     # ------------------------------------------------------------------
     def _cast_arrow_array(
         self,
         array: pa.Array,
         options: CastOptions,
     ) -> pa.Array:
-        """Cast an Arrow array into geography struct<lat, lon>.
+        """Cast an Arrow array into struct<lat, lon>.
 
-        Accepts string arrays (ISO codes, names, coordinate strings) and
-        struct arrays that already have lat/lon fields.  Unparseable values
-        become null when safe=False (default), or raise ValueError when
-        safe=True.
+        Handles:
+        - struct with lat/lon fields → passthrough (rename if needed)
+        - struct with latitude/longitude → rename to lat/lon
+        - string → parse "lat, lon" coordinate pairs
+        - numeric → not meaningful for a point, null out (safe=False)
         """
         safe = getattr(options, "safe", False)
 
-        # Already a struct with lat/lon — pass through.
+        # -- struct passthrough / rename --
         if pa.types.is_struct(array.type):
-            names = {f.name for f in array.type}
-            if "lat" in names and "lon" in names:
-                return array
+            lat_name, lon_name = _resolve_struct_field_names(array.type)
+            if lat_name is not None and lon_name is not None:
+                # Already has lat/lon fields — extract and rebuild canonical.
+                if (
+                    lat_name == "lat"
+                    and lon_name == "lon"
+                    and array.type == GEOGRAPHY_ARROW_TYPE
+                ):
+                    return array
+                lat_col = pc.struct_field(array, lat_name)
+                lon_col = pc.struct_field(array, lon_name)
+                return pa.StructArray.from_arrays(
+                    [pc.cast(lat_col, pa.float64()), pc.cast(lon_col, pa.float64())],
+                    names=["lat", "lon"],
+                )
 
-        src = array
-        # Cast to string if not already, so we can resolve through catalog.
-        if not pa.types.is_string(src.type) and not pa.types.is_large_string(src.type):
-            try:
-                src = pc.cast(src, pa.string(), safe=False)
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                if safe:
-                    raise
-                return pa.nulls(len(src), type=GEOGRAPHY_ARROW_TYPE)
+        # -- string → parse coordinate pairs --
+        if pa.types.is_string(array.type) or pa.types.is_large_string(array.type):
+            return parse_geography_arrow(array, safe=safe)
 
-        parsed = parse_geography_arrow(src, safe=safe)
+        # -- try casting to string first --
+        try:
+            as_str = pc.cast(array, pa.string(), safe=False)
+            return parse_geography_arrow(as_str, safe=safe)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            pass
 
-        if isinstance(parsed, pa.ChunkedArray):
-            parsed = parsed.combine_chunks()
-
-        return parsed
+        if safe:
+            raise ValueError(
+                f"Cannot cast Arrow array of type {array.type!r} to geography. "
+                f"Expected struct<lat, lon>, string coordinate pairs, or similar."
+            )
+        return pa.nulls(len(array), type=GEOGRAPHY_ARROW_TYPE)
 
     # ------------------------------------------------------------------
-    # Python object conversion
+    # Python object conversion — flexible input
     # ------------------------------------------------------------------
     def convert_pyobj(
-        self, value: Any, nullable: bool, safe: bool = False
+        self,
+        value: Any,
+        nullable: bool,
+        safe: bool = False,
     ) -> dict[str, float] | None:
         if value is None:
             if nullable:
                 return None
             raise ValueError(
                 "Got None for a non-nullable GeographyType field. "
-                "Pass a valid geography string or set nullable=True."
+                "Pass a coordinate value or set nullable=True."
             )
 
-        # Accept dicts with lat/lon already.
-        if isinstance(value, dict) and "lat" in value and "lon" in value:
-            return {"lat": float(value["lat"]), "lon": float(value["lon"])}
-
-        zone = _resolve_zone(str(value), _get_catalog())
-
-        if zone is not None:
-            return {"lat": zone.lat, "lon": zone.lon}
+        result = _pyobj_to_latlon(value)
+        if result is not None:
+            return result
 
         if safe:
             raise ValueError(
-                f"Cannot resolve geography value {value!r}. "
-                "No matching zone found in the catalog. "
-                "Pass safe=False to allow null for unparseable values."
+                f"Cannot parse geography coordinate from {value!r}. "
+                f"Expected a dict with lat/lon, a (lat, lon) tuple, "
+                f"or a 'lat, lon' string."
             )
-
         if not nullable:
             raise ValueError(
-                f"Cannot resolve geography value {value!r} and field "
-                "is not nullable. Either fix the input or make the field nullable."
+                f"Cannot parse geography coordinate from {value!r} and field "
+                "is not nullable. Fix the input or make the field nullable."
             )
         return None
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> dict[str, float] | None:
-        if isinstance(value, dict) and "lat" in value and "lon" in value:
-            return {"lat": float(value["lat"]), "lon": float(value["lon"])}
-
-        zone = _resolve_zone(str(value), _get_catalog())
-        if zone is not None:
-            return {"lat": zone.lat, "lon": zone.lon}
-
+        result = _pyobj_to_latlon(value)
+        if result is not None:
+            return result
         if safe:
-            raise ValueError(
-                f"Cannot resolve geography value {value!r}. "
-                "No matching zone found in the catalog."
-            )
+            raise ValueError(f"Cannot parse geography coordinate from {value!r}.")
         return None
 
     # ------------------------------------------------------------------
@@ -493,7 +484,6 @@ class GeographyType(DataType):
     def default_pyobj(self, nullable: bool) -> dict[str, float] | None:
         if nullable:
             return None
-        # WORLD at 0, 0 — always safe.
         return {"lat": 0.0, "lon": 0.0}
 
     def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
@@ -519,3 +509,80 @@ class GeographyType(DataType):
         if self.srid != DEFAULT_SRID:
             return f"geography({srid_str})"
         return "geography"
+
+
+# ---------------------------------------------------------------------------
+# Python object → {lat, lon} dict
+# ---------------------------------------------------------------------------
+
+
+def _pyobj_to_latlon(value: Any) -> dict[str, float] | None:
+    """Try every reasonable format to extract lat/lon from a Python value.
+
+    Returns ``{"lat": ..., "lon": ...}`` or None if nothing works.
+    """
+    # dict with lat/lon keys
+    if isinstance(value, dict):
+        lat = _dict_get_lat(value)
+        lon = _dict_get_lon(value)
+        if lat is not None and lon is not None:
+            return {"lat": float(lat), "lon": float(lon)}
+
+    # tuple / list of two numbers
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        try:
+            lat, lon = float(value[0]), float(value[1])
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return {"lat": lat, "lon": lon}
+        except (TypeError, ValueError):
+            pass
+
+    # string coordinate pair
+    if isinstance(value, str):
+        coord = _parse_coord_string(value)
+        if coord is not None:
+            return {"lat": coord[0], "lon": coord[1]}
+
+    # object with .lat / .lon attributes
+    lat = getattr(value, "lat", None)
+    lon = getattr(value, "lon", None) or getattr(value, "lng", None)
+    if lat is not None and lon is not None:
+        try:
+            return {"lat": float(lat), "lon": float(lon)}
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def _dict_get_lat(d: dict) -> float | None:
+    for key in ("lat", "latitude", "LAT", "LATITUDE", "Lat", "Latitude"):
+        v = d.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _dict_get_lon(d: dict) -> float | None:
+    for key in (
+        "lon",
+        "lng",
+        "long",
+        "longitude",
+        "LON",
+        "LNG",
+        "LONG",
+        "LONGITUDE",
+        "Lon",
+        "Lng",
+    ):
+        v = d.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None

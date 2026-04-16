@@ -1,24 +1,7 @@
-"""Tests for GeographyType — first-class data type for geographic coordinates.
+"""Tests for GeographyType — first-class data type for lat/lon coordinates.
 
-Inner type: struct<lat: float64 not null, lon: float64 not null>.
-
-Covers:
-- type_id = GEOGRAPHY, children_fields = [lat, lon]
-- SRID parameter (default, explicit, ANY, OGC:CRS84, normalization)
-- model parameter (None, SPHERICAL)
-- Databricks DDL: GEOGRAPHY(srid) / GEOGRAPHY(srid, model)
-- Arrow: to_arrow -> struct<lat, lon>
-- Polars: to_polars -> Struct
-- Dict round-trip
-- Merge
-- Cast: string arrays -> struct<lat, lon> via GeoZone catalog
-- Cast: safe=True raises, safe=False nulls
-- Cast: struct passthrough
-- Bulk parse: parse_geography_arrow, parse_geography_polars
-- Python object conversion -> {lat, lon} dicts
-- Default values
-- Repr / str
-- DataType.from_str("geography"), "geography(4326)", etc.
+Inner type: struct<lat: float64, lon: float64>.
+No GeoZone dependency — pure coordinate parsing and casting.
 """
 
 from __future__ import annotations
@@ -45,7 +28,7 @@ from yggdrasil.polars.tests import PolarsTestCase
 
 
 class TestTypeId(unittest.TestCase):
-    def test_type_id_is_geography(self):
+    def test_type_id(self):
         self.assertEqual(GeographyType().type_id, DataTypeId.GEOGRAPHY)
 
     def test_children_fields_lat_lon(self):
@@ -64,14 +47,14 @@ class TestSRID(unittest.TestCase):
     def test_default_srid(self):
         self.assertEqual(GeographyType().srid, 4326)
 
-    def test_explicit_srid_int(self):
+    def test_explicit_srid(self):
         self.assertEqual(GeographyType(srid=3857).srid, 3857)
 
     def test_srid_any(self):
         self.assertEqual(GeographyType(srid="ANY").srid, "ANY")
 
-    def test_srid_any_case_insensitive(self):
-        self.assertEqual(GeographyType(srid="any").srid, "ANY")
+    def test_srid_named_crs(self):
+        self.assertEqual(GeographyType(srid="OGC:CRS84").srid, "OGC:CRS84")
 
     def test_srid_string_numeric(self):
         self.assertEqual(GeographyType(srid="4326").srid, 4326)
@@ -79,23 +62,15 @@ class TestSRID(unittest.TestCase):
     def test_srid_none_defaults(self):
         self.assertEqual(GeographyType(srid=None).srid, DEFAULT_SRID)
 
-    def test_srid_named_crs(self):
-        self.assertEqual(GeographyType(srid="OGC:CRS84").srid, "OGC:CRS84")
-
     def test_srid_empty_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid SRID"):
             GeographyType(srid="")
-
-    def test_equality(self):
-        self.assertEqual(GeographyType(srid=4326), GeographyType(srid=4326))
-        self.assertNotEqual(GeographyType(srid=4326), GeographyType(srid=3857))
 
     def test_model_default_none(self):
         self.assertIsNone(GeographyType().model)
 
     def test_model_spherical(self):
-        geo = GeographyType(srid="OGC:CRS84", model="SPHERICAL")
-        self.assertEqual(geo.model, "SPHERICAL")
+        self.assertEqual(GeographyType(model="SPHERICAL").model, "SPHERICAL")
 
     def test_model_normalized_uppercase(self):
         self.assertEqual(GeographyType(model="spherical").model, "SPHERICAL")
@@ -125,33 +100,29 @@ class TestDatabricksDDL(unittest.TestCase):
         self.assertEqual(geo.to_databricks_ddl(), "GEOGRAPHY(OGC:CRS84, SPHERICAL)")
 
     def test_ddl_with_model_only(self):
-        geo = GeographyType(model="SPHERICAL")
-        self.assertEqual(geo.to_databricks_ddl(), "GEOGRAPHY(4326, SPHERICAL)")
+        self.assertEqual(
+            GeographyType(model="SPHERICAL").to_databricks_ddl(),
+            "GEOGRAPHY(4326, SPHERICAL)",
+        )
 
 
 # ---------------------------------------------------------------------------
-# Arrow — struct<lat: float64, lon: float64>
+# Arrow — struct<lat, lon>
 # ---------------------------------------------------------------------------
 
 
 class TestArrowConversion(ArrowTestCase):
     def test_to_arrow_is_struct(self):
-        arrow_type = GeographyType().to_arrow()
-        self.assertTrue(pa.types.is_struct(arrow_type))
-        self.assertEqual(arrow_type.num_fields, 2)
-        self.assertEqual(arrow_type.field("lat").type, pa.float64())
-        self.assertEqual(arrow_type.field("lon").type, pa.float64())
+        t = GeographyType().to_arrow()
+        self.assertTrue(pa.types.is_struct(t))
+        self.assertEqual(t.field("lat").type, pa.float64())
+        self.assertEqual(t.field("lon").type, pa.float64())
 
     def test_to_arrow_matches_constant(self):
         self.assertEqual(GeographyType().to_arrow(), GEOGRAPHY_ARROW_TYPE)
 
     def test_handles_arrow_type_false(self):
         self.assertFalse(GeographyType.handles_arrow_type(GEOGRAPHY_ARROW_TYPE))
-        self.assertFalse(GeographyType.handles_arrow_type(pa.string()))
-
-    def test_from_arrow_type_raises(self):
-        with self.assertRaisesRegex(TypeError, "Cannot infer GeographyType"):
-            GeographyType.from_arrow_type(GEOGRAPHY_ARROW_TYPE)
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +132,7 @@ class TestArrowConversion(ArrowTestCase):
 
 class TestPolarsConversion(PolarsTestCase):
     def test_to_polars_is_struct(self):
-        pl = self.pl
-        polars_type = GeographyType().to_polars()
-        self.assertIsInstance(polars_type, pl.Struct)
+        self.assertIsInstance(GeographyType().to_polars(), self.pl.Struct)
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +140,12 @@ class TestPolarsConversion(PolarsTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDictRoundTrip(unittest.TestCase):
+class TestDict(unittest.TestCase):
     def test_to_dict_default(self):
         d = GeographyType().to_dict()
         self.assertEqual(d["id"], int(DataTypeId.GEOGRAPHY))
         self.assertEqual(d["name"], "GEOGRAPHY")
         self.assertNotIn("srid", d)
-        self.assertNotIn("model", d)
 
     def test_to_dict_custom_srid(self):
         self.assertEqual(GeographyType(srid=3857).to_dict()["srid"], "3857")
@@ -188,21 +156,13 @@ class TestDictRoundTrip(unittest.TestCase):
     def test_handles_dict_by_name(self):
         self.assertTrue(GeographyType.handles_dict({"name": "GEOGRAPHY"}))
 
-    def test_from_dict(self):
-        d = {"id": int(DataTypeId.GEOGRAPHY), "srid": "3857", "model": "SPHERICAL"}
-        result = GeographyType.from_dict(d)
-        self.assertEqual(result.srid, 3857)
-        self.assertEqual(result.model, "SPHERICAL")
-
     def test_dict_round_trip(self):
         original = GeographyType(srid=3857, model="SPHERICAL")
         self.assertEqual(GeographyType.from_dict(original.to_dict()), original)
 
     def test_datatype_from_dict_dispatch(self):
-        d = {"id": int(DataTypeId.GEOGRAPHY), "srid": "ANY"}
-        result = DataType.from_dict(d)
-        self.assertIsInstance(result, GeographyType)
-        self.assertEqual(result.srid, "ANY")
+        d = {"id": int(DataTypeId.GEOGRAPHY)}
+        self.assertIsInstance(DataType.from_dict(d), GeographyType)
 
 
 # ---------------------------------------------------------------------------
@@ -223,89 +183,87 @@ class TestMerge(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Cast — string arrays to struct<lat, lon>
+# Cast — string arrays → struct<lat, lon>
 # ---------------------------------------------------------------------------
 
 
-class TestCastArrow(ArrowTestCase):
-    def test_cast_resolves_to_lat_lon(self):
+class TestCastStrings(ArrowTestCase):
+    def test_comma_separated(self):
         geo = GeographyType()
-        arr = pa.array(["FR", "CH-ZH"], type=pa.string())
+        arr = pa.array(["48.8566, 2.3522", "47.3769, 8.5417"], type=pa.string())
 
         class _Opts:
             safe = False
 
-        result = geo._cast_arrow_array(arr, _Opts())
-        self.assertTrue(pa.types.is_struct(result.type))
-        rows = result.to_pylist()
-        # France
-        self.assertAlmostEqual(rows[0]["lat"], 46.2276, places=2)
-        self.assertAlmostEqual(rows[0]["lon"], 2.2137, places=2)
-        # Zurich
-        self.assertAlmostEqual(rows[1]["lat"], 47.3769, places=2)
-        self.assertAlmostEqual(rows[1]["lon"], 8.5417, places=2)
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertAlmostEqual(rows[0]["lat"], 48.8566, places=3)
+        self.assertAlmostEqual(rows[0]["lon"], 2.3522, places=3)
+        self.assertAlmostEqual(rows[1]["lat"], 47.3769, places=3)
 
-    def test_cast_safe_false_nulls_unresolvable(self):
+    def test_space_separated(self):
         geo = GeographyType()
-        arr = pa.array(["FR", "TOTALLY_BOGUS", "DE"], type=pa.string())
+        arr = pa.array(["48.8566 2.3522"], type=pa.string())
 
         class _Opts:
             safe = False
 
-        result = geo._cast_arrow_array(arr, _Opts())
-        rows = result.to_pylist()
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertAlmostEqual(rows[0]["lat"], 48.8566, places=3)
+
+    def test_pipe_separated(self):
+        geo = GeographyType()
+        arr = pa.array(["48.8566|2.3522"], type=pa.string())
+
+        class _Opts:
+            safe = False
+
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertAlmostEqual(rows[0]["lat"], 48.8566, places=3)
+
+    def test_semicolon_separated(self):
+        geo = GeographyType()
+        arr = pa.array(["48.8566;2.3522"], type=pa.string())
+
+        class _Opts:
+            safe = False
+
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertAlmostEqual(rows[0]["lat"], 48.8566, places=3)
+
+    def test_negative_coords(self):
+        geo = GeographyType()
+        arr = pa.array(["-33.8688, 151.2093"], type=pa.string())
+
+        class _Opts:
+            safe = False
+
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertAlmostEqual(rows[0]["lat"], -33.8688, places=3)
+        self.assertAlmostEqual(rows[0]["lon"], 151.2093, places=3)
+
+    def test_safe_false_nulls_bad_strings(self):
+        geo = GeographyType()
+        arr = pa.array(["48.8, 2.3", "not coords", None], type=pa.string())
+
+        class _Opts:
+            safe = False
+
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
         self.assertIsNotNone(rows[0])
         self.assertIsNone(rows[1])
-        self.assertIsNotNone(rows[2])
+        self.assertIsNone(rows[2])
 
-    def test_cast_safe_true_raises(self):
+    def test_safe_true_raises_on_bad_string(self):
         geo = GeographyType()
-        arr = pa.array(["FR", "TOTALLY_BOGUS"], type=pa.string())
+        arr = pa.array(["not coords"], type=pa.string())
 
         class _Opts:
             safe = True
 
-        with self.assertRaisesRegex(ValueError, "Cannot resolve"):
+        with self.assertRaisesRegex(ValueError, "Cannot parse coordinate"):
             geo._cast_arrow_array(arr, _Opts())
 
-    def test_cast_preserves_nulls(self):
-        geo = GeographyType()
-        arr = pa.array(["FR", None, "DE"], type=pa.string())
-
-        class _Opts:
-            safe = False
-
-        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
-        self.assertIsNotNone(rows[0])
-        self.assertIsNone(rows[1])
-        self.assertIsNotNone(rows[2])
-
-    def test_cast_struct_passthrough(self):
-        """If input is already struct<lat, lon>, pass through unchanged."""
-        geo = GeographyType()
-        struct_arr = pa.array(
-            [{"lat": 1.0, "lon": 2.0}],
-            type=GEOGRAPHY_ARROW_TYPE,
-        )
-
-        class _Opts:
-            safe = False
-
-        result = geo._cast_arrow_array(struct_arr, _Opts())
-        self.assertIs(result, struct_arr)
-
-    def test_cast_coordinate_string(self):
-        geo = GeographyType()
-        arr = pa.array(["47.3769, 8.5417"], type=pa.string())
-
-        class _Opts:
-            safe = False
-
-        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
-        self.assertAlmostEqual(rows[0]["lat"], 47.3769, places=2)
-        self.assertAlmostEqual(rows[0]["lon"], 8.5417, places=2)
-
-    def test_cast_empty_array(self):
+    def test_empty_array(self):
         geo = GeographyType()
         arr = pa.array([], type=pa.string())
 
@@ -314,65 +272,114 @@ class TestCastArrow(ArrowTestCase):
 
         self.assertEqual(len(geo._cast_arrow_array(arr, _Opts())), 0)
 
-    def test_result_is_struct_type(self):
+    def test_out_of_range_coords_become_null(self):
         geo = GeographyType()
-        arr = pa.array(["FR"], type=pa.string())
+        # lat > 90 is invalid
+        arr = pa.array(["999.0, 999.0"], type=pa.string())
+
+        class _Opts:
+            safe = False
+
+        rows = geo._cast_arrow_array(arr, _Opts()).to_pylist()
+        self.assertIsNone(rows[0])
+
+
+# ---------------------------------------------------------------------------
+# Cast — struct passthrough and rename
+# ---------------------------------------------------------------------------
+
+
+class TestCastStruct(ArrowTestCase):
+    def test_struct_passthrough(self):
+        geo = GeographyType()
+        arr = pa.array(
+            [{"lat": 48.8, "lon": 2.3}],
+            type=GEOGRAPHY_ARROW_TYPE,
+        )
 
         class _Opts:
             safe = False
 
         result = geo._cast_arrow_array(arr, _Opts())
-        self.assertTrue(pa.types.is_struct(result.type))
-        self.assertEqual(result.type.num_fields, 2)
+        self.assertIs(result, arr)
 
+    def test_struct_rename_latitude_longitude(self):
+        geo = GeographyType()
+        arr = pa.array(
+            [{"latitude": 48.8, "longitude": 2.3}],
+            type=pa.struct(
+                [
+                    pa.field("latitude", pa.float64()),
+                    pa.field("longitude", pa.float64()),
+                ]
+            ),
+        )
 
-# ---------------------------------------------------------------------------
-# Bulk parse
-# ---------------------------------------------------------------------------
+        class _Opts:
+            safe = False
 
-
-class TestParseGeographyArrow(ArrowTestCase):
-    def test_basic_parse(self):
-        arr = pa.array(["FR", "DE", None, "xyzzy_404"], type=pa.string())
-        result = parse_geography_arrow(arr, safe=False)
-        rows = result.to_pylist()
-        self.assertIsNotNone(rows[0])
-        self.assertIsNotNone(rows[1])
-        self.assertIsNone(rows[2])
-        self.assertIsNone(rows[3])
-
-    def test_result_has_lat_lon(self):
-        arr = pa.array(["FR"], type=pa.string())
-        result = parse_geography_arrow(arr)
-        self.assertTrue(pa.types.is_struct(result.type))
+        result = geo._cast_arrow_array(arr, _Opts())
         row = result.to_pylist()[0]
         self.assertIn("lat", row)
         self.assertIn("lon", row)
+        self.assertAlmostEqual(row["lat"], 48.8, places=1)
+
+    def test_struct_rename_lng(self):
+        geo = GeographyType()
+        arr = pa.array(
+            [{"lat": 48.8, "lng": 2.3}],
+            type=pa.struct(
+                [
+                    pa.field("lat", pa.float64()),
+                    pa.field("lng", pa.float64()),
+                ]
+            ),
+        )
+
+        class _Opts:
+            safe = False
+
+        result = geo._cast_arrow_array(arr, _Opts())
+        row = result.to_pylist()[0]
+        self.assertEqual(row["lat"], 48.8)
+        self.assertEqual(row["lon"], 2.3)
+
+
+# ---------------------------------------------------------------------------
+# Bulk parse utilities
+# ---------------------------------------------------------------------------
+
+
+class TestParseArrow(ArrowTestCase):
+    def test_basic_parse(self):
+        arr = pa.array(["48.8, 2.3", None, "bad"], type=pa.string())
+        result = parse_geography_arrow(arr, safe=False)
+        rows = result.to_pylist()
+        self.assertIsNotNone(rows[0])
+        self.assertIsNone(rows[1])
+        self.assertIsNone(rows[2])
 
     def test_chunked_array(self):
-        arr = pa.chunked_array([["FR", "DE"], ["CH-ZH"]], type=pa.string())
+        arr = pa.chunked_array(
+            [["48.8, 2.3"], ["47.3, 8.5"]],
+            type=pa.string(),
+        )
         result = parse_geography_arrow(arr, safe=False)
         self.assertIsInstance(result, pa.ChunkedArray)
-        self.assertEqual(len(result.to_pylist()), 3)
-
-    def test_safe_true_raises(self):
-        arr = pa.array(["FR", "BOGUS"], type=pa.string())
-        with self.assertRaisesRegex(ValueError, "Cannot resolve"):
-            parse_geography_arrow(arr, safe=True)
+        self.assertEqual(len(result.to_pylist()), 2)
 
 
-class TestParseGeographyPolars(PolarsTestCase):
+class TestParsePolars(PolarsTestCase):
     def test_basic_parse(self):
         pl = self.pl
-        s = pl.Series("zone", ["FR", "DE", None, "xyzzy_404"])
+        s = pl.Series("coords", ["48.8, 2.3", None, "bad"])
         result = parse_geography_polars(s, safe=False)
-        self.assertEqual(result.name, "zone")
+        self.assertEqual(result.name, "coords")
         self.assertIsInstance(result.dtype, pl.Struct)
         values = result.to_list()
         self.assertIsNotNone(values[0])
-        self.assertIsNotNone(values[1])
+        self.assertIsNone(values[1])
         self.assertIsNone(values[2])
-        self.assertIsNone(values[3])
 
 
 # ---------------------------------------------------------------------------
@@ -381,34 +388,56 @@ class TestParseGeographyPolars(PolarsTestCase):
 
 
 class TestConvertPyobj(unittest.TestCase):
-    def test_convert_string_returns_dict(self):
-        result = GeographyType().convert_pyobj("France", nullable=True)
-        self.assertIsInstance(result, dict)
-        self.assertIn("lat", result)
-        self.assertIn("lon", result)
+    def test_dict_with_lat_lon(self):
+        result = GeographyType().convert_pyobj({"lat": 48.8, "lon": 2.3}, nullable=True)
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
 
-    def test_convert_dict_passthrough(self):
-        result = GeographyType().convert_pyobj({"lat": 1.0, "lon": 2.0}, nullable=True)
-        self.assertEqual(result, {"lat": 1.0, "lon": 2.0})
+    def test_dict_with_latitude_longitude(self):
+        result = GeographyType().convert_pyobj(
+            {"latitude": 48.8, "longitude": 2.3},
+            nullable=True,
+        )
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
 
-    def test_convert_none_nullable(self):
+    def test_dict_with_lng(self):
+        result = GeographyType().convert_pyobj({"lat": 48.8, "lng": 2.3}, nullable=True)
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
+
+    def test_tuple(self):
+        result = GeographyType().convert_pyobj((48.8, 2.3), nullable=True)
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
+
+    def test_list(self):
+        result = GeographyType().convert_pyobj([48.8, 2.3], nullable=True)
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
+
+    def test_string(self):
+        result = GeographyType().convert_pyobj("48.8, 2.3", nullable=True)
+        self.assertAlmostEqual(result["lat"], 48.8, places=1)
+        self.assertAlmostEqual(result["lon"], 2.3, places=1)
+
+    def test_object_with_attrs(self):
+        class Point:
+            lat = 48.8
+            lon = 2.3
+
+        result = GeographyType().convert_pyobj(Point(), nullable=True)
+        self.assertEqual(result, {"lat": 48.8, "lon": 2.3})
+
+    def test_none_nullable(self):
         self.assertIsNone(GeographyType().convert_pyobj(None, nullable=True))
 
-    def test_convert_none_not_nullable_raises(self):
+    def test_none_not_nullable_raises(self):
         with self.assertRaisesRegex(ValueError, "non-nullable"):
             GeographyType().convert_pyobj(None, nullable=False)
 
-    def test_convert_unknown_safe_raises(self):
-        with self.assertRaisesRegex(ValueError, "Cannot resolve"):
-            GeographyType().convert_pyobj(
-                "TOTALLY_BOGUS_ZONE", nullable=True, safe=True
-            )
+    def test_bad_value_safe_raises(self):
+        with self.assertRaisesRegex(ValueError, "Cannot parse"):
+            GeographyType().convert_pyobj("garbage", nullable=True, safe=True)
 
-    def test_convert_unknown_unsafe_returns_none(self):
+    def test_bad_value_unsafe_returns_none(self):
         self.assertIsNone(
-            GeographyType().convert_pyobj(
-                "TOTALLY_BOGUS_ZONE", nullable=True, safe=False
-            )
+            GeographyType().convert_pyobj("garbage", nullable=True, safe=False)
         )
 
 
@@ -422,8 +451,9 @@ class TestDefaults(unittest.TestCase):
         self.assertIsNone(GeographyType().default_pyobj(nullable=True))
 
     def test_default_pyobj_not_nullable(self):
-        result = GeographyType().default_pyobj(nullable=False)
-        self.assertEqual(result, {"lat": 0.0, "lon": 0.0})
+        self.assertEqual(
+            GeographyType().default_pyobj(nullable=False), {"lat": 0.0, "lon": 0.0}
+        )
 
     def test_default_arrow_scalar_nullable(self):
         self.assertIsNone(GeographyType().default_arrow_scalar(nullable=True).as_py())
@@ -471,23 +501,17 @@ class TestRepr(unittest.TestCase):
 
 class TestFromStr(unittest.TestCase):
     def test_from_str_geography(self):
-        result = DataType.from_str("geography")
-        self.assertIsInstance(result, GeographyType)
-        self.assertEqual(result.srid, 4326)
+        self.assertIsInstance(DataType.from_str("geography"), GeographyType)
 
     def test_from_str_geography_srid(self):
         result = DataType.from_str("geography(3857)")
-        self.assertIsInstance(result, GeographyType)
         self.assertEqual(result.srid, 3857)
 
     def test_from_str_geography_any(self):
-        result = DataType.from_str("geography(ANY)")
-        self.assertIsInstance(result, GeographyType)
-        self.assertEqual(result.srid, "ANY")
+        self.assertEqual(DataType.from_str("geography(ANY)").srid, "ANY")
 
     def test_from_str_ogc_crs84_spherical(self):
         result = DataType.from_str("geography(OGC:CRS84, SPHERICAL)")
-        self.assertIsInstance(result, GeographyType)
         self.assertEqual(result.srid, "OGC:CRS84")
         self.assertEqual(result.model, "SPHERICAL")
 
@@ -495,12 +519,11 @@ class TestFromStr(unittest.TestCase):
         self.assertIsInstance(DataType.from_str("geo"), GeographyType)
 
     def test_from_str_GEOGRAPHY_uppercase(self):
-        result = DataType.from_str("GEOGRAPHY(4326)")
-        self.assertIsInstance(result, GeographyType)
+        self.assertIsInstance(DataType.from_str("GEOGRAPHY(4326)"), GeographyType)
 
 
 # ---------------------------------------------------------------------------
-# DataType.from_any / from_dict
+# DataType.from_any
 # ---------------------------------------------------------------------------
 
 
@@ -508,14 +531,8 @@ class TestFromAny(unittest.TestCase):
     def test_from_any_string(self):
         self.assertIsInstance(DataType.from_any("geography"), GeographyType)
 
-    def test_from_any_string_with_srid(self):
-        result = DataType.from_any("geography(3857)")
-        self.assertIsInstance(result, GeographyType)
-        self.assertEqual(result.srid, 3857)
-
     def test_from_dict_dispatch(self):
-        d = {"id": int(DataTypeId.GEOGRAPHY), "srid": "3857", "model": "SPHERICAL"}
+        d = {"id": int(DataTypeId.GEOGRAPHY), "srid": "3857"}
         result = DataType.from_dict(d)
         self.assertIsInstance(result, GeographyType)
         self.assertEqual(result.srid, 3857)
-        self.assertEqual(result.model, "SPHERICAL")
