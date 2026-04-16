@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, MutableMapping
 from dataclasses import dataclass, field as dc_field, field
@@ -417,8 +418,19 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         self,
         tags: dict[AnyStr, AnyStr] | None = None,
     ):
+        primary_key_names = set()
+        if self.metadata:
+            primary_key_names: bytes | None = self.metadata.pop(b"primary_key", None)
+            if primary_key_names:
+                if primary_key_names.startswith(b"[") and primary_key_names.endswith(b"]"):
+                    primary_key_names = set(json.loads(primary_key_names))
+                else:
+                    primary_key_names = primary_key_names.decode().split(".")
+
         inner_fields = OrderedDict()
         for name, f in self.inner_fields.items():
+            if name in primary_key_names:
+                f.with_primary_key(True, inplace=True)
             inner_fields[name] = f.autotag()
 
         self.update_tags(tags)

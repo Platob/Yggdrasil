@@ -30,8 +30,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource, DatabricksService
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-
-from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
     from .schema import Schema
@@ -62,9 +61,9 @@ class Catalog(DatabricksResource):
 
     # ── identity ──────────────────────────────────────────────────────────────
 
-    def full_name(self) -> str:
+    def full_name(self, safe: bool = None) -> str:
         """Return the catalog name (single-part identifier)."""
-        return self.catalog_name
+        return quote_ident(self.catalog_name) if safe else self.catalog_name
 
     def __repr__(self) -> str:
         return f"Catalog<{self.url.to_string()!r}>"

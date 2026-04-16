@@ -90,6 +90,7 @@ This module is intended to be safe by default:
 - Spark and SQL paths follow the same overwrite and merge rules
 """
 
+
 from __future__ import annotations
 
 import logging
@@ -99,6 +100,7 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union, Iterable,
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.databricks.sql.sql_utils import quote_ident
@@ -109,7 +111,9 @@ from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.parquet_io import ParquetOptions
 from yggdrasil.io.enums import SaveMode
 from yggdrasil.io.enums.media_type import MediaTypes
-
+from .catalogs import Catalogs
+from .grants import Grants
+from .schemas import Schemas
 from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
 from .statement_result import StatementResult
@@ -206,6 +210,25 @@ class SQLEngine(DatabricksService):
     )
 
     @property
+    def catalogs(self) -> "Catalogs":
+        """
+        Return the `Catalogs` service scoped to this engine's catalog and schema.
+        """
+        return Catalogs(
+            client=self.client,
+        )
+
+    @property
+    def schemas(self) -> "Schemas":
+        """
+        Return the `Schemas` service scoped to this engine's catalog and schema.
+        """
+        return Schemas(
+            client=self.client,
+            catalog_name=self.catalog_name,
+        )
+
+    @property
     def tables(self) -> Tables:
         """
         Return the `Tables` service scoped to this engine's catalog and schema.
@@ -214,6 +237,15 @@ class SQLEngine(DatabricksService):
             client=self.client,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
+        )
+
+    @property
+    def grants(self) -> Grants:
+        """
+        Return the `Grants` service scoped to this engine's catalog and schema.
+        """
+        return Grants(
+            client=self.client,
         )
 
     def __call__(
@@ -536,6 +568,9 @@ class SQLEngine(DatabricksService):
                 If Spark execution is requested and no SparkSession can be
                 resolved.
         """
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
         if not engine:
             spark_session = (
                 PyEnv.spark_session(
@@ -905,9 +940,9 @@ class SQLEngine(DatabricksService):
         if mode == SaveMode.OVERWRITE:
             table.delete(wait=True, raise_error=False)
 
-        table = table.ensure_created(
+        table = table.create(
             data,
-            schema_mode=schema_mode,
+            mode=schema_mode,
             primary_keys=primary_keys, foreign_keys=foreign_keys
         )
         location = table.full_name(safe=True)

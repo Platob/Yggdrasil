@@ -147,7 +147,14 @@ class ParsedDataType:
         default: DataTypeId = DataTypeId.OBJECT,
     ) -> "ParsedDataType":
         parser = _Parser(value, raise_error=raise_error, default=default)
-        result = parser.parse()
+
+        try:
+            result = parser.parse()
+        except ValueError as e:
+            raise ValueError(
+                f"Failed to parse DataType string {value!r} as a DataType: {e}"
+            ) from e
+
         if isinstance(result, ParsedDataType):
             return result
         return cls(type_id=default, metadata=DataTypeMetadata())

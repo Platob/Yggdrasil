@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union, TYPE_CHECKING, Mapping, Iterable
 
 import pyarrow as pa
-from databricks.sdk.client_types import HostType
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
     TableInfo,
@@ -35,6 +34,7 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.schema import Schema as DataSchema
@@ -45,7 +45,6 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
-
 from .column import Column
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
@@ -67,7 +66,6 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.tables import Tables
     from yggdrasil.databricks.sql.catalog import Catalog
     from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
-    from yggdrasil.databricks.sql.columns import Columns
 
 __all__ = ["Table"]
 
@@ -167,7 +165,10 @@ class Table(DatabricksResource):
 
     @property
     def sql(self) -> "SQLEngine":
-        return self.client.sql
+        return self.client.sql(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name
+        )
 
     @property
     def catalog(self) -> "Catalog":
@@ -219,26 +220,16 @@ class Table(DatabricksResource):
     # =========================================================================
 
     def _reset_cache(self, invalidate_cache: bool = False) -> None:
+        if invalidate_cache:
+            self.sql.tables.invalidate_cached_table(table=self)
+
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
 
-        if invalidate_cache:
-            self.sql.tables.invalidate_cached_table(table=self)
-
     def clear(self) -> "Table":
         self._reset_cache()
         return self
-
-    # =========================================================================
-    # Remote fetchers — single responsibility, no caching inside
-    # =========================================================================
-
-    def _fetch_columns_remote(self) -> list[Column]:
-        return [
-            Column.from_api(table=self, infos=col_info)
-            for col_info in self.infos.columns
-        ]
 
     # =========================================================================
     # Databricks SDK — lazy-loaded properties
@@ -256,31 +247,29 @@ class Table(DatabricksResource):
     def table_id(self) -> str:
         return self.infos.table_id
 
+    def _cache_expired(self) -> bool:
+        if self._infos is None:
+            return True
+        now = time.time()
+        age = now - (self._infos_fetched_at or 0.0)
+        return age >= INFOS_TTL
+
     @property
     def infos(self) -> TableInfo:
-        now = time.time()
-
-        if self._infos is not None:
-            age = now - (self._infos_fetched_at or 0.0)
-            if age < INFOS_TTL:
-                logger.debug(
-                    "Cache hit [Table._infos] table=%s table_id=%s age=%.0fs",
-                    self.full_name(), self._infos.table_id, age,
-                )
-                return self._infos
-            logger.debug(
-                "Cache expired [Table._infos] table=%s age=%.0fs ttl=%.0fs — refreshing",
-                self.full_name(), age, INFOS_TTL,
+        if self._cache_expired():
+            infos = self.client.tables.find_table_remote(
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                table_name=self.table_name,
             )
 
-        infos = self.client.tables.find_table_remote(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-            table_name=self.table_name,
-        )
-
-        object.__setattr__(self, "_infos", infos)
-        object.__setattr__(self, "_infos_fetched_at", now)
+            self._reset_cache()
+            object.__setattr__(self, "_infos", infos)
+            object.__setattr__(self, "_infos_fetched_at", time.time())
+            object.__setattr__(self, "_columns", [
+                Column.from_api(table=self, infos=col_info)
+                for col_info in self.infos.columns
+            ])
         return self._infos
 
     # =========================================================================
@@ -289,15 +278,9 @@ class Table(DatabricksResource):
 
     @property
     def columns(self) -> list[Column]:
-        if self._columns is not None:
-            logger.debug(
-                "Cache hit [Table._columns] table=%s count=%d",
-                self.full_name(), len(self._columns),
-            )
-            return self._columns
-
-        columns = self._fetch_columns_remote()
-        object.__setattr__(self, "_columns", columns)
+        if self._columns is None:
+            # Refresh the cache if needed to ensure we have the latest column infos.
+            _ = self.infos
         return self._columns
 
     def column(
@@ -306,29 +289,21 @@ class Table(DatabricksResource):
         safe: bool = False,
         raise_error: bool = True
     ) -> Column:
-        for col in self.columns:
+        columns = self.columns
+
+        for col in columns:
             if col.name == name:
                 return col
 
         if not safe:
             case_folded = name.casefold()
-            for col in self.columns:
+            for col in columns:
                 if col.name.casefold() == case_folded:
                     return col
 
         if raise_error:
             raise ValueError(f"Column {name!r} not found in {self!r}")
         return None
-
-    @property
-    def columns_service(self) -> "Columns":
-        from .columns import Columns
-        return Columns(
-            client=self.client,
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-            table_name=self.table_name,
-        )
 
     @property
     def data_schema(self) -> DataSchema:
@@ -473,54 +448,33 @@ class Table(DatabricksResource):
         self,
         definition: Union[pa.Schema, Any, None],
         *,
-        schema_mode: SaveMode | None = None,
-        storage_location: str | None = None,
-        comment: str | None = None,
-        properties: Optional[dict[str, str]] = None,
-        table_type: TableType | None = None,
-        data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
-        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
-        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        mode: SaveMode | str | None = None,
+        **options
     ) -> "Table":
-        definition = DataSchema.from_(definition)
-
-        if self.exists:
-            if schema_mode is not None:
-                existing = self.data_schema
-                merged = existing.merge_with(
-                    definition,
-                    mode=schema_mode, downcast=False, upcast=False,
-                )
-                return self.update_columns(merged.children_fields)
-            return self
-
-        if definition is None:
-            _ = self.infos
-
         return self.create(
             definition=definition,
-            storage_location=storage_location,
-            comment=comment,
-            properties=properties,
-            table_type=table_type,
-            data_source_format=data_source_format,
-            if_not_exists=True,
-            primary_keys=primary_keys,
-            foreign_keys=foreign_keys,
+            mode=mode,
+            **options,
         )
 
     def update_column(
         self,
         column: Field,
+        *,
+        mode: SaveMode | str | None = None,
     ):
         return self.update_columns(
             [column],
+            mode=mode,
         )
 
     def update_columns(
         self,
         columns: Iterable[Field],
+        *,
+        mode: SaveMode | str | None = None,
     ):
+        mode = SaveMode.parse(mode, SaveMode.AUTO)
         statements: list[str] = []
         add_columns: list[str] = []
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
@@ -534,7 +488,7 @@ class Table(DatabricksResource):
                 add_columns.append(
                     f"`{data_field.name}` {data_field.dtype.to_databricks_ddl()}"
                 )
-            else:
+            elif mode in (SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO):
                 if existing.name != data_field.name:
                     statements.append(
                         f"{alter_table} RENAME COLUMN `{existing.name}` TO `{data_field.name}`"
@@ -553,6 +507,7 @@ class Table(DatabricksResource):
         self,
         definition: Union[pa.Schema, Any],
         *,
+        mode: SaveMode | str | None = None,
         partition_by: Optional[list[str]] = None,
         storage_location: str | None = None,
         comment: str | None = None,
@@ -572,11 +527,24 @@ class Table(DatabricksResource):
             - creates the table first
             - then applies PK/FK via ALTER TABLE fallback
         """
+        mode = SaveMode.parse(mode, SaveMode.AUTO)
+        schema = DataSchema.from_(definition)
+
+        if self.exists:
+            if mode == SaveMode.ERROR_IF_EXISTS:
+                raise ValueError(f"Table {self!r} already exists")
+            elif mode == SaveMode.IGNORE:
+                return self
+            return self.update_columns(
+                schema.fields,
+                mode=mode,
+            )
+
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
         if table_type == TableType.MANAGED:
-            self.sql_create(
+            return self.sql_create(
                 definition,
                 comment=comment,
                 partition_by=partition_by,
@@ -584,26 +552,23 @@ class Table(DatabricksResource):
                 primary_keys=primary_keys,
                 foreign_keys=foreign_keys,
             )
-        else:
-            if table_type == TableType.EXTERNAL and not storage_location:
-                storage_location = (
-                    self.schema_storage_location(table_type=table_type)
-                    + "/tables/%s" % self.table_name
-                )
-            return self.api_create(
-                definition=definition,
-                storage_location=storage_location,
-                comment=comment,
-                properties=properties,
-                table_type=table_type,
-                data_source_format=data_source_format,
-                if_not_exists=if_not_exists,
-                primary_keys=primary_keys,
-                foreign_keys=foreign_keys,
-            )
 
-        self._reset_cache()
-        return self
+        if table_type == TableType.EXTERNAL and not storage_location:
+            storage_location = (
+                self.schema_storage_location(table_type=table_type)
+                + "/tables/%s" % self.table_name
+            )
+        return self.api_create(
+            definition=definition,
+            storage_location=storage_location,
+            comment=comment,
+            properties=properties,
+            table_type=table_type,
+            data_source_format=data_source_format,
+            if_not_exists=if_not_exists,
+            primary_keys=primary_keys,
+            foreign_keys=foreign_keys,
+        )
 
     def sql_create(
         self,
@@ -634,7 +599,7 @@ class Table(DatabricksResource):
         PK columns are forced to NOT NULL in the column definition to match
         Databricks requirements for primary keys.
         """
-        schema_info = DataSchema.from_any(description)
+        schema_info = DataSchema.from_any(description).autotag()
         partition_by = partition_by or schema_info.partition_by
         cluster_by = cluster_by or schema_info.cluster_by
         primary_keys = primary_keys or schema_info.primary_key_names
@@ -733,14 +698,14 @@ class Table(DatabricksResource):
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 self.sql.execute(
-                    f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.schema_name)}",
+                    f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
                     wait=True,
                 )
                 self.sql.execute(statement, wait=wait_result)
             else:
                 raise
 
-        self._reset_cache()
+        self._reset_cache(invalidate_cache=True)
 
         if schema_info.tags:
             self.set_tags(schema_info.tags)
@@ -763,66 +728,8 @@ class Table(DatabricksResource):
         primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
-        """Create table via the Unity Catalog REST API.
-
-        Constraints are still applied afterward via ALTER TABLE because this
-        implementation uses the table-create REST payload and not the dedicated
-        table-constraints API.
-        """
-        schema_info = DataSchema.from_any(definition)
-        comment = comment or schema_info.comment
-
-        columns = [
-            arrow_field_to_column_info(field=f.to_arrow_field(), position=pos)
-            for pos, f in enumerate(schema_info.children_fields)
-        ]
-
-        body: dict[str, Any] = {
-            "catalog_name":       self.catalog_name,
-            "schema_name":        self.schema_name,
-            "name":               self.table_name,
-            "table_type":         table_type.value,
-            "data_source_format": data_source_format.value,
-            "columns":            [c.as_dict() for c in columns],
-        }
-        if storage_location is not None:
-            body["storage_location"] = storage_location
-        if comment is not None:
-            body["comment"] = comment
-        if properties:
-            body["properties"] = properties
-
-        headers = {
-            "Accept":       "application/json",
-            "Content-Type": "application/json",
-        }
-
-        uc = self.client.workspace_client().tables
-        cfg = uc._api._cfg # noqa
-        if cfg.host_type == HostType.UNIFIED and cfg.workspace_id:
-            headers["X-Databricks-Org-Id"] = cfg.workspace_id
-
-        try:
-            res = uc._api.do( # noqa
-                "POST", "/api/2.1/unity-catalog/tables",
-                body=body, headers=headers,
-            )
-            info = TableInfo.from_dict(res)
-            object.__setattr__(self, "_infos", info)
-        except DatabricksError as exc:
-            if "already exists" in str(exc):
-                if not if_not_exists:
-                    raise
-            else:
-                raise
-
-        self._reset_cache(invalidate_cache=True)
-
-        pk_spec = PrimaryKeySpec.from_any(primary_keys, schema=schema_info)
-        fk_specs = ForeignKeySpec.from_any(foreign_keys, schema=schema_info)
-        self._apply_constraints(pk_spec, fk_specs)
-
-        return self
+        # TODO: support for table_type=TableType.EXTERNAL
+        raise NotImplementedError("API path not implemented for SQL tables.")
 
     def _apply_constraints(
         self,

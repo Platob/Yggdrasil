@@ -14,7 +14,7 @@ from yggdrasil.data import Schema
 class PrimaryKeySpec:
     columns: list[str]
     constraint_name: str | None = None
-    rely: bool = False
+    rely: bool = True
     timeseries: str | None = None
 
     @classmethod
@@ -26,6 +26,7 @@ class PrimaryKeySpec:
         rely: bool | None = None,
         timeseries: str | None = None
     ) -> PrimaryKeySpec | None:
+        rely = True if rely is None else bool(rely)
         info = Schema.from_any(schema)
         fields = [f for f in info.fields if f.name in info.primary_key_names]
 
@@ -41,7 +42,7 @@ class PrimaryKeySpec:
         return cls(
             columns=[f.name for f in fields],
             constraint_name=constraint_name,
-            rely=bool(rely),
+            rely=rely,
             timeseries=timeseries,
         )
 
@@ -51,9 +52,10 @@ class PrimaryKeySpec:
         value: str,
         *,
         constraint_name: str | None = None,
-        rely: bool = False,
+        rely: bool | None = None,
         timeseries: str | None = None,
     ) -> PrimaryKeySpec:
+        rely = True if rely is None else bool(rely)
         value = str(value).strip()
         if not value:
             raise ValueError("Primary key column string cannot be empty")
@@ -75,6 +77,8 @@ class PrimaryKeySpec:
         rely: bool | None = None,
         timeseries: str | None = None,
     ) -> PrimaryKeySpec | None:
+        rely = True if rely is None else bool(rely)
+
         if isinstance(value, cls):
             return value
 

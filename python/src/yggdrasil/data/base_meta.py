@@ -129,6 +129,12 @@ class BaseMetadata(ABC):
             return None
         return self.metadata.get(TAG_PREFIX + _to_bytes(key))
 
+    def _set_tag_value(self, key: bytes | str, value: Any | None) -> None:
+        if value is not None:
+            if not self.metadata:
+                object.__setattr__(self, "metadata", {})
+            self.metadata[TAG_PREFIX + _to_bytes(key)] = _to_bytes(value)
+
     def _tag_flag(self, key: bytes | str) -> bool:
         value = self._tag_value(key)
         return bool(value and value.startswith(b"t"))

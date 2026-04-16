@@ -189,7 +189,6 @@ def _build_pk_constraint_sql(pk_spec: Any) -> str | None:
         parts.append(f"CONSTRAINT {quote_ident(pk_spec.constraint_name)}")
 
     parts.append(f"PRIMARY KEY ({', '.join(cols)})")
-    parts.append("NOT ENFORCED")
 
     if getattr(pk_spec, "rely", False):
         parts.append("RELY")

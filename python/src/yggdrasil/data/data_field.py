@@ -418,13 +418,37 @@ class Field(BaseMetadata, BaseChildrenFields):
     def partition_by(self) -> bool:
         return self._tag_flag(b"partition_by")
 
+    @partition_by.setter
+    def partition_by(self, value: bool) -> None:
+        if value:
+            self._set_tag_value(b"partition_by", True)
+
     @property
     def cluster_by(self) -> bool:
         return self._tag_flag(b"cluster_by")
 
+    @cluster_by.setter
+    def cluster_by(self, value: bool) -> None:
+        if value:
+            self._set_tag_value(b"cluster_by", True)
+
     @property
     def primary_key(self) -> bool:
         return self._tag_flag(b"primary_key")
+
+    @primary_key.setter
+    def primary_key(self, value: bool) -> None:
+        if value:
+            self._set_tag_value(b"primary_key", True)
+
+    def with_primary_key(self, value: bool = True, inplace: bool = True) -> "Field":
+        if value:
+            if inplace:
+                self._set_tag_value(b"primary_key", True)
+                return self
+            else:
+                return self.copy(tags={b"primary_key": True})
+        return self
 
     @property
     def foreign_key(self) -> str | None:

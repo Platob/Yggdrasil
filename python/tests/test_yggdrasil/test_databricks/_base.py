@@ -60,9 +60,7 @@ class DatabricksCase(unittest.TestCase):
         from yggdrasil.databricks.workspaces.workspace import Workspace
 
         try:
-            cls.workspace = Workspace(
-                host="https://dbc-82edd6f4-1e97.cloud.databricks.com/"
-            ).connect()
+            cls.workspace = Workspace().connect()
             # Lightweight auth probe — fails fast when token / profile is wrong
             cls.workspace.workspace_client().current_user.me()
         except unittest.SkipTest:
