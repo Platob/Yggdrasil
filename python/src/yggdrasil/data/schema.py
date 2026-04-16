@@ -177,6 +177,15 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         return [f.name for f in self.inner_fields.values() if f.foreign_key]
 
     @property
+    def foreign_key_refs(self) -> dict[str, str]:
+        """Map each foreign-key column to its ``foreign_key`` tag value."""
+        return {
+            f.name: f.foreign_key
+            for f in self.inner_fields.values()
+            if f.foreign_key
+        }
+
+    @property
     def comment(self):
         if not self.metadata:
             return None

@@ -3,6 +3,9 @@ import time
 import pyarrow as pa
 import pytest
 
+from yggdrasil.data.data_field import Field
+from yggdrasil.data.schema import schema as make_schema
+from yggdrasil.data.types.primitive import IntegerType, StringType
 from yggdrasil.databricks.sql import Table
 
 from ..conftest import requires_databricks, DatabricksCase
@@ -142,3 +145,107 @@ class TestSQLTableIntegration(DatabricksCase):
         assert join_result.column("id").to_pylist() == [1, 2, 3]
         assert join_result.column("parent_id").to_pylist() == [10, 20, 10]
         assert join_result.column("label").to_pylist() == ["north", "south", "north"]
+
+    def test_create_table_reads_foreign_keys_from_schema_metadata(self):
+        """Foreign keys declared via per-field tags flow through ``create``."""
+        parent = self._table(self._scratch_name("test_fk_meta_parent"))
+        child = self._table(self._scratch_name("test_fk_meta_child"))
+        self.addCleanup(self._delete_table, child)
+        self.addCleanup(self._delete_table, parent)
+
+        parent.create(
+            pa.table(
+                [pa.array([1, 2], type=pa.int64()), pa.array(["a", "b"])],
+                names=["id", "label"],
+            ),
+            if_not_exists=False,
+            primary_keys=["id"],
+        )
+
+        int_t = IntegerType(byte_size=8, signed=True)
+        child_schema = make_schema(
+            [
+                Field(name="id", dtype=int_t, nullable=False,
+                      tags={"primary_key": "true"}),
+                Field(
+                    name="parent_id",
+                    dtype=int_t,
+                    nullable=True,
+                    tags={
+                        "foreign_key": (
+                            f"{self._CATALOG}.{self._SCHEMA_NAME}"
+                            f".{parent.table_name}.id"
+                        ),
+                    },
+                ),
+                Field(name="status", dtype=StringType(), nullable=True),
+            ]
+        )
+
+        # No explicit foreign_keys argument — picked up from the schema tags.
+        child.create(child_schema, if_not_exists=False)
+
+        child.insert(
+            pa.table(
+                [
+                    pa.array([10], type=pa.int64()),
+                    pa.array([1], type=pa.int64()),
+                    pa.array(["open"]),
+                ],
+                names=["id", "parent_id", "status"],
+            ),
+            mode="append",
+        )
+
+        assert child.to_arrow_dataset().to_table().num_rows == 1
+
+    def test_set_foreign_keys_applies_from_mapping_and_schema(self):
+        parent = self._table(self._scratch_name("test_sfk_parent"))
+        child = self._table(self._scratch_name("test_sfk_child"))
+        self.addCleanup(self._delete_table, child)
+        self.addCleanup(self._delete_table, parent)
+
+        parent.create(
+            pa.table(
+                [pa.array([1, 2], type=pa.int64()), pa.array(["a", "b"])],
+                names=["id", "label"],
+            ),
+            if_not_exists=False,
+            primary_keys=["id"],
+        )
+        child.create(
+            pa.table(
+                [
+                    pa.array([10], type=pa.int64()),
+                    pa.array([1], type=pa.int64()),
+                ],
+                names=["id", "parent_id"],
+            ),
+            if_not_exists=False,
+            primary_keys=["id"],
+        )
+
+        # 1. Apply from an explicit mapping; partial ref uses table defaults.
+        child.set_foreign_keys(
+            {"parent_id": f"{parent.table_name}.id"},
+            raise_error=True,
+        )
+
+        # 2. Or apply directly from a schema's foreign_key tags.
+        fk_schema = make_schema(
+            [
+                Field(
+                    name="parent_id",
+                    dtype=IntegerType(byte_size=8, signed=True),
+                    nullable=True,
+                    tags={
+                        "foreign_key": (
+                            f"{self._CATALOG}.{self._SCHEMA_NAME}"
+                            f".{parent.table_name}.id"
+                        ),
+                    },
+                ),
+            ]
+        )
+        # The constraint already exists — call is idempotent when raise_error=False.
+        child.set_foreign_keys(schema=fk_schema)
