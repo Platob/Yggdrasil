@@ -588,3 +588,195 @@ def test_map_type_merge_with_same_id_ors_keys_sorted(
 
     assert isinstance(result, MapType)
     assert result.keys_sorted is expected
+
+# ---------------------------------------------------------------------------
+# Construction / conversion surface
+# ---------------------------------------------------------------------------
+
+
+def test_map_type_from_key_value_forces_key_nullable_false(int64_type, string_type) -> None:
+    result = MapType.from_key_value(
+        key_field=Field(name="nope", dtype=string_type, nullable=True),
+        value_field=Field(name="also_nope", dtype=int64_type, nullable=True),
+    )
+
+    assert result.key_field.name == "key"
+    assert result.key_field.nullable is False
+    assert result.value_field.name == "value"
+    assert result.value_field.nullable is True
+
+
+def test_map_type_from_key_value_accepts_raw_dtypes(int64_type, string_type) -> None:
+    result = MapType.from_key_value(
+        key_field=string_type,
+        value_field=int64_type,
+        keys_sorted=True,
+    )
+
+    assert isinstance(result, MapType)
+    assert result.keys_sorted is True
+    assert result.key_field.dtype is string_type
+    assert result.value_field.dtype is int64_type
+
+
+def test_map_type_children_fields_is_entries_struct(int64_type, string_type) -> None:
+    dtype = MapType.from_key_value(string_type, int64_type)
+
+    children = dtype.children_fields
+
+    assert len(children) == 1
+    assert children[0].name == "entries"
+    assert isinstance(children[0].dtype, StructType)
+
+
+def test_map_type_handles_arrow_type() -> None:
+    assert MapType.handles_arrow_type(pa.map_(pa.string(), pa.int64())) is True
+    assert MapType.handles_arrow_type(pa.list_(pa.int64())) is False
+    assert MapType.handles_arrow_type(pa.int64()) is False
+
+
+def test_map_type_handles_dict() -> None:
+    from yggdrasil.data.types.id import DataTypeId
+
+    assert MapType.handles_dict({"id": int(DataTypeId.MAP)}) is True
+    assert MapType.handles_dict({"name": "MAP"}) is True
+    assert MapType.handles_dict({"name": "map"}) is True
+    assert MapType.handles_dict({"name": "ARRAY"}) is False
+
+
+def test_map_type_from_arrow_type_roundtrip() -> None:
+    arrow_type = pa.map_(pa.string(), pa.int64(), keys_sorted=True)
+
+    dtype = MapType.from_arrow_type(arrow_type)
+
+    assert isinstance(dtype, MapType)
+    assert dtype.keys_sorted is True
+    # Round-trip should yield an Arrow map_ equivalent to the source.
+    produced = dtype.to_arrow()
+    assert pa.types.is_map(produced)
+    assert produced.keys_sorted is True
+    assert produced.key_type == pa.string()
+    assert produced.item_type == pa.int64()
+
+
+def test_map_type_from_arrow_type_rejects_non_map() -> None:
+    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+        MapType.from_arrow_type(pa.list_(pa.int64()))
+
+
+def test_map_type_from_polars_type_roundtrip(int64_type, string_type) -> None:
+    polars = pytest.importorskip("polars")
+
+    dtype = MapType.from_key_value(string_type, int64_type)
+    polars_type = dtype.to_polars()
+
+    assert isinstance(polars_type, polars.List)
+    assert isinstance(polars_type.inner, polars.Struct)
+
+    rebuilt = MapType.from_polars_type(polars_type)
+    assert isinstance(rebuilt, MapType)
+    assert rebuilt.key_field.name == "key"
+    assert rebuilt.value_field.name == "value"
+
+
+def test_map_type_handles_polars_type_rejects_non_list_or_non_struct_inner() -> None:
+    polars = pytest.importorskip("polars")
+
+    assert MapType.handles_polars_type(polars.Int64()) is False
+    assert MapType.handles_polars_type(polars.List(polars.Int64())) is False
+
+
+def test_map_type_from_polars_type_rejects_wrong_shape() -> None:
+    polars = pytest.importorskip("polars")
+
+    with pytest.raises(TypeError, match="Unsupported Polars data type"):
+        MapType.from_polars_type(polars.List(polars.Int64()))
+
+
+def test_map_type_to_dict_omits_keys_sorted_by_default(int64_type, string_type) -> None:
+    dtype = MapType.from_key_value(string_type, int64_type)
+
+    payload = dtype.to_dict()
+
+    assert payload["name"] == "MAP"
+    assert "keys_sorted" not in payload
+    assert payload["item_field"]["name"] == "entries"
+
+
+def test_map_type_to_dict_includes_keys_sorted_when_true(int64_type, string_type) -> None:
+    dtype = MapType.from_key_value(string_type, int64_type, keys_sorted=True)
+
+    payload = dtype.to_dict()
+
+    assert payload["keys_sorted"] is True
+
+
+def test_map_type_from_dict_roundtrip(int64_type, string_type) -> None:
+    original = MapType.from_key_value(string_type, int64_type, keys_sorted=True)
+
+    rebuilt = MapType.from_dict(original.to_dict())
+
+    assert isinstance(rebuilt, MapType)
+    assert rebuilt.keys_sorted is True
+    assert rebuilt.key_field.dtype.type_id == string_type.type_id
+    assert rebuilt.value_field.dtype.type_id == int64_type.type_id
+
+
+def test_map_type_default_pyobj_variants(int64_type, string_type) -> None:
+    dtype = MapType.from_key_value(string_type, int64_type)
+
+    assert dtype.default_pyobj(nullable=True) is None
+    assert dtype.default_pyobj(nullable=False) == {}
+
+
+def test_map_type_to_databricks_ddl(int64_type, string_type) -> None:
+    dtype = MapType.from_key_value(string_type, int64_type)
+
+    ddl = dtype.to_databricks_ddl()
+
+    assert ddl.upper().startswith("MAP<")
+    assert ddl.endswith(">")
+    assert "," in ddl  # separates key and value
+
+
+def test_cast_arrow_map_array_returns_original_when_target_is_none(
+    source_map_field: Field,
+) -> None:
+    array = pa.array([[("a", 1)]], type=pa.map_(pa.string(), pa.int64()))
+    options = CastOptions(source_field=source_map_field, target_field=None)
+
+    result = cast_arrow_map_array(array, options)
+
+    assert result is array
+
+
+def test_cast_arrow_map_array_rejects_non_map_source(
+    source_list_of_struct_field: Field,
+    target_map_field: Field,
+) -> None:
+    entry_struct = pa.struct(
+        [
+            pa.field("key", pa.string(), nullable=False),
+            pa.field("value", pa.int64()),
+        ]
+    )
+    array = pa.array([[{"key": "a", "value": 1}]], type=pa.list_(entry_struct))
+
+    options = CastOptions(
+        source_field=source_list_of_struct_field,
+        target_field=target_map_field,
+    )
+
+    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+        cast_arrow_map_array(array, options)
+
+
+def test_string_key_source_field_is_cached() -> None:
+    from yggdrasil.data.types.nested.map import _string_key_source_field
+
+    first = _string_key_source_field()
+    second = _string_key_source_field()
+
+    assert first is second
+    assert first.name == "key"
+    assert first.nullable is False
