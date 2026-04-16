@@ -395,14 +395,20 @@ class MapType(NestedType):
         return None if nullable else {}
 
 
+_STRING_KEY_SOURCE_FIELD: "Field | None" = None
+
+
 def _string_key_source_field() -> "Field":
-    Field = cached_from_import("yggdrasil.data.data_field", "Field")
-    DataType = cached_from_import("yggdrasil.data.types", "DataType")
-    return Field(
-        name="key",
-        dtype=DataType.from_arrow_type(pa.string()),
-        nullable=False,
-    )
+    global _STRING_KEY_SOURCE_FIELD
+    if _STRING_KEY_SOURCE_FIELD is None:
+        Field = cached_from_import("yggdrasil.data.data_field", "Field")
+        DataType = cached_from_import("yggdrasil.data.types", "DataType")
+        _STRING_KEY_SOURCE_FIELD = Field(
+            name="key",
+            dtype=DataType.from_arrow_type(pa.string()),
+            nullable=False,
+        )
+    return _STRING_KEY_SOURCE_FIELD
 
 
 def _cast_pandas_via_arrow(
