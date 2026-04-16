@@ -235,11 +235,8 @@ class MapType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.MapArray | pa.ChunkedArray:
-        options.check(
-            options,
-            source=array,
-            target_field=self.to_field() if options.target_field is None else options.target_field,
-        )
+        options.check_source(array)
+        options.check_target(self)
 
         if options.source_field.dtype.type_id == DataTypeId.NULL or array.null_count == len(array):
             return options.target_field.default_arrow_array(
@@ -269,17 +266,6 @@ class MapType(NestedType):
             raise pa.ArrowInvalid(
                 f"Cannot cast {options.source_field} to {options.target_field}"
             )
-
-    def _cast_arrow_tabular(
-        self,
-        table: pa.Table | pa.RecordBatch,
-        options: "CastOptions",
-    ):
-        options.check(
-            options,
-            source=table,
-            target_field=self.to_field() if options.target_field is None else options.target_field,
-        )
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()

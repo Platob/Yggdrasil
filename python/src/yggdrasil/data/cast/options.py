@@ -84,7 +84,7 @@ class CastOptions:
             source_field = Field.from_(source)
 
         if target is not None and target_field is None:
-            target_field = Field.from_(source)
+            target_field = Field.from_(target)
 
         if isinstance(options, CastOptions):
             if kwargs or source_field is not None or target_field is not None:
@@ -114,6 +114,7 @@ class CastOptions:
         add_missing_fields: bool | None = None,
         datetime_formats: tuple[str, ...] | None = None,
         arrow_memory_pool: pa.MemoryPool | None = None,
+        allow_add_columns: bool | None = None,
     ) -> "CastOptions":
         return CastOptions(
             safe=self.safe if safe is None else safe,
@@ -124,6 +125,7 @@ class CastOptions:
             arrow_memory_pool=self.arrow_memory_pool if arrow_memory_pool is None else arrow_memory_pool,
             strict_match_names=self.strict_match_names if strict_match_names is None else strict_match_names,
             add_missing_columns=self.add_missing_columns if add_missing_columns is None else add_missing_columns,
+            allow_add_columns=self.allow_add_columns if allow_add_columns is None else allow_add_columns,
         )
 
     def check_source(self, obj: Any) -> "CastOptions":
