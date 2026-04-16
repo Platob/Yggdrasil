@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .sql.catalogs import Catalogs
     from .sql.schemas import Schemas
     from .sql.service import Warehouses
+    from .sql.grants import Grants
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
@@ -869,6 +870,18 @@ class DatabricksClient(URLResource):
         )
 
     @property
+    def grants(self) -> "Grants":
+        """Collection-level Unity Catalog grant management service for this client."""
+        from .sql.grants import Grants
+
+        return self.lazy_property(
+            self,
+            cache_attr="_grants",
+            factory=lambda: Grants(client=self),
+            use_cache=True,
+        )
+
+    @property
     def filesystem(self) -> "FileSystem":
         """OS-style Databricks filesystem helper for this client."""
         from .fs.service import FileSystem
@@ -1034,6 +1047,11 @@ class DatabricksService(ABC):
     def schemas(self) -> "Schemas":
         """Collection-level Unity Catalog schema service (shorthand for ``client.schemas``)."""
         return self.client.schemas
+
+    @property
+    def grants(self) -> "Grants":
+        """Collection-level Unity Catalog grant service (shorthand for ``client.grants``)."""
+        return self.client.grants
 
     @property
     def genie(self) -> "Genie":

@@ -1136,6 +1136,91 @@ class VolumePath(DatabricksPath):
                 if not exist_ok:
                     raise
 
+    # ── Grants ────────────────────────────────────────────────────────
+
+    def _grants_full_name(self) -> str:
+        cat, sch, vol, _ = self.sql_volume_or_table_parts()
+        if not (cat and sch and vol):
+            raise ValueError(
+                f"Cannot manage grants on {self!r}: a volume path must include "
+                f"catalog, schema, and volume parts"
+            )
+        return f"{cat}.{sch}.{vol}"
+
+    @property
+    def grants_service(self):
+        """A :class:`Grants` service bound to this volume's client."""
+        from yggdrasil.databricks.sql.grants import Grants
+        return Grants(client=self.client)
+
+    def grants(self, principal: Optional[str] = None, *, effective: bool = False):
+        """Iterate grants on this volume, optionally filtered by ``principal``."""
+        from databricks.sdk.service.catalog import SecurableType
+        return self.grants_service.list(
+            securable_type=SecurableType.VOLUME,
+            full_name=self._grants_full_name(),
+            principal=principal,
+            effective=effective,
+        )
+
+    def grant(self, principal: str, privileges):
+        """Add ``privileges`` for ``principal`` on this volume."""
+        from databricks.sdk.service.catalog import SecurableType
+        return self.grants_service.create(
+            securable_type=SecurableType.VOLUME,
+            full_name=self._grants_full_name(),
+            principal=principal,
+            privileges=privileges,
+        )
+
+    def revoke(self, principal: str, privileges):
+        """Remove ``privileges`` from ``principal`` on this volume."""
+        from databricks.sdk.service.catalog import SecurableType, PermissionsChange
+        from yggdrasil.databricks.sql.grants import _check_principal, _check_privileges
+
+        principal = _check_principal(principal)
+        svc = self.grants_service
+        full_name = self._grants_full_name()
+
+        svc.update(
+            securable_type=SecurableType.VOLUME,
+            full_name=full_name,
+            changes=[
+                PermissionsChange(
+                    principal=principal,
+                    remove=_check_privileges(privileges),
+                )
+            ],
+        )
+        return svc.get(
+            securable_type=SecurableType.VOLUME,
+            full_name=full_name,
+            principal=principal,
+            effective=False,
+            raise_error=False,
+        )
+
+    def set_grants(self, principal: str, privileges):
+        """Replace ``principal``'s privileges on this volume to match ``privileges``."""
+        from databricks.sdk.service.catalog import SecurableType
+        from yggdrasil.databricks.sql.grants import _check_principal
+
+        principal = _check_principal(principal)
+        svc = self.grants_service
+        full_name = self._grants_full_name()
+
+        existing = svc.get(
+            securable_type=SecurableType.VOLUME,
+            full_name=full_name,
+            principal=principal,
+            effective=False,
+            raise_error=False,
+        )
+
+        if existing is None:
+            return self.grant(principal=principal, privileges=privileges)
+        return existing.replace(privileges)
+
     # ── Removal ───────────────────────────────────────────────────────
 
     def _remove_file_impl(self, allow_not_found=True):
