@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pyarrow as pa
 import pytest
 from databricks.sdk.service.catalog import (
     GetPermissionsResponse,
@@ -21,6 +22,7 @@ from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.fs.path import VolumePath
 from yggdrasil.databricks.sql import Catalog, Catalogs, Schema, Table, Tables
 from yggdrasil.databricks.sql.grants import Grant, Grants
+from yggdrasil.databricks.sql.table import parse_grants_principals
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -294,3 +296,117 @@ class TestClientGrantsShortcut:
         catalogs = Catalogs(client=mock_client)
         # mock_client.grants is a MagicMock attribute on the spec
         assert catalogs.grants is mock_client.grants
+
+
+# ── parse_grants_principals ──────────────────────────────────────────────────
+
+
+class TestParseGrantsPrincipals:
+    @pytest.mark.parametrize("value", [None, "", b"", "  ", b"   "])
+    def test_empty_returns_empty_list(self, value):
+        assert parse_grants_principals(value) == []
+
+    def test_json_array_of_strings(self):
+        assert parse_grants_principals(b'["alice", "bob"]') == ["alice", "bob"]
+
+    def test_json_with_whitespace_and_blanks_is_filtered(self):
+        assert parse_grants_principals('["  alice ", "", "bob"]') == ["alice", "bob"]
+
+    def test_comma_separated_string(self):
+        assert parse_grants_principals(b"alice, bob , carol") == ["alice", "bob", "carol"]
+
+    def test_single_principal_string(self):
+        assert parse_grants_principals("alice@example.com") == ["alice@example.com"]
+
+    def test_iterable_input(self):
+        assert parse_grants_principals(["alice", " bob ", ""]) == ["alice", "bob"]
+
+    def test_invalid_json_falls_back_to_comma_split(self):
+        # malformed JSON gets parsed as a single comma-less token
+        assert parse_grants_principals("[not, valid, json") == ["[not", "valid", "json"]
+
+
+# ── Table.create — grants metadata inference ─────────────────────────────────
+
+
+class TestTableCreateGrantsInference:
+    @pytest.fixture()
+    def created_table(self, mock_client, grants_api):
+        """A Table whose sql_create / exists / catalog / schema are stubbed."""
+        table = Table(
+            service=Tables(client=mock_client, catalog_name="main", schema_name="sales"),
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+        )
+        # Pretend the table doesn't exist yet, then exists after sql_create.
+        type(table).exists = property(lambda self: False)  # type: ignore[attr-defined]
+        # Stub sql_create to avoid the SQL execution path.
+        table.sql_create = MagicMock(return_value=table)  # type: ignore[method-assign]
+
+        # Make grants_api.get echo back a matching assignment so Grants.create
+        # (which performs an update followed by a get) succeeds for any principal.
+        def fake_get(*, principal=None, **_):
+            return GetPermissionsResponse(
+                privilege_assignments=[_assignment(principal or "x", [Privilege.SELECT])]
+            )
+
+        grants_api.get.side_effect = fake_get
+        return table
+
+    def test_no_metadata_skips_grants(self, created_table, grants_api):
+        pa_schema = pa.schema([pa.field("id", pa.int64())])
+        created_table.create(pa_schema)
+        grants_api.update.assert_not_called()
+
+    def test_grants_metadata_applies_default_chain(self, created_table, grants_api):
+        pa_schema = pa.schema(
+            [pa.field("id", pa.int64())],
+            metadata={b"grants": b'["alice", "bob"]'},
+        )
+
+        created_table.create(pa_schema)
+
+        # 2 principals × 3 grants (catalog, schema, table) = 6 update calls
+        assert grants_api.update.call_count == 6
+
+        calls = [c.kwargs for c in grants_api.update.call_args_list]
+
+        principals_per_securable: dict[str, list[str]] = {}
+        for c in calls:
+            principals_per_securable.setdefault(c["securable_type"], []).append(
+                c["changes"][0].principal
+            )
+
+        assert principals_per_securable[SecurableType.CATALOG.value] == ["alice", "bob"]
+        assert principals_per_securable[SecurableType.SCHEMA.value] == ["alice", "bob"]
+        assert principals_per_securable[SecurableType.TABLE.value] == ["alice", "bob"]
+
+        privileges_per_securable = {
+            c["securable_type"]: c["changes"][0].add for c in calls
+        }
+        assert privileges_per_securable[SecurableType.CATALOG.value] == [Privilege.USE_CATALOG]
+        assert privileges_per_securable[SecurableType.SCHEMA.value] == [Privilege.USE_SCHEMA]
+        assert privileges_per_securable[SecurableType.TABLE.value] == [Privilege.SELECT]
+
+    def test_grants_metadata_accepts_comma_separated(self, created_table, grants_api):
+        pa_schema = pa.schema(
+            [pa.field("id", pa.int64())],
+            metadata={b"grants": b"alice,bob"},
+        )
+
+        created_table.create(pa_schema)
+        # Same total: 2 principals × 3 securables
+        assert grants_api.update.call_count == 6
+
+    def test_grants_failure_does_not_abort(self, created_table, grants_api):
+        grants_api.update.side_effect = RuntimeError("boom")
+        pa_schema = pa.schema(
+            [pa.field("id", pa.int64())],
+            metadata={b"grants": b"alice,bob"},
+        )
+
+        # Should not raise even though every grant call fails;
+        # one update is attempted per principal (then aborted by the exception).
+        created_table.create(pa_schema)
+        assert grants_api.update.call_count == 2

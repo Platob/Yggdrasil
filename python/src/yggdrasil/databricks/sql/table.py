@@ -20,6 +20,7 @@ access pattern without grep-ing for API calls.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
     DataSourceFormat,
+    Privilege,
     SecurableType,
     TableInfo,
     TableOperation,
@@ -78,6 +80,41 @@ _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
 
 def _needs_column_mapping(col_name: str) -> bool:
     return any(ch in _INVALID_COL_CHARS for ch in col_name)
+
+
+GRANTS_METADATA_KEY: bytes = b"grants"
+
+
+def parse_grants_principals(value: bytes | str | Iterable[Any] | None) -> list[str]:
+    """Parse a ``b"grants"`` metadata value into a list of principal names.
+
+    Accepts a bytes/str payload (JSON array of strings or comma-separated)
+    or any iterable of principal-like values.  Whitespace is stripped and
+    empty entries are skipped while preserving original order.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(p).strip() for p in parsed if str(p).strip()]
+        return [p.strip() for p in text.split(",") if p.strip()]
+
+    if isinstance(value, Iterable):
+        return [str(p).strip() for p in value if str(p).strip()]
+
+    raise TypeError(f"Unsupported grants metadata value: {value!r}")
 
 
 INFOS_TTL: float = 300.0
@@ -546,7 +583,7 @@ class Table(DatabricksResource, GrantsMixin):
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
         if table_type == TableType.MANAGED:
-            return self.sql_create(
+            result = self.sql_create(
                 definition,
                 comment=comment,
                 partition_by=partition_by,
@@ -554,23 +591,62 @@ class Table(DatabricksResource, GrantsMixin):
                 primary_keys=primary_keys,
                 foreign_keys=foreign_keys,
             )
-
-        if table_type == TableType.EXTERNAL and not storage_location:
-            storage_location = (
-                self.schema_storage_location(table_type=table_type)
-                + "/tables/%s" % self.table_name
+        else:
+            if table_type == TableType.EXTERNAL and not storage_location:
+                storage_location = (
+                    self.schema_storage_location(table_type=table_type)
+                    + "/tables/%s" % self.table_name
+                )
+            result = self.api_create(
+                definition=definition,
+                storage_location=storage_location,
+                comment=comment,
+                properties=properties,
+                table_type=table_type,
+                data_source_format=data_source_format,
+                if_not_exists=if_not_exists,
+                primary_keys=primary_keys,
+                foreign_keys=foreign_keys,
             )
-        return self.api_create(
-            definition=definition,
-            storage_location=storage_location,
-            comment=comment,
-            properties=properties,
-            table_type=table_type,
-            data_source_format=data_source_format,
-            if_not_exists=if_not_exists,
-            primary_keys=primary_keys,
-            foreign_keys=foreign_keys,
+
+        self._apply_grants_from_metadata(schema.metadata)
+        return result
+
+    def _apply_grants_from_metadata(
+        self,
+        metadata: Mapping[bytes | str, Any] | None,
+    ) -> None:
+        """Grant the principals listed under ``b"grants"`` access to this table.
+
+        Each principal receives the default privilege chain required to read
+        the table: ``USE_CATALOG`` on the catalog, ``USE_SCHEMA`` on the
+        schema, and ``SELECT`` on the table itself.  Failures are logged and
+        do not abort table creation.
+        """
+        if not metadata:
+            return
+
+        raw = metadata.get(GRANTS_METADATA_KEY) or metadata.get(
+            GRANTS_METADATA_KEY.decode("utf-8")
         )
+        principals = parse_grants_principals(raw)
+        if not principals:
+            return
+
+        catalog = self.catalog
+        schema = self.schema
+
+        for principal in principals:
+            try:
+                catalog.grant(principal, [Privilege.USE_CATALOG])
+                schema.grant(principal, [Privilege.USE_SCHEMA])
+                self.grant(principal, [Privilege.SELECT])
+            except Exception:
+                logger.warning(
+                    "Failed to apply default grants for principal %r on %s",
+                    principal, self.full_name(),
+                    exc_info=True,
+                )
 
     def sql_create(
         self,
