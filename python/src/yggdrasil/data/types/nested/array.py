@@ -90,6 +90,12 @@ class ArrayType(NestedType):
             _f = cls.get_data_field_class()
             item_field = _f.from_any(item_field).with_name("item")
 
+        # Arrow's fixed-size list requires list_size >= 0; treat any negative
+        # value (including the -1 placeholder some serializers emit) as
+        # "variable length" so we don't construct an invalid Arrow type.
+        if list_size is not None and list_size < 0:
+            list_size = None
+
         return cls(
             item_field=item_field,
             list_size=list_size,
@@ -102,6 +108,9 @@ class ArrayType(NestedType):
         cls,
         dtype: "pa.ListType | pa.ListViewType | pa.FixedSizeListType",
     ) -> "ArrayType":
+        if not cls.handles_arrow_type(dtype):
+            raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+
         _f = cls.get_data_field_class()
         item_field = _f.from_arrow_field(dtype.value_field)
 
@@ -275,7 +284,7 @@ class ArrayType(NestedType):
         base = super().to_dict()
         base["item_field"] = self.item_field.to_dict()
 
-        if self.list_size is not None and self.list_size > -1:
+        if self.list_size is not None and self.list_size >= 0:
             base["list_size"] = self.list_size
 
         if self.large:

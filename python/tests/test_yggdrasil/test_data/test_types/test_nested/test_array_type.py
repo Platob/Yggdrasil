@@ -688,3 +688,231 @@ def test_cast_arrow_map_array_to_list_raises_for_struct_target_item_wrong_arity(
 
     with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
         cast_arrow_map_array_to_list(array, options)
+
+# ---------------------------------------------------------------------------
+# Construction / conversion surface
+# ---------------------------------------------------------------------------
+
+
+def test_array_type_from_item_field_sanitizes_negative_list_size() -> None:
+    result = ArrayType.from_item_field(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        list_size=-1,
+    )
+
+    assert result.list_size is None
+
+
+def test_array_type_from_item_field_preserves_zero_list_size() -> None:
+    result = ArrayType.from_item_field(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        list_size=0,
+        safe=True,
+    )
+
+    assert result.list_size == 0
+
+
+def test_array_type_from_item_field_safe_mode_skips_field_rewrite() -> None:
+    original = Field(name="custom", dtype=StringType(), nullable=False)
+    result = ArrayType.from_item_field(item_field=original, safe=True)
+
+    assert result.item_field is original
+
+
+def test_array_type_from_item_field_non_safe_mode_renames_item() -> None:
+    original = Field(name="custom", dtype=StringType(), nullable=False)
+    result = ArrayType.from_item_field(item_field=original, safe=False)
+
+    assert result.item_field.name == "item"
+
+
+def test_array_type_from_arrow_type_list_view() -> None:
+    dtype = pa.list_view(pa.field("item", pa.int64(), nullable=True))
+
+    result = ArrayType.from_arrow_type(dtype)
+
+    assert result.view is True
+    assert result.large is False
+    assert result.list_size is None
+
+
+def test_array_type_from_arrow_type_large_list_view() -> None:
+    dtype = pa.large_list_view(pa.field("item", pa.int64(), nullable=True))
+
+    result = ArrayType.from_arrow_type(dtype)
+
+    assert result.view is True
+    assert result.large is True
+    assert result.list_size is None
+
+
+def test_array_type_from_arrow_type_rejects_non_list_dtype() -> None:
+    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+        ArrayType.from_arrow_type(pa.int64())
+
+
+def test_array_type_handles_arrow_type_returns_false_for_non_list() -> None:
+    assert ArrayType.handles_arrow_type(pa.int64()) is False
+    assert ArrayType.handles_arrow_type(pa.map_(pa.string(), pa.int64())) is False
+    assert ArrayType.handles_arrow_type(
+        pa.struct([pa.field("a", pa.int64())])
+    ) is False
+
+
+def test_array_type_to_dict_includes_large_view_and_list_size() -> None:
+    dtype = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        list_size=3,
+        large=True,
+        view=True,
+    )
+
+    payload = dtype.to_dict()
+
+    assert payload["name"] == "ARRAY"
+    assert payload["list_size"] == 3
+    assert payload["large"] is True
+    assert payload["view"] is True
+    assert payload["item_field"]["dtype"]["name"] == "STRING"
+
+
+def test_array_type_from_dict_roundtrip() -> None:
+    original = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        list_size=3,
+        large=True,
+    )
+
+    reborn = ArrayType.from_dict(original.to_dict())
+
+    assert isinstance(reborn, ArrayType)
+    assert reborn.list_size == 3
+    assert reborn.large is True
+    assert reborn.view is False
+    assert reborn.item_field.name == "item"
+    assert reborn.item_field.dtype.type_id == DataTypeId.STRING
+
+
+def test_array_type_to_arrow_variants() -> None:
+    dtype_default = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+    )
+    dtype_large = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        large=True,
+    )
+    dtype_fixed = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        list_size=4,
+    )
+    dtype_view = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        view=True,
+    )
+    dtype_large_view = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+        view=True,
+        large=True,
+    )
+
+    assert pa.types.is_list(dtype_default.to_arrow())
+    assert pa.types.is_large_list(dtype_large.to_arrow())
+    assert pa.types.is_fixed_size_list(dtype_fixed.to_arrow())
+    assert dtype_fixed.to_arrow().list_size == 4
+    assert pa.types.is_list_view(dtype_view.to_arrow())
+    assert pa.types.is_large_list_view(dtype_large_view.to_arrow())
+
+
+def test_array_type_to_databricks_ddl() -> None:
+    dtype = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+    )
+    assert dtype.to_databricks_ddl().upper().startswith("ARRAY<")
+    assert dtype.to_databricks_ddl().endswith(">")
+
+
+def test_array_type_merge_with_same_id_keeps_list_size_when_one_fixed() -> None:
+    left = ArrayType(
+        item_field=Field(name="item", dtype=IntegerType(), nullable=True),
+        list_size=5,
+    )
+    right = ArrayType(
+        item_field=Field(name="item", dtype=IntegerType(), nullable=True),
+    )
+
+    merged = left._merge_with_same_id(right)
+    assert merged.list_size == 5
+
+    merged_reverse = right._merge_with_same_id(left)
+    assert merged_reverse.list_size == 5
+
+
+def test_array_type_merge_with_same_id_merges_items() -> None:
+    left = ArrayType(
+        item_field=Field(name="item", dtype=IntegerType(), nullable=False),
+    )
+    right = ArrayType(
+        item_field=Field(name="item", dtype=IntegerType(), nullable=True),
+    )
+
+    merged = left._merge_with_same_id(right)
+
+    # merge_with on fields ORs the nullable flag.
+    assert merged.item_field.nullable is True
+
+
+def test_array_type_handles_dict_alternate_alias() -> None:
+    assert ArrayType.handles_dict({"name": "NOT_AN_ARRAY"}) is False
+
+
+def test_array_type_default_pyobj_variants() -> None:
+    dtype = ArrayType(
+        item_field=Field(name="item", dtype=StringType(), nullable=True),
+    )
+    assert dtype.default_pyobj(nullable=True) is None
+    assert dtype.default_pyobj(nullable=False) == []
+
+
+def test_array_type_polars_roundtrip() -> None:
+    polars = pytest.importorskip("polars")
+    dtype = ArrayType(
+        item_field=Field(name="item", dtype=IntegerType(byte_size=8, signed=True), nullable=True),
+    )
+
+    polars_dtype = dtype.to_polars()
+    assert isinstance(polars_dtype, polars.List)
+
+    reborn = ArrayType.from_polars_type(polars_dtype)
+    assert isinstance(reborn, ArrayType)
+    assert reborn.item_field.dtype.type_id == DataTypeId.INTEGER
+
+
+def test_array_type_from_polars_type_rejects_non_list() -> None:
+    polars = pytest.importorskip("polars")
+    with pytest.raises(TypeError, match="Unsupported Polars data type"):
+        ArrayType.from_polars_type(polars.Int64())
+
+
+def test_cast_arrow_list_array_preserves_nested_null_mask(
+    source_array_field: Field,
+    target_array_field: Field,
+) -> None:
+    array = pa.array(
+        [
+            None,
+            [],
+            [1, None, 3],
+        ],
+        type=pa.list_(pa.int64()),
+    )
+
+    options = CastOptions(
+        source_field=source_array_field,
+        target_field=target_array_field,
+    )
+
+    result = cast_arrow_list_array(array, options)
+
+    assert result.to_pylist() == [None, [], ["1", None, "3"]]
+    assert result.is_null().to_pylist() == [True, False, False]
