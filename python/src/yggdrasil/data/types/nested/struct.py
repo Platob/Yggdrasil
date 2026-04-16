@@ -899,7 +899,9 @@ def cast_spark_struct_column(
 
         child_columns.append(child)
 
-    return F.struct(*child_columns)
+    # Preserve null source rows: F.struct always returns a non-null struct,
+    # so without this guard a null row becomes {child: None, ...}.
+    return F.when(column.isNull(), F.lit(None)).otherwise(F.struct(*child_columns))
 
 
 def cast_spark_map_column(
@@ -935,7 +937,7 @@ def cast_spark_map_column(
 
         child_columns.append(casted)
 
-    return F.struct(*child_columns)
+    return F.when(column.isNull(), F.lit(None)).otherwise(F.struct(*child_columns))
 
 
 def cast_spark_list_column(
@@ -959,7 +961,10 @@ def cast_spark_list_column(
     child_columns: list[Any] = []
 
     for i, target_child in enumerate(target_type.children_fields):
-        extracted = column.getItem(i)
+        # F.get is the null-on-out-of-bounds accessor; plain column[i] /
+        # column.getItem(i) raises an ArrayIndexOutOfBoundsException in
+        # Spark 4.x when the source list is shorter than the target struct.
+        extracted = F.get(column, F.lit(i))
 
         casted = target_child.cast_spark_column(
             extracted,
@@ -971,7 +976,7 @@ def cast_spark_list_column(
 
         child_columns.append(casted)
 
-    return F.struct(*child_columns)
+    return F.when(column.isNull(), F.lit(None)).otherwise(F.struct(*child_columns))
 
 
 def cast_spark_tabular(

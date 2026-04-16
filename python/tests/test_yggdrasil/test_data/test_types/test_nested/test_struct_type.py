@@ -775,6 +775,7 @@ class TestCastSparkStructColumns(SparkTestCase):
     """Spark-backed cast tests for struct, map, and list → struct conversions."""
 
     def setUp(self) -> None:
+        super().setUp()
         int64_type = DataType.from_arrow_type(pa.int64())
         int32_type = DataType.from_arrow_type(pa.int32())  # noqa: F841
         string_type = DataType.from_arrow_type(pa.string())
@@ -909,7 +910,7 @@ class TestCastSparkStructColumns(SparkTestCase):
         )
 
         self.assertEqual(
-            [_normalize_nested(v) for v in result.toArrow()["target_struct"].tolist()],
+            [_normalize_nested(v) for v in result.toArrow()["target_struct"].to_pylist()],
             [
                 {"first": 1, "second": "2", "third": 3},
                 {"first": 4, "second": None, "third": None},
