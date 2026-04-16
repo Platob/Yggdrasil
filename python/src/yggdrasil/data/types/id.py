@@ -30,4 +30,5 @@ class DataTypeId(IntEnum):
     DICTIONARY = 65
     JSON = 66
     ENUM = 67
+    GEOGRAPHY = 68
 

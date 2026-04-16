@@ -510,6 +510,11 @@ class DataType(BaseChildrenFields, ABC):
             from .extensions.obj import ObjectType
             return ObjectType()
 
+        if parsed.type_id == DataTypeId.GEOGRAPHY:
+            from .extensions.geography import GeographyType, _normalize_srid
+            srid_arg = meta.args[0] if meta.args else None
+            return GeographyType(srid=_normalize_srid(srid_arg))
+
         if parsed.type_id == DataTypeId.EXTENSION:
             # If extension metadata carries a name, try to resolve it from the
             # registry.  Otherwise, fall through to StringType — we can't do
@@ -520,14 +525,6 @@ class DataType(BaseChildrenFields, ABC):
                 target_cls = _EXTENSION_REGISTRY.get(ext_name)
                 if target_cls is not None:
                     return target_cls()
-
-            # Parser-level canonical names for known extension types.
-            parsed_name = (meta.name or "").lower()
-            if parsed_name in {"geography", "geo", "geozone", "geolocation"}:
-                from .extensions.geography import GeographyType, _normalize_srid
-                srid_arg = meta.args[0] if meta.args else None
-                return GeographyType(srid=_normalize_srid(srid_arg))
-
             return StringType()
 
         raise TypeError(f"Unsupported parsed data type: {parsed!r}")

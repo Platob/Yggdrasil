@@ -1,4 +1,4 @@
-"""GeographyType — extension type for geographic zone data.
+"""GeographyType — first-class data type for geographic zone data.
 
 Stores geography identifiers as strings (ISO codes, country names, region
 codes, EIC codes, coordinates) and normalizes them through the GeoZone
@@ -6,9 +6,9 @@ catalog on cast.
 
 Databricks DDL follows the native ``GEOGRAPHY`` type spec::
 
-    GEOGRAPHY          → GEOGRAPHY(4326)   -- WGS 84 default
-    GEOGRAPHY(4326)    → explicit SRID
-    GEOGRAPHY(ANY)     → accepts any SRID
+    GEOGRAPHY          -> GEOGRAPHY(4326)   -- WGS 84 default
+    GEOGRAPHY(4326)    -> explicit SRID
+    GEOGRAPHY(ANY)     -> accepts any SRID
 
 Cast behavior:
 - Input strings are resolved through GeoZoneCatalog (codes, aliases,
@@ -23,15 +23,21 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.data.types.extensions.base import ExtensionType
+from yggdrasil.data.types.id import DataTypeId
+from yggdrasil.io import SaveMode
+from ..base import DataType
+from ..support import get_polars, get_spark_sql
 
 if TYPE_CHECKING:
     import polars
+    import pyspark.sql.types as pst
+    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.data_field import Field
     from yggdrasil.data.enums.geozone.base import GeoZone
     from yggdrasil.data.enums.geozone.catalog import GeoZoneCatalog
 
@@ -64,13 +70,6 @@ def _resolve_zone(
     return catalog.parse_str(stripped)
 
 
-def _zone_to_code(zone: "GeoZone | None") -> str | None:
-    """Extract the canonical code string from a resolved zone."""
-    if zone is None:
-        return None
-    return zone.code
-
-
 # ---------------------------------------------------------------------------
 # SRID normalization
 # ---------------------------------------------------------------------------
@@ -79,7 +78,7 @@ def _zone_to_code(zone: "GeoZone | None") -> str | None:
 def _normalize_srid(value: int | str | None) -> int | str:
     """Normalize an SRID value to either an int or the string ``"ANY"``.
 
-    Accepts ``None`` (→ default 4326), ints, numeric strings, and the
+    Accepts ``None`` (-> default 4326), ints, numeric strings, and the
     literal ``"ANY"`` (case-insensitive).
     """
     if value is None:
@@ -219,14 +218,9 @@ def parse_geography_polars(
     Same semantics as :func:`parse_geography_arrow` but operates on Polars
     Series.  Goes through Arrow internally for catalog resolution.
     """
-    from yggdrasil.data.types.support import get_polars
-
     pl = get_polars()
-
     arrow = series.to_arrow()
     parsed = parse_geography_arrow(arrow, catalog=catalog, safe=safe, output=output)
-
-    # Rebuild as Polars Series, keep the original name.
     return pl.Series(name=series.name, values=parsed, dtype=pl.String)
 
 
@@ -236,10 +230,10 @@ def parse_geography_polars(
 
 
 @dataclass(frozen=True)
-class GeographyType(ExtensionType):
-    """Extension type for geographic zone identifiers.
+class GeographyType(DataType):
+    """First-class data type for geographic zone identifiers.
 
-    Stores geography data as Arrow strings and normalizes on cast through
+    Stores geography data as strings and normalizes on cast through
     the GeoZone catalog.  Resolved values are canonical codes (region_iso
     or country_iso or key).
 
@@ -247,8 +241,8 @@ class GeographyType(ExtensionType):
     ----------
     srid : int | str
         Spatial Reference System Identifier.  Default is ``4326`` (WGS 84).
-        Pass ``"ANY"`` to accept any SRID.  This controls the Databricks
-        DDL output: ``GEOGRAPHY(4326)``, ``GEOGRAPHY(ANY)``, etc.
+        Pass ``"ANY"`` to accept any SRID.  Controls the Databricks DDL:
+        ``GEOGRAPHY(4326)``, ``GEOGRAPHY(ANY)``, etc.
     output : str
         What field to extract from resolved zones: ``"code"`` (default),
         ``"name"``, ``"country_iso"``, ``"region_iso"``, ``"key"``,
@@ -259,69 +253,119 @@ class GeographyType(ExtensionType):
         geo = GeographyType()               # GEOGRAPHY(4326), output=code
         geo = GeographyType(srid="ANY")      # GEOGRAPHY(ANY)
         geo = GeographyType(srid=4326, output="country_iso")
-
-    Casting an Arrow array through this type normalizes every element::
-
-        arr = pa.array(["France", "DE", "zuerich", "xyzzy"])
-        result = geo._cast_arrow_array(arr, options)
-        # → ["FR IDF", "DE BE", "CH ZH", null]  (with safe=False)
     """
-
-    extension_name: ClassVar[str] = "yggdrasil.geography"
-    storage_type: ClassVar[pa.DataType] = pa.string()
 
     srid: int | str = DEFAULT_SRID
     output: str = "code"
 
     def __post_init__(self) -> None:
-        # Normalize srid so "4326", 4326, "any", "ANY" all land correctly.
         object.__setattr__(self, "srid", _normalize_srid(self.srid))
 
     # ------------------------------------------------------------------
-    # Serialization — omit default values to keep metadata compact
+    # DataType protocol
     # ------------------------------------------------------------------
-    def _own_field_values(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        if self.srid != DEFAULT_SRID:
-            # Store as string so "ANY" survives JSON round-trip.
-            out["srid"] = str(self.srid) if isinstance(self.srid, int) else self.srid
-        if self.output != "code":
-            out["output"] = self.output
-        return out
+    @property
+    def type_id(self) -> DataTypeId:
+        return DataTypeId.GEOGRAPHY
+
+    @property
+    def children_fields(self) -> list[Field]:
+        return []
+
+    # ------------------------------------------------------------------
+    # Arrow — geography stores as plain string
+    # ------------------------------------------------------------------
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        # Arrow has no native geography type.
+        return False
 
     @classmethod
-    def deserialize_metadata(cls, serialized: bytes) -> "GeographyType":
-        """Reconstruct from Arrow IPC metadata bytes."""
-        if not serialized:
-            return cls()
-        import json
+    def from_arrow_type(cls, dtype: pa.DataType) -> GeographyType:
+        raise TypeError(
+            f"Cannot infer GeographyType from Arrow type {dtype!r}. "
+            "Arrow has no native geography type. "
+            "Use DataType.from_str('geography') or GeographyType() directly."
+        )
 
-        payload = json.loads(serialized)
-        srid_raw = payload.pop("srid", None)
-        srid = _normalize_srid(srid_raw)
-        output = payload.get("output", "code")
-        return cls(srid=srid, output=output)
+    def to_arrow(self) -> pa.DataType:
+        return pa.string()
+
+    # ------------------------------------------------------------------
+    # Polars — plain string, no native geography
+    # ------------------------------------------------------------------
+    @classmethod
+    def handles_polars_type(cls, dtype: polars.DataType) -> bool:
+        return False
+
+    def to_polars(self) -> polars.DataType:
+        pl = get_polars()
+        return pl.String
+
+    # ------------------------------------------------------------------
+    # Spark — plain string, no native geography
+    # ------------------------------------------------------------------
+    @classmethod
+    def handles_spark_type(cls, dtype: pst.DataType) -> bool:
+        return False
+
+    def to_spark(self) -> Any:
+        spark = get_spark_sql()
+        return spark.types.StringType()
 
     # ------------------------------------------------------------------
     # Databricks DDL — native GEOGRAPHY type
     # ------------------------------------------------------------------
     def to_databricks_ddl(self) -> str:
-        """Produce Databricks-compatible ``GEOGRAPHY(srid)`` DDL.
-
-        Default SRID is 4326 (WGS 84).  ``"ANY"`` produces
-        ``GEOGRAPHY(ANY)``.
-        """
-        if isinstance(self.srid, str):
-            return f"GEOGRAPHY({self.srid})"
         return f"GEOGRAPHY({self.srid})"
 
     # ------------------------------------------------------------------
-    # Casting — the main show
+    # Dict round-trip
+    # ------------------------------------------------------------------
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        type_id = value.get("id")
+        if type_id == int(DataTypeId.GEOGRAPHY):
+            return True
+        name = str(value.get("name", "")).upper()
+        return name == "GEOGRAPHY"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> GeographyType:
+        srid = _normalize_srid(value.get("srid"))
+        output = value.get("output", "code")
+        return cls(srid=srid, output=output)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "id": int(DataTypeId.GEOGRAPHY),
+            "name": DataTypeId.GEOGRAPHY.name,
+        }
+        if self.srid != DEFAULT_SRID:
+            d["srid"] = str(self.srid) if isinstance(self.srid, int) else self.srid
+        if self.output != "code":
+            d["output"] = self.output
+        return d
+
+    # ------------------------------------------------------------------
+    # Merge
+    # ------------------------------------------------------------------
+    def _merge_with_same_id(
+        self,
+        other: DataType,
+        mode: SaveMode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ) -> GeographyType:
+        return self
+
+    # ------------------------------------------------------------------
+    # Cast — normalize through GeoZone catalog
     # ------------------------------------------------------------------
     def _cast_arrow_array(
         self,
         array: pa.Array,
-        options: Any,
+        options: CastOptions,
     ) -> pa.Array:
         """Cast an Arrow array into geography codes.
 
@@ -331,35 +375,25 @@ class GeographyType(ExtensionType):
         """
         safe = getattr(options, "safe", False)
 
-        # If already our extension type, unwrap to storage first.
         src = array
-        if isinstance(src.type, pa.ExtensionType):
-            src = src.storage
-
-        # Cast to string if not already — we accept ints, binaries, etc.
+        # Cast to string if not already.
         if not pa.types.is_string(src.type) and not pa.types.is_large_string(src.type):
             try:
                 src = pc.cast(src, pa.string(), safe=False)
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
                 if safe:
                     raise
-                # Can't even stringify — null everything out.
-                return pa.ExtensionArray.from_storage(
-                    self.to_arrow(),
-                    pa.nulls(len(src), type=pa.string()),
-                )
+                return pa.nulls(len(src), type=pa.string())
 
         parsed = parse_geography_arrow(src, safe=safe, output=self.output)
 
-        # Flatten to plain array if chunked came back.
         if isinstance(parsed, pa.ChunkedArray):
             parsed = parsed.combine_chunks()
 
-        # Wrap into extension type.
-        return pa.ExtensionArray.from_storage(self.to_arrow(), parsed)
+        return parsed
 
     # ------------------------------------------------------------------
-    # Python object conversion — single value
+    # Python object conversion
     # ------------------------------------------------------------------
     def convert_pyobj(
         self, value: Any, nullable: bool, safe: bool = False
@@ -408,7 +442,6 @@ class GeographyType(ExtensionType):
     def default_pyobj(self, nullable: bool) -> str | None:
         if nullable:
             return None
-        # "WORLD" is a safe non-null default — it's always in the catalog.
         return "WORLD"
 
     def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
