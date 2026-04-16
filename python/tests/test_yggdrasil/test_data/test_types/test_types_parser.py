@@ -15,10 +15,14 @@ class TestParserAliases(unittest.TestCase):
     def test_simple_aliases(self):
         self.assertIs(ParsedDataType.parse_type_id("int"), DataTypeId.INTEGER)
         self.assertIs(ParsedDataType.parse_type_id("bigint"), DataTypeId.INTEGER)
-        self.assertIs(ParsedDataType.parse_type_id("double precision"), DataTypeId.FLOAT)
+        self.assertIs(
+            ParsedDataType.parse_type_id("double precision"), DataTypeId.FLOAT
+        )
         self.assertIs(ParsedDataType.parse_type_id("bytea"), DataTypeId.BINARY)
         self.assertIs(ParsedDataType.parse_type_id("json"), DataTypeId.JSON)
-        self.assertIs(ParsedDataType.parse_type_id("timestamp_ntz"), DataTypeId.TIMESTAMP)
+        self.assertIs(
+            ParsedDataType.parse_type_id("timestamp_ntz"), DataTypeId.TIMESTAMP
+        )
 
     def test_numeric_wire_id(self):
         self.assertIs(ParsedDataType.parse_type_id("32"), DataTypeId.ARRAY)
@@ -97,9 +101,7 @@ class TestParserPythonSyntax(unittest.TestCase):
                     ordered=False,
                     extras={"container": "set"},
                 ),
-                children=(
-                    ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
-                ),
+                children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
             ),
         )
 
@@ -284,9 +286,7 @@ class TestParserSQLSyntax(unittest.TestCase):
             ParsedDataType(
                 DataTypeId.ARRAY,
                 DataTypeMetadata(),
-                children=(
-                    ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
-                ),
+                children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
             ),
         )
 
@@ -373,7 +373,9 @@ class TestParserSQLSyntax(unittest.TestCase):
                                         DataTypeMetadata(),
                                         name="b",
                                         children=(
-                                            ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
+                                            ParsedDataType(
+                                                DataTypeId.STRING, DataTypeMetadata()
+                                            ),
                                         ),
                                     ),
                                 ),
@@ -415,7 +417,9 @@ class TestParserMetadata(unittest.TestCase):
 
     def test_string_metadata_brackets(self):
         self.assertEqual(
-            ParsedDataType.parse("string[encoding='utf8', format=`email`, nullable=true]"),
+            ParsedDataType.parse(
+                "string[encoding='utf8', format=`email`, nullable=true]"
+            ),
             ParsedDataType(
                 DataTypeId.STRING,
                 DataTypeMetadata(encoding="utf8", format="email", nullable=True),
@@ -451,7 +455,9 @@ class TestParserMetadata(unittest.TestCase):
 
     def test_timestamp_metadata(self):
         self.assertEqual(
-            ParsedDataType.parse('timestamp[tz="UTC", unit="ns", ordered=true, nullable=true]'),
+            ParsedDataType.parse(
+                'timestamp[tz="UTC", unit="ns", ordered=true, nullable=true]'
+            ),
             ParsedDataType(
                 DataTypeId.TIMESTAMP,
                 DataTypeMetadata(
@@ -521,7 +527,9 @@ class TestParserEdgeCases(unittest.TestCase):
 
     def test_raise_error_false_returns_default(self):
         self.assertEqual(
-            ParsedDataType.parse("map<string>", raise_error=False, default=DataTypeId.NULL),
+            ParsedDataType.parse(
+                "map<string>", raise_error=False, default=DataTypeId.NULL
+            ),
             ParsedDataType(DataTypeId.NULL, DataTypeMetadata()),
         )
 
@@ -552,12 +560,12 @@ class TestParserEdgeCases(unittest.TestCase):
         )
 
     def test_unknown_type_recursive_becomes_udd(self):
+        # geography is now a first-class type with DataTypeId.GEOGRAPHY.
         self.assertEqual(
             ParsedDataType.parse("geography(point, 4326)"),
             ParsedDataType(
-                DataTypeId.EXTENSION,
-                DataTypeMetadata(name="geography", args=("point", 4326)),
-                name="geography",
+                DataTypeId.GEOGRAPHY,
+                DataTypeMetadata(args=("point", 4326)),
             ),
         )
 
@@ -570,9 +578,8 @@ class TestParserEdgeCases(unittest.TestCase):
                 children=(
                     ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
                     ParsedDataType(
-                        DataTypeId.EXTENSION,
-                        DataTypeMetadata(name="geography", args=("point", 4326)),
-                        name="geography",
+                        DataTypeId.GEOGRAPHY,
+                        DataTypeMetadata(args=("point", 4326)),
                     ),
                 ),
             ),

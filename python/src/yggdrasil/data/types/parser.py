@@ -92,15 +92,27 @@ class ParsedDataType:
 
     @property
     def item(self) -> "ParsedDataType | None":
-        return self.children[0] if self.type_id is DataTypeId.ARRAY and self.children else None
+        return (
+            self.children[0]
+            if self.type_id is DataTypeId.ARRAY and self.children
+            else None
+        )
 
     @property
     def key(self) -> "ParsedDataType | None":
-        return self.children[0] if self.type_id is DataTypeId.MAP and len(self.children) >= 1 else None
+        return (
+            self.children[0]
+            if self.type_id is DataTypeId.MAP and len(self.children) >= 1
+            else None
+        )
 
     @property
     def value(self) -> "ParsedDataType | None":
-        return self.children[1] if self.type_id is DataTypeId.MAP and len(self.children) >= 2 else None
+        return (
+            self.children[1]
+            if self.type_id is DataTypeId.MAP and len(self.children) >= 2
+            else None
+        )
 
     @property
     def fields(self) -> tuple["ParsedDataType", ...]:
@@ -112,11 +124,19 @@ class ParsedDataType:
 
     @property
     def index_type(self) -> "ParsedDataType | None":
-        return self.children[0] if self.type_id is DataTypeId.DICTIONARY and len(self.children) >= 1 else None
+        return (
+            self.children[0]
+            if self.type_id is DataTypeId.DICTIONARY and len(self.children) >= 1
+            else None
+        )
 
     @property
     def value_type(self) -> "ParsedDataType | None":
-        return self.children[1] if self.type_id is DataTypeId.DICTIONARY and len(self.children) >= 2 else None
+        return (
+            self.children[1]
+            if self.type_id is DataTypeId.DICTIONARY and len(self.children) >= 2
+            else None
+        )
 
     @classmethod
     def parse(
@@ -249,7 +269,7 @@ class _Lexer:
                 continue
             break
 
-        return Token("number", self.text[start:self.index], start)
+        return Token("number", self.text[start : self.index], start)
 
     def _read_identifier(self) -> Token:
         start = self.index
@@ -258,7 +278,7 @@ class _Lexer:
             if ch.isspace() or ch in _TOKEN_PUNCT or ch in _QUOTE_CHARS:
                 break
             self.index += 1
-        return Token("ident", self.text[start:self.index], start)
+        return Token("ident", self.text[start : self.index], start)
 
 
 class _Parser:
@@ -318,7 +338,9 @@ class _Parser:
                 non_null.append(variant)
 
         if len(non_null) == 1:
-            return _set_nullable(non_null[0], True if nullable else non_null[0].metadata.nullable)
+            return _set_nullable(
+                non_null[0], True if nullable else non_null[0].metadata.nullable
+            )
 
         return ParsedDataType(
             type_id=DataTypeId.UNION,
@@ -337,7 +359,9 @@ class _Parser:
             inner, extras = self._parse_annotated()
             return ParsedDataType(
                 type_id=inner.type_id,
-                metadata=replace(inner.metadata, extras={**inner.metadata.extras, **extras}),
+                metadata=replace(
+                    inner.metadata, extras={**inner.metadata.extras, **extras}
+                ),
                 name=inner.name,
                 children=inner.children,
             )
@@ -355,7 +379,9 @@ class _Parser:
                     non_null.append(part)
 
             if len(non_null) == 1:
-                return _set_nullable(non_null[0], True if nullable else non_null[0].metadata.nullable)
+                return _set_nullable(
+                    non_null[0], True if nullable else non_null[0].metadata.nullable
+                )
 
             return ParsedDataType(
                 type_id=DataTypeId.UNION,
@@ -534,7 +560,11 @@ class _Parser:
         if canonical in {"varchar", "char", "character_varying", "character"}:
             if self._peek_any_generic_open():
                 args = self._parse_scalar_args()
-                length = int(args[0]) if len(args) == 1 and isinstance(args[0], int) else None
+                length = (
+                    int(args[0])
+                    if len(args) == 1 and isinstance(args[0], int)
+                    else None
+                )
                 return ParsedDataType(
                     type_id=DataTypeId.STRING,
                     metadata=DataTypeMetadata(length=length, args=tuple(args)),
@@ -568,6 +598,15 @@ class _Parser:
                 )
             return ParsedDataType(type_id=DataTypeId.DICTIONARY)
 
+        if dtype is DataTypeId.GEOGRAPHY:
+            if self._peek_any_generic_open():
+                args = self._parse_geography_args()
+                return ParsedDataType(
+                    type_id=DataTypeId.GEOGRAPHY,
+                    metadata=DataTypeMetadata(args=tuple(args)),
+                )
+            return ParsedDataType(type_id=DataTypeId.GEOGRAPHY)
+
         if dtype is DataTypeId.EXTENSION or dtype is None:
             if self._peek_any_generic_open():
                 open_tok = self._advance()
@@ -590,13 +629,17 @@ class _Parser:
         if dtype is DataTypeId.INTEGER:
             return ParsedDataType(
                 type_id=dtype,
-                metadata=DataTypeMetadata(byte_size=_default_integer_byte_size(canonical)),
+                metadata=DataTypeMetadata(
+                    byte_size=_default_integer_byte_size(canonical)
+                ),
             )
 
         if dtype is DataTypeId.FLOAT:
             return ParsedDataType(
                 type_id=dtype,
-                metadata=DataTypeMetadata(byte_size=_default_float_byte_size(canonical)),
+                metadata=DataTypeMetadata(
+                    byte_size=_default_float_byte_size(canonical)
+                ),
             )
 
         return ParsedDataType(type_id=dtype)
@@ -641,8 +684,7 @@ class _Parser:
             return self._fail("Annotated first argument must be a type")
 
         extras = {
-            f"annotation_{idx}": value
-            for idx, value in enumerate(parts[1:], start=1)
+            f"annotation_{idx}": value for idx, value in enumerate(parts[1:], start=1)
         }
         return first, extras
 
@@ -769,6 +811,73 @@ class _Parser:
         open_tok = self._expect_any_generic_open()
         close_char = _matching_close(open_tok.value)
         return self._parse_scalar_items(close_char)
+
+    def _parse_geography_args(self) -> list[object]:
+        """Parse geography-specific args like ``(OGC:CRS84, SPHERICAL)``.
+
+        Handles compound identifiers joined by ``:`` (e.g. ``OGC:CRS84``)
+        that the generic scalar parser would choke on, since ``:`` is
+        normally a punctuation token.
+        """
+        open_tok = self._expect_any_generic_open()
+        close_char = _matching_close(open_tok.value)
+        items: list[object] = []
+
+        if self._peek_punct(close_char):
+            self._advance()
+            return items
+
+        while True:
+            items.append(self._parse_geography_arg())
+            if self._peek_punct(","):
+                self._advance()
+                continue
+            break
+
+        self._expect_punct(close_char)
+        return items
+
+    def _parse_geography_arg(self) -> object:
+        """Parse a single geography arg, joining ``ident:ident`` into one string."""
+        tok = self._current()
+        if tok is None:
+            return self._fail("Unexpected end of geography args")
+
+        if tok.kind == "number":
+            self._advance()
+            return _parse_number(tok.value)
+
+        if tok.kind == "string":
+            self._advance()
+            return tok.value
+
+        if tok.kind == "ident":
+            # Consume the identifier and any colon-separated continuations
+            # so OGC:CRS84 becomes the single string "OGC:CRS84".
+            self._advance()
+            parts = [tok.value]
+            while self._peek_punct(":"):
+                self._advance()  # consume ':'
+                nxt = self._current()
+                if nxt is not None and nxt.kind in ("ident", "number"):
+                    self._advance()
+                    parts.append(nxt.value)
+                else:
+                    # Trailing colon with nothing after — just keep what we have.
+                    parts.append("")
+                    break
+            compound = ":".join(parts) if len(parts) > 1 else parts[0]
+
+            low = compound.lower()
+            if low == "true":
+                return True
+            if low == "false":
+                return False
+            if low in {"none", "null", "nil"}:
+                return None
+            return compound
+
+        return self._fail(f"Unexpected token in geography args: {tok.value!r}")
 
     def _parse_metadata(self, close_char: str) -> DataTypeMetadata:
         items: list[tuple[str | None, object]] = []
@@ -985,7 +1094,9 @@ class _Parser:
             return self._fail("Unexpected end in struct field")
 
         if tok.kind not in {"ident", "string"}:
-            return self._fail("Struct field name must be an identifier or quoted string")
+            return self._fail(
+                "Struct field name must be an identifier or quoted string"
+            )
 
         self._advance()
         name = tok.value
@@ -1004,7 +1115,9 @@ class _Parser:
             type_id=field_type.type_id,
             metadata=replace(
                 field_type.metadata,
-                nullable=nullable if nullable is not None else field_type.metadata.nullable,
+                nullable=(
+                    nullable if nullable is not None else field_type.metadata.nullable
+                ),
             ),
             name=name,
             children=field_type.children,
@@ -1060,7 +1173,11 @@ class _Parser:
 
     def _peek_ident_ci(self, value: str) -> bool:
         tok = self._current()
-        return tok is not None and tok.kind == "ident" and tok.value.lower() == value.lower()
+        return (
+            tok is not None
+            and tok.kind == "ident"
+            and tok.value.lower() == value.lower()
+        )
 
     def _match_ident_phrase(self, *parts: str) -> bool:
         for offset, part in enumerate(parts):
@@ -1129,14 +1246,11 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "object": ("object", DataTypeId.OBJECT),
         "any": ("object", DataTypeId.OBJECT),
         "variant": ("object", DataTypeId.OBJECT),
-
         "none": ("none", DataTypeId.NULL),
         "null": ("none", DataTypeId.NULL),
         "nil": ("none", DataTypeId.NULL),
-
         "bool": ("bool", DataTypeId.BOOL),
         "boolean": ("bool", DataTypeId.BOOL),
-
         "int": ("int", DataTypeId.INTEGER),
         "integer": ("integer", DataTypeId.INTEGER),
         "bigint": ("bigint", DataTypeId.INTEGER),
@@ -1153,7 +1267,6 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "u16": ("u16", DataTypeId.INTEGER),
         "u32": ("u32", DataTypeId.INTEGER),
         "u64": ("u64", DataTypeId.INTEGER),
-
         "float": ("float", DataTypeId.FLOAT),
         "double": ("double", DataTypeId.FLOAT),
         "double_precision": ("double_precision", DataTypeId.FLOAT),
@@ -1161,30 +1274,26 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "f16": ("f16", DataTypeId.FLOAT),
         "f32": ("f32", DataTypeId.FLOAT),
         "f64": ("f64", DataTypeId.FLOAT),
-
         "decimal": ("decimal", DataTypeId.DECIMAL),
         "numeric": ("decimal", DataTypeId.DECIMAL),
-
         "date": ("date", DataTypeId.DATE),
-
         "time": ("time", DataTypeId.TIME),
-
         "timestamp": ("timestamp", DataTypeId.TIMESTAMP),
         "datetime": ("timestamp", DataTypeId.TIMESTAMP),
         "timestamp_with_time_zone": ("timestamp_with_time_zone", DataTypeId.TIMESTAMP),
-        "timestamp_without_time_zone": ("timestamp_without_time_zone", DataTypeId.TIMESTAMP),
+        "timestamp_without_time_zone": (
+            "timestamp_without_time_zone",
+            DataTypeId.TIMESTAMP,
+        ),
         "timestamp_ntz": ("timestamp_ntz", DataTypeId.TIMESTAMP),
         "timestamp_ltz": ("timestamp_ltz", DataTypeId.TIMESTAMP),
-
         "duration": ("duration", DataTypeId.DURATION),
         "interval": ("duration", DataTypeId.DURATION),
         "timedelta": ("duration", DataTypeId.DURATION),
-
         "binary": ("binary", DataTypeId.BINARY),
         "bytes": ("binary", DataTypeId.BINARY),
         "bytea": ("binary", DataTypeId.BINARY),
         "blob": ("binary", DataTypeId.BINARY),
-
         "string": ("string", DataTypeId.STRING),
         "str": ("string", DataTypeId.STRING),
         "text": ("string", DataTypeId.STRING),
@@ -1192,36 +1301,31 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "char": ("char", DataTypeId.STRING),
         "character_varying": ("character_varying", DataTypeId.STRING),
         "character": ("character", DataTypeId.STRING),
-
         "array": ("array", DataTypeId.ARRAY),
         "list": ("array", DataTypeId.ARRAY),
         "set": ("set", DataTypeId.ARRAY),
         "frozenset": ("frozenset", DataTypeId.ARRAY),
-
         "map": ("map", DataTypeId.MAP),
         "dict": ("map", DataTypeId.MAP),
         "mapping": ("map", DataTypeId.MAP),
-
         "struct": ("struct", DataTypeId.STRUCT),
         "row": ("struct", DataTypeId.STRUCT),
         "record": ("struct", DataTypeId.STRUCT),
         "tuple": ("tuple", DataTypeId.STRUCT),
-
         "union": ("union", DataTypeId.UNION),
-
         "json": ("json", DataTypeId.JSON),
-
         "enum": ("enum", DataTypeId.ENUM),
         "literal": ("literal", DataTypeId.ENUM),
-
         "dictionary": ("dictionary", DataTypeId.DICTIONARY),
         "categorical": ("dictionary", DataTypeId.DICTIONARY),
-
+        "geography": ("geography", DataTypeId.GEOGRAPHY),
+        "geo": ("geography", DataTypeId.GEOGRAPHY),
+        "geozone": ("geography", DataTypeId.GEOGRAPHY),
+        "geolocation": ("geography", DataTypeId.GEOGRAPHY),
         "udd": ("udd", DataTypeId.EXTENSION),
         "user_defined": ("udd", DataTypeId.EXTENSION),
         "user_defined_datatype": ("udd", DataTypeId.EXTENSION),
         "custom": ("udd", DataTypeId.EXTENSION),
-
         "optional": ("optional", None),
         "annotated": ("annotated", None),
     }
