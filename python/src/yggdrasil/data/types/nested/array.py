@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_polars, get_spark_sql
+from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.io import SaveMode
 
 from .base import DataType, NestedType
 
 if TYPE_CHECKING:
+    import pandas as pd
     import polars
     import pyspark.sql.types as pst
     from yggdrasil.data.cast.options import CastOptions
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ArrayType",
+    "cast_arrow_list_array",
+    "cast_arrow_map_array_to_list",
+    "cast_polars_list_expr",
+    "cast_polars_list_series",
+    "cast_pandas_list_series",
+    "cast_spark_list_column",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -298,6 +305,84 @@ class ArrayType(NestedType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else []
 
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ) -> "polars.Series":
+        pl = get_polars()
+        options.check_source(series)
+        options.check_target(self)
+
+        if options.source_field.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
+            return options.target_field.default_polars_series(size=len(series))
+
+        expr = self._cast_polars_expr(
+            pl.col(series.name),
+            options=options,
+        ).alias(options.target_field.name)
+        return pl.DataFrame({series.name: series}).select(expr).to_series()
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ) -> Any:
+        options.check_target(self)
+
+        if options.source_field.dtype.type_id == DataTypeId.NULL:
+            return options.target_field.default_polars_expr(alias=options.target_field.name)
+
+        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+            return cast_polars_list_expr(expr, options)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source_field} to {options.target_field}"
+            )
+
+    def _cast_pandas_series(
+        self,
+        series: "pd.Series",
+        options: "CastOptions",
+    ) -> "pd.Series":
+        pd = get_pandas()
+        options.check_source(series)
+        options.check_target(self)
+
+        if options.source_field.dtype.type_id == DataTypeId.NULL or series.isna().all():
+            return options.target_field.default_pandas_series(size=len(series))
+
+        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+            return cast_pandas_list_series(series, options)
+
+        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+            return _cast_pandas_via_arrow(series, options, cast_arrow_map_array_to_list)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source_field} to {options.target_field}"
+            )
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ) -> Any:
+        options.check_source(column)
+        options.check_target(self)
+
+        if options.source_field.dtype.type_id == DataTypeId.NULL:
+            return options.target_field.default_spark_column()
+
+        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+            return cast_spark_list_column(column, options)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source_field} to {options.target_field}"
+            )
+
 
 def cast_arrow_list_array(
     array: pa.Array | pa.ChunkedArray,
@@ -456,4 +541,97 @@ def cast_arrow_map_array_to_list(
         offsets=array.offsets,
         values=entry_values,
         mask=array.is_null(),
+    )
+
+
+# Polars
+
+def cast_polars_list_expr(
+    expr: Any,
+    options: "CastOptions",
+) -> Any:
+    pl = get_polars()
+
+    if options.target_field is None:
+        return expr
+    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+
+    source_type: ArrayType = options.source_field.dtype
+    target_type: ArrayType = options.target_field.dtype
+
+    casted_element = target_type.item_field.cast_polars_expr(
+        pl.element(),
+        options=options.copy(
+            source_field=source_type.item_field,
+            target_field=target_type.item_field,
+        ),
+    )
+
+    return expr.list.eval(casted_element)
+
+
+def cast_polars_list_series(
+    series: "polars.Series",
+    options: "CastOptions",
+) -> "polars.Series":
+    pl = get_polars()
+    expr = cast_polars_list_expr(pl.col(series.name), options).alias(options.target_field.name)
+    return pl.DataFrame({series.name: series}).select(expr).to_series()
+
+
+# Pandas
+
+def _cast_pandas_via_arrow(
+    series: "pd.Series",
+    options: "CastOptions",
+    caster,
+) -> "pd.Series":
+    pd = get_pandas()
+
+    source_arrow_type = options.source_field.dtype.to_arrow()
+    source_array = pa.array(series.tolist(), type=source_arrow_type)
+    casted = caster(source_array, options)
+
+    if isinstance(casted, pa.ChunkedArray):
+        values = casted.to_pylist()
+    else:
+        values = casted.to_pylist()
+
+    return pd.Series(values, index=series.index, name=options.target_field.name, dtype="object")
+
+
+def cast_pandas_list_series(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    return _cast_pandas_via_arrow(series, options, cast_arrow_list_array)
+
+
+# PySpark
+
+def cast_spark_list_column(
+    column: Any,
+    options: "CastOptions",
+) -> Any:
+    spark = get_spark_sql()
+    F = spark.functions
+
+    if options.target_field is None:
+        return column
+    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+
+    source_type: ArrayType = options.source_field.dtype
+    target_type: ArrayType = options.target_field.dtype
+
+    return F.transform(
+        column,
+        lambda x: target_type.item_field.cast_spark_column(
+            x,
+            options=options.copy(
+                source_field=source_type.item_field,
+                target_field=target_type.item_field,
+            ),
+        ),
     )

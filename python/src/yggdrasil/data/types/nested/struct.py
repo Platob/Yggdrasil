@@ -384,7 +384,7 @@ def cast_arrow_map_array(
         casted = target_child.cast_arrow_array(
             values,
             options=options.copy(
-                source_field=source_type.item_field,
+                source_field=source_type.value_field,
                 target_field=target_child,
             ),
         )
@@ -925,7 +925,7 @@ def cast_spark_map_column(
         casted = target_child.cast_spark_column(
             extracted,
             options=options.copy(
-                source_field=source_type.item_field,
+                source_field=source_type.value_field,
                 target_field=target_child,
             ),
         ).alias(target_child.name)
@@ -964,7 +964,7 @@ def cast_spark_list_column(
                 source_field=source_type.item_field,
                 target_field=target_child,
             ),
-        )
+        ).alias(target_child.name)
 
         child_columns.append(casted)
 
