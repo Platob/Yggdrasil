@@ -7,6 +7,7 @@ from .columns import Columns
 from .engine import SQLEngine, StatementResult
 from .exceptions import SQLError
 from .schema import Schema
+from .schemas import Schemas
 from .service import Warehouses
 from .sql_utils import *
 from .staging import StagingPath
