@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from .sql.tables import Tables
     from .sql.columns import Columns
     from .sql.catalogs import Catalogs
+    from .sql.schemas import Schemas
     from .sql.service import Warehouses
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -837,6 +838,25 @@ class DatabricksClient(URLResource):
         )
 
     @property
+    def schemas(self) -> "Schemas":
+        """Collection-level Unity Catalog schema service for this client.
+
+        Provides dict-like access to schemas and tables::
+
+            client.schemas["main.sales"]             # Schema
+            client.schemas["main.sales.orders"]      # Table
+            client.schemas(catalog_name="main")      # Schemas scoped to "main"
+        """
+        from .sql.schemas import Schemas
+
+        return self.lazy_property(
+            self,
+            cache_attr="_schemas",
+            factory=lambda: Schemas(client=self),
+            use_cache=True,
+        )
+
+    @property
     def genie(self) -> "Genie":
         """Genie conversation and space management helper for this client."""
         from .ai.genie import Genie
@@ -1009,6 +1029,11 @@ class DatabricksService(ABC):
     def catalogs(self) -> "Catalogs":
         """Collection-level Unity Catalog hierarchy service (shorthand for ``client.catalogs``)."""
         return self.client.catalogs
+
+    @property
+    def schemas(self) -> "Schemas":
+        """Collection-level Unity Catalog schema service (shorthand for ``client.schemas``)."""
+        return self.client.schemas
 
     @property
     def genie(self) -> "Genie":
