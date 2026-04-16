@@ -76,10 +76,16 @@ def _resolve_zone(
 
 
 def _normalize_srid(value: int | str | None) -> int | str:
-    """Normalize an SRID value to either an int or the string ``"ANY"``.
+    """Normalize an SRID value.
 
-    Accepts ``None`` (-> default 4326), ints, numeric strings, and the
-    literal ``"ANY"`` (case-insensitive).
+    Returns an int for numeric SRIDs, or a string for named references.
+
+    Accepted inputs:
+    - ``None`` -> default 4326
+    - int -> kept as-is
+    - ``"ANY"`` (case-insensitive) -> ``"ANY"``
+    - ``"4326"`` (numeric string) -> ``4326``
+    - ``"OGC:CRS84"`` or other named CRS references -> kept as uppercase string
     """
     if value is None:
         return DEFAULT_SRID
@@ -87,18 +93,26 @@ def _normalize_srid(value: int | str | None) -> int | str:
     if isinstance(value, int):
         return value
 
-    text = str(value).strip().upper()
-    if text == "ANY":
+    text = str(value).strip()
+    upper = text.upper()
+
+    if upper == "ANY":
         return "ANY"
 
     try:
         return int(text)
     except (ValueError, TypeError):
-        raise ValueError(
-            f"Invalid SRID value {value!r}. "
-            f"Pass an integer SRID (e.g. 4326), 'ANY', or None for the "
-            f"default (WGS 84 / 4326)."
-        )
+        pass
+
+    # Named CRS references like OGC:CRS84 — keep as uppercase string.
+    if text:
+        return upper
+
+    raise ValueError(
+        f"Invalid SRID value {value!r}. "
+        f"Pass an integer SRID (e.g. 4326), 'ANY', a named CRS "
+        f"(e.g. 'OGC:CRS84'), or None for the default (WGS 84 / 4326)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +255,11 @@ class GeographyType(DataType):
     ----------
     srid : int | str
         Spatial Reference System Identifier.  Default is ``4326`` (WGS 84).
-        Pass ``"ANY"`` to accept any SRID.  Controls the Databricks DDL:
-        ``GEOGRAPHY(4326)``, ``GEOGRAPHY(ANY)``, etc.
+        Pass ``"ANY"`` to accept any SRID, or a named CRS like
+        ``"OGC:CRS84"``.  Controls the Databricks DDL output.
+    model : str | None
+        Coordinate model.  ``None`` (default) omits it from DDL.
+        ``"SPHERICAL"`` produces ``GEOGRAPHY(srid, SPHERICAL)``.
     output : str
         What field to extract from resolved zones: ``"code"`` (default),
         ``"name"``, ``"country_iso"``, ``"region_iso"``, ``"key"``,
@@ -250,16 +267,20 @@ class GeographyType(DataType):
 
     Example::
 
-        geo = GeographyType()               # GEOGRAPHY(4326), output=code
-        geo = GeographyType(srid="ANY")      # GEOGRAPHY(ANY)
-        geo = GeographyType(srid=4326, output="country_iso")
+        geo = GeographyType()                              # GEOGRAPHY(4326)
+        geo = GeographyType(srid="ANY")                    # GEOGRAPHY(ANY)
+        geo = GeographyType(srid="OGC:CRS84", model="SPHERICAL")
+        #  -> GEOGRAPHY(OGC:CRS84, SPHERICAL)
     """
 
     srid: int | str = DEFAULT_SRID
+    model: str | None = None
     output: str = "code"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "srid", _normalize_srid(self.srid))
+        if self.model is not None:
+            object.__setattr__(self, "model", str(self.model).strip().upper())
 
     # ------------------------------------------------------------------
     # DataType protocol
@@ -317,6 +338,8 @@ class GeographyType(DataType):
     # Databricks DDL — native GEOGRAPHY type
     # ------------------------------------------------------------------
     def to_databricks_ddl(self) -> str:
+        if self.model:
+            return f"GEOGRAPHY({self.srid}, {self.model})"
         return f"GEOGRAPHY({self.srid})"
 
     # ------------------------------------------------------------------
@@ -333,8 +356,9 @@ class GeographyType(DataType):
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> GeographyType:
         srid = _normalize_srid(value.get("srid"))
+        model = value.get("model")
         output = value.get("output", "code")
-        return cls(srid=srid, output=output)
+        return cls(srid=srid, model=model, output=output)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -343,6 +367,8 @@ class GeographyType(DataType):
         }
         if self.srid != DEFAULT_SRID:
             d["srid"] = str(self.srid) if isinstance(self.srid, int) else self.srid
+        if self.model:
+            d["model"] = self.model
         if self.output != "code":
             d["output"] = self.output
         return d
@@ -456,14 +482,20 @@ class GeographyType(DataType):
         parts: list[str] = []
         if self.srid != DEFAULT_SRID:
             parts.append(f"srid={self.srid!r}")
+        if self.model:
+            parts.append(f"model={self.model!r}")
         if self.output != "code":
             parts.append(f"output={self.output!r}")
         return f"GeographyType({', '.join(parts)})"
 
     def __str__(self) -> str:
         srid_str = str(self.srid)
+        if self.model:
+            base = f"geography({srid_str}, {self.model})"
+        elif self.srid != DEFAULT_SRID:
+            base = f"geography({srid_str})"
+        else:
+            base = "geography"
         if self.output != "code":
-            return f"geography({srid_str})[{self.output}]"
-        if self.srid != DEFAULT_SRID:
-            return f"geography({srid_str})"
-        return "geography"
+            return f"{base}[{self.output}]"
+        return base

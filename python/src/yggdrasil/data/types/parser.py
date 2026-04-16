@@ -600,7 +600,7 @@ class _Parser:
 
         if dtype is DataTypeId.GEOGRAPHY:
             if self._peek_any_generic_open():
-                args = self._parse_scalar_args()
+                args = self._parse_geography_args()
                 return ParsedDataType(
                     type_id=DataTypeId.GEOGRAPHY,
                     metadata=DataTypeMetadata(args=tuple(args)),
@@ -811,6 +811,73 @@ class _Parser:
         open_tok = self._expect_any_generic_open()
         close_char = _matching_close(open_tok.value)
         return self._parse_scalar_items(close_char)
+
+    def _parse_geography_args(self) -> list[object]:
+        """Parse geography-specific args like ``(OGC:CRS84, SPHERICAL)``.
+
+        Handles compound identifiers joined by ``:`` (e.g. ``OGC:CRS84``)
+        that the generic scalar parser would choke on, since ``:`` is
+        normally a punctuation token.
+        """
+        open_tok = self._expect_any_generic_open()
+        close_char = _matching_close(open_tok.value)
+        items: list[object] = []
+
+        if self._peek_punct(close_char):
+            self._advance()
+            return items
+
+        while True:
+            items.append(self._parse_geography_arg())
+            if self._peek_punct(","):
+                self._advance()
+                continue
+            break
+
+        self._expect_punct(close_char)
+        return items
+
+    def _parse_geography_arg(self) -> object:
+        """Parse a single geography arg, joining ``ident:ident`` into one string."""
+        tok = self._current()
+        if tok is None:
+            return self._fail("Unexpected end of geography args")
+
+        if tok.kind == "number":
+            self._advance()
+            return _parse_number(tok.value)
+
+        if tok.kind == "string":
+            self._advance()
+            return tok.value
+
+        if tok.kind == "ident":
+            # Consume the identifier and any colon-separated continuations
+            # so OGC:CRS84 becomes the single string "OGC:CRS84".
+            self._advance()
+            parts = [tok.value]
+            while self._peek_punct(":"):
+                self._advance()  # consume ':'
+                nxt = self._current()
+                if nxt is not None and nxt.kind in ("ident", "number"):
+                    self._advance()
+                    parts.append(nxt.value)
+                else:
+                    # Trailing colon with nothing after — just keep what we have.
+                    parts.append("")
+                    break
+            compound = ":".join(parts) if len(parts) > 1 else parts[0]
+
+            low = compound.lower()
+            if low == "true":
+                return True
+            if low == "false":
+                return False
+            if low in {"none", "null", "nil"}:
+                return None
+            return compound
+
+        return self._fail(f"Unexpected token in geography args: {tok.value!r}")
 
     def _parse_metadata(self, close_char: str) -> DataTypeMetadata:
         items: list[tuple[str | None, object]] = []

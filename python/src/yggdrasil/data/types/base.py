@@ -76,7 +76,11 @@ _NONE_TYPE = type(None)
 
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
-    return isinstance(obj, type) and issubclass(obj, class_or_tuple) or obj is class_or_tuple
+    return (
+        isinstance(obj, type)
+        and issubclass(obj, class_or_tuple)
+        or obj is class_or_tuple
+    )
 
 
 def _strip_annotated(hint: object) -> object:
@@ -155,8 +159,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @property
     @abstractmethod
-    def type_id(self) -> DataTypeId:
-        ...
+    def type_id(self) -> DataTypeId: ...
 
     def convert_pyobj(self, value: Any, nullable: bool, safe: bool = False):
         if value is None:
@@ -166,17 +169,17 @@ class DataType(BaseChildrenFields, ABC):
     def _convert_pyobj(self, value: Any, safe: bool = False):
         return pa.scalar(value, type=self.to_arrow(), safe=safe).as_py()
 
-    def convert_arrow_scalar(self, value: pa.Scalar, nullable: bool, safe: bool = False) -> pa.Scalar:
+    def convert_arrow_scalar(
+        self, value: pa.Scalar, nullable: bool, safe: bool = False
+    ) -> pa.Scalar:
         return value.cast(self.to_arrow(), safe=safe)
 
-    def to_struct(
-        self,
-        name: str | None = None
-    ) -> "StructType":
+    def to_struct(self, name: str | None = None) -> "StructType":
         if self.type_id == DataTypeId.STRUCT:
             return self
 
         from .nested import StructType
+
         return StructType(fields=[self.to_field(name=name)])
 
     def to_field(
@@ -316,7 +319,9 @@ class DataType(BaseChildrenFields, ABC):
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
-        raise NotImplementedError(f"{type(self).__name__}.default_pyobj(nullable=False) is not implemented")
+        raise NotImplementedError(
+            f"{type(self).__name__}.default_pyobj(nullable=False) is not implemented"
+        )
 
     def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
         return pa.scalar(self.default_pyobj(nullable=nullable), type=self.to_arrow())
@@ -338,7 +343,9 @@ class DataType(BaseChildrenFields, ABC):
         nullable: bool = True,
     ):
         pl = get_polars()
-        value = self.default_polars_scalar(nullable=nullable) if value is None else value
+        value = (
+            self.default_polars_scalar(nullable=nullable) if value is None else value
+        )
         s = pl.lit(value, dtype=self.to_polars())
 
         if alias and alias != DEFAULT_FIELD_NAME:
@@ -354,7 +361,9 @@ class DataType(BaseChildrenFields, ABC):
         name: str = "",
     ):
         pl = get_polars()
-        value = self.default_polars_scalar(nullable=nullable) if value is None else value
+        value = (
+            self.default_polars_scalar(nullable=nullable) if value is None else value
+        )
         return pl.Series(
             name=name or DEFAULT_FIELD_NAME,
             values=[value] * size,
@@ -371,7 +380,9 @@ class DataType(BaseChildrenFields, ABC):
         index: Any = None,
     ):
         pd = get_pandas()
-        value = self.default_pandas_scalar(nullable=nullable) if value is None else value
+        value = (
+            self.default_pandas_scalar(nullable=nullable) if value is None else value
+        )
         return pd.Series(
             [value] * size,
             index=index,
@@ -424,7 +435,9 @@ class DataType(BaseChildrenFields, ABC):
         if parsed.type_id == DataTypeId.DECIMAL:
             precision = meta.precision if meta.precision is not None else 38
             scale = meta.scale if meta.scale is not None else 18
-            return DecimalType(byte_size=parsed.byte_size, precision=precision, scale=scale)
+            return DecimalType(
+                byte_size=parsed.byte_size, precision=precision, scale=scale
+            )
 
         if parsed.type_id == DataTypeId.DATE:
             return DateType()
@@ -454,8 +467,12 @@ class DataType(BaseChildrenFields, ABC):
             return ArrayType.from_item_field(field_cls.from_parsed(child), safe=False)
 
         if parsed.type_id == DataTypeId.MAP:
-            key_child = parsed.key or ParsedDataType(type_id=DataTypeId.STRING, name="key")
-            value_child = parsed.value or ParsedDataType(type_id=DataTypeId.STRING, name="value")
+            key_child = parsed.key or ParsedDataType(
+                type_id=DataTypeId.STRING, name="key"
+            )
+            value_child = parsed.value or ParsedDataType(
+                type_id=DataTypeId.STRING, name="value"
+            )
 
             key_dtype = field_cls.from_parsed(key_child, name="key")
             value_dtype = field_cls.from_parsed(value_child, name="value")
@@ -490,8 +507,7 @@ class DataType(BaseChildrenFields, ABC):
             dtypes = [cls.from_parsed(child) for child in parsed.variants]
             first = dtypes[0]
             if all(
-                type(dtype) is type(first)
-                and dtype.to_dict() == first.to_dict()
+                type(dtype) is type(first) and dtype.to_dict() == first.to_dict()
                 for dtype in dtypes[1:]
             ):
                 return first
@@ -508,12 +524,19 @@ class DataType(BaseChildrenFields, ABC):
 
         if parsed.type_id == DataTypeId.OBJECT:
             from .extensions.obj import ObjectType
+
             return ObjectType()
 
         if parsed.type_id == DataTypeId.GEOGRAPHY:
             from .extensions.geography import GeographyType, _normalize_srid
+
             srid_arg = meta.args[0] if meta.args else None
-            return GeographyType(srid=_normalize_srid(srid_arg))
+            model_arg = meta.args[1] if len(meta.args) >= 2 else None
+            model = str(model_arg).upper() if model_arg is not None else None
+            return GeographyType(
+                srid=_normalize_srid(srid_arg),
+                model=model,
+            )
 
         if parsed.type_id == DataTypeId.EXTENSION:
             # If extension metadata carries a name, try to resolve it from the
@@ -522,6 +545,7 @@ class DataType(BaseChildrenFields, ABC):
             ext_name = getattr(meta, "extension_name", None) or ""
             if ext_name:
                 from .extensions.base import _EXTENSION_REGISTRY
+
                 target_cls = _EXTENSION_REGISTRY.get(ext_name)
                 if target_cls is not None:
                     return target_cls()
@@ -539,9 +563,7 @@ class DataType(BaseChildrenFields, ABC):
         opts = opts.check_source(array).check_target(self)
 
         if not opts.need_cast(
-            check_names=True,
-            check_dtypes=True,
-            check_metadata=False
+            check_names=True, check_dtypes=True, check_metadata=False
         ):
             return array
 
@@ -550,7 +572,9 @@ class DataType(BaseChildrenFields, ABC):
                 return self._cast_chunked_array(array, opts)
             return self._cast_arrow_array(array, opts)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
-            raise ValueError(f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}") from e
+            raise ValueError(
+                f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}"
+            ) from e
 
     def _cast_arrow_array(
         self,
@@ -583,12 +607,12 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ) -> "polars.Series | polars.Expr":
-        opts = get_cast_options_class().check(options, **more_options).check_source(series)
+        opts = (
+            get_cast_options_class().check(options, **more_options).check_source(series)
+        )
 
         if not opts.need_cast(
-            check_names=True,
-            check_dtypes=True,
-            check_metadata=False
+            check_names=True, check_dtypes=True, check_metadata=False
         ):
             return series
 
@@ -604,12 +628,12 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ) -> "polars.Series | polars.Expr":
-        opts = get_cast_options_class().check(options, **more_options).check_source(series)
+        opts = (
+            get_cast_options_class().check(options, **more_options).check_source(series)
+        )
 
         if not opts.need_cast(
-            check_names=True,
-            check_dtypes=True,
-            check_metadata=False
+            check_names=True, check_dtypes=True, check_metadata=False
         ):
             return series
 
@@ -636,7 +660,11 @@ class DataType(BaseChildrenFields, ABC):
 
         return self.fill_polars_array_nulls(
             casted,
-            nullable=options.target_field.nullable if options.target_field is not None else True,
+            nullable=(
+                options.target_field.nullable
+                if options.target_field is not None
+                else True
+            ),
         )
 
     def _cast_polars_expr(
@@ -647,7 +675,11 @@ class DataType(BaseChildrenFields, ABC):
         casted = expr.cast(dtype=self.to_polars(), strict=options.safe)
         return self.fill_polars_array_nulls(
             casted,
-            nullable=options.target_field.nullable if options.target_field is not None else True,
+            nullable=(
+                options.target_field.nullable
+                if options.target_field is not None
+                else True
+            ),
         )
 
     def cast_polars_tabular(
@@ -665,7 +697,9 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions",
     ):
         if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError("Need struct implementation for cast_polars_tabular")
+            raise NotImplementedError(
+                "Need struct implementation for cast_polars_tabular"
+            )
         return self.to_struct()._cast_polars_tabular(table, options)
 
     def cast_pandas_series(
@@ -701,7 +735,11 @@ class DataType(BaseChildrenFields, ABC):
 
         return self.fill_pandas_series_nulls(
             out,
-            nullable=options.target_field.nullable if options.target_field is not None else True,
+            nullable=(
+                options.target_field.nullable
+                if options.target_field is not None
+                else True
+            ),
         )
 
     def cast_pandas_tabular(
@@ -719,7 +757,9 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions",
     ):
         if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError("Need struct implementation for cast_pandas_tabular")
+            raise NotImplementedError(
+                "Need struct implementation for cast_pandas_tabular"
+            )
         return self.to_struct()._cast_pandas_tabular(data, options)
 
     def cast_arrow_tabular(
@@ -737,7 +777,9 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions",
     ):
         if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError("Need struct implementation for cast_arrow_tabular")
+            raise NotImplementedError(
+                "Need struct implementation for cast_arrow_tabular"
+            )
         return self.to_struct()._cast_arrow_tabular(table, options)
 
     def cast_spark_column(
@@ -767,7 +809,11 @@ class DataType(BaseChildrenFields, ABC):
         casted = column.cast(self.to_spark())
         return self.fill_spark_column_nulls(
             casted,
-            nullable=options.target_field.nullable if options.target_field is not None else True,
+            nullable=(
+                options.target_field.nullable
+                if options.target_field is not None
+                else True
+            ),
         )
 
     def cast_spark_tabular(
@@ -785,7 +831,9 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions",
     ):
         if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError("Need struct implementation for cast_spark_tabular")
+            raise NotImplementedError(
+                "Need struct implementation for cast_spark_tabular"
+            )
         return self.to_struct()._cast_spark_tabular(data, options)
 
     @classmethod
@@ -870,6 +918,7 @@ class DataType(BaseChildrenFields, ABC):
 
         if hint is object:
             from .extensions.obj import ObjectType
+
             return ObjectType()
 
         if is_dataclass(hint):
@@ -895,7 +944,10 @@ class DataType(BaseChildrenFields, ABC):
 
             dtypes = [cls.from_pytype(arg) for arg in non_null_args]
             first = dtypes[0]
-            if all(type(dtype) is type(first) and dtype.to_dict() == first.to_dict() for dtype in dtypes[1:]):
+            if all(
+                type(dtype) is type(first) and dtype.to_dict() == first.to_dict()
+                for dtype in dtypes[1:]
+            ):
                 return first
 
             return StringType()
@@ -1150,8 +1202,14 @@ class DataType(BaseChildrenFields, ABC):
     def from_arrow(
         cls,
         value: Union[
-            pa.Field, pa.DataType, pa.Array, pa.ChunkedArray,
-            pa.Table, pa.RecordBatch, pa.Scalar, pa.Schema,
+            pa.Field,
+            pa.DataType,
+            pa.Array,
+            pa.ChunkedArray,
+            pa.Table,
+            pa.RecordBatch,
+            pa.Scalar,
+            pa.Schema,
         ],
     ) -> "DataType":
         if isinstance(value, pa.DataType):
@@ -1188,6 +1246,7 @@ class DataType(BaseChildrenFields, ABC):
     @classmethod
     def from_arrow_schema(cls, value: pa.Schema) -> "StructType":
         from ..data_field import Field
+
         return StructType(fields=[Field.from_arrow_field(f) for f in value])
 
     @classmethod
@@ -1230,10 +1289,11 @@ class DataType(BaseChildrenFields, ABC):
         pl = get_polars()
         from ..data_field import Field
 
-        return StructType(fields=[
-            Field.from_polars(pl.Field(name=k, dtype=d))
-            for k, d in schema.items()
-        ])
+        return StructType(
+            fields=[
+                Field.from_polars(pl.Field(name=k, dtype=d)) for k, d in schema.items()
+            ]
+        )
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "DataType":
@@ -1384,18 +1444,21 @@ class DataType(BaseChildrenFields, ABC):
         elif base.type_id == DataTypeId.MAP:
             key_type = value.get("keyType")
             if key_type is not None:
-                base.key_field.with_dtype(key_type, inplace=True).with_name("key", inplace=True)
+                base.key_field.with_dtype(key_type, inplace=True).with_name(
+                    "key", inplace=True
+                )
 
             value_type = value.get("valueType")
             if value_type is not None:
-                base.value_field.with_dtype(value_type, inplace=True).with_name("value", inplace=True)
+                base.value_field.with_dtype(value_type, inplace=True).with_name(
+                    "value", inplace=True
+                )
 
             value_contains_null = value.get("valueContainsNull")
             if value_contains_null is not None:
                 base.value_field.with_nullable(value_contains_null, inplace=True)
 
         return base
-
 
     def fill_arrow_array_nulls(
         self,
@@ -1450,11 +1513,15 @@ class DataType(BaseChildrenFields, ABC):
 
             return pa.chunked_array(
                 [
-                    pa.repeat(
-                        value=default_scalar,
-                        size=chunk_size,
-                        memory_pool=memory_pool,
-                    ) if chunk_size > 0 else pa.array([], type=arrow_type)
+                    (
+                        pa.repeat(
+                            value=default_scalar,
+                            size=chunk_size,
+                            memory_pool=memory_pool,
+                        )
+                        if chunk_size > 0
+                        else pa.array([], type=arrow_type)
+                    )
                     for chunk_size in chunks
                 ],
                 type=arrow_type,
@@ -1520,7 +1587,11 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None:
             default_scalar = self.default_arrow_scalar(nullable=nullable)
 
-        return F.when(column.isNull(), F.lit(default_scalar.as_py())).otherwise(column).cast(self.to_spark())
+        return (
+            F.when(column.isNull(), F.lit(default_scalar.as_py()))
+            .otherwise(column)
+            .cast(self.to_spark())
+        )
 
 
 from .nested import ArrayType, MapType, NestedType, StructType

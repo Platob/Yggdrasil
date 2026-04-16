@@ -74,17 +74,36 @@ class TestSRID(unittest.TestCase):
     def test_srid_none_defaults(self):
         self.assertEqual(GeographyType(srid=None).srid, DEFAULT_SRID)
 
-    def test_invalid_srid_raises(self):
+    def test_srid_named_crs(self):
+        geo = GeographyType(srid="OGC:CRS84")
+        self.assertEqual(geo.srid, "OGC:CRS84")
+
+    def test_srid_empty_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid SRID"):
-            GeographyType(srid="BOGUS")
+            GeographyType(srid="")
 
     def test_equality_same_srid(self):
         self.assertEqual(GeographyType(srid=4326), GeographyType(srid=4326))
         self.assertEqual(GeographyType(srid="ANY"), GeographyType(srid="ANY"))
+        self.assertEqual(
+            GeographyType(srid="OGC:CRS84"), GeographyType(srid="OGC:CRS84")
+        )
 
     def test_equality_different_srid(self):
         self.assertNotEqual(GeographyType(srid=4326), GeographyType(srid=3857))
         self.assertNotEqual(GeographyType(srid=4326), GeographyType(srid="ANY"))
+
+    def test_model_parameter(self):
+        geo = GeographyType(srid="OGC:CRS84", model="SPHERICAL")
+        self.assertEqual(geo.srid, "OGC:CRS84")
+        self.assertEqual(geo.model, "SPHERICAL")
+
+    def test_model_none_by_default(self):
+        self.assertIsNone(GeographyType().model)
+
+    def test_model_normalized_uppercase(self):
+        geo = GeographyType(model="spherical")
+        self.assertEqual(geo.model, "SPHERICAL")
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +129,14 @@ class TestDatabricksDDL(unittest.TestCase):
         self.assertEqual(
             GeographyType(output="name").to_databricks_ddl(), "GEOGRAPHY(4326)"
         )
+
+    def test_ddl_ogc_crs84_spherical(self):
+        geo = GeographyType(srid="OGC:CRS84", model="SPHERICAL")
+        self.assertEqual(geo.to_databricks_ddl(), "GEOGRAPHY(OGC:CRS84, SPHERICAL)")
+
+    def test_ddl_with_model_only(self):
+        geo = GeographyType(model="SPHERICAL")
+        self.assertEqual(geo.to_databricks_ddl(), "GEOGRAPHY(4326, SPHERICAL)")
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +555,24 @@ class TestFromStr(unittest.TestCase):
         result = DataType.from_str("GEOGRAPHY(4326)")
         self.assertIsInstance(result, GeographyType)
         self.assertEqual(result.srid, 4326)
+
+    def test_from_str_ogc_crs84_spherical(self):
+        result = DataType.from_str("geography(OGC:CRS84, SPHERICAL)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, "OGC:CRS84")
+        self.assertEqual(result.model, "SPHERICAL")
+
+    def test_from_str_GEOGRAPHY_ogc_crs84_spherical(self):
+        result = DataType.from_str("GEOGRAPHY(OGC:CRS84, SPHERICAL)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, "OGC:CRS84")
+        self.assertEqual(result.model, "SPHERICAL")
+
+    def test_from_str_srid_with_model(self):
+        result = DataType.from_str("geography(4326, SPHERICAL)")
+        self.assertIsInstance(result, GeographyType)
+        self.assertEqual(result.srid, 4326)
+        self.assertEqual(result.model, "SPHERICAL")
 
 
 # ---------------------------------------------------------------------------
