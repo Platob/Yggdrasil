@@ -1,19 +1,15 @@
 """Spark DataFrame extension helpers for aliases and resampling."""
 
-import datetime
 import inspect
 import re
-from typing import List, Union, Optional, Iterable, Callable, Mapping, Any
+from typing import List, Union, Optional, Iterable, Callable, Any
 
 import pyarrow as pa
 import pyspark.sql as SparkSQL
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
-
-from yggdrasil.data.cast import CastOptions, convert
+from yggdrasil.data.cast import convert
 from yggdrasil.pandas.lib import pandas
-from yggdrasil.polars.cast import arrow_table_to_polars_dataframe
-from .cast import spark_type_to_arrow_type, arrow_field_to_spark_field
 
 __all__ = []
 
@@ -147,196 +143,6 @@ def _append_drop_col_to_spark_schema(schema: "T.StructType", drop_col: str) -> "
     if drop_col in schema.fieldNames():
         return schema
     return T.StructType(list(schema.fields) + [T.StructField(drop_col, T.IntegerType(), True)])
-
-
-def upsample(
-    df: SparkSQL.DataFrame,
-    time: Union[str, SparkSQL.Column],
-    interval: Union[str, datetime.timedelta],
-    partitionBy: Optional[List[Union[str, SparkSQL.Column]]] = None,
-    fill: Optional[str] = "forward",
-) -> SparkSQL.DataFrame:
-    """
-    Upsample using Polars via Arrow inside mapInArrow-style group apply.
-    """
-    df: SparkSQL.DataFrame = df
-
-    time_col_name = getAlias(time, full=False)
-    partition_col_names = getAliases(partitionBy) or []
-
-    if not partition_col_names:
-        drop_col = "__repart"
-        df = df.withColumn(drop_col, F.lit(1))
-        partition_col_names = [drop_col]
-    else:
-        drop_col = None
-
-    options = CastOptions.check_arg(spark_type_to_arrow_type(df.schema))
-    spark_schema = arrow_field_to_spark_field(options.target_field)
-
-    def within_group(tb: pa.Table) -> pa.Table:
-        """Apply upsample logic to a grouped Arrow table.
-
-        Args:
-            tb: Arrow table for a grouped partition.
-
-        Returns:
-            Arrow table with upsampled data.
-        """
-        from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
-
-        res = (
-            arrow_table_to_polars_dataframe(tb, options)
-            .sort(time_col_name)
-            .upsample(time_col_name, every=interval, group_by=partition_col_names)
-        )
-
-        if fill:
-            res = res.fill_null(strategy=fill)
-
-        return polars_dataframe_to_arrow_table(res, options)
-
-    result = (
-        df
-        .groupBy(*partition_col_names)
-        .applyInArrow(within_group, schema=spark_schema.dataType)
-    )
-
-    if drop_col:
-        result = result.drop(drop_col)
-
-    return result
-
-
-def resample(
-    df: SparkSQL.DataFrame,
-    every: Union[str, datetime.timedelta],
-    time: Optional[Union[str, SparkSQL.Column]] = None,
-    partitionBy: Optional[List[Union[str, SparkSQL.Column]]] = None,
-    agg: Optional[Mapping[str, Any]] = None,
-    fill: Optional[str] = "forward",
-    period: Optional[Union[str, datetime.timedelta]] = None,
-    offset: Optional[Union[str, datetime.timedelta]] = None,
-    closed: str = "left",
-    label: str = "left",
-    start_by: str = "window",
-    schema: Optional[Union["T.StructType", str]] = None,
-) -> SparkSQL.DataFrame:
-    """
-    Spark DataFrame .resample(...) implemented via Polars inside applyInArrow.
-
-    Behavior:
-      - If agg is None: UPSAMPLE mode (insert missing timestamps), then fill (forward/backward/zero/none)
-      - If agg is provided: DOWNSAMPLE mode using polars group_by_dynamic + aggregations
-
-    Notes / constraints:
-      - time can be omitted: we infer the first Spark TimestampType column (Datetime-only)
-      - For agg != None, you SHOULD pass `schema` (Spark StructType or schema string).
-        Spark requires the output schema for applyInArrow.
-        If schema is not provided, we raise.
-      - agg should be a dict mapping column -> aggregator, e.g. {"qty":"sum","px":"last"}.
-        (Keep it picklable; don't pass Polars Exprs here.)
-
-    This uses the Polars DataFrame `.resample(...)` extension you added, so the
-    upsample-with-group keys stays correct even on older Polars versions.
-    """
-    df: SparkSQL.DataFrame = df
-
-    partition_col_names = getAliases(partitionBy) or []
-
-    # Infer time column if not given (Datetime-only: TimestampType)
-    if time is None:
-        time_col_name = _infer_time_col_spark(df)
-    else:
-        time_col_name = getAlias(time, full=False)
-
-    # If no partition keys, force a single group like upsample()
-    if not partition_col_names:
-        drop_col = "__repart"
-        df = df.withColumn(drop_col, F.lit(1))
-        partition_col_names = [drop_col]
-    else:
-        drop_col = None
-
-    # Input conversion options always based on the (possibly augmented) input schema
-    in_options = CastOptions.check_arg(spark_type_to_arrow_type(df.schema))
-
-    # Output schema/options:
-    # - upsample mode defaults to input schema
-    # - downsample mode requires explicit schema
-    if agg is None:
-        out_options = in_options
-        spark_schema_for_apply = arrow_field_to_spark_field(out_options.target_field).dataType
-    else:
-        if schema is None:
-            raise ValueError(
-                "resample: agg provided but schema is None. "
-                "Spark applyInArrow requires the output schema for aggregated resample."
-            )
-        spark_schema_for_apply = convert(schema, T.StructType)
-
-        # If we injected drop_col, it will be present in Polars output (as a group key).
-        # So the applyInArrow schema must include it too, then we drop it after.
-        if drop_col is not None:
-            spark_schema_for_apply = _append_drop_col_to_spark_schema(spark_schema_for_apply, drop_col)
-
-        # Build output cast options from the declared output schema
-        out_arrow_field = convert(spark_schema_for_apply, pa.Field)
-        out_options = CastOptions.check_arg(out_arrow_field)
-
-    def within_group(tb: pa.Table) -> pa.Table:
-        """Apply resample logic to a grouped Arrow table.
-
-        Args:
-            tb: Arrow table for a grouped partition.
-
-        Returns:
-            Arrow table with resampled data.
-        """
-        from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
-        from yggdrasil.polars.extensions import resample
-
-        pdf = arrow_table_to_polars_dataframe(tb, in_options)
-
-        # Call your Polars extension resample
-        if agg is None:
-            res = resample(
-                pdf,
-                time_col=time_col_name,
-                every=every,
-                group_by=partition_col_names,
-                fill=(fill or "none"),
-                period=period,
-                offset=offset,
-                closed=closed,
-                label=label,
-                start_by=start_by,
-            )
-        else:
-            res = resample(
-                pdf,
-                time_col=time_col_name,
-                every=every,
-                group_by=partition_col_names,
-                agg=dict(agg),
-                period=period,
-                offset=offset,
-                closed=closed,
-                label=label,
-                start_by=start_by,
-            )
-
-        return polars_dataframe_to_arrow_table(res, out_options)
-
-    result = (
-        df.groupBy(*partition_col_names)
-        .applyInArrow(within_group, schema=spark_schema_for_apply)
-    )
-
-    if drop_col:
-        result = result.drop(drop_col)
-
-    return result
 
 
 def checkJoin(
@@ -480,8 +286,6 @@ def checkMapInPandas(
 # Monkey-patch only when PySpark is actually there
 for method in [
     latest,
-    upsample,
-    resample,
     checkJoin,
     getAlias,
     checkMapInArrow,

@@ -4,7 +4,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.databricks.sql import SQLEngine
-from yggdrasil.databricks.sql.exceptions import SqlStatementError
+from yggdrasil.databricks.sql.exceptions import SQLError
 from ..conftest import requires_databricks, DatabricksCase
 
 pytestmark = [requires_databricks, pytest.mark.integration]
@@ -33,12 +33,13 @@ class TestSQLEngine(DatabricksCase):
             pa.array([{"q": dt.datetime.now(dt.timezone.utc)}, None, None]),
             pa.array([[{"list_nest": dt.datetime.now()}], None, None]),
             pa.array([{"k": "v"}, None, None], type=pa.map_(pa.string(), pa.string()))
-        ], names=["id", "c2", "c3", "map column"])
+        ], names=["id", "new column", "c3", "map column"])
 
         self.engine.insert_into(
-            data,
+            other_data,
             table_name="test_insert",
-            mode="append"
+            mode="append",
+            schema_mode="append",
         )
 
         n = self.engine.table(table_name="test_insert")
@@ -59,7 +60,7 @@ class TestSQLEngine(DatabricksCase):
 
         self.assertEqual(read.shape[0], data.num_rows + other_data.num_rows)
 
-        with pytest.raises(SqlStatementError):
+        with pytest.raises(SQLError):
             self.engine.execute(f"SELECT * from unknown_table")
 
         self.engine.drop_table(table_name="test_insert")

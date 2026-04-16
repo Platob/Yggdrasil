@@ -60,11 +60,11 @@ class IAMUser(DatabricksResource):
         repr=False,
         compare=False,
     )
-    id: Optional[str] = None
-    name: Optional[str] = None
-    username: Optional[str] = None
+    id: str | None = None
+    name: str | None = None
+    username: str | None = None
     emails: Optional[list[str]] = None
-    external_id: Optional[str] = None
+    external_id: str | None = None
     active: bool = True
     client_type: ClientType = ClientType.ACCOUNT
 
@@ -286,16 +286,15 @@ class IAMGroup(DatabricksResource):
     """
     Lightweight group wrapper around Databricks IAM group payloads.
     """
-
     service: IAMGroups = field(
         default_factory=IAMGroups.current,
         repr=False,
         compare=False,
     )
-    id: Optional[str] = None
-    name: Optional[str] = None
-    account_id: Optional[str] = None
-    external_id: Optional[str] = None
+    id: str | None = None
+    name: str | None = None
+    account_id: str | None = None
+    external_id: str | None = None
     client_type: Optional[ClientType] = None
     entitlements: Optional[list[str]] = None
     members: Optional[list[IAMUser]] = None

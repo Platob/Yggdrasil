@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from email.utils import parsedate_to_datetime
 from typing import Tuple, Optional
 
 from databricks.sdk import WorkspaceClient
@@ -23,7 +24,7 @@ def get_volume_status(
     full_path: str,
     check_file_first: bool = True,
     raise_error: bool = True,
-) -> Tuple[Optional[bool], Optional[bool], Optional[int], Optional[dt.datetime]]:
+) -> Tuple[Optional[bool], Optional[bool], int | None, Optional[dt.datetime]]:
     client = sdk.files
 
     if check_file_first:
@@ -77,7 +78,67 @@ def get_volume_metadata(
     return None
 
 
-def _parse_mtime(info):
+def _parse_mtime(info) -> dt.datetime:
     if not info:
         return dt.datetime.now(tz=dt.timezone.utc)
+
+    for key in ("last_modified", "modified_at", "modification_time", "mtime"):
+        value = getattr(info, key, None)
+        if value is None:
+            continue
+
+        if isinstance(value, dt.datetime):
+            return (
+                value.replace(tzinfo=dt.timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(dt.timezone.utc)
+            )
+
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+
+            # 1. ISO-8601 / near-ISO
+            try:
+                parsed = dt.datetime.fromisoformat(value)
+                return (
+                    parsed.replace(tzinfo=dt.timezone.utc)
+                    if parsed.tzinfo is None
+                    else parsed.astimezone(dt.timezone.utc)
+                )
+            except ValueError:
+                pass
+
+            # 2. Common "Z" suffix variant
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return (
+                    parsed.replace(tzinfo=dt.timezone.utc)
+                    if parsed.tzinfo is None
+                    else parsed.astimezone(dt.timezone.utc)
+                )
+            except ValueError:
+                pass
+
+            # 3. RFC 2822 / HTTP-date, e.g. "Sat, 11 Apr 2026 16:21:34 GMT"
+            try:
+                parsed = parsedate_to_datetime(value)
+                return (
+                    parsed.replace(tzinfo=dt.timezone.utc)
+                    if parsed.tzinfo is None
+                    else parsed.astimezone(dt.timezone.utc)
+                )
+            except (TypeError, ValueError, IndexError):
+                pass
+
+            raise ValueError(f"Unsupported mtime string format: {value!r}")
+
+        # numeric timestamp
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+
+    return dt.datetime.now(tz=dt.timezone.utc)
 

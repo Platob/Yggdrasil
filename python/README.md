@@ -84,7 +84,6 @@ print(out.schema)
 ```python
 from yggdrasil.polars.lib import polars
 from yggdrasil.pandas.lib import pandas
-from yggdrasil.spark.lib import pyspark_sql
 
 pl_df = polars.DataFrame({"id": [1, 2]})
 pd_df = pandas.DataFrame({"id": [1, 2]})

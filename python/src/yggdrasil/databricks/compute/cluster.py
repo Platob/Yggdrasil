@@ -158,8 +158,8 @@ class Cluster(DatabricksResource):
         repr=False,
         compare=False,
     )
-    cluster_id: Optional[str] = None
-    cluster_name: Optional[str] = None
+    cluster_id: str | None = None
+    cluster_name: str | None = None
 
     _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
     _details_refresh_time: float = dataclasses.field(default=0.0, repr=False, hash=False, compare=False)
@@ -372,7 +372,7 @@ class Cluster(DatabricksResource):
     def update(
         self,
         *,
-        single_user_name: Optional[str] = None,
+        single_user_name: str | None = None,
         libraries: Optional[list[Union[str, Library]]] = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         wait: WaitingConfigArg = True,
@@ -561,8 +561,8 @@ class Cluster(DatabricksResource):
         self,
         *,
         language: Optional[Language] = None,
-        context_id: Optional[str] = None,
-        context_key: Optional[str] = None,
+        context_id: str | None = None,
+        context_key: str | None = None,
     ) -> ExecutionContext:
         """
         Return an execution context for this cluster.
@@ -593,10 +593,10 @@ class Cluster(DatabricksResource):
         context: Optional[ExecutionContext | str] = None,
         command: Optional[str | Callable] = None,
         *,
-        command_str: Optional[str] = None,
+        command_str: str | None = None,
         func: Optional[Callable] = None,
         language: Optional[Language] = None,
-        command_id: Optional[str] = None,
+        command_id: str | None = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
     ) -> "CommandExecution":
         """

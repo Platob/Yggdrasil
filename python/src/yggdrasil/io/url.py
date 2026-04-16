@@ -221,7 +221,7 @@ class URL:
         cls,
         obj: Any,
         *,
-        default_scheme: Optional[str] = None,
+        default_scheme: str | None = None,
         decode: bool = False,
         normalize: bool = True,
     ) -> URL:
@@ -254,7 +254,7 @@ class URL:
         cls,
         raw: str,
         *,
-        default_scheme: Optional[str] = None,
+        default_scheme: str | None = None,
         decode: bool = False,
         normalize: bool = True,
     ) -> URL:
@@ -378,7 +378,7 @@ class URL:
         return self.to_string()
 
     def __repr__(self):
-        return f"URL<{self.to_string()!r}>"
+        return f"URL({self.to_string()!r})"
 
     def __truediv__(self, other: object) -> URL:
         if not isinstance(other, str):

@@ -510,7 +510,6 @@ class TestSendManyRemoteGrouping:
 # ===========================================================================
 
 # Skip the entire section when pyspark is not installed.
-pyspark = pytest.importorskip("pyspark", reason="pyspark not installed")
 
 import os as _os
 import sys as _sys
@@ -528,17 +527,21 @@ _SKIP_MAPIN_ARROW = pytest.mark.skipif(
 
 @pytest.fixture(scope="session")
 def spark():
-    """Minimal local SparkSession shared across all spark_send tests."""
+    pytest.importorskip("pyspark", reason="pyspark not installed")
+
     from pyspark.sql import SparkSession
 
-    return (
-        SparkSession.builder
-        .master("local[1]")
-        .appName("yggdrasil-session-test")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .getOrCreate()
-    )
+    try:
+        return (
+            SparkSession.builder
+            .master("local[1]")
+            .appName("yggdrasil-session-test")
+            .config("spark.ui.enabled", "false")
+            .config("spark.sql.shuffle.partitions", "1")
+            .getOrCreate()
+        )
+    except Exception as exc:
+        pytest.skip(f"Local SparkSession is unavailable in this environment: {exc}")
 
 
 def _empty_spark_df(spark_session):
@@ -592,7 +595,8 @@ class TestSparkSend:
 
         fake_df = spark.createDataFrame([{"value": 42}])
         with patch.object(DynamicFrame, "cast", return_value=fake_df):
-            from yggdrasil.data import schema as build_schema, field as build_field
+            from yggdrasil.data.schema import schema as build_schema
+            from yggdrasil.data.data_field import field as build_field
 
             out_schema = build_schema([build_field("value", pa.int64())])
             result = session.spark_send(
@@ -705,7 +709,7 @@ class TestSparkSend:
     def test_all_requests_served_from_cache_zero_network_calls(self, spark):
         """When every request is a cache hit, _local_send is never called."""
         from pyspark.sql import DataFrame as SparkDataFrame
-        from yggdrasil.spark.cast import arrow_schema_to_spark_schema
+        from yggdrasil.spark.cast import any_to_spark_schema
 
         req = _req("https://example.com/a")
         cached = _resp(request=req.anonymize(mode="remove"))
@@ -713,7 +717,7 @@ class TestSparkSend:
         arrow_tbl = pa.Table.from_batches([cached.to_arrow_batch(parse=False)])
         spark_hit_df = spark.createDataFrame(
             arrow_tbl.to_pandas(),
-            schema=arrow_schema_to_spark_schema(RESPONSE_ARROW_SCHEMA),
+            schema=any_to_spark_schema(RESPONSE_ARROW_SCHEMA),
         )
 
         t_cache_result = MagicMock()

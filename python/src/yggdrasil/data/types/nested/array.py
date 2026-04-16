@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import pyarrow as pa
+from yggdrasil.data.types.id import DataTypeId
+from yggdrasil.data.types.support import get_polars, get_spark_sql
+from yggdrasil.io import SaveMode
+
+from .base import DataType, NestedType
+
+if TYPE_CHECKING:
+    import polars
+    import pyspark.sql.types as pst
+    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.data_field import Field
+    from .map import MapType
+
+
+__all__ = [
+    "ArrayType",
+]
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ArrayType(NestedType):
+    item_field: "Field"
+    list_size: int | None = None
+    large: bool = False
+    view: bool = False
+
+    @property
+    def type_id(self) -> DataTypeId:
+        return DataTypeId.ARRAY
+
+    def _merge_with_same_id(
+        self,
+        other: "ArrayType",
+        mode: SaveMode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ):
+        item_field = self.item_field.merge_with(
+            other.item_field,
+            mode=mode, downcast=downcast, upcast=upcast
+        )
+
+        return self.__class__(
+            item_field=item_field,
+            list_size=self.list_size or other.list_size,
+            large=self.large,
+            view=self.view,
+        )
+
+    @property
+    def children_fields(self) -> list["Field"]:
+        return [self.item_field]
+
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        return (
+            pa.types.is_list(dtype)
+            or pa.types.is_large_list(dtype)
+            or pa.types.is_list_view(dtype)
+            or pa.types.is_large_list_view(dtype)
+            or pa.types.is_fixed_size_list(dtype)
+        )
+
+    @classmethod
+    def from_item_field(
+        cls,
+        item_field: "Field",
+        list_size: int | None = None,
+        large: bool = False,
+        view: bool = False,
+        safe: bool = False,
+    ):
+        if not safe:
+            _f = cls.get_data_field_class()
+            item_field = _f.from_any(item_field).with_name("item")
+
+        return cls(
+            item_field=item_field,
+            list_size=list_size,
+            large=large,
+            view=view,
+        )
+
+    @classmethod
+    def from_arrow_type(
+        cls,
+        dtype: "pa.ListType | pa.ListViewType | pa.FixedSizeListType",
+    ) -> "ArrayType":
+        _f = cls.get_data_field_class()
+        item_field = _f.from_arrow_field(dtype.value_field)
+
+        if pa.types.is_list(dtype):
+            return cls(
+                item_field=item_field,
+                list_size=None,
+                large=False,
+                view=False,
+            )
+
+        if pa.types.is_large_list(dtype):
+            return cls(
+                item_field=item_field,
+                list_size=None,
+                large=True,
+                view=False,
+            )
+
+        if pa.types.is_list_view(dtype):
+            return cls(
+                item_field=item_field,
+                list_size=None,
+                large=False,
+                view=True,
+            )
+
+        if pa.types.is_large_list_view(dtype):
+            return cls(
+                item_field=item_field,
+                list_size=None,
+                large=True,
+                view=True,
+            )
+
+        if pa.types.is_fixed_size_list(dtype):
+            return cls(
+                item_field=item_field,
+                list_size=dtype.list_size,
+                large=False,
+                view=False,
+            )
+
+        raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+
+    @classmethod
+    def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
+        pl = get_polars()
+        return isinstance(dtype, pl.List)
+
+    @classmethod
+    def from_polars_type(cls, dtype: "polars.List") -> "ArrayType":
+        if not cls.handles_polars_type(dtype):
+            raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+
+        _f = cls.get_data_field_class()
+
+        return cls(
+            item_field=_f(
+                name="item",
+                dtype=DataType.from_polars_type(dtype.inner),
+                nullable=True,
+                metadata=None,
+            ),
+            list_size=None,
+            large=False,
+            view=False,
+        )
+
+    @classmethod
+    def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
+        spark = get_spark_sql()
+        return isinstance(dtype, spark.types.ArrayType)
+
+    @classmethod
+    def from_spark_type(cls, dtype: "pst.ArrayType") -> "ArrayType":
+        if not cls.handles_spark_type(dtype):
+            raise TypeError(f"Unsupported Spark data type: {dtype!r}")
+
+        _f = cls.get_data_field_class()
+
+        return cls(
+            item_field=_f(
+                name="item",
+                dtype=DataType.from_spark_type(dtype.elementType),
+                nullable=dtype.containsNull,
+                metadata=None,
+            ),
+            list_size=None,
+            large=False,
+            view=False,
+        )
+
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        return (
+            value.get("id") == int(DataTypeId.ARRAY)
+            or str(value.get("name", "")).upper() == "ARRAY"
+        )
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ArrayType":
+        _f = cls.get_data_field_class()
+
+        return cls(
+            item_field=_f.from_any(value["item_field"]),
+            list_size=value.get("list_size"),
+            large=bool(value.get("large", False)),
+            view=bool(value.get("view", False)),
+        )
+
+    def to_arrow(self) -> pa.DataType:
+        value_field = self.item_field.to_arrow_field()
+
+        if self.list_size is not None:
+            return pa.list_(value_field, self.list_size)
+
+        if self.view:
+            if self.large:
+                return pa.large_list_view(value_field)
+            return pa.list_view(value_field)
+
+        if self.large:
+            return pa.large_list(value_field)
+
+        return pa.list_(value_field)
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        options: "CastOptions",
+    ) -> pa.Array | pa.ChunkedArray:
+        options.check(
+            options,
+            source=array,
+            target_field=self.to_field() if options.target_field is None else options.target_field,
+        )
+
+        if options.source_field.dtype.type_id == DataTypeId.NULL or array.null_count == len(array):
+            return options.target_field.default_arrow_array(
+                size=len(array),
+                memory_pool=options.arrow_memory_pool,
+            )
+
+        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+            return cast_arrow_list_array(
+                array,
+                options=options,
+            )
+
+        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+            return cast_arrow_map_array_to_list(
+                array,
+                options=options,
+            )
+
+        else:
+            raise pa.ArrowInvalid(
+                f"Cannot cast {options.source_field} to {options.target_field}"
+            )
+
+    def _cast_arrow_tabular(
+        self,
+        table: pa.Table | pa.RecordBatch,
+        options: "CastOptions",
+    ):
+        options.check(
+            options,
+            source=table,
+            target_field=self.to_field() if options.target_field is None else options.target_field,
+        )
+
+    def to_polars(self) -> "polars.DataType":
+        pl = get_polars()
+        return pl.List(self.item_field.dtype.to_polars())
+
+    def to_spark(self) -> Any:
+        spark = get_spark_sql()
+        return spark.types.ArrayType(
+            self.item_field.dtype.to_spark(),
+            containsNull=self.item_field.nullable,
+        )
+
+    def to_databricks_ddl(self) -> str:
+        return f"ARRAY<{self.item_field.dtype.to_databricks_ddl()}>"
+
+    def to_dict(self) -> dict[str, Any]:
+        base = super().to_dict()
+        base["item_field"] = self.item_field.to_dict()
+
+        if self.list_size is not None and self.list_size > -1:
+            base["list_size"] = self.list_size
+
+        if self.large:
+            base["large"] = True
+        if self.view:
+            base["view"] = True
+
+        return base
+
+    def default_pyobj(self, nullable: bool) -> Any:
+        return None if nullable else []
+
+
+def cast_arrow_list_array(
+    array: pa.Array | pa.ChunkedArray,
+    options: "CastOptions",
+) -> pa.Array | pa.ChunkedArray:
+    options.check_source(array)
+
+    if options.target_field is None:
+        return array
+    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            cast_arrow_list_array(
+                chunk,
+                options=options,
+            )
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(
+            chunks,
+            type=options.target_field.dtype.to_arrow(),
+        )
+
+    source_field: Field = options.source_field
+    target_field: Field = options.target_field
+
+    source_type: ArrayType = source_field.dtype
+    target_type: ArrayType = target_field.dtype
+
+    values = array.values
+
+    target_values = target_type.item_field.cast_arrow_array(
+        values,
+        options=options.copy(source_field=source_type.item_field),
+    )
+
+    if target_type.list_size is not None:
+        return pa.FixedSizeListArray.from_arrays(
+            values=target_values,
+            list_size=target_type.list_size,
+            mask=array.is_null(),
+        )
+
+    if target_type.view:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    if target_type.large:
+        return pa.LargeListArray.from_arrays(
+            offsets=array.offsets,
+            values=target_values,
+            mask=array.is_null(),
+        )
+
+    return pa.ListArray.from_arrays(
+        offsets=array.offsets,
+        values=target_values,
+        mask=array.is_null(),
+    )
+
+
+def cast_arrow_map_array_to_list(
+    array: pa.MapArray | pa.ChunkedArray,
+    options: "CastOptions",
+) -> pa.Array | pa.ChunkedArray:
+    options.check_source(array)
+
+    if options.target_field is None:
+        return array
+    elif options.source_field.dtype.type_id != DataTypeId.MAP:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            cast_arrow_map_array_to_list(
+                chunk,
+                options=options,
+            )
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(
+            chunks,
+            type=options.target_field.dtype.to_arrow(),
+        )
+
+    source_field: Field = options.source_field
+    target_field: Field = options.target_field
+
+    source_type: "MapType" = source_field.dtype
+    target_type: ArrayType = target_field.dtype
+
+    target_item_type = target_type.item_field.dtype
+
+    if target_item_type.type_id != DataTypeId.STRUCT:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    if len(target_item_type.children_fields) != 2:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    target_key_field = target_item_type.field_at(0)
+    target_value_field = target_item_type.field_at(1)
+
+    target_key_array = target_key_field.cast_arrow_array(
+        array.keys,
+        options=options.copy(source_field=source_type.key_field),
+    )
+
+    target_value_array = target_value_field.cast_arrow_array(
+        array.items,
+        options=options.copy(source_field=source_type.value_field),
+    )
+
+    entry_values = pa.StructArray.from_arrays(
+        [
+            target_key_array,
+            target_value_array,
+        ],
+        fields=[
+            target_key_field.to_arrow_field(),
+            target_value_field.to_arrow_field(),
+        ],
+        memory_pool=options.arrow_memory_pool,
+    )
+
+    if target_type.list_size is not None:
+        return pa.FixedSizeListArray.from_arrays(
+            values=entry_values,
+            list_size=target_type.list_size,
+            mask=array.is_null(),
+        )
+
+    if target_type.view:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source_field} to {options.target_field}"
+        )
+
+    if target_type.large:
+        return pa.LargeListArray.from_arrays(
+            offsets=array.offsets,
+            values=entry_values,
+            mask=array.is_null(),
+        )
+
+    return pa.ListArray.from_arrays(
+        offsets=array.offsets,
+        values=entry_values,
+        mask=array.is_null(),
+    )

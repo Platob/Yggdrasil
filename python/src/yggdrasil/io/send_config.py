@@ -602,10 +602,10 @@ class SendManyConfig(_ConfigBase):
         repr=False,
     )
 
-    normalize: Optional[bool] = None
-    batch_size: Optional[int] = None
+    normalize: bool | None = None
+    batch_size: int | None = None
     ordered: bool = False
-    max_in_flight: Optional[int] = None
+    max_in_flight: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.check_arg(self.wait))

@@ -7,7 +7,6 @@ Yggdrasil keeps most integrations optional. Import external libraries through pa
 ```python
 from yggdrasil.polars.lib import polars
 from yggdrasil.pandas.lib import pandas
-from yggdrasil.spark.lib import pyspark, pyspark_sql
 ```
 
 These wrappers use runtime import/install guards so base installs stay lightweight.

@@ -95,12 +95,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union, Iterable, OrderedDict, Mapping
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
+from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import BytesIO
@@ -109,15 +110,16 @@ from yggdrasil.io.buffer.parquet_io import ParquetOptions
 from yggdrasil.io.enums import SaveMode
 from yggdrasil.io.enums.media_type import MediaTypes
 
-from .statement_result import StatementResult
+from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
+from .statement_result import StatementResult
 from .table import Table
 from .tables import Tables
-from .types import quote_ident, PrimaryKeySpec, ForeignKeySpec
+from .types import PrimaryKeySpec, ForeignKeySpec
 from .warehouse import SQLWarehouse
-from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
 from ..fs.path import DatabricksPath
+from ...data.statement_result import StatementResultBatch
 
 logger = logging.getLogger(__name__)
 
@@ -140,27 +142,6 @@ def _build_match_condition(
     right_alias: str,
     null_safe: bool = True,
 ) -> str:
-    """
-    Build a SQL equality condition for merge keys.
-
-    Each key is compared between the left and right aliases using either
-    null-safe equality (`<=>`) or standard equality (`=`).
-
-    Args:
-        match_by:
-            Column names used as merge keys.
-        left_alias:
-            Alias for the target relation.
-        right_alias:
-            Alias for the source relation.
-        null_safe:
-            When True, use Databricks null-safe equality so NULL matches NULL.
-
-    Returns:
-        SQL predicate joined with `AND`, for example:
-
-            t.`id` <=> s.`id` AND t.`ts` <=> s.`ts`
-    """
     op = "<=>" if null_safe else "="
     return " AND ".join(
         f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
@@ -200,8 +181,8 @@ class SQLEngine(DatabricksService):
     - merge behavior is enabled only when `match_by` is provided
     """
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
     default_warehouse: Optional[SQLWarehouse] = field(
         default=None,
         repr=False,
@@ -238,8 +219,8 @@ class SQLEngine(DatabricksService):
     def __call__(
         self,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         warehouse: Optional[SQLWarehouse | str] = None,
     ) -> SQLEngine:
         """
@@ -287,8 +268,8 @@ class SQLEngine(DatabricksService):
 
     def warehouse(
         self,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
     ) -> SQLWarehouse:
         """
         Resolve the warehouse used by this engine.
@@ -340,19 +321,167 @@ class SQLEngine(DatabricksService):
 
         return self.default_warehouse
 
+    def execute_many(
+        self,
+        statements: Iterable[str] | Mapping[str, str],
+        *,
+        row_limit: int | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        engine: Optional[Literal["spark", "api"]] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        byte_limit: int | None = None,
+        cache_for: WaitingConfigArg = None,
+        spark_session: Optional["SparkSession"] = None,
+        parallel: bool = False,
+    ) -> StatementResultBatch:
+        """
+        Execute multiple SQL statements.
+
+        Behavior
+        --------
+        - Statements are normalized with ``strip()``
+        - Empty statements are ignored
+        - Execution order is preserved in the returned batch
+        - When ``parallel=False``:
+          - all statements except the last are executed with ``wait=True``
+          - the final statement uses the caller-provided ``wait`` value
+        - When ``parallel=True``:
+          - all statements are submitted immediately
+          - each statement uses the caller-provided ``wait`` value
+          - results are returned in input order, but execution order is not enforced
+
+        Args:
+            statements:
+                SQL statements to execute.
+
+                Accepts either:
+                - an iterable of SQL strings, keyed as ``"0"``, ``"1"``, ...
+                - a mapping of ``{name: statement}``, preserving mapping order
+            row_limit:
+                Optional row limit forwarded to each statement execution.
+            catalog_name:
+                Catalog override for warehouse API execution context.
+            schema_name:
+                Schema override for warehouse API execution context.
+            wait:
+                Waiting configuration.
+            raise_error:
+                Whether execution errors should be raised.
+            engine:
+                Explicit engine override: ``"spark"`` or ``"api"``.
+            warehouse_id:
+                Warehouse ID override for API execution.
+            warehouse_name:
+                Warehouse name override for API execution.
+            byte_limit:
+                Optional response byte limit for API execution.
+            cache_for:
+                Optional TTL for statement result caching.
+            spark_session:
+                Explicit SparkSession override.
+            parallel:
+                When ``True``, submit all statements without sequential dependency
+                waiting. Use only when statements are independent.
+
+        Returns:
+            A :class:`StatementResultBatch` containing results in input order.
+
+        Raises:
+            ValueError:
+                If no non-empty SQL statements were provided.
+        """
+        items: OrderedDict[str, str] = OrderedDict()
+
+        if isinstance(statements, Mapping):
+            for key, statement in statements.items():
+                stmt = statement.strip()
+                if stmt:
+                    items[str(key)] = stmt
+        else:
+            for i, statement in enumerate(statements):
+                stmt = statement.strip()
+                if stmt:
+                    items[str(i)] = stmt
+
+        if not items:
+            raise ValueError("No non-empty SQL statements were provided.")
+
+        results: OrderedDict[str, StatementResult] = OrderedDict()
+
+        if parallel:
+            for key, statement in items.items():
+                results[key] = self.execute(
+                    statement,
+                    row_limit=row_limit,
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    wait=False,
+                    raise_error=raise_error,
+                    engine=engine,
+                    warehouse_id=warehouse_id,
+                    warehouse_name=warehouse_name,
+                    byte_limit=byte_limit,
+                    cache_for=cache_for,
+                    spark_session=spark_session,
+                )
+
+            return StatementResultBatch(results=results).wait(wait=wait, raise_error=raise_error)
+
+        keys = list(items.keys())
+
+        for key in keys[:-1]:
+            results[key] = self.execute(
+                items[key],
+                row_limit=row_limit,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                wait=True,
+                raise_error=raise_error,
+                engine=engine,
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name,
+                byte_limit=byte_limit,
+                cache_for=cache_for,
+                spark_session=spark_session,
+            )
+
+        last_key = keys[-1]
+        results[last_key] = self.execute(
+            items[last_key],
+            row_limit=row_limit,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            wait=wait,
+            raise_error=raise_error,
+            engine=engine,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
+            byte_limit=byte_limit,
+            cache_for=cache_for,
+            spark_session=spark_session,
+        )
+
+        batch = StatementResultBatch(results=results)
+
+        return batch
+
     def execute(
         self,
         statement: str,
         *,
-        row_limit: Optional[int] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        row_limit: int | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         engine: Optional[Literal["spark", "api"]] = None,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
-        byte_limit: Optional[int] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        byte_limit: int | None = None,
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
     ) -> StatementResult:
@@ -485,11 +614,11 @@ class SQLEngine(DatabricksService):
 
     def table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
     ) -> Table:
         """
         Resolve a table handle.
@@ -529,10 +658,11 @@ class SQLEngine(DatabricksService):
         ],
         *,
         mode: SaveMode | str | None = None,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        schema_mode: SaveMode | str | None = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -563,6 +693,8 @@ class SQLEngine(DatabricksService):
                 and other project-supported convertible types.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             location:
                 Fully qualified destination table.
             catalog_name:
@@ -629,6 +761,7 @@ class SQLEngine(DatabricksService):
                 schema_name=schema_name,
                 table_name=table_name,
                 mode=mode,
+                schema_mode=schema_mode,
                 cast_options=cast_options,
                 overwrite_schema=overwrite_schema,
                 match_by=match_by,
@@ -650,6 +783,7 @@ class SQLEngine(DatabricksService):
             schema_name=schema_name,
             table_name=table_name,
             mode=mode,
+            schema_mode=schema_mode,
             cast_options=cast_options,
             overwrite_schema=overwrite_schema,
             match_by=match_by,
@@ -667,11 +801,12 @@ class SQLEngine(DatabricksService):
     def arrow_insert_into(
         self,
         data,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         mode: SaveMode | str | None = None,
+        schema_mode: SaveMode | str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -721,6 +856,8 @@ class SQLEngine(DatabricksService):
                 Table name override.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             cast_options:
                 Casting rules used to align staged data to the destination
                 schema.
@@ -751,6 +888,8 @@ class SQLEngine(DatabricksService):
             None.
         """
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
 
         table = Table.parse(
             obj=location if table is None else table,
@@ -763,15 +902,17 @@ class SQLEngine(DatabricksService):
         if mode == SaveMode.OVERWRITE:
             table.delete(wait=True, raise_error=False)
 
-        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
-        location = table.full_name(safe=True)
-        catalog_name, schema_name = table.catalog_name, table.schema_name
-        existing_schema = table.arrow_schema
+        if mode == SaveMode.OVERWRITE:
+            table.delete(wait=True, raise_error=False)
 
-        cast_options = CastOptions.check_arg(
-            options=cast_options,
-            target_field=existing_schema,
+        table = table.ensure_created(
+            data,
+            schema_mode=schema_mode,
+            primary_keys=primary_keys, foreign_keys=foreign_keys
         )
+        location = table.full_name(safe=True)
+        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
+        existing_schema = table.data_schema
 
         logger.debug("Inserting %s into %s", type(data), location)
 
@@ -779,8 +920,8 @@ class SQLEngine(DatabricksService):
         if temp_volume_path is None:
             staging = StagingPath.for_table(
                 client=self.client,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
+                catalog_name=table.catalog_name,
+                schema_name=table.schema_name,
                 table_name=table.table_name,
                 max_lifetime=3600,
             )
@@ -797,7 +938,7 @@ class SQLEngine(DatabricksService):
             mio.buffer.seek(0)
             temp_volume_path.write_bytes(mio.buffer.memoryview())
 
-        columns = list(existing_schema.names)
+        columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
 
         statements: list[str] = []
@@ -928,10 +1069,11 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         data: Any,
         *,
         mode: SaveMode | str | None = None,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        schema_mode: SaveMode | str | None = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -974,6 +1116,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 Input data convertible to a Spark DataFrame.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             location:
                 Fully qualified destination table.
             catalog_name:
@@ -1024,6 +1168,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         )
 
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
 
         if table is None:
             table = self.table(
@@ -1033,18 +1179,20 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 table_name=table_name,
             )
 
-        # OVERWRITE: drop before background thread so the slot is freed
+        # TODO: Fix async databricks notebook
+        wait = True if PyEnv.in_databricks() else wait
+
+        # OVERWRITE: drop before the background thread so the slot is freed
         # synchronously and callers can re-create the table immediately.
         if mode == SaveMode.OVERWRITE:
             table.delete(wait=True, raise_error=False)
 
-        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
-
-        existing_schema = table.arrow_schema
-        cast_options = CastOptions.check_arg(
-            options=cast_options,
-            target_field=existing_schema,
+        table = table.ensure_created(
+            data,
+            schema_mode=schema_mode,
+            primary_keys=primary_keys, foreign_keys=foreign_keys
         )
+        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
         data_df = any_to_spark_dataframe(data, cast_options)
         target = table.delta_spark()
 
@@ -1143,11 +1291,11 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
     def drop_table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> None:
@@ -1182,10 +1330,10 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         self,
         definition: Union[pa.Field, pa.Schema, Any],
         *,
-        full_name: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        full_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
         **kwargs,
@@ -1247,4 +1395,3 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             foreign_keys=foreign_keys,
             **kwargs,
         )
-

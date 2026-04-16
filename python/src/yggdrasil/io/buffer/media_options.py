@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from typing import Any, Optional, Sequence
 
-from yggdrasil.data import CastOptions, CastOptionsArg
+from yggdrasil.data.cast.options import CastOptions, CastOptionsArg
 
 from ..enums.save_mode import SaveMode
 
@@ -26,8 +26,8 @@ class MediaOptions:
     """Base options shared by all :class:`MediaIO` subclasses."""
 
     # global read properties
-    columns: Optional[Sequence[str]] = None
-    cast: CastOptions = None
+    columns: Sequence[str] | None = None
+    cast: CastOptions | None = None
     use_threads: bool = True
     ignore_empty: bool = True
     lazy: bool = False
@@ -43,7 +43,7 @@ class MediaOptions:
     def __post_init__(self) -> None:
         """Normalize and validate all fields in-place."""
         self.columns = self._normalize_columns(self.columns)
-        self.cast = CastOptions.check_arg(self.cast)
+        self.cast = CastOptions.check(self.cast)
         self.use_threads = self._validate_bool("use_threads", self.use_threads)
         self.ignore_empty = self._validate_bool("ignore_empty", self.ignore_empty)
         self.lazy = self._validate_bool("lazy", self.lazy)
@@ -55,7 +55,7 @@ class MediaOptions:
         self._validate_subclass_fields()
 
     def with_cast(self, cast: CastOptionsArg):
-        return replace(self, cast=CastOptions.check_arg(cast))
+        return replace(self, cast=CastOptions.check(cast))
 
     @classmethod
     def check_parameters(

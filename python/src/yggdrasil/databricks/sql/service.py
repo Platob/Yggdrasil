@@ -195,8 +195,8 @@ class Warehouses(DatabricksService):
 
     def find_warehouse(
         self,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
         find_default: bool = False,
         raise_error: bool = True,
     ) -> Optional["SQLWarehouse"]:
@@ -354,8 +354,8 @@ class Warehouses(DatabricksService):
 
     def create_or_update(
         self,
-        warehouse_id: Optional[str] = None,
-        name: Optional[str] = None,
+        warehouse_id: str | None = None,
+        name: str | None = None,
         permissions: Optional[List[Union[WarehouseAccessControlRequest, str]]] = None,
         wait: Optional[WaitingConfig] = None,
         **warehouse_specs,
@@ -389,7 +389,7 @@ class Warehouses(DatabricksService):
 
     def create(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         *,
         permissions: Optional[List[Union[WarehouseAccessControlRequest, str]]] = None,
         wait: WaitingConfigArg = None,

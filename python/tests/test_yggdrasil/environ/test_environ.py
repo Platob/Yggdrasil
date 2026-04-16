@@ -561,10 +561,6 @@ class TestUvResolution:
         monkeypatch.setattr(env, "ensure_uv", lambda install_runtime=True: env.python_path)
         assert env._uv_base_cmd() == [str(env.python_path), "-m", "uv"]
 
-    def test_pip_cmd_prefers_uv(self, monkeypatch, env):
-        monkeypatch.setattr(env, "_uv_base_cmd", lambda install_runtime=True: ["uv"])
-        assert env._pip_cmd_args() == ["uv", "pip", "--python", str(env.python_path)]
-
     def test_pip_cmd_falls_back(self, monkeypatch, env):
         monkeypatch.setattr(env, "_uv_base_cmd", lambda **kw: (_ for _ in ()).throw(RuntimeError()))
         assert env._pip_cmd_args() == [str(env.python_path), "-m", "pip"]
@@ -579,39 +575,7 @@ class TestUvResolution:
 # ===================================================================
 
 class TestPackageManagement:
-    """Test ``requirements``, ``install``, ``update``, ``uninstall``, ``pip``."""
-
-    def test_requirements_filters_system(self, monkeypatch, env):
-        monkeypatch.setattr(env, "_pip_cmd_args", lambda prefer_uv=None: ["python", "-m", "pip"])
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw: SimpleNamespace(
-            stdout=json.dumps([
-                {"name": "pip", "version": "24.0"},
-                {"name": "pyarrow", "version": "19.0.0"},
-                {"name": "test-helper", "version": "1.0"},
-                {"name": "PyWin32", "version": "999"},
-            ])
-        ))
-        out = env.requirements(with_system=False)
-        assert out == [("pyarrow", "19.0.0")]
-
-    def test_requirements_with_system_keeps_all(self, monkeypatch, env):
-        monkeypatch.setattr(env, "_pip_cmd_args", lambda prefer_uv=None: ["python", "-m", "pip"])
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw: SimpleNamespace(
-            stdout=json.dumps([
-                {"name": "pip", "version": "24.0"},
-                {"name": "pyarrow", "version": "19.0.0"},
-            ])
-        ))
-        out = env.requirements(with_system=True)
-        assert out == [("pip", "24.0"), ("pyarrow", "19.0.0")]
-
-    def test_requirements_bad_json_shape(self, monkeypatch, env):
-        monkeypatch.setattr(env, "_pip_cmd_args", lambda prefer_uv=None: ["python", "-m", "pip"])
-        monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw: SimpleNamespace(
-            stdout=json.dumps({"nope": 1})
-        ))
-        with pytest.raises(ValueError, match="Unexpected pip output"):
-            env.requirements()
+    """Test ``install``, ``update``, ``uninstall``, ``pip``."""
 
     def test_install_returns_none_when_no_inputs(self, env):
         assert env.install() is None

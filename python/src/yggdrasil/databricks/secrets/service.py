@@ -49,7 +49,7 @@ class Secrets(DatabricksService):
 
     def create_scope(
         self,
-        key: Optional[str] = None,
+        key: str | None = None,
         *,
         permissions: Union[list["Permission"], None] = None,
         scope: Union["Scope", str, None] = None,

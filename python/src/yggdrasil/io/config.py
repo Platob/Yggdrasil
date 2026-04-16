@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Optional
+from typing import Any, Optional
 
 __all__ = ["BufferConfig", "DEFAULT_CONFIG", "get_tmp_dir"]
 
@@ -100,14 +100,16 @@ class BufferConfig:
     prefix: str = "tmp-"
     suffix: str = ".bin"
     keep_spilled_file: bool = False
-    tmp_dir: Optional[Path] = None
+    tmp_dir: Optional[Path | Any] = None
 
     @classmethod
     def default(cls) -> "BufferConfig":
         return DEFAULT_CONFIG
 
-    def create_spill_path(self, lifetime_seconds: Optional[int] = None) -> Path:
-        tmp_dir = Path(self.tmp_dir) if self.tmp_dir is not None else get_tmp_dir()
+    def create_spill_path(self, lifetime_seconds: int | None = None):
+        tmp_dir = self.tmp_dir if self.tmp_dir is not None else get_tmp_dir()
+        if not hasattr(tmp_dir, "__truediv__"):
+            tmp_dir = Path(tmp_dir)
         now = int(time.time())
         end = now + int(lifetime_seconds) if lifetime_seconds is not None else now + 24 * 3600
         name = f"{self.prefix}{now}-{end}-{os.urandom(8).hex()}{self.suffix}"

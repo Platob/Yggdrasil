@@ -43,6 +43,6 @@ import yggdrasil.arrow as pa
 from yggdrasil.data.cast import CastOptions
 
 schema = pa.schema([pa.field("id", pa.int64())])
-opts = CastOptions.check_arg(schema, strict_match_names=True)
+opts = CastOptions.check(schema, strict_match_names=True)
 print(opts.target_field)
 ```

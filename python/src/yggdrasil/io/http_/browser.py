@@ -312,7 +312,7 @@ class BrowserHTTPSession(HTTPSession):
         """Explicitly set the ``User-Agent`` string."""
         self.user_agent = str(ua)
 
-    def rotate_user_agent(self, seed: Optional[int] = None) -> str:
+    def rotate_user_agent(self, seed: int | None = None) -> str:
         """Generate and apply a new random ``User-Agent`` string.
 
         Parameters
@@ -334,7 +334,7 @@ class BrowserHTTPSession(HTTPSession):
         browser: str = "chrome",
         *,
         platform: str = "windows",
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ) -> str:
         """Set ``User-Agent`` to a plausible UA for a specific
         *browser* / *platform* combination.
@@ -817,7 +817,7 @@ class BrowserHTTPSession(HTTPSession):
         self,
         url: URL | str,
         *,
-        from_url: Optional[str] = None,
+        from_url: str | None = None,
         headers: Optional[Mapping[str, str]] = None,
         raise_error: bool = True,
         config: SendConfig | Mapping[str, Any] | None = None,

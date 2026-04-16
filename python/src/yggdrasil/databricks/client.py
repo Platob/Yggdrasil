@@ -14,7 +14,8 @@ from databricks.sdk.config import Config
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
-from yggdrasil.io import BytesIO, MimeTypes
+from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.enums import MimeTypes
 from yggdrasil.io.url import URL, URLResource, url_resource_class
 from yggdrasil.version import __version__ as ygg_version
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
+    from .fs.service import FileSystem
     from .fs.path import DatabricksPath
     from .ai.genie import Genie
 
@@ -101,7 +103,7 @@ class DatabricksClient(URLResource):
 
     # Azure
     azure_workspace_resource_id: Optional[str] = env_field("ARM_RESOURCE_ID", repr_=False)
-    azure_use_msi: Optional[bool] = field(default=None, repr=False)
+    azure_use_msi: bool | None = field(default=None, repr=False)
     azure_client_secret: Optional[str] = env_field("ARM_CLIENT_SECRET", repr_=False)
     azure_client_id: Optional[str] = env_field("ARM_CLIENT_ID", repr_=False)
     azure_tenant_id: Optional[str] = env_field("ARM_TENANT_ID", repr_=False)
@@ -116,11 +118,11 @@ class DatabricksClient(URLResource):
     config_file: Optional[str] = env_field("DATABRICKS_CONFIG_FILE", repr_=False, compare=False, hash_=False)
 
     # HTTP / client behavior
-    auth_type: Optional[str] = None
+    auth_type: str | None = None
     http_timeout_seconds: Optional[int] = field(default=None, repr=False)
     retry_timeout_seconds: Optional[int] = field(default=None, repr=False)
     debug_truncate_bytes: Optional[int] = field(default=None, repr=False)
-    debug_headers: Optional[bool] = field(default=None, repr=False)
+    debug_headers: bool | None = field(default=None, repr=False)
     rate_limit: Optional[int] = field(default=None, repr=False)
 
     # Extras
@@ -571,9 +573,9 @@ class DatabricksClient(URLResource):
 
     @staticmethod
     def _base_tmp_path(
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
     ) -> str:
         if catalog_name and schema_name:
             base_path = "/Volumes/%s/%s/%s" % (
@@ -586,13 +588,13 @@ class DatabricksClient(URLResource):
 
     def tmp_path(
         self,
-        suffix: Optional[str] = None,
-        extension: Optional[str] = None,
-        max_lifetime: Optional[float] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
-        base_path: Optional[str] = None,
+        suffix: str | None = None,
+        extension: str | None = None,
+        max_lifetime: float | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
+        base_path: str | None = None,
     ) -> "DatabricksPath":
         """
         Shared cache base under Volumes for the current user.
@@ -640,10 +642,10 @@ class DatabricksClient(URLResource):
         self,
         raise_error: bool = True,
         wait: WaitingConfigArg = True,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        volume_name: Optional[str] = None,
-        base_path: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
+        base_path: str | None = None,
     ):
         wait = WaitingConfig.check_arg(wait)
 
@@ -846,10 +848,27 @@ class DatabricksClient(URLResource):
             use_cache=True,
         )
 
+    @property
+    def filesystem(self) -> "FileSystem":
+        """OS-style Databricks filesystem helper for this client."""
+        from .fs.service import FileSystem
+
+        return self.lazy_property(
+            self,
+            cache_attr="_filesystem",
+            factory=lambda: FileSystem(client=self),
+            use_cache=True,
+        )
+
+    @property
+    def fs(self) -> "FileSystem":
+        """Short alias for :attr:`filesystem`."""
+        return self.filesystem
+
     def spark_connect(
         self,
     ):
-        from databricks.connect import DatabricksSession
+        from databricks.connect import DatabricksSession # noqa
 
         session = (
             DatabricksSession().builder
@@ -995,6 +1014,16 @@ class DatabricksService(ABC):
     def genie(self) -> "Genie":
         """Genie service (shorthand for ``client.genie``)."""
         return self.client.genie
+
+    @property
+    def filesystem(self) -> "FileSystem":
+        """Filesystem service (shorthand for ``client.filesystem``)."""
+        return self.client.filesystem
+
+    @property
+    def fs(self) -> "FileSystem":
+        """Short alias for :attr:`filesystem`."""
+        return self.client.fs
 
 
 @dataclass

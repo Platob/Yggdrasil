@@ -123,7 +123,7 @@ class ThreadJob(AsyncJob[T]):
         # --- Timed wait via WaitingConfig ---
         else:
             config = WaitingConfig.check_arg(wait)
-            timeout: Optional[float] = config.timeout if config.timeout else None
+            timeout: float | None = config.timeout if config.timeout else None
             completed = self._done.wait(timeout=timeout)
             if not completed:
                 func_name = getattr(self.job.func, "__qualname__", repr(self.job.func))

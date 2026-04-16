@@ -73,7 +73,7 @@ def _make_ctx(
 def _make_cmd(
     ctx: Optional[ExecutionContext] = None,
     *,
-    command_id: Optional[str] = None,
+    command_id: str | None = None,
     command: str = "print(1)",
     language: Language = Language.PYTHON,
     pyfunc=None,

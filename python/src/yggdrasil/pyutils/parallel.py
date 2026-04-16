@@ -30,9 +30,9 @@ R = TypeVar("R")
 def parallelize(
     executor_cls: Type[cf.Executor] = cf.ThreadPoolExecutor,
     *,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     arg_index: int = 0,
-    timeout: Optional[float] = None,
+    timeout: float | None = None,
     return_exceptions: bool = False,
     show_progress: bool = False,  # 👈 new flag
 ) -> Callable[[Callable[P, R]], Callable[P, Iterator[R]]]:

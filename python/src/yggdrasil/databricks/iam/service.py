@@ -141,7 +141,7 @@ class IAMGroups(IAM):
         self,
         obj: Union["IAMGroup", str],
         *,
-        group_id: Optional[str] = None,
+        group_id: str | None = None,
         client_type: Optional[ClientType] = None
     ):
         if isinstance(obj, IAMGroup):
@@ -188,9 +188,9 @@ class IAMGroups(IAM):
     def list(
         self,
         *,
-        name: Optional[str] = None,
+        name: str | None = None,
         client_type: Optional[ClientType] = None,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         raise_error: bool = True
     ) -> Iterator["IAMGroup"]:
         from .resource import IAMGroup
@@ -298,10 +298,10 @@ class IAMUsers(IAM):
     def list(
         self,
         *,
-        name: Optional[str] = None,
-        user_name: Optional[str] = None,
+        name: str | None = None,
+        user_name: str | None = None,
         client_type: Optional[ClientType] = None,
-        limit: Optional[int] = None
+        limit: int | None = None
     ) -> Iterator["IAMUser"]:
         from .resource import IAMUser
 

@@ -1,170 +1,755 @@
 # AGENTS.md
 
-## Project Overview
-Yggdrasil is a **schema-aware data interchange library** (PyPI: `ygg`, import: `yggdrasil`). It converts values/schemas between Python types, Apache Arrow, Polars, pandas, Spark, and Databricks using a central **converter registry**. A secondary Power Query connector lives in `powerquery/` but is rarely changed.
+## Mission
 
-## Architecture
+Yggdrasil exists to help users **integrate data systems fast, cleanly, and with less glue code**.
 
-### Converter Registry — the core pattern
-Everything flows through `yggdrasil/data/cast/registry.py`. Converters are registered with `@register_converter(from_hint, to_hint)` and dispatched via `convert(value, target_type)`. Dispatch order: exact match → identity → Any-wildcard → MRO fallback → one-hop composition. Each engine module (`arrow/cast.py`, `polars/cast.py`, `pandas/cast.py`, `spark/cast.py`) registers its own converters on import — understand this pattern before adding new conversions.
+When working in this repo, optimize in this order:
 
-### `lib.py` — lazy dependency guard
-Every optional-dependency subpackage has a `lib.py` that tries to import the library and falls back to `PyEnv.runtime_import_module()` for auto-install. **Always import the external library through its `lib.py`**, never `import polars` directly:
+1. **User integration success**
+2. **Helpful behavior and recovery**
+3. **Cross-engine compatibility**
+4. **Performance**
+5. **Internal neatness**
+
+If there is a tradeoff, prefer the implementation that makes the library easier to use correctly and easier to recover from when the user gets it wrong.
+
+---
+
+## Core rule
+
+This repo is not just about converting types.
+It is about making Arrow, Polars, pandas, Spark, Databricks, Python objects, schemas, HTTP payloads, and serialized buffers work together without the user writing a pile of annoying custom code.
+
+A good change should do at least one of these:
+
+- reduce boilerplate for the caller
+- preserve more schema intent across boundaries
+- improve debugging and recovery
+- make a common workflow faster without changing semantics
+- make the public API easier to discover and harder to misuse
+
+If it does none of those, it is probably not worth adding.
+
+---
+
+## Tone and style rules
+
+### General writing vibe
+Use clear, direct, modern language.
+Do not write stiff corporate robot text.
+Do not write cringe meme sludge either.
+
+Target tone:
+- blunt but helpful
+- confident but not arrogant
+- practical, not academic
+- reads like a sharp engineer explaining the fix, not a legal disclaimer
+
+### Comments must sound human
+Comments should help the next engineer understand:
+- what weird edge case exists
+- why the branch exists
+- what invariant is being protected
+- what the caller gets out of it
+
+Comments should **not** narrate obvious syntax.
+
+Good:
 ```python
-# correct
+# PyArrow can choke on repeat(size=0) on some versions, so return a typed empty array instead.
+```
+
+Better, in repo vibe:
+```python
+# Yeah, this looks extra, but PyArrow can throw on repeat(size=0).
+# Return a typed empty array here so callers do not get random nonsense.
+```
+
+Bad:
+```python
+# create empty array
+```
+
+### Error messages should help, not just complain
+Error messages should be explicit and useful.
+They should usually include:
+- what was passed
+- what was expected
+- what valid values or next steps exist
+- suggestions for likely typos or nearby matches when practical
+
+Good:
+```python
+raise KeyError(
+    "No field named 'prcie'. Available fields: ['price', 'volume']. "
+    "Did you mean 'price'? Use .field_names() to inspect valid names."
+)
+```
+
+Bad:
+```python
+raise KeyError("field not found")
+```
+
+### Gen Z style guidance for comments and errors
+Yes, you can use a Gen Z tone, but do it with restraint.
+The library still needs to feel professional and stable.
+
+Allowed vibe:
+- direct
+- slightly punchy
+- lightly conversational
+- small bits of personality
+
+Not allowed:
+- slang spam
+- forced jokes
+- meme formatting
+- sarcasm that hides the actual fix
+- anything that makes logs or exceptions harder to parse
+
+Good examples:
+```python
+# Databricks type payloads are messy in the wild, so normalize hard here.
+# Better we absorb the chaos than force every caller to do cleanup first.
+```
+
+```python
+raise ValueError(
+    "Conflicting field names: 'foo' and 'bar'. Pick one. "
+    "If you meant the same field, pass matching values."
+)
+```
+
+```python
+raise TypeError(
+    "Unsupported Databricks SQL type: 'ARRAY<NOPE>'. "
+    "Valid nested forms are ARRAY<type>, MAP<key, value>, and STRUCT<...>."
+)
+```
+
+Not good:
+```python
+raise ValueError("nah this is busted fr")
+```
+
+```python
+# no cap pyarrow is tweaking 💀
+```
+
+Rule: **sound sharp, not unserious**.
+
+---
+
+## What this project is
+
+Yggdrasil is a **schema-aware data interchange library**.
+
+- PyPI package: `ygg`
+- import package: `yggdrasil`
+
+It converts and normalizes:
+- Python values and type hints
+- Apache Arrow arrays, fields, schemas, tables
+- Polars types, series, expressions, frames
+- pandas dtypes and objects
+- Spark SQL types and DataFrames
+- Databricks SQL and API type payloads
+- HTTP request and response payloads
+- serialized binary and structured formats
+
+The point is to make all of that feel like one coherent system.
+
+---
+
+## Architecture you need to understand first
+
+### Converter registry is the core pattern
+Everything flows through:
+- `yggdrasil/data/cast/registry.py`
+
+Converters are registered with:
+```python
+@register_converter(from_hint, to_hint)
+```
+
+Dispatch order:
+1. exact match
+2. identity
+3. `Any` wildcard
+4. MRO fallback
+5. one-hop composition
+
+Before adding conversion code, decide whether it belongs in:
+- the registry
+- an engine-specific converter module
+- a normalization helper used by multiple converters
+
+Do not bolt on random ad hoc conversion logic when it should live in the registry.
+
+### Engine modules register on import
+These modules register their own converters on import:
+- `arrow/cast.py`
+- `polars/cast.py`
+- `pandas/cast.py`
+- `spark/cast.py`
+
+If a conversion seems like it should exist but does not fire, check import/registration first.
+
+### `CastOptions` is the shared options object
+`CastOptions` lives in:
+- `data/cast/options.py`
+
+Use it to normalize:
+- source hints
+- safety behavior
+- memory behavior
+- conversion options
+- schema hints
+
+Do not invent parallel one-off option patterns unless there is a real reason.
+
+### `lib.py` is the optional dependency guard
+Every optional-dependency subsystem should import through its `lib.py` guard when that pattern exists.
+
+Correct:
+```python
 from yggdrasil.polars.lib import polars
-# wrong — breaks when polars isn't installed
+```
+
+Wrong:
+```python
 import polars
 ```
 
-### `CastOptions` — the options object
-`CastOptions` (in `data/cast/options.py`) threads through nearly every conversion. Use `CastOptions.check_arg()` to normalize the many accepted input types (`dict`, `pa.Field`, `pa.Schema`, `None`).
+Base installs must stay lightweight.
+Optional dependencies must remain optional.
 
-### `io/` — HTTP/IO subsystem
-The `io/` package is the primary HTTP and binary-buffer layer:
-- `io/session.py` defines the abstract `Session` base (Delta-table caching, batch dispatch via `send_many`, Spark scatter via `spark_send`).
-- `io/http_/session.py` provides `HTTPSession`, the concrete urllib3-backed implementation. This is the **preferred HTTP client** for new code.
-- `io/url.py` has `URL` (immutable parsed URL) and `URLResource` (base class for resources addressable by URL; register via `@register_url_resource`).
-- `io/buffer/` has `BytesIO` (spill-to-disk buffer with compression/media-type detection) and format readers (`arrow_ipc_io.py`, `parquet_io.py`, `json_io.py`, `zip_io.py`).
-- `io/send_config.py` has `SendConfig` / `SendManyConfig` for request-level options including cache control.
-- `requests/session.py` has the older `YGGSession` (built on `requests.Session`), still used for simple retry-only HTTP. Prefer `io/http_/HTTPSession` for new features (caching, pagination, concurrency).
+### `io/` is the real integration boundary
+The `io/` package is where integration gets real:
+- requests
+- responses
+- URLs
+- buffers
+- media types
+- codecs
+- sessions
+- pagination
+- caching
 
-### `ai/` — AI session
-`AISession` (in `ai/session.py`) wraps OpenAI with retry, caching (`Expiring`), and structured response parsing. `SQLSession` (in `ai/sql_session.py`) extends it for multi-dialect SQL generation (`SQLFlavor`: Databricks, PostgreSQL, DuckDB, Polars SQL, MongoDB). Both import OpenAI through a try/except + `PyEnv.runtime_import_module` guard (no `lib.py` file; the guard is inline).
+Preferred HTTP client for new work:
+- `io/http_/session.py` → `HTTPSession`
 
-### Module layout
-- `data/cast/` — registry, `CastOptions`, datetime converters (core, no optional deps)
-- `data/enums/` — `Timezone` normalisation; `geozone/` sub-package with `GeoZone` frozen dataclass (WKB-cached geospatial zones, Polars expression builders for batch parsing)
-- `arrow/` — Arrow schema inference from type hints (`python_arrow.py`), Arrow↔Arrow casting (`cast.py`)
-- `polars/`, `pandas/`, `spark/` — engine-specific converters, each with `lib.py` + `cast.py` + `extensions.py`
-- `io/` — HTTP/IO subsystem: `BytesIO` spill-to-disk buffer, `URL`/`URLResource` registry, `PreparedRequest`/`Response`, `HTTPSession` (urllib3-backed with Delta-table caching), `SendConfig`/`SendManyConfig`, media-type detection, codec enums, format-specific buffer readers (`buffer/arrow_ipc_io.py`, `parquet_io.py`, `json_io.py`, `zip_io.py`)
-- `databricks/` — workspace config, SQL engine, jobs, compute/cluster management, IAM (users/groups), secrets, account services
-- `dataclasses/` — `dataclass_to_arrow_field`, `WaitingConfig`, `Expiring[T]` cache, `ExpiringDict[K,V]` TTL dict
-- `pickle/` — custom serialization with wire-tag ranges (`ser/`), plus `json.py`, `dill.py`, `serde.py`
-- `requests/` — `YGGSession` (retry-enabled HTTP via `requests` library), MSAL auth
-- `ai/` — `AISession` (OpenAI-backed chat with retry/caching), `SQLSession` (multi-dialect SQL generation: Databricks, PostgreSQL, DuckDB, Polars SQL, MongoDB)
-- `mongoengine/` — MongoEngine integration with `lib.py` guard, connection management, custom extensions (document/fields/queryset), `@with_mongo_connection` decorator
-- `concurrent/` — `JobPoolExecutor` bounded thread pool for large/infinite job streams, Spark placeholder
-- `web/` — async proxy servers (`proxy/http_.py` HTTP proxy, `proxy/mongo.py` MongoDB TLS proxy)
-- `pyutils/` — `@retry`, `@parallelize` decorators, plus `equality`, `exceptions`, `dummy` helpers
-- `environ/` — `PyEnv` for runtime module import/install, dependency metadata; also exports `runtime_import_module()` as a standalone function
-- `blake3/`, `xxhash/` — hash library wrappers following the `lib.py` guard pattern
-- `fastapi/` — optional REST API layer (entry point: `ygg-api`), with routers/services/schemas for Python, system, Databricks, and Excel execution
-- `rs.py` — Rust acceleration bridge; imports from `yggrs.<submodule>` with pure-Python fallbacks; exposes `HAS_RS` flag
+Use the modern stack unless you have a strong reason not to.
 
-## Development Setup
+---
 
-`ygg` (the Python package) uses **setuptools** as its build backend and is
-**pure Python** — it installs everywhere without Rust.  The optional Rust
-extension is a *separate* PyPI project (`yggrs`) built with **maturin**.
+## Repo map
+
+### Core conversion and schema
+- `data/cast/` — registry, cast options, core converters
+- `data/enums/` — enums and normalization helpers
+- `arrow/` — Arrow inference and Arrow conversions
+- `polars/` — Polars integration
+- `pandas/` — pandas integration
+- `spark/` — Spark integration
+- `dataclasses/` — dataclass helpers and config/cache utilities
+
+### IO and transport
+- `io/` — sessions, requests, responses, buffers, codecs, media IO
+- `web/` — proxy-related code
+
+### Platform integrations
+- `databricks/` — SQL, jobs, clusters, IAM, secrets, account services
+- `mongoengine/` — MongoEngine integration
+- `fastapi/` — optional API layer
+
+### AI and SQL
+- `ai/` — OpenAI-backed sessions and SQL generation
+
+### Serialization and acceleration
+- `pickle/` — custom serialization system
+- `rs.py` — Rust bridge with Python fallback
+- `blake3/`, `xxhash/` — guarded hash wrappers
+
+### Utilities
+- `pyutils/` — retry, parallelization, helper functions
+- `environ/` — runtime import/install logic
+
+---
+
+## Engineering priorities
+
+### 1. Make the common path easy
+If a user already has a value, schema, field, type string, or framework object, the library should do its best to accept it.
+
+Support practical caller inputs when reasonable:
+- Python type hints
+- strings
+- dict payloads
+- Arrow fields and schemas
+- Polars and pandas objects
+- Spark types
+- Databricks `type_text` payloads
+- objects with `.schema`, `.type`, `.arrow_schema`, or equivalent
+
+The caller should not need a pre-normalization ritual just to use the library.
+
+### 2. Help the user recover fast
+When something fails, do not just reject the input.
+Explain:
+- what failed
+- why it failed
+- what values are valid
+- what to try next
+
+For lookup-style APIs, suggest valid names or indices.
+For parsing APIs, show the unsupported fragment.
+For conversion APIs, mention what source and target were involved.
+
+### 3. Preserve the contract surface
+Arrow schema and field semantics are part of the user contract.
+Preserve when possible:
+- field names
+- field order
+- nullability
+- metadata
+- tags
+- nested structure
+- precision/scale
+- timezone intent
+
+Do not silently drop meaningful schema information unless the API explicitly documents that loss.
+
+### 4. Prefer ergonomics over abstraction purity
+If a small convenience change saves the caller a bunch of repeated glue code, it is usually a good trade.
+
+Good:
+```python
+field_by("price")
+field_by(0)
+field_by(name="price", raise_error=False)
+field_by(index=0)
+```
+
+Bad:
+- forcing the caller to pre-convert everything into one exact shape
+- making them know internal module boundaries to use public APIs
+- surfacing raw low-level exceptions with zero context
+
+### 5. Performance matters, but not at the cost of semantics
+Prefer:
+- Arrow-native operations
+- Polars lazy expressions
+- vectorized work
+- chunk-preserving operations
+- zero-copy or near-zero-copy flows
+- optional Rust fast paths
+
+But correctness and user-visible behavior come first.
+Python fallback behavior is canonical.
+
+---
+
+## Public API design rules
+
+### Be forgiving on input, strict on meaning
+It is good to accept multiple equivalent input shapes.
+It is not good to silently accept conflicting arguments.
+
+If arguments conflict, fail explicitly.
+
+Good:
+```python
+raise ValueError(
+    "Conflicting field names: 'foo' and 'bar'. "
+    "Pass only one name source, or pass matching values."
+)
+```
+
+### Convenience is good when it stays predictable
+It is fine to support a convenience positional argument like `name_or_index` if:
+- explicit keyword overrides still exist
+- conflicts are detected
+- return behavior stays clear
+- type hints stay honest
+
+### Type hints must match runtime truth
+If a method can return `None`, annotate `| None`.
+Do not fake stricter types just because the happy path returns a value.
+
+### Keyword-only arguments are good for ambiguous options
+Use keyword-only arguments when they make calls easier to read and harder to misuse.
+
+---
+
+## Rules for comments
+
+### Comment the weirdness, not the syntax
+Focus comments on:
+- version quirks
+- engine edge cases
+- schema invariants
+- user-facing behavior
+- compatibility hacks
+
+Good:
+```python
+# Spark schema payloads can arrive half-normalized, so accept both the raw type
+# and the wrapper object here. Better this helper deals with it once.
+```
+
+Good:
+```python
+# Keep metadata intact here. Losing it would make downstream schema diffs useless.
+```
+
+Bad:
+```python
+# loop through fields
+for field in fields:
+```
+
+### Comment style vibe
+Keep it sharp and readable.
+You can sound a little conversational, but do not turn the repo into a meme graveyard.
+
+Examples of acceptable vibe:
+```python
+# This branch looks redundant, but it saves callers from a super annoying Arrow edge case.
+```
+
+```python
+# Databricks payloads are not always clean, so normalize aggressively here.
+```
+
+Examples of not acceptable vibe:
+```python
+# bro this thing is cooked
+```
+
+```python
+# yolo
+```
+
+---
+
+## Rules for error messages
+
+### Every good error should try to answer these
+- what did you pass?
+- what did the library expect?
+- what can you pass instead?
+- what should you do next?
+
+### Preferred error shape
+Use explicit, practical error messages.
+
+Good:
+```python
+raise KeyError(
+    "No field named 'prcie'. Available fields: ['price', 'volume']. "
+    "Did you mean 'price'? Use .field_names() to inspect valid names."
+)
+```
+
+Good:
+```python
+raise TypeError(
+    "Unsupported Arrow data type: dense_union<...>. "
+    "This path currently supports primitive, list, map, and struct-like types."
+)
+```
+
+Good:
+```python
+raise ValueError(
+    "No field found at index 5. Valid index range: 0..2. "
+    "Use .field_names() to inspect available fields."
+)
+```
+
+### Gen Z style for errors
+Allowed:
+- direct wording
+- short punchy sentence fragments when still clear
+- slightly more human phrasing than default enterprise sludge
+
+Examples:
+```python
+raise ValueError(
+    "Conflicting field indexes: 1 and 2. Pick one. "
+    "If both point to the same thing in your code, normalize before calling field_by()."
+)
+```
+
+```python
+raise TypeError(
+    "Unsupported Databricks SQL type: 'STRUCT<foo BAR>'. "
+    "This parser is strict on nested syntax because guessing here would be messy."
+)
+```
+
+Not allowed:
+- meme slang
+- emoji
+- inside jokes
+- sarcasm instead of guidance
+- error text that sounds funny but hides the fix
+
+Rule: the message can have attitude, but it still needs to be instantly useful in logs.
+
+---
+
+## Optional dependency policy
+
+Optional dependencies must remain optional.
+
+### Rules
+- base `ygg` install must work without non-core engines
+- base `ygg` install must work without Rust
+- guarded imports must remain guarded
+- missing dependency errors should say which package/feature is required
+
+If a subsystem uses `lib.py`, follow that pattern.
+If it uses an inline runtime guard, stay consistent with that subsystem.
+
+---
+
+## Conversion design rules
+
+Before adding or changing a conversion, answer these:
+
+1. Is this a value conversion, schema conversion, or both?
+2. Should this live in the registry?
+3. What schema intent must survive?
+4. Is the behavior symmetric or intentionally one-way?
+5. What happens if the target engine is unavailable?
+6. What does the failure message say?
+
+Good conversion work:
+- fits the registry model
+- preserves names/nullability/metadata where possible
+- handles nested structures correctly
+- has realistic tests for success and failure
+- does not force the caller to know internals
+
+Red flags:
+- conversion only works after some non-obvious import side effect
+- conversion silently drops metadata
+- native path and Python fallback differ semantically
+- raw low-level exceptions leak straight to users with no context
+
+---
+
+## HTTP / IO guidance
+
+When working in `io/`:
+
+### Prefer the modern HTTP stack
+Use:
+- `HTTPSession`
+- `PreparedRequest`
+- `Response`
+- `SendConfig` / `SendManyConfig`
+
+### Preserve observability
+Requests and responses should stay easy to inspect and debug.
+Preserve things like:
+- normalized URL parts
+- promoted headers
+- remaining headers maps
+- body bytes
+- payload hashes
+- timestamps
+- status and timing fields
+
+### Treat buffers as core infrastructure
+`BytesIO` and `MediaIO` are not side helpers.
+They are central to real interop.
+Changes here must preserve:
+- spill-to-disk behavior
+- codec behavior
+- cursor safety
+- Arrow / Parquet / JSON / IPC compatibility
+- typed IO semantics
+
+---
+
+## Databricks guidance
+
+Databricks code should make real payloads easier to work with.
+That means:
+- supporting practical type strings and wrappers
+- parsing nested SQL types robustly
+- normalizing inconsistent payload shapes
+- showing the exact unsupported fragment in failures
+
+Do not build toy parsers for idealized input only.
+Real integration payloads are messier than docs examples.
+The library should absorb that mess where it is safe to do so.
+
+---
+
+## AI / SQL guidance
+
+The AI layer should be:
+- retry-safe
+- cache-aware
+- structured in output
+- explicit about dialect behavior
+
+When changing AI or SQL code:
+- prefer structured parsing over vague text handling
+- preserve retry and caching logic
+- keep dialect differences visible and testable
+- avoid hidden network assumptions
+
+---
+
+## Rust acceleration policy
+
+Rust is an optional fast path.
+It is not the source of truth.
+
+### Non-negotiable rules
+- Python behavior is canonical
+- Rust behavior must match Python behavior
+- pure Python fallback must stay correct
+- tests must pass with and without native support
+- never import `yggrs` directly outside `yggdrasil/rs.py`
+
+### When Rust is worth it
+Add Rust only when:
+- the path is actually hot
+- semantics are stable
+- Python fallback already exists and is correct
+- the speedup is worth the added maintenance cost
+
+Do not use Rust to hide unclear logic.
+Fix the semantics first.
+Then optimize.
+
+---
+
+## Testing expectations
+
+Run at least the relevant scope:
 
 ```bash
 cd python
-uv venv .venv
-.venv\Scripts\activate      # Windows
-# source .venv/bin/activate  # Linux/Mac
+pytest
+pytest tests/test_yggdrasil/test_data/
+ruff check
+black .
 ```
 
-**Standard dev install (no Rust required):**
-```bash
-uv pip install -e .[dev]
-```
+### Every meaningful change should test
+- expected success behavior
+- realistic failure behavior
+- optional dependency boundaries when relevant
+- native vs fallback parity when `rs.py` is involved
+- schema preservation when applicable
 
-**With Rust — also compile the native extension locally:**
-```bash
-uv pip install -e .[dev]
-cd rust
-maturin develop --release   # compiles yggrs and installs it into the venv
-cd ..
-```
+### Test the user experience, not just internals
+Prefer tests that validate:
+- what input a real caller passes
+- what result they get back
+- what exception they see when they misuse the API
 
-**Activate pre-built native wheels from PyPI:**
-```bash
-pip install ygg[native]     # installs yggrs>=<version> from PyPI
-```
+This repo wins when callers need less glue code and get less confusing failures.
+So test that, not only the internals.
 
-Install only the extras you need: `.[polars]`, `.[databricks]`, `.[bigdata]`,
-`.[pickle]`, `.[api]`, `.[http]`, `.[data]`, `.[native]`.
+---
 
-## Testing
-```bash
-cd python
-pytest                  # run all tests
-pytest tests/test_yggdrasil/test_data/   # run a specific submodule
-ruff check              # lint
-black .                 # format
-```
-- Tests live in `python/tests/test_yggdrasil/`, mirroring the `src/yggdrasil/` layout.
-- `conftest.py` injects `python/src` into `sys.path` and sets `DATABRICKS_HOST` env var for offline test stubs.
-- Python **3.10+** required; CI runs 3.10–3.13.
+## What to read before changing code
 
-## Conventions
-- **`__all__` in every module** — public API is explicit; follow this when adding exports.
-- **`from __future__ import annotations`** — used in most modules for deferred evaluation; new modules should include it.
-- **Frozen/slotted dataclasses** for immutable config objects (`@dataclass(frozen=True, slots=True)`).
-- **Converter signature**: `func(value, options=None) -> converted_value` — `options` is always `Optional[CastOptions]`.
-- **`*` re-exports in `__init__.py`** — subpackages barrel-export via `from .module import *`.
-- **Version** is in `src/yggdrasil/version.py` as a `VersionInfo` named tuple; bump there and in `pyproject.toml`.
-- **pyarrow is the only hard runtime dependency** — everything else is optional and guarded.
+Start here:
+1. `AGENTS.md`
+2. root `README.md`
+3. `python/README.md`
 
+Then inspect the subsystem you are touching.
 
-## LLM Agent Playbook (Repository-Specific)
-- Start by reading this `AGENTS.md`, then skim `README.md` + `python/README.md` to align terminology before changing code.
-- Prefer **Polars-first implementations** for dataframe logic (lazy plans, expression pushdown, reduced memory pressure). Add pandas/Spark fallbacks only when required by public API or optional dependency boundaries.
-- Treat Arrow schema/metadata as the contract surface. New helpers should preserve field names, nullability, and metadata unless explicitly documented otherwise.
-- When adding optional dependencies, follow the existing lazy import pattern (`lib.py` or runtime guard) to keep the base install lightweight.
-- Keep cross-version compatibility explicit (Python 3.10–3.13): avoid syntax or stdlib assumptions that drop 3.10 support.
+Before implementing a fix, check:
+- existing registry behavior
+- nearby converters
+- option normalization patterns
+- tests covering adjacent behavior
+- whether the same bug pattern already exists elsewhere
 
-### Skills usage guidance for coding agents
-- Use **`skill-creator`** only when the task is to author or revise reusable Codex skills/workflows.
-- Use **`skill-installer`** only when the task asks to install/list skills into `$CODEX_HOME/skills`.
-- If neither applies, proceed with normal repository workflows and do not force skill usage.
+---
 
-### Optional Rust acceleration guidance
+## Review checklist before finishing
 
-Rust lives in `rust/` (crate name `yggrs`).  The Python bridge
-is `yggdrasil/rs.py`.  The **key invariant**: every Rust submodule name must
-match a Python package under `src/yggdrasil/`.
+### User integration
+- Does this reduce caller boilerplate?
+- Does it accept the shapes users naturally have?
+- Does it improve recovery when input is wrong?
 
-#### Naming & layout rules
+### Semantics
+- Are names, metadata, nullability, and nested structure preserved?
+- Is lossy behavior explicit?
 
-| Python package          | Rust file                    | PyO3 submodule           |
-|-------------------------|------------------------------|--------------------------|
-| `yggdrasil/data/`       | `rust/src/data.rs`           | `yggdrasil.rust.data`    |
-| `yggdrasil/io/`         | `rust/src/io.rs`             | `yggdrasil.rust.io`      |
-| `yggdrasil/arrow/`      | `rust/src/arrow.rs`          | `yggdrasil.rust.arrow`   |
-| `yggdrasil/polars/`     | `rust/src/polars_.rs`        | `yggdrasil.rust.polars_` |
+### API quality
+- Are conflicts explicit?
+- Are defaults ergonomic?
+- Do type hints match runtime truth?
 
-(Append `_` to Rust file names that clash with reserved keywords, e.g. `polars`.)
+### Compatibility
+- Does this still work without optional dependencies unless truly required?
+- Does it preserve Python 3.10 compatibility?
 
-#### Adding a new Rust kernel — checklist
+### Performance
+- Is the path vectorized / Arrow-native / Polars-first where appropriate?
+- Did performance work avoid changing semantics?
 
-1. **Pick the right submodule** — `yggrs/src/<package>.rs` where `<package>`
-   matches the Python package the kernel accelerates.  Create the file if it
-   does not exist.
-2. **Write the `#[pyfunction]`** inside the submodule.
-3. **Expose a `pub fn register()`** in the same file that calls
-   `module.add_function(...)` for every public function.
-4. **Declare the module** in `lib.rs` with `mod <package>;` and add a
-   `PyModule::new` + `register()` call inside `#[pymodule] fn yggrs(...)`.
-5. **Update the Python bridge** `yggdrasil/rs.py`:
-   - Add a `try/except` import from `yggdrasil.rust.<package>` for the new symbol.
-   - Add a pure-Python fallback with identical behaviour.
-   - Export the new symbol in `__all__`.
-6. **Write tests** in `tests/test_yggdrasil/test_rs/test_rs.py` that pass
-   both with *and without* the native wheel (the fallback must keep them green).
-7. **Never import** `yggrs` directly anywhere except `yggdrasil/rs.py` —
-   all callers go through the Python bridge.
+### Testing
+- Is there a realistic success test?
+- Is there a realistic failure test?
+- Is fallback behavior covered where relevant?
 
-#### Invariants to maintain
+If those answers are shaky, the patch is probably not done.
 
-- Rust should be an **optional fast path**, never a hard import dependency.
-- `ygg` (the main PyPI package) uses **setuptools** — `pip install ygg`
-  works everywhere without Rust.  Native wheels are the separate `yggrs`
-  package built from `rust/` and published by `publish-native.yml`.
-- `HAS_RS` in `yggdrasil.rs` is the canonical flag for feature detection.
-- Rust source files use the *same* names as the Python packages they mirror so
-  locating the implementation is trivial for future agents.
-- Pure-Python fallbacks must be **behaviourally identical** and tested in CI
-  without a native build (the default).
+---
 
+## Strong preferences for coding agents
+
+### Prefer making the library more helpful
+A small ergonomic improvement that saves every caller friction is usually a good trade.
+
+### Prefer explicit recovery guidance
+Do not just reject bad input.
+Tell the user how to get back on track.
+
+### Prefer local consistency
+Follow patterns already used in the subsystem unless there is a clear upgrade path.
+
+### Prefer extending existing abstractions
+If the new behavior belongs naturally in an existing abstraction, put it there.
+Do not create isolated side APIs without a strong reason.
+
+### Prefer boring reliability
+This library sits on integration boundaries.
+Stable and obvious beats clever and fragile.
+
+---
+
+## Skills guidance for coding agents
+
+Use normal repository workflows unless the task is specifically about skills.
+
+Use:
+- `skill-creator` only when authoring or revising reusable Codex skills/workflows
+- `skill-installer` only when installing or listing skills into `$CODEX_HOME/skills`
+
+Do not force skill usage for normal repository code changes.
+
+---
+
+## Final rule
+
+When unsure, choose the implementation that would make a real user say:
+
+> Nice. I passed the thing I already had, and the library either worked or told me exactly how to fix it.

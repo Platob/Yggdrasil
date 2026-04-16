@@ -51,7 +51,7 @@ class DatabricksIO(ABC, IO):
         self,
         path: "DatabricksPath",
         mode: str,
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ):
@@ -115,7 +115,7 @@ class DatabricksIO(ABC, IO):
         cls,
         path: "DatabricksPath",
         mode: str,
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
         position: int = 0,
         buffer: Optional[io.BytesIO] = None,
     ) -> "DatabricksIO":
@@ -785,9 +785,9 @@ class DatabricksVolumeIO(DatabricksIO):
         data: Union[bytes, bytearray, memoryview, BinaryIO],
         *,
         overwrite: bool = True,
-        part_size: Optional[int] = None,
+        part_size: int | None = None,
         use_parallel: bool = True,
-        parallelism: Optional[int] = None,
+        parallelism: int | None = None,
     ):
         """Write bytes/stream to a volume file safely (BinaryIO upload)."""
         sdk = self.workspace.workspace_client()

@@ -45,11 +45,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union
 
 import pyarrow as pa
-from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.io import MimeTypes
-from yggdrasil.io.enums import Codec, MediaType, MimeType, SaveMode
-from yggdrasil.pickle.serde import ObjectSerde
 
+from yggdrasil.io.enums import MimeTypes, Codec, MediaType, MimeType, SaveMode
+from yggdrasil.pickle.serde import ObjectSerde
 from .bytes_io import BytesIO
 from .media_options import MediaOptions
 
@@ -61,7 +59,7 @@ if TYPE_CHECKING:
 
 O = TypeVar("O", bound=MediaOptions)
 
-__all__ = ["MediaIO"]
+__all__ = ["MediaIO", "MediaOptions"]
 
 
 @dataclass(slots=True)
@@ -117,7 +115,7 @@ class MediaIO(ABC, Generic[O]):
             return data
 
         try:
-            return cast_arrow_tabular(data, options=cast)
+            return cast.cast_arrow_tabular(data)
         except Exception:
             if options.raise_error:
                 raise
@@ -307,7 +305,7 @@ class MediaIO(ABC, Generic[O]):
 
     def _write_table_as_batches(self, *, table: "pyarrow.Table", options: O) -> None:
         """Convert *table* to batches and forward to :meth:`_write_arrow_batches`."""
-        casted = options.cast.cast_arrow(table)
+        casted = options.cast.cast_arrow_tabular(table)
 
         self._write_arrow_batches(
             batches=iter(casted.to_batches()),
@@ -325,7 +323,6 @@ class MediaIO(ABC, Generic[O]):
         buffer: BytesIO,
         media: MediaType | MimeType | str,
     ) -> "MediaIO[MediaOptions]":
-        """Create the appropriate :class:`MediaIO` subclass for *media*."""
         media = MediaType.parse(media)
         mt = media.mime_type
         buffer.set_media_type(media, safe=False)
@@ -333,9 +330,15 @@ class MediaIO(ABC, Generic[O]):
         if mt is MimeTypes.PARQUET:
             from .parquet_io import ParquetIO
             return ParquetIO(media_type=media, buffer=buffer)
+        if mt is MimeTypes.CSV or mt is MimeTypes.TSV:
+            from .csv_io import CsvIO
+            return CsvIO(media_type=media, buffer=buffer)
         if mt is MimeTypes.JSON or mt is MimeTypes.NDJSON:
             from .json_io import JsonIO
             return JsonIO(media_type=media, buffer=buffer)
+        if mt is MimeTypes.XML:
+            from .xml_io import XmlIO
+            return XmlIO(media_type=media, buffer=buffer)
         if mt is MimeTypes.ZIP:
             from .zip_io import ZipIO
             return ZipIO(media_type=media, buffer=buffer)

@@ -22,7 +22,7 @@ class UserAgentGenerator:
     - Avoids obviously fake combos (mostly)
     """
 
-    seed: Optional[int] = None
+    seed: int | None = None
 
     def _rng(self) -> Random:
         return Random(self.seed)
@@ -167,7 +167,7 @@ class UserAgentGenerator:
 
 # ---- convenience ----
 
-def random_user_agent(seed: Optional[int] = None) -> str:
+def random_user_agent(seed: int | None = None) -> str:
     """
     Convenience function:
       random_user_agent() -> random UA

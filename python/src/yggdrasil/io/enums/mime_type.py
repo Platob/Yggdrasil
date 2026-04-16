@@ -69,7 +69,7 @@ class MimeType:
         return self.value
 
     def __repr__(self) -> str:
-        return f"<{self.__class__.__name__}.{self.name}: {self.value!r}>"
+        return f"{self.__class__.__name__}({self.name!r} -> {self.value!r})"
 
     @classmethod
     def get(cls, value: object) -> "MimeType | None":
@@ -115,7 +115,7 @@ class MimeType:
             return default
 
         if not isinstance(magic, (bytes, bytearray)):
-            from ..buffer import BytesIO
+            from yggdrasil.io.buffer import BytesIO
 
             if isinstance(magic, BytesIO):
                 magic = bytes(magic.head(64))

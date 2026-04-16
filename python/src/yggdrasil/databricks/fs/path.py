@@ -18,20 +18,18 @@ self-contained.
 """
 from __future__ import annotations
 
-import dataclasses as dc
 import datetime as dt
 import fnmatch
 import logging
 import stat as stat_mod
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, astuple, replace
 from threading import Thread
 from typing import (
     Any, ClassVar, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING,
 )
 from urllib.parse import urlparse
-
-from yggdrasil.environ import shutdown as yg_shutdown
 
 from databricks.sdk.errors import InternalError
 from databricks.sdk.errors.platform import (
@@ -46,6 +44,7 @@ from databricks.sdk.service.catalog import VolumeType, VolumeInfo, PathOperation
 from databricks.sdk.service.workspace import ObjectType
 from pyarrow.fs import FileInfo, FileType
 
+from yggdrasil.environ import shutdown as yg_shutdown
 from .io import DatabricksIO
 from .path_kind import DatabricksPathKind
 from .volumes_path import get_volume_status, get_volume_metadata
@@ -81,7 +80,7 @@ SDK_ERRORS = (
 # stat_result stand-in
 # ---------------------------------------------------------------------------
 
-@dc.dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True)
 class DatabricksStatResult:
     """Minimal ``os.stat_result``-compatible object for Databricks paths."""
     st_size: int = 0
@@ -89,7 +88,7 @@ class DatabricksStatResult:
     st_mode: int = 0
 
     def __getitem__(self, idx):          # os.stat_result is subscript-able
-        return dc.astuple(self)[idx]
+        return astuple(self)[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +97,19 @@ class DatabricksStatResult:
 
 def _split(path: str) -> List[str]:
     return [p for p in path.split("/") if p]
+
+
+def _coerce_mtime_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        return dt.datetime.fromisoformat(value).timestamp()
+    value = float(value)
+    if value > 10_000_000_000:
+        value = value / 1000.0
+    return value
 
 
 def _parse_string(s: str) -> Tuple[Optional[str], List[str], Optional[str]]:
@@ -146,7 +158,7 @@ def _flatten(parts) -> List[str]:
 # Abstract base
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dc.dataclass(eq=False)
+@dataclass(eq=False)
 class DatabricksPath(ABC):
     """``pathlib.PurePosixPath``-like API for Databricks remote paths.
 
@@ -157,20 +169,20 @@ class DatabricksPath(ABC):
     kind: ClassVar[DatabricksPathKind]
 
     # ── Shared fields ─────────────────────────────────────────────────
-    parts: List[str] = dc.field(default_factory=list)
-    temporary: bool = dc.field(default=False)
+    parts: List[str] = field(default_factory=list)
+    temporary: bool = field(default=False)
 
     # Cached metadata (excluded from eq/hash)
-    _is_file: Optional[bool]  = dc.field(repr=False, hash=False, compare=False, default=None)
-    _is_dir:  Optional[bool]  = dc.field(repr=False, hash=False, compare=False, default=None)
-    _size:    Optional[int]   = dc.field(repr=False, hash=False, compare=False, default=None)
-    _mtime:   Optional[float] = dc.field(repr=False, hash=False, compare=False, default=None)
-    _client:  Optional["DatabricksClient"] = dc.field(
+    _is_file: bool | None  = field(repr=False, hash=False, compare=False, default=None)
+    _is_dir: bool | None  = field(repr=False, hash=False, compare=False, default=None)
+    _size: int | None   = field(repr=False, hash=False, compare=False, default=None)
+    _mtime: float | None = field(repr=False, hash=False, compare=False, default=None)
+    _client:  Optional["DatabricksClient"] = field(
         repr=False, hash=False, compare=False, default=None,
     )
 
     # Shutdown-hook handle — populated when temporary=True
-    _shutdown_hook: Any = dc.field(
+    _shutdown_hook: Any = field(
         default=None, init=False, repr=False, hash=False, compare=False,
     )
 
@@ -191,7 +203,7 @@ class DatabricksPath(ABC):
         """Fetch remote status and cache in ``_is_file / _is_dir / _size / _mtime``."""
 
     @abstractmethod
-    def _ls_impl(self, recursive: bool, fetch_size: Optional[int],
+    def _ls_impl(self, recursive: bool, fetch_size: int | None,
                  allow_not_found: bool) -> Iterator["DatabricksPath"]: ...
 
     @abstractmethod
@@ -227,7 +239,7 @@ class DatabricksPath(ABC):
                 obj._register_shutdown_remove()
             return obj
 
-        hostname: Optional[str] = None
+        hostname: str | None = None
         if isinstance(obj, str):
             head, tail, hostname = _parse_string(obj)
             if head is None:
@@ -438,7 +450,11 @@ class DatabricksPath(ABC):
             self._remove_dir_impl(
                 recursive=recursive, allow_not_found=allow_not_found, with_root=True,
             )
-        return self
+
+        if allow_not_found:
+            return self
+
+        raise FileNotFoundError(f"{self!r} does not exist")
 
     def rmfile(self, allow_not_found: bool = True) -> "DatabricksPath":
         self._remove_file_impl(allow_not_found=allow_not_found)
@@ -541,7 +557,7 @@ class DatabricksPath(ABC):
     def ls(
         self,
         recursive: bool = False,
-        fetch_size: Optional[int] = None,
+        fetch_size: int | None = None,
         allow_not_found: bool = True,
     ) -> Iterator["DatabricksPath"]:
         yield from self._ls_impl(
@@ -574,7 +590,7 @@ class DatabricksPath(ABC):
         return self._size or 0
 
     @content_length.setter
-    def content_length(self, value: Optional[int]) -> None:
+    def content_length(self, value: int | None) -> None:
         self._size = value
 
     @property
@@ -606,15 +622,15 @@ class DatabricksPath(ABC):
 
     def reset_metadata(
         self,
-        is_file: Optional[bool] = None,
-        is_dir:  Optional[bool] = None,
-        size:    Optional[int]  = None,
-        mtime:   Optional[float]= None,
+        is_file: bool | None = None,
+        is_dir: bool | None = None,
+        size:    int | None  = None,
+        mtime: float | None= None,
     ) -> "DatabricksPath":
         self._is_file = is_file
         self._is_dir  = is_dir
-        self._size    = size
-        self._mtime   = mtime
+        self._size = None if size is None else int(size)
+        self._mtime = _coerce_mtime_seconds(mtime)
         return self
 
     # ================================================================== #
@@ -734,9 +750,6 @@ class DatabricksPath(ABC):
             self._client.__exit__(exc_type, exc_val, exc_tb)
         self.close(wait=False)
 
-    def __del__(self) -> None:
-        self.close(wait=False)
-
     def __str__(self) -> str:
         return self.full_path()
 
@@ -749,10 +762,10 @@ class DatabricksPath(ABC):
     # ── Clone ─────────────────────────────────────────────────────────
 
     def _copy_with(self, **overrides) -> "DatabricksPath":
-        return dc.replace(self, **overrides)
+        return replace(self, **overrides)
 
     def clone_instance(self, **kwargs) -> "DatabricksPath":
-        return dc.replace(
+        return replace(
             self,
             parts   =kwargs.get("parts",   self.parts),
             _client =kwargs.get("client",  self._client),
@@ -794,7 +807,7 @@ def _empty(client=None) -> "DBFSPath":
 # DBFSPath  (/dbfs/…)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dc.dataclass(eq=False)
+@dataclass(eq=False)
 class DBFSPath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.DBFS
 
@@ -828,6 +841,7 @@ class DBFSPath(DatabricksPath):
                     _client=self.workspace,
                     _is_file=not info.is_dir, _is_dir=info.is_dir,
                     _size=info.file_size,
+                    _mtime=_coerce_mtime_seconds(getattr(info, "modification_time", None)),
                 )
                 if recursive and info.is_dir:
                     yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
@@ -871,7 +885,7 @@ class DBFSPath(DatabricksPath):
 # WorkspacePath  (/Workspace/…)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dc.dataclass(eq=False)
+@dataclass(eq=False)
 class WorkspacePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.WORKSPACE
 
@@ -907,6 +921,7 @@ class WorkspacePath(DatabricksPath):
                     _client=self.workspace,
                     _is_file=not is_dir, _is_dir=is_dir,
                     _size=info.size,
+                    _mtime=_coerce_mtime_seconds(getattr(info, "modified_at", None)),
                 )
         except SDK_ERRORS:
             if not allow_not_found:
@@ -946,11 +961,11 @@ class WorkspacePath(DatabricksPath):
 # VolumePath  (/Volumes/catalog/schema/volume/…)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dc.dataclass(eq=False)
+@dataclass(eq=False)
 class VolumePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.VOLUME
 
-    _volume_info: Optional[VolumeInfo] = dc.field(
+    _volume_info: Optional[VolumeInfo] = field(
         repr=False, hash=False, compare=False, default=None,
     )
 
@@ -1012,9 +1027,9 @@ class VolumePath(DatabricksPath):
             self._volume_info = volume_info
         return self
 
-    def clone_instance(self, *, volume_info=dc.MISSING, **kwargs):
+    def clone_instance(self, *, volume_info=..., **kwargs):
         clone = super().clone_instance(**kwargs)
-        clone._volume_info = self._volume_info if volume_info is dc.MISSING else volume_info
+        clone._volume_info = self._volume_info if volume_info is ... else volume_info
         return clone
 
     # ── Listing ───────────────────────────────────────────────────────
@@ -1035,6 +1050,11 @@ class VolumePath(DatabricksPath):
                     parts=child_parts, _client=self.workspace,
                     _is_file=not info.is_directory, _is_dir=info.is_directory,
                     _size=info.file_size,
+                    _mtime=_coerce_mtime_seconds(
+                        getattr(info, "last_modified", None)
+                        or getattr(info, "modified_at", None)
+                        or getattr(info, "modification_time", None)
+                    ),
                 )
                 if recursive and info.is_directory:
                     yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
@@ -1062,6 +1082,7 @@ class VolumePath(DatabricksPath):
                 child = VolumePath(
                     parts=pts, _client=self.workspace,
                     _is_file=False, _is_dir=True, _size=0,
+                    _mtime=time.time(),
                 )
                 if recursive:
                     yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
@@ -1162,7 +1183,7 @@ class VolumePath(DatabricksPath):
 # TablePath  (/Tables/catalog/schema/table)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dc.dataclass(eq=False)
+@dataclass(eq=False)
 class TablePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.TABLE
 

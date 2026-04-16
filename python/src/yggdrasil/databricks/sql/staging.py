@@ -124,9 +124,9 @@ class StagingPath:
         catalog_name: str,
         schema_name: str,
         table_name: str,
-        max_lifetime: Optional[float] = 3600,
-        start_ts: Optional[int] = None,
-        token: Optional[str] = None,
+        max_lifetime: float | None = 3600,
+        start_ts: int | None = None,
+        token: str | None = None,
     ) -> "StagingPath":
         catalog = cls._clean_part(catalog_name)
         schema = cls._clean_part(schema_name)

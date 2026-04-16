@@ -337,7 +337,7 @@ class ExecutionContext:
     context_key: Optional[str] = dc.field(default=None, repr=False, compare=False, hash=False)
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
     temporary: bool = dc.field(default=False, repr=False, compare=False, hash=False)
-    close_after: Optional[float] = dc.field(default=1800.0, repr=False, compare=False, hash=False)
+    close_after: float | None = dc.field(default=1800.0, repr=False, compare=False, hash=False)
 
     _remote_metadata: Optional[RemoteMetadata] = dc.field(
         default=None,
@@ -481,10 +481,10 @@ class ExecutionContext:
         *,
         cluster: "Cluster",
         language: Language = Language.PYTHON,
-        context_key: Optional[str] = None,
+        context_key: str | None = None,
         temporary: bool = False,
         reset: bool = False,
-        close_after: Optional[float] = 1800.0,
+        close_after: float | None = 1800.0,
     ) -> "ExecutionContext":
         """
         Return a pooled execution context, creating it if needed.
@@ -550,7 +550,7 @@ class ExecutionContext:
         self,
         *,
         language: Language,
-        context_key: Optional[str] = None,
+        context_key: str | None = None,
         wait: WaitingConfigArg = True,
         temporary: bool = False,
     ) -> "ExecutionContext":
@@ -806,10 +806,10 @@ for _k, _v in _env.items():
         self,
         command: Optional[str | Callable] = None,
         *,
-        command_str: Optional[str] = None,
+        command_str: str | None = None,
         language: Optional[Language | Literal["python", "r", "sql", "scala", "shell"]] = None,
         context: Optional["ExecutionContext"] = None,
-        command_id: Optional[str] = None,
+        command_id: str | None = None,
         func: Optional[Callable] = None,
         environ: Optional[Mapping] = None,
     ) -> "CommandExecution":
@@ -1013,7 +1013,7 @@ print(p.stdout, flush=True)
         args, kwargs = self._normalize_call_args(func, args=args, kwargs=kwargs)
 
         payload: str = dumps([serfunc, args, kwargs], b64=True)
-        remote_payload_path: Optional[str] = None
+        remote_payload_path: str | None = None
 
         if len(payload) > 900_000:
             tmp = self.client.tmp_path(

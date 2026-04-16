@@ -139,10 +139,6 @@ def _canonicalize_client_kwargs(kwargs: Mapping[str, object]) -> dict[str, objec
     return out
 
 
-def _client_cache_key_from_kwargs(kwargs: Mapping[str, object]) -> str:
-    return json.dumps(_canonicalize_client_kwargs(kwargs), sort_keys=True, separators=(",", ":"))
-
-
 def _nested_serialized_bytes(obj: object) -> bytes:
     nested = Serialized.from_python_object(obj)
     with BytesIO() as buf:
@@ -199,7 +195,7 @@ def _extract_ygg_client_kwargs(client: DatabricksClient) -> dict[str, object]:
 
 def _client_from_kwargs(kwargs_obj: Mapping[str, object]) -> DatabricksClient:
     kwargs = _canonicalize_client_kwargs(kwargs_obj)
-    key = _client_cache_key_from_kwargs(kwargs)
+    key = json.dumps(_canonicalize_client_kwargs(kwargs), sort_keys=True, separators=(",", ":"))
 
     cached = _YGG_DATABRICKS_CLIENT_CACHE.get(key)
     if cached is not None:

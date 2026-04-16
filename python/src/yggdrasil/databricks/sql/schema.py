@@ -29,8 +29,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource, DatabricksService
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-
-from .types import escape_sql_string
+from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 
 if TYPE_CHECKING:
     from .catalog import Catalog
@@ -47,16 +46,16 @@ class Schema(DatabricksResource):
 
     service: DatabricksService
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
 
     # TTL for the _infos cache (seconds).  None disables expiry.
-    _infos_ttl: Optional[float] = field(default=1800.0, repr=False, compare=False, hash=False)
+    _infos_ttl: float | None = field(default=1800.0, repr=False, compare=False, hash=False)
 
     _infos: Optional[SchemaInfo] = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
-    _infos_fetched_at: Optional[float] = field(
+    _infos_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
 
@@ -70,7 +69,7 @@ class Schema(DatabricksResource):
         return f"{self.catalog_name}.{self.schema_name}"
 
     def __repr__(self) -> str:
-        return f"Schema<{self.url.to_string()!r}>"
+        return f"Schema({self.url.to_string()!r})"
 
     def __str__(self) -> str:
         return self.full_name()
@@ -171,11 +170,12 @@ class Schema(DatabricksResource):
             table_name=name,
         )
 
-    def tables(self) -> Iterator["Table"]:
-        """Iterate over all tables in this schema."""
+    def tables(self, name: str | None = None) -> Iterator["Table"]:
+        """Iterate over tables in this schema, optionally filtered by name."""
         return self.client.tables.list_tables(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
+            name=name,
         )
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -183,9 +183,9 @@ class Schema(DatabricksResource):
     def create(
         self,
         *,
-        comment: Optional[str] = None,
+        comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-        storage_root: Optional[str] = None,
+        storage_root: str | None = None,
         if_not_exists: bool = True,
     ) -> "Schema":
         """Create this schema in Unity Catalog.
@@ -217,9 +217,9 @@ class Schema(DatabricksResource):
     def ensure_created(
         self,
         *,
-        comment: Optional[str] = None,
+        comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-        storage_root: Optional[str] = None,
+        storage_root: str | None = None,
     ) -> "Schema":
         """Create this schema if it does not already exist, then return ``self``."""
         if not self.exists:
@@ -260,7 +260,12 @@ class Schema(DatabricksResource):
 
     # ── tags ──────────────────────────────────────────────────────────────────
 
-    def set_tags_ddl(self, tags: Mapping[str, str] | None) -> str:
+    def set_tags_ddl(
+        self,
+        tags: Mapping[str, str] | None,
+        *,
+        tag_collation: str | None = DEFAULT_TAG_COLLATION,
+    ) -> str:
         """Build an ``ALTER SCHEMA … SET TAGS`` DDL statement."""
         pairs: list[str] = []
         for k, v in (tags or {}).items():
@@ -268,7 +273,8 @@ class Schema(DatabricksResource):
             val = str(v).strip() if v is not None else ""
             if key and val:
                 pairs.append(
-                    f"'{escape_sql_string(key)}' = '{escape_sql_string(val)}'"
+                    f"{databricks_tag_literal(key, collation=tag_collation)} = "
+                    f"{databricks_tag_literal(val, collation=tag_collation)}"
                 )
         if not pairs:
             raise ValueError(f"Cannot set empty tags on {self!r}")
@@ -277,10 +283,15 @@ class Schema(DatabricksResource):
             f"SET TAGS ({', '.join(pairs)})"
         )
 
-    def set_tags(self, tags: Mapping[str, str] | None) -> "Schema":
+    def set_tags(
+        self,
+        tags: Mapping[str, str] | None,
+        *,
+        tag_collation: str | None = DEFAULT_TAG_COLLATION,
+    ) -> "Schema":
         """Execute ``ALTER SCHEMA … SET TAGS`` for the given mapping."""
         if tags:
-            self.sql.execute(self.set_tags_ddl(tags))
+            self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
         return self
 
     # ── update ────────────────────────────────────────────────────────────────
@@ -288,8 +299,8 @@ class Schema(DatabricksResource):
     def update(
         self,
         *,
-        comment: Optional[str] = None,
-        owner: Optional[str] = None,
+        comment: str | None = None,
+        owner: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
     ) -> "Schema":
         """Update schema metadata in-place and refresh the local cache."""
@@ -307,4 +318,3 @@ class Schema(DatabricksResource):
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
-

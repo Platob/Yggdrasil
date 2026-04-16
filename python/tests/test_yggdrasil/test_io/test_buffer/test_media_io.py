@@ -25,9 +25,11 @@ import pyarrow.parquet as pq
 import pytest
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.arrow_ipc_io import IPCIO, IPCOptions
+from yggdrasil.io.buffer.csv_io import CsvIO, CsvOptions
 from yggdrasil.io.buffer.json_io import JsonIO, JsonOptions
 from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.parquet_io import ParquetIO, ParquetOptions
+from yggdrasil.io.buffer.xml_io import XmlIO
 from yggdrasil.io.buffer.zip_io import ZipIO, ZipOptions
 from yggdrasil.io.enums import MediaType, MimeType, SaveMode, GZIP
 from yggdrasil.io.enums.mime_type import MimeTypes
@@ -89,6 +91,11 @@ class TestMediaIOMake:
         mio = MediaIO.make(buf, MimeTypes.JSON)
         assert isinstance(mio, JsonIO)
 
+    def test_make_csv(self):
+        buf = BytesIO(b"a,b\n1,2\n")
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        assert isinstance(mio, CsvIO)
+
     def test_make_ndjson_dispatches_to_json_io(self):
         buf = BytesIO(b'{"a":1}\n{"a":2}\n')
         mio = MediaIO.make(buf, MimeTypes.NDJSON)
@@ -98,6 +105,11 @@ class TestMediaIOMake:
         buf = BytesIO(_ipc_bytes())
         mio = MediaIO.make(buf, MimeTypes.ARROW_IPC)
         assert isinstance(mio, IPCIO)
+
+    def test_make_xml(self):
+        buf = BytesIO(b"<rows><row><a>1</a></row></rows>")
+        mio = MediaIO.make(buf, MimeTypes.XML)
+        assert isinstance(mio, XmlIO)
 
     def test_make_zip(self):
         buf = BytesIO(_zip_bytes({"data.parquet": _parquet_bytes()}))
@@ -250,6 +262,40 @@ class TestParquetIO:
     def test_check_options_override(self):
         opts = ParquetIO.check_options(None, compression="snappy")
         assert opts.compression == "snappy"
+
+
+# ===================================================================
+# CsvIO
+# ===================================================================
+
+class TestCsvIO:
+    def test_write_read_roundtrip(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        result = mio.read_arrow_table()
+        assert result.to_pylist() == SAMPLE_TABLE.to_pylist()
+
+    def test_read_empty_returns_empty_table(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        result = mio.read_arrow_table()
+        assert result.num_rows == 0
+
+    def test_column_projection(self):
+        buf = BytesIO(b"a,b,c\n1,2,3\n4,5,6\n")
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        result = mio.read_arrow_table(options=CsvOptions(columns=["a", "c"]))
+        assert result.column_names == ["a", "c"]
+        assert result.to_pylist() == [{"a": 1, "c": 3}, {"a": 4, "c": 6}]
+
+    def test_gzip_compressed_roundtrip(self):
+        mt = MediaType(MimeTypes.CSV, codec=GZIP)
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mt)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        result = mio.read_arrow_table()
+        assert result.to_pylist() == SAMPLE_TABLE.to_pylist()
 
 
 # ===================================================================

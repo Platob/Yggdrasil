@@ -19,7 +19,7 @@ _serde = BsonJsonSerde()
 
 class RpcRequest(BaseModel):
     database: str
-    collection: Optional[str] = None
+    collection: str | None = None
     operation: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, Field, fields, is_dataclass
 from inspect import isclass
-from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional, Callable, TypeVar, get_type_hints
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -24,29 +24,17 @@ T = TypeVar("T")
 
 
 def dataclass_to_arrow_field(cls_or_instance: Any) -> "pa.Field":
-    """Return a cached Arrow Field describing the dataclass type.
-
-    Args:
-        cls_or_instance: Dataclass class or instance.
-
-    Returns:
-        Arrow field describing the dataclass schema.
-
-    Raises:
-        ValueError: If the input is not a dataclass class or instance.
-    """
-    if not is_dataclass(cls_or_instance):
-        raise ValueError(f"{cls_or_instance!r} is not a dataclass or yggdrasil dataclass")
-
-    cls = cls_or_instance if isclass(cls_or_instance) else cls_or_instance.__class__
+    if not isinstance(cls_or_instance, type):
+        cls = cls_or_instance.__class__
+    else:
+        cls = cls_or_instance
 
     existing = DATACLASS_ARROW_FIELD_CACHE.get(cls)
     if existing is not None:
         return existing
 
-    from yggdrasil.arrow.python_arrow import arrow_field_from_hint
-
-    built = arrow_field_from_hint(cls)
+    from yggdrasil.data.data_field import Field
+    built = Field.from_dataclass(cls).to_arrow_field()
     DATACLASS_ARROW_FIELD_CACHE[cls] = built
     return built
 

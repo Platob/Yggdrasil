@@ -15,7 +15,7 @@ class Dummy:
     def from_name(
         cls,
         *module_path: str | Iterable[str],
-        to_class: Optional[bool] = None,
+        to_class: bool | None = None,
         try_import: bool = False,
     ) -> Any:
         """

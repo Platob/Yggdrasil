@@ -135,7 +135,7 @@ def unwrap_optional(hint: Any) -> tuple[bool, Any]:
     Return (is_optional, base_hint) for Optional[T] / T | None.
 
     Examples:
-      Optional[int] -> (True, int)
+      int | None -> (True, int)
       int | None -> (True, int)
       int -> (False, int)
     """
@@ -318,7 +318,7 @@ def convert(
             return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]
 
     # Normalize options (CastOptions, Arrow types, kwargs, etc.)
-    options = CastOptions.check_arg(options=options, **kwargs)
+    options = CastOptions.check(options=options, **kwargs)
 
     if value is None:
         return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]

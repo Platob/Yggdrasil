@@ -164,5 +164,5 @@ def test_arrow_array_to_list_recursively_casts_elements() -> None:
 
 def test_options_object_is_accepted() -> None:
     # Don’t assume specific fields exist; just ensure the arg path works.
-    opts = CastOptions.check_arg()
+    opts = CastOptions.check()
     assert convert("2", int, options=opts) == 2

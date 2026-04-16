@@ -1,31 +1,86 @@
 from __future__ import annotations
 
-from .cities import load_cities
-from .core import load_core_geozones
-from .country_zones import load_country_zones
-from .countries import load_countries
-from .geozone import GeoZone
-from .mountains import load_mountains
-from .zones_entsoe import load_entsoe_zones
-from .zones_markets import load_market_zones
+from typing import Iterable, Mapping, Any
 
-__all__ = ['load_geozones']
+from .base import GeoZone, GeoZoneType
+from .catalog import GeoZoneCatalog
+from .continents import load_continent_geozones
+from .countries import fetch_country_geozones
+from .entsoe import fetch_entsoe_bidding_zones
 
-_LOADERS = (
-    load_core_geozones,
-    load_countries,
-    load_cities,
-    load_entsoe_zones,
-    load_market_zones,
-    load_country_zones,
-    load_mountains,
+__all__ = ["DEFAULT_GEOZONES", "load_geozones"]
+
+DEFAULT_GEOZONES: tuple[GeoZone, ...] = (
+    GeoZone(
+        gtype=GeoZoneType.EARTH,
+        key="WORLD",
+        name="World",
+        country_iso=None,
+        region_iso="WORLD",
+        ccy=None,
+        lat=0.0,
+        lon=0.0,
+        aliases=("EARTH", "GLOBAL"),
+    ),
+    *load_continent_geozones(),
+    GeoZone(
+        gtype=GeoZoneType.COUNTRY,
+        key="FR",
+        name="France",
+        country_iso="FR",
+        region_iso="FR-IDF",
+        sub_iso="FR-IDF",
+        ccy="EUR",
+        lat=46.2276,
+        lon=2.2137,
+        aliases=("FRA",),
+    ),
+    GeoZone(
+        gtype=GeoZoneType.COUNTRY,
+        key="DE",
+        name="Germany",
+        country_iso="DE",
+        region_iso="DE-BE",
+        sub_iso="DE-BE",
+        ccy="EUR",
+        lat=51.1657,
+        lon=10.4515,
+        aliases=("DEU", "GERMANY"),
+    ),
+    GeoZone(
+        gtype=GeoZoneType.CITY,
+        key="CH-ZH",
+        name="Zurich",
+        country_iso="CH",
+        region_iso="CH-ZH",
+        sub_iso="CH-ZH",
+        ccy="CHF",
+        lat=47.3769,
+        lon=8.5417,
+        aliases=("ZURICH", "ZUERICH"),
+    ),
 )
 
+_DEFAULT_CATALOG: GeoZoneCatalog | None = None
 
-def load_geozones() -> None:
-    GeoZone.clear_cache()
-    for loader in _LOADERS:
-        loader()
-    GeoZone.UK = GeoZone.UNITED_KINGDOM
-    GeoZone.USA = GeoZone.UNITED_STATES
-    GeoZone.US = GeoZone.UNITED_STATES
+
+def load_geozones(
+    values: Iterable[GeoZone | Mapping[str, Any]] | None = None,
+    *,
+    include_countries: bool = False,
+    include_entsoe_bidding_zones: bool = False,
+) -> GeoZoneCatalog:
+    global _DEFAULT_CATALOG
+
+    if values is None and not include_countries and not include_entsoe_bidding_zones:
+        if _DEFAULT_CATALOG is None:
+            _DEFAULT_CATALOG = GeoZoneCatalog.from_values(DEFAULT_GEOZONES)
+        return _DEFAULT_CATALOG
+
+    catalog_values: list[GeoZone | Mapping[str, Any]] = list(DEFAULT_GEOZONES if values is None else values)
+    if include_countries:
+        catalog_values.extend(fetch_country_geozones())
+    if include_entsoe_bidding_zones:
+        catalog_values.extend(fetch_entsoe_bidding_zones())
+
+    return GeoZoneCatalog.from_values(catalog_values)

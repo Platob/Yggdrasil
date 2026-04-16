@@ -103,16 +103,16 @@ class WaitingConfig:
         interval: Optional[Union[int, float, dt.timedelta]] = None,
         backoff: Optional[Union[int, float, dt.timedelta]] = None,
         max_interval: Optional[Union[int, float, dt.timedelta]] = None,
-        retries: Optional[int] = None,
+        retries: int | None = None,
     ) -> "WaitingConfig":
         if arg is None and timeout is None:
             return DEFAULT_WAITING_CONFIG
 
-        base_timeout: Optional[float] = None
-        base_interval: Optional[float] = None
-        base_backoff: Optional[float] = None
-        base_max_interval: Optional[float] = None
-        base_retries: Optional[int] = None
+        base_timeout: float | None = None
+        base_interval: float | None = None
+        base_backoff: float | None = None
+        base_max_interval: float | None = None
+        base_retries: int | None = None
 
         if arg is not None:
             if isinstance(arg, cls):

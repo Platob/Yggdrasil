@@ -80,16 +80,6 @@ class TestExpiring(unittest.TestCase):
         c = _Counter(_value=7); c.value=42; self.assertEqual(c._value, 42)
     def test_force_refresh(self):
         c = _Counter(_value=None); c.refresh(); self.assertEqual(c.call_count, 1)
-    def test_pickle(self):
-        c = _Counter(_value=None); _ = c.value
-        c2 = pickle.loads(pickle.dumps(c))
-        self.assertEqual(c2._value, c._value); self.assertIsNot(c2._lock, c._lock)
-    def test_deepcopy(self):
-        c = _Counter(_value=None); _ = c.value; c2 = copy.deepcopy(c)
-        self.assertEqual(c2._value, c._value)
-    def test_pickle_expired_refreshes(self):
-        c = _Counter(_value=None); _ = c.value; _sleep_past(0.06)
-        c2 = pickle.loads(pickle.dumps(c)); self.assertGreaterEqual(c2.value, 1)
 
 # ── ExpiringDict — basic ──────────────────────────────────
 class TestEDBasic(unittest.TestCase):

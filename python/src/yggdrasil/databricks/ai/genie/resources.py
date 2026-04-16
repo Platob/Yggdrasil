@@ -20,10 +20,10 @@ class GenieAnswer:
     space_id: str
     conversation_id: str
     message_id: str
-    status: Optional[str] = None
-    content: Optional[str] = None
-    text: Optional[str] = None
-    attachment_id: Optional[str] = None
-    query: Optional[str] = None
+    status: str | None = None
+    content: str | None = None
+    text: str | None = None
+    attachment_id: str | None = None
+    query: str | None = None
     query_result: Optional[Any] = None
     raw_message: Optional[Any] = None

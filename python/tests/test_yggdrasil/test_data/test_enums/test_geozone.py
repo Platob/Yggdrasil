@@ -1,174 +1,137 @@
+from __future__ import annotations
+
 import pytest
 
-from yggdrasil.data.enums.geozone import GeoZone, GeoZoneType, load_geozones
+from yggdrasil.data.enums.geozone import (
+    GeoZone,
+    GeoZoneCatalog,
+    GeoZoneType,
+    join_geozones,
+    load_geozones,
+)
+from yggdrasil.polars.tests import PolarsTestCase
 
 
-@pytest.fixture(scope="module", autouse=True)
-def geozones_loaded() -> None:
-    GeoZone.clear_cache()
-    load_geozones()
+@pytest.fixture(scope="module")
+def catalog() -> GeoZoneCatalog:
+    return load_geozones()
 
 
-@pytest.fixture(autouse=True)
-def clear_internal_lru_state_between_tests() -> None:
-    # Keep the registry loaded, but make each test independent from cached resolver internals.
-    GeoZone._resolver_cache.cache_clear()
-    GeoZone._build_bidding_zone_regex_cache.cache_clear()
-    GeoZone._build_bin_lookup_cache.cache_clear()
+def test_geozone_normalizes_and_validates() -> None:
+    zone = GeoZone(
+        gtype=GeoZoneType.REGION,
+        key=" fr ",
+        name=" Ile   de   France ",
+        country_iso=" fr ",
+        region_iso=" fr-idf ",
+        sub_iso=" fr-idf ",
+        ccy=" eur ",
+        lat="48.8566",
+        lon="2.3522",
+        aliases=("fra", "paris-region"),
+    )
+
+    assert zone.key == "FR"
+    assert zone.gtype == GeoZoneType.REGION
+    assert zone.name == "Ile de France"
+    assert zone.country_iso == "FR"
+    assert zone.region_iso == "FR IDF"
+    assert zone.sub_iso == "FR IDF"
+    assert zone.ccy == "EUR"
+    assert zone.aliases == ("FRA", "PARIS REGION")
 
 
 @pytest.mark.parametrize(
-    ("value", "expected_attr", "expected_type"),
+    ("value", "expected_name"),
     [
-        ("Europe", "EUROPE", GeoZoneType.CONTINENT),
-        ("FR", "FRANCE", GeoZoneType.COUNTRY),
-        ("France", "FRANCE", GeoZoneType.COUNTRY),
-        ("BZN|FR", "FRANCE", GeoZoneType.COUNTRY),
-        ("UK", "UNITED_KINGDOM", GeoZoneType.COUNTRY),
-        ("UK photovoltaic power generation forecast Meteologica 30min", "UNITED_KINGDOM", GeoZoneType.COUNTRY),
-        ("Zurich", "ZURICH", GeoZoneType.CITY),
-        ("SE1", "SE1", GeoZoneType.ZONE),
-        ("Swiss Alps", "SWISS_ALPS", GeoZoneType.ZONE),
+        ("FR", "France"),
+        ("fra", "France"),
+        ("Europe", "Europe"),
+        ("CH-ZH", "Zurich"),
+        ("zuerich", "Zurich"),
     ],
 )
-def test_parse_str_resolves_common_inputs(value: str, expected_attr: str, expected_type: int) -> None:
-    zone = GeoZone.parse_str(value)
-
-    assert zone is getattr(GeoZone, expected_attr)
-    assert zone.gtype == expected_type
-
-
-@pytest.mark.parametrize(
-    ("value", "expected_attr"),
-    [
-        ("united kingdom", "UNITED_KINGDOM"),
-        ("UNITED-KINGDOM", "UNITED_KINGDOM"),
-        ("bzn/fr", "FRANCE"),
-        ("pjm dom", "PJM_DOM"),
-        ("swiss-alps", "SWISS_ALPS"),
-    ],
-)
-def test_parse_str_normalizes_separators_and_case(value: str, expected_attr: str) -> None:
-    assert GeoZone.parse_str(value) is getattr(GeoZone, expected_attr)
-
-
-@pytest.mark.parametrize(
-    ("value", "expected_attr"),
-    [
-        ("Europe France", "EUROPE"),
-        ("France Zurich", "FRANCE"),
-        ("Zurich SE1", "ZURICH"),
-    ],
-)
-def test_parse_str_prefers_broader_geotype_when_multiple_tokens_match(value: str, expected_attr: str) -> None:
-    assert GeoZone.parse_str(value) is getattr(GeoZone, expected_attr)
-
-
-def test_parse_str_uses_token_windows_for_free_text() -> None:
-    assert GeoZone.parse_str("Sweden SE1 wind power") is GeoZone.SE1
-    assert GeoZone.parse_str("flow around pjm dom peak hours") is GeoZone.PJM_DOM
+def test_catalog_parse_str_resolves_codes_and_aliases(catalog: GeoZoneCatalog, value: str, expected_name: str) -> None:
+    zone = catalog.parse_str(value)
+    assert zone is not None
+    assert zone.name == expected_name
 
 
 @pytest.mark.parametrize(
     "value",
-    [
-        "47.3769, 8.5417",
-        "47.3769 8.5417",
-        "47.3769|8.5417",
-        "47.3769;8.5417",
-    ],
+    ["47.3769, 8.5417", "47.3769 8.5417", "47.3769|8.5417", "47.3769;8.5417"],
 )
-def test_parse_str_resolves_coordinate_strings(value: str) -> None:
-    assert GeoZone.parse_str(value) is GeoZone.ZURICH
+def test_catalog_parse_str_resolves_known_coordinates(catalog: GeoZoneCatalog, value: str) -> None:
+    zone = catalog.parse_str(value)
+    assert zone is not None
+    assert zone.name == "Zurich"
 
 
-@pytest.mark.parametrize(
-    ("value", "expected_attr"),
-    [
-        ({"key": "FR"}, "FRANCE"),
-        ({"name": "Zurich"}, "ZURICH"),
-        ({"eic": "10YFR-RTE------C"}, "FRANCE"),
-        ({"lat": 47.3769, "lon": 8.5417}, "ZURICH"),
-        ((47.3769, 8.5417), "ZURICH"),
-    ],
-)
-def test_parse_accepts_multiple_input_shapes(value, expected_attr: str) -> None:
-    assert GeoZone.parse(value) is getattr(GeoZone, expected_attr)
+def test_catalog_parse_returns_ad_hoc_zone_for_unknown_coordinates(catalog: GeoZoneCatalog) -> None:
+    zone = catalog.parse_str("10.5, 20.5")
+    assert zone == GeoZone(gtype=GeoZoneType.CUSTOM, lat=10.5, lon=20.5)
 
 
-def test_parse_accepts_binary_wkb() -> None:
-    assert GeoZone.parse(GeoZone.ZURICH.wkb) is GeoZone.ZURICH
+def test_catalog_parse_accepts_mappings_and_tuples(catalog: GeoZoneCatalog) -> None:
+    assert catalog.parse({"country_iso": "DE"}).name == "Germany"
+    assert catalog.parse({"lat": 47.3769, "lon": 8.5417}).name == "Zurich"
+
+    tuple_zone = catalog.parse((1.5, 2.5))
+    assert tuple_zone == GeoZone(gtype=GeoZoneType.CUSTOM, lat=1.5, lon=2.5)
 
 
-@pytest.mark.parametrize(
-    ("value", "return_value", "expected"),
-    [
-        ("France", "country_iso", "FR"),
-        ("Zurich", "city_iso", "ZRH"),
-    ],
-)
-def test_py_parse_str_scalar_fields(value: str, return_value: str, expected: str) -> None:
-    assert GeoZone.py_parse_str(value, return_value=return_value) == expected
+def test_load_geozones_accepts_custom_records() -> None:
+    catalog = load_geozones(
+        [
+            {
+                "key": "CA-QC",
+                "name": "Quebec",
+                "country_iso": "CA",
+                "region_iso": "CA-QC",
+                "lat": 52.9399,
+                "lon": -73.5491,
+                "aliases": ["QUEBEC"],
+            }
+        ]
+    )
+
+    zone = catalog.parse("quebec")
+    assert zone is not None
+    assert zone.region_iso == "CA QC"
+    assert zone.country_iso == "CA"
 
 
-def test_py_parse_str_struct_and_dataclass() -> None:
-    struct_value = GeoZone.py_parse_str("SE1", return_value="struct")
-    dataclass_value = GeoZone.py_parse_str("SE1", return_value="dataclass")
+class TestGeoZonePolars(PolarsTestCase):
 
-    assert struct_value["key"] == "SE1"
-    assert struct_value["country_iso"] == "SE"
-    assert dataclass_value is GeoZone.SE1
+    def setUp(self) -> None:
+        super().setUp()
+        self.catalog = load_geozones()
 
+    def test_join_geozones_enriches_polars_frames(self) -> None:
+        frame = self.pl.DataFrame({"zone": ["fr", "CH-ZH", "unknown"]})
+        enriched = join_geozones(frame, "zone", catalog=self.catalog)
 
-@pytest.mark.parametrize(
-    "return_value",
-    ["wkb", "country_iso", "city_iso", "point", "struct", "dataclass"],
-)
-def test_py_parse_str_returns_nullish_values_for_missing_input(return_value: str) -> None:
-    value = GeoZone.py_parse_str(None, return_value=return_value)
+        self.assertEqual(enriched["geozone_country_iso"].to_list(), ["FR", "CH", None])
+        self.assertEqual(enriched["geozone_gtype"].to_list(), ["COUNTRY", "CITY", None])
+        self.assertEqual(enriched["geozone_name"].to_list(), ["France", "Zurich", None])
+        self.assertEqual(enriched["geozone_ccy"].to_list(), ["EUR", "CHF", None])
 
-    if return_value == "point":
-        assert value == {"lat": None, "lon": None}
-    elif return_value == "struct":
-        assert value["key"] is None
-        assert value["wkb"] is None
-    else:
-        assert value is None
+    def test_catalog_to_polars_supports_filters(self) -> None:
+        frame = self.catalog.to_polars(country_iso="FR")
 
+        self.assertIsInstance(frame, self.pl.DataFrame)
+        self.assertEqual(frame["name"].to_list(), ["France"])
+        self.assertEqual(frame["country_iso"].to_list(), ["FR"])
 
-def test_py_parse_bin_variants() -> None:
-    assert GeoZone.py_parse_bin(GeoZone.ZURICH.wkb, return_value="dataclass") is GeoZone.ZURICH
-    assert GeoZone.py_parse_bin(GeoZone.ZURICH.wkb, return_value="country_iso") == "CH"
-    assert GeoZone.py_parse_bin(GeoZone.ZURICH.wkb, return_value="point") == {
-        "lat": pytest.approx(47.3769),
-        "lon": pytest.approx(8.5417),
-    }
+    def test_catalog_to_polars_supports_text_match(self) -> None:
+        frame = self.catalog.to_polars(text="zuerich")
 
+        self.assertEqual(frame["key"].to_list(), ["CH ZH"])
+        self.assertEqual(frame["name"].to_list(), ["Zurich"])
 
-@pytest.mark.parametrize(
-    "value",
-    ["", "   ", "definitely_not_a_zone", None],
-)
-def test_parse_str_returns_none_for_unknown_values(value) -> None:
-    if value is None:
-        assert GeoZone.parse(value) is None
-    else:
-        assert GeoZone.parse_str(value) is None
+    def test_catalog_to_polars_supports_sub_iso_and_currency_filters(self) -> None:
+        frame = self.catalog.to_polars(sub_iso="CH-ZH", ccy="CHF")
 
-
-def test_load_geozones_sets_convenience_aliases() -> None:
-    assert GeoZone.UK is GeoZone.UNITED_KINGDOM
-    assert GeoZone.USA is GeoZone.UNITED_STATES
-    assert GeoZone.US is GeoZone.UNITED_STATES
-
-
-def test_clear_cache_empties_registries() -> None:
-    GeoZone.clear_cache()
-
-    assert GeoZone.CACHE_ALL == []
-    assert GeoZone.CACHE_BY_KEY == {}
-    assert GeoZone.CACHE_BY_NAME == {}
-    assert GeoZone.CACHE_BY_GEOM == {}
-
-    load_geozones()
-    assert GeoZone.parse_str("France") is GeoZone.FRANCE
+        self.assertEqual(frame["name"].to_list(), ["Zurich"])
+        self.assertEqual(frame["sub_iso"].to_list(), ["CH ZH"])
+        self.assertEqual(frame["ccy"].to_list(), ["CHF"])

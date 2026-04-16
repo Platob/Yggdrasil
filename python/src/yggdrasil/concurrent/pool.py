@@ -36,8 +36,8 @@ class JobPoolExecutor(ThreadPoolExecutor):
 
     def __init__(
         self,
-        max_workers: Optional[int] = None,
-        max_in_flight: Optional[int] = None,
+        max_workers: int | None = None,
+        max_in_flight: int | None = None,
         job_name_prefix: str = "",
     ) -> None:
         super().__init__(
@@ -71,7 +71,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         cls,
         obj: Any,
         *,
-        max_workers: Optional[int] = None,
+        max_workers: int | None = None,
     ) -> "JobPoolExecutor":
         if isinstance(obj, cls):
             return cls  # type: ignore[return-value]
@@ -120,7 +120,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
         jobs: Iterable[Job],
         *,
         ordered: bool = False,
-        max_in_flight: Optional[int] = None,
+        max_in_flight: int | None = None,
         cancel_on_exit: bool = False,
         shutdown_on_exit: bool = False,
         shutdown_wait: bool = False,

@@ -7,7 +7,7 @@ The :class:`Timezone` dataclass wraps an IANA timezone identifier (e.g.
   ``EST``, …), and fixed UTC offsets (``+01:00``, ``UTC-05``).
 * **Conversion helpers** — ``localize`` naive datetimes, ``convert`` between
   zones, extract ``utc_offset`` at a given instant.
-* **Polars integration** — ``from_polars_dtype`` to extract the tz from a
+* **Polars integration** — ``from_polars_type`` to extract the tz from a
   ``pl.Datetime``, ``polars_normalize`` to map a Series/Expr of timezone
   strings to canonical IANA names.
 * **Pre-built constants** — ``Timezone.UTC``, ``Timezone.CET``, etc.
@@ -345,12 +345,12 @@ class Timezone:
     # ── Polars integration ───────────────────────────────────────────────────
 
     @classmethod
-    def from_polars_dtype(cls, dtype: "polars.DataType") -> "Timezone | None":
+    def from_polars_type(cls, dtype: "polars.DataType") -> "Timezone | None":
         """Extract the timezone from a Polars ``Datetime`` dtype.
 
         Returns ``None`` if the dtype is not ``Datetime`` or has no timezone.
 
-        >>> Timezone.from_polars_dtype(pl.Datetime("us", "Europe/Paris"))
+        >>> Timezone.from_polars_type(pl.Datetime("us", "Europe/Paris"))
         Timezone('Europe/Paris')
         """
         import polars as pl

@@ -117,8 +117,8 @@ def _schema_to_arrow_schema(schema: Any) -> Any:
 
 def _arrow_schema_to_spark_schema(arrow_schema: Any) -> Any:
     """Convert a ``pyarrow.Schema`` to a ``pyspark.sql.types.StructType``."""
-    from yggdrasil.spark.cast import arrow_schema_to_spark_schema
-    return arrow_schema_to_spark_schema(arrow_schema)
+    from yggdrasil.spark.cast import any_to_spark_schema
+    return any_to_spark_schema(arrow_schema)
 
 
 def _datatype_to_json(dtype: Any) -> str:

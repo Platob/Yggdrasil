@@ -13,7 +13,7 @@ Coverage
 - now, today (smoke)
 - ZoneInfo interop (to_zoneinfo, key, tzinfo)
 - Arrow integration (from_arrow_type, arrow_timestamp_type)
-- Polars integration (from_polars_dtype, polars_normalize)
+- Polars integration (from_polars_type, polars_normalize)
 - all_iana enumeration
 - Edge cases and error handling
 """
@@ -492,16 +492,16 @@ class TestArrowIntegration:
 
 class TestPolarsIntegration:
 
-    def test_from_polars_dtype_with_tz(self):
-        tz = Timezone.from_polars_dtype(pl.Datetime("us", "Europe/Paris"))
+    def test_from_polars_type_with_tz(self):
+        tz = Timezone.from_polars_type(pl.Datetime("us", "Europe/Paris"))
         assert tz is not None
         assert tz.iana == "Europe/Paris"
 
-    def test_from_polars_dtype_without_tz(self):
-        assert Timezone.from_polars_dtype(pl.Datetime("us")) is None
+    def test_from_polars_type_without_tz(self):
+        assert Timezone.from_polars_type(pl.Datetime("us")) is None
 
-    def test_from_polars_dtype_non_datetime(self):
-        assert Timezone.from_polars_dtype(pl.Int64()) is None
+    def test_from_polars_type_non_datetime(self):
+        assert Timezone.from_polars_type(pl.Int64()) is None
 
     def test_polars_normalize_series(self):
         s = pl.Series("tz", ["CEST", "EDT", "UTC", "Bogus", None])

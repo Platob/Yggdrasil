@@ -44,7 +44,7 @@ def _run_pip(*args: str) -> Tuple[int, str, str]:
 @dc.dataclass(frozen=True)
 class PipIndexSettings:
     """Resolved pip index configuration from env and config sources."""
-    index_url: Optional[str] = None
+    index_url: str | None = None
     extra_index_urls: List[str] = dc.field(default_factory=list)
     sources: Dict[str, Dict[str, Any]] = dc.field(default_factory=dict)  # {"env": {...}, "config": {...}}
 
@@ -121,7 +121,7 @@ def get_pip_index_settings() -> PipIndexSettings:
 
     # Read pip config (best-effort)
     rc, out, _err = _run_pip("config", "list", "--format=json")
-    config_index_url: Optional[str] = None
+    config_index_url: str | None = None
     config_extra_raw: List[Any] = []
 
     if rc == 0 and out:

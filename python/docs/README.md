@@ -90,7 +90,6 @@ Always import optional dependencies through their `lib.py` guard modules:
 ```python
 from yggdrasil.polars.lib import polars
 from yggdrasil.pandas.lib import pandas
-from yggdrasil.spark.lib import pyspark_sql
 ```
 
 Polars cast example:
@@ -161,7 +160,7 @@ from yggdrasil.data.cast import CastOptions
 
 
 def normalize_options(options=None, target_field=None) -> CastOptions:
-    return CastOptions.check_arg(options, target_field=target_field, strict_match_names=True)
+    return CastOptions.check(options, target_field=target_field, strict_match_names=True)
 ```
 
 ---

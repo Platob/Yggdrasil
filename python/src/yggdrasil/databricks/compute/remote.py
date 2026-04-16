@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 def databricks_remote_compute(
     _func: Optional[Callable] = None,
-    cluster_id: Optional[str] = None,
-    cluster_name: Optional[str] = None,
+    cluster_id: str | None = None,
+    cluster_name: str | None = None,
     workspace: Optional[Union["DatabricksClient", str]] = None,
     cluster: Optional["Cluster"] = None,
     env_keys: Optional[List[str]] = None,

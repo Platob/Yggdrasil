@@ -674,6 +674,247 @@ def test_path_backed_truncate_modifies_original_file(cfg: BufferConfig, tmp_path
     assert path.read_bytes() == b"abc"
 
 
+class FakeRemotePath:
+    def __init__(self, local: Path) -> None:
+        self._local = local
+
+    @property
+    def parent(self) -> "FakeRemotePath":
+        return FakeRemotePath(self._local.parent)
+
+    def mkdir(self, parents: bool = True, exist_ok: bool = True):
+        self._local.mkdir(parents=parents, exist_ok=exist_ok)
+        return self
+
+    def touch(self) -> None:
+        self._local.parent.mkdir(parents=True, exist_ok=True)
+        self._local.touch()
+
+    def exists(self) -> bool:
+        return self._local.exists()
+
+    def stat(self):
+        return self._local.stat()
+
+    def open(self, mode: str = "rb"):
+        self._local.parent.mkdir(parents=True, exist_ok=True)
+        return self._local.open(mode)
+
+    def read_bytes(self) -> bytes:
+        return self._local.read_bytes()
+
+    def write_bytes(self, data: bytes) -> None:
+        self._local.parent.mkdir(parents=True, exist_ok=True)
+        self._local.write_bytes(data)
+
+    def unlink(self, missing_ok: bool = True) -> None:
+        if self._local.exists():
+            self._local.unlink()
+        elif not missing_ok:
+            raise FileNotFoundError(self._local)
+
+    def copy_to(self, dest) -> None:
+        payload = self.read_bytes()
+        dest.write_bytes(payload)
+
+    def __truediv__(self, other: str) -> "FakeRemotePath":
+        return FakeRemotePath(self._local / other)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeRemotePath) and self._local == other._local
+
+    def __str__(self) -> str:
+        return f"fake://{self._local.as_posix()}"
+
+
+def test_spill_uses_remote_style_tmp_dir(tmp_path: Path) -> None:
+    remote_root = FakeRemotePath(tmp_path / "remote")
+    cfg = BufferConfig(
+        spill_bytes=8,
+        tmp_dir=remote_root,
+        prefix="bytes-io-",
+        suffix=".bin",
+        keep_spilled_file=False,
+    )
+
+    b = BytesIO(b"x" * 32, config=cfg)
+    path = b.path
+
+    assert b.spilled
+    assert isinstance(path, FakeRemotePath)
+    assert path.exists()
+    assert b.to_bytes() == b"x" * 32
+
+    b.seek(40)
+    b.write(b"z")
+
+    assert b.size == 41
+    assert b.to_bytes()[32:40] == b"\x00" * 8
+    assert b.to_bytes()[40:] == b"z"
+
+    b.close()
+    assert not path.exists()
+
+
+def test_databricks_path_tmp_dir_can_back_spill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    databricks = pytest.importorskip("yggdrasil.databricks")
+    path_mod = pytest.importorskip("yggdrasil.databricks.fs.path")
+    db_path = databricks.DatabricksPath.parse("/dbfs/unit-tests")
+
+    def localize(path_obj) -> Path:
+        return tmp_path.joinpath(*path_obj.parts)
+
+    def exists(self) -> bool:
+        return localize(self).exists()
+
+    def stat(self):
+        return localize(self).stat()
+
+    def touch(self) -> None:
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.touch()
+
+    def open_(self, mode: str = "rb", buffering: int = -1, encoding=None, errors=None, newline=None, clone: bool = False):
+        _ = buffering, encoding, errors, newline, clone
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        return local.open(mode)
+
+    def read_bytes(self, use_cache: bool = False) -> bytes:
+        _ = use_cache
+        return localize(self).read_bytes()
+
+    def write_bytes(self, data) -> None:
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(data)
+
+    def unlink(self, missing_ok: bool = True) -> None:
+        local = localize(self)
+        if local.exists():
+            local.unlink()
+        elif not missing_ok:
+            raise FileNotFoundError(local)
+
+    def copy_to(self, dest, allow_not_found: bool = True) -> None:
+        _ = allow_not_found
+        payload = localize(self).read_bytes()
+        dest.write_bytes(payload)
+
+    def mkdir_impl(self, parents: bool = True, exist_ok: bool = True) -> None:
+        localize(self).mkdir(parents=parents, exist_ok=exist_ok)
+
+    def remove_file_impl(self, allow_not_found: bool = True) -> None:
+        unlink(self, missing_ok=allow_not_found)
+
+    def remove_dir_impl(self, recursive: bool = True, allow_not_found: bool = True, with_root: bool = True) -> None:
+        _ = recursive, with_root
+        local = localize(self)
+        if local.exists():
+            local.rmdir()
+        elif not allow_not_found:
+            raise FileNotFoundError(local)
+
+    monkeypatch.setattr(path_mod.DBFSPath, "exists", exists)
+    monkeypatch.setattr(path_mod.DBFSPath, "stat", stat)
+    monkeypatch.setattr(path_mod.DBFSPath, "touch", touch)
+    monkeypatch.setattr(path_mod.DBFSPath, "open", open_)
+    monkeypatch.setattr(path_mod.DBFSPath, "read_bytes", read_bytes)
+    monkeypatch.setattr(path_mod.DBFSPath, "write_bytes", write_bytes)
+    monkeypatch.setattr(path_mod.DBFSPath, "unlink", unlink)
+    monkeypatch.setattr(path_mod.DBFSPath, "copy_to", copy_to)
+    monkeypatch.setattr(path_mod.DBFSPath, "_mkdir_impl", mkdir_impl)
+    monkeypatch.setattr(path_mod.DBFSPath, "_remove_file_impl", remove_file_impl)
+    monkeypatch.setattr(path_mod.DBFSPath, "_remove_dir_impl", remove_dir_impl)
+
+    cfg = BufferConfig(
+        spill_bytes=8,
+        tmp_dir=db_path,
+        prefix="bytes-io-",
+        suffix=".bin",
+        keep_spilled_file=False,
+    )
+
+    b = BytesIO(b"a" * 32, config=cfg)
+
+    assert b.spilled
+    assert isinstance(b.path, path_mod.DBFSPath)
+    assert b.path.exists()
+    assert b.to_bytes() == b"a" * 32
+
+    b.seek(0)
+    b.write(b"bcd")
+    assert b.to_bytes().startswith(b"bcd")
+
+    spill_path = b.path
+    b.close()
+    assert spill_path is not None
+    assert not spill_path.exists()
+
+
+def test_init_from_databricks_path_keeps_path_in_backing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    databricks = pytest.importorskip("yggdrasil.databricks")
+    path_mod = pytest.importorskip("yggdrasil.databricks.fs.path")
+    db_path = databricks.DatabricksPath.parse("/dbfs/unit-tests/shared.bin")
+
+    def localize(path_obj) -> Path:
+        return tmp_path.joinpath(*path_obj.parts)
+
+    def exists(self) -> bool:
+        return localize(self).exists()
+
+    def stat(self):
+        return localize(self).stat()
+
+    def touch(self) -> None:
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.touch()
+
+    def open_(self, mode: str = "rb", buffering: int = -1, encoding=None, errors=None, newline=None, clone: bool = False):
+        _ = buffering, encoding, errors, newline, clone
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        return local.open(mode)
+
+    def read_bytes(self, use_cache: bool = False) -> bytes:
+        _ = use_cache
+        return localize(self).read_bytes()
+
+    def write_bytes(self, data) -> None:
+        local = localize(self)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(data)
+
+    def unlink(self, missing_ok: bool = True) -> None:
+        local = localize(self)
+        if local.exists():
+            local.unlink()
+        elif not missing_ok:
+            raise FileNotFoundError(local)
+
+    def mkdir_impl(self, parents: bool = True, exist_ok: bool = True) -> None:
+        localize(self).mkdir(parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(path_mod.DBFSPath, "exists", exists)
+    monkeypatch.setattr(path_mod.DBFSPath, "stat", stat)
+    monkeypatch.setattr(path_mod.DBFSPath, "touch", touch)
+    monkeypatch.setattr(path_mod.DBFSPath, "open", open_)
+    monkeypatch.setattr(path_mod.DBFSPath, "read_bytes", read_bytes)
+    monkeypatch.setattr(path_mod.DBFSPath, "write_bytes", write_bytes)
+    monkeypatch.setattr(path_mod.DBFSPath, "unlink", unlink)
+    monkeypatch.setattr(path_mod.DBFSPath, "_mkdir_impl", mkdir_impl)
+
+    db_path.write_bytes(b"abcdef")
+
+    b = BytesIO(db_path, copy=False)
+
+    assert isinstance(b.path, path_mod.DBFSPath)
+    assert b.path == db_path
+    assert b.to_bytes() == b"abcdef"
+
+
 def test_init_from_invalid_type_raises(cfg: BufferConfig) -> None:
     with pytest.raises(TypeError):
         BytesIO(123, config=cfg)  # type: ignore[arg-type]

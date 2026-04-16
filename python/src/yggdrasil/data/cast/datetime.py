@@ -43,6 +43,7 @@ __all__ = [
     "any_to_timedelta",
     "any_to_tzinfo",
     "truncate_datetime",
+    "truncate_datetime_value",
     "iter_datetime_ranges",
 ]
 
@@ -545,6 +546,16 @@ def truncate_datetime(
         return _add_interval(truncated, spec)
 
     return truncated
+
+
+def truncate_datetime_value(
+    value: Any,
+    spec: Any,
+    tz: str | dt.tzinfo | dt.timedelta | None = None,
+) -> dt.datetime:
+    dt_value = any_to_datetime(value, tz=tz)
+    interval_spec = spec if isinstance(spec, _IntervalSpec) else _coerce_interval(spec)
+    return _truncate_datetime_value(dt_value, interval_spec)
 
 
 def iter_datetime_ranges(

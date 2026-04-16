@@ -712,8 +712,34 @@ class PyEnv:
         create: bool = True,
         import_error: bool = True,
         install_spark: bool = False,
+        local_setup: bool = True,
+        extra_config: dict[str, str] | None = None,
     ) -> "SparkSession | None":
+        """Return a cached SparkSession, creating one if needed.
+
+        Resolution order:
+        1. Return the cached session if already resolved.
+        2. Check for an active SparkSession in the current process.
+        3. Try connecting via DatabricksClient (if available).
+        4. Bootstrap a local session using ``yggdrasil.spark.setup`` utilities
+           (winutils, JVM compat flags, etc.) when *local_setup* is True.
+        5. Fall back to bare ``SparkSession.builder.getOrCreate()``.
+
+        Args:
+            create:       Whether to create a new session if none exists.
+            import_error: Raise ImportError when PySpark is missing and
+                          *install_spark* is False.
+            install_spark: Auto-install PySpark via pip if missing.
+            local_setup:  Use ``yggdrasil.spark.setup`` to handle winutils,
+                          Java compat flags, and sensible local defaults.
+                          Set to False if you manage the Spark env yourself.
+            extra_config: Additional Spark config key/value pairs forwarded
+                          to ``create_local_session`` when bootstrapping.
+        """
         if cls._SPARK_SESSION is MISSING:
+            # ------------------------------------------------------------------
+            # Ensure PySpark is importable
+            # ------------------------------------------------------------------
             try:
                 from pyspark.sql import SparkSession
             except ImportError:
@@ -731,6 +757,9 @@ class PyEnv:
                 cls._SPARK_SESSION = None
                 return cls._SPARK_SESSION
 
+            # ------------------------------------------------------------------
+            # Look for an already-active session
+            # ------------------------------------------------------------------
             active = None
             try:
                 from pyspark.sql import SparkSession
@@ -739,21 +768,43 @@ class PyEnv:
             except ImportError:
                 pass
 
-            if active is None:
-                try:
-                    from yggdrasil.databricks.client import DatabricksClient
-
-                    active = DatabricksClient.current().spark_connect(create=create)
-                except:
-                    pass
-
             if active is not None:
                 cls._SPARK_SESSION = active
 
             elif create:
-                from pyspark.sql import SparkSession
+                # ----------------------------------------------------------
+                # Bootstrap a local session, using the setup utilities so
+                # winutils / Java compat / Arrow optimizations are handled.
+                # ----------------------------------------------------------
+                if local_setup:
+                    try:
+                        from yggdrasil.spark.setup import (
+                            configure_java_compat,
+                            create_local_session,
+                            ensure_hadoop_home,
+                        )
 
-                cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
+                        ensure_hadoop_home()
+                        configure_java_compat()
+                        cls._SPARK_SESSION = create_local_session(
+                            extra_config=extra_config,
+                        )
+                    except Exception:
+                        # If the setup utilities blow up (missing Java, network
+                        # issues, etc.), fall through to the bare builder so the
+                        # caller still gets *something* when possible.
+                        logger.warning(
+                            "PyEnv.spark_session: local setup bootstrap failed, "
+                            "falling back to bare SparkSession.builder",
+                            exc_info=True,
+                        )
+                        from pyspark.sql import SparkSession
+
+                        cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
+                else:
+                    from pyspark.sql import SparkSession
+
+                    cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
 
             else:
                 cls._SPARK_SESSION = None
