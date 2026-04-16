@@ -498,7 +498,8 @@ class IntegerType(NumericType):
 
     def __str__(self):
         bits = (self.byte_size or 8) * 8
-        return f"int{bits}"
+        prefix = "int" if self.signed else "uint"
+        return f"{prefix}{bits}"
 
     def __repr__(self):
         return self.__str__()
@@ -1036,9 +1037,9 @@ class TimeType(TemporalType):
 
     @classmethod
     def from_arrow_type(cls, dtype: pa.DataType) -> "TimeType":
-        unit = getattr(dtype, "unit", "us")
-        bit_width = getattr(dtype, "bit_width", 64)
-        return cls(byte_size=bit_width // 8, unit=unit)
+        if not pa.types.is_time(dtype):
+            raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+        return cls(byte_size=dtype.bit_width // 8, unit=dtype.unit)
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
@@ -1111,6 +1112,8 @@ class TimestampType(TemporalType):
 
     @classmethod
     def from_arrow_type(cls, dtype: pa.TimestampType) -> "TimestampType":
+        if not pa.types.is_timestamp(dtype):
+            raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
         return cls(byte_size=8, unit=dtype.unit, tz=dtype.tz)
 
     @classmethod
@@ -1194,6 +1197,8 @@ class DurationType(TemporalType):
 
     @classmethod
     def from_arrow_type(cls, dtype: pa.DurationType) -> "DurationType":
+        if not pa.types.is_duration(dtype):
+            raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
         return cls(byte_size=8, unit=dtype.unit)
 
     @classmethod
