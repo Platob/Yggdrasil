@@ -24,12 +24,13 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
-from databricks.sdk.service.catalog import CatalogInfo
+from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource, DatabricksService
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
+from .grants import GrantsMixin
 from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Catalog(DatabricksResource):
+class Catalog(DatabricksResource, GrantsMixin):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags."""
 
     service: DatabricksService
@@ -316,6 +317,14 @@ class Catalog(DatabricksResource):
         if tags:
             self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
         return self
+
+    # ── grants ────────────────────────────────────────────────────────────────
+
+    def _grants_securable_type(self) -> SecurableType:
+        return SecurableType.CATALOG
+
+    def _grants_full_name(self) -> str:
+        return self.catalog_name
 
     # ── update ────────────────────────────────────────────────────────────────
 

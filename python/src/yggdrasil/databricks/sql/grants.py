@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses as dc
 import logging
+from abc import abstractmethod
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Union
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Grant",
     "Grants",
+    "GrantsMixin",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -388,3 +390,108 @@ class Grants(DatabricksService):
             full_name=full_name,
             changes=list(changes or ()) or None,
         )
+
+
+class GrantsMixin:
+    """Convenience mix-in adding Unity Catalog grant management to a securable.
+
+    Implementers must provide :meth:`_grants_securable_type` and
+    :meth:`_grants_full_name`.  ``self.client`` must resolve to a
+    :class:`DatabricksClient` (already true for :class:`DatabricksResource`
+    subclasses and :class:`VolumePath`).
+    """
+
+    @abstractmethod
+    def _grants_securable_type(self) -> SecurableType:
+        """Return the :class:`SecurableType` for this securable."""
+
+    @abstractmethod
+    def _grants_full_name(self) -> str:
+        """Return the dotted full name to address this securable in the API."""
+
+    @property
+    def grants_service(self) -> "Grants":
+        """A :class:`Grants` service bound to this securable's client."""
+        return Grants(client=self.client)
+
+    def grants(
+        self,
+        principal: str | None = None,
+        *,
+        effective: bool = False,
+    ) -> Iterator[Grant]:
+        """Iterate grants on this securable, optionally filtered by principal.
+
+        Args:
+            principal: Restrict to a single principal (user, group, or service principal).
+            effective: When ``True``, return effective (inherited) permissions.
+        """
+        return self.grants_service.list(
+            securable_type=self._grants_securable_type(),
+            full_name=self._grants_full_name(),
+            principal=principal,
+            effective=effective,
+        )
+
+    def grant(
+        self,
+        principal: str,
+        privileges: Sequence[Privilege | str],
+    ) -> Grant:
+        """Add ``privileges`` for ``principal`` and return the resulting :class:`Grant`."""
+        return self.grants_service.create(
+            securable_type=self._grants_securable_type(),
+            full_name=self._grants_full_name(),
+            principal=principal,
+            privileges=privileges,
+        )
+
+    def revoke(
+        self,
+        principal: str,
+        privileges: Sequence[Privilege | str],
+    ) -> Grant | None:
+        """Remove ``privileges`` from ``principal``.
+
+        Returns the remaining :class:`Grant` for ``principal``, or ``None`` if
+        no privileges remain.
+        """
+        principal = _check_principal(principal)
+        self.grants_service.update(
+            securable_type=self._grants_securable_type(),
+            full_name=self._grants_full_name(),
+            changes=[
+                PermissionsChange(
+                    principal=principal,
+                    remove=_check_privileges(privileges),
+                )
+            ],
+        )
+        return self.grants_service.get(
+            securable_type=self._grants_securable_type(),
+            full_name=self._grants_full_name(),
+            principal=principal,
+            effective=False,
+            raise_error=False,
+        )
+
+    def set_grants(
+        self,
+        principal: str,
+        privileges: Sequence[Privilege | str],
+    ) -> Grant:
+        """Replace ``principal``'s privileges so they exactly match ``privileges``."""
+        principal = _check_principal(principal)
+
+        existing = self.grants_service.get(
+            securable_type=self._grants_securable_type(),
+            full_name=self._grants_full_name(),
+            principal=principal,
+            effective=False,
+            raise_error=False,
+        )
+
+        if existing is None:
+            return self.grant(principal=principal, privileges=privileges)
+
+        return existing.replace(privileges)

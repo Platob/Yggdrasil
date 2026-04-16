@@ -28,10 +28,11 @@ from typing import Any, Optional, Union, TYPE_CHECKING, Mapping, Iterable
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
+    DataSourceFormat,
+    SecurableType,
     TableInfo,
     TableOperation,
     TableType,
-    DataSourceFormat,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
 
@@ -46,6 +47,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
 from .column import Column
+from .grants import GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
     _build_table_constraints_sql,
@@ -86,7 +88,7 @@ INFOS_TTL: float = 300.0
 # ===========================================================================
 
 @dataclass
-class Table(DatabricksResource):
+class Table(DatabricksResource, GrantsMixin):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
     catalog_name: str = "default"
@@ -939,6 +941,20 @@ class Table(DatabricksResource):
             table=self,
             operation=operation,
         )
+
+    # =========================================================================
+    # Grants — Unity Catalog REST API helpers
+    # =========================================================================
+
+    def _grants_securable_type(self) -> SecurableType:
+        return SecurableType.TABLE
+
+    def _grants_full_name(self) -> str:
+        return self.full_name()
+
+    # =========================================================================
+    # Permissions — SQL DDL helpers
+    # =========================================================================
 
     def add_permissions(
         self,
