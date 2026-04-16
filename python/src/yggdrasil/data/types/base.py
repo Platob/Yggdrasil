@@ -74,6 +74,13 @@ __all__ = [
 
 _NONE_TYPE = type(None)
 
+_FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
+    ("pyarrow", "from_arrow"),
+    ("polars", "from_polars"),
+    ("pandas", "from_pandas"),
+    ("pyspark", "from_spark"),
+)
+
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
     return (
@@ -136,9 +143,6 @@ def _literal_values_to_hint(values: tuple[object, ...]) -> object:
 
 class DataType(BaseChildrenFields, ABC):
     _singleton_instance: ClassVar["DataType | None"] = None
-
-    def __repr__(self):
-        return self.to_arrow().__repr__()
 
     def __str__(self):
         return self.to_arrow().__str__()
@@ -265,13 +269,26 @@ class DataType(BaseChildrenFields, ABC):
         return inst
 
     @classmethod
+    def _any_subclass_handles(cls, dtype: Any, handler: str, label: str) -> bool:
+        subclasses = cls.__subclasses__()
+        if not subclasses:
+            raise TypeError(f"Unsupported {label} data type: {dtype!r}")
+        return any(getattr(sub, handler)(dtype) for sub in subclasses)
+
+    @staticmethod
+    def _target_nullable(options: "CastOptions") -> bool:
+        return options.target_field.nullable if options.target_field is not None else True
+
+    @staticmethod
+    def _matches_dict(value: dict[str, Any], type_id: DataTypeId, *aliases: str) -> bool:
+        if value.get("id") == int(type_id):
+            return True
+        name = str(value.get("name", "")).upper()
+        return name == type_id.name or name in aliases
+
+    @classmethod
     def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_arrow_type(dtype):
-                    return True
-            return False
-        raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+        return cls._any_subclass_handles(dtype, "handles_arrow_type", "Arrow")
 
     @abstractmethod
     def to_arrow(self) -> pa.DataType:
@@ -279,12 +296,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_polars_type(dtype):
-                    return True
-            return False
-        raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+        return cls._any_subclass_handles(dtype, "handles_polars_type", "Polars")
 
     @abstractmethod
     def to_polars(self) -> "polars.DataType":
@@ -292,12 +304,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_spark_type(dtype):
-                    return True
-            return False
-        raise TypeError(f"Unsupported Spark data type: {dtype!r}")
+        return cls._any_subclass_handles(dtype, "handles_spark_type", "Spark")
 
     @abstractmethod
     def to_spark(self) -> Any:
@@ -628,20 +635,7 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ) -> "polars.Series | polars.Expr":
-        opts = (
-            get_cast_options_class().check(options, **more_options).check_source(series)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return series
-
-        pl = get_polars()
-
-        if isinstance(series, pl.Expr):
-            return self._cast_polars_expr(series, opts)
-        return self._cast_polars_series(series, opts)
+        return self.cast_polars_series(series, options, **more_options)
 
     def _cast_polars_series(
         self,
@@ -658,14 +652,7 @@ class DataType(BaseChildrenFields, ABC):
             )
             casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
 
-        return self.fill_polars_array_nulls(
-            casted,
-            nullable=(
-                options.target_field.nullable
-                if options.target_field is not None
-                else True
-            ),
-        )
+        return self.fill_polars_array_nulls(casted, nullable=self._target_nullable(options))
 
     def _cast_polars_expr(
         self,
@@ -673,14 +660,7 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions",
     ):
         casted = expr.cast(dtype=self.to_polars(), strict=options.safe)
-        return self.fill_polars_array_nulls(
-            casted,
-            nullable=(
-                options.target_field.nullable
-                if options.target_field is not None
-                else True
-            ),
-        )
+        return self.fill_polars_array_nulls(casted, nullable=self._target_nullable(options))
 
     def cast_polars_tabular(
         self,
@@ -733,14 +713,7 @@ class DataType(BaseChildrenFields, ABC):
             out.index = series.index
             out.name = series.name
 
-        return self.fill_pandas_series_nulls(
-            out,
-            nullable=(
-                options.target_field.nullable
-                if options.target_field is not None
-                else True
-            ),
-        )
+        return self.fill_pandas_series_nulls(out, nullable=self._target_nullable(options))
 
     def cast_pandas_tabular(
         self,
@@ -807,14 +780,7 @@ class DataType(BaseChildrenFields, ABC):
         options.check_source(column)
 
         casted = column.cast(self.to_spark())
-        return self.fill_spark_column_nulls(
-            casted,
-            nullable=(
-                options.target_field.nullable
-                if options.target_field is not None
-                else True
-            ),
-        )
+        return self.fill_spark_column_nulls(casted, nullable=self._target_nullable(options))
 
     def cast_spark_tabular(
         self,
@@ -849,14 +815,9 @@ class DataType(BaseChildrenFields, ABC):
 
         ns, _ = ObjectSerde.module_and_name(value)
 
-        if ns.startswith("pyarrow"):
-            return cls.from_arrow(value)
-        elif ns.startswith("polars"):
-            return cls.from_polars(value)
-        elif ns.startswith("pandas"):
-            return cls.from_pandas(value)
-        elif ns.startswith("pyspark"):
-            return cls.from_spark(value)
+        for prefix, method in _FROM_ANY_NS_DISPATCH:
+            if ns.startswith(prefix):
+                return getattr(cls, method)(value)
 
         if isinstance(value, Mapping):
             return cls.from_dict(value)
@@ -1251,10 +1212,9 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_arrow_type(cls, value: pa.DataType) -> "DataType":
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_arrow_type(value):
-                    return subclass.from_arrow_type(value)
+        for subclass in cls.__subclasses__():
+            if subclass.handles_arrow_type(value):
+                return subclass.from_arrow_type(value)
         raise TypeError(f"Unsupported Arrow data type: {value!r}")
 
     @classmethod
@@ -1297,10 +1257,9 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "DataType":
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_polars_type(dtype):
-                    return subclass.from_polars_type(dtype)
+        for subclass in cls.__subclasses__():
+            if subclass.handles_polars_type(dtype):
+                return subclass.from_polars_type(dtype)
         raise TypeError(f"Unsupported Polars data type: {dtype!r}")
 
     @classmethod
@@ -1391,10 +1350,9 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_spark_type(cls, value: "pst.DataType") -> "DataType":
-        if cls.__subclasses__():
-            for subclass in cls.__subclasses__():
-                if subclass.handles_spark_type(value):
-                    return subclass.from_spark_type(value)
+        for subclass in cls.__subclasses__():
+            if subclass.handles_spark_type(value):
+                return subclass.from_spark_type(value)
         raise ValueError(f"Unknown DataType payload: {value!r}")
 
     @classmethod

@@ -157,9 +157,8 @@ class MapType(NestedType):
     def from_polars_type(cls, dtype: "polars.List") -> "MapType":
         _f = cached_from_import("yggdrasil.data.data_field", "Field")
         StructType = cached_from_import("yggdrasil.data.types.nested", "StructType")
-        pl = get_polars()
 
-        if not isinstance(dtype, pl.List) or not isinstance(dtype.inner, pl.Struct):
+        if not cls.handles_polars_type(dtype):
             raise TypeError(f"Unsupported Polars data type: {dtype!r}")
 
         fields = [_f.from_polars(f) for f in dtype.inner.fields]
@@ -212,7 +211,7 @@ class MapType(NestedType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.MAP) or str(value.get("name", "")).upper() == "MAP"
+        return cls._matches_dict(value, DataTypeId.MAP)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "MapType":

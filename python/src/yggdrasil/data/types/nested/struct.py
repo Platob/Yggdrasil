@@ -115,7 +115,7 @@ class StructType(NestedType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.STRUCT) or str(value.get("name", "")).upper() == "STRUCT"
+        return cls._matches_dict(value, DataTypeId.STRUCT)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StructType":

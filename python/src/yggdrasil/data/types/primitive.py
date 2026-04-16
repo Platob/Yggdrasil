@@ -123,7 +123,7 @@ class NullType(PrimitiveType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.NULL) or str(value.get("name", "")).upper() == "NULL"
+        return cls._matches_dict(value, DataTypeId.NULL)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NullType":
@@ -242,7 +242,7 @@ class BinaryType(PrimitiveType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.BINARY) or str(value.get("name", "")).upper() == "BINARY"
+        return cls._matches_dict(value, DataTypeId.BINARY)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BinaryType":
@@ -365,7 +365,7 @@ class StringType(PrimitiveType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.STRING) or str(value.get("name", "")).upper() == "STRING"
+        return cls._matches_dict(value, DataTypeId.STRING)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StringType":
@@ -457,7 +457,7 @@ class BooleanType(PrimitiveType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.BOOL) or str(value.get("name", "")).upper() in {"BOOL", "BOOLEAN"}
+        return cls._matches_dict(value, DataTypeId.BOOL, "BOOLEAN")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BooleanType":
@@ -484,6 +484,12 @@ class BooleanType(PrimitiveType):
 @dataclass(frozen=True)
 class NumericType(PrimitiveType, ABC):
     pass
+
+
+_INT_ARROW_SIGNED = {1: pa.int8, 2: pa.int16, 4: pa.int32, 8: pa.int64}
+_INT_ARROW_UNSIGNED = {1: pa.uint8, 2: pa.uint16, 4: pa.uint32, 8: pa.uint64}
+_INT_DDL_SIGNED = {1: "BYTE", 2: "SHORT", 4: "INT", 8: "BIGINT"}
+_INT_DDL_UNSIGNED = {1: "SHORT", 2: "INT", 4: "BIGINT", 8: "DECIMAL(20, 0)"}
 
 
 @dataclass(frozen=True)
@@ -600,7 +606,7 @@ class IntegerType(NumericType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.INTEGER) or str(value.get("name", "")).upper() == "INTEGER"
+        return cls._matches_dict(value, DataTypeId.INTEGER)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "IntegerType":
@@ -609,70 +615,38 @@ class IntegerType(NumericType):
             signed=bool(value.get("signed", True)),
         )
 
+    @property
+    def _size(self) -> int:
+        return self.byte_size or 8
+
     def to_arrow(self) -> pa.DataType:
-        if self.signed:
-            return {
-                1: pa.int8(),
-                2: pa.int16(),
-                4: pa.int32(),
-                8: pa.int64(),
-            }[self.byte_size or 8]
-        return {
-            1: pa.uint8(),
-            2: pa.uint16(),
-            4: pa.uint32(),
-            8: pa.uint64(),
-        }[self.byte_size or 8]
+        mapping = _INT_ARROW_SIGNED if self.signed else _INT_ARROW_UNSIGNED
+        return mapping[self._size]()
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()
-        if self.signed:
-            return {
-                1: pl.Int8,
-                2: pl.Int16,
-                4: pl.Int32,
-                8: pl.Int64,
-            }[self.byte_size or 8]
-        return {
-            1: pl.UInt8,
-            2: pl.UInt16,
-            4: pl.UInt32,
-            8: pl.UInt64,
-        }[self.byte_size or 8]
+        signed = {1: pl.Int8, 2: pl.Int16, 4: pl.Int32, 8: pl.Int64}
+        unsigned = {1: pl.UInt8, 2: pl.UInt16, 4: pl.UInt32, 8: pl.UInt64}
+        return (signed if self.signed else unsigned)[self._size]
 
     def to_spark(self) -> Any:
         spark = get_spark_sql()
-        if not self.signed:
-            # Spark does not really support uints natively
-            return {
-                1: spark.types.ShortType(),
-                2: spark.types.IntegerType(),
-                4: spark.types.LongType(),
-                8: spark.types.DecimalType(20, 0),
-            }[self.byte_size or 8]
-
-        return {
-            1: spark.types.ByteType(),
-            2: spark.types.ShortType(),
-            4: spark.types.IntegerType(),
-            8: spark.types.LongType(),
-        }[self.byte_size or 8]
+        t = spark.types
+        if self.signed:
+            mapping = {1: t.ByteType, 2: t.ShortType, 4: t.IntegerType, 8: t.LongType}
+            return mapping[self._size]()
+        # Spark does not really support uints natively
+        unsigned_factories = {
+            1: t.ShortType,
+            2: t.IntegerType,
+            4: t.LongType,
+            8: lambda: t.DecimalType(20, 0),
+        }
+        return unsigned_factories[self._size]()
 
     def to_databricks_ddl(self) -> str:
-        if not self.signed:
-            return {
-                1: "SHORT",
-                2: "INT",
-                4: "BIGINT",
-                8: "DECIMAL(20, 0)",
-            }[self.byte_size or 8]
-
-        return {
-            1: "BYTE",
-            2: "SHORT",
-            4: "INT",
-            8: "BIGINT",
-        }[self.byte_size or 8]
+        mapping = _INT_DDL_SIGNED if self.signed else _INT_DDL_UNSIGNED
+        return mapping[self._size]
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0
@@ -752,41 +726,31 @@ class FloatingPointType(NumericType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.FLOAT) or str(value.get("name", "")).upper() == "FLOAT"
+        return cls._matches_dict(value, DataTypeId.FLOAT)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "FloatingPointType":
         return cls(byte_size=value.get("byte_size", 8))
 
+    @property
+    def _size(self) -> int:
+        return self.byte_size or 8
+
     def to_arrow(self) -> pa.DataType:
-        return {
-            2: pa.float16() if hasattr(pa, "float16") else pa.float32(),
-            4: pa.float32(),
-            8: pa.float64(),
-        }[self.byte_size or 8]
+        if self._size == 2:
+            return pa.float16() if hasattr(pa, "float16") else pa.float32()
+        return pa.float64() if self._size == 8 else pa.float32()
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()
-        return {
-            2: pl.Float32,
-            4: pl.Float32,
-            8: pl.Float64,
-        }.get(self.byte_size or 8, pl.Float64)
+        return pl.Float64 if self._size == 8 else pl.Float32
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
-        return {
-            2: spark.types.FloatType(),
-            4: spark.types.FloatType(),
-            8: spark.types.DoubleType(),
-        }.get(self.byte_size or 8, spark.types.DoubleType())
+        t = get_spark_sql().types
+        return t.DoubleType() if self._size == 8 else t.FloatType()
 
     def to_databricks_ddl(self) -> str:
-        return {
-            2: "FLOAT",
-            4: "FLOAT",
-            8: "DOUBLE",
-        }.get(self.byte_size or 8, "DOUBLE")
+        return "DOUBLE" if self._size == 8 else "FLOAT"
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0.0
@@ -884,7 +848,7 @@ class DecimalType(NumericType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.DECIMAL) or str(value.get("name", "")).upper() == "DECIMAL"
+        return cls._matches_dict(value, DataTypeId.DECIMAL)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DecimalType":
@@ -1026,7 +990,7 @@ class DateType(TemporalType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.DATE) or str(value.get("name", "")).upper() == "DATE"
+        return cls._matches_dict(value, DataTypeId.DATE)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DateType":
@@ -1097,7 +1061,7 @@ class TimeType(TemporalType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.TIME) or str(value.get("name", "")).upper() == "TIME"
+        return cls._matches_dict(value, DataTypeId.TIME)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "TimeType":
@@ -1178,7 +1142,7 @@ class TimestampType(TemporalType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.TIMESTAMP) or str(value.get("name", "")).upper() == "TIMESTAMP"
+        return cls._matches_dict(value, DataTypeId.TIMESTAMP)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "TimestampType":
@@ -1254,7 +1218,7 @@ class DurationType(TemporalType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return value.get("id") == int(DataTypeId.DURATION) or str(value.get("name", "")).upper() == "DURATION"
+        return cls._matches_dict(value, DataTypeId.DURATION)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DurationType":
