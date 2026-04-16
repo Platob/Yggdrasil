@@ -520,6 +520,13 @@ class DataType(BaseChildrenFields, ABC):
                 target_cls = _EXTENSION_REGISTRY.get(ext_name)
                 if target_cls is not None:
                     return target_cls()
+
+            # Parser-level canonical names for known extension types.
+            parsed_name = (meta.name or "").lower()
+            if parsed_name in {"geography", "geo", "geozone", "geolocation"}:
+                from .extensions.geography import GeographyType
+                return GeographyType()
+
             return StringType()
 
         raise TypeError(f"Unsupported parsed data type: {parsed!r}")

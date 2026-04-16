@@ -1217,6 +1217,11 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "dictionary": ("dictionary", DataTypeId.DICTIONARY),
         "categorical": ("dictionary", DataTypeId.DICTIONARY),
 
+        "geography": ("geography", DataTypeId.EXTENSION),
+        "geo": ("geography", DataTypeId.EXTENSION),
+        "geozone": ("geography", DataTypeId.EXTENSION),
+        "geolocation": ("geography", DataTypeId.EXTENSION),
+
         "udd": ("udd", DataTypeId.EXTENSION),
         "user_defined": ("udd", DataTypeId.EXTENSION),
         "user_defined_datatype": ("udd", DataTypeId.EXTENSION),
