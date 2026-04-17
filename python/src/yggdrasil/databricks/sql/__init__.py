@@ -14,4 +14,6 @@ from .staging import StagingPath
 from .table import Table
 from .tables import Tables
 from .types import PrimaryKeySpec, ForeignKeySpec
+from .view import View
+from .views import Views
 from .warehouse import SQLWarehouse

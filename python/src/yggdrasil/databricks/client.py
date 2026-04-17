@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
     from .sql.tables import Tables
+    from .sql.views import Views
     from .sql.columns import Columns
     from .sql.catalogs import Catalogs
     from .sql.schemas import Schemas
@@ -808,6 +809,18 @@ class DatabricksClient(URLResource):
         )
 
     @property
+    def views(self) -> "Views":
+        """Collection-level Unity Catalog view service for this client."""
+        from .sql.views import Views
+
+        return self.lazy_property(
+            self,
+            cache_attr="_views",
+            factory=lambda: Views(client=self),
+            use_cache=True,
+        )
+
+    @property
     def columns(self) -> "Columns":
         """Collection-level Unity Catalog column service for this client."""
         from .sql.columns import Columns
@@ -1037,6 +1050,11 @@ class DatabricksService(ABC):
     def tables(self) -> "Tables":
         """Collection-level Unity Catalog table service (shorthand for ``client.tables``)."""
         return self.client.tables
+
+    @property
+    def views(self) -> "Views":
+        """Collection-level Unity Catalog view service (shorthand for ``client.views``)."""
+        return self.client.views
 
     @property
     def catalogs(self) -> "Catalogs":
