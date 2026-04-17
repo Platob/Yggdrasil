@@ -424,13 +424,7 @@ class SQLEngine(DatabricksService):
                 max_lifetime=3600,
             )
             staging.register_shutdown_cleanup()
-            staging.path.parent.mkdir(parents=True, exist_ok=True)
-
-            with BytesIO() as buffer:
-                mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
-                mio.write_table(value, options=ParquetOptions())
-                mio.buffer.seek(0)
-                staging.path.write_bytes(mio.buffer.memoryview())
+            staging.write_table(value)
 
             owned.append(staging)
             substitutions[alias] = _staging_parquet_ref(staging)
@@ -1102,17 +1096,17 @@ class SQLEngine(DatabricksService):
                 max_lifetime=3600,
             )
             staging.register_shutdown_cleanup()
+            staging.write_table(data, cast_options=cast_options)
             temp_volume_path = staging.path
         else:
             temp_volume_path = DatabricksPath.parse(obj=temp_volume_path, client=self.client)
+            temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
 
-        temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with BytesIO() as buffer:
-            mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
-            mio.write_table(data, options=ParquetOptions(cast=cast_options))
-            mio.buffer.seek(0)
-            temp_volume_path.write_bytes(mio.buffer.memoryview())
+            with BytesIO() as buffer:
+                mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
+                mio.write_table(data, options=ParquetOptions(cast=cast_options))
+                mio.buffer.seek(0)
+                temp_volume_path.write_bytes(mio.buffer.memoryview())
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
