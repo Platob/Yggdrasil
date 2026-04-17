@@ -42,6 +42,7 @@ import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union
 
 import pyarrow as pa
@@ -399,9 +400,21 @@ class MediaIO(ABC, Generic[O]):
     @classmethod
     def make(
         cls,
-        buffer: BytesIO,
-        media: MediaType | MimeType | str,
+        buffer: "BytesIO | str | Path | Any",
+        media: "MediaType | MimeType | str | None" = None,
     ) -> "MediaIO[MediaOptions]":
+        if not isinstance(buffer, BytesIO):
+            if media is None:
+                media = MediaType.parse(buffer, default=MediaType(MimeTypes.OCTET_STREAM))
+            buffer = BytesIO(buffer)
+
+        if media is None:
+            if buffer.media_type is None:
+                raise ValueError(
+                    "MediaIO.make requires a media type when the buffer has none set"
+                )
+            media = buffer.media_type
+
         media = MediaType.parse(media)
         mt = media.mime_type
         buffer.set_media_type(media, safe=False)

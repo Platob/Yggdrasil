@@ -133,6 +133,33 @@ class TestMediaIOMake:
         MediaIO.make(buf, MimeTypes.PARQUET)
         assert buf.media_type.mime_type is MimeTypes.PARQUET
 
+    def test_make_from_string_path_infers_media(self, tmp_path):
+        path = tmp_path / "sample.parquet"
+        path.write_bytes(_parquet_bytes())
+
+        mio = MediaIO.make(str(path))
+
+        assert isinstance(mio, ParquetIO)
+        assert mio.media_type.mime_type is MimeTypes.PARQUET
+        assert mio.read_arrow_table().equals(SAMPLE_TABLE)
+
+    def test_make_from_pathlib_path_infers_media(self, tmp_path):
+        path = tmp_path / "sample.csv"
+        path.write_bytes(b"a,b\n1,x\n2,y\n3,z\n")
+
+        mio = MediaIO.make(path)
+
+        assert isinstance(mio, CsvIO)
+        assert mio.media_type.mime_type is MimeTypes.CSV
+
+    def test_make_from_path_with_explicit_media(self, tmp_path):
+        path = tmp_path / "no_extension"
+        path.write_bytes(_parquet_bytes())
+
+        mio = MediaIO.make(path, MimeTypes.PARQUET)
+
+        assert isinstance(mio, ParquetIO)
+
 
 # ===================================================================
 # Codec helpers
