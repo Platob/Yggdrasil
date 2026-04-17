@@ -42,9 +42,6 @@ from .service import (
 from .statement import Statement
 from ..client import DatabricksResource
 
-# ``StatementResult`` is kept as an alias for :class:`Statement`.
-StatementResult = Statement
-
 __all__ = [
     "SQLWarehouse",
     "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
@@ -388,7 +385,7 @@ class SQLWarehouse(DatabricksResource):
         wait: WaitingConfigArg = True,
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
-    ) -> StatementResult:
+    ) -> Statement:
         """Execute a SQL statement on this (or another) warehouse.
 
         ``statement`` may be raw SQL or a :class:`Statement`.  When a

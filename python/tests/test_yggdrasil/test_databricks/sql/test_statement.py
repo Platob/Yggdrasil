@@ -177,11 +177,6 @@ def test_statement_result_alias_points_to_statement():
     assert StatementResult is Statement
 
 
-def test_statement_self_reference_via_statement_property():
-    stmt = Statement(text="SELECT 1")
-    assert stmt.statement is stmt
-
-
 def test_started_false_without_statement_id():
     stmt = Statement(text="SELECT 1")
     assert stmt.started is False

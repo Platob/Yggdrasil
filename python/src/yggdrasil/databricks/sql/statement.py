@@ -260,11 +260,6 @@ class Statement(BaseStatementResult, DatabricksService):
             self.statement_id,
         )
 
-    @property
-    def statement(self) -> "Statement":
-        """Back-compat alias: a started Statement *is* its own handler."""
-        return self
-
     # ------------------------------------------------------------------
     # State / status
     # ------------------------------------------------------------------
