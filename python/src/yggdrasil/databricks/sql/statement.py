@@ -87,6 +87,15 @@ class Statement:
             temporary_tables={**self.temporary_tables, **tables},
         )
 
+    def clear(self) -> "Statement":
+        """Return a new Statement with text and all bound arguments cleared."""
+        return replace(
+            self,
+            text="",
+            parameters={},
+            temporary_tables={},
+        )
+
     def to_parameter_list(self) -> Optional[List[StatementParameterListItem]]:
         """Render bound parameters as Databricks ``StatementParameterListItem``.
 
