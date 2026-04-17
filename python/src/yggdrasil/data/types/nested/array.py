@@ -9,6 +9,12 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.io import SaveMode
 
+from ._cast_json import (
+    cast_arrow_json_string_array,
+    cast_polars_json_string_expr,
+    cast_spark_json_string_column,
+    is_json_string_source,
+)
 from .base import DataType, NestedType
 
 if TYPE_CHECKING:
@@ -243,19 +249,24 @@ class ArrayType(NestedType):
         options.check_source(array)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or array.null_count == len(array):
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or array.null_count == len(array):
             return options.target_field.default_arrow_array(
                 size=len(array),
                 memory_pool=options.arrow_memory_pool,
             )
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif is_json_string_source(source_type_id):
+            return cast_arrow_json_string_array(array, options=options)
+
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_arrow_list_array(
                 array,
                 options=options,
             )
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif source_type_id == DataTypeId.MAP:
             return cast_arrow_map_array_to_list(
                 array,
                 options=options,
@@ -322,10 +333,15 @@ class ArrayType(NestedType):
     ) -> Any:
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL:
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
             return options.target_field.default_polars_expr(alias=options.target_field.name)
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif is_json_string_source(source_type_id):
+            return cast_polars_json_string_expr(expr, options)
+
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_polars_list_expr(expr, options)
 
         else:
@@ -342,13 +358,18 @@ class ArrayType(NestedType):
         options.check_source(series)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or series.isna().all():
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or series.isna().all():
             return options.target_field.default_pandas_series(size=len(series))
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif is_json_string_source(source_type_id):
+            return _cast_pandas_via_arrow(series, options, cast_arrow_json_string_array)
+
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_pandas_list_series(series, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif source_type_id == DataTypeId.MAP:
             return _cast_pandas_via_arrow(series, options, cast_arrow_map_array_to_list)
 
         else:
@@ -364,10 +385,15 @@ class ArrayType(NestedType):
         options.check_source(column)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL:
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
             return options.target_field.default_spark_column()
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif is_json_string_source(source_type_id):
+            return cast_spark_json_string_column(column, options)
+
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_spark_list_column(column, options)
 
         else:
@@ -582,7 +608,11 @@ def _cast_pandas_via_arrow(
     pd = get_pandas()
 
     source_arrow_type = options.source_field.dtype.to_arrow()
-    source_array = pa.array(series.tolist(), type=source_arrow_type)
+    source_array = pa.array(
+        series.tolist(),
+        type=source_arrow_type,
+        from_pandas=True,
+    )
     casted = caster(source_array, options)
 
     if isinstance(casted, pa.ChunkedArray):

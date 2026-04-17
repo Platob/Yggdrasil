@@ -583,12 +583,45 @@ class DataType(BaseChildrenFields, ABC):
                 f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}"
             ) from e
 
+    @staticmethod
+    def _nullify_empty_arrow_strings(
+        array: pa.Array | pa.ChunkedArray,
+    ) -> pa.Array | pa.ChunkedArray:
+        dtype = array.type
+        if (
+            pa.types.is_string(dtype)
+            or pa.types.is_large_string(dtype)
+            or pa.types.is_string_view(dtype)
+        ):
+            empty = pa.scalar("", type=dtype)
+        elif (
+            pa.types.is_binary(dtype)
+            or pa.types.is_large_binary(dtype)
+            or pa.types.is_binary_view(dtype)
+        ):
+            empty = pa.scalar(b"", type=dtype)
+        else:
+            return array
+
+        null_scalar = pa.scalar(None, type=dtype)
+
+        if isinstance(array, pa.ChunkedArray):
+            chunks = [
+                pc.if_else(pc.equal(chunk, empty), null_scalar, chunk)
+                for chunk in array.chunks
+            ]
+            return pa.chunked_array(chunks, type=dtype)
+
+        return pc.if_else(pc.equal(array, empty), null_scalar, array)
+
     def _cast_arrow_array(
         self,
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.Array:
         options = options.check_source(array)
+
+        array = self._nullify_empty_arrow_strings(array)
 
         casted = pc.cast(
             array,
@@ -625,9 +658,26 @@ class DataType(BaseChildrenFields, ABC):
 
         pl = get_polars()
 
+        series = self._nullify_empty_polars_strings(series)
+
         if isinstance(series, pl.Expr):
             return self._cast_polars_expr(series, opts)
         return self._cast_polars_series(series, opts)
+
+    @staticmethod
+    def _nullify_empty_polars_strings(
+        series: "polars.Series | polars.Expr",
+    ) -> "polars.Series | polars.Expr":
+        pl = get_polars()
+
+        if not isinstance(series, pl.Series):
+            return series
+
+        if series.dtype != pl.String and series.dtype != pl.Binary:
+            return series
+
+        arr = DataType._nullify_empty_arrow_strings(series.to_arrow())
+        return pl.Series(name=series.name, values=arr, dtype=series.dtype)
 
     def cast_polars_expr(
         self,
@@ -779,8 +829,28 @@ class DataType(BaseChildrenFields, ABC):
     ):
         options.check_source(column)
 
+        column = self._nullify_empty_spark_strings(column, options)
+
         casted = column.cast(self.to_spark())
         return self.fill_spark_column_nulls(casted, nullable=self._target_nullable(options))
+
+    @staticmethod
+    def _nullify_empty_spark_strings(
+        column: "ps.Column",
+        options: "CastOptions",
+    ) -> "ps.Column":
+        source_field = options.source_field
+        if source_field is None:
+            return column
+
+        source_type_id = source_field.dtype.type_id
+        if source_type_id not in (DataTypeId.STRING, DataTypeId.BINARY):
+            return column
+
+        spark = get_spark_sql()
+        F = spark.functions
+        empty = F.lit("") if source_type_id == DataTypeId.STRING else F.lit(b"")
+        return F.when(column == empty, F.lit(None)).otherwise(column)
 
     def cast_spark_tabular(
         self,

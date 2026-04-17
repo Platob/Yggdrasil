@@ -13,6 +13,12 @@ from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.io import SaveMode
+from ._cast_json import (
+    cast_arrow_json_string_array,
+    cast_polars_json_string_expr,
+    cast_spark_json_string_column,
+    is_json_string_source,
+)
 from .array import ArrayType
 
 if TYPE_CHECKING:
@@ -238,25 +244,30 @@ class MapType(NestedType):
         options.check_source(array)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or array.null_count == len(array):
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or array.null_count == len(array):
             return options.target_field.default_arrow_array(
                 size=len(array),
                 memory_pool=options.arrow_memory_pool,
             )
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif is_json_string_source(source_type_id):
+            return cast_arrow_json_string_array(array, options=options)
+
+        elif source_type_id == DataTypeId.MAP:
             return cast_arrow_map_array(
                 array,
                 options=options,
             )
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_arrow_list_array_to_map(
                 array,
                 options=options,
             )
 
-        elif options.source_field.dtype.type_id == DataTypeId.STRUCT:
+        elif source_type_id == DataTypeId.STRUCT:
             return cast_arrow_struct_array_to_map(
                 array,
                 options=options,
@@ -280,8 +291,23 @@ class MapType(NestedType):
         options.check_source(series)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or series.null_count() == len(series):
             return options.target_field.default_polars_series(size=len(series))
+
+        if is_json_string_source(source_type_id):
+            # polars represents a Map as List<Struct<key, value>>, which
+            # ``str.json_decode`` can only populate from a JSON *list* of
+            # entries — not a plain JSON object.  Roundtrip via Arrow so
+            # ``{"a":1,"b":2}`` shaped input still decodes correctly.
+            arrow_input = series.to_arrow()
+            arrow_output = cast_arrow_json_string_array(
+                arrow_input, options=options
+            )
+            return pl.from_arrow(arrow_output).rename(
+                options.target_field.name
+            )
 
         expr = self._cast_polars_expr(
             pl.col(series.name),
@@ -297,16 +323,25 @@ class MapType(NestedType):
     ) -> Any:
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL:
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
             return options.target_field.default_polars_expr(alias=options.target_field.name)
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif is_json_string_source(source_type_id):
+            # JSON object → Map needs materialisation (see _cast_polars_series)
+            raise TypeError(
+                f"Cannot cast {options.source_field} to {options.target_field} "
+                "as an expression; use cast_polars_series for a JSON map source."
+            )
+
+        elif source_type_id == DataTypeId.MAP:
             return cast_polars_map_expr(expr, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_polars_list_expr_to_map(expr, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.STRUCT:
+        elif source_type_id == DataTypeId.STRUCT:
             return cast_polars_struct_expr_to_map(expr, options)
 
         else:
@@ -322,16 +357,21 @@ class MapType(NestedType):
         options.check_source(series)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or series.isna().all():
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or series.isna().all():
             return options.target_field.default_pandas_series(size=len(series))
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif is_json_string_source(source_type_id):
+            return _cast_pandas_via_arrow(series, options, cast_arrow_json_string_array)
+
+        elif source_type_id == DataTypeId.MAP:
             return cast_pandas_map_series(series, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_pandas_list_series_to_map(series, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.STRUCT:
+        elif source_type_id == DataTypeId.STRUCT:
             return cast_pandas_struct_series_to_map(series, options)
 
         else:
@@ -347,16 +387,21 @@ class MapType(NestedType):
         options.check_source(column)
         options.check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL:
+        source_type_id = options.source_field.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
             return options.target_field.default_spark_column()
 
-        elif options.source_field.dtype.type_id == DataTypeId.MAP:
+        elif is_json_string_source(source_type_id):
+            return cast_spark_json_string_column(column, options)
+
+        elif source_type_id == DataTypeId.MAP:
             return cast_spark_map_column(column, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.ARRAY:
+        elif source_type_id == DataTypeId.ARRAY:
             return cast_spark_list_column_to_map(column, options)
 
-        elif options.source_field.dtype.type_id == DataTypeId.STRUCT:
+        elif source_type_id == DataTypeId.STRUCT:
             return cast_spark_struct_column_to_map(column, options)
 
         else:
@@ -419,7 +464,11 @@ def _cast_pandas_via_arrow(
     pd = get_pandas()
 
     source_arrow_type = options.source_field.dtype.to_arrow()
-    source_array = pa.array(series.tolist(), type=source_arrow_type)
+    source_array = pa.array(
+        series.tolist(),
+        type=source_arrow_type,
+        from_pandas=True,
+    )
     casted = caster(source_array, options)
 
     if isinstance(casted, pa.ChunkedArray):
