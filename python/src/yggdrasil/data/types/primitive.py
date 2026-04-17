@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql.types as pst
     from ..data_field import Field
+    from yggdrasil.data.cast.options import CastOptions
 
 
 __all__ = [
@@ -33,6 +34,111 @@ __all__ = [
     "TimestampType",
     "DurationType",
 ]
+
+
+def _json_encode_helpers():
+    from .nested._cast_json import (
+        cast_arrow_json_encode_array,
+        cast_polars_json_encode_series,
+        cast_spark_json_encode_column,
+        is_json_nested_source,
+    )
+
+    return (
+        cast_arrow_json_encode_array,
+        cast_polars_json_encode_series,
+        cast_spark_json_encode_column,
+        is_json_nested_source,
+    )
+
+
+class _JsonEncodeTargetMixin:
+    """Mixin providing nested→string/binary cast via JSON serialisation.
+
+    Used by ``StringType`` and ``BinaryType`` whose arrow cast path
+    otherwise raises ``ArrowNotImplementedError`` when fed a
+    list/struct/map source.
+    """
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        options = options.check_source(array)
+
+        (
+            cast_arrow_json_encode_array,
+            _,
+            _,
+            is_json_nested_source,
+        ) = _json_encode_helpers()
+
+        if is_json_nested_source(options.source_field.dtype.type_id):
+            return cast_arrow_json_encode_array(array, options)
+
+        return super()._cast_arrow_array(array, options)
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        options.check_source(series)
+
+        (
+            _,
+            cast_polars_json_encode_series,
+            _,
+            is_json_nested_source,
+        ) = _json_encode_helpers()
+
+        if is_json_nested_source(options.source_field.dtype.type_id):
+            return cast_polars_json_encode_series(series, options)
+
+        return super()._cast_polars_series(series, options)
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ):
+        (
+            _,
+            _,
+            _,
+            is_json_nested_source,
+        ) = _json_encode_helpers()
+
+        if options.source_field is not None and is_json_nested_source(
+            options.source_field.dtype.type_id
+        ):
+            raise TypeError(
+                f"Cannot cast {options.source_field} to {options.target_field} "
+                "as an expression; use cast_polars_series for a JSON-encoded "
+                "nested source."
+            )
+
+        return super()._cast_polars_expr(expr, options)
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ):
+        options.check_source(column)
+
+        (
+            _,
+            _,
+            cast_spark_json_encode_column,
+            is_json_nested_source,
+        ) = _json_encode_helpers()
+
+        if is_json_nested_source(options.source_field.dtype.type_id):
+            return cast_spark_json_encode_column(column, options)
+
+        return super()._cast_spark_column(column, options)
 
 
 @dataclass(frozen=True)
@@ -148,7 +254,7 @@ class NullType(PrimitiveType):
 
 
 @dataclass(frozen=True)
-class BinaryType(PrimitiveType):
+class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
     large: bool = False
     view: bool = False
 
@@ -277,7 +383,7 @@ class BinaryType(PrimitiveType):
 
 
 @dataclass(frozen=True)
-class StringType(PrimitiveType):
+class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     large: bool = False
     view: bool = False
 
