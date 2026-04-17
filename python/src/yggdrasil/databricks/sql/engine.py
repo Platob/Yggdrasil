@@ -875,6 +875,7 @@ class SQLEngine(DatabricksService):
             dict,
             list,
             str,
+            Statement,
             "pandas.DataFrame",
             "polars.DataFrame",
             "pyspark.sql.DataFrame",
@@ -966,6 +967,24 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
+        if isinstance(data, Statement):
+            return self.sql_insert_into(
+                data,
+                mode=mode,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
+                raise_error=raise_error,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                table=table,
+            )
+
         if spark_session is None:
             if hasattr(data, "sparkSession"):
                 spark_session = data.sparkSession
@@ -1110,6 +1129,24 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
+        if isinstance(data, Statement):
+            return self.sql_insert_into(
+                data,
+                mode=mode,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
+                raise_error=raise_error,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                table=table,
+            )
+
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
@@ -1287,6 +1324,164 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
         return None
 
+    def sql_insert_into(
+        self,
+        statement: "Statement | str",
+        *,
+        mode: SaveMode | str | None = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        match_by: Optional[list[str]] = None,
+        update_cols: Optional[list[str]] = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        zorder_by: Optional[list[str]] = None,
+        optimize_after_merge: bool = False,
+        vacuum_hours: int | None = None,
+        table: Optional[Table] = None,
+    ) -> None:
+        """Insert into a Delta table directly from a SQL query.
+
+        No data is read by the client: the query runs on the warehouse and
+        its output is written into the target table with
+        ``INSERT INTO ... SELECT``, ``MERGE INTO ... USING (<query>)``,
+        or ``DELETE`` + ``INSERT`` depending on ``mode`` and ``match_by``.
+
+        The target table must already exist; its column list drives the
+        target columns and the projection over the source subquery.
+        """
+        prepared = Statement.prepare(statement)
+        mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
+        table = Table.parse(
+            obj=location if table is None else table,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            service=self.tables,
+        )
+
+        if mode == SaveMode.OVERWRITE:
+            table.delete(wait=True, raise_error=False)
+
+        if not table.exists:
+            raise ValueError(
+                "sql_insert_into requires the target table to exist; "
+                f"{table.full_name()!r} was not found."
+            )
+
+        location = table.full_name(safe=True)
+        columns = list(table.data_schema.field_names())
+        cols_quoted = ", ".join(quote_ident(c) for c in columns)
+        src_cols = ", ".join(f"src.{quote_ident(c)}" for c in columns)
+        source_sql = f"(\n{prepared.text}\n)"
+
+        logger.debug("Inserting query into %s", location)
+
+        statements: list["Statement | str"] = []
+
+        if mode == SaveMode.TRUNCATE:
+            insert_sql = (
+                f"INSERT INTO {location} ({cols_quoted})\n"
+                f"SELECT {src_cols} FROM {source_sql} AS src"
+            )
+            if match_by:
+                key_cols = ", ".join(quote_ident(k) for k in match_by)
+                on_condition = _build_match_condition(
+                    match_by,
+                    left_alias="T",
+                    right_alias="S",
+                    null_safe=True,
+                )
+                delete_sql = (
+                    f"DELETE FROM {location} AS T\n"
+                    f"USING (\nSELECT DISTINCT {key_cols} FROM {source_sql} AS src\n) AS S\n"
+                    f"ON {on_condition}"
+                )
+                statements.extend([
+                    replace(prepared, text=delete_sql),
+                    replace(prepared, text=insert_sql),
+                ])
+            else:
+                statements.append(f"TRUNCATE TABLE {location}")
+                statements.append(replace(prepared, text=insert_sql))
+
+        elif match_by and mode != SaveMode.OVERWRITE:
+            on_condition = _build_match_condition(
+                match_by,
+                left_alias="T",
+                right_alias="S",
+                null_safe=True,
+            )
+            insert_clause = (
+                f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+            )
+
+            if mode == SaveMode.APPEND:
+                merge_sql = (
+                    f"MERGE INTO {location} AS T\n"
+                    f"USING {source_sql} AS S\n"
+                    f"ON {on_condition}\n"
+                    f"{insert_clause}"
+                )
+                statements.append(replace(prepared, text=merge_sql))
+            else:
+                update_cols_effective = (
+                    update_cols
+                    if update_cols is not None
+                    else [c for c in columns if c not in match_by]
+                )
+                update_clause = ""
+                if update_cols_effective:
+                    update_set = ", ".join(
+                        f"T.{quote_ident(c)} = S.{quote_ident(c)}"
+                        for c in update_cols_effective
+                    )
+                    update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
+
+                merge_sql = (
+                    f"MERGE INTO {location} AS T\n"
+                    f"USING {source_sql} AS S\n"
+                    f"ON {on_condition}\n"
+                    f"{update_clause}\n"
+                    f"{insert_clause}"
+                )
+                statements.append(replace(prepared, text=merge_sql))
+
+        else:
+            insert_sql = (
+                f"INSERT INTO {location} ({cols_quoted})\n"
+                f"SELECT {src_cols} FROM {source_sql} AS src"
+            )
+            statements.append(replace(prepared, text=insert_sql))
+
+        if statements:
+            if len(statements) == 1:
+                self.execute(statements[0], wait=wait, raise_error=raise_error)
+            else:
+                for stmt in statements[:-1]:
+                    self.execute(stmt, wait=True, raise_error=raise_error)
+                self.execute(statements[-1], wait=wait, raise_error=raise_error)
+
+        logger.info("SQL inserted into %s", location)
+
+        if zorder_by:
+            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
+            self.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
+
+        if optimize_after_merge and match_by:
+            self.execute(f"OPTIMIZE {location}")
+
+        if vacuum_hours is not None:
+            self.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
+
+        return None
+
     def spark_insert_into(
         self,
         data: Any,
@@ -1378,6 +1573,23 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
+        if isinstance(data, Statement):
+            return self.sql_insert_into(
+                data,
+                mode=mode,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                table=table,
+            )
+
         from yggdrasil.spark.cast import any_to_spark_dataframe
         import pyspark.sql.functions as F
 
