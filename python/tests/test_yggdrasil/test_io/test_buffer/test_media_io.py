@@ -1156,3 +1156,120 @@ class TestSaveModeViaConvenienceMethods:
         mio.write_pandas_frame(pd.DataFrame({"x": [2]}), options=ParquetOptions(mode="append"))
         result = mio.read_pandas_frame()
         assert list(result["x"]) == [1, 2]
+
+
+# ===================================================================
+# Safe ingestion of unstructured list/generator records
+# ===================================================================
+
+class TestWriteTableUnstructured:
+    """Cover ``write_table`` with sparse dicts, all-None rows, and generators."""
+
+    def test_list_with_all_none_column(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table([{"id": None}])
+        table = mio.read_arrow_table()
+        assert table.num_rows == 1
+        assert table.column_names == ["id"]
+        assert table.to_pydict() == {"id": [None]}
+
+    def test_list_with_sparse_keys_keeps_all_columns(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table([{"a": 1}, {"b": "x"}, {"c": True}])
+        table = mio.read_arrow_table()
+        assert set(table.column_names) == {"a", "b", "c"}
+        assert table.num_rows == 3
+        assert table.to_pydict() == {
+            "a": [1, None, None],
+            "b": [None, "x", None],
+            "c": [None, None, True],
+        }
+
+    def test_list_with_none_row_is_tolerated(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table([{"id": 1}, None, {"id": 3}])
+        rows = mio.read_pylist()
+        assert rows == [{"id": 1}, {"id": None}, {"id": 3}]
+
+    def test_list_rejects_non_dict_elements(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        with pytest.raises(TypeError, match="write_table\\(list\\) expects list\\[dict\\]"):
+            mio.write_table([{"a": 1}, "not-a-dict"])
+
+    def test_generator_with_sparse_keys(self):
+        def gen():
+            yield {"id": 1}
+            yield {"id": None, "name": "alpha"}
+            yield {"extra": True}
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table(gen())
+        rows = mio.read_pylist()
+        assert rows == [
+            {"id": 1, "name": None, "extra": None},
+            {"id": None, "name": "alpha", "extra": None},
+            {"id": None, "name": None, "extra": True},
+        ]
+
+    def test_generator_with_all_none_column_roundtrips_via_json(self):
+        def gen():
+            yield {"id": None}
+            yield {"id": None}
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.JSON)
+        mio.write_table(gen())
+        rows = mio.read_pylist()
+        assert rows == [{"id": None}, {"id": None}]
+
+    def test_empty_list_writes_empty_table(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table([])
+        table = mio.read_arrow_table()
+        assert table.num_rows == 0
+
+    def test_empty_generator_writes_empty_table(self):
+        def gen():
+            if False:
+                yield {}
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table(gen())
+        table = mio.read_arrow_table()
+        assert table.num_rows == 0
+
+    def test_write_pylist_accepts_generator(self):
+        def gen():
+            yield {"id": 1}
+            yield {"id": 2, "name": "bob"}
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_pylist(gen())
+        rows = mio.read_pylist()
+        assert rows == [
+            {"id": 1, "name": None},
+            {"id": 2, "name": "bob"},
+        ]
+
+    def test_append_via_generator_with_sparse_keys(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_table([{"a": 1}])
+        mio.write_table(
+            iter([{"a": 2}, {"b": "x"}]),
+            options=ParquetOptions(mode="append"),
+        )
+        rows = mio.read_pylist()
+        assert rows == [
+            {"a": 1, "b": None},
+            {"a": 2, "b": None},
+            {"a": None, "b": "x"},
+        ]
