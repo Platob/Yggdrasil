@@ -40,6 +40,35 @@ class Statement:
     parameters: Mapping[str, Any] = field(default_factory=dict)
     temporary_tables: Mapping[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def prepare(
+        cls,
+        statement: "Statement | str",
+        *,
+        parameters: Mapping[str, Any] | None = None,
+        temporary_tables: Mapping[str, Any] | None = None,
+    ) -> "Statement":
+        """Coerce ``statement`` into a :class:`Statement`, merging extra args.
+
+        When ``statement`` is already a :class:`Statement`, any additional
+        ``parameters`` or ``temporary_tables`` are merged on top of its
+        existing values.  When it is a string, a new instance is built from
+        the supplied arguments.
+        """
+        if isinstance(statement, cls):
+            prepared = statement
+            if parameters:
+                prepared = prepared.bind(**parameters)
+            if temporary_tables:
+                prepared = prepared.with_temporary_tables(**temporary_tables)
+            return prepared
+
+        return cls(
+            text=str(statement),
+            parameters=dict(parameters) if parameters else {},
+            temporary_tables=dict(temporary_tables) if temporary_tables else {},
+        )
+
     def bind(self, **parameters: Any) -> "Statement":
         """Return a new Statement with additional named parameters bound."""
         if not parameters:

@@ -116,6 +116,7 @@ from .grants import Grants
 from .schemas import Schemas
 from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
+from .statement import Statement
 from .statement_result import StatementResult
 from .table import Table
 from .tables import Tables
@@ -611,7 +612,7 @@ class SQLEngine(DatabricksService):
 
     def execute(
         self,
-        statement: str,
+        statement: "str | Statement",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -625,6 +626,7 @@ class SQLEngine(DatabricksService):
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+        parameters: Mapping[str, Any] | None = None,
     ) -> StatementResult:
         """
         Execute a SQL statement through Spark or the Databricks SQL API.
@@ -643,7 +645,10 @@ class SQLEngine(DatabricksService):
 
         Args:
             statement:
-                SQL text to execute.
+                SQL text to execute, or a :class:`Statement` carrying both
+                the text and its bound arguments.  Strings are coerced via
+                :meth:`Statement.prepare` together with any ``parameters``
+                or ``temporary_tables`` passed to this call.
             row_limit:
                 Optional row limit. Applied through `limit()` on Spark results
                 or forwarded to the SQL API.
@@ -674,7 +679,12 @@ class SQLEngine(DatabricksService):
                 clause. Tabular values are materialized to a fresh staging
                 path via Parquet. Engine-owned staging paths are attached to
                 the returned ``StatementResult`` and cleaned up lazily once
-                it reaches a terminal state.
+                it reaches a terminal state.  Merged on top of any temporary
+                tables already carried by ``statement``.
+            parameters:
+                Optional named parameters bound to ``:name`` placeholders in
+                the query text.  Merged on top of any parameters already
+                carried by ``statement``.
 
         Returns:
             A `StatementResult` wrapping either a Spark result or a warehouse API
@@ -685,14 +695,21 @@ class SQLEngine(DatabricksService):
                 If Spark execution is requested and no SparkSession can be
                 resolved.
         """
+        prepared = Statement.prepare(
+            statement,
+            parameters=parameters,
+            temporary_tables=temporary_tables,
+        )
+
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
 
         substitutions, owned_staging = self._stage_temporary_tables(
-            temporary_tables,
+            prepared.temporary_tables,
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
+        statement = prepared.text
         if substitutions:
             statement = _apply_temporary_table_aliases(statement, substitutions)
 
@@ -767,6 +784,7 @@ class SQLEngine(DatabricksService):
                 wait=wait,
                 raise_error=raise_error,
                 row_limit=row_limit,
+                parameters=prepared.to_parameter_list(),
             )
 
         if owned_staging:
