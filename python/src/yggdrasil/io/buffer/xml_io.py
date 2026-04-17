@@ -249,6 +249,28 @@ class XmlIO(MediaIO[XmlOptions]):
 
         yield batch
 
+    def _collect_arrow_schema(self) -> "pa.Schema":
+        """Return the XML schema by inferring from only the first row element."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        options = self.check_options(options=None)
+
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+            records = self._load_xml_records(options=options)
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
+
+        if not records:
+            return pa.schema([])
+        return pa.RecordBatch.from_pylist(records[:1]).schema
+
     def _value_to_xml(
         self,
         parent: ET.Element,

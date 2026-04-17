@@ -11,6 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
+import pyarrow as pa
+import pyarrow.ipc as ipc
+
 from .media_io import MediaIO
 from .media_options import MediaOptions
 
@@ -79,8 +82,6 @@ class IPCIO(MediaIO[IPCOptions]):
             yield batch
             return
 
-        import pyarrow as pa
-
         table = pa.Table.from_batches([batch]).select(options.columns)
         yield from table.to_batches()
 
@@ -93,9 +94,6 @@ class IPCIO(MediaIO[IPCOptions]):
 
         Tries the *file* layout first; falls back to *stream*.
         """
-        import pyarrow as pa
-        import pyarrow.ipc as ipc
-
         if self.buffer.size <= 0:
             return
 
@@ -114,6 +112,30 @@ class IPCIO(MediaIO[IPCOptions]):
         finally:
             arrow_io.close()
 
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the IPC schema by reading only the file/stream header."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+            arrow_io = self.buffer.to_arrow_io("r")
+            try:
+                try:
+                    return ipc.open_file(arrow_io).schema
+                except (pa.ArrowInvalid, pa.ArrowIOError):
+                    arrow_io.seek(0)
+                    return ipc.open_stream(arrow_io).schema
+            finally:
+                arrow_io.close()
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
+
     def _write_arrow_batches(
         self,
         *,
@@ -122,8 +144,6 @@ class IPCIO(MediaIO[IPCOptions]):
         options: IPCOptions,
     ) -> None:
         """Write record batches as IPC into the (uncompressed) buffer."""
-        import pyarrow.ipc as ipc
-
         arrow_io = self.buffer.to_arrow_io("w")
         try:
             write_options = ipc.IpcWriteOptions(

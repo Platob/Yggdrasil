@@ -21,6 +21,8 @@ import json as _json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
 
+import pyarrow as pa
+
 import yggdrasil.pickle.json as json_mod
 from yggdrasil.io.enums import SaveMode
 from .media_io import MediaIO
@@ -128,8 +130,6 @@ class JsonIO(MediaIO[JsonOptions]):
         * ``[1, 2, 3]`` → one batch with a ``"value"`` column.
         * ``{…}`` (single object) → one batch with one row.
         """
-        import pyarrow as pa
-
         records = self._load_json_records(options)
         if not records:
             return
@@ -143,6 +143,28 @@ class JsonIO(MediaIO[JsonOptions]):
 
         yield batch
 
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the JSON schema by inferring types from only the first record."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        options = self.check_options(options=None)
+
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+            records = self._load_json_records(options)
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
+
+        if not records:
+            return pa.schema([])
+        return pa.RecordBatch.from_pylist(records[:1]).schema
+
     def _write_arrow_batches(
         self,
         *,
@@ -155,8 +177,6 @@ class JsonIO(MediaIO[JsonOptions]):
         Collects all rows and serialises as a single ``[{…}, …]`` list
         for compact, optimised output.
         """
-        import pyarrow as pa
-
         all_batches = list(batches)
         if not all_batches:
             records: list[dict] = []

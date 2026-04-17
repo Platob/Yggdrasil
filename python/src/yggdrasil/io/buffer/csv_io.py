@@ -17,6 +17,9 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence
 
+import pyarrow as pa
+import pyarrow.csv as csv_pa
+
 from yggdrasil.io.enums import MimeTypes
 
 from .media_io import MediaIO
@@ -272,8 +275,6 @@ class CsvIO(MediaIO[CsvOptions]):
 
     def _read_options(self, *, options: CsvOptions, has_header: bool):
         """Build :mod:`pyarrow.csv` read options."""
-        import pyarrow.csv as csv_pa
-
         return csv_pa.ReadOptions(
             use_threads=options.use_threads,
             skip_rows=options.skip_rows,
@@ -283,8 +284,6 @@ class CsvIO(MediaIO[CsvOptions]):
 
     def _parse_options(self, *, options: CsvOptions, delimiter: str):
         """Build :mod:`pyarrow.csv` parse options."""
-        import pyarrow.csv as csv_pa
-
         quote_char = options.quote_char if options.quote_char is not None else False
         escape_char = options.escape_char if options.escape_char is not None else False
 
@@ -297,8 +296,6 @@ class CsvIO(MediaIO[CsvOptions]):
 
     def _convert_options(self, *, options: CsvOptions):
         """Build :mod:`pyarrow.csv` convert options with Arrow inference enabled."""
-        import pyarrow.csv as csv_pa
-
         return csv_pa.ConvertOptions(
             strings_can_be_null=options.strings_can_be_null,
             quoted_strings_can_be_null=options.quoted_strings_can_be_null,
@@ -314,9 +311,6 @@ class CsvIO(MediaIO[CsvOptions]):
         options: CsvOptions,
     ) -> Iterator["pyarrow.RecordBatch"]:
         """Yield record batches from the CSV / TSV buffer."""
-        import pyarrow as pa
-        import pyarrow.csv as csv_pa
-
         if self.buffer.size <= 0:
             return
 
@@ -341,6 +335,44 @@ class CsvIO(MediaIO[CsvOptions]):
 
         yield from pa.Table.from_batches(table.to_batches()).to_batches()
 
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the CSV schema by opening a streaming reader (header only)."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        options = self.check_options(options=None)
+        delimiter = self._infer_delimiter(options=options)
+        has_header = self._infer_has_header(options=options, delimiter=delimiter)
+
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+            arrow_io = self.buffer.to_arrow_io("r")
+            try:
+                reader = csv_pa.open_csv(
+                    arrow_io,
+                    read_options=self._read_options(options=options, has_header=has_header),
+                    parse_options=self._parse_options(options=options, delimiter=delimiter),
+                    convert_options=self._convert_options(options=options),
+                )
+                try:
+                    schema = reader.schema
+                finally:
+                    reader.close()
+                if options.columns is not None:
+                    schema = pa.schema(
+                        [schema.field(name) for name in options.columns if name in schema.names]
+                    )
+                return schema
+            finally:
+                arrow_io.close()
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
+
     def _write_arrow_batches(
         self,
         *,
@@ -349,9 +381,6 @@ class CsvIO(MediaIO[CsvOptions]):
         options: CsvOptions,
     ) -> None:
         """Write record batches as CSV / TSV into the buffer."""
-        import pyarrow as pa
-        import pyarrow.csv as csv_pa
-
         delimiter = self._infer_delimiter(options=options)
         table = pa.Table.from_batches(list(batches), schema=schema)
 

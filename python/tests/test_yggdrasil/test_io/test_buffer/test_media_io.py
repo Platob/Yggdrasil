@@ -1273,3 +1273,140 @@ class TestWriteTableUnstructured:
             {"a": 2, "b": None},
             {"a": None, "b": "x"},
         ]
+
+
+# ===================================================================
+# collect_schema() — cheap schema inspection across formats
+# ===================================================================
+
+class TestCollectSchema:
+    """Verify that ``collect_schema`` returns the expected yggdrasil Schema
+    without collecting all data."""
+
+    @pytest.mark.parametrize(
+        "mime",
+        [
+            MimeTypes.PARQUET,
+            MimeTypes.ARROW_IPC,
+            MimeTypes.JSON,
+            MimeTypes.CSV,
+            MimeTypes.XML,
+            MimeTypes.ZIP,
+        ],
+    )
+    def test_returns_yggdrasil_schema(self, mime):
+        from yggdrasil.data.schema import Schema
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mime)
+        mio.write_arrow_table(SAMPLE_TABLE)
+
+        schema = mio.collect_schema()
+        assert isinstance(schema, Schema)
+        assert list(schema.keys()) == ["a", "b"]
+
+    @pytest.mark.parametrize(
+        "mime",
+        [
+            MimeTypes.PARQUET,
+            MimeTypes.ARROW_IPC,
+            MimeTypes.JSON,
+            MimeTypes.CSV,
+            MimeTypes.XML,
+            MimeTypes.ZIP,
+        ],
+    )
+    def test_empty_buffer_returns_empty_schema(self, mime):
+        from yggdrasil.data.schema import Schema
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mime)
+        schema = mio.collect_schema()
+        assert isinstance(schema, Schema)
+        assert list(schema.keys()) == []
+
+    def test_parquet_schema_types_match(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        arrow_schema = mio.collect_schema().to_arrow_schema()
+        assert arrow_schema.names == ["a", "b"]
+        assert arrow_schema.field("a").type == pa.int64()
+        assert arrow_schema.field("b").type == pa.string()
+
+    def test_ipc_schema_types_match(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.ARROW_IPC)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        arrow_schema = mio.collect_schema().to_arrow_schema()
+        assert arrow_schema.names == ["a", "b"]
+        assert arrow_schema.field("a").type == pa.int64()
+
+    def test_parquet_does_not_decode_row_groups(self, monkeypatch):
+        """ParquetIO.collect_schema must read the footer only (no iter_batches)."""
+        import pyarrow.parquet as pq
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_arrow_table(SAMPLE_TABLE)
+
+        real_iter_batches = pq.ParquetFile.iter_batches
+        calls = {"count": 0}
+
+        def spy(self, *args, **kwargs):
+            calls["count"] += 1
+            return real_iter_batches(self, *args, **kwargs)
+
+        monkeypatch.setattr(pq.ParquetFile, "iter_batches", spy)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b"]
+        assert calls["count"] == 0
+
+    def test_json_large_array_returns_schema(self):
+        """JsonIO.collect_schema returns the schema inferred from the first
+        record even for large arrays."""
+        records = [{"a": i, "b": f"v{i}"} for i in range(10_000)]
+        buf = BytesIO(json.dumps(records).encode("utf-8"))
+        mio = MediaIO.make(buf, MimeTypes.JSON)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b"]
+
+    def test_parquet_with_column_projection_not_used(self):
+        """collect_schema returns the full schema regardless of options.columns."""
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b"]
+
+    def test_gzip_parquet_roundtrip(self):
+        mt = MediaType(MimeTypes.PARQUET, codec=GZIP)
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mt)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b"]
+
+    def test_gzip_json_roundtrip(self):
+        mt = MediaType(MimeTypes.JSON, codec=GZIP)
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mt)
+        mio.write_arrow_table(SAMPLE_TABLE)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b"]
+
+    def test_csv_header_only_path(self):
+        buf = BytesIO(b"a,b,c\n1,2,3\n")
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["a", "b", "c"]
+
+    def test_zip_reads_first_member_schema(self):
+        raw_zip = _zip_bytes({
+            "a.parquet": _parquet_bytes(pa.table({"x": [1]})),
+            "b.parquet": _parquet_bytes(pa.table({"y": ["z"]})),
+        })
+        buf = BytesIO(raw_zip)
+        mio = MediaIO.make(buf, MimeTypes.ZIP)
+        schema = mio.collect_schema()
+        assert list(schema.keys()) == ["x"]
