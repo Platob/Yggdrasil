@@ -509,6 +509,28 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     def from_arrow(cls, obj):
         return Field.from_arrow(obj).to_schema()
 
+    @classmethod
+    def from_path(
+        cls,
+        path: Any,
+        *,
+        media: Any = None,
+        path_io: Any = None,
+    ) -> "Schema":
+        from yggdrasil.io.buffer.path_io import PathIO
+
+        if isinstance(path, PathIO):
+            resolved = path
+        elif isinstance(path_io, PathIO):
+            resolved = path_io
+        else:
+            factory = path_io
+            if factory is None:
+                from yggdrasil.io.buffer.local_path_io import LocalPathIO
+                factory = LocalPathIO
+            resolved = factory.make(path, media=media)
+        return resolved.collect_schema()
+
     def to_field(self) -> Field:
         return Field(
             name=self.name,

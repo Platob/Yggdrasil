@@ -603,3 +603,65 @@ def test_ordered_dict_input_is_preserved():
     s = Schema(inner_fields=inner)
 
     assert list(s.keys()) == ["a", "b", "c"]
+
+
+def test_schema_from_path_discovers_fields_and_metadata(tmp_path):
+    import pyarrow.parquet as pq
+
+    arrow_schema = pa.schema(
+        [
+            pa.field("x", pa.int64(), metadata={b"comment": b"the x"}),
+            pa.field("s", pa.string()),
+        ],
+        metadata={b"author": b"ygg"},
+    )
+    table = pa.table({"x": [1, 2, 3], "s": ["a", "b", "c"]}, schema=arrow_schema)
+    path = tmp_path / "data.parquet"
+    pq.write_table(table, path)
+
+    out = Schema.from_path(path)
+
+    assert [f.name for f in out.fields] == ["x", "s"]
+    assert out["x"].arrow_type == pa.int64()
+    assert out["s"].arrow_type == pa.string()
+    assert out.metadata == {b"author": b"ygg"}
+    assert out["x"].metadata == {b"comment": b"the x"}
+
+
+def test_schema_from_path_accepts_path_io_instance(tmp_path):
+    import pyarrow.parquet as pq
+    from yggdrasil.io.buffer.local_path_io import LocalPathIO
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"x": [1, 2]}), path)
+
+    out = Schema.from_path(LocalPathIO.make(path))
+
+    assert [f.name for f in out.fields] == ["x"]
+
+
+def test_schema_from_path_accepts_path_io_factory(tmp_path):
+    import pyarrow.parquet as pq
+    from yggdrasil.io.buffer.local_path_io import LocalPathIO
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"x": [1, 2]}), path)
+
+    out = Schema.from_path(path, path_io=LocalPathIO)
+
+    assert [f.name for f in out.fields] == ["x"]
+
+
+def test_field_from_path_returns_struct_field(tmp_path):
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(
+        pa.table({"x": [1, 2], "s": ["a", "b"]}),
+        path,
+    )
+
+    out = Field.from_path(path)
+
+    assert isinstance(out.dtype, StructType)
+    assert [f.name for f in out.dtype.fields] == ["x", "s"]

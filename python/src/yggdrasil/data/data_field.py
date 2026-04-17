@@ -771,6 +771,20 @@ class Field(BaseMetadata, BaseChildrenFields):
             metadata=_strip_internal_metadata(value.metadata),
         )
 
+    @classmethod
+    def from_path(
+        cls,
+        path: Any,
+        *,
+        media: Any = None,
+        path_io: Any = None,
+    ) -> "Field":
+        from .schema import Schema
+
+        return Schema.from_path(
+            path, media=media, path_io=path_io
+        ).to_field()
+
     def to_arrow(self):
         return self.to_arrow_field()
 
