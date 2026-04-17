@@ -6,11 +6,14 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.environ import shutdown as yg_shutdown
 
 from ..fs.path import DatabricksPath
+
+if TYPE_CHECKING:
+    from yggdrasil.data.cast import CastOptions
 
 __all__ = ["StagingPath"]
 
@@ -115,6 +118,44 @@ class StagingPath:
                 root,
                 exc_info=True,
             )
+
+    def write_table(
+        self,
+        data: Any,
+        *,
+        cast_options: Optional["CastOptions"] = None,
+    ) -> "StagingPath":
+        """Serialize ``data`` to Parquet and upload it to this staging path.
+
+        Ensures the parent directory exists, converts ``data`` through
+        :class:`yggdrasil.io.buffer.media_io.MediaIO` using Parquet, and
+        writes the resulting bytes to ``self.path``.
+
+        Args:
+            data:
+                Any tabular input supported by ``MediaIO.write_table``.
+            cast_options:
+                Optional :class:`CastOptions` forwarded to the Parquet writer.
+
+        Returns:
+            ``self`` so calls can be chained.
+        """
+        from yggdrasil.io import BytesIO
+        from yggdrasil.io.buffer.media_io import MediaIO
+        from yggdrasil.io.buffer.parquet_io import ParquetOptions
+        from yggdrasil.io.enums.media_type import MediaTypes
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        options = ParquetOptions(cast=cast_options) if cast_options else ParquetOptions()
+
+        with BytesIO() as buffer:
+            mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
+            mio.write_table(data, options=options)
+            mio.buffer.seek(0)
+            self.path.write_bytes(mio.buffer.memoryview())
+
+        return self
 
     @classmethod
     def for_table(
