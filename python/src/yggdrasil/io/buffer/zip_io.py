@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional
 
+import pyarrow as pa
+
 from yggdrasil.io.enums import MediaType, MimeTypes, SaveMode
 
 from .bytes_io import BytesIO
@@ -289,6 +291,35 @@ class ZipIO(MediaIO[ZipOptions]):
             )
             yield from table.to_batches()
 
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the schema of the first selected ZIP member."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        options = self.check_options(options=None)
+
+        member_schema: pa.Schema | None = None
+        for _info, inner_buf in self.iter_members(options=options):
+            member_schema = inner_buf.media_io()._collect_arrow_schema()
+            break
+
+        if member_schema is None:
+            return pa.schema([])
+
+        if options.read_member_infos:
+            extra_fields: list[pa.Field] = []
+            for key, alias in options.read_member_infos:
+                if key == "name":
+                    extra_fields.append(pa.field(alias, pa.string(), nullable=False))
+                else:
+                    raise ValueError(
+                        f"ZipIO: unknown options.read_member_infos[{key!r}]. "
+                        "Must be in ('name',)"
+                    )
+            member_schema = pa.schema(list(member_schema) + extra_fields)
+
+        return member_schema
+
     def _write_arrow_batches(
         self,
         *,
@@ -297,8 +328,6 @@ class ZipIO(MediaIO[ZipOptions]):
         options: ZipOptions,
     ) -> None:
         """Serialise batches into a single ZIP member."""
-        import pyarrow as pa
-
         table = pa.Table.from_batches(list(batches), schema=schema)
         inner_media = self._pick_inner_media_for_write(options)
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Optional
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from .media_io import MediaIO
 from .media_options import MediaOptions
 
@@ -76,8 +79,6 @@ class ParquetIO(MediaIO[ParquetOptions]):
         if self.buffer.size <= 0:
             return
 
-        import pyarrow.parquet as pq
-
         arrow_io = self.buffer.to_arrow_io("r")
         try:
             pf = pq.ParquetFile(arrow_io)
@@ -89,6 +90,26 @@ class ParquetIO(MediaIO[ParquetOptions]):
         finally:
             arrow_io.close()
 
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the Parquet schema by reading only the file footer."""
+        if self.buffer.size <= 0:
+            return pa.schema([])
+
+        buf, decompressed = self._decompressed_buffer()
+        orig_buffer = self.buffer
+        try:
+            if decompressed:
+                self.buffer = buf
+            arrow_io = self.buffer.to_arrow_io("r")
+            try:
+                return pq.ParquetFile(arrow_io).schema_arrow
+            finally:
+                arrow_io.close()
+        finally:
+            if decompressed:
+                self.buffer = orig_buffer
+                buf.close()
+
     def _write_arrow_batches(
         self,
         *,
@@ -97,8 +118,6 @@ class ParquetIO(MediaIO[ParquetOptions]):
         options: ParquetOptions,
     ) -> None:
         """Write record batches as Parquet into the (uncompressed) buffer."""
-        import pyarrow.parquet as pq
-
         arrow_io = self.buffer.to_arrow_io("w")
         try:
             writer = pq.ParquetWriter(

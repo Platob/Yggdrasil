@@ -56,6 +56,8 @@ if TYPE_CHECKING:
     import polars
     import pyarrow
 
+    from yggdrasil.data.schema import Schema
+
 
 O = TypeVar("O", bound=MediaOptions)
 
@@ -267,6 +269,41 @@ class MediaIO(ABC, Generic[O]):
                 schema=schema,
                 options=options,
             )
+
+    # ------------------------------------------------------------------
+    # Schema inspection
+    # ------------------------------------------------------------------
+
+    def collect_schema(self) -> "Schema":
+        """Return the yggdrasil :class:`Schema` without collecting all data.
+
+        Delegates to :meth:`_collect_arrow_schema` to obtain the Arrow
+        schema through the most efficient path the concrete format offers
+        (Parquet footer, Arrow IPC header, CSV header row, first JSON
+        record, first ZIP member, …), then wraps it as a yggdrasil
+        :class:`~yggdrasil.data.schema.Schema`.
+        """
+        from yggdrasil.data.schema import Schema
+
+        return Schema.from_arrow(self._collect_arrow_schema())
+
+    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+        """Return the Arrow schema without collecting all data.
+
+        Default implementation consumes only the first record batch from
+        :meth:`read_arrow_batches`. Subclasses should override with a
+        metadata-only fast path when the format allows one.
+        """
+        iterator = self.read_arrow_batches()
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return pa.schema([])
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        return first.schema
 
     # ------------------------------------------------------------------
     # Abstract protocol
