@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
+from yggdrasil.data.data_field import Field
 from yggdrasil.data.types.base import DataType
-from yggdrasil.data.types.primitive import IntegerType
+from yggdrasil.data.types.primitive import BinaryType, IntegerType, StringType
 from yggdrasil.pandas.tests import PandasTestCase
 from yggdrasil.polars.tests import PolarsTestCase
 
@@ -54,6 +55,56 @@ class TestDataTypeArrow(_IntegerCastFillMixin, ArrowTestCase):
         self.assertEqual(out.type, pa.int64())
         self.assertEqual(out.to_pylist(), [1, 2, 3])
 
+    def test_cast_arrow_array_string_to_int_nullifies_empty(self):
+        pa = self.pa
+        arr = pa.array(["1", "2", "", "3", None], type=pa.string())
+
+        out = self.dtype.cast_arrow_array(arr)
+
+        self.assertEqual(out.type, pa.int64())
+        self.assertEqual(out.to_pylist(), [1, 2, None, 3, None])
+
+    def test_cast_arrow_array_binary_to_int_nullifies_empty(self):
+        pa = self.pa
+        arr = pa.array([b"1", b"2", b"", b"3", None], type=pa.binary())
+
+        out = self.dtype.cast_arrow_array(arr)
+
+        self.assertEqual(out.type, pa.int64())
+        self.assertEqual(out.to_pylist(), [1, 2, None, 3, None])
+
+    def test_cast_arrow_array_large_string_to_string_nullifies_empty(self):
+        pa = self.pa
+        arr = pa.array(["a", "", "b", None], type=pa.large_string())
+
+        out = StringType().cast_arrow_array(arr)
+
+        self.assertEqual(out.type, pa.string())
+        self.assertEqual(out.to_pylist(), ["a", None, "b", None])
+
+    def test_cast_arrow_chunked_array_string_to_int_nullifies_empty(self):
+        pa = self.pa
+        arr = pa.chunked_array(
+            [
+                pa.array(["1", "", "3"], type=pa.string()),
+                pa.array(["", "5", None], type=pa.string()),
+            ]
+        )
+
+        out = self.dtype.cast_arrow_array(arr)
+
+        self.assertEqual(out.type, pa.int64())
+        self.assertEqual(out.to_pylist(), [1, None, 3, None, 5, None])
+
+    def test_cast_arrow_array_non_string_source_untouched(self):
+        pa = self.pa
+        arr = pa.array([1.0, 0.0, 3.0], type=pa.float64())
+
+        out = self.dtype.cast_arrow_array(arr)
+
+        self.assertEqual(out.type, pa.int64())
+        self.assertEqual(out.to_pylist(), [1, 0, 3])
+
 
 class TestDataTypePandas(_IntegerCastFillMixin, PandasTestCase):
 
@@ -82,6 +133,16 @@ class TestDataTypePandas(_IntegerCastFillMixin, PandasTestCase):
         out = self.dtype.cast_pandas_series(series)
 
         self.assertEqual(out.name, "my_col")
+
+    def test_cast_pandas_series_string_to_int_nullifies_empty(self):
+        series = self.pd.Series(["1", "2", "", "3"], name="x")
+
+        out = self.dtype.cast_pandas_series(series)
+
+        self.assertEqual(out.name, "x")
+        self.assertEqual(out.tolist()[:2], [1, 2])
+        self.assertEqual(out.tolist()[3], 3)
+        self.assertTrue(self.pd.isna(out.iloc[2]))
 
 
 class TestDataTypePolars(_IntegerCastFillMixin, PolarsTestCase):
@@ -116,3 +177,23 @@ class TestDataTypePolars(_IntegerCastFillMixin, PolarsTestCase):
         out = self.dtype.cast_polars_series(series)
 
         self.assertEqual(out.name, "my_col")
+
+    def test_cast_polars_series_string_to_int_nullifies_empty(self):
+        target = Field(name="x", dtype=self.dtype, nullable=True)
+        series = self.pl.Series("x", ["1", "2", "", "3", None])
+
+        out = target.cast_polars_series(series)
+
+        self.assertEqual(out.to_list(), [1, 2, None, 3, None])
+        self.assertEqual(out.dtype, self.pl.Int64)
+
+    def test_cast_polars_series_binary_to_int_nullifies_empty(self):
+        target = Field(name="x", dtype=self.dtype, nullable=True)
+        series = self.pl.Series(
+            "x", [b"1", b"2", b"", b"3", None], dtype=self.pl.Binary
+        )
+
+        out = target.cast_polars_series(series)
+
+        self.assertEqual(out.to_list(), [1, 2, None, 3, None])
+        self.assertEqual(out.dtype, self.pl.Int64)
