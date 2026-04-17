@@ -1375,10 +1375,21 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             )
 
         location = table.full_name(safe=True)
-        columns = list(table.data_schema.field_names())
+        fields = list(table.data_schema.fields)
+        columns = [f.name for f in fields]
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
+        cast_projection = ", ".join(
+            (
+                f"CAST(raw_src.{quote_ident(f.name)} AS "
+                f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                f" AS {quote_ident(f.name)}"
+            )
+            for f in fields
+        )
         src_cols = ", ".join(f"src.{quote_ident(c)}" for c in columns)
-        source_sql = f"(\n{prepared.text}\n)"
+        source_sql = (
+            f"(\nSELECT {cast_projection} FROM (\n{prepared.text}\n) AS raw_src\n)"
+        )
 
         logger.debug("Inserting query into %s", location)
 
