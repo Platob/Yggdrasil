@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import pyarrow as pa
 from yggdrasil.data import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pandas
@@ -67,6 +70,18 @@ class StatementResult(ABC):
     _spark_df: Optional["pyspark.sql.DataFrame"] = field(
         init=False,
         default=None,
+        repr=False,
+        compare=False,
+    )
+    _temporary_tables: tuple[Any, ...] = field(
+        init=False,
+        default=(),
+        repr=False,
+        compare=False,
+    )
+    _temporary_tables_cleaned: bool = field(
+        init=False,
+        default=False,
         repr=False,
         compare=False,
     )
@@ -239,6 +254,7 @@ class StatementResult(ABC):
         if not wait:
             if raise_error:
                 self.raise_for_status()
+            self._maybe_cleanup_temporary_tables()
             return self
 
         iteration = 0
@@ -253,7 +269,53 @@ class StatementResult(ABC):
         if raise_error:
             self.raise_for_status()
 
+        self._maybe_cleanup_temporary_tables()
+
         return self
+
+    # -------------------------------------------------------------------------
+    # Temporary table cleanup
+    # -------------------------------------------------------------------------
+
+    def attach_temporary_tables(self, tables: Iterable[Any]) -> StatementResult:
+        """Attach temporary staging resources to be cleaned up when ``done``.
+
+        Each entry must expose ``cleanup(allow_not_found: bool = True)``.
+        Cleanup is best-effort and idempotent; it runs lazily the first time
+        the statement reaches a terminal state (see ``_maybe_cleanup_temporary_tables``).
+        """
+        items = tuple(tables)
+        if not items:
+            return self
+        object.__setattr__(
+            self,
+            "_temporary_tables",
+            tuple(self._temporary_tables) + items,
+        )
+        object.__setattr__(self, "_temporary_tables_cleaned", False)
+        return self
+
+    def _maybe_cleanup_temporary_tables(self) -> None:
+        if self._temporary_tables_cleaned or not self._temporary_tables:
+            return
+        try:
+            is_done = self.done
+        except Exception:
+            return
+        if not is_done:
+            return
+
+        for resource in self._temporary_tables:
+            try:
+                resource.cleanup(allow_not_found=True)
+            except Exception:
+                logger.debug(
+                    "Failed to cleanup temporary staging resource %r",
+                    resource,
+                    exc_info=True,
+                )
+        object.__setattr__(self, "_temporary_tables_cleaned", True)
+        object.__setattr__(self, "_temporary_tables", ())
 
     # -------------------------------------------------------------------------
     # Arrow contract

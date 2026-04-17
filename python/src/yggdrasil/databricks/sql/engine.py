@@ -153,6 +153,24 @@ def _build_match_condition(
     )
 
 
+def _staging_parquet_ref(path: StagingPath) -> str:
+    """Inline ``parquet.`<path>``` source clause for a staging path."""
+    return f"parquet.{quote_ident(str(path.path))}"
+
+
+def _apply_temporary_table_aliases(
+    statement: str,
+    substitutions: Mapping[str, str],
+) -> str:
+    """Replace ``{alias}`` occurrences in ``statement`` with staging references."""
+    if not substitutions:
+        return statement
+    rendered = statement
+    for alias, replacement in substitutions.items():
+        rendered = rendered.replace("{" + alias + "}", replacement)
+    return rendered
+
+
 @dataclass(frozen=True)
 class SQLEngine(DatabricksService):
     """
@@ -353,6 +371,72 @@ class SQLEngine(DatabricksService):
 
         return self.default_warehouse
 
+    def _stage_temporary_tables(
+        self,
+        temporary_tables: Mapping[str, Any] | None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+    ) -> tuple[Dict[str, str], list[StagingPath]]:
+        """Resolve ``temporary_tables`` into SQL substitutions and owned staging paths.
+
+        For each entry:
+
+        - If the value is already a :class:`StagingPath`, it is reused directly
+          and its path is substituted into the SQL. The engine does not take
+          ownership of pre-existing paths.
+        - Otherwise the value is treated as tabular data, written to a fresh
+          :class:`StagingPath` as Parquet, and the engine takes ownership of
+          the new staging path so it can be cleaned up lazily when the
+          resulting :class:`StatementResult` is done.
+
+        Returns:
+            A tuple ``(substitutions, owned_paths)`` where ``substitutions``
+            maps each alias to the ``parquet.`<path>``` SQL source clause and
+            ``owned_paths`` lists every staging path the engine created.
+        """
+        if not temporary_tables:
+            return {}, []
+
+        effective_catalog = catalog_name or self.catalog_name
+        effective_schema = schema_name or self.schema_name
+
+        substitutions: Dict[str, str] = {}
+        owned: list[StagingPath] = []
+
+        for alias, value in temporary_tables.items():
+            if isinstance(value, StagingPath):
+                substitutions[alias] = _staging_parquet_ref(value)
+                continue
+
+            if not effective_catalog or not effective_schema:
+                raise ValueError(
+                    "temporary_tables requires catalog_name and schema_name "
+                    "to be resolvable on the engine or provided explicitly; "
+                    f"cannot stage alias {alias!r}."
+                )
+
+            staging = StagingPath.for_table(
+                client=self.client,
+                catalog_name=effective_catalog,
+                schema_name=effective_schema,
+                table_name=alias,
+                max_lifetime=3600,
+            )
+            staging.register_shutdown_cleanup()
+            staging.path.parent.mkdir(parents=True, exist_ok=True)
+
+            with BytesIO() as buffer:
+                mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
+                mio.write_table(value, options=ParquetOptions())
+                mio.buffer.seek(0)
+                staging.path.write_bytes(mio.buffer.memoryview())
+
+            owned.append(staging)
+            substitutions[alias] = _staging_parquet_ref(staging)
+
+        return substitutions, owned
+
     def execute_many(
         self,
         statements: Iterable[str] | Mapping[str, str],
@@ -369,6 +453,7 @@ class SQLEngine(DatabricksService):
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
         parallel: bool = False,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementResultBatch:
         """
         Execute multiple SQL statements.
@@ -418,6 +503,14 @@ class SQLEngine(DatabricksService):
             parallel:
                 When ``True``, submit all statements without sequential dependency
                 waiting. Use only when statements are independent.
+            temporary_tables:
+                Optional mapping of alias → :class:`StagingPath` or tabular
+                data. Aliases referenced in statements as ``{alias}`` are
+                replaced with the corresponding ``parquet.`<path>``` source
+                clause. Tabular values are materialized to a fresh staging
+                path via Parquet. Engine-owned staging paths are attached to
+                every result in the batch and cleaned up lazily once those
+                results reach a terminal state.
 
         Returns:
             A :class:`StatementResultBatch` containing results in input order.
@@ -442,6 +535,18 @@ class SQLEngine(DatabricksService):
         if not items:
             raise ValueError("No non-empty SQL statements were provided.")
 
+        substitutions, owned_staging = self._stage_temporary_tables(
+            temporary_tables,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+
+        if substitutions:
+            items = OrderedDict(
+                (key, _apply_temporary_table_aliases(stmt, substitutions))
+                for key, stmt in items.items()
+            )
+
         results: OrderedDict[str, StatementResult] = OrderedDict()
 
         if parallel:
@@ -460,6 +565,10 @@ class SQLEngine(DatabricksService):
                     cache_for=cache_for,
                     spark_session=spark_session,
                 )
+
+            if owned_staging:
+                for result in results.values():
+                    result.attach_temporary_tables(owned_staging)
 
             return StatementResultBatch(results=results).wait(wait=wait, raise_error=raise_error)
 
@@ -497,6 +606,11 @@ class SQLEngine(DatabricksService):
             spark_session=spark_session,
         )
 
+        if owned_staging:
+            for result in results.values():
+                result.attach_temporary_tables(owned_staging)
+                result._maybe_cleanup_temporary_tables()
+
         batch = StatementResultBatch(results=results)
 
         return batch
@@ -516,6 +630,7 @@ class SQLEngine(DatabricksService):
         byte_limit: int | None = None,
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementResult:
         """
         Execute a SQL statement through Spark or the Databricks SQL API.
@@ -558,6 +673,14 @@ class SQLEngine(DatabricksService):
                 Optional TTL for statement result caching.
             spark_session:
                 Explicit SparkSession override.
+            temporary_tables:
+                Optional mapping of alias → :class:`StagingPath` or tabular
+                data. Aliases referenced in ``statement`` as ``{alias}`` are
+                replaced with the corresponding ``parquet.`<path>``` source
+                clause. Tabular values are materialized to a fresh staging
+                path via Parquet. Engine-owned staging paths are attached to
+                the returned ``StatementResult`` and cleaned up lazily once
+                it reaches a terminal state.
 
         Returns:
             A `StatementResult` wrapping either a Spark result or a warehouse API
@@ -570,6 +693,14 @@ class SQLEngine(DatabricksService):
         """
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
+
+        substitutions, owned_staging = self._stage_temporary_tables(
+            temporary_tables,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+        if substitutions:
+            statement = _apply_temporary_table_aliases(statement, substitutions)
 
         if not engine:
             spark_session = (
@@ -619,7 +750,13 @@ class SQLEngine(DatabricksService):
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
             )
-            result.persist(data=df)
+            if owned_staging:
+                # Spark is lazy; materialize to Arrow before the staging
+                # parquet files get cleaned up, otherwise the DataFrame
+                # would read from files that no longer exist.
+                result.persist(mode="arrow", data=df.toArrow())
+            else:
+                result.persist(data=df)
         else:
             wh = self.warehouse(
                 warehouse_id=warehouse_id,
@@ -637,6 +774,10 @@ class SQLEngine(DatabricksService):
                 raise_error=raise_error,
                 row_limit=row_limit,
             )
+
+        if owned_staging:
+            result.attach_temporary_tables(owned_staging)
+            result._maybe_cleanup_temporary_tables()
 
         if cache_for is not None:
             self._cached_queries.set(
