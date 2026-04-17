@@ -198,3 +198,73 @@ def test_start_is_idempotent_when_started():
     object.__setattr__(stmt, "statement_id", "abc123")
     # Should return self without submitting (warehouse arg is unused).
     assert stmt.start() is stmt
+
+
+def test_cancel_noop_when_not_started():
+    stmt = Statement(text="SELECT 1")
+    # Not started -> no client calls, returns self.
+    assert stmt.cancel() is stmt
+
+
+def test_cancel_noop_for_spark_statements():
+    stmt = Statement(text="SELECT 1")
+    object.__setattr__(stmt, "statement_id", "SparkSQL")
+    assert stmt.cancel() is stmt
+
+
+def test_cancel_noop_when_already_done():
+    from databricks.sdk.service.sql import (
+        StatementResponse,
+        StatementState,
+        StatementStatus,
+    )
+
+    stmt = Statement(text="SELECT 1")
+    object.__setattr__(stmt, "statement_id", "abc123")
+    object.__setattr__(
+        stmt,
+        "_response",
+        StatementResponse(
+            statement_id="abc123",
+            status=StatementStatus(state=StatementState.SUCCEEDED),
+        ),
+    )
+    assert stmt.cancel() is stmt
+
+
+def test_cancel_calls_sdk_when_running():
+    from unittest.mock import MagicMock
+
+    from databricks.sdk.service.sql import (
+        StatementResponse,
+        StatementState,
+        StatementStatus,
+    )
+
+    stmt = Statement(text="SELECT 1")
+    object.__setattr__(stmt, "statement_id", "abc123")
+    object.__setattr__(
+        stmt,
+        "_response",
+        StatementResponse(
+            statement_id="abc123",
+            status=StatementStatus(state=StatementState.RUNNING),
+        ),
+    )
+
+    # Stub the workspace client to record the cancel + get_statement calls.
+    ws = MagicMock()
+    ws.statement_execution.get_statement.return_value = StatementResponse(
+        statement_id="abc123",
+        status=StatementStatus(state=StatementState.CANCELED),
+    )
+
+    client = MagicMock()
+    client.workspace_client.return_value = ws
+    object.__setattr__(stmt, "client", client)
+
+    result = stmt.cancel()
+
+    assert result is stmt
+    ws.statement_execution.cancel_execution.assert_called_once_with(statement_id="abc123")
+    assert stmt._response.status.state == StatementState.CANCELED

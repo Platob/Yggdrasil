@@ -219,6 +219,26 @@ class Statement(BaseStatementResult, DatabricksService):
 
         return self
 
+    def cancel(self) -> "Statement":
+        """Cancel the running statement on Databricks.
+
+        No-op when the statement has not been started or has already
+        reached a terminal state.  After a successful cancellation the
+        cached response is refreshed so ``state``/``done``/``failed``
+        reflect the cancelled status.
+        """
+        if not self.started or self.statement_id == "SparkSQL":
+            return self
+        if self._response is not None and self._response.status.state in DONE_STATES:
+            return self
+
+        self.client.workspace_client().statement_execution.cancel_execution(
+            statement_id=self.statement_id,
+        )
+        object.__setattr__(self, "_response", None)
+        self.refresh_status()
+        return self
+
     # ------------------------------------------------------------------
     # Dunder / convenience
     # ------------------------------------------------------------------
