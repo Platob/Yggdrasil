@@ -39,6 +39,7 @@ from .service import (
     _jitter_sleep_seconds,
     safeEndpointInfo,
 )
+from .statement import Statement
 from .statement_result import StatementResult
 from ..client import DatabricksResource
 
@@ -369,7 +370,7 @@ class SQLWarehouse(DatabricksResource):
 
     def execute(
         self,
-        statement: str | None = None,
+        statement: "str | Statement | None" = None,
         *,
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
@@ -386,7 +387,16 @@ class SQLWarehouse(DatabricksResource):
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
     ) -> StatementResult:
-        """Execute a SQL statement on this (or another) warehouse."""
+        """Execute a SQL statement on this (or another) warehouse.
+
+        ``statement`` may be raw SQL or a :class:`Statement`.  When a
+        :class:`Statement` is supplied its parameters take precedence over
+        ``parameters``.
+        """
+        prepared = Statement.prepare(statement) if statement is not None else Statement(text="")
+        if parameters is None:
+            parameters = prepared.to_parameter_list()
+
         if format is None:
             format = Format.ARROW_STREAM
 
@@ -421,7 +431,7 @@ class SQLWarehouse(DatabricksResource):
 
         LOGGER.debug(
             "Executing SQL on warehouse %s (%s):\n%s",
-            instance.warehouse_name, resolved_wh_id, statement,
+            instance.warehouse_name, resolved_wh_id, prepared.text,
         )
 
         started_at = time.monotonic()
@@ -437,7 +447,7 @@ class SQLWarehouse(DatabricksResource):
         while True:
             try:
                 response = sdk_client.execute_statement(
-                    statement=statement,
+                    statement=prepared.text,
                     warehouse_id=resolved_wh_id,
                     byte_limit=byte_limit,
                     disposition=disposition,
@@ -487,6 +497,7 @@ class SQLWarehouse(DatabricksResource):
             warehouse_id=resolved_wh_id,
             statement_id=response.statement_id,
             disposition=disposition,
+            statement=prepared,
             _response=response,
         )
 

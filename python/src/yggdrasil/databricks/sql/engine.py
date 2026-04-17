@@ -744,9 +744,11 @@ class SQLEngine(DatabricksService):
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
-        statement = prepared.text
         if substitutions:
-            statement = _apply_temporary_table_aliases(statement, substitutions)
+            prepared = replace(
+                prepared,
+                text=_apply_temporary_table_aliases(prepared.text, substitutions),
+            )
 
         if not engine:
             spark_session = (
@@ -767,11 +769,11 @@ class SQLEngine(DatabricksService):
         if spark_session is not None:
             engine = "spark"
 
-        statement = statement.strip()
+        prepared = replace(prepared, text=prepared.text.strip())
 
         if cache_for is not None:
             cache_for = WaitingConfig.check_arg(cache_for)
-            existing = self._cached_queries.get(statement)
+            existing = self._cached_queries.get(prepared.text)
             if existing is not None:
                 return existing
 
@@ -786,7 +788,7 @@ class SQLEngine(DatabricksService):
                 else spark_session
             )
 
-            df = spark_session.sql(statement)
+            df = spark_session.sql(prepared.text)
             if row_limit:
                 df = df.limit(row_limit)
 
@@ -795,6 +797,7 @@ class SQLEngine(DatabricksService):
                 warehouse_id="SparkSQL",
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
+                statement=prepared,
             )
             if owned_staging:
                 # Spark is lazy; materialize to Arrow before the staging
@@ -810,7 +813,7 @@ class SQLEngine(DatabricksService):
             )
 
             result = wh.execute(
-                statement=statement,
+                statement=prepared,
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
                 byte_limit=byte_limit,
@@ -819,7 +822,6 @@ class SQLEngine(DatabricksService):
                 wait=wait,
                 raise_error=raise_error,
                 row_limit=row_limit,
-                parameters=prepared.to_parameter_list(),
             )
 
         if owned_staging:
@@ -828,7 +830,7 @@ class SQLEngine(DatabricksService):
 
         if cache_for is not None:
             self._cached_queries.set(
-                key=statement,
+                key=prepared.text,
                 value=result,
                 ttl=cache_for.timeout_total_seconds,
             )

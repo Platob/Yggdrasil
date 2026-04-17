@@ -29,6 +29,7 @@ from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
 
 from .exceptions import SQLError
+from .statement import Statement
 from ..client import DatabricksService
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class StatementResult(BaseStatementResult, DatabricksService):
     warehouse_id: str | None = None
     statement_id: str | None = None
     disposition: Optional[Disposition] = None
+    statement: Statement = field(default_factory=lambda: Statement(text=""))
 
     _response: Optional[StatementResponse] = field(default=None, repr=False, compare=False, hash=False)
 

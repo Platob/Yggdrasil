@@ -164,3 +164,29 @@ def test_statement_is_frozen():
     stmt = Statement(text="SELECT 1")
     with pytest.raises(Exception):
         stmt.text = "SELECT 2"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# StatementResult.statement property
+# ---------------------------------------------------------------------------
+
+
+def test_statement_result_defaults_to_empty_statement():
+    from yggdrasil.databricks.client import DatabricksClient
+    from yggdrasil.databricks.sql.statement_result import StatementResult
+
+    result = StatementResult(client=DatabricksClient.__new__(DatabricksClient))
+    assert isinstance(result.statement, Statement)
+    assert result.statement.text == ""
+
+
+def test_statement_result_carries_provided_statement():
+    from yggdrasil.databricks.client import DatabricksClient
+    from yggdrasil.databricks.sql.statement_result import StatementResult
+
+    stmt = Statement(text="SELECT 1", parameters={"x": 1})
+    result = StatementResult(
+        client=DatabricksClient.__new__(DatabricksClient),
+        statement=stmt,
+    )
+    assert result.statement is stmt
