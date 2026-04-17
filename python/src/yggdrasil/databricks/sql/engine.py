@@ -610,6 +610,25 @@ class SQLEngine(DatabricksService):
 
         return batch
 
+    def prepare(
+        self,
+        statement: "str | Statement",
+        *,
+        parameters: Mapping[str, Any] | None = None,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+    ) -> Statement:
+        """Build a :class:`Statement` from a string or existing ``Statement``.
+
+        Extra ``parameters`` and ``temporary_tables`` are merged on top of
+        any values carried by ``statement``.  The returned ``Statement`` can
+        be passed to :meth:`execute` later.
+        """
+        return Statement.prepare(
+            statement,
+            parameters=parameters,
+            temporary_tables=temporary_tables,
+        )
+
     def execute(
         self,
         statement: "str | Statement",
