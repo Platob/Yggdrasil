@@ -282,7 +282,7 @@ class MediaIO(ABC, Generic[O]):
     # Schema inspection
     # ------------------------------------------------------------------
 
-    def collect_schema(self) -> "Schema":
+    def collect_schema(self, full: bool = False) -> "Schema":
         """Return the yggdrasil :class:`Schema` without collecting all data.
 
         Delegates to :meth:`_collect_arrow_schema` to obtain the Arrow
@@ -290,18 +290,27 @@ class MediaIO(ABC, Generic[O]):
         (Parquet footer, Arrow IPC header, CSV header row, first JSON
         record, first ZIP member, …), then wraps it as a yggdrasil
         :class:`~yggdrasil.data.schema.Schema`.
+
+        When *full* is ``True``, container formats that expose multiple
+        inner payloads (:class:`~yggdrasil.io.buffer.zip_io.ZipIO`,
+        :class:`~yggdrasil.io.buffer.path_io.PathIO`) inspect every
+        member/file and return the unified schema instead of stopping at
+        the first one. Single-payload formats ignore the flag.
         """
         from yggdrasil.data.schema import Schema
 
-        return Schema.from_arrow(self._collect_arrow_schema())
+        return Schema.from_arrow(self._collect_arrow_schema(full=full))
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the Arrow schema without collecting all data.
 
         Default implementation consumes only the first record batch from
         :meth:`read_arrow_batches`. Subclasses should override with a
-        metadata-only fast path when the format allows one.
+        metadata-only fast path when the format allows one. The *full*
+        flag is accepted for API consistency; container subclasses use
+        it to inspect every member instead of just the first.
         """
+        del full
         iterator = self.read_arrow_batches()
         try:
             first = next(iterator)

@@ -1477,3 +1477,26 @@ class TestCollectSchema:
         mio = MediaIO.make(buf, MimeTypes.ZIP)
         schema = mio.collect_schema()
         assert list(schema.keys()) == ["x"]
+
+    def test_zip_full_unifies_all_member_schemas(self):
+        raw_zip = _zip_bytes({
+            "a.parquet": _parquet_bytes(pa.table({"x": [1]})),
+            "b.parquet": _parquet_bytes(pa.table({"y": ["z"]})),
+        })
+        buf = BytesIO(raw_zip)
+        mio = MediaIO.make(buf, MimeTypes.ZIP)
+        schema = mio.collect_schema(full=True)
+        assert set(schema.keys()) == {"x", "y"}
+
+    def test_pathio_full_unifies_all_file_schemas(self, tmp_path):
+        from yggdrasil.io.buffer.local_path_io import LocalPathIO
+
+        pq.write_table(pa.table({"x": [1]}), tmp_path / "a.parquet")
+        pq.write_table(pa.table({"y": ["z"]}), tmp_path / "b.parquet")
+
+        pio = LocalPathIO.make(tmp_path)
+        first_schema = pio.collect_schema()
+        assert len(first_schema.keys()) == 1
+
+        full_schema = pio.collect_schema(full=True)
+        assert set(full_schema.keys()) == {"x", "y"}

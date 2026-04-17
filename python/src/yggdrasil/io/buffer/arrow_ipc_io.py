@@ -112,8 +112,9 @@ class IPCIO(MediaIO[IPCOptions]):
         finally:
             arrow_io.close()
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the IPC schema by reading only the file/stream header."""
+        del full
         if self.buffer.size <= 0:
             return pa.schema([])
 

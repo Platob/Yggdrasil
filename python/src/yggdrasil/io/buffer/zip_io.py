@@ -291,20 +291,31 @@ class ZipIO(MediaIO[ZipOptions]):
             )
             yield from table.to_batches()
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
-        """Return the schema of the first selected ZIP member."""
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
+        """Return the schema of the first selected ZIP member.
+
+        When *full* is ``True``, inspect every selected member and return
+        the unified schema (union of fields across members).
+        """
         if self.buffer.size <= 0:
             return pa.schema([])
 
         options = self.check_options(options=None)
 
-        member_schema: pa.Schema | None = None
+        collected: list[pa.Schema] = []
         for _info, inner_buf in self.iter_members(options=options):
-            member_schema = inner_buf.media_io()._collect_arrow_schema()
-            break
+            collected.append(inner_buf.media_io()._collect_arrow_schema(full=full))
+            if not full:
+                break
 
-        if member_schema is None:
+        if not collected:
             return pa.schema([])
+
+        member_schema = (
+            pa.unify_schemas(collected, promote_options="default")
+            if len(collected) > 1
+            else collected[0]
+        )
 
         if options.read_member_infos:
             extra_fields: list[pa.Field] = []

@@ -335,8 +335,9 @@ class CsvIO(MediaIO[CsvOptions]):
 
         yield from pa.Table.from_batches(table.to_batches()).to_batches()
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the CSV schema by opening a streaming reader (header only)."""
+        del full
         if self.buffer.size <= 0:
             return pa.schema([])
 
