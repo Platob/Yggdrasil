@@ -160,6 +160,46 @@ class TestMediaIOMake:
 
         assert isinstance(mio, ParquetIO)
 
+    def test_write_table_from_string_path(self, tmp_path):
+        src = tmp_path / "src.parquet"
+        src.write_bytes(_parquet_bytes())
+
+        out_buf = BytesIO()
+        mio = MediaIO.make(out_buf, MimeTypes.PARQUET)
+        mio.write_table(str(src))
+
+        result = MediaIO.make(
+            BytesIO(out_buf.to_bytes()), MimeTypes.PARQUET
+        ).read_arrow_table()
+        assert result.equals(SAMPLE_TABLE)
+
+    def test_write_table_from_pathlib_path_across_formats(self, tmp_path):
+        src = tmp_path / "src.parquet"
+        src.write_bytes(_parquet_bytes())
+
+        out_buf = BytesIO()
+        mio = MediaIO.make(out_buf, MimeTypes.JSON)
+        mio.write_table(src)
+
+        result = MediaIO.make(
+            BytesIO(out_buf.to_bytes()), MimeTypes.JSON
+        ).read_arrow_table()
+        assert result.to_pylist() == SAMPLE_TABLE.to_pylist()
+
+    def test_write_table_from_directory_path(self, tmp_path):
+        dataset = tmp_path / "ds"
+        dataset.mkdir()
+        (dataset / "part.parquet").write_bytes(_parquet_bytes())
+
+        out_buf = BytesIO()
+        mio = MediaIO.make(out_buf, MimeTypes.PARQUET)
+        mio.write_table(dataset)
+
+        result = MediaIO.make(
+            BytesIO(out_buf.to_bytes()), MimeTypes.PARQUET
+        ).read_arrow_table()
+        assert result.equals(SAMPLE_TABLE)
+
 
 # ===================================================================
 # Codec helpers

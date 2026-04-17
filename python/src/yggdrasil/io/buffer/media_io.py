@@ -137,6 +137,13 @@ class MediaIO(ABC, Generic[O]):
         )
 
     @staticmethod
+    def _is_path_input(obj: Any) -> bool:
+        """Return True for ``str`` / ``Path`` / ``os.PathLike`` inputs."""
+        if isinstance(obj, (str, Path)):
+            return True
+        return hasattr(obj, "__fspath__")
+
+    @staticmethod
     def _peek_iterable(obj: Iterable[Any]) -> tuple[Any, Iterator[Any]]:
         """Return first item and a rebuilt iterator including that first item."""
         iterator = iter(obj)
@@ -477,6 +484,11 @@ class MediaIO(ABC, Generic[O]):
         - ``polars.DataFrame`` / ``polars.LazyFrame``
         - ``list[dict]`` or any ``Iterable[dict]`` (including generators)
         - ``dict[str, list]`` (column-oriented)
+        - ``str`` / :class:`pathlib.Path` / ``os.PathLike`` pointing to a
+          file or directory readable by
+          :class:`~yggdrasil.io.buffer.path_io.PathIO` — the source is
+          streamed through Arrow batches into this buffer, enabling
+          format conversion (e.g. Parquet → JSON).
 
         Unstructured record streams (heterogeneous or sparse keys, all-``None``
         values, e.g. ``[{"id": None}]`` or ``[{"a": 1}, {"b": "x"}]``) are
@@ -484,6 +496,16 @@ class MediaIO(ABC, Generic[O]):
         entries are backfilled with ``None`` so no columns are silently
         dropped.
         """
+        if self._is_path_input(obj):
+            from .local_path_io import LocalPathIO
+
+            source = LocalPathIO.make(obj)
+            return self.write_table(
+                source.read_arrow_batches(),
+                options=options,
+                **option_kwargs,
+            )
+
         if isinstance(obj, pa.Table):
             return self.write_arrow_table(
                 table=obj,
