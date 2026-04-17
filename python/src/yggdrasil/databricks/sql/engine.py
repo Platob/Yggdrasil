@@ -95,7 +95,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union, Iterable, OrderedDict, Mapping
 
 import pyarrow as pa
@@ -434,7 +434,7 @@ class SQLEngine(DatabricksService):
 
     def execute_many(
         self,
-        statements: Iterable[str] | Mapping[str, str],
+        statements: "Iterable[str | Statement] | Mapping[str, str | Statement]",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -471,8 +471,10 @@ class SQLEngine(DatabricksService):
                 SQL statements to execute.
 
                 Accepts either:
-                - an iterable of SQL strings, keyed as ``"0"``, ``"1"``, ...
-                - a mapping of ``{name: statement}``, preserving mapping order
+                - an iterable of SQL strings or :class:`Statement` objects,
+                  keyed as ``"0"``, ``"1"``, ...
+                - a mapping of ``{name: statement}``, preserving mapping order,
+                  where each value is a SQL string or :class:`Statement`
             row_limit:
                 Optional row limit forwarded to each statement execution.
             catalog_name:
@@ -505,7 +507,9 @@ class SQLEngine(DatabricksService):
                 clause. Tabular values are materialized to a fresh staging
                 path via Parquet. Engine-owned staging paths are attached to
                 every result in the batch and cleaned up lazily once those
-                results reach a terminal state.
+                results reach a terminal state.  Merged on top of any
+                per-statement temporary tables already carried by
+                :class:`Statement` inputs.
 
         Returns:
             A :class:`StatementResultBatch` containing results in input order.
@@ -514,18 +518,24 @@ class SQLEngine(DatabricksService):
             ValueError:
                 If no non-empty SQL statements were provided.
         """
-        items: OrderedDict[str, str] = OrderedDict()
+        items: OrderedDict[str, Statement] = OrderedDict()
+
+        def _add(key: str, raw: "str | Statement") -> None:
+            prepared = Statement.prepare(raw)
+            stripped = prepared.text.strip()
+            if not stripped:
+                return
+            items[key] = (
+                prepared if prepared.text == stripped
+                else replace(prepared, text=stripped)
+            )
 
         if isinstance(statements, Mapping):
-            for key, statement in statements.items():
-                stmt = statement.strip()
-                if stmt:
-                    items[str(key)] = stmt
+            for key, raw in statements.items():
+                _add(str(key), raw)
         else:
-            for i, statement in enumerate(statements):
-                stmt = statement.strip()
-                if stmt:
-                    items[str(i)] = stmt
+            for i, raw in enumerate(statements):
+                _add(str(i), raw)
 
         if not items:
             raise ValueError("No non-empty SQL statements were provided.")
@@ -538,16 +548,22 @@ class SQLEngine(DatabricksService):
 
         if substitutions:
             items = OrderedDict(
-                (key, _apply_temporary_table_aliases(stmt, substitutions))
+                (
+                    key,
+                    replace(
+                        stmt,
+                        text=_apply_temporary_table_aliases(stmt.text, substitutions),
+                    ),
+                )
                 for key, stmt in items.items()
             )
 
         results: OrderedDict[str, StatementResult] = OrderedDict()
 
         if parallel:
-            for key, statement in items.items():
+            for key, stmt in items.items():
                 results[key] = self.execute(
-                    statement,
+                    stmt,
                     row_limit=row_limit,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
