@@ -90,8 +90,9 @@ class ParquetIO(MediaIO[ParquetOptions]):
         finally:
             arrow_io.close()
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the Parquet schema by reading only the file footer."""
+        del full
         if self.buffer.size <= 0:
             return pa.schema([])
 

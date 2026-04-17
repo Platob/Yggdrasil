@@ -280,6 +280,39 @@ class PathIO(MediaIO[PathOptions], ABC):
         del batches, schema, options
         raise NotImplementedError(f"{type(self).__name__} does not support writes yet")
 
+    def _collect_arrow_schema(self, full: bool = False) -> "pa.Schema":
+        """Return the Arrow schema of the underlying path.
+
+        For a single file, reads that file's schema. For a directory,
+        inspects only the first file by default, or every file when
+        *full* is ``True`` (returning the unified schema across all
+        members).
+        """
+        options = self.check_options(options=None)
+        mime_type = self.media_type.mime_type if self.is_file else None
+
+        collected: list[pa.Schema] = []
+        for file_io in self.iter_files(
+            recursive=options.recursive,
+            include_hidden=options.include_hidden,
+            supported_only=options.supported_only,
+            mime_type=mime_type,
+        ):
+            media = MediaType.parse(str(file_io.path), default=file_io.media_type)
+            payload = file_io.path.read_bytes()
+            with BytesIO(payload, media_type=media) as buffer:
+                collected.append(buffer.media_io(media)._collect_arrow_schema(full=full))
+            if not full:
+                break
+
+        if not collected:
+            return pa.schema([])
+
+        if len(collected) == 1:
+            return collected[0]
+
+        return pa.unify_schemas(collected, promote_options="default")
+
     def count_rows(
         self,
         *,

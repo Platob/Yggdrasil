@@ -249,8 +249,9 @@ class XmlIO(MediaIO[XmlOptions]):
 
         yield batch
 
-    def _collect_arrow_schema(self) -> "pa.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pa.Schema":
         """Return the XML schema by inferring from only the first row element."""
+        del full
         if self.buffer.size <= 0:
             return pa.schema([])
 

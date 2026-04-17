@@ -143,8 +143,9 @@ class JsonIO(MediaIO[JsonOptions]):
 
         yield batch
 
-    def _collect_arrow_schema(self) -> "pyarrow.Schema":
+    def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the JSON schema by inferring types from only the first record."""
+        del full
         if self.buffer.size <= 0:
             return pa.schema([])
 
