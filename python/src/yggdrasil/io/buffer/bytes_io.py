@@ -4,7 +4,7 @@ Design
 ------
 - Own logical cursor (self._pos), independent from any OS/file cursor
 - In-memory backing is bytearray + logical size
-- Spilled backing is a filesystem path only (no persistent Python file handle)
+- Spilled backing is a path-like object (local ``Path`` or ``DatabricksPath``)
 - Uses os.pread/os.pwrite for cursorless file IO
 - Keeps optional readonly mmap for zero-copy reads when spilled
 
@@ -26,7 +26,6 @@ import mmap
 import os
 import shutil
 import struct
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, IO, Literal, Optional, Union
 
@@ -52,8 +51,11 @@ BufferLike = Union[
     "BytesIO",
     str,
     Path,
+    "DatabricksPath",
     IO[bytes],
 ]
+
+SpillPath = "Path | DatabricksPath"
 
 _HEAD_DEFAULT = 128
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
@@ -76,7 +78,7 @@ class BytesIO(io.RawIOBase):
 
     def __init__(
         self,
-        data: IO[bytes] | bytes | bytearray | memoryview | str | Path | None = None,
+        data: IO[bytes] | bytes | bytearray | memoryview | str | SpillPath | None = None,
         *,
         media_type: Optional["MediaType"] = None,
         config: BufferConfig | None = None,
@@ -89,7 +91,7 @@ class BytesIO(io.RawIOBase):
         self._size: int = 0
         self._pos: int = 0
 
-        self._path: Path | None = None
+        self._path: SpillPath | None = None
         self._mmap: mmap.mmap | None = None
         self._owns_path: bool = False
         self._media_type: MediaType | None = media_type
@@ -176,8 +178,8 @@ class BytesIO(io.RawIOBase):
             self._init_from_stdlib_bytesio(data)
             return
 
-        if isinstance(data, (str, Path)):
-            self._init_from_path(Path(data), copy=copy)
+        if self._is_pathish(data):
+            self._init_from_path(self._coerce_path(data), copy=copy)
             return
 
         if isinstance(data, BytesIO):
@@ -234,7 +236,25 @@ class BytesIO(io.RawIOBase):
         self._pos = src._pos
         self._media_type = src._media_type
 
-    def _init_from_path(self, path: Path, *, copy: bool) -> None:
+    @staticmethod
+    def _is_pathish(value: Any) -> bool:
+        return isinstance(value, (str, Path)) or (
+            hasattr(value, "open")
+            and hasattr(value, "exists")
+            and hasattr(value, "stat")
+        )
+
+    @staticmethod
+    def _coerce_path(value: Any):
+        if isinstance(value, (str, Path)):
+            return Path(value)
+        return value
+
+    @staticmethod
+    def _is_local_path(path: Any) -> bool:
+        return isinstance(path, Path)
+
+    def _init_from_path(self, path, *, copy: bool) -> None:
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
@@ -243,7 +263,10 @@ class BytesIO(io.RawIOBase):
             size = path.stat().st_size
             if size > self._cfg.spill_bytes:
                 dst = self._cfg.create_spill_path()
-                shutil.copyfile(path, dst)
+                if hasattr(path, "copy_to"):
+                    path.copy_to(dst)
+                else:
+                    shutil.copyfile(path, dst)
                 self._buf = None
                 self._size = 0
                 self._path = dst
@@ -295,7 +318,7 @@ class BytesIO(io.RawIOBase):
     # Backing helpers
     # ------------------------------------------------------------------
 
-    def _create_spill_path(self) -> Path:
+    def _create_spill_path(self):
         if self._path is None:
             self._path = self._cfg.create_spill_path()
         return self._path
@@ -323,17 +346,12 @@ class BytesIO(io.RawIOBase):
     def spill_to_file(self) -> None:
         if self._buf is None:
             return
-
-        cfg = self._cfg
-        tmp_dir = str(cfg.tmp_dir) if cfg.tmp_dir is not None else None
-        fd, name = tempfile.mkstemp(prefix=cfg.prefix, suffix=cfg.suffix, dir=tmp_dir)
-        path = Path(name)
-
-        try:
+        path = self._cfg.create_spill_path()
+        with path.open("w+b") as fh:
             if self._size:
-                os.write(fd, memoryview(self._buf)[: self._size])
-        finally:
-            os.close(fd)
+                payload = memoryview(self._buf)[: self._size]
+                fh.write(payload.tobytes() if not payload.contiguous else payload)
+            fh.flush()
 
         self._buf = None
         self._size = 0
@@ -398,7 +416,7 @@ class BytesIO(io.RawIOBase):
             return b""
 
         with self._path.open("rb") as fh:
-            if _HAS_PREAD:
+            if self._is_local_path(self._path) and _HAS_PREAD:
                 return os.pread(fh.fileno(), n, pos)
 
             fh.seek(pos)
@@ -424,7 +442,7 @@ class BytesIO(io.RawIOBase):
             raise RuntimeError("No backing store available for write")
 
         with self._path.open("r+b") as fh:
-            if _HAS_PWRITE:
+            if self._is_local_path(self._path) and _HAS_PWRITE:
                 written = int(os.pwrite(fh.fileno(), mv, pos))
             else:
                 fh.seek(pos)
@@ -464,7 +482,7 @@ class BytesIO(io.RawIOBase):
         return self._path is not None
 
     @property
-    def path(self) -> Path | None:
+    def path(self):
         return self._path
 
     @property
@@ -665,6 +683,34 @@ class BytesIO(io.RawIOBase):
         """
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
+
+        if self._is_pathish(dst) and not isinstance(dst, str):
+            path = self._coerce_path(dst)
+
+            if path.exists() and not overwrite:
+                raise FileExistsError(f"Destination already exists: {path}")
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            if self._buf is not None:
+                payload = memoryview(self._buf)[: self._size]
+                path.write_bytes(payload.tobytes() if not payload.contiguous else payload)
+                return self._size
+
+            if self._path is None or self.size == 0:
+                path.write_bytes(b"")
+                return 0
+
+            if self._path == path:
+                return self.size
+
+            if hasattr(self._path, "copy_to"):
+                self._path.copy_to(path)
+            else:
+                with self._path.open("rb") as src:
+                    with path.open("wb") as out:
+                        shutil.copyfileobj(src, out, length=batch_size)
+            return self.size
 
         if isinstance(dst, (str, os.PathLike)):
             path = Path(dst)
@@ -885,9 +931,9 @@ class BytesIO(io.RawIOBase):
     # ------------------------------------------------------------------
 
     def xxh3_64(self) -> "xxhash.xxh3_64":
-        from xxhash import xxh3_64
+        from yggdrasil.xxhash.lib import xxhash
 
-        h = xxh3_64()
+        h = xxhash.xxh3_64()
         h.update(self.memoryview())
         return h
 
@@ -896,7 +942,7 @@ class BytesIO(io.RawIOBase):
         return u if u < 2**63 else u - 2**64
 
     def blake3(self) -> "blake3.blake3":
-        from blake3 import blake3
+        from yggdrasil.blake3.lib import blake3
 
         h = blake3(max_threads=blake3.AUTO)
 
@@ -906,6 +952,9 @@ class BytesIO(io.RawIOBase):
             return h
 
         if self._path is not None:
+            if not self._is_local_path(self._path):
+                h.update(self.to_bytes())
+                return h
             h.update_mmap(str(self._path))
             return h
 
@@ -926,7 +975,7 @@ class BytesIO(io.RawIOBase):
     def view(
         self,
         *,
-        pos: Optional[int] = None,
+        pos: int | None = None,
         size: int | None = None,
         max_size: int | None = None,
     ):
@@ -966,6 +1015,9 @@ class BytesIO(io.RawIOBase):
 
         if self._path is None or not self._path.exists():
             return memoryview(b"")
+
+        if not self._is_local_path(self._path):
+            return memoryview(self.to_bytes())
 
         size = self._path.stat().st_size
         if size == 0:
@@ -1010,6 +1062,8 @@ class BytesIO(io.RawIOBase):
 
         if "r" in mode:
             if self.spilled and self._path is not None:
+                if not self._is_local_path(self._path):
+                    return pa.PythonFile(self.open_reader(), mode="r")
                 return pa.memory_map(str(self._path), "r")
 
             mv = self.memoryview()
@@ -1022,6 +1076,9 @@ class BytesIO(io.RawIOBase):
 
             if self._path is None:
                 raise RuntimeError("Failed to materialize spill file for Arrow IO")
+
+            if not self._is_local_path(self._path):
+                return pa.PythonFile(self.buffer(), mode=mode)
 
             if "w" in mode:
                 return pa.OSFile(str(self._path), mode="w")

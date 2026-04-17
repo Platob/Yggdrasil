@@ -4,6 +4,7 @@ from .lib import WorkspaceClient # noqa: F401
 from .workspaces import Workspace
 from .client import DatabricksClient
 from .fs import DatabricksPath, DatabricksPathKind, DatabricksIO
+from .fs.service import FileSystem
 from .ai.genie import Genie, GenieAnswer, GenieSpace
 
 
@@ -13,6 +14,7 @@ __all__ = [
     "DatabricksPath",
     "DatabricksPathKind",
     "DatabricksIO",
+    "FileSystem",
     "Genie",
     "GenieAnswer",
     "GenieSpace",

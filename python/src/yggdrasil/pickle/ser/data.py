@@ -31,7 +31,7 @@ from yggdrasil.pickle.ser.pyarrow import (
 )
 
 if TYPE_CHECKING:
-    from yggdrasil.data.field import Field
+    from yggdrasil.data.data_field import Field
     from yggdrasil.data.schema import Schema
 
 __all__ = [
@@ -78,7 +78,7 @@ class DataSerialized(Serialized[object]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> "Serialized[object] | None":
-        from yggdrasil.data.field import Field
+        from yggdrasil.data.data_field import Field
         from yggdrasil.data.schema import Schema
 
         if isinstance(obj, Field):
@@ -102,7 +102,7 @@ class FieldSerialized(DataSerialized):
 
     @property
     def value(self) -> "Field":
-        from yggdrasil.data.field import Field
+        from yggdrasil.data.data_field import Field
 
         arrow_schema = _schema_from_ipc_file_buffer(_decode_to_arrow_buffer(self))
 
@@ -143,7 +143,7 @@ class FieldSerialized(DataSerialized):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> "Serialized[object] | None":
-        from yggdrasil.data.field import Field
+        from yggdrasil.data.data_field import Field
 
         if isinstance(obj, Field):
             return cls.from_value(obj, metadata=metadata, codec=codec)

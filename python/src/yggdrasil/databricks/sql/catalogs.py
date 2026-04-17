@@ -148,11 +148,11 @@ class Catalogs(DatabricksService):
 
     def parse_location(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """Parse a 1-, 2-, or 3-part dotted name into ``(catalog, schema, table)``.
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from yggdrasil.data.field import Field, field as make_field
+from yggdrasil.data.data_field import Field, field as make_field
 from yggdrasil.data.schema import Schema, schema as make_schema
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser import dumps, loads

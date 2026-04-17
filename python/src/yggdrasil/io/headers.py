@@ -159,15 +159,15 @@ class PromotedHeaders:
     `remaining` contains all non-promoted headers after normalization.
     """
 
-    host: Optional[str] = None
-    user_agent: Optional[str] = None
-    accept: Optional[str] = None
-    accept_encoding: Optional[str] = None
-    accept_language: Optional[str] = None
-    content_type: Optional[str] = None
+    host: str | None = None
+    user_agent: str | None = None
+    accept: str | None = None
+    accept_encoding: str | None = None
+    accept_language: str | None = None
+    content_type: str | None = None
     content_length: int = 0
-    content_encoding: Optional[str] = None
-    transfer_encoding: Optional[str] = None
+    content_encoding: str | None = None
+    transfer_encoding: str | None = None
     remaining: dict[str, str] = field(default_factory=dict)
 
     HEADER_TO_ATTR: ClassVar[dict[str, str]] = {
@@ -188,7 +188,7 @@ class PromotedHeaders:
         headers: Mapping[HeaderValue, HeaderValue],
         *,
         normalize: bool = True,
-        host: Optional[str] = None,
+        host: str | None = None,
     ) -> "PromotedHeaders":
         """
         Extract common headers into typed attributes.

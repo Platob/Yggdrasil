@@ -6,7 +6,7 @@ Per-table DDL/DML lives in :class:`~yggdrasil.databricks.sql.table.Table`.
 
 Caching strategy
 ----------------
-A module-level :class:`ExpiringDict` (``_TABLE_INFO_CACHE``) keyed by
+A module-level :class:`ExpiringDict` (``_TABLE_CACHE``) keyed by
 ``"host|catalog.schema.table"`` acts as a fast *local* cache so the same
 table lookup never hits the API twice within the TTL window.
 
@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Optional, Iterator, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
 from yggdrasil.databricks.client import DatabricksService
-from yggdrasil.databricks.sql.types import quote_ident
+from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .table import Table
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 # Module-level function cache
 # Keyed by "host|catalog.schema.table"; default TTL = 5 minutes.
 # ---------------------------------------------------------------------------
-_TABLE_INFO_CACHE: ExpiringDict[str, TableInfo] = ExpiringDict(default_ttl=300.0)
+_TABLE_CACHE: ExpiringDict[str, Table] = ExpiringDict(default_ttl=300.0)
 
 
 @dataclass(frozen=True)
@@ -59,9 +60,39 @@ class Tables(DatabricksService):
             ...
     """
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
-    table_name: Optional[str] = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
+    table_name: str | None = None
+
+    def __call__(
+        self,
+        catalog_name: Optional[str] = "",
+        schema_name: Optional[str] = "",
+        table_name: Optional[str] = "",
+        *args,
+        **kwargs
+    ):
+        if catalog_name == "":
+            catalog_name = self.catalog_name
+
+        if schema_name == "":
+            schema_name = self.schema_name
+
+        if table_name == "":
+            table_name = self.table_name
+
+        if catalog_name and schema_name and table_name:
+            return self.find_table(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name
+            )
+
+        return Tables(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name
+        )
 
     def parse_catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         parts = [_.strip("`") for _ in full_name.split(".")]
@@ -79,10 +110,10 @@ class Tables(DatabricksService):
 
     def parse_check_location_params(
         self,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         safe_chars: bool = True,
     ) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
         if location:
@@ -109,11 +140,11 @@ class Tables(DatabricksService):
 
     def table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        table_name: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        table_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
     ) -> "Table":
         """Return a :class:`~yggdrasil.databricks.sql.table.Table` bound to this service."""
 
@@ -125,7 +156,7 @@ class Tables(DatabricksService):
             table_name=table_name or self.table_name,
         )
 
-    def catalog(self, name: Optional[str] = None) -> "Catalog":
+    def catalog(self, name: str | None = None) -> "Catalog":
         """Return a :class:`Catalog` using this service's client.
 
         Args:
@@ -140,10 +171,10 @@ class Tables(DatabricksService):
 
     def schema(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
     ) -> "Schema":
         """Return a :class:`Schema` using this service's client.
 
@@ -181,23 +212,45 @@ class Tables(DatabricksService):
         host = self.client.base_url.to_string() if self.client else "default"
         return f"{host}|{catalog_name}.{schema_name}.{table_name}"
 
-    def _invalidate(
+    def invalidate_cached_table(
+        self,
+        table: Table | str | None = None,
+        *,
+        catalog_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        table_name: Optional[str] = None,
+    ):
+        if table is not None:
+            if isinstance(table, Table):
+                catalog_name = table.catalog_name
+                schema_name = table.schema_name
+                table_name = table.table_name
+            else:
+                catalog_name, schema_name, table_name = self.parse_catalog_schema_table_names(table)
+
+        return self._invalidate_cached_table(catalog_name, schema_name, table_name)
+
+    def _invalidate_cached_table(
         self,
         catalog_name: Optional[str],
         schema_name: Optional[str],
         table_name: Optional[str],
     ) -> None:
         """Evict one entry from the module-level cache."""
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
         key = self._cache_key(catalog_name, schema_name, table_name)
-        try:
-            del _TABLE_INFO_CACHE[key]
-        except KeyError:
-            pass
+
+        if table_name:
+            try:
+                del _TABLE_CACHE[key]
+            except KeyError:
+                pass
 
     @classmethod
     def invalidate_all(cls) -> None:
         """Clear the entire module-level table-info cache."""
-        _TABLE_INFO_CACHE.clear()
+        _TABLE_CACHE.clear()
 
     # -------------------------------------------------------------------------
     # Remote fetch — single responsibility, no caching
@@ -207,9 +260,9 @@ class Tables(DatabricksService):
         self,
         catalog_name: str,
         schema_name: str,
-        table_name: Optional[str] = None,
+        table_name: str | None = None,
         *,
-        table_id: Optional[str] = None,
+        table_id: str | None = None,
         raise_error: bool = True,
     ) -> Optional[TableInfo]:
         """Raw API lookup — three strategies in order, no cache.
@@ -288,20 +341,19 @@ class Tables(DatabricksService):
 
     def find_table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        table_id: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        table_id: str | None = None,
         raise_error: bool = True,
-        use_cache: bool = True,
-        cache_ttl: Optional[float] = None,
+        cache_ttl: float | None = 300.0,
     ) -> Optional["Table"]:
         """Resolve a table by name or Unity Catalog ID.
 
-        Caching is enabled by default (``use_cache=True``).  Set
-        ``use_cache=False`` to force a fresh API call and refresh the entry.
+        Caching is controlled only by ``cache_ttl``. Set ``cache_ttl=None``
+        to bypass the cache for this lookup.
 
         Args:
             location:     Full string location
@@ -310,7 +362,6 @@ class Tables(DatabricksService):
             schema_name:  Override schema (falls back to service default).
             table_id:     Unity Catalog table UUID — triggers id-based search.
             raise_error:  Raise :exc:`ResourceDoesNotExist` when not found.
-            use_cache:    ``False`` bypasses and refreshes the cache entry.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
         """
         _, catalog, schema, name = self.parse_check_location_params(
@@ -320,21 +371,15 @@ class Tables(DatabricksService):
         cache_key = self._cache_key(catalog, schema, name)
 
         # 1. Check local cache -----------------------------------------------
-        if use_cache:
-            cached: Optional[TableInfo] = _TABLE_INFO_CACHE.get(cache_key)
+        if cache_ttl is not None:
+            cached: Optional[Table] = _TABLE_CACHE.get(cache_key)
             if cached is not None:
                 logger.debug(
-                    "Cache hit [Tables.find_table] key=%s table_id=%s",
-                    cache_key, cached.table_id,
+                    "Cache hit [Tables.find_table] key=%s table=%s",
+                    cache_key, cached.full_name(),
                 )
-                tb = Table(
-                    service=self,
-                    catalog_name=cached.catalog_name,
-                    schema_name=cached.schema_name,
-                    table_name=cached.name,
-                )
-                object.__setattr__(tb, "_infos", cached)
-                return tb
+                object.__setattr__(cached, "service", self)
+                return cached
 
         # 2. Fetch remote ----------------------------------------------------
         info = self.find_table_remote(
@@ -347,13 +392,6 @@ class Tables(DatabricksService):
         if info is None:
             return None
 
-        # 3. Update local cache ----------------------------------------------
-        if use_cache:
-            if cache_ttl is not None:
-                _TABLE_INFO_CACHE.set(cache_key, info, ttl=cache_ttl)
-            else:
-                _TABLE_INFO_CACHE.set(cache_key, info)
-
         tb = Table(
             service=self,
             catalog_name=info.catalog_name,
@@ -361,37 +399,68 @@ class Tables(DatabricksService):
             table_name=info.name,
         )
         object.__setattr__(tb, "_infos", info)
+
+        # 3. Update local cache ----------------------------------------------
+        if cache_ttl is not None:
+            _TABLE_CACHE.set(cache_key, tb, ttl=cache_ttl)
         return tb
 
     def list_tables(
         self,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         *,
-        use_cache: bool = True,
-        cache_ttl: Optional[float] = None,
+        cache_ttl: float | None = 300.0,
     ) -> Iterator["Table"]:
-        """Iterate over all tables in a schema, populating the local cache.
+        """Iterate over tables in the resolved catalog/schema scope.
 
         Args:
+            name:         Optional table-name filter. When it contains ``*``,
+                          matching uses a case-insensitive glob.
             catalog_name: Override catalog (falls back to service default).
             schema_name:  Override schema (falls back to service default).
-            use_cache:    Populate ``_TABLE_INFO_CACHE`` from results.
+                          When omitted, iterates every schema in the resolved
+                          catalog scope. When both are omitted, iterates every
+                          visible catalog and schema.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
         """
+        catalog_name = self.catalog_name if catalog_name is None else catalog_name
+        schema_name = self.schema_name if schema_name is None else schema_name
 
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
+        if catalog_name is None:
+            from .catalogs import Catalogs
+
+            for catalog in Catalogs(client=self.client).list():
+                yield from self.list_tables(
+                    name=name,
+                    catalog_name=catalog.catalog_name,
+                    schema_name=schema_name,
+                    cache_ttl=cache_ttl,
+                )
+            return
+
+        if schema_name is None:
+            for schema in self.catalog(catalog_name).schemas():
+                yield from self.list_tables(
+                    name=name,
+                    catalog_name=catalog_name,
+                    schema_name=schema.schema_name,
+                    cache_ttl=cache_ttl,
+                )
+            return
+
         uc = self.client.workspace_client().tables
+        glob_name = name.casefold() if isinstance(name, str) and "*" in name else None
 
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
-            if use_cache:
-                key = self._cache_key(info.catalog_name, info.schema_name, info.name)
-                if _TABLE_INFO_CACHE.get(key) is None:
-                    if cache_ttl is not None:
-                        _TABLE_INFO_CACHE.set(key, info, ttl=cache_ttl)
-                    else:
-                        _TABLE_INFO_CACHE.set(key, info)
+            if name is not None:
+                info_name = info.name or ""
+                if glob_name is not None:
+                    if not fnmatchcase(info_name.casefold(), glob_name):
+                        continue
+                elif info_name != name:
+                    continue
 
             tb = Table(
                 service=self,
@@ -400,5 +469,10 @@ class Tables(DatabricksService):
                 table_name=info.name,
             )
             object.__setattr__(tb, "_infos", info)
+
+            if cache_ttl is not None:
+                key = self._cache_key(info.catalog_name, info.schema_name, info.name)
+                if _TABLE_CACHE.get(key) is None:
+                    _TABLE_CACHE.set(key, tb, ttl=cache_ttl)
             yield tb
 

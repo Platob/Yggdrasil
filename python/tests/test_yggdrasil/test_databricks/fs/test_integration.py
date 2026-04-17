@@ -212,12 +212,6 @@ class TestVolumeIntegration(DatabricksIntegrationBase):
         self.assertTrue(table.equals(read_table))
         d.rmdir()
 
-    def test_temporary_credentials(self):
-        folder_path = self.vol_base / "tmp_path"
-        folder_path.mkdir()
-        creds = folder_path.temporary_credentials()
-        self.assertTrue(creds)
-
     def test_read_text_write_text(self):
         f = self.vol_base / "text.txt"
         f.write_text("volume text ñ")

@@ -7,7 +7,7 @@ import inspect
 import types
 import uuid
 from collections.abc import Collection, Mapping, MutableMapping, MutableSequence, MutableSet
-from typing import Any, Tuple, Union, get_args, get_origin, Optional, List
+from typing import Any, Tuple, Union, get_args, get_origin
 
 import pyarrow as pa
 
@@ -15,7 +15,6 @@ __all__ = [
     "default_scalar",
     "default_python_scalar",
     "default_arrow_scalar",
-    "default_arrow_array"
 ]
 
 DEFAULT_MAPS_INITIALIZED = False
@@ -257,58 +256,6 @@ def default_arrow_scalar(
         raise TypeError(f"Cannot determine default value for Arrow type {dtype!r}")
 
 
-def default_arrow_array(
-    dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType],
-    nullable: bool,
-    size: int = 0,
-    memory_pool: Optional[pa.MemoryPool] = None,
-    chunks: Optional[List[int]] = None,
-    scalar_default: Optional[pa.Scalar] = None,
-) -> Union[pa.Array, pa.ChunkedArray]:
-    """Return a default Arrow array or chunked array for a given type.
-
-    Args:
-        dtype: Arrow data type.
-        nullable: Whether values are nullable.
-        size: Number of elements.
-        memory_pool: Optional Arrow memory pool.
-        chunks: Optional chunk sizes.
-        scalar_default: Optional scalar default override.
-
-    Returns:
-        Arrow array or chunked array.
-    """
-    if scalar_default is None:
-        scalar_default = default_arrow_scalar(dtype=dtype, nullable=nullable)
-
-    # ✅ PyArrow compatibility: repeat(size=0) can throw "Must pass at least one array"
-    if size == 0 and (chunks is None):
-        return pa.array([], type=dtype)
-
-    if chunks is not None:
-        if len(chunks) == 0:
-            # also avoid "must pass at least one array" from chunked_array([])
-            return pa.chunked_array([], type=dtype)
-
-        return pa.chunked_array(
-            [
-                pa.repeat(
-                    value=scalar_default,
-                    size=chunk_size,
-                    memory_pool=memory_pool # noqa
-                ) if chunk_size > 0 else pa.array([], type=dtype)
-                for chunk_size in chunks
-            ],
-            type=dtype,
-        )
-
-    return pa.repeat(
-        value=scalar_default,
-        size=size,
-        memory_pool=memory_pool # noqa
-    )
-
-
 def default_python_scalar(hint: Any):
     """Return a default Python value for the given type hint.
 
@@ -364,7 +311,7 @@ def default_scalar(
         type,
         pa.DataType, pa.Field,
     ],
-    nullable: Optional[bool] = None
+    nullable: bool | None = None
 ):
     """Return a default scalar value for Python or Arrow type hints.
 

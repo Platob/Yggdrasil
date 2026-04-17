@@ -90,17 +90,20 @@ This module is intended to be safe by default:
 - Spark and SQL paths follow the same overwrite and merge rules
 """
 
+
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union, Iterable, OrderedDict, Mapping
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
+from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import BytesIO
@@ -108,16 +111,19 @@ from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.parquet_io import ParquetOptions
 from yggdrasil.io.enums import SaveMode
 from yggdrasil.io.enums.media_type import MediaTypes
-
-from .statement_result import StatementResult
+from .catalogs import Catalogs
+from .grants import Grants
+from .schemas import Schemas
+from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
+from .statement_result import StatementResult
 from .table import Table
 from .tables import Tables
-from .types import quote_ident, PrimaryKeySpec, ForeignKeySpec
+from .types import PrimaryKeySpec, ForeignKeySpec
 from .warehouse import SQLWarehouse
-from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from ..client import DatabricksService
 from ..fs.path import DatabricksPath
+from ...data.statement_result import StatementResultBatch
 
 logger = logging.getLogger(__name__)
 
@@ -140,32 +146,29 @@ def _build_match_condition(
     right_alias: str,
     null_safe: bool = True,
 ) -> str:
-    """
-    Build a SQL equality condition for merge keys.
-
-    Each key is compared between the left and right aliases using either
-    null-safe equality (`<=>`) or standard equality (`=`).
-
-    Args:
-        match_by:
-            Column names used as merge keys.
-        left_alias:
-            Alias for the target relation.
-        right_alias:
-            Alias for the source relation.
-        null_safe:
-            When True, use Databricks null-safe equality so NULL matches NULL.
-
-    Returns:
-        SQL predicate joined with `AND`, for example:
-
-            t.`id` <=> s.`id` AND t.`ts` <=> s.`ts`
-    """
     op = "<=>" if null_safe else "="
     return " AND ".join(
         f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
         for k in match_by
     )
+
+
+def _staging_parquet_ref(path: StagingPath) -> str:
+    """Inline ``parquet.`<path>``` source clause for a staging path."""
+    return f"parquet.{quote_ident(str(path.path))}"
+
+
+def _apply_temporary_table_aliases(
+    statement: str,
+    substitutions: Mapping[str, str],
+) -> str:
+    """Replace ``{alias}`` occurrences in ``statement`` with staging references."""
+    if not substitutions:
+        return statement
+    rendered = statement
+    for alias, replacement in substitutions.items():
+        rendered = rendered.replace("{" + alias + "}", replacement)
+    return rendered
 
 
 @dataclass(frozen=True)
@@ -200,8 +203,8 @@ class SQLEngine(DatabricksService):
     - merge behavior is enabled only when `match_by` is provided
     """
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
     default_warehouse: Optional[SQLWarehouse] = field(
         default=None,
         repr=False,
@@ -225,6 +228,25 @@ class SQLEngine(DatabricksService):
     )
 
     @property
+    def catalogs(self) -> "Catalogs":
+        """
+        Return the `Catalogs` service scoped to this engine's catalog and schema.
+        """
+        return Catalogs(
+            client=self.client,
+        )
+
+    @property
+    def schemas(self) -> "Schemas":
+        """
+        Return the `Schemas` service scoped to this engine's catalog and schema.
+        """
+        return Schemas(
+            client=self.client,
+            catalog_name=self.catalog_name,
+        )
+
+    @property
     def tables(self) -> Tables:
         """
         Return the `Tables` service scoped to this engine's catalog and schema.
@@ -235,11 +257,20 @@ class SQLEngine(DatabricksService):
             schema_name=self.schema_name,
         )
 
+    @property
+    def grants(self) -> Grants:
+        """
+        Return the `Grants` service scoped to this engine's catalog and schema.
+        """
+        return Grants(
+            client=self.client,
+        )
+
     def __call__(
         self,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         warehouse: Optional[SQLWarehouse | str] = None,
     ) -> SQLEngine:
         """
@@ -287,8 +318,8 @@ class SQLEngine(DatabricksService):
 
     def warehouse(
         self,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
     ) -> SQLWarehouse:
         """
         Resolve the warehouse used by this engine.
@@ -340,21 +371,260 @@ class SQLEngine(DatabricksService):
 
         return self.default_warehouse
 
+    def _stage_temporary_tables(
+        self,
+        temporary_tables: Mapping[str, Any] | None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+    ) -> tuple[Dict[str, str], list[StagingPath]]:
+        """Resolve ``temporary_tables`` into SQL substitutions and owned staging paths.
+
+        For each entry:
+
+        - If the value is already a :class:`StagingPath`, it is reused directly
+          and its path is substituted into the SQL. The engine does not take
+          ownership of pre-existing paths.
+        - Otherwise the value is treated as tabular data, written to a fresh
+          :class:`StagingPath` as Parquet, and the engine takes ownership of
+          the new staging path so it can be cleaned up lazily when the
+          resulting :class:`StatementResult` is done.
+
+        Returns:
+            A tuple ``(substitutions, owned_paths)`` where ``substitutions``
+            maps each alias to the ``parquet.`<path>``` SQL source clause and
+            ``owned_paths`` lists every staging path the engine created.
+        """
+        if not temporary_tables:
+            return {}, []
+
+        effective_catalog = catalog_name or self.catalog_name
+        effective_schema = schema_name or self.schema_name
+
+        substitutions: Dict[str, str] = {}
+        owned: list[StagingPath] = []
+
+        for alias, value in temporary_tables.items():
+            if isinstance(value, StagingPath):
+                substitutions[alias] = _staging_parquet_ref(value)
+                continue
+
+            if not effective_catalog or not effective_schema:
+                raise ValueError(
+                    "temporary_tables requires catalog_name and schema_name "
+                    "to be resolvable on the engine or provided explicitly; "
+                    f"cannot stage alias {alias!r}."
+                )
+
+            staging = StagingPath.for_table(
+                client=self.client,
+                catalog_name=effective_catalog,
+                schema_name=effective_schema,
+                table_name=alias,
+                max_lifetime=3600,
+            )
+            staging.register_shutdown_cleanup()
+            staging.write_table(value)
+
+            owned.append(staging)
+            substitutions[alias] = _staging_parquet_ref(staging)
+
+        return substitutions, owned
+
+    def execute_many(
+        self,
+        statements: Iterable[str] | Mapping[str, str],
+        *,
+        row_limit: int | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        engine: Optional[Literal["spark", "api"]] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        byte_limit: int | None = None,
+        cache_for: WaitingConfigArg = None,
+        spark_session: Optional["SparkSession"] = None,
+        parallel: bool = False,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+    ) -> StatementResultBatch:
+        """
+        Execute multiple SQL statements.
+
+        Behavior
+        --------
+        - Statements are normalized with ``strip()``
+        - Empty statements are ignored
+        - Execution order is preserved in the returned batch
+        - When ``parallel=False``:
+          - all statements except the last are executed with ``wait=True``
+          - the final statement uses the caller-provided ``wait`` value
+        - When ``parallel=True``:
+          - all statements are submitted immediately
+          - each statement uses the caller-provided ``wait`` value
+          - results are returned in input order, but execution order is not enforced
+
+        Args:
+            statements:
+                SQL statements to execute.
+
+                Accepts either:
+                - an iterable of SQL strings, keyed as ``"0"``, ``"1"``, ...
+                - a mapping of ``{name: statement}``, preserving mapping order
+            row_limit:
+                Optional row limit forwarded to each statement execution.
+            catalog_name:
+                Catalog override for warehouse API execution context.
+            schema_name:
+                Schema override for warehouse API execution context.
+            wait:
+                Waiting configuration.
+            raise_error:
+                Whether execution errors should be raised.
+            engine:
+                Explicit engine override: ``"spark"`` or ``"api"``.
+            warehouse_id:
+                Warehouse ID override for API execution.
+            warehouse_name:
+                Warehouse name override for API execution.
+            byte_limit:
+                Optional response byte limit for API execution.
+            cache_for:
+                Optional TTL for statement result caching.
+            spark_session:
+                Explicit SparkSession override.
+            parallel:
+                When ``True``, submit all statements without sequential dependency
+                waiting. Use only when statements are independent.
+            temporary_tables:
+                Optional mapping of alias → :class:`StagingPath` or tabular
+                data. Aliases referenced in statements as ``{alias}`` are
+                replaced with the corresponding ``parquet.`<path>``` source
+                clause. Tabular values are materialized to a fresh staging
+                path via Parquet. Engine-owned staging paths are attached to
+                every result in the batch and cleaned up lazily once those
+                results reach a terminal state.
+
+        Returns:
+            A :class:`StatementResultBatch` containing results in input order.
+
+        Raises:
+            ValueError:
+                If no non-empty SQL statements were provided.
+        """
+        items: OrderedDict[str, str] = OrderedDict()
+
+        if isinstance(statements, Mapping):
+            for key, statement in statements.items():
+                stmt = statement.strip()
+                if stmt:
+                    items[str(key)] = stmt
+        else:
+            for i, statement in enumerate(statements):
+                stmt = statement.strip()
+                if stmt:
+                    items[str(i)] = stmt
+
+        if not items:
+            raise ValueError("No non-empty SQL statements were provided.")
+
+        substitutions, owned_staging = self._stage_temporary_tables(
+            temporary_tables,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+
+        if substitutions:
+            items = OrderedDict(
+                (key, _apply_temporary_table_aliases(stmt, substitutions))
+                for key, stmt in items.items()
+            )
+
+        results: OrderedDict[str, StatementResult] = OrderedDict()
+
+        if parallel:
+            for key, statement in items.items():
+                results[key] = self.execute(
+                    statement,
+                    row_limit=row_limit,
+                    catalog_name=catalog_name,
+                    schema_name=schema_name,
+                    wait=False,
+                    raise_error=raise_error,
+                    engine=engine,
+                    warehouse_id=warehouse_id,
+                    warehouse_name=warehouse_name,
+                    byte_limit=byte_limit,
+                    cache_for=cache_for,
+                    spark_session=spark_session,
+                )
+
+            if owned_staging:
+                for result in results.values():
+                    result.attach_temporary_tables(owned_staging)
+
+            return StatementResultBatch(results=results).wait(wait=wait, raise_error=raise_error)
+
+        keys = list(items.keys())
+
+        for key in keys[:-1]:
+            results[key] = self.execute(
+                items[key],
+                row_limit=row_limit,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                wait=True,
+                raise_error=raise_error,
+                engine=engine,
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name,
+                byte_limit=byte_limit,
+                cache_for=cache_for,
+                spark_session=spark_session,
+            )
+
+        last_key = keys[-1]
+        results[last_key] = self.execute(
+            items[last_key],
+            row_limit=row_limit,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            wait=wait,
+            raise_error=raise_error,
+            engine=engine,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
+            byte_limit=byte_limit,
+            cache_for=cache_for,
+            spark_session=spark_session,
+        )
+
+        if owned_staging:
+            for result in results.values():
+                result.attach_temporary_tables(owned_staging)
+                result._maybe_cleanup_temporary_tables()
+
+        batch = StatementResultBatch(results=results)
+
+        return batch
+
     def execute(
         self,
         statement: str,
         *,
-        row_limit: Optional[int] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        row_limit: int | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         engine: Optional[Literal["spark", "api"]] = None,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
-        byte_limit: Optional[int] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        byte_limit: int | None = None,
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementResult:
         """
         Execute a SQL statement through Spark or the Databricks SQL API.
@@ -397,6 +667,14 @@ class SQLEngine(DatabricksService):
                 Optional TTL for statement result caching.
             spark_session:
                 Explicit SparkSession override.
+            temporary_tables:
+                Optional mapping of alias → :class:`StagingPath` or tabular
+                data. Aliases referenced in ``statement`` as ``{alias}`` are
+                replaced with the corresponding ``parquet.`<path>``` source
+                clause. Tabular values are materialized to a fresh staging
+                path via Parquet. Engine-owned staging paths are attached to
+                the returned ``StatementResult`` and cleaned up lazily once
+                it reaches a terminal state.
 
         Returns:
             A `StatementResult` wrapping either a Spark result or a warehouse API
@@ -407,6 +685,17 @@ class SQLEngine(DatabricksService):
                 If Spark execution is requested and no SparkSession can be
                 resolved.
         """
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
+
+        substitutions, owned_staging = self._stage_temporary_tables(
+            temporary_tables,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+        if substitutions:
+            statement = _apply_temporary_table_aliases(statement, substitutions)
+
         if not engine:
             spark_session = (
                 PyEnv.spark_session(
@@ -455,7 +744,13 @@ class SQLEngine(DatabricksService):
                 statement_id="SparkSQL",
                 disposition=Disposition.EXTERNAL_LINKS,
             )
-            result.persist(data=df)
+            if owned_staging:
+                # Spark is lazy; materialize to Arrow before the staging
+                # parquet files get cleaned up, otherwise the DataFrame
+                # would read from files that no longer exist.
+                result.persist(mode="arrow", data=df.toArrow())
+            else:
+                result.persist(data=df)
         else:
             wh = self.warehouse(
                 warehouse_id=warehouse_id,
@@ -474,6 +769,10 @@ class SQLEngine(DatabricksService):
                 row_limit=row_limit,
             )
 
+        if owned_staging:
+            result.attach_temporary_tables(owned_staging)
+            result._maybe_cleanup_temporary_tables()
+
         if cache_for is not None:
             self._cached_queries.set(
                 key=statement,
@@ -485,11 +784,11 @@ class SQLEngine(DatabricksService):
 
     def table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
     ) -> Table:
         """
         Resolve a table handle.
@@ -529,10 +828,11 @@ class SQLEngine(DatabricksService):
         ],
         *,
         mode: SaveMode | str | None = None,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        schema_mode: SaveMode | str | None = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -563,6 +863,8 @@ class SQLEngine(DatabricksService):
                 and other project-supported convertible types.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             location:
                 Fully qualified destination table.
             catalog_name:
@@ -629,6 +931,7 @@ class SQLEngine(DatabricksService):
                 schema_name=schema_name,
                 table_name=table_name,
                 mode=mode,
+                schema_mode=schema_mode,
                 cast_options=cast_options,
                 overwrite_schema=overwrite_schema,
                 match_by=match_by,
@@ -650,6 +953,7 @@ class SQLEngine(DatabricksService):
             schema_name=schema_name,
             table_name=table_name,
             mode=mode,
+            schema_mode=schema_mode,
             cast_options=cast_options,
             overwrite_schema=overwrite_schema,
             match_by=match_by,
@@ -667,11 +971,12 @@ class SQLEngine(DatabricksService):
     def arrow_insert_into(
         self,
         data,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         mode: SaveMode | str | None = None,
+        schema_mode: SaveMode | str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -721,6 +1026,8 @@ class SQLEngine(DatabricksService):
                 Table name override.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             cast_options:
                 Casting rules used to align staged data to the destination
                 schema.
@@ -751,6 +1058,8 @@ class SQLEngine(DatabricksService):
             None.
         """
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
 
         table = Table.parse(
             obj=location if table is None else table,
@@ -763,15 +1072,17 @@ class SQLEngine(DatabricksService):
         if mode == SaveMode.OVERWRITE:
             table.delete(wait=True, raise_error=False)
 
-        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
-        location = table.full_name(safe=True)
-        catalog_name, schema_name = table.catalog_name, table.schema_name
-        existing_schema = table.arrow_schema
+        if mode == SaveMode.OVERWRITE:
+            table.delete(wait=True, raise_error=False)
 
-        cast_options = CastOptions.check_arg(
-            options=cast_options,
-            target_field=existing_schema,
+        table = table.create(
+            data,
+            mode=schema_mode,
+            primary_keys=primary_keys, foreign_keys=foreign_keys
         )
+        location = table.full_name(safe=True)
+        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
+        existing_schema = table.data_schema
 
         logger.debug("Inserting %s into %s", type(data), location)
 
@@ -779,25 +1090,25 @@ class SQLEngine(DatabricksService):
         if temp_volume_path is None:
             staging = StagingPath.for_table(
                 client=self.client,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
+                catalog_name=table.catalog_name,
+                schema_name=table.schema_name,
                 table_name=table.table_name,
                 max_lifetime=3600,
             )
             staging.register_shutdown_cleanup()
+            staging.write_table(data, cast_options=cast_options)
             temp_volume_path = staging.path
         else:
             temp_volume_path = DatabricksPath.parse(obj=temp_volume_path, client=self.client)
+            temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
 
-        temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
+            with BytesIO() as buffer:
+                mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
+                mio.write_table(data, options=ParquetOptions(cast=cast_options))
+                mio.buffer.seek(0)
+                temp_volume_path.write_bytes(mio.buffer.memoryview())
 
-        with BytesIO() as buffer:
-            mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
-            mio.write_table(data, options=ParquetOptions(cast=cast_options))
-            mio.buffer.seek(0)
-            temp_volume_path.write_bytes(mio.buffer.memoryview())
-
-        columns = list(existing_schema.names)
+        columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
 
         statements: list[str] = []
@@ -928,10 +1239,11 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         data: Any,
         *,
         mode: SaveMode | str | None = None,
-        location: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        schema_mode: SaveMode | str | None = None,
+        location: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
@@ -974,6 +1286,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 Input data convertible to a Spark DataFrame.
             mode:
                 Save mode controlling append / overwrite / merge semantics.
+            schema_mode:
+                Schema mode to merge with current target schema
             location:
                 Fully qualified destination table.
             catalog_name:
@@ -1024,6 +1338,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         )
 
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
+        catalog_name = catalog_name or self.catalog_name
+        schema_name = schema_name or self.schema_name
 
         if table is None:
             table = self.table(
@@ -1033,18 +1349,20 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
                 table_name=table_name,
             )
 
-        # OVERWRITE: drop before background thread so the slot is freed
+        # TODO: Fix async databricks notebook
+        wait = True if PyEnv.in_databricks() else wait
+
+        # OVERWRITE: drop before the background thread so the slot is freed
         # synchronously and callers can re-create the table immediately.
         if mode == SaveMode.OVERWRITE:
             table.delete(wait=True, raise_error=False)
 
-        table = table.ensure_created(data, primary_keys=primary_keys, foreign_keys=foreign_keys)
-
-        existing_schema = table.arrow_schema
-        cast_options = CastOptions.check_arg(
-            options=cast_options,
-            target_field=existing_schema,
+        table = table.ensure_created(
+            data,
+            schema_mode=schema_mode,
+            primary_keys=primary_keys, foreign_keys=foreign_keys
         )
+        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
         data_df = any_to_spark_dataframe(data, cast_options)
         target = table.delta_spark()
 
@@ -1143,11 +1461,11 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
     def drop_table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> None:
@@ -1182,10 +1500,10 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         self,
         definition: Union[pa.Field, pa.Schema, Any],
         *,
-        full_name: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        full_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
         **kwargs,
@@ -1247,4 +1565,3 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             foreign_keys=foreign_keys,
             **kwargs,
         )
-

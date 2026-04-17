@@ -23,13 +23,12 @@ from databricks.sdk.service.sql import (
     StatementStatus,
     ExternalLink,
 )
-
-from yggdrasil.arrow.cast import cast_arrow_tabular
 from yggdrasil.concurrent.threading import JobPoolExecutor, Job
+from yggdrasil.data import Schema, Field
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
-from .exceptions import SqlStatementError
-from .types import column_info_to_arrow_field
+
+from .exceptions import SQLError
 from ..client import DatabricksService
 
 if TYPE_CHECKING:
@@ -52,8 +51,8 @@ __all__ = ["StatementResult"]
 
 @dataclass(frozen=True)
 class StatementResult(BaseStatementResult, DatabricksService):
-    warehouse_id: Optional[str] = None
-    statement_id: Optional[str] = None
+    warehouse_id: str | None = None
+    statement_id: str | None = None
     disposition: Optional[Disposition] = None
 
     _response: Optional[StatementResponse] = field(default=None, repr=False, compare=False, hash=False)
@@ -153,7 +152,7 @@ class StatementResult(BaseStatementResult, DatabricksService):
     def raise_for_status(self) -> "StatementResult":
         """Raise `SqlStatementError` if the statement is in a failed state."""
         if self.failed:
-            error = SqlStatementError.from_statement(self)
+            error = SQLError.from_statement(self)
 
             raise error
         return self
@@ -177,27 +176,20 @@ class StatementResult(BaseStatementResult, DatabricksService):
         self.wait()
         return self.response.result
 
-    def make_arrow_schema(self) -> pa.Schema:
-        """Return the Arrow schema for the result.
-
-        Strategy:
-        - If cached Arrow table exists, reuse its schema.
-        - If Spark DF exists, convert Spark schema → Arrow schema.
-        - Else, derive schema from the Databricks SQL manifest.
-
-        Returns
-        -------
-        pyarrow.Schema
-            Arrow schema with metadata including source and statement id.
-        """
+    def make_data_schema(self) -> Schema:
         manifest = self.manifest
-        metadata = {"source": "databricks-sql", "statement_id": self.statement_id or ""}
+        metadata = {
+            "engine": "databricks-sql",
+            "statement_id": self.statement_id or ""
+        }
 
         if manifest is None:
             return pa.schema([], metadata=metadata)
 
-        fields = [column_info_to_arrow_field(c) for c in manifest.schema.columns]
-        return pa.schema(fields, metadata=metadata)
+        return Schema.from_any_fields(
+            [Field.from_databricks(c) for c in (manifest.schema.columns or [])],
+            metadata=metadata
+        )
 
     # ----------------------------
     # External links
@@ -253,8 +245,8 @@ class StatementResult(BaseStatementResult, DatabricksService):
     def _to_arrow_batches(
         self,
         max_workers: int = 4,
-        max_in_flight: Optional[int] = None,
-        batch_size: Optional[int] = None,
+        max_in_flight: int | None = None,
+        batch_size: int | None = None,
         maintain_order: bool = False,
     ) -> Iterator[pa.RecordBatch]:
         """Stream results as Arrow RecordBatches.
@@ -263,9 +255,9 @@ class StatementResult(BaseStatementResult, DatabricksService):
         ----------
         max_workers : int
             Maximum number of parallel workers for external chunk downloads.
-        max_in_flight : Optional[int]
+        max_in_flight : int | None
             Max number of futures allowed in-flight (backpressure). If None, executor default.
-        batch_size : Optional[int]
+        batch_size : int | None
             Optional chunk size (rows) when splitting cached tables into batches.
             Does not change batch sizing of remote chunks (those are server-defined).
         maintain_order : bool
@@ -330,7 +322,7 @@ class StatementResult(BaseStatementResult, DatabricksService):
                     pipc.open_stream(src)
                     .read_all()
                 )
-                casted = cast_arrow_tabular(tb, cast_options)
+                casted = cast_options.cast_arrow_tabular(tb)
                 return casted.to_batches()
 
         def jobs() -> Iterable[Job]:
@@ -354,8 +346,8 @@ class StatementResult(BaseStatementResult, DatabricksService):
         self,
         *,
         max_workers: int = 4,
-        max_in_flight: Optional[int] = None,
-        batch_size: Optional[int] = None,
+        max_in_flight: int | None = None,
+        batch_size: int | None = None,
         schema: Optional[pa.Schema] = None,
         maintain_order: bool = False,
         stream: bool = True,
@@ -382,8 +374,8 @@ class StatementResult(BaseStatementResult, DatabricksService):
         self,
         *,
         max_workers: int = 4,
-        max_in_flight: Optional[int] = None,
-        batch_size: Optional[int] = None,
+        max_in_flight: int | None = None,
+        batch_size: int | None = None,
         maintain_order: bool = False,
     ):
         return self.to_arrow_reader(

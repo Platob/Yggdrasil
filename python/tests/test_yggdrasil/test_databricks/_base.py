@@ -34,7 +34,7 @@ __all__ = ["DatabricksCase"]
 
 _SKIP_MSG = (
     "Integration tests require DATABRICKS_HOST to be set. "
-    "Example: DATABRICKS_HOST=https://dbc-82edd6f4-1e97.cloud.databricks.com/"
+    "Example: DATABRICKS_HOST=https://dbc-xxx.cloud.databricks.com/"
 )
 
 
@@ -54,8 +54,8 @@ class DatabricksCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not os.environ.get("DATABRICKS_HOST"):
-            raise unittest.SkipTest(_SKIP_MSG)
+        # if not os.environ.get("DATABRICKS_HOST"):
+        #     raise unittest.SkipTest(_SKIP_MSG)
 
         from yggdrasil.databricks.workspaces.workspace import Workspace
 

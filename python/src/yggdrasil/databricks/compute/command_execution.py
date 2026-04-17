@@ -79,7 +79,7 @@ _MODULE_UPLOAD_CACHE_LOCK = RLock()
 @dataclass
 class CommandExecution:
     context: ExecutionContext
-    command_id: Optional[str] = None
+    command_id: str | None = None
 
     language: Optional[Language] = field(default=None, repr=False, compare=False, hash=False)
     command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)

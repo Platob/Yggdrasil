@@ -26,8 +26,8 @@ class MediaType:
 
     def __repr__(self) -> str:
         if self.codec is None:
-            return f"<MediaType {self.mime_type.value}>"
-        return f"<MediaType {self.mime_type.value} + {self.codec.name}>"
+            return f"MediaType({self.mime_type!r})"
+        return f"MediaType({self.mime_type!r} + {self.codec!r})"
 
     @classmethod
     def parse(

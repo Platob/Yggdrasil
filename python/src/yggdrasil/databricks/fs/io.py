@@ -69,7 +69,7 @@ class DatabricksIO(ABC, IO):
         self,
         path: "DatabricksPath",
         mode: str,
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
         position: int = 0,
         buffer: Optional[_Buffer] = None,
     ):
@@ -88,7 +88,7 @@ class DatabricksIO(ABC, IO):
         cls,
         path: "DatabricksPath",
         mode: str,
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
         position: int = 0,
         buffer: Optional[_Buffer] = None,
     ) -> "DatabricksIO":
@@ -495,9 +495,9 @@ class DatabricksVolumeIO(DatabricksIO):
         data: Union[bytes, bytearray, memoryview, BinaryIO],
         *,
         overwrite: bool = True,
-        part_size: Optional[int] = None,
+        part_size: int | None = None,
         use_parallel: bool = True,
-        parallelism: Optional[int] = None,
+        parallelism: int | None = None,
     ):
         sdk = self.workspace.workspace_client()
         full_path = self.path.full_path()

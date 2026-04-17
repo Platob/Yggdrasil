@@ -55,10 +55,10 @@ class Columns(DatabricksService):
             print(c.name)
     """
 
-    catalog_name: Optional[str] = None
-    schema_name: Optional[str] = None
-    table_name: Optional[str] = None
-    column_name: Optional[str] = None
+    catalog_name: str | None = None
+    schema_name: str | None = None
+    table_name: str | None = None
+    column_name: str | None = None
 
     # -------------------------------------------------------------------------
     # Parsing
@@ -145,12 +145,12 @@ class Columns(DatabricksService):
 
     def column(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        column_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        column_name: str | None = None,
     ) -> "Column":
         """Resolve and return a single :class:`~yggdrasil.databricks.sql.column.Column`.
 
@@ -180,11 +180,11 @@ class Columns(DatabricksService):
 
     def list_columns(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
     ) -> list["Column"]:
         """Return all columns for a table.
 

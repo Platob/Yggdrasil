@@ -652,11 +652,30 @@ def cast_polars_array_to_list(
 def cast_polars_array(
     array: Union[pl.Series, pl.Expr],
     options: Optional[CastOptions] = None,
-    parent_name: Optional[str] = None,
+    parent_name: str | None = None,
+    to_expr: bool = False,
+) -> Union[pl.Series, pl.Expr]:
+    """Cast a Polars Series or Expression using Arrow casting rules as source of truth.
+    
+    This is now a thin wrapper around Field.cast_polars_array.
+    """
+    options = CastOptions.check(options)
+    if options.target_field is None and options.field_name is None:
+        return _cast_polars_array_impl(array, options=options, parent_name=parent_name, to_expr=to_expr)
+
+    from yggdrasil.data.data_field import Field
+    target_field = Field.from_any(options.target_field or options.field_name)
+    return target_field.cast_polars_array(array, options=options, to_expr=to_expr)
+
+
+def _cast_polars_array_impl(
+    array: Union[pl.Series, pl.Expr],
+    options: Optional[CastOptions] = None,
+    parent_name: str | None = None,
     to_expr: bool = False,
 ) -> Union[pl.Series, pl.Expr]:
     """Cast a Polars Series / Expr to the dtype described by *options*."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
     tpf = options.target_polars_field
     need_fill = options.need_nullability_fill(source_obj=array)
 
@@ -728,7 +747,18 @@ def cast_polars_array(
     else:
         safe = options.safe
 
-        if spdt.is_temporal() and (tpdt.is_numeric() or tpdt.is_integer() or tpdt.is_float()):
+        # Unsafe string-to-numeric truncation
+        if not safe and spdt == pl.String and (tpdt.is_numeric() or tpdt.is_integer()):
+             # Polars .cast(strict=False) on "1.9" -> Int results in null.
+             # To truncate like users expect: cast to Float then to Int.
+             if is_expr:
+                 array = array.cast(pl.Float64, strict=False).cast(tpdt, strict=False)
+             elif to_expr:
+                 array = pl.col(col_name).cast(pl.Float64, strict=False).cast(tpdt, strict=False)
+             else:
+                 array = array.cast(pl.Float64, strict=False).cast(tpdt, strict=False)
+        
+        elif spdt.is_temporal() and (tpdt.is_numeric() or tpdt.is_integer() or tpdt.is_float()):
             if spdt.__class__ is pl.Time:
                 if is_expr:
                     array = (
@@ -789,9 +819,29 @@ def cast_polars_frame(
     return cast_polars_dataframe(df, options)
 
 @register_converter(pl.DataFrame, pl.DataFrame)
-def cast_polars_dataframe(df: pl.DataFrame, options: Optional[CastOptions] = None) -> pl.DataFrame:
+def cast_polars_dataframe(
+    df: pl.DataFrame,
+    options: Optional[CastOptions] = None,
+) -> pl.DataFrame:
+    """Cast a Polars DataFrame to the schema described by *options*.
+    
+    This is now a thin wrapper around Schema.cast_polars_frame.
+    """
+    options = CastOptions.check(options)
+    if options.target_arrow_schema is None and options.target_field is None:
+        return _cast_polars_dataframe_impl(df, options=options)
+
+    from yggdrasil.data.schema import Schema
+    target_schema = Schema.from_any(options.target_field or options.target_arrow_schema)
+    return target_schema.cast_polars_frame(df, options=options)
+
+
+def _cast_polars_dataframe_impl(
+    df: pl.DataFrame,
+    options: Optional[CastOptions] = None,
+) -> pl.DataFrame:
     """Cast a Polars DataFrame to a target Arrow schema (expr-first on eager DF)."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
     options.check_source(df)
     target_schema = options.target_arrow_schema
 
@@ -870,9 +920,29 @@ def default_polars_array(is_expr: bool, num_rows: int, arrow_field: pa.Field, dt
 
 
 @register_converter(pl.LazyFrame, pl.LazyFrame)
-def cast_polars_lazyframe(lf: pl.LazyFrame, options: Optional[CastOptions] = None) -> pl.LazyFrame:
+def cast_polars_lazyframe(
+    lf: pl.LazyFrame,
+    options: Optional[CastOptions] = None,
+) -> pl.LazyFrame:
+    """Cast a Polars LazyFrame to the schema described by *options*.
+    
+    This is now a thin wrapper around Schema.cast_polars_frame.
+    """
+    options = CastOptions.check(options)
+    if options.target_arrow_schema is None and options.target_field is None:
+        return _cast_polars_lazyframe_impl(lf, options=options)
+
+    from yggdrasil.data.schema import Schema
+    target_schema = Schema.from_any(options.target_field or options.target_arrow_schema)
+    return target_schema.cast_polars_frame(lf, options=options)
+
+
+def _cast_polars_lazyframe_impl(
+    lf: pl.LazyFrame,
+    options: Optional[CastOptions] = None,
+) -> pl.LazyFrame:
     """Cast a Polars LazyFrame to a target Arrow schema — fully lazy."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
     target_schema = options.target_arrow_schema
 
     if target_schema is None:
@@ -942,7 +1012,7 @@ def cast_polars_lazyframe(lf: pl.LazyFrame, options: Optional[CastOptions] = Non
 @register_converter(pl.LazyFrame, pa.Table)
 def polars_dataframe_to_arrow_table(data: pl.DataFrame | pl.LazyFrame, options: Optional[CastOptions] = None) -> pa.Table:
     """Convert a Polars DataFrame to a ``pyarrow.Table``."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
     if options.target_field is not None:
         data = cast_polars_frame(data, options)
@@ -962,7 +1032,7 @@ def polars_dataframe_to_arrow_table(data: pl.DataFrame | pl.LazyFrame, options: 
 @register_converter(pa.Table, pl.DataFrame)
 def arrow_table_to_polars_dataframe(table: pa.Table, options: Optional[CastOptions] = None) -> pl.DataFrame:
     """Convert a ``pyarrow.Table`` to a Polars DataFrame."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
     if options.target_arrow_schema is not None:
         table = cast_arrow_tabular(table, options)
@@ -974,7 +1044,7 @@ def arrow_table_to_polars_dataframe(table: pa.Table, options: Optional[CastOptio
 def any_to_polars_dataframe(obj: Any, options: Optional[CastOptions] = None) -> pl.DataFrame:
     """Convert any supported object to a Polars DataFrame."""
     if not isinstance(obj, pl.DataFrame):
-        options = CastOptions.check_arg(options)
+        options = CastOptions.check(options)
 
         if obj is None:
             return pl.DataFrame([], schema=options.target_polars_schema)
@@ -1017,53 +1087,9 @@ def arrow_type_to_polars_type(
     options: Optional[dict] = None,
 ) -> pl.DataType:
     """Convert a ``pyarrow.DataType`` to a Polars dtype."""
-    dtype = ARROW_TO_POLARS.get(arrow_type)
-    if dtype is not None:
-        return dtype
+    from yggdrasil.data.types.base import DataType
 
-    if pat.is_timestamp(arrow_type):
-        unit = arrow_type.unit if arrow_type.unit != "s" else "ms"
-        return pl.Datetime(time_unit=unit, time_zone=arrow_type.tz)
-
-    if pat.is_date(arrow_type):
-        return pl.Date()
-
-    if pat.is_time(arrow_type):
-        return pl.Time()
-
-    if pat.is_duration(arrow_type):
-        unit = arrow_type.unit if arrow_type.unit != "s" else "ms"
-        return pl.Duration(time_unit=unit)
-
-    if pat.is_decimal(arrow_type):
-        return pl.Decimal(precision=arrow_type.precision, scale=arrow_type.scale)
-
-    if is_arrow_type_binary_like(arrow_type):
-        return pl.Binary()
-
-    if is_arrow_type_string_like(arrow_type):
-        return pl.Utf8()
-
-    if pat.is_dictionary(arrow_type):
-        return pl.Categorical()
-
-    if pat.is_map(arrow_type):
-        key = arrow_type_to_polars_type(arrow_type.key_type)
-        val = arrow_type_to_polars_type(arrow_type.item_type)
-        return pl.List(pl.Struct([pl.Field("key", key), pl.Field("value", val)]))
-
-    if is_arrow_type_list_like(arrow_type):
-        return pl.List(arrow_type_to_polars_type(arrow_type.value_type))
-
-    if pat.is_struct(arrow_type):
-        return pl.Struct([pl.Field(f.name, arrow_type_to_polars_type(f.type)) for f in arrow_type])
-
-    raise TypeError(
-        f"No Polars equivalent for Arrow type {arrow_type!r} (id={arrow_type.id}).\n"
-        f"  Hint: Register a custom converter via "
-        f"register_converter(pa.DataType, pl.DataType), or cast the Arrow column "
-        f"to a supported type before conversion."
-    )
+    return DataType.from_arrow_type(arrow_type).to_polars()
 
 
 @register_converter(pa.Field, pl.Field)
@@ -1100,50 +1126,9 @@ def arrow_schema_to_polars_schema(schema: pa.Schema, options: Optional[dict] = N
 @register_converter(pl.DataType, pa.DataType)
 def polars_type_to_arrow_type(pl_type: Union[pl.DataType, type], options: Optional[dict] = None) -> pa.DataType:
     """Convert a Polars dtype (class or instance) to a ``pyarrow.DataType``."""
-    existing = POLARS_BASE_TO_ARROW.get(pl_type) or POLARS_BASE_TO_ARROW.get(type(pl_type))
-    if existing is not None:
-        return existing
+    from yggdrasil.data.types.base import DataType
 
-    if pl_type.is_nested():
-        if isinstance(pl_type, pl.Array):
-            return pa.list_(
-                polars_type_to_arrow_type(pl_type.inner),
-                list_size=pl_type.shape[0],  # type: ignore
-            )
-
-        if isinstance(pl_type, pl.List):
-            return pa.list_(polars_type_to_arrow_type(pl_type.inner))
-
-        if isinstance(pl_type, pl.Struct):
-            return pa.struct([polars_field_to_arrow_field(f) for f in pl_type.fields])
-    else:
-        if pl_type.is_temporal():
-            if isinstance(pl_type, pl.Datetime):
-                return pa.timestamp(pl_type.time_unit, tz=pl_type.time_zone)
-
-            if isinstance(pl_type, pl.Duration):
-                return pa.duration(pl_type.time_unit)
-
-            if isinstance(pl_type, pl.Time):
-                return pa.time64("ns")
-
-        if pl_type.is_decimal():
-            p, s = pl_type.precision, pl_type.scale
-            return pa.decimal128(p, s) if (p is None or p <= 38) else pa.decimal256(p, s)
-
-        if isinstance(pl_type, (pl.Categorical, pl.Enum)):
-            return pa.dictionary(index_type=pa.int32(), value_type=pa.string())
-
-        if isinstance(pl_type, pl.Object):
-            return pa.string()
-
-    raise TypeError(
-        f"No Arrow equivalent for Polars dtype {pl_type!r} "
-        f"(class={type(pl_type).__name__}).\n"
-        f"  Hint: Register a custom converter via "
-        f"register_converter(pl.DataType, pa.DataType), or cast the Polars column "
-        f"to a supported dtype first (e.g. series.cast(pl.Utf8))."
-    )
+    return DataType.from_polars(pl_type).to_arrow()
 
 
 @register_converter(pl.Field, pa.Field)
@@ -1160,9 +1145,9 @@ def polars_field_to_arrow_field(field: pl.Field, options: Optional[CastOptions] 
 @register_converter(pl.Schema, pa.Field)
 def polars_schema_to_arrow_field(schema: pl.Schema, options: Optional[CastOptions] = None) -> pa.Field:
     """Convert a ``pl.Schema`` to a struct ``pyarrow.Field``."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
-    name = "root"
+    name = DEFAULT_FIELD_NAME
     nullable = True
     metadata = None
 
@@ -1228,7 +1213,7 @@ def polars_array_to_polars_field(array: Union[pl.Series, pl.Expr], options: Opti
 
 def any_polars_to_arrow_field(obj: Any, options: Optional[CastOptions] = None) -> pa.Field:
     """Convert any Polars object to a ``pyarrow.Field``."""
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
     if options.target_arrow_field is not None:
         return options.target_arrow_field
@@ -1240,15 +1225,15 @@ def any_polars_to_arrow_field(obj: Any, options: Optional[CastOptions] = None) -
         if options.source_field is not None:
             return options.source_field.name, options.source_field.nullable, options.source_field.metadata
 
-        return "root", True, None
+        return DEFAULT_FIELD_NAME, True, None
 
     if isinstance(obj, pl.DataFrame):
         fields = [polars_array_to_arrow_field(obj.to_series(i)) for i in range(obj.shape[1])]
-        return pa.field("root", pa.struct(fields), metadata={"__class__": "polars.DataFrame"})
+        return pa.field(DEFAULT_FIELD_NAME, pa.struct(fields), metadata={"__class__": "polars.DataFrame"})
 
     if isinstance(obj, pl.LazyFrame):
         fields = [polars_field_to_arrow_field(pl.Field(name=n, dtype=d)) for n, d in obj.schema.items()]
-        return pa.field("root", pa.struct(fields), metadata={"__class__": "polars.LazyFrame"})
+        return pa.field(DEFAULT_FIELD_NAME, pa.struct(fields), metadata={"__class__": "polars.LazyFrame"})
 
     if isinstance(obj, (pl.Series, pl.Expr)):
         return polars_array_to_arrow_field(obj)

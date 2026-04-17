@@ -10,17 +10,18 @@ if TYPE_CHECKING:
     from .statement_result import StatementResult
 
 __all__ = [
+    "SQLError",
     "SqlStatementError"
 ]
 
 
 @dataclass(frozen=True)
-class SqlStatementError(DatabricksError):
+class SQLError(DatabricksError):
     statement_id: str
     state: StatementState
     message: str
     error_code: ServiceErrorCode
-    url: Optional[str] = None
+    url: str | None = None
 
     def __str__(self) -> str:
         return f"[%s][%s][%s]: %s" % (
@@ -34,7 +35,7 @@ class SqlStatementError(DatabricksError):
         return f"SqlStatementError(url={self.url!r}, message={self.message!r})"
 
     @classmethod
-    def from_statement(cls, stmt: "StatementResult") -> "SqlStatementError":
+    def from_statement(cls, stmt: "StatementResult") -> "SQLError":
         statement_id = stmt.statement_id or "<unknown>"
         state = stmt.state
         status = stmt.status
@@ -54,3 +55,6 @@ class SqlStatementError(DatabricksError):
             error_code=error_code,
             url=url
         )
+
+
+SqlStatementError = SQLError

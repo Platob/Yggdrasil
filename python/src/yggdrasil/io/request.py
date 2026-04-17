@@ -8,7 +8,9 @@ from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.data import any_to_datetime, field as schema_field, schema
+from yggdrasil.data import any_to_datetime
+from yggdrasil.data.data_field import field as schema_field
+from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io import MediaType, MimeTypes
 from .buffer import BytesIO
@@ -351,7 +353,7 @@ REQUEST_SCHEMA["request_sent_at"] = schema_field(
 
 REQUEST_ARROW_SCHEMA: pa.Schema = REQUEST_SCHEMA.to_arrow_schema()
 
-_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_SCHEMA.names)
+_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_SCHEMA.field_names())
 _PROMOTED_REQUEST_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
     ("Host", "request_host"),
     ("User-Agent", "request_user_agent"),
@@ -672,12 +674,12 @@ class PreparedRequest:
     def copy(
         self,
         *,
-        method: Optional[str] = None,
+        method: str | None = None,
         url: URL | str | None = None,
         headers: Optional[Mapping[str, str]] = None,
         buffer: Optional[BytesIO] = ...,
         tags: Optional[Mapping[str, str]] = None,
-        sent_at: Optional[int] = None,
+        sent_at: int | None = None,
         before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
         prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
         local_cache_config: Optional["CacheConfig"] = ...,

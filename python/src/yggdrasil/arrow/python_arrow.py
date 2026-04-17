@@ -288,6 +288,20 @@ def _arrow_type_from_hint(hint):
 
         return _struct_from_tuple(args)
 
+    if hasattr(hint, "to_arrow") and callable(hint.to_arrow):
+        try:
+            return hint.to_arrow()
+        except Exception:
+            pass
+
+    # Basic string-based duck typing for yggdrasil types if we can't import them
+    if hasattr(hint, "__module__") and hint.__module__.startswith("yggdrasil."):
+        if hint.__name__ == "DataType" or any(base.__name__ == "DataType" for base in getattr(hint, "__mro__", [])):
+             # If it's the class itself, we might not be able to do much without an instance,
+             # but usually it's a DataType instance.
+             # If it's the class, it's probably not what was intended as a hint.
+             pass
+
     raise TypeError(f"Cannot determine Arrow type for {hint!r}")
 
 

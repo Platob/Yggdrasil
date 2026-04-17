@@ -84,9 +84,9 @@ class HTTPSession(Session):
     def to_browser(
         self,
         *,
-        user_agent: Optional[str] = None,
+        user_agent: str | None = None,
         accept_language: str = "en-US,en;q=0.9",
-        ua_seed: Optional[int] = None,
+        ua_seed: int | None = None,
     ) -> "BrowserHTTPSession":
         """Return a :class:`~yggdrasil.io.http_.browser.BrowserHTTPSession`
         that inherits this session's connection settings.

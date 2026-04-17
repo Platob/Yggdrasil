@@ -15,7 +15,7 @@ __all__ = ["Genie"]
 class Genie(DatabricksService):
     """High-level wrapper around Databricks Workspace Genie APIs."""
 
-    default_space_id: Optional[str] = None
+    default_space_id: str | None = None
 
     @property
     def api(self):
@@ -25,8 +25,8 @@ class Genie(DatabricksService):
         self,
         content: str,
         *,
-        space_id: Optional[str] = None,
-        conversation_id: Optional[str] = None,
+        space_id: str | None = None,
+        conversation_id: str | None = None,
         timeout_seconds: float = 120.0,
         poll_interval_seconds: float = 1.0,
     ) -> GenieAnswer:
@@ -63,7 +63,7 @@ class Genie(DatabricksService):
             message=message,
         )
 
-    def start_conversation(self, content: str, *, space_id: Optional[str] = None) -> GenieSpace:
+    def start_conversation(self, content: str, *, space_id: str | None = None) -> GenieSpace:
         resolved_space_id = space_id or self.default_space_id
         if not resolved_space_id:
             raise ValueError("space_id is required unless default_space_id is set")
@@ -113,9 +113,9 @@ class Genie(DatabricksService):
         *,
         warehouse_id: str,
         serialized_space: str,
-        description: Optional[str] = None,
-        parent_path: Optional[str] = None,
-        title: Optional[str] = None,
+        description: str | None = None,
+        parent_path: str | None = None,
+        title: str | None = None,
     ):
         return self.api.create_space(
             warehouse_id=warehouse_id,
@@ -132,10 +132,10 @@ class Genie(DatabricksService):
         self,
         *,
         space_id: str,
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        serialized_space: Optional[str] = None,
-        warehouse_id: Optional[str] = None,
+        title: str | None = None,
+        description: str | None = None,
+        serialized_space: str | None = None,
+        warehouse_id: str | None = None,
     ):
         return self.api.update_space(
             space_id=space_id,
@@ -265,7 +265,7 @@ class Genie(DatabricksService):
     def get_eval_run(self, *, space_id: str, eval_run_id: str):
         return self.api.genie_get_eval_run(space_id=space_id, eval_run_id=eval_run_id)
 
-    def list_eval_runs(self, *, space_id: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
+    def list_eval_runs(self, *, space_id: str, page_size: int | None = None, page_token: str | None = None):
         return self.api.genie_list_eval_runs(
             space_id=space_id,
             page_size=page_size,
@@ -277,8 +277,8 @@ class Genie(DatabricksService):
         *,
         space_id: str,
         eval_run_id: str,
-        page_size: Optional[int] = None,
-        page_token: Optional[str] = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
     ):
         return self.api.genie_list_eval_results(
             space_id=space_id,

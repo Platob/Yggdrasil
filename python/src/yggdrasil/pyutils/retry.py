@@ -55,11 +55,11 @@ def retry(
     tries: int = 3,
     delay: float = 0.5,
     backoff: float = 2.0,
-    max_delay: Optional[float] = None,
+    max_delay: float | None = None,
     jitter: Optional[Callable[[float], float]] = None,
     logger: Optional[logging.Logger] = None,
     reraise: bool = True,
-    timeout: Optional[float] = None,
+    timeout: float | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """
     Retry decorator that works for both sync and async functions.

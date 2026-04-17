@@ -1,15 +1,15 @@
 """Casting options for Arrow- and engine-aware conversions."""
+from dataclasses import dataclass
+from typing import Any, Optional, Union, TypeVar, TYPE_CHECKING
 
-import dataclasses
-from typing import Any, List, Optional, Union, TYPE_CHECKING, TypeVar
+import pyarrow as pa
 
-import yggdrasil.arrow as pa
-from yggdrasil.pickle.serde import ObjectSerde
+from yggdrasil.data.data_field import Field
+from yggdrasil.data.types.support import get_polars, get_spark_sql
 
 if TYPE_CHECKING:
     import polars
-    import pyspark
-    import pandas
+    import pyspark.sql as ps
 
 __all__ = [
     "CastOptions",
@@ -23,575 +23,281 @@ CastOptionsArg = Union[
     pa.DataType,
     pa.Field,
     pa.Schema,
+    "Any",
+    "Any",
     None,
 ]
 
 
-@dataclasses.dataclass
+@dataclass(frozen=True, slots=True)
 class CastOptions:
-    """Options controlling Arrow casting behavior.
-
-    Attributes
-    ----------
-    safe:
-        If True, only allow "safe" casts (delegated to pyarrow.compute.cast).
-    add_missing_columns:
-        If True, create default-valued columns/fields when the target schema
-        has fields missing in the source.
-    strict_match_names:
-        If True, only match fields/columns by exact name (case-sensitive).
-        If False, allows case-insensitive and positional matching.
-    allow_add_columns:
-        If True, allow additional columns beyond the target schema to remain.
-        If False, extra columns are dropped.
-    eager:
-        If True, enable eager casting behavior.
-    datetime_patterns:
-        Optional list of datetime parsing patterns.
-    merge:
-        If True, enable merge casting.
-    source_arrow_field:
-        Describes the source field/schema. Used to infer nullability behavior.
-    target_arrow_field:
-        Describes the target field/schema.
-    """
-
+    source_field: Optional[Field] = None
+    target_field: Optional[Field] = None
     safe: bool = False
-    add_missing_columns: bool = True
+    add_missing_fields: bool = True
+    arrow_memory_pool: Optional[pa.MemoryPool] = None
     strict_match_names: bool = False
+    add_missing_columns: bool = True
     allow_add_columns: bool = False
-    eager: bool = False
-    datetime_patterns: Optional[List[str]] = None
-    merge: bool = False
-
-    source_arrow_field: Optional[pa.Field] = None
-    _source_spark_field: Optional["pyspark.sql.types.StructField"] = dataclasses.field(
-        default=None, init=False, repr=False
-    )
-    _source_polars_field: Optional["polars.Field"] = dataclasses.field(
-        default=None, init=False, repr=False
+    datetime_formats: tuple[str, ...] = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
     )
 
-    target_arrow_field: Optional[pa.Field] = None
-    _target_spark_field: Optional["pyspark.sql.types.StructField"] = dataclasses.field(
-        default=None, init=False, repr=False
-    )
-    _target_polars_field: Optional["polars.Field"] = dataclasses.field(
-        default=None, init=False, repr=False
-    )
+    @property
+    def source_schema(self):
+        return self.source_field.to_schema() if self.source_field is not None else None
 
-    arrow_memory_pool: Optional[pa.MemoryPool] = dataclasses.field(
-        default=None, init=False, repr=False
-    )
+    @property
+    def target_schema(self):
+        return self.target_field.to_schema() if self.target_field is not None else None
 
-    def __init__(
-        self,
-        safe: bool = False,
-        add_missing_columns: bool = True,
-        strict_match_names: bool = False,
-        allow_add_columns: bool = False,
-        eager: bool = False,
-        datetime_patterns: Optional[List[str]] = None,
-        merge: bool = False,
-        source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-        target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-    ):
-        self.safe = safe
-        self.add_missing_columns = add_missing_columns
-        self.strict_match_names = strict_match_names
-        self.allow_add_columns = allow_add_columns
-        self.eager = eager
-        self.datetime_patterns = datetime_patterns
-        self.merge = merge
+    def __post_init__(self):
+        if self.source_field is not None:
+            object.__setattr__(
+                self, "source_field",
+                Field.from_(self.source_field)
+            )
 
-        # private caches — must exist before the setters fire
-        object.__setattr__(self, "source_arrow_field", None)
-        object.__setattr__(self, "_source_polars_field", None)
-        object.__setattr__(self, "_source_spark_field", None)
-        object.__setattr__(self, "target_arrow_field", None)
-        object.__setattr__(self, "_target_polars_field", None)
-        object.__setattr__(self, "_target_spark_field", None)
-        object.__setattr__(self, "arrow_memory_pool", None)
-
-        if source_field is not None:
-            self.source_field = source_field
-
-        if target_field is not None:
-            self.target_field = target_field
+        if self.target_field is not None:
+            object.__setattr__(
+                self, "target_field",
+                Field.from_(self.target_field)
+            )
 
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
 
     @classmethod
-    def safe_init(cls, **kwargs) -> "CastOptions":
-        """Deprecated alias — construct CastOptions(...) directly."""
-        return cls(**kwargs)
-
-    @classmethod
-    def check_arg(
+    def check(
         cls,
         options: CastOptionsArg = None,
-        source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-        target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
+        source: Any = None,
+        source_field: Optional[Field] = None,
+        target: Any = None,
+        target_field: Optional[Field] = None,
         **kwargs,
     ) -> "CastOptions":
+        if source is not None and source_field is None:
+            source_field = Field.from_(source)
+
+        if target is not None and target_field is None:
+            target_field = Field.from_(target)
+
         if isinstance(options, CastOptions):
             if kwargs or source_field is not None or target_field is not None:
-                return options.copy(source_field=source_field, target_field=target_field, **kwargs)
+                return options.copy(
+                    source_field=source_field,
+                    target_field=target_field,
+                    **kwargs
+                )
             return options
 
-        resolved_target = target_field if target_field is not None else options
-        return cls(source_field=source_field, target_field=resolved_target, **kwargs)
+        if isinstance(options, dict):
+            kwargs = {**options, **kwargs}
+
+        return cls(
+            source_field=source_field,
+            target_field=target_field,
+            **kwargs
+        )
 
     def copy(
         self,
-        safe: bool = False,
-        add_missing_columns: Optional[bool] = None,
-        strict_match_names: bool = False,
-        allow_add_columns: bool = False,
-        eager: bool = False,
-        datetime_patterns: Optional[List[str]] = None,
-        merge: bool = False,
-        source_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
-        target_field: Optional[Union[pa.Field, pa.Schema, pa.DataType]] = None,
+        source_field: Field | None = None,
+        target_field: Field | None = None,
+        safe: bool | None = None,
+        add_missing_columns: bool | None = None,
+        strict_match_names: bool | None = None,
+        add_missing_fields: bool | None = None,
+        datetime_formats: tuple[str, ...] | None = None,
+        arrow_memory_pool: pa.MemoryPool | None = None,
+        allow_add_columns: bool | None = None,
     ) -> "CastOptions":
         return CastOptions(
-            safe=self.safe or safe,
+            safe=self.safe if safe is None else safe,
+            source_field=self.source_field if source_field is None else Field.from_(source_field),
+            target_field=self.target_field if target_field is None else Field.from_(target_field),
+            add_missing_fields=self.add_missing_fields if add_missing_fields is None else add_missing_fields,
+            datetime_formats=self.datetime_formats if datetime_formats is None else datetime_formats,
+            arrow_memory_pool=self.arrow_memory_pool if arrow_memory_pool is None else arrow_memory_pool,
+            strict_match_names=self.strict_match_names if strict_match_names is None else strict_match_names,
             add_missing_columns=self.add_missing_columns if add_missing_columns is None else add_missing_columns,
-            strict_match_names=self.strict_match_names or strict_match_names,
-            allow_add_columns=self.allow_add_columns or allow_add_columns,
-            eager=self.eager or eager,
-            datetime_patterns=self.datetime_patterns or datetime_patterns,
-            merge=self.merge or merge,
-            source_field=source_field if source_field is not None else self.source_arrow_field,
-            target_field=target_field if target_field is not None else self.target_arrow_field,
+            allow_add_columns=self.allow_add_columns if allow_add_columns is None else allow_add_columns,
         )
-
-    # ------------------------------------------------------------------
-    # Source field
-    # ------------------------------------------------------------------
 
     def check_source(self, obj: Any) -> "CastOptions":
-        """Set the source field from *obj* if not already configured.
-
-        Parameters
-        ----------
-        obj:
-            Source object to infer the field from.
-
-        Returns
-        -------
-        self
-        """
-        if self.source_arrow_field is None and obj is not None:
-            self.source_field = obj
+        if self.source_field is None and obj is not None:
+            return self.with_source(obj, inplace=True)
         return self
 
-    @property
-    def source_field(self) -> Optional[pa.Field]:
-        """The configured source Arrow field."""
-        return self.source_arrow_field
+    def with_source(self, obj: Any, inplace: bool = False) -> "CastOptions":
+        f = Field.from_(obj)
 
-    @source_field.setter
-    def source_field(self, value: Any) -> None:
-        """Set the source Arrow field, converting from schema / type if needed.
+        if inplace:
+            object.__setattr__(self, "source_field", f)
+            return self
+        return self.copy(source_field=f)
 
-        Resets cached Polars and Spark fields so they are recomputed from the
-        new value on next access.
-        """
-        if value is not None and not isinstance(value, pa.Field):
-            from yggdrasil.arrow.cast import any_to_arrow_field
+    def check_target(self, obj: Any) -> "CastOptions":
+        if self.target_field is None and obj is not None:
+            return self.with_target(obj, inplace=True)
+        return self
 
-            value = any_to_arrow_field(value, None)
-        object.__setattr__(self, "source_arrow_field", value)
-        object.__setattr__(self, "_source_polars_field", None)
-        object.__setattr__(self, "_source_spark_field", None)
+    def with_target(self, obj: Any, inplace: bool = False) -> "CastOptions":
+        f = Field.from_(obj)
 
-    @property
-    def source_polars_field(self) -> Optional["polars.Field"]:
-        """Lazily computed Polars field for the source."""
-        if self.source_arrow_field is not None and self._source_polars_field is None:
-            from yggdrasil.polars.cast import arrow_field_to_polars_field
-
-            object.__setattr__(
-                self,
-                "_source_polars_field",
-                arrow_field_to_polars_field(self.source_arrow_field, None),
-            )
-        return self._source_polars_field
-
-    @property
-    def source_spark_field(self) -> Optional["pyspark.sql.types.StructField"]:
-        """Lazily computed Spark field for the source."""
-        if self.source_arrow_field is not None and self._source_spark_field is None:
-            from yggdrasil.spark.cast import arrow_field_to_spark_field
-
-            object.__setattr__(
-                self,
-                "_source_spark_field",
-                arrow_field_to_spark_field(self.source_arrow_field, None),
-            )
-        return self._source_spark_field
-
-    # ------------------------------------------------------------------
-    # Target field
-    # ------------------------------------------------------------------
-
-    @property
-    def target_field(self) -> Optional[pa.Field]:
-        """The configured target Arrow field."""
-        return self.target_arrow_field
-
-    @target_field.setter
-    def target_field(self, value: Any) -> None:
-        """Set the target Arrow field, converting from schema / type if needed.
-
-        Resets cached Polars and Spark fields so they are recomputed from the
-        new value on next access.
-        """
-        if value is not None and not isinstance(value, pa.Field):
-            from yggdrasil.arrow.cast import any_to_arrow_field
-
-            value = any_to_arrow_field(value, None)
-        object.__setattr__(self, "target_arrow_field", value)
-        object.__setattr__(self, "_target_polars_field", None)
-        object.__setattr__(self, "_target_spark_field", None)
-
-    @property
-    def target_schema(self):
-        if self.target_arrow_field is None:
-            return None
-
-        from yggdrasil.data import Schema
-
-        return Schema.from_arrow(self.target_arrow_field)
-
-    @property
-    def target_field_name(self) -> Optional[str]:
-        """Effective target field name, falling back to the source field name."""
-        if self.target_field is None:
-            return self.source_field.name if self.source_field is not None else None
-        if not self.target_field.name and self.source_field is not None:
-            return self.source_field.name
-        return self.target_field.name
-
-    @property
-    def target_polars_field(self) -> Optional["polars.Field"]:
-        """Lazily computed Polars field for the target."""
-        if self.target_arrow_field is not None and self._target_polars_field is None:
-            from yggdrasil.polars.cast import arrow_field_to_polars_field
-
-            object.__setattr__(
-                self,
-                "_target_polars_field",
-                arrow_field_to_polars_field(self.target_arrow_field, None),
-            )
-        return self._target_polars_field
-
-    @property
-    def target_polars_schema(self) -> Optional[dict[str, "polars.DataType"]]:
-        """Polars schema dict derived from the target field (struct only)."""
-        polars_field = self.target_polars_field
-        if polars_field is None:
-            return None
-
-        from ...polars.lib import polars
-
-        polars_type: polars.Struct = polars_field.dtype
-        return {field.name: field.dtype for field in polars_type.fields}
-
-    @property
-    def target_spark_field(self) -> Optional["pyspark.sql.types.StructField"]:
-        """Lazily computed Spark field for the target."""
-        if self.target_arrow_field is not None and self._target_spark_field is None:
-            from yggdrasil.spark.cast import arrow_field_to_spark_field
-
-            object.__setattr__(
-                self,
-                "_target_spark_field",
-                arrow_field_to_spark_field(self.target_arrow_field, None),
-            )
-        return self._target_spark_field
-
-    @property
-    def target_arrow_schema(self) -> Optional[pa.Schema]:
-        """Schema view of ``target_field``.
-
-        For struct types the children are unwrapped into schema fields;
-        otherwise the field is treated as a single-field schema.
-        """
-        if self.target_field is None:
-            return None
-        from yggdrasil.arrow.cast import arrow_field_to_schema
-
-        return arrow_field_to_schema(self.target_field, None)
-
-    @property
-    def target_spark_schema(self) -> Optional["pyspark.sql.types.StructType"]:
-        """Spark schema view of the target Arrow schema."""
-        arrow_schema = self.target_arrow_schema
-        if arrow_schema is None:
-            return None
-        from yggdrasil.spark.cast import arrow_schema_to_spark_schema
-
-        return arrow_schema_to_spark_schema(arrow_schema, None)
-
-    # ------------------------------------------------------------------
-    # Cast-need predicates
-    # ------------------------------------------------------------------
-
-    def need_arrow_type_cast(self, source_obj: Any) -> bool:
-        """Return True when the source and target Arrow types differ."""
-        if self.target_field is None:
-            return False
-        self.check_source(source_obj)
-        return self.source_field.type != self.target_field.type
-
-    def need_polars_type_cast(self, source_obj: Any) -> bool:
-        """Return True when the source and target Polars dtypes differ."""
-        if self.target_polars_field is None:
-            return False
-        self.check_source(source_obj)
-        return self.source_polars_field.dtype != self.target_polars_field.dtype
-
-    def need_spark_type_cast(self, source_obj: Any) -> bool:
-        """Return True when the source and target Spark dataTypes differ."""
-        if self.target_spark_field is None:
-            return False
-        self.check_source(source_obj)
-        return self.source_spark_field.dataType != self.target_spark_field.dataType
-
-    def need_nullability_fill(self, source_obj: Any) -> bool:
-        """Return True when the source is nullable but the target is not."""
-        if self.target_field is None:
-            return False
-        self.check_source(source_obj)
-        return self.source_field.nullable and not self.target_field.nullable
-
-    # ------------------------------------------------------------------
-    # Source child accessors
-    # ------------------------------------------------------------------
-
-    def source_child_arrow_field(
-        self,
-        index: int = None,
-        name: str = None,
-        raise_error: bool = True
-    ) -> pa.Field:
-        """Return a child source Arrow field by *index* or *name*."""
-        return self._child_arrow_field(
-            self.source_arrow_field,
-            index=index,
-            name=name,
-            raise_error=raise_error
-        )
-
-    def source_child_polars_field(
-        self,
-        index: int = None,
-        name: str = None,
-        raise_error: bool = True
-    ) -> "polars.Field":
-        """Return a child source Polars field by *index* or *name*."""
-        from yggdrasil.polars.cast import arrow_field_to_polars_field
-
-        arrow = self.source_child_arrow_field(index=index, name=name, raise_error=raise_error)
-
-        if arrow is None:
-            return arrow
-        return arrow_field_to_polars_field(arrow)
-
-    # ------------------------------------------------------------------
-    # Target child accessors
-    # ------------------------------------------------------------------
-
-    def target_child_arrow_field(
-        self,
-        index: int = None,
-        name: str = None,
-        raise_error: bool = True
-    ) -> pa.Field:
-        """Return a child target Arrow field by *index* or *name*."""
-        return self._child_arrow_field(
-            self.target_arrow_field,
-            index=index,
-            name=name,
-            raise_error=raise_error
-        )
-
-    def target_child_polars_field(
-        self,
-        index: int = None,
-        name: str = None,
-        raise_error: bool = True
-    ) -> "polars.Field":
-        """Return a child target Polars field by *index* or *name*."""
-        from yggdrasil.polars.cast import arrow_field_to_polars_field
-
-        arrow = self.target_child_arrow_field(index=index, name=name, raise_error=raise_error)
-        if arrow is None:
-            return arrow
-        return arrow_field_to_polars_field(arrow)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _child_arrow_field(
-        self,
-        arrow_field: pa.Field,
-        index: int = None,
-        name: str = None,
-        raise_error: bool = True
-    ) -> Optional[pa.Field]:
-        """Return a child Arrow field by *index* or *name* for nested types.
-
-        For structs, returns the field at *index* or by *name* (case-sensitive
-        when ``safe=True``, case-insensitive when ``safe=False``).
-        For list-like types, returns the value field. For maps, synthesises an
-        ``entries`` struct field containing the key and item fields.
-        Non-nested types are returned unchanged.
-
-        Parameters
-        ----------
-        arrow_field:
-            The parent Arrow field to inspect.
-        index:
-            Child field index (used when *name* is not provided).
-        name:
-            Child field name. Takes precedence over *index*.
-        raise_error:
-            If ``True``, raise on lookup failure. If ``False``, return ``None``.
-
-        Raises
-        ------
-        KeyError
-            If a name lookup finds no match and ``raise_error=True``.
-        NotImplementedError
-            If the nested type is not supported and ``raise_error=True``.
-        """
-        source_type: Union[pa.DataType, pa.ListType, pa.StructType, pa.MapType] = (
-            arrow_field.type
-        )
-
-        if not pa.types.is_nested(source_type):
-            return arrow_field
-
-        if pa.types.is_struct(source_type):
-            if name is not None:
-                if self.strict_match_names:
-                    try:
-                        return source_type.field(name)
-                    except KeyError:
-                        if raise_error:
-                            raise
-                        return None
-
-                name_lower = name.lower()
-                for i in range(source_type.num_fields):
-                    f = source_type.field(i)
-                    if f.name.lower() == name_lower:
-                        return f
-
-                if raise_error:
-                    raise KeyError(
-                        f"No field matching {name!r} (case-insensitive) in struct {source_type}"
-                    )
-                return None
-
-            # --- index lookup (with optional name validation) ---
-            try:
-                f = source_type.field(index)
-            except IndexError:
-                if raise_error:
-                    raise
-                return None
-
-            if name is not None:
-                expected = name if self.strict_match_names else name.lower()
-                actual = f.name if self.strict_match_names else f.name.lower()
-                if actual != expected:
-                    if raise_error:
-                        raise KeyError(
-                            f"Field at index {index} is {f.name!r}, expected {name!r}"
-                        )
-                    return None
-
-            return f
-
-        if (
-            pa.types.is_list(source_type)
-            or pa.types.is_large_list(source_type)
-            or pa.types.is_list_view(source_type)
-            or pa.types.is_large_list_view(source_type)
-            or pa.types.is_fixed_size_list(source_type)
-        ):
-            return source_type.value_field
-
-        if pa.types.is_map(source_type):
-            m = self.target_arrow_field
-            return pa.field(
-                name="entries",
-                type=pa.struct([source_type.key_field, source_type.value_field]),
-                nullable=False,
-                metadata=None if m is None else m.metadata
-            )
-
-        if raise_error:
-            raise NotImplementedError(f"Unsupported nested Arrow type: {source_type}")
-        return None
-
-    def cast_table(
-        self,
-        obj: S
-    ) -> S:
-        if isinstance(obj, (pa.Table, pa.RecordBatch)):
-            return self.cast_arrow(obj)
-
-        ns, _ = ObjectSerde.module_and_name(obj)
-
-        if ns.startswith("pandas."):
-            return self.cast_pandas(obj)
-
-        if ns.startswith("polars."):
-            return self.cast_polars(obj)
-
-        if ns.startswith("pyspark."):
-            return self.cast_pyspark(obj)
-
-        raise ValueError(
-            f"Cannot cast table %s" % repr(obj)
-        )
+        if inplace:
+            object.__setattr__(self, "target_field", f)
+            return self
+        return self.copy(target_field=f)
 
     def cast_arrow(
         self,
-        obj: pa.Table | pa.RecordBatch,
-    ) -> pa.Table | pa.RecordBatch:
-        from yggdrasil.arrow.cast import cast_arrow_tabular
+        obj: Union[
+            pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch,
+            pa.DataType, pa.Field, pa.Schema,
+        ]
+    ):
+        if isinstance(obj, (pa.Array, pa.ChunkedArray)):
+            return self.cast_arrow_array(obj)
+        elif isinstance(obj, (pa.Table, pa.RecordBatch)):
+            return self.cast_arrow_tabular(obj)
+        else:
+            raise TypeError(f"Cannot cast {type(obj)} to arrow")
 
-        return cast_arrow_tabular(obj, self)
+    def cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray
+    ):
+        if self.target_field is None:
+            return array
+        return self.target_field.cast_arrow_array(array, options=self)
+
+    def cast_arrow_tabular(
+        self,
+        table: pa.Table | pa.RecordBatch
+    ):
+        if self.target_field is None:
+            return table
+        return self.target_field.cast_arrow_tabular(table, options=self)
 
     def cast_polars(
         self,
-        obj: "polars.DataFrame | polars.LazyFrame"
-    ) -> "polars.DataFrame | polars.LazyFrame":
-        from yggdrasil.polars.cast import cast_polars_frame
-
-        return cast_polars_frame(obj, self)
-
-    def cast_pandas(
-        self,
-        obj: "pandas.DataFrame"
+        obj: "polars.DataFrame | polars.LazyFrame | polars.Series | polars.Expr"
     ):
-        from yggdrasil.pandas.cast import cast_pandas_dataframe
+        if self.target_field is None:
+            return obj
 
-        return cast_pandas_dataframe(obj, self)
+        pl = get_polars()
 
-    def cast_pyspark(
+        if isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
+            return self.cast_polars_tabular(obj)
+        elif isinstance(obj, (pl.Series, pl.Expr)):
+            return self.cast_polars_series(obj)
+        else:
+            raise TypeError(f"Cannot cast {type(obj)} to polars")
+
+    def cast_polars_tabular(
         self,
-        obj: "pyspark.sql.DataFrame"
+        table: "polars.DataFrame | polars.LazyFrame"
     ):
-        from yggdrasil.spark.cast import cast_spark_dataframe
+        if self.target_field is None:
+            return table
+        return self.target_field.cast_polars_tabular(table, options=self)
 
-        return cast_spark_dataframe(obj, self)
+    def cast_polars_series(
+        self,
+        table: "polars.Series | polars.Expr"
+    ):
+        if self.target_field is None:
+            return table
+        return self.target_field.cast_polars_series(table, options=self)
+
+    def cast_spark(
+        self,
+        obj: "ps.DataFrame | ps.Column"
+    ):
+        if self.target_field is None:
+            return obj
+
+        spark = get_spark_sql()
+
+        if isinstance(obj, spark.DataFrame):
+            return self.cast_spark_tabular(obj)
+        elif isinstance(obj, spark.Column):
+            return self.cast_spark_column(obj)
+        else:
+            raise TypeError(f"Cannot cast {type(obj)} to spark")
+
+    def cast_spark_column(
+        self,
+        col: "ps.Column"
+    ):
+        if self.target_field is None:
+            return col
+        return self.target_field.cast_spark_column(col, options=self)
+
+    def cast_spark_tabular(
+        self,
+        table: "ps.DataFrame"
+    ):
+        if self.target_field is None:
+            return table
+        return self.target_field.cast_spark_tabular(table, options=self)
+
+    def fill_arrow_nulls(
+        self,
+        obj: Union[
+            pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch,
+        ]
+    ):
+        if self.target_field is None:
+            return obj
+        return self.target_field.fill_arrow_array_nulls(obj)
+
+    def need_cast(
+        self,
+        check_names: bool = True,
+        check_dtypes: bool = True,
+        check_metadata: bool = True
+    ):
+        if self.target_field is None:
+            return False
+
+        if self.source_field is None:
+            return True
+
+        return not self.source_field.dtype.equals(
+            self.target_field.dtype,
+            check_names=check_names, check_dtypes=check_dtypes,
+            check_metadata=check_metadata
+        )
+
+    def polars_alias(self, series: "polars.Series | polars.Expr"):
+        if self.target_field is None:
+            return series
+
+        target_name = self.target_field.name
+
+        if target_name:
+            if hasattr(series, "name"):
+                return series.alias(target_name) if target_name != series.name else series
+            else:
+                return series.alias(target_name)
+        return series
+
+    def spark_alias(self, column: "ps.Column") -> "ps.Column":
+        if self.target_field is None:
+            return column
+
+        target_name = self.target_field.name
+
+        if target_name:
+            if hasattr(column, "name"):
+                return column.alias(target_name) if target_name != column.name else column
+            else:
+                return column.alias(target_name)
+        return column

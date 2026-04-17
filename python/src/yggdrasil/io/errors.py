@@ -210,7 +210,7 @@ class TimeoutError(RequestError, _u3.TimeoutError):  # type: ignore[misc]
         message: str,
         *,
         request: "PreparedRequest",
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
     ):
         super().__init__(message, request=request)
         self.timeout = timeout
@@ -228,9 +228,9 @@ class ReadTimeoutError(TimeoutError, _u3.ReadTimeoutError):  # type: ignore[misc
         message: str,
         *,
         request: "PreparedRequest",
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         pool: Any = None,
-        url: Optional[str] = None,
+        url: str | None = None,
     ):
         _u3.ReadTimeoutError.__init__(self, pool or object(), url or "", message)
         TimeoutError.__init__(self, message, request=request, timeout=timeout)
@@ -320,7 +320,7 @@ class ResponseError(HTTPError):
 
         headers: dict[str, str] = {}
 
-        retry_after: Optional[float] = getattr(self, "retry_after", None)
+        retry_after: float | None = getattr(self, "retry_after", None)
         if retry_after is not None:
             body["retry_after"] = retry_after
             headers["Retry-After"] = str(int(retry_after))
@@ -363,7 +363,7 @@ class ResponseError(HTTPError):
 
         headers: dict[str, str] = {}
 
-        retry_after: Optional[float] = getattr(self, "retry_after", None)
+        retry_after: float | None = getattr(self, "retry_after", None)
         if retry_after is not None:
             body["retry_after"] = retry_after
             headers["Retry-After"] = str(int(retry_after))
@@ -464,7 +464,7 @@ class TooManyRequests(ClientError):
 
     def __init__(self, message: str, *, response: "Response"):
         super().__init__(message, response=response)
-        self.retry_after: Optional[float] = _parse_retry_after(response)
+        self.retry_after: float | None = _parse_retry_after(response)
 
 
 # ---- 5xx ----------------------------------------------------------------
@@ -486,7 +486,7 @@ class ServiceUnavailable(ServerError):
 
     def __init__(self, message: str, *, response: "Response"):
         super().__init__(message, response=response)
-        self.retry_after: Optional[float] = _parse_retry_after(response)
+        self.retry_after: float | None = _parse_retry_after(response)
 
 
 class GatewayTimeout(ServerError):
@@ -526,7 +526,7 @@ class IncompleteRead(ResponseError, _u3.IncompleteRead):  # type: ignore[misc]
         *,
         response: "Response",
         partial: int = 0,
-        expected: Optional[int] = None,
+        expected: int | None = None,
     ):
         _u3.IncompleteRead.__init__(self, partial, expected)
         ResponseError.__init__(self, message, response=response)

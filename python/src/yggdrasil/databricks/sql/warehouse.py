@@ -77,8 +77,8 @@ class SQLWarehouse(DatabricksResource):
         repr=False,
         compare=False,
     )
-    warehouse_id: Optional[str] = None
-    warehouse_name: Optional[str] = None
+    warehouse_id: str | None = None
+    warehouse_name: str | None = None
 
     _details: Optional[EndpointInfo] = dc.field(
         default=None, repr=False, hash=False, compare=False,
@@ -100,8 +100,8 @@ class SQLWarehouse(DatabricksResource):
     def __call__(
         self,
         *,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
     ) -> "SQLWarehouse":
         if not warehouse_id and not warehouse_name:
             return self
@@ -330,7 +330,7 @@ class SQLWarehouse(DatabricksResource):
         permissions: Optional[List[Union[WarehouseAccessControlRequest, str]]] = None,
         *,
         wait: WaitingConfigArg = True,
-        warehouse_id: Optional[str] = None,
+        warehouse_id: str | None = None,
     ) -> "SQLWarehouse":
         """Apply ACL entries to this warehouse."""
         sdk_client = self.client.workspace_client().warehouses
@@ -369,19 +369,19 @@ class SQLWarehouse(DatabricksResource):
 
     def execute(
         self,
-        statement: Optional[str] = None,
+        statement: str | None = None,
         *,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
-        byte_limit: Optional[int] = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        byte_limit: int | None = None,
         disposition: Optional[Disposition] = None,
         format: Optional[Format] = None,
         on_wait_timeout: Optional[ExecuteStatementRequestOnWaitTimeout] = None,
         parameters: Optional[List[StatementParameterListItem]] = None,
-        row_limit: Optional[int] = None,
-        wait_timeout: Optional[str] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
+        row_limit: int | None = None,
+        wait_timeout: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         wait: WaitingConfigArg = True,
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,

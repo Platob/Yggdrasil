@@ -9,6 +9,7 @@ import pytest
 
 from yggdrasil.data.cast.datetime import (
     CURRENT_TZINFO,
+    _coerce_interval,
     any_to_date,
     any_to_datetime,
     float_to_date,
@@ -16,6 +17,7 @@ from yggdrasil.data.cast.datetime import (
     int_to_date,
     int_to_datetime,
     normalize_datetime_string,
+    truncate_datetime_value,
 )
 
 
@@ -163,3 +165,16 @@ def test_numeric_inference_near_current_epoch_scales() -> None:
     assert abs(sec.timestamp() - now_s) < 1
     assert abs(ms.timestamp() - now_s) < 1
     assert abs(us.timestamp() - now_s) < 1
+
+
+def test_truncate_datetime_value_accepts_any_value_and_interval_string() -> None:
+    value = "2024-01-31T23:59:59.123456+01:00"
+    out = truncate_datetime_value(value, "PT15M")
+    assert out == dt.datetime(2024, 1, 31, 23, 45, tzinfo=dt.timezone(dt.timedelta(hours=1)))
+
+
+def test_truncate_datetime_value_accepts_interval_spec_instance() -> None:
+    value = dt.datetime(2024, 5, 17, 14, 37, 59, tzinfo=dt.timezone.utc)
+    spec = _coerce_interval("P1M")
+    out = truncate_datetime_value(value, spec)
+    assert out == dt.datetime(2024, 5, 1, 0, 0, tzinfo=dt.timezone.utc)

@@ -136,7 +136,7 @@ class Scope(DatabricksResource):
 
     def update(
         self,
-        key: Optional[str] = None,
+        key: str | None = None,
         permissions: Optional[list[Permission]] = None,
     ):
         if not self.key:

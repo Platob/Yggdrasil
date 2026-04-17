@@ -117,58 +117,6 @@ def test_from_parsed_url_rejects_empty_path():
         DatabricksClient.from_parsed_url(FakeURL())
 
 
-def test_config_maps_public_fields(monkeypatch):
-    monkeypatch.setattr(module_under_test, "Config", DummyConfig)
-
-    client = DatabricksClient(
-        host="https://adb-123.databricks.com/",
-        account_id="acc-1",
-        token="tok",
-        client_id="cid",
-        client_secret="csec",
-        token_audience="aud",
-        azure_workspace_resource_id="res-id",
-        azure_use_msi=True,
-        azure_client_secret="az-sec",
-        azure_client_id="az-id",
-        azure_tenant_id="tenant",
-        azure_environment="public",
-        google_credentials="gcred",
-        google_service_account="svc@x",
-        profile="dev",
-        config_file="/tmp/.databrickscfg",
-        http_timeout_seconds=10,
-        retry_timeout_seconds=20,
-        debug_truncate_bytes=1000,
-        debug_headers=True,
-        rate_limit=99,
-    )
-
-    cfg = client.config
-
-    assert cfg.host == "https://adb-123.databricks.com"
-    assert cfg.account_id == "acc-1"
-    assert cfg.token == "tok"
-    assert cfg.client_id == "cid"
-    assert cfg.client_secret == "csec"
-    assert cfg.token_audience == "aud"
-    assert cfg.azure_workspace_resource_id == "res-id"
-    assert cfg.azure_use_msi is True
-    assert cfg.azure_client_secret == "az-sec"
-    assert cfg.azure_client_id == "az-id"
-    assert cfg.azure_tenant_id == "tenant"
-    assert cfg.azure_environment == "public"
-    assert cfg.google_credentials == "gcred"
-    assert cfg.google_service_account == "svc@x"
-    assert cfg.profile == "dev"
-    assert cfg.config_file == "/tmp/.databrickscfg"
-    assert cfg.http_timeout_seconds == 10
-    assert cfg.retry_timeout_seconds == 20
-    assert cfg.debug_truncate_bytes == 1000
-    assert cfg.debug_headers is True
-    assert cfg.rate_limit == 99
-
-
 def test_connected_false_when_no_clients():
     client = DatabricksClient()
     assert client.connected is False

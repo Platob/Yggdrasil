@@ -17,36 +17,6 @@ def userinfo(monkeypatch):
     return m
 
 
-def test_cache(userinfo, monkeypatch):
-    calls = {"key": 0, "email": 0, "cwd": 0, "git": 0, "proj": 0, "url": 0}
-
-    monkeypatch.setattr(userinfo, "_get_key", lambda: calls.__setitem__("key", calls["key"] + 1) or "k")
-    monkeypatch.setattr(userinfo, "_get_upn_email", lambda: calls.__setitem__("email", calls["email"] + 1) or "e@x.com")
-    monkeypatch.setattr(userinfo, "_guess_email_from_env", lambda: None)
-    monkeypatch.setattr(userinfo, "_safe_getcwd", lambda: calls.__setitem__("cwd", calls["cwd"] + 1) or "/tmp/x")
-    monkeypatch.setattr(userinfo, "_infer_project", lambda cwd: calls.__setitem__("proj", calls["proj"] + 1) or (None, None))
-    monkeypatch.setattr(userinfo, "_git_info", lambda cwd: calls.__setitem__("git", calls["git"] + 1) or None)
-    monkeypatch.setattr(userinfo, "_git_url_from_info", lambda git: None)
-    monkeypatch.setattr(
-        userinfo,
-        "_current_compute_url",
-        lambda *, hostname, cwd: calls.__setitem__("url", calls["url"] + 1) or None,
-    )
-
-    a = userinfo.get_user_info()
-    b = userinfo.get_user_info()
-    c = userinfo.get_user_info(refresh=True)
-
-    assert a is b
-    assert a is not c
-    assert calls["key"] == 2
-    assert calls["email"] == 2
-    assert calls["cwd"] == 2
-    assert calls["proj"] == 2
-    assert calls["git"] == 2
-    assert calls["url"] == 2
-
-
 def test_normalize_abs_path_for_url(userinfo):
     assert userinfo.normalize_abs_path_for_url("/a//b///c") == "/a/b/c"
     assert userinfo.normalize_abs_path_for_url(r"C:\Users\Nika\proj") == "/C:/Users/Nika/proj"

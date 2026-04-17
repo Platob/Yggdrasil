@@ -26,6 +26,24 @@ def cast_pandas_series(
 ) -> pandas.Series:
     """
     Cast a pandas Series to a target Arrow type using Arrow casting rules.
+    
+    This is now a thin wrapper around Field.cast_pandas_frame.
+    """
+    options = CastOptions.check(options)
+    if options.target_field is None and options.field_name is None:
+        return _cast_pandas_series_impl(series, options=options)
+
+    from yggdrasil.data.data_field import Field
+    target_field = Field.from_any(options.target_field or options.field_name)
+    return target_field.cast_pandas_frame(series, options=options)
+
+
+def _cast_pandas_series_impl(
+    series: pandas.Series,
+    options: Optional[CastOptions] = None,
+) -> pandas.Series:
+    """
+    Cast a pandas Series to a target Arrow type using Arrow casting rules.
 
     The target type/field should be provided via `options` (e.g. options.target_schema
     or options.target_field, depending on how ArrowCastOptions is defined).
@@ -36,7 +54,7 @@ def cast_pandas_series(
       - default handling (via cast_arrow_array)
     We then convert back to pandas and restore index/name.
     """
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
     arrow_array = pa.array(series, from_pandas=True)
     casted = cast_arrow_array(arrow_array, options)
@@ -54,6 +72,24 @@ def cast_pandas_dataframe(
 ) -> pandas.DataFrame:
     """
     Cast a pandas DataFrame to a target Arrow schema using Arrow casting rules.
+    
+    This is now a thin wrapper around Schema.cast_pandas_frame.
+    """
+    options = CastOptions.check(options)
+    if options.target_arrow_schema is None and options.target_field is None:
+        return _cast_pandas_dataframe_impl(dataframe, options=options)
+
+    from yggdrasil.data.schema import Schema
+    target_schema = Schema.from_any(options.target_field or options.target_arrow_schema)
+    return target_schema.cast_pandas_frame(dataframe, options=options)
+
+
+def _cast_pandas_dataframe_impl(
+    dataframe: pandas.DataFrame,
+    options: Optional[CastOptions] = None,
+) -> pandas.DataFrame:
+    """
+    Cast a pandas DataFrame to a target Arrow schema using Arrow casting rules.
 
     Behavior is analogous to the Polars version, but we delegate casting to
     `cast_arrow_table` and then adjust columns on the pandas side:
@@ -64,7 +100,7 @@ def cast_pandas_dataframe(
           * True: extra pandas columns (not in the target schema / cast result)
                   are appended unchanged
     """
-    options = CastOptions.check_arg(options)
+    options = CastOptions.check(options)
 
     original_index = dataframe.index
 
@@ -101,7 +137,7 @@ def arrow_array_to_pandas_series(
     Convert a pyarrow.Array (or ChunkedArray) to a pandas Series,
     optionally applying Arrow casting via ArrowCastOptions before conversion.
     """
-    opts = CastOptions.check_arg(cast_options)
+    opts = CastOptions.check(cast_options)
 
     if isinstance(array, pa.ChunkedArray):
         array = array.combine_chunks()
@@ -119,7 +155,7 @@ def arrow_table_to_pandas_dataframe(
     Convert a pyarrow.Table to a pandas DataFrame, optionally applying Arrow
     casting rules first.
     """
-    opts = CastOptions.check_arg(cast_options)
+    opts = CastOptions.check(cast_options)
 
     if opts.target_arrow_schema is not None:
         table = cast_arrow_tabular(table, opts)
@@ -141,7 +177,7 @@ def pandas_series_to_arrow_array(
     Convert a pandas Series to a pyarrow.Array, optionally applying Arrow
     casting via ArrowCastOptions.
     """
-    opts = CastOptions.check_arg(cast_options)
+    opts = CastOptions.check(cast_options)
 
     array = pa.array(series, from_pandas=True)
     return cast_arrow_array(array, opts)
@@ -156,7 +192,7 @@ def pandas_dataframe_to_arrow_table(
     Convert a pandas DataFrame to a pyarrow.Table, optionally applying Arrow
     casting rules via ArrowCastOptions.
     """
-    opts = CastOptions.check_arg(cast_options)
+    opts = CastOptions.check(cast_options)
 
     table = pa.Table.from_pandas(df, preserve_index=False)
     return cast_arrow_tabular(table, opts)

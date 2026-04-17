@@ -8,6 +8,7 @@ import ssl
 import pytest
 
 from yggdrasil.io.http_ import BrowserHTTPSession, HTTPSession
+from yggdrasil.io.errors import ForbiddenError
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.url import URL
 
@@ -665,6 +666,11 @@ network_mark = pytest.mark.skipif(
 
 @network_mark
 class TestBrowserHTTPSessionNetwork:
+    @staticmethod
+    def _skip_if_blocked(exc: ForbiddenError) -> None:
+        if "zscaler" in str(exc).lower():
+            pytest.skip("httpbin.org is blocked by the local network policy")
+
     def test_navigate_httpbin(self):
         if not _tcp_can_connect("httpbin.org", 443):
             pytest.skip("Cannot reach httpbin.org:443")
@@ -688,7 +694,11 @@ class TestBrowserHTTPSessionNetwork:
             pytest.skip("Cannot reach httpbin.org:443")
         b = BrowserHTTPSession()
         b.set_cookie("mycookie", "hello")
-        resp = b.navigate("https://httpbin.org/cookies")
+        try:
+            resp = b.navigate("https://httpbin.org/cookies")
+        except ForbiddenError as exc:
+            self._skip_if_blocked(exc)
+            raise
         data = resp.json()
         assert data.get("cookies", {}).get("mycookie") == "hello"
 
@@ -703,10 +713,14 @@ class TestBrowserHTTPSessionNetwork:
         if not _tcp_can_connect("httpbin.org", 443):
             pytest.skip("Cannot reach httpbin.org:443")
         b = BrowserHTTPSession()
-        resp = b.submit_form(
-            "https://httpbin.org/post",
-            {"username": "alice", "password": "s3cr3t"},
-        )
+        try:
+            resp = b.submit_form(
+                "https://httpbin.org/post",
+                {"username": "alice", "password": "s3cr3t"},
+            )
+        except ForbiddenError as exc:
+            self._skip_if_blocked(exc)
+            raise
         assert resp.status_code == 200
         data = resp.json()
         assert data["form"]["username"] == "alice"

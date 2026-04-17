@@ -14,8 +14,8 @@ class HttpTransport:
 
     def __init__(
         self,
-        host: Optional[str] = None,
-        token: Optional[str] = None,
+        host: str | None = None,
+        token: str | None = None,
         timeout: float = 30.0,
         session: Optional[requests.Session] = None,
         **_: Any,
@@ -38,7 +38,7 @@ class HttpTransport:
         database: str,
         operation: str,
         arguments: Dict[str, Any],
-        collection: Optional[str] = None,
+        collection: str | None = None,
     ) -> Any:
         payload = {
             "database": database,

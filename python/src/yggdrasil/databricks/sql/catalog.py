@@ -24,14 +24,14 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
-from databricks.sdk.service.catalog import CatalogInfo
+from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource, DatabricksService
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-
-from .types import escape_sql_string
+from .grants import GrantsMixin
+from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
     from .schema import Schema
@@ -43,28 +43,28 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Catalog(DatabricksResource):
+class Catalog(DatabricksResource, GrantsMixin):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags."""
 
     service: DatabricksService
 
-    catalog_name: Optional[str] = None
+    catalog_name: str | None = None
 
     # TTL for the _infos cache (seconds).  None disables expiry.
-    _infos_ttl: Optional[float] = field(default=1800.0, repr=False, compare=False, hash=False)
+    _infos_ttl: float | None = field(default=1800.0, repr=False, compare=False, hash=False)
 
     _infos: Optional[CatalogInfo] = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
-    _infos_fetched_at: Optional[float] = field(
+    _infos_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
 
     # ── identity ──────────────────────────────────────────────────────────────
 
-    def full_name(self) -> str:
+    def full_name(self, safe: bool = None) -> str:
         """Return the catalog name (single-part identifier)."""
-        return self.catalog_name
+        return quote_ident(self.catalog_name) if safe else self.catalog_name
 
     def __repr__(self) -> str:
         return f"Catalog<{self.url.to_string()!r}>"
@@ -172,10 +172,10 @@ class Catalog(DatabricksResource):
 
     def table(
         self,
-        location: Optional[str] = None,
+        location: str | None = None,
         *,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
     ) -> "Table":
         """Return a :class:`Table` within this catalog.
 
@@ -194,7 +194,7 @@ class Catalog(DatabricksResource):
 
     def tables(
         self,
-        schema_name: Optional[str] = None,
+        schema_name: str | None = None,
     ) -> Iterator["Table"]:
         """Iterate over all tables in the given schema (or all schemas)."""
         if schema_name:
@@ -211,9 +211,9 @@ class Catalog(DatabricksResource):
     def create(
         self,
         *,
-        comment: Optional[str] = None,
+        comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-        storage_root: Optional[str] = None,
+        storage_root: str | None = None,
         if_not_exists: bool = True,
     ) -> "Catalog":
         """Create this catalog in Unity Catalog.
@@ -244,9 +244,9 @@ class Catalog(DatabricksResource):
     def ensure_created(
         self,
         *,
-        comment: Optional[str] = None,
+        comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-        storage_root: Optional[str] = None,
+        storage_root: str | None = None,
     ) -> "Catalog":
         """Create this catalog if it does not already exist, then return ``self``."""
         if not self.exists:
@@ -287,7 +287,12 @@ class Catalog(DatabricksResource):
 
     # ── tags ──────────────────────────────────────────────────────────────────
 
-    def set_tags_ddl(self, tags: Mapping[str, str] | None) -> str:
+    def set_tags_ddl(
+        self,
+        tags: Mapping[str, str] | None,
+        *,
+        tag_collation: str | None = DEFAULT_TAG_COLLATION,
+    ) -> str:
         """Build an ``ALTER CATALOG … SET TAGS`` DDL statement."""
         pairs: list[str] = []
         for k, v in (tags or {}).items():
@@ -295,25 +300,39 @@ class Catalog(DatabricksResource):
             val = str(v).strip() if v is not None else ""
             if key and val:
                 pairs.append(
-                    f"'{escape_sql_string(key)}' = '{escape_sql_string(val)}'"
+                    f"{databricks_tag_literal(key, collation=tag_collation)} = "
+                    f"{databricks_tag_literal(val, collation=tag_collation)}"
                 )
         if not pairs:
             raise ValueError(f"Cannot set empty tags on {self!r}")
         return f"ALTER CATALOG `{self.catalog_name}` SET TAGS ({', '.join(pairs)})"
 
-    def set_tags(self, tags: Mapping[str, str] | None) -> "Catalog":
+    def set_tags(
+        self,
+        tags: Mapping[str, str] | None,
+        *,
+        tag_collation: str | None = DEFAULT_TAG_COLLATION,
+    ) -> "Catalog":
         """Execute ``ALTER CATALOG … SET TAGS`` for the given mapping."""
         if tags:
-            self.sql.execute(self.set_tags_ddl(tags))
+            self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
         return self
+
+    # ── grants ────────────────────────────────────────────────────────────────
+
+    def _grants_securable_type(self) -> SecurableType:
+        return SecurableType.CATALOG
+
+    def _grants_full_name(self) -> str:
+        return self.catalog_name
 
     # ── update ────────────────────────────────────────────────────────────────
 
     def update(
         self,
         *,
-        comment: Optional[str] = None,
-        owner: Optional[str] = None,
+        comment: str | None = None,
+        owner: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
     ) -> "Catalog":
         """Update catalog metadata in-place and refresh the local cache."""

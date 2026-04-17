@@ -343,7 +343,10 @@ class TestCatalogTags:
     def test_set_tags_ddl_produces_alter_statement(self, cat):
         ddl = cat.set_tags_ddl({"env": "prod", "team": "data"})
         assert ddl.startswith("ALTER CATALOG `main` SET TAGS")
-        assert "'env' = 'prod'" in ddl or "'team' = 'data'" in ddl
+        assert (
+            "'env' = 'prod'" in ddl
+            or "'team' = 'data'" in ddl
+        )
 
     def test_set_tags_ddl_empty_raises(self, cat):
         with pytest.raises(ValueError):

@@ -121,11 +121,11 @@ class Clusters(DatabricksService):
     # ------------------------------------------------------------------ #
     def all_purpose_cluster(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         *,
-        key: Optional[str] = None,
+        key: str | None = None,
         custom_tags: Optional[MutableMapping[str, str]] = None,
-        single_user_name: Optional[str] = None,
+        single_user_name: str | None = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         libraries: Optional[Sequence[str]] = None,
         wait: WaitingConfigArg = True,
@@ -192,7 +192,7 @@ class Clusters(DatabricksService):
 
     def spark_versions(
         self,
-        photon: Optional[bool] = None,
+        photon: bool | None = None,
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
         *,
         allow_ml: bool = False,
@@ -223,13 +223,13 @@ class Clusters(DatabricksService):
 
     def latest_spark_version(
         self,
-        photon: Optional[bool] = None,
+        photon: bool | None = None,
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
         *,
         allow_ml: bool = False,
         allow_gpu: bool = True,
     ) -> SparkVersion:
-        def pick(ph: Optional[bool], use_py: bool) -> Optional[SparkVersion]:
+        def pick(ph: bool | None, use_py: bool) -> Optional[SparkVersion]:
             versions = self.spark_versions(
                 photon=ph,
                 python_version=python_version if use_py else None,
@@ -256,7 +256,7 @@ class Clusters(DatabricksService):
         update: bool,
         details: ClusterDetails,
         python_version: Optional[Union[str, tuple[int, ...]]] = None,
-        single_user_name: Optional[str] = None,
+        single_user_name: str | None = None,
         **kwargs,
     ) -> ClusterDetails:
         pip_settings = PipIndexSettings.current()
@@ -325,9 +325,9 @@ class Clusters(DatabricksService):
 
     def create_or_update(
         self,
-        cluster_id: Optional[str] = None,
-        cluster_name: Optional[str] = None,
-        single_user_name: Optional[str] = None,
+        cluster_id: str | None = None,
+        cluster_name: str | None = None,
+        single_user_name: str | None = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         libraries: Optional[list[Union[str, Library]]] = None,
         wait: WaitingConfigArg = True,
@@ -359,7 +359,7 @@ class Clusters(DatabricksService):
         *,
         libraries: Optional[list[Union[str, Library]]] = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
-        single_user_name: Optional[str] = None,
+        single_user_name: str | None = None,
         wait: WaitingConfigArg = True,
         **cluster_spec: Any,
     ) -> "Cluster":
@@ -404,9 +404,9 @@ class Clusters(DatabricksService):
     def list(
         self,
         *,
-        name: Optional[str] = None,
+        name: str | None = None,
         sources: Optional[list[ClusterSource]] = None,
-        limit: Optional[int] = None,
+        limit: int | None = None,
     ) -> Iterator["Cluster"]:
         from .cluster import Cluster
 
@@ -439,10 +439,10 @@ class Clusters(DatabricksService):
 
     def find_cluster(
         self,
-        cluster_id: Optional[str] = None,
+        cluster_id: str | None = None,
         *,
-        cluster_name: Optional[str] = None,
-        raise_error: Optional[bool] = None,
+        cluster_name: str | None = None,
+        raise_error: bool | None = None,
     ) -> Optional["Cluster"]:
         if not cluster_name and not cluster_id:
             raise ValueError("Either name or cluster_id must be provided")

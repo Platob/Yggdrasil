@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Mapping, Optional
+from typing import TYPE_CHECKING, Mapping
 
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
-
-from yggdrasil.databricks.sql.types import column_info_to_arrow_field
-from ...data import Field
+from yggdrasil.data import Field
+from yggdrasil.databricks.sql.sql_utils import (
+    DEFAULT_TAG_COLLATION,
+    _safe_constraint_name,
+    databricks_tag_literal,
+    quote_qualified_ident,
+)
 
 if TYPE_CHECKING:
     from .columns import Columns
@@ -20,11 +24,7 @@ __all__ = ["Column"]
 class Column:
     table: "Table"
     name: str
-    dfield: Field = field(repr=False, compare=False, hash=False)
-
-    @property
-    def arrow_field(self):
-        return self.dfield.to_arrow_field()
+    field: Field = field(repr=False, compare=False, hash=False)
 
     @classmethod
     def from_api(
@@ -32,12 +32,23 @@ class Column:
         table: "Table",
         infos: SQLColumnInfo | CatalogColumnInfo
     ):
-        arrow_field = column_info_to_arrow_field(infos)
+        f = Field.from_databricks(infos)
+        metadata = {
+            b"engine": b"databricks",
+            b"catalog_name": table.catalog_name.encode(),
+            b"schema_name": table.schema_name.encode(),
+            b"table_name": table.table_name.encode(),
+        }
+
+        if not f.metadata:
+            f.with_metadata(metadata)
+        else:
+            f.metadata.update(metadata)
 
         return cls(
             table=table,
-            name=arrow_field.name,
-            dfield=Field.from_arrow(arrow_field),
+            name=f.name,
+            field=f,
         )
 
     @property
@@ -46,18 +57,30 @@ class Column:
 
     @property
     def metadata(self) -> Mapping[bytes, bytes]:
-        return self.arrow_field.metadata or {}
+        return self.field.metadata or {}
 
     def _qcol(self) -> str:
         return f"`{self.name}`"
 
-    def _safe_constraint_name(self, name: str | None, fallback: str) -> str:
-        raw = name or fallback
-        return self.table._safe_str(raw)
+    def _stable_constraint_name(
+        self,
+        constraint_name: str | None,
+        *parts: object,
+    ) -> str:
+        """Build a stable constraint name from structured parts."""
+        if constraint_name:
+            return _safe_constraint_name(constraint_name)
+        return _safe_constraint_name(*parts)
 
-    def set_tags_ddl(self, tags: Mapping[str, str]):
+    def set_tags_ddl(
+        self,
+        tags: Mapping[str, str],
+        *,
+        tag_collation: str | None = None,
+    ):
         str_tags = ", ".join(
-            "'%s' = '%s'" % (self.table._safe_str(k), self.table._safe_str(v))
+            f"{databricks_tag_literal(k, collation=tag_collation)} = "
+            f"{databricks_tag_literal(v, collation=tag_collation)}"
             for k, v in tags.items() if k and v
         )
 
@@ -72,9 +95,11 @@ class Column:
     def set_tags(
         self,
         tags: Mapping[str, str] | None,
+        *,
+        tag_collation: str | None = DEFAULT_TAG_COLLATION,
     ):
         if tags:
-            query = self.set_tags_ddl(tags)
+            query = self.set_tags_ddl(tags, tag_collation=tag_collation)
             if query:
                 self.engine.execute(query)
         return self
@@ -92,9 +117,11 @@ class Column:
         Databricks PK/FK constraints are table constraints, even if this helper is
         exposed from a column object.
         """
-        cname = self._safe_constraint_name(
+        cname = self._stable_constraint_name(
             constraint_name,
-            f"{self.table.name}_{self.name}_pk",
+            self.table.name,
+            self.name,
+            "pk",
         )
         rely_clause = " RELY" if rely else ""
         timeseries_clause = " TIMESERIES" if timeseries else ""
@@ -163,9 +190,13 @@ class Column:
         Build DDL to add a single-column foreign key constraint.
         """
         ref_column_name = ref_column.name if isinstance(ref_column, Column) else ref_column
-        cname = self._safe_constraint_name(
+        cname = self._stable_constraint_name(
             constraint_name,
-            f"{self.table.name}_{self.name}__{ref_table.name}_{ref_column_name}_fk",
+            self.table.name,
+            self.name,
+            ref_table.name,
+            ref_column_name,
+            "fk",
         )
 
         options: list[str] = []
@@ -184,7 +215,7 @@ class Column:
             f"ALTER TABLE {self.table.full_name(safe=True)} "
             f"ADD CONSTRAINT `{cname}` "
             f"FOREIGN KEY ({self._qcol()}) "
-            f"REFERENCES {ref_table.full_name(safe=True)} (`{ref_column_name}`)"
+            f"REFERENCES {quote_qualified_ident(ref_table.full_name())} (`{ref_column_name}`)"
             f"{options_sql}"
         )
 
@@ -216,14 +247,12 @@ class Column:
 
         if column is not None:
             if isinstance(column, Column):
-                # Column object — extract table and column directly
                 if ref_table is None:
                     ref_table = column.table
                 if ref_column is None:
                     ref_column = column
 
             elif isinstance(column, str):
-                # String — parse dotted name with current table as defaults
                 svc = Columns(
                     client=self.table.client,
                     catalog_name=self.table.catalog_name,
@@ -240,11 +269,9 @@ class Column:
                 if ref_column is None:
                     ref_column = col_name
 
-        # Resolve a string ref_table
         if isinstance(ref_table, str):
             ref_table = self.table.client.tables.find_table(location=ref_table)
 
-        # Default: self-referencing FK
         if ref_table is None:
             ref_table = self.table
 
@@ -256,7 +283,7 @@ class Column:
         *,
         ref_table: "str | Table | None" = None,
         ref_column: "str | Column | None" = None,
-        constraint_name: Optional[str] = None,
+        constraint_name: str | None = None,
         rely: bool = False,
         match_full: bool = False,
         on_update_no_action: bool = False,

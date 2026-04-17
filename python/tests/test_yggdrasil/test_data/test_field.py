@@ -1,503 +1,153 @@
-"""Unit tests for yggdrasil/data/field.py"""
 from __future__ import annotations
 
-import json
-
+import pandas as pd
+import polars as pl
 import pyarrow as pa
-import pytest
 
-from yggdrasil.data.field import (
-    Field,
-    _decode_metadata_dict,
-    _merge_metadata_and_tags,
-    _normalize_metadata,
-    _to_bytes,
-    field,
-)
+from yggdrasil.data.data_field import Field
+from yggdrasil.data.types.primitive import IntegerType, StringType
 
 
-# ============================================================================
-# _to_bytes
-# ============================================================================
+def test_with_default_updates_metadata_backed_default():
+    field = Field(name="qty", dtype=IntegerType(byte_size=8, signed=True), nullable=False)
 
+    field = field.with_default(7)
 
-class TestToBytes:
-    def test_none_returns_empty(self):
-        assert _to_bytes(None) == b""
+    assert field.has_default is True
+    assert field.default == 7
+    assert field.default_arrow_scalar.as_py() == 7
 
-    def test_bytes_passthrough(self):
-        assert _to_bytes(b"hello") == b"hello"
 
-    def test_str_encodes_utf8(self):
-        assert _to_bytes("hello") == b"hello"
+def test_default_arrow_array_uses_field_default():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+        default=11,
+    )
 
-    def test_str_unicode(self):
-        assert _to_bytes("caf\u00e9") == "café".encode("utf-8")
+    arr = field.default_arrow_array(size=3)
 
-    def test_int_json_encoded(self):
-        assert _to_bytes(42) == b"42"
+    assert arr.to_pylist() == [11, 11, 11]
 
-    def test_bool_json_encoded(self):
-        assert _to_bytes(True) == b"true"
 
-    def test_list_json_encoded(self):
-        assert _to_bytes([1, 2]) == b"[1,2]"
+def test_fill_arrow_array_nulls_uses_field_default():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+        default=9,
+    )
+    arr = pa.array([1, None, 3], type=pa.int64())
 
-    def test_dict_json_encoded(self):
-        result = json.loads(_to_bytes({"a": 1}))
-        assert result == {"a": 1}
+    out = field.fill_arrow_array_nulls(arr)
 
+    assert out.to_pylist() == [1, 9, 3]
 
-# ============================================================================
-# _normalize_metadata
-# ============================================================================
 
+def test_default_pandas_series_uses_field_name_and_default():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+        default=5,
+    )
 
-class TestNormalizeMetadata:
-    def test_both_none_returns_none(self):
-        assert _normalize_metadata(None, None) is None
+    out = field.default_pandas_series(size=3)
 
-    def test_empty_dicts_return_none(self):
-        assert _normalize_metadata({}, {}) is None
+    assert out.name == "qty"
+    assert out.tolist() == [5, 5, 5]
 
-    def test_metadata_bytes_keys(self):
-        result = _normalize_metadata({b"key": b"val"}, None)
-        assert result == {b"key": b"val"}
 
-    def test_metadata_str_keys(self):
-        result = _normalize_metadata({"key": "val"}, None)
-        assert result == {b"key": b"val"}
+def test_fill_pandas_series_nulls_uses_field_default():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+        default=5,
+    )
+    series = pd.Series([1, None, 3], name="qty")
 
-    def test_tags_get_t_prefix(self):
-        result = _normalize_metadata(None, {"role": "identifier"})
-        assert result == {b"t:role": b"identifier"}
+    out = field.fill_pandas_series_nulls(series)
 
-    def test_metadata_and_tags_merged(self):
-        result = _normalize_metadata({"comment": "hi"}, {"role": "id"})
-        assert result[b"comment"] == b"hi"
-        assert result[b"t:role"] == b"id"
+    assert out.tolist() == [1.0, 5.0, 3.0]
 
-    def test_none_values_excluded(self):
-        result = _normalize_metadata({"k": None}, None)
-        assert result is None
 
-    def test_empty_key_excluded(self):
-        result = _normalize_metadata({"": "val"}, None)
-        assert result is None
+def test_cast_pandas_series_applies_target_field():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+    )
+    series = pd.Series([1, 2, 3], name="qty")
 
+    out = field.cast_pandas_series(series)
 
-# ============================================================================
-# _merge_metadata_and_tags
-# ============================================================================
+    assert out.name == "qty"
+    assert out.tolist() == [1, 2, 3]
 
 
-class TestMergeMetadataAndTags:
-    def test_both_none_returns_none(self):
-        assert _merge_metadata_and_tags(None, None) is None
+def test_default_polars_series_uses_field_name_and_default():
+    field = Field(
+        name="book_id",
+        dtype=StringType(),
+        nullable=False,
+        default="NA",
+    )
 
-    def test_metadata_only(self):
-        result = _merge_metadata_and_tags({b"k": b"v"}, None)
-        assert result == {b"k": b"v"}
+    out = field.default_polars_series(size=2)
 
-    def test_tags_get_t_prefix(self):
-        result = _merge_metadata_and_tags(None, {b"role": b"id"})
-        assert result == {b"t:role": b"id"}
+    assert out.name == "book_id"
+    assert out.to_list() == ["NA", "NA"]
 
-    def test_tags_already_prefixed_not_doubled(self):
-        result = _merge_metadata_and_tags(None, {b"t:role": b"id"})
-        assert result == {b"t:role": b"id"}
 
-    def test_both_merged(self):
-        result = _merge_metadata_and_tags({b"a": b"1"}, {b"b": b"2"})
-        assert result[b"a"] == b"1"
-        assert result[b"t:b"] == b"2"
+def test_fill_polars_series_nulls_uses_field_default():
+    field = Field(
+        name="book_id",
+        dtype=StringType(),
+        nullable=False,
+        default="NA",
+    )
+    series = pl.Series("book_id", ["A", None, "C"])
 
-    def test_tags_overwrite_metadata(self):
-        result = _merge_metadata_and_tags({b"t:x": b"old"}, {b"x": b"new"})
-        assert result[b"t:x"] == b"new"
+    out = field.fill_polars_array_nulls(series)
 
+    assert out.to_list() == ["A", "NA", "C"]
 
-# ============================================================================
-# _decode_metadata_dict
-# ============================================================================
 
+def test_cast_polars_series_applies_target_field():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+    )
+    series = pl.Series("qty", [1, 2, 3])
 
-class TestDecodeMetadataDict:
-    def test_none_returns_empty_dict(self):
-        assert _decode_metadata_dict(None) == {}
+    out = field.cast_polars_series(series)
 
-    def test_empty_dict_returns_empty(self):
-        assert _decode_metadata_dict({}) == {}
+    assert out.name == "qty"
+    assert out.to_list() == [1, 2, 3]
 
-    def test_json_value_decoded(self):
-        result = _decode_metadata_dict({b"n": b"42"})
-        assert result["n"] == 42
 
-    def test_string_value_decoded(self):
-        result = _decode_metadata_dict({b"k": b"hello"})
-        assert result["k"] == "hello"
+def test_to_arrow_field_includes_type_json_metadata():
+    field = Field(
+        name="qty",
+        dtype=IntegerType(byte_size=8, signed=True),
+        nullable=False,
+        metadata={b"comment": b"quantity"},
+    )
 
-    def test_boolean_json_decoded(self):
-        result = _decode_metadata_dict({b"flag": b"true"})
-        assert result["flag"] is True
+    out = field.to_arrow_field()
 
-    def test_key_decoded_as_utf8(self):
-        result = _decode_metadata_dict({b"my_key": b'"val"'})
-        assert "my_key" in result
+    assert out.name == "qty"
+    assert out.nullable is False
+    assert out.metadata is not None
+    assert b"comment" in out.metadata
+    assert b"to_json" in out.metadata
 
-    def test_non_json_falls_back_to_string(self):
-        result = _decode_metadata_dict({b"k": b"not-json!"})
-        assert result["k"] == "not-json!"
 
+def test_from_str_nullable_suffix():
+    field = Field.from_str("qty!: int64")
 
-# ============================================================================
-# field() factory
-# ============================================================================
-
-
-class TestFieldFactory:
-    def test_basic_creation(self):
-        f = field("price", pa.float64())
-        assert isinstance(f, Field)
-        assert f.name == "price"
-        assert f.arrow_type == pa.float64()
-        assert f.nullable is True
-
-    def test_nullable_false(self):
-        f = field("id", pa.int64(), nullable=False)
-        assert f.nullable is False
-
-    def test_with_metadata(self):
-        f = field("x", pa.int32(), metadata={"comment": "test"})
-        assert f.metadata[b"comment"] == b"test"
-
-    def test_with_tags(self):
-        f = field("x", pa.int32(), tags={"role": "id"})
-        assert f.metadata[b"t:role"] == b"id"
-
-    def test_with_metadata_and_tags(self):
-        f = field("x", pa.int32(), metadata={"m": "1"}, tags={"t": "2"})
-        assert f.metadata[b"m"] == b"1"
-        assert f.metadata[b"t:t"] == b"2"
-
-
-# ============================================================================
-# Field — properties
-# ============================================================================
-
-
-class TestFieldProperties:
-    def test_partition_by_true(self):
-        f = Field(name="dt", arrow_type=pa.date32(), metadata={b"t:partition_by": b"true"})
-        assert f.partition_by is True
-
-    def test_partition_by_false_missing(self):
-        f = Field(name="dt", arrow_type=pa.date32())
-        assert f.partition_by is False
-
-    def test_cluster_by_true(self):
-        f = Field(name="id", arrow_type=pa.int64(), metadata={b"t:cluster_by": b"true"})
-        assert f.cluster_by is True
-
-    def test_cluster_by_false_missing(self):
-        f = Field(name="id", arrow_type=pa.int64())
-        assert f.cluster_by is False
-
-    def test_tags_returns_dict_without_prefix(self):
-        f = Field(
-            name="x",
-            arrow_type=pa.int32(),
-            metadata={b"t:role": b"id", b"comment": b"hi"},
-        )
-        assert f.tags == {b"role": b"id"}
-
-    def test_tags_empty_when_no_metadata(self):
-        f = Field(name="x", arrow_type=pa.int32())
-        assert f.tags == {}
-
-
-# ============================================================================
-# Field.copy
-# ============================================================================
-
-
-class TestFieldCopy:
-    def setup_method(self):
-        self.f = Field(
-            name="amount",
-            arrow_type=pa.float64(),
-            nullable=True,
-            metadata={b"comment": b"base"},
-        )
-
-    def test_copy_identical(self):
-        f2 = self.f.copy()
-        assert f2.name == self.f.name
-        assert f2.arrow_type == self.f.arrow_type
-        assert f2.nullable == self.f.nullable
-        assert f2.metadata == self.f.metadata
-
-    def test_copy_changes_name(self):
-        f2 = self.f.copy(name="qty")
-        assert f2.name == "qty"
-        assert f2.arrow_type == self.f.arrow_type
-
-    def test_copy_changes_type(self):
-        f2 = self.f.copy(arrow_type=pa.int64())
-        assert f2.arrow_type == pa.int64()
-
-    def test_copy_changes_nullable(self):
-        f2 = self.f.copy(nullable=False)
-        assert f2.nullable is False
-
-    def test_copy_new_metadata_replaces(self):
-        f2 = self.f.copy(metadata={"new": "val"})
-        assert f2.metadata == {b"new": b"val"}
-
-    def test_copy_new_tags_replaces_metadata(self):
-        f2 = self.f.copy(tags={"role": "measure"})
-        assert f2.metadata == {b"t:role": b"measure"}
-
-    def test_copy_preserves_immutability(self):
-        f2 = self.f.copy()
-        assert f2 is not self.f
-
-
-# ============================================================================
-# Field.autotag
-# ============================================================================
-
-
-class TestFieldAutotag:
-    def _tag(self, f: Field, key: str) -> str | None:
-        raw = f.metadata or {}
-        v = raw.get(b"t:" + key.encode())
-        return v.decode() if v else None
-
-    def test_boolean_kind(self):
-        f = Field("flag", pa.bool_()).autotag()
-        assert self._tag(f, "kind") == "boolean"
-
-    def test_integer_kind(self):
-        f = Field("count", pa.int32()).autotag()
-        assert self._tag(f, "kind") == "integer"
-        assert self._tag(f, "numeric") == "true"
-
-    def test_float_kind(self):
-        f = Field("rate", pa.float32()).autotag()
-        assert self._tag(f, "kind") == "float"
-        assert self._tag(f, "numeric") == "true"
-
-    def test_decimal_kind(self):
-        f = Field("price", pa.decimal128(18, 4)).autotag()
-        assert self._tag(f, "kind") == "decimal"
-        assert self._tag(f, "numeric") == "true"
-
-    def test_timestamp_kind(self):
-        f = Field("ts", pa.timestamp("us")).autotag()
-        assert self._tag(f, "kind") == "timestamp"
-        assert self._tag(f, "temporal") == "true"
-
-    def test_timestamp_unit_tagged(self):
-        f = Field("ts", pa.timestamp("ms")).autotag()
-        assert self._tag(f, "unit") == "ms"
-
-    def test_timestamp_tz_tagged(self):
-        f = Field("ts", pa.timestamp("us", tz="UTC")).autotag()
-        assert self._tag(f, "tz") == "UTC"
-
-    def test_date_kind(self):
-        f = Field("event_date", pa.date32()).autotag()
-        assert self._tag(f, "kind") == "date"
-        assert self._tag(f, "temporal") == "true"
-
-    def test_time_kind(self):
-        f = Field("open_time", pa.time64("us")).autotag()
-        assert self._tag(f, "kind") == "time"
-
-    def test_duration_kind(self):
-        f = Field("elapsed", pa.duration("s")).autotag()
-        assert self._tag(f, "kind") == "duration"
-
-    def test_string_kind(self):
-        f = Field("label", pa.string()).autotag()
-        assert self._tag(f, "kind") == "string"
-
-    def test_binary_kind(self):
-        f = Field("blob", pa.binary()).autotag()
-        assert self._tag(f, "kind") == "binary"
-
-    def test_list_kind(self):
-        f = Field("items", pa.list_(pa.int32())).autotag()
-        assert self._tag(f, "kind") == "list"
-        assert self._tag(f, "nested") == "true"
-
-    def test_struct_kind(self):
-        f = Field("row", pa.struct([pa.field("x", pa.int32())])).autotag()
-        assert self._tag(f, "kind") == "struct"
-        assert self._tag(f, "nested") == "true"
-
-    def test_nullable_tagged(self):
-        f = Field("x", pa.int32(), nullable=False).autotag()
-        assert self._tag(f, "nullable") == "false"
-
-    def test_id_role(self):
-        f = Field("customer_id", pa.int64()).autotag()
-        assert self._tag(f, "role") == "identifier"
-
-    def test_timestamp_role(self):
-        f = Field("event_ts", pa.timestamp("us")).autotag()
-        assert self._tag(f, "role") == "event_time"
-
-    def test_date_role(self):
-        f = Field("trade_date", pa.date32()).autotag()
-        assert self._tag(f, "role") == "date"
-
-    def test_created_at_role(self):
-        f = Field("created_at", pa.timestamp("us")).autotag()
-        assert self._tag(f, "role") == "created_at"
-
-    def test_updated_at_role(self):
-        f = Field("updated_at", pa.timestamp("us")).autotag()
-        assert self._tag(f, "role") == "updated_at"
-
-    def test_deleted_at_role(self):
-        f = Field("deleted_at", pa.timestamp("us")).autotag()
-        assert self._tag(f, "role") == "deleted_at"
-
-    def test_is_prefix_flag_role(self):
-        f = Field("is_active", pa.bool_()).autotag()
-        assert self._tag(f, "role") == "flag"
-
-    def test_has_prefix_flag_role(self):
-        f = Field("has_access", pa.bool_()).autotag()
-        assert self._tag(f, "role") == "flag"
-
-    def test_price_role(self):
-        f = Field("close_price", pa.float64()).autotag()
-        assert self._tag(f, "role") == "price"
-
-    def test_quantity_role(self):
-        f = Field("quantity", pa.int64()).autotag()
-        assert self._tag(f, "role") == "measure"
-
-    def test_name_role(self):
-        f = Field("full_name", pa.string()).autotag()
-        assert self._tag(f, "role") == "attribute"
-
-    def test_country_role(self):
-        # "country" contains the substring "count" which triggers the measure heuristic
-        # first; use a name that cleanly matches only the dimension heuristic.
-        f = Field("region", pa.string()).autotag()
-        assert self._tag(f, "role") == "dimension"
-
-    def test_country_substring_collision(self):
-        # "country" contains "count" → measure fires first via setdefault;
-        # the dimension setdefault does not override it.  This is the current
-        # behaviour; the test pins it so any future fix is visible.
-        f = Field("country", pa.string()).autotag()
-        assert self._tag(f, "role") in ("measure", "dimension")
-
-    def test_partition_by_preserved_in_autotag(self):
-        f = Field("dt", pa.date32(), metadata={b"t:partition_by": b"true"}).autotag()
-        assert self._tag(f, "partition_by") == "true"
-
-    def test_existing_tags_win_over_inferred(self):
-        # manually set role overrides what autotag would infer
-        f = Field(
-            "customer_id",
-            pa.int64(),
-            metadata={b"t:role": b"custom"},
-        ).autotag()
-        assert self._tag(f, "role") == "custom"
-
-
-# ============================================================================
-# Field.from_any / from_arrow / to_arrow_field
-# ============================================================================
-
-
-class TestFieldConversion:
-    def test_from_arrow_pa_field(self):
-        arrow_field = pa.field("x", pa.int32(), nullable=False)
-        f = Field.from_arrow(arrow_field)
-        assert f.name == "x"
-        assert f.arrow_type == pa.int32()
-        assert f.nullable is False
-
-    def test_from_arrow_preserves_metadata(self):
-        arrow_field = pa.field("x", pa.int32(), metadata={b"k": b"v"})
-        f = Field.from_arrow(arrow_field)
-        assert f.metadata == {b"k": b"v"}
-
-    def test_from_any_with_field_instance(self):
-        f = Field(name="y", arrow_type=pa.float64())
-        assert Field.from_any(f) is f
-
-    def test_from_any_with_arrow_field(self):
-        arrow_field = pa.field("z", pa.string())
-        f = Field.from_any(arrow_field)
-        assert isinstance(f, Field)
-        assert f.name == "z"
-
-    def test_to_arrow_field(self):
-        f = Field(name="a", arrow_type=pa.int64(), nullable=False)
-        af = f.to_arrow_field()
-        assert isinstance(af, pa.Field)
-        assert af.name == "a"
-        assert af.type == pa.int64()
-        assert af.nullable is False
-
-    def test_to_arrow_field_with_metadata(self):
-        f = Field(name="b", arrow_type=pa.string(), metadata={b"k": b"v"})
-        af = f.to_arrow_field()
-        assert af.metadata == {b"k": b"v"}
-
-    def test_roundtrip_arrow(self):
-        f = Field(name="c", arrow_type=pa.float32(), nullable=True)
-        assert Field.from_arrow(f.to_arrow_field()) == f
-
-
-# ============================================================================
-# Field.from_polars / to_polars_field
-# ============================================================================
-
-
-class TestFieldPolars:
-    @pytest.fixture(autouse=True)
-    def _skip_if_no_polars(self):
-        pytest.importorskip("polars")
-
-    def test_from_polars_name_and_dtype(self):
-        import polars as pl
-
-        f = Field.from_polars(name="x", dtype=pl.Int64())
-        assert f.name == "x"
-        assert f.arrow_type == pa.int64()
-
-    def test_from_polars_object(self):
-        import polars as pl
-
-        pl_field = pl.Field("val", pl.Float64())
-        f = Field.from_polars(pl_field)
-        assert f.name == "val"
-        assert f.arrow_type == pa.float64()
-
-    def test_from_polars_requires_name_and_dtype(self):
-        with pytest.raises(ValueError):
-            Field.from_polars()
-
-    def test_to_polars_field(self):
-        import polars as pl
-
-        f = Field(name="score", arrow_type=pa.float32())
-        pf = f.to_polars_field()
-        assert pf.name == "score"
-        assert pf.dtype == pl.Float32()
-
-    def test_roundtrip_polars(self):
-        import polars as pl
-
-        f = Field.from_polars(name="ts", dtype=pl.Datetime("us"))
-        pf = f.to_polars_field()
-        assert pf.name == "ts"
+    assert field.name == "qty"
+    assert field.nullable is False

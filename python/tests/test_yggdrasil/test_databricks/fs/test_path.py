@@ -5,6 +5,7 @@ and the new pathlib.PurePosixPath-compatible properties.
 """
 from __future__ import annotations
 
+import datetime as dt
 import unittest
 
 from yggdrasil.databricks.fs.path import (
@@ -14,8 +15,10 @@ from yggdrasil.databricks.fs.path import (
     VolumePath,
     TablePath,
     DatabricksStatResult,
+    _coerce_mtime_seconds,
 )
 from yggdrasil.databricks.fs.path_kind import DatabricksPathKind
+from yggdrasil.databricks.fs.volumes_path import _parse_mtime
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -284,6 +287,34 @@ class TestStatResult(unittest.TestCase):
         s = DatabricksStatResult()
         with self.assertRaises(AttributeError):
             s.st_size = 1
+
+
+class TestMetadataNormalization(unittest.TestCase):
+
+    def test_coerce_mtime_seconds_accepts_datetime(self):
+        value = dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+        self.assertEqual(_coerce_mtime_seconds(value), value.timestamp())
+
+    def test_reset_metadata_normalizes_datetime_mtime(self):
+        p = DatabricksPath.parse("/Volumes/cat/schema/vol/file.txt")
+        value = dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+
+        p.reset_metadata(is_file=True, is_dir=False, size="3", mtime=value)
+        original = type(p)._refresh_metadata
+        try:
+            type(p)._refresh_metadata = lambda self: None
+            st = p.stat()
+        finally:
+            type(p)._refresh_metadata = original
+
+        self.assertEqual(st.st_size, 3)
+        self.assertEqual(st.st_mtime, value.timestamp())
+
+    def test_parse_volume_mtime_prefers_supported_fields(self):
+        class Info:
+            last_modified = dt.datetime(2024, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+
+        self.assertEqual(_parse_mtime(Info()), Info.last_modified)
 
 
 # ══════════════════════════════════════════════════════════════════════════

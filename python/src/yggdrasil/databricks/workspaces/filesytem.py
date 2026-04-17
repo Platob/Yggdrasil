@@ -258,7 +258,7 @@ class DatabricksFileSystemHandler(FileSystemHandler):
         self,
         path,
         mode: str = "r+",
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
     ):
         """Open a file path as a Databricks IO stream.
 

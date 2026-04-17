@@ -50,6 +50,21 @@ def _require_https(host: str) -> None:
         pytest.skip(f"Cannot complete TLS handshake with {host}:443")
 
 
+def _require_httpbin_post() -> None:
+    _require_https("httpbin.org")
+
+    session = HTTPSession()
+    response = session.post(
+        "https://httpbin.org/post",
+        headers={"User-Agent": "real-http-test"},
+        json={"probe": True},
+        raise_error=False,
+    )
+    body = response.content.decode("utf-8", errors="ignore").lower()
+    if response.status_code == 403 and "zscaler" in body:
+        pytest.skip("Outbound POST to httpbin.org is blocked by the local network policy")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _network_precheck():
     # Light precheck so failures are mostly meaningful test failures, not
@@ -128,7 +143,7 @@ def test_redirect_followed():
 
 
 def test_post_json_roundtrip():
-    _require_https("httpbin.org")
+    _require_httpbin_post()
 
     s = HTTPSession()
 
@@ -150,7 +165,7 @@ def test_post_json_roundtrip():
 
 
 def test_post_raw_body_roundtrip():
-    _require_https("httpbin.org")
+    _require_httpbin_post()
 
     s = HTTPSession()
     body = b"hello-real-world"
@@ -230,14 +245,13 @@ def test_session_get_helper():
 
 
 def test_session_post_helper_with_json():
-    _require_https("httpbin.org")
+    _require_httpbin_post()
 
     s = HTTPSession()
     payload = {"x": 1, "y": "z"}
 
     resp = s.post(
         "https://httpbin.org/post",
-        headers={"User-Agent": "real-http-test"},
         json=payload,
         raise_error=False,
     )

@@ -172,9 +172,9 @@ class RefreshResult(Generic[T]):
     If both are ``None`` → non-expiring.
     """
     value: Optional[T]
-    created_at_ns: Optional[int] = None
-    ttl_ns: Optional[int] = None
-    expires_at_ns: Optional[int] = None
+    created_at_ns: int | None = None
+    ttl_ns: int | None = None
+    expires_at_ns: int | None = None
 
     @classmethod
     def make(
@@ -205,6 +205,7 @@ class Expiring(Generic[T], ABC):
     _created_at_ns: int = field(default_factory=now_utc_ns, repr=False)
     _expires_at_ns: Optional[int] = field(default=None, repr=False)
     _ttl_ns: Optional[int] = field(default=None, repr=False)
+
     _lock: RLock = field(default_factory=RLock, init=False, repr=False, compare=False)
 
     # ── abstract ────────────────────────────────────────────
@@ -316,29 +317,6 @@ class Expiring(Generic[T], ABC):
         """Force refresh now (same as accessing ``.value`` and discarding it)."""
         _ = self.value
 
-    # ── pickle ───────────────────────────────────────────────
-
-    def __getstate__(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "_value": self._value,
-                "_created_at_ns": self._created_at_ns,
-                "_expires_at_ns": self._expires_at_ns,
-                "_ttl_ns": self._ttl_ns,
-            }
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        object.__setattr__(self, "_lock", RLock())
-        with self._lock:
-            self._value = state.get("_value")
-            self._created_at_ns = _to_epoch_ns(
-                state.get("_created_at_ns", now_utc_ns()), "_created_at_ns"
-            )
-            self._ttl_ns = _to_ttl_ns(state.get("_ttl_ns"))
-            self._expires_at_ns = _to_expires_at_ns(
-                state.get("_expires_at_ns"), now_ns=self._created_at_ns
-            )
-
     # ── internals ────────────────────────────────────────────
 
     def _apply_refresh_result(self, rr: RefreshResult[T]) -> None:
@@ -402,7 +380,7 @@ class ExpiringDict(Generic[K, V]):
         self,
         default_ttl: Optional[Union[float, int, timedelta]] = 300.0,
         *,
-        max_size: Optional[int] = None,
+        max_size: int | None = None,
         refresher: Optional[Callable[[K], RefreshResult[V]]] = None,
     ) -> None:
         self._default_ttl_ns: Optional[int] = self._parse_ttl(default_ttl)
