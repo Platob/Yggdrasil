@@ -967,7 +967,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, Statement):
+        if isinstance(data, Statement) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1129,7 +1129,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, Statement):
+        if isinstance(data, Statement) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1573,7 +1573,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
-        if isinstance(data, Statement):
+        if isinstance(data, Statement) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,

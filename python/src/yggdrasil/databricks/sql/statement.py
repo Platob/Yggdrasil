@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
@@ -9,6 +10,16 @@ from typing import Any, List, Optional
 from databricks.sdk.service.sql import StatementParameterListItem
 
 __all__ = ["Statement"]
+
+
+_SQL_COMMENT_OR_WS_RE = re.compile(
+    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)+",
+    re.DOTALL,
+)
+_SQL_QUERY_LEAD_RE = re.compile(
+    r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +50,26 @@ class Statement:
     text: str
     parameters: Mapping[str, Any] = field(default_factory=dict)
     temporary_tables: Mapping[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def looks_like_query(text: Any) -> bool:
+        """Fast heuristic: return ``True`` when ``text`` looks like a SQL query.
+
+        Leading whitespace and SQL comments are skipped; a string is treated
+        as a query when its first keyword is ``SELECT``, ``WITH``, ``VALUES``,
+        ``TABLE``, or ``FROM``.  Non-string inputs return ``False``.
+        """
+        if not isinstance(text, str) or not text:
+            return False
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+        while True:
+            match = _SQL_COMMENT_OR_WS_RE.match(stripped)
+            if not match:
+                break
+            stripped = stripped[match.end():]
+        return bool(_SQL_QUERY_LEAD_RE.match(stripped))
 
     @classmethod
     def prepare(
