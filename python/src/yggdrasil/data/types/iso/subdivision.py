@@ -1,14 +1,23 @@
 """ISO 3166-2 subdivision type (country + subdivision code).
 
-The canonical form is ``<alpha-2>-<subdivision>`` (e.g. ``US-CA``,
-``FR-75``, ``GB-ENG``).  No embedded lookup table — there are thousands
-of subdivisions across countries and validation happens structurally:
+Canonical form: ``<alpha-2>-<subdivision>`` (e.g. ``US-CA``, ``FR-75``,
+``GB-ENG``).  No embedded ISO 3166-2 catalog — validation and
+extraction are structural with flexible country-prefix matching.
 
-1. Split on ``-`` (or space).
-2. Resolve the country part through :class:`ISOCountryType` (alpha-2).
-3. Require a subdivision part of 1-3 alphanumerics.
+Parsing is tolerant of a wide range of input shapes::
 
-Values that don't match the structure become null when ``safe=False``.
+    US-CA               -> US-CA
+    USA-CA              -> US-CA
+    US CA               -> US-CA
+    France 75           -> FR-75
+    Germany - Berlin    -> DE-BER   (subdivision truncated to 3 alnum)
+    UNITED STATES CA    -> US-CA
+    CH-                 -> CH       (country only)
+    GB                  -> GB       (country only)
+
+For country-only inputs (no trailing subdivision) the output is just
+the alpha-2 country code.  Unresolvable values become null when
+``safe=False``.
 """
 from __future__ import annotations
 
@@ -17,7 +26,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Mapping
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from .base import ISOType, normalize_iso_token_keep_hyphen
 from .country import _ALPHA2_MAP, _VALID_ALPHA2
@@ -25,21 +33,87 @@ from .country import _ALPHA2_MAP, _VALID_ALPHA2
 if TYPE_CHECKING:
     import polars
 
-__all__ = ["ISOSubdivisionType"]
+__all__ = ["ISOSubdivisionType", "parse_subdivision_token"]
 
 
-# ISO 3166-2 structural regex: alpha-2 country code + hyphen + 1-3 alphanumerics.
-_ISO_3166_2_RE = re.compile(r"^([A-Z]{2})-([A-Z0-9]{1,3})$")
+# Max number of leading words to test as a country name ("UNITED ARAB EMIRATES"
+# is 3, "BONAIRE SINT EUSTATIUS AND SABA" is 5 but those keep the same
+# alpha-2, so a cap of 5 covers every ISO 3166-1 short name we ship).
+_MAX_COUNTRY_TOKENS: int = 5
+
+_WORD_RE = re.compile(r"[A-Z0-9]+")
+
+
+def _resolve_country_alpha2(value: str) -> str | None:
+    if value in _VALID_ALPHA2:
+        return value
+    return _ALPHA2_MAP.get(value)
+
+
+def parse_subdivision_token(token: str) -> str | None:
+    """Flexible parser for ISO 3166-2-style inputs.
+
+    ``token`` must already be upper-cased; this function handles
+    whitespace/punctuation normalization internally.  Returns the
+    canonical form or None when the country prefix can't be matched.
+    """
+    words = _WORD_RE.findall(token)
+    if not words:
+        return None
+
+    max_prefix = min(len(words), _MAX_COUNTRY_TOKENS)
+    for prefix_len in range(max_prefix, 0, -1):
+        country_text = " ".join(words[:prefix_len])
+        country = _resolve_country_alpha2(country_text)
+        if country is None:
+            country = _resolve_country_alpha2(country_text.replace(" ", ""))
+        if country is None:
+            continue
+
+        sub_words = words[prefix_len:]
+        if not sub_words:
+            # Country-only input like "CH-" or "GB".
+            return country
+
+        # Concatenate remaining alphanumerics and truncate to 3 chars
+        # (ISO 3166-2 subdivision codes are 1-3 chars).
+        sub_raw = "".join(sub_words)
+        sub = sub_raw[:3]
+        if not sub or not sub.isalnum():
+            return country
+        return f"{country}-{sub}"
+
+    # Single-token fallback: "USCA", "FRPAR" — chop the country prefix off.
+    if len(words) == 1:
+        return _chop_prefix_fallback(words[0])
+
+    return None
+
+
+def _chop_prefix_fallback(compact: str) -> str | None:
+    """Fallback: treat the first 2 or 3 chars as a country code."""
+    # Try alpha-3 first (more specific), then alpha-2.
+    for split_at in (3, 2):
+        if len(compact) <= split_at:
+            continue
+        country = _resolve_country_alpha2(compact[:split_at])
+        if country is None:
+            continue
+        sub_raw = compact[split_at:]
+        sub = sub_raw[:3]
+        if not sub or not sub.isalnum():
+            return country
+        return f"{country}-{sub}"
+    return None
 
 
 @dataclass(frozen=True)
 class ISOSubdivisionType(ISOType):
-    """ISO 3166-2 subdivision code (e.g. ``US-CA``, ``FR-75``).
+    """ISO 3166-2 subdivision code with flexible input parsing.
 
-    Validates structure only; no embedded catalog of all 5000+
-    subdivision codes.  The country part is normalized via
-    :class:`ISOCountryType` so inputs like ``USA-CA`` or ``UNITED
-    STATES-CA`` resolve to ``US-CA``.
+    Recognizes country names, alpha-2/alpha-3 codes, numeric codes, and
+    common aliases at the country position; the trailing subdivision
+    part is truncated to the first 3 alphanumerics.
     """
 
     iso_name: ClassVar[str] = "iso_subdivision"
@@ -48,77 +122,31 @@ class ISOSubdivisionType(ISOType):
         return normalize_iso_token_keep_hyphen(value)
 
     def _resolve_token(self, token: str) -> str | None:
-        # token is upper-cased with non-alnum-except-hyphen collapsed to spaces.
-        # Accept either "CC-SUB" or "CC SUB".
-        compact = token.replace(" ", "")
-        if not compact:
-            return None
-
-        # Try hyphen split first.
-        if "-" in compact:
-            country_part, _, sub_part = compact.partition("-")
-        else:
-            # No hyphen: try splitting at 2-char or 3-char prefix.
-            country_part = compact[:2]
-            sub_part = compact[2:]
-            if not sub_part:
-                return None
-
-        country = _resolve_country_alpha2(country_part)
-        if country is None:
-            # Try alpha-3 prefix (first 3 chars).
-            if len(compact) >= 4:
-                country = _resolve_country_alpha2(compact[:3])
-                if country is not None:
-                    sub_part = compact[3:].lstrip("-")
-
-        if country is None:
-            return None
-
-        sub = sub_part.strip("-")
-        if not sub or not sub.isalnum():
-            return None
-        if not (1 <= len(sub) <= 3):
-            return None
-
-        canonical = f"{country}-{sub}"
-        if _ISO_3166_2_RE.match(canonical):
-            return canonical
-        return None
+        return parse_subdivision_token(token)
 
     # ------------------------------------------------------------------
-    # Vectorized Arrow — structural: normalize then regex-validate.
+    # Vectorized Arrow — row-wise Python to honour flexible parsing.
     # ------------------------------------------------------------------
     def _resolve_arrow_string(self, array: pa.Array) -> pa.Array:
-        # Normalize: uppercase, collapse non-alnum-except-hyphen to single chars,
-        # strip. We do upper, then replace non-[A-Z0-9-] with empty, then trim.
-        upper = pc.utf8_upper(array)
-        cleaned = pc.replace_substring_regex(upper, pattern=r"[^A-Z0-9-]+", replacement="")
-
-        # Extract the ISO 3166-2 pattern: exactly 2 alpha + '-' + 1-3 alnum.
-        extracted = pc.extract_regex(
-            cleaned, pattern=r"^(?P<country>[A-Z]{2})-(?P<sub>[A-Z0-9]{1,3})$"
-        )
-        country = pc.struct_field(extracted, "country")
-        sub = pc.struct_field(extracted, "sub")
-
-        # Validate country part against alpha-2 set.
-        valid_country_values = pa.array(sorted(_VALID_ALPHA2), type=pa.string())
-        country_ok = pc.is_in(country, value_set=valid_country_values)
-
-        combined = pc.binary_join_element_wise(country, sub, "-")
-        return pc.if_else(country_ok, combined, pa.scalar(None, type=pa.string()))
-
-    def _normalize_arrow_string(self, array: pa.Array) -> pa.Array:
-        upper = pc.utf8_upper(array)
-        return pc.replace_substring_regex(upper, pattern=r"[^A-Z0-9-]+", replacement="")
+        out: list[str | None] = []
+        for s in array.to_pylist():
+            if s is None:
+                out.append(None)
+                continue
+            token = self._normalize(s)
+            if token is None:
+                out.append(None)
+                continue
+            out.append(parse_subdivision_token(token))
+        return pa.array(out, type=pa.string())
 
     @classmethod
     def _build_lookup_map(cls) -> Mapping[str, str]:
         return {}
 
     # ------------------------------------------------------------------
-    # Polars lazy path — regex-validate structurally, unknown -> null.
+    # Polars lazy — delegate to the Python parser via map_elements.
+    # Lazy contract: never raises on unparseable values.
     # ------------------------------------------------------------------
     def _cast_polars_expr(
         self,
@@ -128,26 +156,20 @@ class ISOSubdivisionType(ISOType):
         from yggdrasil.data.types.support import get_polars
         pl = get_polars()
 
-        cleaned = (
-            expr.cast(pl.Utf8, strict=False)
-            .str.to_uppercase()
-            .str.replace_all(r"[^A-Z0-9-]+", "")
+        def _resolve(s: str | None) -> str | None:
+            if s is None:
+                return None
+            token = self._normalize(s)
+            if token is None:
+                return None
+            return parse_subdivision_token(token)
+
+        return expr.cast(pl.Utf8, strict=False).map_elements(
+            _resolve, return_dtype=pl.Utf8
         )
-
-        extracted = cleaned.str.extract_groups(
-            r"^(?P<country>[A-Z]{2})-(?P<sub>[A-Z0-9]{1,3})$"
-        )
-        country = extracted.struct.field("country")
-        sub = extracted.struct.field("sub")
-
-        valid_country = pl.Series("_valid", sorted(_VALID_ALPHA2), dtype=pl.Utf8)
-        country_ok = country.is_in(valid_country.implode())
-
-        combined = country + pl.lit("-") + sub
-        return pl.when(country_ok).then(combined).otherwise(pl.lit(None, dtype=pl.Utf8))
 
     # ------------------------------------------------------------------
-    # Spark lazy path — regex-based structural validation.
+    # Spark lazy — Python UDF so the flexible parser is reused.
     # ------------------------------------------------------------------
     def _cast_spark_column(self, column, options):
         from yggdrasil.data.types.support import get_spark_sql
@@ -155,22 +177,16 @@ class ISOSubdivisionType(ISOType):
         F = spark.functions
         options.check_source(column)
 
-        cleaned = F.regexp_replace(
-            F.upper(column.cast(spark.types.StringType())),
-            r"[^A-Z0-9-]+",
-            "",
-        )
+        def _resolve(s):
+            if s is None:
+                return None
+            token = self._normalize(s)
+            if token is None:
+                return None
+            return parse_subdivision_token(token)
 
-        pattern = r"^([A-Z]{2})-([A-Z0-9]{1,3})$"
-        country = F.regexp_extract(cleaned, pattern, 1)
-        sub = F.regexp_extract(cleaned, pattern, 2)
-
-        valid_list = sorted(_VALID_ALPHA2)
-        # isin requires concrete python values; pass positional.
-        country_ok = country.isin(*valid_list) & (sub != F.lit(""))
-
-        combined = F.concat_ws("-", country, sub)
-        return F.when(country_ok, combined).otherwise(F.lit(None).cast(spark.types.StringType()))
+        resolve_udf = F.udf(_resolve, spark.types.StringType())
+        return resolve_udf(column.cast(spark.types.StringType()))
 
     # ------------------------------------------------------------------
     # Dict
@@ -180,9 +196,3 @@ class ISOSubdivisionType(ISOType):
         name = str(value.get("name", "")).upper()
         iso = str(value.get("iso", "")).lower()
         return name in {"ISOSUBDIVISIONTYPE", "ISO_SUBDIVISION"} or iso == cls.iso_name
-
-
-def _resolve_country_alpha2(value: str) -> str | None:
-    if value in _VALID_ALPHA2:
-        return value
-    return _ALPHA2_MAP.get(value)

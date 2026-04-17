@@ -279,6 +279,34 @@ class TestISOSubdivisionType(unittest.TestCase):
             ISOSubdivisionType().convert_pyobj("FR-75", nullable=True), "FR-75"
         )
 
+    def test_country_name_with_code(self):
+        self.assertEqual(
+            ISOSubdivisionType().convert_pyobj("France 75", nullable=True), "FR-75"
+        )
+
+    def test_country_name_with_subdivision_name(self):
+        # Berlin -> "BER" (first 3 alnum of the remainder).
+        self.assertEqual(
+            ISOSubdivisionType().convert_pyobj("Germany - Berlin", nullable=True),
+            "DE-BER",
+        )
+
+    def test_multi_word_country(self):
+        self.assertEqual(
+            ISOSubdivisionType().convert_pyobj("UNITED STATES CA", nullable=True),
+            "US-CA",
+        )
+
+    def test_country_only_trailing_dash(self):
+        self.assertEqual(
+            ISOSubdivisionType().convert_pyobj("CH-", nullable=True), "CH"
+        )
+
+    def test_country_only_bare(self):
+        self.assertEqual(
+            ISOSubdivisionType().convert_pyobj("GB", nullable=True), "GB"
+        )
+
     def test_unknown_country(self):
         self.assertIsNone(
             ISOSubdivisionType().convert_pyobj("ZZ-CA", nullable=True)
@@ -286,7 +314,7 @@ class TestISOSubdivisionType(unittest.TestCase):
 
     def test_bad_format(self):
         self.assertIsNone(
-            ISOSubdivisionType().convert_pyobj("garbage", nullable=True)
+            ISOSubdivisionType().convert_pyobj("!!!", nullable=True)
         )
 
 
@@ -297,6 +325,23 @@ class TestISOSubdivisionTypeArrow(ArrowTestCase):
         self.assertEqual(
             t._cast_arrow_array(arr, _Opts()).to_pylist(),
             ["US-CA", "FR-75", "GB-ENG", None, None],
+        )
+
+    def test_cast_flexible(self):
+        t = ISOSubdivisionType()
+        arr = pa.array(
+            [
+                "France 75",
+                "Germany - Berlin",
+                "UNITED STATES CA",
+                "CH-",
+                "USA-CA",
+                None,
+            ]
+        )
+        self.assertEqual(
+            t._cast_arrow_array(arr, _Opts()).to_pylist(),
+            ["FR-75", "DE-BER", "US-CA", "CH", "US-CA", None],
         )
 
 
@@ -318,11 +363,32 @@ class TestISOCityType(unittest.TestCase):
     def test_alpha3_prefix(self):
         self.assertEqual(ISOCityType().convert_pyobj("USA-NYC", nullable=True), "US-NYC")
 
-    def test_too_short_city(self):
-        self.assertIsNone(ISOCityType().convert_pyobj("FR-PA", nullable=True))
+    def test_country_name_city_name(self):
+        self.assertEqual(
+            ISOCityType().convert_pyobj("France Paris", nullable=True), "FR-PAR"
+        )
+
+    def test_trailing_dash_country_only(self):
+        self.assertEqual(ISOCityType().convert_pyobj("FR-", nullable=True), "FR")
+
+    def test_short_city_truncated(self):
+        # "PA" is only 2 chars but we accept partial input; result is "FR-PA".
+        self.assertEqual(ISOCityType().convert_pyobj("FR-PA", nullable=True), "FR-PA")
 
     def test_unknown_country(self):
         self.assertIsNone(ISOCityType().convert_pyobj("ZZ-YYY", nullable=True))
+
+
+class TestISOSubdivisionTypePolars(PolarsTestCase):
+    def test_lazy_expr_flexible(self):
+        pl = self.pl
+        df = pl.DataFrame(
+            {"c": ["France 75", "Germany - Berlin", "CH-", "xxx", None]}
+        )
+        out = df.select(
+            ISOSubdivisionType()._cast_polars_expr(pl.col("c"), _Opts()).alias("c")
+        )
+        self.assertEqual(out["c"].to_list(), ["FR-75", "DE-BER", "CH", None, None])
 
 
 class TestISOCityTypeArrow(ArrowTestCase):
@@ -332,6 +398,14 @@ class TestISOCityTypeArrow(ArrowTestCase):
         self.assertEqual(
             t._cast_arrow_array(arr, _Opts()).to_pylist(),
             ["FR-PAR", "FR-PAR", None, None],
+        )
+
+    def test_cast_flexible(self):
+        t = ISOCityType()
+        arr = pa.array(["France Paris", "Germany - Berlin", "USA-NYC", "CH-", None])
+        self.assertEqual(
+            t._cast_arrow_array(arr, _Opts()).to_pylist(),
+            ["FR-PAR", "DE-BER", "US-NYC", "CH", None],
         )
 
 
