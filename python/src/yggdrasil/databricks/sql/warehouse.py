@@ -39,7 +39,7 @@ from .service import (
     _jitter_sleep_seconds,
     safeEndpointInfo,
 )
-from .statement_result import StatementResult
+from .statement import Statement
 from ..client import DatabricksResource
 
 __all__ = [
@@ -369,7 +369,7 @@ class SQLWarehouse(DatabricksResource):
 
     def execute(
         self,
-        statement: str | None = None,
+        statement: "str | Statement | None" = None,
         *,
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
@@ -385,8 +385,17 @@ class SQLWarehouse(DatabricksResource):
         wait: WaitingConfigArg = True,
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
-    ) -> StatementResult:
-        """Execute a SQL statement on this (or another) warehouse."""
+    ) -> Statement:
+        """Execute a SQL statement on this (or another) warehouse.
+
+        ``statement`` may be raw SQL or a :class:`Statement`.  When a
+        :class:`Statement` is supplied its parameters take precedence over
+        ``parameters``.
+        """
+        prepared = Statement.prepare(statement) if statement is not None else Statement(text="")
+        if parameters is None:
+            parameters = prepared.to_parameter_list()
+
         if format is None:
             format = Format.ARROW_STREAM
 
@@ -421,7 +430,7 @@ class SQLWarehouse(DatabricksResource):
 
         LOGGER.debug(
             "Executing SQL on warehouse %s (%s):\n%s",
-            instance.warehouse_name, resolved_wh_id, statement,
+            instance.warehouse_name, resolved_wh_id, prepared.text,
         )
 
         started_at = time.monotonic()
@@ -437,7 +446,7 @@ class SQLWarehouse(DatabricksResource):
         while True:
             try:
                 response = sdk_client.execute_statement(
-                    statement=statement,
+                    statement=prepared.text,
                     warehouse_id=resolved_wh_id,
                     byte_limit=byte_limit,
                     disposition=disposition,
@@ -482,13 +491,14 @@ class SQLWarehouse(DatabricksResource):
 
                 iteration += 1
 
-        execution = StatementResult(
-            client=self.client,
-            warehouse_id=resolved_wh_id,
-            statement_id=response.statement_id,
-            disposition=disposition,
-            _response=response,
-        )
+        # Record execution state on the prepared Statement so it becomes
+        # a started handler (``statement_id`` is now set).
+        object.__setattr__(prepared, "client", self.client)
+        object.__setattr__(prepared, "warehouse_id", resolved_wh_id)
+        object.__setattr__(prepared, "statement_id", response.statement_id)
+        object.__setattr__(prepared, "disposition", disposition)
+        object.__setattr__(prepared, "_response", response)
+        execution = prepared
 
         LOGGER.info(
             "Executed SQL statement_id=%s on warehouse %s (%s)",
