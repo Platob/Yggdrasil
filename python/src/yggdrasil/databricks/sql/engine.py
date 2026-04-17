@@ -792,13 +792,11 @@ class SQLEngine(DatabricksService):
             if row_limit:
                 df = df.limit(row_limit)
 
-            result = StatementResult(
-                client=self.client,
-                warehouse_id="SparkSQL",
-                statement_id="SparkSQL",
-                disposition=Disposition.EXTERNAL_LINKS,
-                statement=prepared,
-            )
+            object.__setattr__(prepared, "client", self.client)
+            object.__setattr__(prepared, "warehouse_id", "SparkSQL")
+            object.__setattr__(prepared, "statement_id", "SparkSQL")
+            object.__setattr__(prepared, "disposition", Disposition.EXTERNAL_LINKS)
+            result = prepared
             if owned_staging:
                 # Spark is lazy; materialize to Arrow before the staging
                 # parquet files get cleaned up, otherwise the DataFrame

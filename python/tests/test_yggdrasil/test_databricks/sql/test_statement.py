@@ -171,22 +171,30 @@ def test_statement_is_frozen():
 # ---------------------------------------------------------------------------
 
 
-def test_statement_result_defaults_to_empty_statement():
-    from yggdrasil.databricks.client import DatabricksClient
+def test_statement_result_alias_points_to_statement():
     from yggdrasil.databricks.sql.statement_result import StatementResult
 
-    result = StatementResult(client=DatabricksClient.__new__(DatabricksClient))
-    assert isinstance(result.statement, Statement)
-    assert result.statement.text == ""
+    assert StatementResult is Statement
 
 
-def test_statement_result_carries_provided_statement():
-    from yggdrasil.databricks.client import DatabricksClient
-    from yggdrasil.databricks.sql.statement_result import StatementResult
+def test_statement_self_reference_via_statement_property():
+    stmt = Statement(text="SELECT 1")
+    assert stmt.statement is stmt
 
-    stmt = Statement(text="SELECT 1", parameters={"x": 1})
-    result = StatementResult(
-        client=DatabricksClient.__new__(DatabricksClient),
-        statement=stmt,
-    )
-    assert result.statement is stmt
+
+def test_started_false_without_statement_id():
+    stmt = Statement(text="SELECT 1")
+    assert stmt.started is False
+
+
+def test_started_true_when_statement_id_set():
+    stmt = Statement(text="SELECT 1")
+    object.__setattr__(stmt, "statement_id", "abc123")
+    assert stmt.started is True
+
+
+def test_start_is_idempotent_when_started():
+    stmt = Statement(text="SELECT 1")
+    object.__setattr__(stmt, "statement_id", "abc123")
+    # Should return self without submitting (warehouse arg is unused).
+    assert stmt.start() is stmt

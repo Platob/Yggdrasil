@@ -40,8 +40,10 @@ from .service import (
     safeEndpointInfo,
 )
 from .statement import Statement
-from .statement_result import StatementResult
 from ..client import DatabricksResource
+
+# ``StatementResult`` is kept as an alias for :class:`Statement`.
+StatementResult = Statement
 
 __all__ = [
     "SQLWarehouse",
@@ -492,14 +494,14 @@ class SQLWarehouse(DatabricksResource):
 
                 iteration += 1
 
-        execution = StatementResult(
-            client=self.client,
-            warehouse_id=resolved_wh_id,
-            statement_id=response.statement_id,
-            disposition=disposition,
-            statement=prepared,
-            _response=response,
-        )
+        # Record execution state on the prepared Statement so it becomes
+        # a started handler (``statement_id`` is now set).
+        object.__setattr__(prepared, "client", self.client)
+        object.__setattr__(prepared, "warehouse_id", resolved_wh_id)
+        object.__setattr__(prepared, "statement_id", response.statement_id)
+        object.__setattr__(prepared, "disposition", disposition)
+        object.__setattr__(prepared, "_response", response)
+        execution = prepared
 
         LOGGER.info(
             "Executed SQL statement_id=%s on warehouse %s (%s)",
