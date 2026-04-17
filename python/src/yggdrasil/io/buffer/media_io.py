@@ -140,13 +140,55 @@ class MediaIO(ABC, Generic[O]):
         first = next(iterator)
         return first, itertools.chain((first,), iterator)
 
+    @staticmethod
+    def _normalize_dict_records(records: Iterable[Any]) -> list[dict]:
+        """Materialize an iterable of dicts into a row-complete list.
+
+        Collects the **union** of keys across all rows and fills missing
+        keys with ``None``. This lets :func:`pyarrow.Table.from_pylist`
+        safely ingest unstructured / sparse records (e.g. ``[{"id": 1},
+        {"name": "a"}]`` or ``[{"id": None}]``) without silently dropping
+        keys that don't appear in the first row.
+        """
+        materialized: list[dict] = []
+        key_order: list[str] = []
+        seen: set[str] = set()
+
+        for row in records:
+            if row is None:
+                materialized.append({})
+                continue
+            if not isinstance(row, dict):
+                raise TypeError(
+                    "Expected dict rows for write_table(iterable[dict]); "
+                    f"got item of type {type(row).__name__}"
+                )
+            materialized.append(row)
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    key_order.append(key)
+
+        if not key_order:
+            return []
+
+        return [{k: row.get(k) for k in key_order} for row in materialized]
+
+    @classmethod
+    def _safe_table_from_pylist(cls, records: Iterable[Any]) -> "pyarrow.Table":
+        """Build an Arrow table from dict records, tolerating sparse keys and null-only columns."""
+        normalized = cls._normalize_dict_records(records)
+        if not normalized:
+            return pa.table({})
+        return pa.Table.from_pylist(normalized)  # noqa
+
     @classmethod
     def _table_from_tabular_iterable(cls, obj: Iterable[Any]) -> "pyarrow.Table":
         """Infer an Arrow table from an iterable of supported tabular objects."""
         first, iterator = cls._peek_iterable(obj)
 
         if isinstance(first, dict):
-            return pa.Table.from_pylist(list(iterator)) # noqa
+            return cls._safe_table_from_pylist(iterator)
 
         if isinstance(first, pa.RecordBatch):
             return pa.Table.from_batches(list(iterator))
@@ -172,7 +214,7 @@ class MediaIO(ABC, Generic[O]):
         first, iterator = cls._peek_iterable(obj)
 
         if isinstance(first, dict):
-            table = pa.Table.from_pylist(list(iterator)) # noqa
+            table = cls._safe_table_from_pylist(iterator)
             return iter(table.to_batches()), table.schema
 
         if isinstance(first, pa.RecordBatch):
@@ -379,15 +421,18 @@ class MediaIO(ABC, Generic[O]):
 
         Supported inputs
         ----------------
-        - pyarrow.Table
-        - Iterator[pyarrow.Table]
-        - Iterator[pyarrow.RecordBatch]
-        - pandas.DataFrame
-        - polars.DataFrame
-        - polars.LazyFrame
-        - list[dict]
-        - Iterator[dict]
-        - dict[str, list]
+        - ``pyarrow.Table`` / ``pyarrow.RecordBatch``
+        - ``Iterable[pyarrow.Table]`` / ``Iterable[pyarrow.RecordBatch]``
+        - ``pandas.DataFrame``
+        - ``polars.DataFrame`` / ``polars.LazyFrame``
+        - ``list[dict]`` or any ``Iterable[dict]`` (including generators)
+        - ``dict[str, list]`` (column-oriented)
+
+        Unstructured record streams (heterogeneous or sparse keys, all-``None``
+        values, e.g. ``[{"id": None}]`` or ``[{"a": 1}, {"b": "x"}]``) are
+        normalized: the union of keys across rows is computed and missing
+        entries are backfilled with ``None`` so no columns are silently
+        dropped.
         """
         if isinstance(obj, pa.Table):
             return self.write_arrow_table(
@@ -418,11 +463,16 @@ class MediaIO(ABC, Generic[O]):
             )
 
         if isinstance(obj, list):
-            if obj and not all(isinstance(row, dict) for row in obj):
-                raise TypeError(
-                    "write_table(list) expects list[dict], "
-                    f"got list[{type(obj[0]).__name__}]"
+            if obj:
+                bad = next(
+                    (row for row in obj if not isinstance(row, (dict, type(None)))),
+                    None,
                 )
+                if bad is not None:
+                    raise TypeError(
+                        "write_table(list) expects list[dict], "
+                        f"got element of type {type(bad).__name__}"
+                    )
             self.write_pylist(
                 data=obj,
                 options=options,
@@ -660,13 +710,18 @@ class MediaIO(ABC, Generic[O]):
 
     def write_pylist(
         self,
-        data: list[dict],
+        data: Iterable[dict],
         *,
         options: O | None = None,
         **option_kwargs,
     ) -> None:
-        """Write a list of row dicts to the buffer."""
-        tb = pa.Table.from_pylist(data) # noqa
+        """Write a list (or iterable/generator) of row dicts to the buffer.
+
+        Accepts unstructured records: missing keys are filled with ``None``
+        using the union of keys across rows, and all-``None`` columns are
+        written with Arrow ``null`` type.
+        """
+        tb = self._safe_table_from_pylist(data)
         self.write_arrow_table(
             table=tb,
             options=options,
