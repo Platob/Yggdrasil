@@ -17,6 +17,7 @@ from .continent import ISOContinentType
 from .country import ISOCountryType
 from .currency import ISOCurrencyType
 from .subdivision import ISOSubdivisionType
+from .timezone import TimezoneType
 
 __all__ = [
     "ISOType",
@@ -25,6 +26,7 @@ __all__ = [
     "ISOCountryType",
     "ISOCurrencyType",
     "ISOSubdivisionType",
+    "TimezoneType",
     "normalize_iso_token",
     "normalize_iso_token_keep_hyphen",
 ]

@@ -17,6 +17,7 @@ from yggdrasil.data.types.iso import (
     ISOCurrencyType,
     ISOSubdivisionType,
     ISOType,
+    TimezoneType,
 )
 from yggdrasil.polars.tests import PolarsTestCase
 
@@ -410,6 +411,358 @@ class TestISOCityTypeArrow(ArrowTestCase):
 
 
 # ---------------------------------------------------------------------------
+# TimezoneType
+# ---------------------------------------------------------------------------
+
+
+class TestTimezoneTypePyObj(unittest.TestCase):
+    def test_canonical_passthrough(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("Europe/Paris", nullable=True),
+            "Europe/Paris",
+        )
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("europe/paris", nullable=True),
+            "Europe/Paris",
+        )
+        self.assertEqual(
+            TimezoneType().convert_pyobj("EUROPE/PARIS", nullable=True),
+            "Europe/Paris",
+        )
+
+    def test_utc_alias(self):
+        self.assertEqual(TimezoneType().convert_pyobj("UTC", nullable=True), "Etc/UTC")
+        self.assertEqual(TimezoneType().convert_pyobj("utc", nullable=True), "Etc/UTC")
+        self.assertEqual(TimezoneType().convert_pyobj("Zulu", nullable=True), "Etc/UTC")
+
+    def test_legacy_abbrev_rewritten(self):
+        # CET/MET/WET etc. are not treated as canonical — they map onto a
+        # representative Area/Location zone.
+        self.assertEqual(TimezoneType().convert_pyobj("CET", nullable=True), "Europe/Paris")
+        self.assertEqual(TimezoneType().convert_pyobj("MET", nullable=True), "Europe/Paris")
+        self.assertEqual(TimezoneType().convert_pyobj("EET", nullable=True), "Europe/Athens")
+        self.assertEqual(TimezoneType().convert_pyobj("WET", nullable=True), "Europe/Lisbon")
+        self.assertEqual(TimezoneType().convert_pyobj("MST", nullable=True), "America/Phoenix")
+        self.assertEqual(TimezoneType().convert_pyobj("HST", nullable=True), "Pacific/Honolulu")
+        self.assertEqual(
+            TimezoneType().convert_pyobj("PST8PDT", nullable=True),
+            "America/Los_Angeles",
+        )
+
+    def test_backward_link_aliases(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("US/Eastern", nullable=True),
+            "America/New_York",
+        )
+        self.assertEqual(
+            TimezoneType().convert_pyobj("Asia/Calcutta", nullable=True),
+            "Asia/Kolkata",
+        )
+        self.assertEqual(
+            TimezoneType().convert_pyobj("GB", nullable=True),
+            "Europe/London",
+        )
+
+    def test_whitespace_around_separator(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("Europe / Paris", nullable=True),
+            "Europe/Paris",
+        )
+
+    def test_space_inside_location(self):
+        # Real IANA names use underscores where there would be spaces.
+        self.assertEqual(
+            TimezoneType().convert_pyobj("America/New York", nullable=True),
+            "America/New_York",
+        )
+
+    def test_windows_backslash(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("Europe\\Paris", nullable=True),
+            "Europe/Paris",
+        )
+
+    def test_etc_signed_offset(self):
+        self.assertEqual(
+            TimezoneType().convert_pyobj("Etc/GMT+5", nullable=True),
+            "Etc/GMT+5",
+        )
+
+    def test_unknown_safe_false(self):
+        self.assertIsNone(TimezoneType().convert_pyobj("Mars/Olympus", nullable=True))
+
+    def test_unknown_safe_true_raises(self):
+        with self.assertRaisesRegex(ValueError, "Cannot parse"):
+            TimezoneType().convert_pyobj("Mars/Olympus", nullable=True, safe=True)
+
+    def test_none_nullable(self):
+        self.assertIsNone(TimezoneType().convert_pyobj(None, nullable=True))
+
+    def test_none_not_nullable_raises(self):
+        with self.assertRaises(ValueError):
+            TimezoneType().convert_pyobj(None, nullable=False)
+
+    def test_repr_str(self):
+        t = TimezoneType()
+        self.assertEqual(repr(t), "TimezoneType()")
+        self.assertEqual(str(t), "timezone")
+
+
+class TestTimezoneTypeOffsets(unittest.TestCase):
+    """UTC-offset strings are preserved in ±HH:MM canonical form."""
+
+    def test_iso_offset_positive(self):
+        self.assertEqual(TimezoneType().convert_pyobj("+05:00", nullable=True), "+05:00")
+
+    def test_iso_offset_negative(self):
+        self.assertEqual(TimezoneType().convert_pyobj("-08:00", nullable=True), "-08:00")
+
+    def test_short_offset_padded(self):
+        self.assertEqual(TimezoneType().convert_pyobj("+5", nullable=True), "+05:00")
+        self.assertEqual(TimezoneType().convert_pyobj("-8", nullable=True), "-08:00")
+
+    def test_compact_offset(self):
+        self.assertEqual(TimezoneType().convert_pyobj("+0530", nullable=True), "+05:30")
+        self.assertEqual(TimezoneType().convert_pyobj("-0800", nullable=True), "-08:00")
+
+    def test_utc_gmt_prefix(self):
+        self.assertEqual(TimezoneType().convert_pyobj("UTC+5", nullable=True), "+05:00")
+        self.assertEqual(TimezoneType().convert_pyobj("GMT-0530", nullable=True), "-05:30")
+        self.assertEqual(TimezoneType().convert_pyobj("UTC+14", nullable=True), "+14:00")
+
+    def test_bare_z(self):
+        self.assertEqual(TimezoneType().convert_pyobj("Z", nullable=True), "+00:00")
+
+    def test_out_of_range_rejected(self):
+        self.assertIsNone(TimezoneType().convert_pyobj("+25:00", nullable=True))
+        self.assertIsNone(TimezoneType().convert_pyobj("UTC+25", nullable=True))
+        self.assertIsNone(TimezoneType().convert_pyobj("+05:99", nullable=True))
+
+
+class TestTimezoneTypeCrossType(unittest.TestCase):
+    """tzinfo / ZoneInfo / timedelta inputs convert into canonical strings."""
+
+    def test_zoneinfo_input(self):
+        from zoneinfo import ZoneInfo
+
+        self.assertEqual(
+            TimezoneType().convert_pyobj(ZoneInfo("Europe/Paris"), nullable=True),
+            "Europe/Paris",
+        )
+
+    def test_datetime_timezone_utc_input(self):
+        import datetime as dt
+
+        self.assertEqual(
+            TimezoneType().convert_pyobj(dt.timezone.utc, nullable=True),
+            "+00:00",
+        )
+
+    def test_datetime_timezone_offset_input(self):
+        import datetime as dt
+
+        self.assertEqual(
+            TimezoneType().convert_pyobj(
+                dt.timezone(dt.timedelta(hours=-5)), nullable=True
+            ),
+            "-05:00",
+        )
+
+    def test_timedelta_input(self):
+        import datetime as dt
+
+        self.assertEqual(
+            TimezoneType().convert_pyobj(
+                dt.timedelta(hours=5, minutes=30), nullable=True
+            ),
+            "+05:30",
+        )
+        self.assertEqual(
+            TimezoneType().convert_pyobj(dt.timedelta(hours=-8), nullable=True),
+            "-08:00",
+        )
+
+    def test_to_tzinfo_iana(self):
+        from zoneinfo import ZoneInfo
+
+        self.assertEqual(TimezoneType.to_tzinfo("Europe/Paris"), ZoneInfo("Europe/Paris"))
+
+    def test_to_tzinfo_offset(self):
+        import datetime as dt
+
+        self.assertEqual(
+            TimezoneType.to_tzinfo("+05:30"),
+            dt.timezone(dt.timedelta(hours=5, minutes=30)),
+        )
+
+    def test_to_timedelta(self):
+        import datetime as dt
+
+        self.assertEqual(
+            TimezoneType.to_timedelta("-08:00"), dt.timedelta(hours=-8)
+        )
+
+    def test_registry_tzinfo_to_str(self):
+        import datetime as dt
+
+        from yggdrasil.data.cast import convert
+
+        self.assertEqual(
+            convert(dt.timezone(dt.timedelta(hours=-5)), str), "-05:00"
+        )
+
+    def test_registry_zoneinfo_to_str(self):
+        from zoneinfo import ZoneInfo
+
+        from yggdrasil.data.cast import convert
+
+        self.assertEqual(convert(ZoneInfo("Europe/Paris"), str), "Europe/Paris")
+
+    def test_registry_timedelta_to_str(self):
+        import datetime as dt
+
+        from yggdrasil.data.cast import convert
+
+        self.assertEqual(convert(dt.timedelta(hours=5, minutes=30), str), "+05:30")
+
+    def test_registry_str_to_zoneinfo(self):
+        from zoneinfo import ZoneInfo
+
+        from yggdrasil.data.cast import convert
+
+        self.assertEqual(convert("Europe/Paris", ZoneInfo), ZoneInfo("Europe/Paris"))
+
+
+class TestTimezoneTypeArrow(ArrowTestCase):
+    def test_cast_mixed(self):
+        t = TimezoneType()
+        arr = pa.array(
+            [
+                "UTC",
+                "Europe/Paris",
+                "europe / paris",
+                "CET",
+                "US/Eastern",
+                "Asia/Calcutta",
+                "America/New York",
+                None,
+                "Mars/Olympus",
+            ]
+        )
+        self.assertEqual(
+            t._cast_arrow_array(arr, _Opts()).to_pylist(),
+            [
+                "Etc/UTC",
+                "Europe/Paris",
+                "Europe/Paris",
+                "Europe/Paris",
+                "America/New_York",
+                "Asia/Kolkata",
+                "America/New_York",
+                None,
+                None,
+            ],
+        )
+
+    def test_cast_offsets(self):
+        t = TimezoneType()
+        arr = pa.array(
+            [
+                "+05:00",
+                "-08:00",
+                "UTC+5",
+                "+0530",
+                "Z",
+                "UTC+25",
+                "+25:00",
+                "GMT-0530",
+            ]
+        )
+        self.assertEqual(
+            t._cast_arrow_array(arr, _Opts()).to_pylist(),
+            [
+                "+05:00",
+                "-08:00",
+                "+05:00",
+                "+05:30",
+                "+00:00",
+                None,
+                None,
+                "-05:30",
+            ],
+        )
+
+    def test_cast_safe_true_raises(self):
+        t = TimezoneType()
+        with self.assertRaisesRegex(ValueError, "Cannot parse"):
+            t._cast_arrow_array(pa.array(["Mars/Olympus"]), _Opts(safe=True))
+
+    def test_cast_safe_false_nulls(self):
+        t = TimezoneType()
+        out = t._cast_arrow_array(pa.array(["Mars/Olympus"]), _Opts(safe=False))
+        self.assertEqual(out.to_pylist(), [None])
+
+
+class TestTimezoneTypePolars(PolarsTestCase):
+    def test_eager_series(self):
+        pl = self.pl
+        s = pl.Series("tz", ["UTC", "Europe/Paris", "CET", None, "nope"])
+        out = TimezoneType()._cast_polars_series(s, _Opts())
+        self.assertEqual(
+            out.to_list(), ["Etc/UTC", "Europe/Paris", "Europe/Paris", None, None]
+        )
+
+    def test_eager_offsets(self):
+        pl = self.pl
+        s = pl.Series("tz", ["+05:00", "UTC+5", "Z", "UTC+25", "GMT-0530"])
+        out = TimezoneType()._cast_polars_series(s, _Opts())
+        self.assertEqual(
+            out.to_list(), ["+05:00", "+05:00", "+00:00", None, "-05:30"]
+        )
+
+    def test_lazy_expr(self):
+        pl = self.pl
+        df = pl.DataFrame(
+            {"tz": ["UTC", "Europe/Paris", "CET", "US/Eastern", None, "nope"]}
+        )
+        out = df.select(
+            TimezoneType()._cast_polars_expr(pl.col("tz"), _Opts()).alias("tz")
+        )
+        self.assertEqual(
+            out["tz"].to_list(),
+            ["Etc/UTC", "Europe/Paris", "Europe/Paris", "America/New_York", None, None],
+        )
+
+    def test_lazy_offsets(self):
+        pl = self.pl
+        df = pl.DataFrame({"tz": ["+05:00", "UTC-8", "Z", "+25:00"]})
+        out = df.select(
+            TimezoneType()._cast_polars_expr(pl.col("tz"), _Opts()).alias("tz")
+        )
+        self.assertEqual(
+            out["tz"].to_list(), ["+05:00", "-08:00", "+00:00", None]
+        )
+
+
+class TestTimezoneTypeDict(unittest.TestCase):
+    def test_to_dict(self):
+        d = TimezoneType().to_dict()
+        self.assertEqual(d["name"], "TimezoneType")
+        self.assertEqual(d["iso"], "timezone")
+
+    def test_handles_dict(self):
+        self.assertTrue(TimezoneType.handles_dict({"name": "TimezoneType"}))
+        self.assertTrue(TimezoneType.handles_dict({"iso": "timezone"}))
+
+    def test_from_dict_round_trip(self):
+        t1 = TimezoneType()
+        t2 = TimezoneType.from_dict(t1.to_dict())
+        self.assertEqual(t1, t2)
+
+
+# ---------------------------------------------------------------------------
 # ISOType base — framework integration invariants
 # ---------------------------------------------------------------------------
 
@@ -422,11 +775,12 @@ class TestISOTypeFrameworks(ArrowTestCase):
             ISOContinentType(),
             ISOSubdivisionType(),
             ISOCityType(),
+            TimezoneType(),
         ):
             self.assertEqual(t.to_arrow(), pa.string())
 
     def test_to_databricks_ddl(self):
-        for t in (ISOCountryType(), ISOCurrencyType()):
+        for t in (ISOCountryType(), ISOCurrencyType(), TimezoneType()):
             self.assertEqual(t.to_databricks_ddl(), "STRING")
 
     def test_base_not_in_registry_standalone(self):
