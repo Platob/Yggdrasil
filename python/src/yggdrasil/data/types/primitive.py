@@ -382,6 +382,16 @@ class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
         return None if nullable else b""
 
 
+_TEMPORAL_TYPE_IDS = frozenset(
+    {
+        DataTypeId.DATE,
+        DataTypeId.TIME,
+        DataTypeId.TIMESTAMP,
+        DataTypeId.DURATION,
+    }
+)
+
+
 @dataclass(frozen=True)
 class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     large: bool = False
@@ -395,6 +405,86 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     @property
     def type_id(self) -> DataTypeId:
         return DataTypeId.STRING
+
+    # ------------------------------------------------------------------
+    # Temporal source support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _source_is_temporal(options: "CastOptions") -> bool:
+        sf = options.source_field
+        return sf is not None and sf.dtype.type_id in _TEMPORAL_TYPE_IDS
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        options = options.check_source(array)
+
+        if self._source_is_temporal(options):
+            from ._temporal_cast import arrow_cast_to_string
+
+            casted = arrow_cast_to_string(array)
+            if self.to_arrow() != casted.type:
+                casted = pa.compute.cast(casted, self.to_arrow())
+            return options.fill_arrow_nulls(casted)
+
+        return super()._cast_arrow_array(array, options)
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        options.check_source(series)
+
+        if self._source_is_temporal(options):
+            pl = get_polars()
+            from ._temporal_cast import arrow_cast_to_string
+
+            arrow = arrow_cast_to_string(series.to_arrow())
+            casted = pl.Series(name=series.name, values=arrow, dtype=pl.String)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_polars_series(series, options)
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ):
+        if self._source_is_temporal(options):
+            pl = get_polars()
+            # Polars Expr path: format via the native dt accessor where possible.
+            src_id = options.source_field.dtype.type_id
+            if src_id in (DataTypeId.DATE, DataTypeId.TIMESTAMP):
+                return expr.dt.to_string("iso").cast(pl.String)
+            if src_id == DataTypeId.TIME:
+                return expr.cast(pl.String, strict=options.safe)
+            # Duration: render as integer count of source unit for round-trip.
+            return expr.dt.total_microseconds().cast(pl.String)
+
+        return super()._cast_polars_expr(expr, options)
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ):
+        options = options.check_source(column)
+
+        if self._source_is_temporal(options):
+            from ._temporal_cast import spark_temporal_to_string
+
+            casted = spark_temporal_to_string(column)
+            return self.fill_spark_column_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_spark_column(column, options)
 
     def _merge_with_same_id(
         self,
@@ -1003,10 +1093,210 @@ _TEMPORAL_UNIT_ORDER = {
 }
 
 
+def _temporal_cast_module():
+    """Lazy handle on the shared temporal cast helpers.
+
+    Kept behind a callable so the import side-effects in ``data/types/`` stay
+    linear and the helper module doesn't reach back into us while we're still
+    being defined.
+    """
+    from . import _temporal_cast as tc
+
+    return tc
+
+
 @dataclass(frozen=True)
 class TemporalType(PrimitiveType, ABC):
     unit: str = "us"
     tz: str | None = None
+
+    # ------------------------------------------------------------------
+    # Vectorized best-effort casting
+    # ------------------------------------------------------------------
+
+    def _arrow_target_kind(self) -> str:
+        """One-letter tag used by the shared arrow dispatcher."""
+        return {
+            DataTypeId.DATE: "date",
+            DataTypeId.TIME: "time",
+            DataTypeId.TIMESTAMP: "timestamp",
+            DataTypeId.DURATION: "duration",
+        }[self.type_id]
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        options = options.check_source(array)
+        tc = _temporal_cast_module()
+
+        array = self._nullify_empty_arrow_strings(array)
+
+        # options.safe=True means strict parsing. Best-effort ingestion
+        # (the default) keeps fractional seconds and reinterprets wall-clock
+        # when coercing naive timestamps to a target tz.
+        best_effort = not options.safe
+
+        kind = self._arrow_target_kind()
+        if kind == "date":
+            casted = tc.arrow_cast_to_date(array)
+        elif kind == "time":
+            casted = tc.arrow_cast_to_time(
+                array, unit=self.unit, keep_fractional=best_effort
+            )
+        elif kind == "timestamp":
+            casted = tc.arrow_cast_to_timestamp(
+                array,
+                unit=self.unit,
+                tz=self.tz,
+                keep_fractional=best_effort,
+                unsafe_tz=best_effort,
+            )
+        else:  # duration
+            casted = tc.arrow_cast_to_duration(array, unit=self.unit)
+
+        return options.fill_arrow_nulls(casted)
+
+    def _polars_dtype_instance(self):
+        """Force ``to_polars`` into an instance.
+
+        ``pl.Date`` / ``pl.Time`` are classes rather than instances, and Polars
+        rejects second-precision on ``Datetime`` / ``Duration`` — normalize
+        both quirks here so the cast helpers don't trip on them.
+        """
+        import dataclasses as _dc
+
+        pl = get_polars()
+
+        target = self
+        if self.unit in {"s", "d"} and self.type_id in {
+            DataTypeId.TIMESTAMP,
+            DataTypeId.DURATION,
+        }:
+            target = _dc.replace(self, unit="ms")
+
+        dtype = target.to_polars()
+        if isinstance(dtype, type) and issubclass(dtype, pl.DataType):
+            return dtype()
+        return dtype
+
+    def _needs_arrow_bridge(self) -> bool:
+        """Polars cannot represent every Arrow temporal unit natively.
+
+        ``Datetime`` / ``Duration`` both reject ``'s'``; ``DateType.unit == 'ms'``
+        is also a Polars oddity. In those cases we roundtrip through Arrow so
+        the caller still gets a correct value even if Polars can't store it in
+        its highest-fidelity form.
+        """
+        if self.type_id in (DataTypeId.TIMESTAMP, DataTypeId.DURATION):
+            return self.unit == "s"
+        return False
+
+    def _polars_from_arrow(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        pl = get_polars()
+        arrow = series.to_arrow()
+        casted = self._cast_arrow_array(arrow, options)
+        return pl.Series(name=series.name, values=casted)
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        if self._needs_arrow_bridge():
+            casted = self._polars_from_arrow(series, options)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        from yggdrasil.polars.cast import cast_polars_array_to_temporal
+
+        pl = get_polars()
+        source_dtype = series.dtype
+        target_dtype = self._polars_dtype_instance()
+
+        casted = cast_polars_array_to_temporal(
+            series,
+            source=source_dtype,
+            target=target_dtype,
+            safe=options.safe,
+            source_tz=(source_dtype.time_zone if isinstance(source_dtype, pl.Datetime) else None),
+            target_tz=self.tz,
+        )
+
+        return self.fill_polars_array_nulls(
+            casted, nullable=self._target_nullable(options)
+        )
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ):
+        from yggdrasil.polars.cast import cast_polars_array_to_temporal
+
+        pl = get_polars()
+
+        if self._needs_arrow_bridge():
+            # Expressions can't roundtrip through Arrow cleanly. Fall back to the
+            # stock polars cast and let the evaluator best-effort it.
+            return expr.cast(self._polars_dtype_instance(), strict=options.safe)
+
+        source_field = options.source_field
+        source_dtype = source_field.dtype.to_polars() if source_field is not None else pl.String
+        if isinstance(source_dtype, type) and issubclass(source_dtype, pl.DataType):
+            source_dtype = source_dtype()
+        target_dtype = self._polars_dtype_instance()
+
+        casted = cast_polars_array_to_temporal(
+            expr,
+            source=source_dtype,
+            target=target_dtype,
+            safe=options.safe,
+            source_tz=getattr(source_dtype, "time_zone", None)
+            if isinstance(source_dtype, pl.Datetime)
+            else None,
+            target_tz=self.tz,
+            to_expr=True,
+        )
+
+        return self.fill_polars_array_nulls(
+            casted, nullable=self._target_nullable(options)
+        )
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ):
+        tc = _temporal_cast_module()
+        options = options.check_source(column)
+
+        column = self._nullify_empty_spark_strings(column, options)
+
+        best_effort = not options.safe
+
+        kind = self._arrow_target_kind()
+        if kind == "date":
+            casted = tc.spark_to_date(column)
+        elif kind == "timestamp":
+            casted = tc.spark_to_timestamp(
+                column, unit=self.unit, tz=self.tz, unsafe_tz=best_effort
+            )
+        elif kind == "time":
+            # Spark has no TIME; we land as string per to_spark().
+            casted = tc.spark_to_time_string(column)
+        else:  # duration — yggdrasil stores it as LongType count of unit
+            casted = tc.spark_to_duration_seconds(column, unit=self.unit)
+
+        return self.fill_spark_column_nulls(
+            casted, nullable=self._target_nullable(options)
+        )
 
     def _merge_with_same_id(
         self,
