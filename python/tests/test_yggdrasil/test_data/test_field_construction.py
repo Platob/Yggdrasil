@@ -91,7 +91,8 @@ def test_from_str_shorthand_nullable_name_override_matches_current_parser_behavi
     out = Field.from_str("qty!:int64")
 
     assert out.name == "qty"
-    assert isinstance(out.dtype, StringType)
+    assert isinstance(out.dtype, IntegerType)
+    assert out.dtype.byte_size == 8
     assert out.nullable is False
 
 
