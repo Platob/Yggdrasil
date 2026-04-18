@@ -18,6 +18,9 @@ def mock_client():
         to_string=lambda: f"https://adb-123.azuredatabricks.net{p}"
     )
     client.sql = MagicMock()
+    # Table.sql delegates through ``self.client.sql(catalog_name=..., schema_name=...)``,
+    # so fold the call back to the same mock to keep assertions on ``client.sql.execute``.
+    client.sql.return_value = client.sql
     return client
 
 

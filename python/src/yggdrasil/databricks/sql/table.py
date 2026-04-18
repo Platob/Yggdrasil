@@ -32,8 +32,10 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
     Privilege,
     SecurableType,
+    TableConstraint,
     TableInfo,
     TableOperation,
+    TableRowFilter,
     TableType,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
@@ -49,9 +51,10 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
 from .column import Column
-from .grants import GrantsMixin
+from .grants import Grant, GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
+    _build_fk_constraint_sql,
     _build_table_constraints_sql,
     _qualify_fk_ref,
     _safe_constraint_name,
@@ -70,9 +73,10 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.sql.tables import Tables
     from yggdrasil.databricks.sql.catalog import Catalog
+    from yggdrasil.databricks.sql.columns import Columns
     from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
 
-__all__ = ["Table"]
+__all__ = ["Table", "TableAllInfos"]
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +145,12 @@ class Table(DatabricksResource, GrantsMixin):
         default=None, init=False, repr=False, compare=False, hash=False,
     )
     _infos_fetched_at: float | None = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _all_infos: Optional["TableAllInfos"] = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _all_infos_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
     _columns: Optional[list[Column]] = field(
@@ -265,6 +275,8 @@ class Table(DatabricksResource, GrantsMixin):
 
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
+        object.__setattr__(self, "_all_infos", None)
+        object.__setattr__(self, "_all_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
 
     def clear(self) -> "Table":
@@ -287,30 +299,65 @@ class Table(DatabricksResource, GrantsMixin):
     def table_id(self) -> str:
         return self.infos.table_id
 
-    def _cache_expired(self) -> bool:
-        if self._infos is None:
-            return True
-        now = time.time()
-        age = now - (self._infos_fetched_at or 0.0)
-        return age >= INFOS_TTL
+    @staticmethod
+    def _is_fresh(fetched_at: float | None) -> bool:
+        if fetched_at is None:
+            return False
+        return (time.time() - fetched_at) < INFOS_TTL
+
+    def _store_infos(self, infos: TableInfo) -> TableInfo:
+        """Populate the lightweight infos + columns caches."""
+        object.__setattr__(self, "_infos", infos)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
+        object.__setattr__(self, "_columns", [
+            Column.from_api(table=self, infos=col_info)
+            for col_info in (infos.columns or [])
+        ])
+        return infos
+
+    def _store_all_infos(self, snapshot: "TableAllInfos") -> "TableAllInfos":
+        """Populate the full snapshot cache and mirror its ``infos`` into the basic cache."""
+        object.__setattr__(self, "_all_infos", snapshot)
+        object.__setattr__(self, "_all_infos_fetched_at", time.time())
+        self._store_infos(snapshot.infos)
+        return snapshot
 
     @property
     def infos(self) -> TableInfo:
-        if self._cache_expired():
-            infos = self.client.tables.find_table_remote(
+        """Basic :class:`TableInfo` — TTL-cached, fed by :attr:`all_infos` when available."""
+        if self._all_infos is not None and self._is_fresh(self._all_infos_fetched_at):
+            return self._all_infos.infos
+        if self._infos is not None and self._is_fresh(self._infos_fetched_at):
+            return self._infos
+
+        info = self.client.tables.find_table_remote(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+        )
+        self._store_infos(info)
+        return info
+
+    @property
+    def all_infos(self) -> "TableAllInfos":
+        """Full :class:`TableAllInfos` snapshot — cached with the same TTL as :attr:`infos`.
+
+        Delegates to :meth:`Tables.fetch_all_infos`, reusing a fresh
+        :attr:`_infos` cache as a seed so the basic ``TableInfo`` lookup
+        runs at most once.  The returned snapshot also re-seeds the
+        basic cache so a subsequent ``infos`` access is free.
+        """
+        if self._all_infos is None or not self._is_fresh(self._all_infos_fetched_at):
+            seed = self._infos if self._is_fresh(self._infos_fetched_at) else None
+            snapshot = self.sql.tables.fetch_all_infos(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
                 table_name=self.table_name,
+                table=self,
+                infos=seed,
             )
-
-            self._reset_cache()
-            object.__setattr__(self, "_infos", infos)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-            object.__setattr__(self, "_columns", [
-                Column.from_api(table=self, infos=col_info)
-                for col_info in self.infos.columns
-            ])
-        return self._infos
+            self._store_all_infos(snapshot)
+        return self._all_infos
 
     # =========================================================================
     # Arrow schema introspection
@@ -547,6 +594,90 @@ class Table(DatabricksResource, GrantsMixin):
             **options,
         )
 
+    def _columns_service(self) -> "Columns":
+        """Columns service scoped to this table's catalog/schema/table defaults."""
+        from .columns import Columns
+
+        return Columns(
+            client=self.client,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+        )
+
+    def _resolve_fk_field(
+        self,
+        data_field: Field,
+    ) -> tuple[Field, "ForeignKeySpec | None"]:
+        """Detect the ``catalog.schema.table.column`` FK pattern on ``data_field.name``.
+
+        When ``data_field.name`` contains ``.``, it is parsed through the
+        :class:`Columns` service (scoped to this table's defaults) as a
+        foreign-key reference:
+
+        =============================================  =======================================
+        Input name                                     Resolved as
+        =============================================  =======================================
+        ``"ref_table.col"``                            ``<this catalog>.<this schema>.ref_table.col``
+        ``"ref_schema.ref_table.col"``                 ``<this catalog>.ref_schema.ref_table.col``
+        ``"catalog.schema.ref_table.col"``             fully qualified
+        =============================================  =======================================
+
+        The referenced column is looked up via the Columns service so the
+        local column inherits its dtype (keeping the FK type-compatible).
+        The returned field is renamed to the leaf column name and the
+        returned :class:`ForeignKeySpec` carries the fully-qualified ref
+        plus a stable, FK-specific constraint name.
+
+        Safe fall-back: if the pattern can't be fully resolved, or the
+        reference points at this same table, the field is simply renamed
+        to the leaf name (dotted names are never valid column names) and
+        ``None`` is returned for the FK spec.
+        """
+        name = data_field.name or ""
+        if "." not in name:
+            return data_field, None
+
+        columns_service = self._columns_service()
+        cat, sch, tbl, col = columns_service.parse_location(name)
+
+        if not (cat and sch and tbl and col):
+            return data_field, None
+
+        local_field = data_field.with_name(col, inplace=False)
+
+        if (
+            cat == self.catalog_name
+            and sch == self.schema_name
+            and tbl == self.table_name
+        ):
+            return local_field, None
+
+        try:
+            ref_column = columns_service.column(
+                catalog_name=cat,
+                schema_name=sch,
+                table_name=tbl,
+                column_name=col,
+            )
+        except Exception:
+            logger.warning(
+                "Foreign key reference %r could not be resolved; skipping constraint.",
+                name, exc_info=True,
+            )
+            return local_field, None
+
+        local_field = local_field.with_dtype(ref_column.field.dtype, inplace=False)
+
+        fk_spec = ForeignKeySpec(
+            column=col,
+            ref=f"{cat}.{sch}.{tbl}.{col}",
+            constraint_name=_safe_constraint_name(
+                self.table_name, col, tbl, col, "fk",
+            ),
+        )
+        return local_field, fk_spec
+
     def update_column(
         self,
         column: Field,
@@ -567,10 +698,12 @@ class Table(DatabricksResource, GrantsMixin):
         mode = SaveMode.parse(mode, SaveMode.AUTO)
         statements: list[str] = []
         add_columns: list[str] = []
+        pending_fks: list[ForeignKeySpec] = []
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
 
         for column in columns:
             data_field = Field.from_any(column)
+            data_field, fk = self._resolve_fk_field(data_field)
 
             existing = self.column(name=data_field.name, safe=False, raise_error=False)
 
@@ -578,6 +711,8 @@ class Table(DatabricksResource, GrantsMixin):
                 add_columns.append(
                     f"`{data_field.name}` {data_field.dtype.to_databricks_ddl()}"
                 )
+                if fk is not None:
+                    pending_fks.append(fk)
             elif mode in (SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO):
                 if existing.name != data_field.name:
                     statements.append(
@@ -586,6 +721,17 @@ class Table(DatabricksResource, GrantsMixin):
 
         if add_columns:
             statements.append(f"{alter_table} ADD COLUMNS ({', '.join(add_columns)})")
+
+        for fk in pending_fks:
+            statements.append(
+                f"{alter_table} ADD "
+                + _build_fk_constraint_sql(
+                    self.table_name,
+                    fk,
+                    default_catalog=self.catalog_name,
+                    default_schema=self.schema_name,
+                )
+            )
 
         if statements:
             self.sql.execute_many(statements)
@@ -735,11 +881,14 @@ class Table(DatabricksResource, GrantsMixin):
         comment = comment or schema_info.comment
 
         pk_spec = PrimaryKeySpec.from_any(primary_keys, schema=schema_info)
-        fk_specs = ForeignKeySpec.from_any(foreign_keys, schema=schema_info)
+        fk_specs = list(ForeignKeySpec.from_any(foreign_keys, schema=schema_info))
 
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
         for f in schema_info.children_fields:
+            f, inferred_fk = self._resolve_fk_field(f)
+            if inferred_fk is not None:
+                fk_specs.append(inferred_fk)
             if f.primary_key and f.nullable:
                 f = f.with_nullable(False)
             effective_fields.append(f)
@@ -840,8 +989,9 @@ class Table(DatabricksResource, GrantsMixin):
         if schema_info.tags:
             self.set_tags(schema_info.tags)
 
-        for f in schema_info.values():
-            self.column(f.name).set_tags(f.tags)
+        for f in effective_fields:
+            if f.tags:
+                self.column(f.name).set_tags(f.tags)
 
         return self
 
@@ -1204,6 +1354,98 @@ class Table(DatabricksResource, GrantsMixin):
             f"ON TABLE {self.full_name(safe=True)} "
             f"TO {quote_principal(principal)}"
         )
+
+
+# ===========================================================================
+# TableAllInfos — consolidated snapshot returned by Tables.fetch_all_infos
+# ===========================================================================
+
+@dataclass
+class TableAllInfos:
+    """Aggregated Unity Catalog information for a single table.
+
+    Bundles together the basic :class:`TableInfo` (columns, comment, owner,
+    properties, row filter, constraints, storage metadata) with the data
+    only reachable from separate Unity Catalog endpoints — entity-tag
+    assignments on the table itself, entity-tag assignments keyed by
+    column name, and the grants assigned on the table (direct and,
+    optionally, inherited).
+
+    Any section that could not be fetched stays empty; the rest of the
+    snapshot remains usable.
+    """
+
+    table: "Table"
+    infos: TableInfo
+    tags: tuple[Any, ...] = ()
+    column_tags: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
+    grants: tuple[Grant, ...] = ()
+    effective_grants: tuple[Grant, ...] = ()
+
+    @property
+    def full_name(self) -> str:
+        return self.table.full_name()
+
+    @property
+    def columns(self) -> list[Any]:
+        return list(self.infos.columns or [])
+
+    @property
+    def comment(self) -> str | None:
+        return self.infos.comment
+
+    @property
+    def owner(self) -> str | None:
+        return self.infos.owner
+
+    @property
+    def row_filter(self) -> TableRowFilter | None:
+        return self.infos.row_filter
+
+    @property
+    def table_constraints(self) -> list[TableConstraint]:
+        return list(self.infos.table_constraints or [])
+
+    @property
+    def properties(self) -> Mapping[str, str]:
+        return self.infos.properties or {}
+
+    @property
+    def storage_location(self) -> str | None:
+        return self.infos.storage_location
+
+    @property
+    def table_type(self) -> TableType | None:
+        return self.infos.table_type
+
+    @staticmethod
+    def _serialize(value: Any) -> Any:
+        if hasattr(value, "as_dict"):
+            try:
+                return value.as_dict()
+            except Exception:
+                pass
+        return value
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-friendly dictionary (falls back to ``repr`` on opaque values)."""
+        return {
+            "full_name": self.full_name,
+            "infos": self._serialize(self.infos),
+            "tags": [self._serialize(t) for t in self.tags],
+            "column_tags": {
+                name: [self._serialize(t) for t in items]
+                for name, items in self.column_tags.items()
+            },
+            "grants": [
+                {"principal": g.principal, "privileges": list(g.privileges)}
+                for g in self.grants
+            ],
+            "effective_grants": [
+                {"principal": g.principal, "privileges": list(g.privileges)}
+                for g in self.effective_grants
+            ],
+        }
 
 
 # ===========================================================================
