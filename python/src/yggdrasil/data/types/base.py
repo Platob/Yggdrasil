@@ -1385,6 +1385,14 @@ class DataType(BaseChildrenFields, ABC):
             if name in float_map:
                 return FloatingPointType(byte_size=float_map[name])
 
+            # pandas extension dtypes (StringDtype, BooleanDtype) are not
+            # numpy dtypes; check them before the np.dtype branch. Pandas 3.0
+            # made StringDtype the default for Python-string columns.
+            if isinstance(dtype, pd.StringDtype):
+                return StringType()
+            if isinstance(dtype, pd.BooleanDtype):
+                return BooleanType()
+
             if isinstance(dtype, np.dtype):
                 if dtype.kind == "i":
                     return IntegerType(byte_size=dtype.itemsize, signed=True)
