@@ -15,11 +15,12 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, TYPE_CHECKING, Union
+from typing import Any, Iterator, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.sql import StatementResponse, StatementState
 
+from yggdrasil.data import any_to_datetime
 from yggdrasil.databricks.client import DatabricksService
 
 from .sql_utils import escape_sql_string
@@ -59,14 +60,11 @@ def _sql_quote(value: str) -> str:
     return "'" + escape_sql_string(value) + "'"
 
 
-def _to_timestamp_literal(value: Union[str, _dt.datetime]) -> str:
-    if isinstance(value, _dt.datetime):
-        if value.tzinfo is None:
-            rendered = value.isoformat(sep=" ")
-        else:
-            rendered = value.astimezone(_dt.timezone.utc).isoformat(sep=" ")
-        return f"TIMESTAMP {_sql_quote(rendered)}"
-    return f"TIMESTAMP {_sql_quote(str(value))}"
+def _to_timestamp_literal(value: Any) -> str:
+    parsed = any_to_datetime(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_dt.timezone.utc)
+    return f"TIMESTAMP {_sql_quote(parsed.isoformat(sep=' '))}"
 
 
 @dataclass(frozen=True)
@@ -194,9 +192,9 @@ class Statements(DatabricksService):
         executed_by_user_id: Optional[str],
         statement_id: Optional[str],
         statement_type: Optional[str],
-        status: Optional[Union[StatementState, str]],
-        start_time_from: Optional[Union[str, _dt.datetime]],
-        start_time_to: Optional[Union[str, _dt.datetime]],
+        status: Any,
+        start_time_from: Any,
+        start_time_to: Any,
         text_contains: Optional[str],
         limit: Optional[int],
         order_by: str,
@@ -254,9 +252,9 @@ class Statements(DatabricksService):
         executed_by_user_id: str | None = None,
         statement_id: str | None = None,
         statement_type: str | None = None,
-        status: Optional[Union[StatementState, str]] = None,
-        start_time_from: Optional[Union[str, _dt.datetime]] = None,
-        start_time_to: Optional[Union[str, _dt.datetime]] = None,
+        status: StatementState | str | None = None,
+        start_time_from: Any = None,
+        start_time_to: Any = None,
         text_contains: str | None = None,
         limit: int | None = 1000,
         order_by: str = "start_time DESC",
@@ -274,9 +272,10 @@ class Statements(DatabricksService):
         statement_type, status:
             Equality filters applied in the SQL ``WHERE`` clause.
         start_time_from, start_time_to:
-            Half-open time range on the ``start_time`` column.  Accepts
-            ISO strings or ``datetime`` objects (naive values are passed
-            through, aware values are normalised to UTC).
+            Half-open time range on the ``start_time`` column.  Parsed
+            via :func:`yggdrasil.data.any_to_datetime`, so ISO strings,
+            ``datetime`` / ``date`` objects, and epoch numerics are all
+            accepted; aware values are normalised to UTC.
         text_contains:
             Case-insensitive substring match on ``statement_text``.
         limit:
