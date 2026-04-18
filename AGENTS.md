@@ -165,6 +165,19 @@ The point is to make all of that feel like one coherent system.
 
 ## Architecture you need to understand first
 
+### Reach for `yggdrasil.data` first
+`yggdrasil.data` is the canonical surface for describing and moving frames.
+If the task touches a dataframe, schema, field, type, or cross-engine conversion, start here and drop down to `polars` / `pandas` / `pyspark` / `pyarrow` only when the abstraction genuinely does not cover the case.
+
+Prefer, in this order:
+- `DataField` / `Field` and `Schema` (names, nullability, metadata, tags, nested structure, engine dtype intent in one place). Use `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_any_fields` instead of re-building per-engine schemas by hand.
+- `DataType` / `DataTypeId` and the `types/` submodules (`primitive`, `nested`, `iso`, `extensions`) for type hints. Don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` when a `DataType` produces all of them.
+- `DataTable` and `StatementResult` for "execute, then move rows" integrations. New backends should implement these rather than invent a parallel surface.
+- `yggdrasil.data.cast.convert(value, target, options=...)` with `CastOptions` for value conversion. Do not call `df.to_pandas()`, `pl.from_arrow(...)`, `spark.createDataFrame(...)` directly from feature code if a registered converter already handles it.
+- `yggdrasil.data.enums` (currency, geozone, timezone) for normalized domain values — don't re-parse those strings inline.
+
+Only drop past this layer to add a new converter, write engine-internal glue in `arrow/` / `polars/` / `pandas/` / `spark/`, or implement performance-critical code the abstraction intentionally doesn't cover. When you do, register the new behavior back into `yggdrasil.data` (converter + `DataType` + `Field`/`Schema` support) so the next caller gets it for free.
+
 ### Converter registry is the core pattern
 Everything flows through:
 - `yggdrasil/data/cast/registry.py`
@@ -643,6 +656,42 @@ pytest
 pytest tests/test_yggdrasil/test_data/
 ruff check
 black .
+```
+
+### Use the engine TestCase base classes for data tests
+Any test that touches a dataframe, Arrow object, or engine-side type **must** subclass the matching base class from `yggdrasil.*.tests` instead of importing the engine module at the top of the file.
+
+| Engine | Base class | Module |
+| --- | --- | --- |
+| Arrow  | `ArrowTestCase`  | `yggdrasil.arrow.tests`  |
+| Polars | `PolarsTestCase` | `yggdrasil.polars.tests` |
+| pandas | `PandasTestCase` | `yggdrasil.pandas.tests` |
+| Spark  | `SparkTestCase`  | `yggdrasil.spark.tests`  |
+
+Why this is the rule:
+- Optional deps get skipped with a real install hint. Top-level `import polars` in a test file breaks base installs.
+- You get `self.pa` / `self.pl` / `self.pd` / `self.spark`, a per-test `self.tmp_path`, Arrow interop helpers, and built-in frame/schema assertions (`assertFrameEqual`, `assertSchemaEqual`, `assertSeriesEqual`, `SparkTestCase.assertDataFrameEqual` / `assertSparkEqual`).
+- `SparkTestCase` shares one process-wide `SparkSession` — don't build your own and don't stop it in `tearDown`.
+- Cross-engine tests can multi-inherit (`class TestX(PolarsTestCase, ArrowTestCase):`) or split into sibling classes in the same file — both work; pick whichever keeps the body clean.
+- Databricks integration tests keep the `integration` marker **and** subclass the relevant engine TestCase so local runs skip cleanly without `DATABRICKS_HOST`.
+
+Example:
+
+```python
+from yggdrasil.arrow.tests import ArrowTestCase
+from yggdrasil.polars.tests import PolarsTestCase
+
+class TestMyCodec(ArrowTestCase):
+    def test_roundtrip(self):
+        tbl = self.table({"id": [1, 2, 3], "val": ["a", "b", "c"]})
+        out = self.tmp_path / "t.parquet"
+        self.write_parquet(tbl, out)
+        self.assertFrameEqual(self.read_parquet(out), tbl)
+
+class TestMyCodecPolars(PolarsTestCase):
+    def test_from_arrow(self):
+        df = self.arrow_to_polars(self.pl.DataFrame({"x": [1, 2]}).to_arrow())
+        self.assertFrameEqual(df, {"x": [1, 2]})
 ```
 
 ### Every meaningful change should test

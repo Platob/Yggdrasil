@@ -38,6 +38,26 @@ black .
 - `pytest-asyncio` runs in `strict` mode — async tests need the explicit marker.
 - `python/tests/conftest.py` injects `python/src` onto `sys.path` and wires a `yggdrasil` DEBUG logger, so tests run without installing the package.
 
+### Data tests use the engine TestCase base classes
+
+Any test that touches a dataframe, Arrow object, or engine-side type **must** subclass the matching base class from `yggdrasil.*.tests` instead of importing the engine module at the top of the file. These bases handle optional-dependency skipping, per-test tmp dirs, Arrow interop, and frame/schema assertions — you get a consistent skip story and less boilerplate for free.
+
+| Engine | Base class | Module |
+| --- | --- | --- |
+| Arrow | `ArrowTestCase` | `yggdrasil.arrow.tests` |
+| Polars | `PolarsTestCase` | `yggdrasil.polars.tests` |
+| pandas | `PandasTestCase` | `yggdrasil.pandas.tests` |
+| Spark | `SparkTestCase` | `yggdrasil.spark.tests` |
+
+Rules:
+
+- Do `from yggdrasil.arrow.tests import ArrowTestCase` (etc.) and subclass it. Use `self.pa` / `self.pl` / `self.pd` / `self.spark` rather than a top-level `import pyarrow as pa` — a bare import breaks base installs and defeats the skip-on-missing behavior.
+- Use the provided helpers (`self.table(...)`, `self.df(...)`, `self.lazy(...)`, `self.record_batch(...)`, `self.arrow_to_polars(...)`, `self.write_parquet(...)`, `self.tmp_path`, etc.) instead of reimplementing fixtures.
+- Prefer the built-in assertions (`assertFrameEqual`, `assertSchemaEqual`, `assertSeriesEqual`, `SparkTestCase.assertDataFrameEqual` / `assertSparkEqual`) — they give readable diffs and handle dtype/order/index knobs consistently.
+- Cross-engine tests can multi-inherit (e.g. `class TestX(PolarsTestCase, ArrowTestCase):`) or split into sibling classes in the same file — both work; pick whichever keeps the test body clean.
+- `SparkTestCase` shares a single process-wide `SparkSession`; don't call `SparkSession.builder` yourself and don't stop the session in `tearDown`.
+- For Databricks integration tests, keep the `integration` marker *and* subclass `ArrowTestCase` (or whichever engine is actually exercised) so the local run still skips cleanly without `DATABRICKS_HOST`.
+
 Rust extension (only when touching `rust/`):
 
 ```bash
@@ -60,6 +80,20 @@ python -m yggdrasil.fastapi.main   # entry point, also exposed as `ygg-api`
 ```
 
 ## Architecture
+
+### Reach for `yggdrasil.data` before raw engine APIs
+
+`yggdrasil.data` is the canonical surface for describing and moving frames. When a task involves a dataframe, schema, field, type, or a cross-engine conversion, start from `yggdrasil.data` and only drop down to `polars` / `pandas` / `pyspark` / `pyarrow` when you actually need something the abstraction does not cover.
+
+Prefer these primitives in this order:
+
+- `yggdrasil.data.DataField` / `Field` and `yggdrasil.data.Schema` for describing columns — they carry names, nullability, metadata, tags, nested structure, and engine-side dtype intent in one place. Build them with `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_any_fields`, etc. instead of re-building per-engine schemas by hand.
+- `yggdrasil.data.DataType` / `DataTypeId` (and the `types/` submodules: `primitive`, `nested`, `iso`, `extensions`) for type hints — don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` strings when a `DataType` can produce all of them.
+- `yggdrasil.data.DataTable` and `yggdrasil.data.statement_result.StatementResult` for anything that looks like "execute a query, then move rows somewhere" — new integrations should implement these interfaces rather than invent a parallel one.
+- `yggdrasil.data.cast.convert(value, target, options=...)` with `CastOptions` for value conversion. Do not call `df.to_pandas()`, `pl.from_arrow(...)`, or `spark.createDataFrame(...)` directly from feature code if a registered converter already handles it — that's what the registry is for.
+- `yggdrasil.data.enums` (currency, geozone, timezone) when you need normalized domain values; do not re-parse those strings inline.
+
+Only reach past this layer when adding a new converter, writing engine-internal glue in `arrow/` / `polars/` / `pandas/` / `spark/`, or implementing performance-critical code that the abstraction intentionally doesn't cover. When you do, register the new behavior back into `yggdrasil.data` (converter + `DataType` + `DataField`/`Schema` support) so the next caller gets it for free.
 
 ### Converter registry is the core
 
@@ -96,8 +130,8 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 
 ### Module map (top level of `yggdrasil/`)
 
-- **Schema & conversion:** `data/` (cast registry, enums, `DataField`/`Schema`/`Table`, statement results), `arrow/` (type inference, Arrow cast helpers, extensions), `dataclasses/` (dataclass→Arrow field helpers, waiting/expiring utilities).
-- **Dataframe engines:** `polars/`, `pandas/`, `spark/` — each registers on import and provides a `lib.py` guard.
+- **Schema & conversion (start here):** `data/` is the canonical surface — cast registry + `CastOptions`, `DataType`/`DataTypeId`, `DataField`/`Schema`/`DataTable`, `StatementResult`, normalized enums (currency, geozone, timezone). `arrow/` holds type inference and Arrow cast helpers; `dataclasses/` has dataclass→Arrow field helpers and waiting/expiring utilities.
+- **Dataframe engines:** `polars/`, `pandas/`, `spark/` — each registers on import and provides a `lib.py` guard *and* a `tests.py` TestCase base. Prefer the `yggdrasil.data` abstractions over calling these engines directly from feature code.
 - **Platform integrations:** `databricks/` (sub-packages `sql/`, `jobs/`, `compute/`, `iam/`, `secrets/`, `workspaces/`, `fs/`, `account/`, `ai/`; entry via `DatabricksClient`), `mongo/`, `mongoengine/`, `fastapi/` (routers power the Power Query connector).
 - **Serialization & hashing:** `pickle/` (custom serialization with optional cloudpickle/dill/zstandard), `blake3/`, `xxhash/` — all guarded.
 - **Utilities:** `pyutils/` (retry, parallelize, helpers), `concurrent/`, `environ/` (runtime import/install logic), `fxrates/`, `requests/`, `exceptions.py`, `version.py`.
