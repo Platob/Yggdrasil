@@ -427,14 +427,14 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         self,
         tags: dict[AnyStr, AnyStr] | None = None,
     ):
-        primary_key_names = set()
+        primary_key_names: set[str] | list[str] = set()
         if self.metadata:
-            primary_key_names: bytes | None = self.metadata.pop(b"primary_key", None)
-            if primary_key_names:
-                if primary_key_names.startswith(b"[") and primary_key_names.endswith(b"]"):
-                    primary_key_names = set(json.loads(primary_key_names))
+            raw = self.metadata.pop(b"primary_key", None)
+            if raw:
+                if raw.startswith(b"[") and raw.endswith(b"]"):
+                    primary_key_names = set(json.loads(raw))
                 else:
-                    primary_key_names = primary_key_names.decode().split(".")
+                    primary_key_names = raw.decode().split(".")
 
         inner_fields = OrderedDict()
         for name, f in self.inner_fields.items():
