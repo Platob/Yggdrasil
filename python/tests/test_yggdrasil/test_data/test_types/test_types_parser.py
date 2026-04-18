@@ -24,6 +24,60 @@ class TestParserAliases(unittest.TestCase):
             ParsedDataType.parse_type_id("timestamp_ntz"), DataTypeId.TIMESTAMP
         )
 
+    def test_sized_integer_aliases(self):
+        cases = [
+            ("int8", 1),
+            ("int16", 2),
+            ("int32", 4),
+            ("int64", 8),
+            ("uint8", 1),
+            ("uint16", 2),
+            ("uint32", 4),
+            ("uint64", 8),
+            ("INT64", 8),
+        ]
+        for expr, byte_size in cases:
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.INTEGER,
+                        DataTypeMetadata(byte_size=byte_size),
+                    ),
+                )
+
+    def test_sized_float_aliases(self):
+        cases = [
+            ("float16", 2),
+            ("float32", 4),
+            ("float64", 8),
+            ("FLOAT64", 8),
+        ]
+        for expr, byte_size in cases:
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.FLOAT,
+                        DataTypeMetadata(byte_size=byte_size),
+                    ),
+                )
+
+    def test_list_of_int64(self):
+        expected_child = ParsedDataType(
+            DataTypeId.INTEGER, DataTypeMetadata(byte_size=8)
+        )
+        for expr in ("list<int64>", "list[int64]", "array<int64>"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.ARRAY,
+                        DataTypeMetadata(),
+                        children=(expected_child,),
+                    ),
+                )
+
     def test_numeric_wire_id(self):
         self.assertIs(ParsedDataType.parse_type_id("32"), DataTypeId.ARRAY)
         self.assertIs(ParsedDataType.parse_type_id("67"), DataTypeId.ENUM)

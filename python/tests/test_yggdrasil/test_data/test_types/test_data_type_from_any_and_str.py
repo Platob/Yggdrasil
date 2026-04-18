@@ -67,8 +67,8 @@ class TestFromStr(ArrowTestCase):
         pa = self.pa
         out = DataType.from_str("int64")
 
-        self.assertIsInstance(out, StringType)
-        self.assertEqual(out.to_arrow(), pa.string())
+        self.assertIsInstance(out, IntegerType)
+        self.assertEqual(out.to_arrow(), pa.int64())
 
     def test_from_str_json_payload_integer(self):
         pa = self.pa
