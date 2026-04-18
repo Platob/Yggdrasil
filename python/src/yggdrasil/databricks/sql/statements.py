@@ -251,8 +251,8 @@ class Statements(DatabricksService):
         statement_id: str | None = None,
         statement_type: str | None = None,
         status: StatementState | str | None = None,
-        start_time_from: Any = None,
-        start_time_to: Any = None,
+        start_time_from: Any = "default",
+        start_time_to: Any = "default",
         text_contains: str | None = None,
         limit: int | None = 1000,
         order_by: str = "start_time DESC",
@@ -273,7 +273,11 @@ class Statements(DatabricksService):
             Half-open time range on the ``start_time`` column.  Parsed
             via :func:`yggdrasil.data.any_to_datetime`, so ISO strings,
             ``datetime`` / ``date`` objects, and epoch numerics are all
-            accepted; aware values are normalised to UTC.
+            accepted; aware values are normalised to UTC.  The sentinel
+            ``"default"`` (the default) resolves ``start_time_to`` to
+            the current UTC time and ``start_time_from`` to
+            ``start_time_to - 7 days``.  Pass ``None`` to drop the
+            corresponding bound from the query.
         text_contains:
             Case-insensitive substring match on ``statement_text``.
         limit:
@@ -290,6 +294,16 @@ class Statements(DatabricksService):
 
         effective_warehouse = warehouse_id or self.warehouse_id
         effective_executed_by = executed_by or self.executed_by
+
+        if start_time_to == "default":
+            start_time_to = _dt.datetime.now(_dt.timezone.utc)
+        if start_time_from == "default":
+            anchor = (
+                any_to_datetime(start_time_to, tz=_dt.timezone.utc)
+                if start_time_to is not None
+                else _dt.datetime.now(_dt.timezone.utc)
+            )
+            start_time_from = anchor - _dt.timedelta(days=7)
 
         query = self._build_list_query(
             warehouse_id=effective_warehouse,

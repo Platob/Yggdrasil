@@ -207,6 +207,44 @@ def test_list_statements_inherits_service_defaults():
     assert "warehouse_id = 'wh-default'" in query
 
 
+def test_list_statements_defaults_to_last_7_days():
+    client = DatabricksClient(host="https://example.cloud.databricks.com")
+    svc = client.statements
+
+    query = _captured_query(svc, limit=1)
+    # Both bounds are emitted by default.
+    assert "start_time >= TIMESTAMP" in query
+    assert "start_time < TIMESTAMP" in query
+
+
+def test_list_statements_default_anchors_from_on_explicit_to():
+    client = DatabricksClient(host="https://example.cloud.databricks.com")
+    svc = client.statements
+
+    query = _captured_query(
+        svc,
+        start_time_to=_dt.datetime(2026, 4, 10, 12, 0, 0, tzinfo=_dt.timezone.utc),
+        limit=1,
+    )
+    # Anchor = 2026-04-10, from = anchor - 7 days = 2026-04-03.
+    assert "start_time >= TIMESTAMP '2026-04-03 12:00:00+00:00'" in query
+    assert "start_time < TIMESTAMP '2026-04-10 12:00:00+00:00'" in query
+
+
+def test_list_statements_explicit_none_drops_time_filters():
+    client = DatabricksClient(host="https://example.cloud.databricks.com")
+    svc = client.statements
+
+    query = _captured_query(
+        svc,
+        start_time_from=None,
+        start_time_to=None,
+        limit=1,
+    )
+    assert "start_time >= TIMESTAMP" not in query
+    assert "start_time < TIMESTAMP" not in query
+
+
 # ---------------------------------------------------------------------------
 # Dict-like access
 # ---------------------------------------------------------------------------
