@@ -623,15 +623,20 @@ class SendManyConfig(_ConfigBase):
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
         if isinstance(arg, SendConfig):
-            return cls(
-                wait=arg.wait,
-                raise_error=arg.raise_error,
-                stream=arg.stream,
-                remote_cache=arg.remote_cache,
-                local_cache=arg.local_cache,
-                spark_session=arg.spark_session,
-                **overrides,
-            )
+            base = {
+                "wait": arg.wait,
+                "raise_error": arg.raise_error,
+                "stream": arg.stream,
+                "remote_cache": arg.remote_cache,
+                "local_cache": arg.local_cache,
+                "spark_session": arg.spark_session,
+            }
+            # Overrides win, but a None override means "no opinion" — fall back
+            # to the base value so we don't silently clobber the parent config.
+            for key, value in overrides.items():
+                if value is not None:
+                    base[key] = value
+            return cls.parse_mapping(base)
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
         raise TypeError(
