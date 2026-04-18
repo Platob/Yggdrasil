@@ -12,6 +12,7 @@ from .service import Warehouses
 from .sql_utils import *
 from .staging import StagingPath
 from .statement import Statement
+from .statements import Statements
 from .table import Table
 from .tables import Tables
 from .types import PrimaryKeySpec, ForeignKeySpec

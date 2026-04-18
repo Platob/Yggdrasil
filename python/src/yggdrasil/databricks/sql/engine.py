@@ -792,7 +792,7 @@ class SQLEngine(DatabricksService):
             if row_limit:
                 df = df.limit(row_limit)
 
-            object.__setattr__(prepared, "client", self.client)
+            object.__setattr__(prepared, "service", self.client.statements)
             object.__setattr__(prepared, "warehouse_id", "SparkSQL")
             object.__setattr__(prepared, "statement_id", "SparkSQL")
             object.__setattr__(prepared, "disposition", Disposition.EXTERNAL_LINKS)

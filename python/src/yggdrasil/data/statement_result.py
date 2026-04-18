@@ -34,7 +34,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class StatementResult(ABC):
     """Arrow-first wrapper around a statement execution result.
 

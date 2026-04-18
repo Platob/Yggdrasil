@@ -493,7 +493,7 @@ class SQLWarehouse(DatabricksResource):
 
         # Record execution state on the prepared Statement so it becomes
         # a started handler (``statement_id`` is now set).
-        object.__setattr__(prepared, "client", self.client)
+        object.__setattr__(prepared, "service", self.client.statements)
         object.__setattr__(prepared, "warehouse_id", resolved_wh_id)
         object.__setattr__(prepared, "statement_id", response.statement_id)
         object.__setattr__(prepared, "disposition", disposition)
