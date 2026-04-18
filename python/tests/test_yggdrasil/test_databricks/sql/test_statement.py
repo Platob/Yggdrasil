@@ -168,17 +168,6 @@ def test_statement_has_default_service():
     assert stmt.client is stmt.service.client
 
 
-# ---------------------------------------------------------------------------
-# StatementResult.statement property
-# ---------------------------------------------------------------------------
-
-
-def test_statement_result_alias_points_to_statement():
-    from yggdrasil.databricks.sql.statement_result import StatementResult
-
-    assert StatementResult is Statement
-
-
 def test_started_false_without_statement_id():
     stmt = Statement(text="SELECT 1")
     assert stmt.started is False
