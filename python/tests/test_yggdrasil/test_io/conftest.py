@@ -1,5 +1,9 @@
 # tests/io/conftest.py
-"""Shared fixtures and compression helpers for yggdrasil.io tests."""
+"""Shared fixtures for yggdrasil.io tests.
+
+Factories / constants live in `_helpers.py` so tests can import them
+directly (conftest modules are pytest plugins, not importable modules).
+"""
 
 from __future__ import annotations
 
@@ -7,17 +11,24 @@ import bz2
 import gzip
 import lzma
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Skip entire suite if yggdrasil is not installed
-# ---------------------------------------------------------------------------
-
+# Skip everything if yggdrasil itself isn't importable.
 pytest.importorskip("yggdrasil")
 
-from yggdrasil.io.buffer.bytes_io import BytesIO   # noqa: E402
-from yggdrasil.io.config import BufferConfig        # noqa: E402
+from yggdrasil.io.buffer.bytes_io import BytesIO       # noqa: E402
+from yggdrasil.io.config import BufferConfig           # noqa: E402
+from yggdrasil.io.request import PreparedRequest       # noqa: E402
+from yggdrasil.io.response import Response             # noqa: E402
+
+from ._helpers import (                                # noqa: E402
+    MockSession,
+    make_request,
+    make_response,
+    make_table_mock,
+)
 
 # ---------------------------------------------------------------------------
 # Shared payload constants
@@ -87,3 +98,27 @@ def spill_config(tmp_path: Path) -> BufferConfig:
 def spilled_buf(spill_config: BufferConfig) -> BytesIO:
     """A BytesIO that has already migrated to disk."""
     return BytesIO(PAYLOAD, config=spill_config)
+
+
+@pytest.fixture
+def req() -> PreparedRequest:
+    """A fresh GET request with deterministic `sent_at`."""
+    return make_request()
+
+
+@pytest.fixture
+def resp(req: PreparedRequest) -> Response:
+    """A fresh 200 response anchored to `req`."""
+    return make_response(request=req)
+
+
+@pytest.fixture
+def mock_session() -> MockSession:
+    """A MockSession with an empty response queue."""
+    return MockSession()
+
+
+@pytest.fixture
+def mock_table() -> MagicMock:
+    """A MagicMock table whose SQL execute returns zero hits."""
+    return make_table_mock()
