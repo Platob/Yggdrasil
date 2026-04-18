@@ -523,3 +523,185 @@ def test_field_cast_preserves_default_field_roundtrip() -> None:
     f = Field("n", StringType())
     out = f.cast_arrow_array(arr)
     assert out.to_pylist() == ["1", "2", "3"]
+
+
+# ---------------------------------------------------------------------------
+# Datetime string shape coverage — fractional, no fractional, " UTC", Z
+# ---------------------------------------------------------------------------
+
+_UTC = dt.timezone.utc
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # No fractional seconds
+        ("2023-01-02T03:04:05", dt.datetime(2023, 1, 2, 3, 4, 5)),
+        ("2023-01-02 03:04:05", dt.datetime(2023, 1, 2, 3, 4, 5)),
+        # Fractional seconds, various widths
+        ("2023-01-02T03:04:05.1", dt.datetime(2023, 1, 2, 3, 4, 5, 100000)),
+        ("2023-01-02T03:04:05.12", dt.datetime(2023, 1, 2, 3, 4, 5, 120000)),
+        ("2023-01-02T03:04:05.123", dt.datetime(2023, 1, 2, 3, 4, 5, 123000)),
+        ("2023-01-02T03:04:05.123456", dt.datetime(2023, 1, 2, 3, 4, 5, 123456)),
+        # Over-precision — truncated to target unit
+        ("2023-01-02T03:04:05.123456789", dt.datetime(2023, 1, 2, 3, 4, 5, 123456)),
+    ],
+)
+def test_arrow_str_to_timestamp_naive_shape(value: str, expected: dt.datetime) -> None:
+    arr = pa.array([value])
+    out = arrow_str_to_timestamp(arr, unit="us", tz=None)
+    assert out.type == pa.timestamp("us")
+    assert out.to_pylist() == [expected]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Z suffix — no fractional
+        ("2023-01-02T03:04:05Z", dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)),
+        ("2023-01-02 03:04:05Z", dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)),
+        # Z suffix with fractional
+        (
+            "2023-01-02T03:04:05.5Z",
+            dt.datetime(2023, 1, 2, 3, 4, 5, 500000, tzinfo=_UTC),
+        ),
+        (
+            "2023-01-02T03:04:05.123456Z",
+            dt.datetime(2023, 1, 2, 3, 4, 5, 123456, tzinfo=_UTC),
+        ),
+        # " UTC" (space-separated) — no fractional
+        ("2023-01-02T03:04:05 UTC", dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)),
+        ("2023-01-02 03:04:05 UTC", dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)),
+        # "UTC" (no space) — also normalized
+        ("2023-01-02T03:04:05UTC", dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)),
+        # " UTC" with fractional
+        (
+            "2023-01-02T03:04:05.123 UTC",
+            dt.datetime(2023, 1, 2, 3, 4, 5, 123000, tzinfo=_UTC),
+        ),
+        (
+            "2023-01-02 03:04:05.987654 UTC",
+            dt.datetime(2023, 1, 2, 3, 4, 5, 987654, tzinfo=_UTC),
+        ),
+        # Numeric offset with fractional
+        (
+            "2023-01-02T05:04:05.5+02:00",
+            dt.datetime(2023, 1, 2, 3, 4, 5, 500000, tzinfo=_UTC),
+        ),
+    ],
+)
+def test_arrow_str_to_timestamp_tz_aware_shape(
+    value: str, expected: dt.datetime
+) -> None:
+    arr = pa.array([value])
+    out = arrow_str_to_timestamp(arr, unit="us", tz="UTC")
+    assert out.type == pa.timestamp("us", tz="UTC")
+    assert out.to_pylist() == [expected]
+
+
+def test_arrow_str_to_timestamp_mixed_utc_and_z_in_one_column() -> None:
+    arr = pa.array(
+        [
+            "2023-01-02T03:04:05Z",
+            "2023-01-02T03:04:05 UTC",
+            "2023-01-02T03:04:05.123Z",
+            "2023-01-02T03:04:05.123 UTC",
+            "2023-01-02T03:04:05",  # naive — unsafe_tz assumes target zone
+        ]
+    )
+    out = arrow_str_to_timestamp(arr, unit="us", tz="UTC")
+    values = out.to_pylist()
+    assert values[0] == dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)
+    assert values[1] == dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)
+    assert values[2] == dt.datetime(2023, 1, 2, 3, 4, 5, 123000, tzinfo=_UTC)
+    assert values[3] == dt.datetime(2023, 1, 2, 3, 4, 5, 123000, tzinfo=_UTC)
+    # Naive + unsafe_tz=True → wall-clock reinterpreted as UTC.
+    assert values[4] == dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)
+
+
+def test_arrow_str_to_timestamp_keep_fractional_false_drops_subsecond() -> None:
+    arr = pa.array(
+        [
+            "2023-01-02T03:04:05Z",
+            "2023-01-02T03:04:05.987Z",
+            "2023-01-02T03:04:05.987 UTC",
+        ]
+    )
+    out = arrow_str_to_timestamp(arr, unit="us", tz="UTC", keep_fractional=False)
+    assert out.to_pylist() == [
+        dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC),
+        dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC),
+        dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC),
+    ]
+
+
+def test_arrow_str_to_date_accepts_utc_and_z_suffixed_datetimes() -> None:
+    arr = pa.array(
+        [
+            "2023-01-02T03:04:05Z",
+            "2023-01-02T03:04:05 UTC",
+            "2023-01-02T03:04:05.999 UTC",
+            "2023-05-17",
+        ]
+    )
+    out = arrow_str_to_date(arr)
+    assert out.to_pylist() == [
+        dt.date(2023, 1, 2),
+        dt.date(2023, 1, 2),
+        dt.date(2023, 1, 2),
+        dt.date(2023, 5, 17),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unit", "expected_micros"),
+    [("ms", 123_000), ("us", 123_456), ("ns", 123_456_789)],
+)
+def test_arrow_str_to_timestamp_fractional_precision_per_unit(
+    unit: str, expected_micros: int
+) -> None:
+    # Feed 9 fractional digits and verify each unit only keeps as many as it can.
+    arr = pa.array(["2023-01-02T03:04:05.123456789"])
+    out = arrow_str_to_timestamp(arr, unit=unit, tz=None)
+
+    # For ns we can't decode to datetime (arrow clamps to us in to_pylist on
+    # some versions); compare via int64 in that case.
+    if unit == "ns":
+        as_int = pa.compute.cast(out, pa.int64()).to_pylist()[0]
+        # Epoch for 2023-01-02T03:04:05 = 1_672_628_645 seconds.
+        expected = 1_672_628_645 * 1_000_000_000 + expected_micros
+        assert as_int == expected
+        return
+
+    if unit == "ms":
+        expected_dt = dt.datetime(2023, 1, 2, 3, 4, 5, 123000)
+    else:
+        expected_dt = dt.datetime(2023, 1, 2, 3, 4, 5, 123456)
+    assert out.to_pylist() == [expected_dt]
+
+
+def test_timestamp_type_handles_all_shapes_in_one_cast() -> None:
+    arr = pa.array(
+        [
+            "2023-01-02T03:04:05",
+            "2023-01-02T03:04:05.5",
+            "2023-01-02T03:04:05Z",
+            "2023-01-02T03:04:05.123Z",
+            "2023-01-02T03:04:05 UTC",
+            "2023-01-02T03:04:05.999 UTC",
+        ]
+    )
+    out = TimestampType(unit="us", tz="UTC")._cast_arrow_array(arr, CastOptions())
+    values = out.to_pylist()
+    assert all(v.tzinfo is not None for v in values)
+    # Wall-clock payloads are identical across the no-fractional rows.
+    assert (
+        values[0]
+        == values[2]
+        == values[4]
+        == dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=_UTC)
+    )
+    # Fractional payloads preserve sub-second precision.
+    assert values[1].microsecond == 500000
+    assert values[3].microsecond == 123000
+    assert values[5].microsecond == 999000

@@ -358,6 +358,18 @@ def attach_fractional_seconds(
     return pc.add(timestamps, frac_dur)
 
 
+def _normalize_utc_suffix(array: pa.Array) -> pa.Array:
+    """Rewrite trailing named-UTC tags so the ``%z`` strptime branch picks them up.
+
+    Real-world columns love suffixes like ``" UTC"`` or ``"UTC"`` that Arrow's
+    strptime can't map to a timezone. Normalizing to ``+00:00`` lets the
+    tz-aware format catalogue handle them identically to ``Z``.
+    """
+    # Trailing "UTC" with optional whitespace. Handles both " UTC" (space-
+    # separated, common in ISO-ish exports) and stuck-on "UTC".
+    return pc.replace_substring_regex(array, pattern=r"\s*UTC$", replacement="+00:00")
+
+
 def arrow_str_to_timestamp(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
@@ -390,7 +402,8 @@ def arrow_str_to_timestamp(
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
-        stripped = _strip_fractional_seconds(chunk)
+        normalized = _normalize_utc_suffix(chunk)
+        stripped = _strip_fractional_seconds(normalized)
 
         chosen = (
             tuple(formats)
@@ -400,7 +413,7 @@ def arrow_str_to_timestamp(
         naive = _coalesce_strptime(stripped, chosen, unit=unit, strip_tz=True)
 
         if keep_fractional:
-            naive = attach_fractional_seconds(naive, chunk, unit=unit)
+            naive = attach_fractional_seconds(naive, normalized, unit=unit)
 
         if tz:
             assume = tz if unsafe_tz else "UTC"
@@ -423,13 +436,18 @@ def arrow_str_to_date(
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
+        chunk = _normalize_utc_suffix(chunk)
         chunk = _strip_fractional_seconds(chunk)
-        # Reuse the datetime catalogue too — users frequently hand us a full
-        # datetime string and expect the date portion.
+        # Reuse both the tz-aware and naive datetime catalogues — users often
+        # hand us a full datetime (with ``Z``, offset, or naive body) and
+        # expect the date portion. ``strip_tz=True`` flattens tz-aware parses
+        # back to naive before we cast to ``date32``.
         chosen = (
             tuple(formats)
             if formats is not None
-            else ARROW_DATE_FORMATS + ARROW_DATETIME_FORMATS_NAIVE
+            else ARROW_DATE_FORMATS
+            + ARROW_DATETIME_FORMATS_TZ
+            + ARROW_DATETIME_FORMATS_NAIVE
         )
         parsed = _coalesce_strptime(chunk, chosen, unit="us", strip_tz=True)
         return pc.cast(parsed, pa.date32())
