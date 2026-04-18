@@ -182,8 +182,21 @@ class TestSparkExecution:
         cached = make_response(request=req.anonymize(mode="remove"))
 
         arrow_tbl = pa.Table.from_batches([cached.to_arrow_batch(parse=False)])
+        # Arrow → pylist keeps map columns as lists-of-pairs; pyspark's MapType
+        # converter wants dicts, so normalize before handing rows to Spark.
+        map_cols = {
+            f.name for f in arrow_tbl.schema if pa.types.is_map(f.type)
+        }
+
+        def _normalize_row(row: dict) -> dict:
+            for col in map_cols:
+                pairs = row.get(col)
+                row[col] = dict(pairs) if pairs else {}
+            return row
+
+        rows = [_normalize_row(r) for r in arrow_tbl.to_pylist()]
         spark_hit_df = spark.createDataFrame(
-            arrow_tbl.to_pandas(),
+            rows,
             schema=any_to_spark_schema(RESPONSE_ARROW_SCHEMA),
         )
         result_obj = MagicMock()

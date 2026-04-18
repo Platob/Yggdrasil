@@ -6,6 +6,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import BinaryType, StructField, StructType
 
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
+from yggdrasil.data.cast import CastOptions, convert
 from yggdrasil.environ import PyEnv
 from yggdrasil.pickle.ser.serde import loads, dumps
 
@@ -108,10 +109,10 @@ def outputs_map_partition(
         for i in range(batch.num_rows):
             obj = loads(col[i].as_py())
 
-            rb = schema.cast_unstructured(
+            rb = convert(
                 obj,
-                as_type=pa.RecordBatch,
-                safe=False,
+                target_hint=pa.RecordBatch,
+                options=CastOptions(target_field=schema.to_arrow_schema(), safe=False),
             )
 
             if rb.num_rows == 0:

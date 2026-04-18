@@ -1076,3 +1076,39 @@ class Response:
 
     def apply(self, func: Callable[["Response"], "Response"]) -> "Response":
         return func(self)
+
+
+# ---------------------------------------------------------------------------
+# Cast registry — intercept Any->Arrow routes so Response instances (and
+# engine-specific subclasses like HTTPResponse) use their own Arrow projection
+# instead of falling back to the generic polars path, which doesn't know
+# about Response.
+#
+# We patch the wildcard entries rather than registering (Response, pa.*)
+# because dispatch checks `Any -> to_hint` before MRO lookup, so a plain
+# subclass registration would never win for an instance of a wildcard target.
+# ---------------------------------------------------------------------------
+
+from yggdrasil.arrow import cast as _arrow_cast  # noqa: E402
+from yggdrasil.arrow.cast import cast_arrow_tabular  # noqa: E402
+from yggdrasil.data.cast.registry import _any_registry  # noqa: E402
+
+
+_original_any_to_arrow_table = _arrow_cast.any_to_arrow_table
+_original_any_to_arrow_record_batch = _arrow_cast.any_to_arrow_record_batch
+
+
+def _any_to_arrow_table_with_response(obj, options=None):
+    if isinstance(obj, Response):
+        return cast_arrow_tabular(obj.to_arrow_table(parse=False), options)
+    return _original_any_to_arrow_table(obj, options)
+
+
+def _any_to_arrow_record_batch_with_response(obj, options=None):
+    if isinstance(obj, Response):
+        return cast_arrow_tabular(obj.to_arrow_batch(parse=False), options)
+    return _original_any_to_arrow_record_batch(obj, options)
+
+
+_any_registry[pa.Table] = _any_to_arrow_table_with_response
+_any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
