@@ -1,9 +1,11 @@
 """
-Unit tests for :meth:`Table.fetch_all_infos` and :class:`TableAllInfos`.
+Unit tests for :meth:`Tables.fetch_all_infos`, :attr:`Table.all_infos`, and
+the shared caching with :attr:`Table.infos`.
 """
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -65,17 +67,24 @@ def table_infos():
 
 
 @pytest.fixture()
-def table(mock_client, table_infos):
-    service = Tables(client=mock_client, catalog_name="main", schema_name="sales")
+def tables(mock_client):
+    return Tables(client=mock_client, catalog_name="main", schema_name="sales")
+
+
+@pytest.fixture()
+def primed_table(mock_client, tables, table_infos):
+    """Table with a fresh basic ``_infos`` cache — no network access required."""
     tb = Table(
-        service=service,
+        service=tables,
         catalog_name="main",
         schema_name="sales",
         table_name="orders",
     )
-    # Prime the cache so .infos does not hit the network.
-    object.__setattr__(tb, "_infos", table_infos)
-    object.__setattr__(tb, "_infos_fetched_at", 9e18)
+    tb._store_infos(table_infos)
+    # Route Table.sql.tables back to the same `tables` service instance so
+    # ``Table.all_infos`` delegates through our fixture.
+    mock_client.sql.return_value.tables = tables
+    mock_client.tables = tables
     return tb
 
 
@@ -92,11 +101,11 @@ def _tag(entity_type: str, entity_name: str, key: str, value: str) -> EntityTagA
     )
 
 
-# ── fetch_all_infos ───────────────────────────────────────────────────────────
+# ── Tables.fetch_all_infos ────────────────────────────────────────────────────
 
 
-class TestFetchAllInfos:
-    def test_gathers_tags_column_tags_and_grants(self, table, mock_ws, table_infos):
+class TestTablesFetchAllInfos:
+    def test_gathers_tags_column_tags_and_grants(self, tables, mock_ws, table_infos):
         def fake_tag_list(*, entity_type, entity_name, **_):
             if entity_type == "tables":
                 return iter([_tag("tables", entity_name, "pii", "true")])
@@ -109,7 +118,12 @@ class TestFetchAllInfos:
             privilege_assignments=[_assignment("alice", [Privilege.SELECT])]
         )
 
-        result = table.fetch_all_infos()
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+            infos=table_infos,
+        )
 
         assert isinstance(result, TableAllInfos)
         assert result.infos is table_infos
@@ -130,14 +144,18 @@ class TestFetchAllInfos:
         assert result.effective_grants == ()
         mock_ws.grants.get_effective.assert_not_called()
 
-    def test_include_effective_grants_calls_get_effective(self, table, mock_ws):
+    def test_include_effective_grants_calls_get_effective(self, tables, mock_ws, table_infos):
         mock_ws.entity_tag_assignments.list.return_value = iter([])
         mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
         mock_ws.grants.get_effective.return_value = GetPermissionsResponse(
             privilege_assignments=[_assignment("bob", [Privilege.MODIFY])]
         )
 
-        result = table.fetch_all_infos(
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+            infos=table_infos,
             include_tags=False,
             include_column_tags=False,
             include_grants=False,
@@ -147,10 +165,14 @@ class TestFetchAllInfos:
         assert [g.principal for g in result.effective_grants] == ["bob"]
         mock_ws.grants.get_effective.assert_called_once()
 
-    def test_disable_flags_skip_fetches(self, table, mock_ws):
+    def test_disable_flags_skip_fetches(self, tables, mock_ws, table_infos):
         mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
 
-        result = table.fetch_all_infos(
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+            infos=table_infos,
             include_tags=False,
             include_column_tags=False,
             include_grants=False,
@@ -165,38 +187,112 @@ class TestFetchAllInfos:
         assert result.grants == ()
         assert result.effective_grants == ()
 
-    def test_swallows_tag_errors_by_default(self, table, mock_ws):
+    def test_swallows_tag_errors_by_default(self, tables, mock_ws, table_infos):
         mock_ws.entity_tag_assignments.list.side_effect = RuntimeError("tags API off")
         mock_ws.grants.get.return_value = GetPermissionsResponse(
             privilege_assignments=[_assignment("alice", [Privilege.SELECT])]
         )
 
-        result = table.fetch_all_infos()
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+            infos=table_infos,
+        )
 
         # Tag fetches failed silently; grants still populated.
         assert result.tags == ()
         assert result.column_tags == {}
         assert [g.principal for g in result.grants] == ["alice"]
 
-    def test_raise_error_propagates_tag_failure(self, table, mock_ws):
+    def test_raise_error_propagates_tag_failure(self, tables, mock_ws, table_infos):
         mock_ws.entity_tag_assignments.list.side_effect = RuntimeError("boom")
 
         with pytest.raises(RuntimeError, match="boom"):
-            table.fetch_all_infos(raise_error=True)
+            tables.fetch_all_infos(
+                catalog_name="main",
+                schema_name="sales",
+                table_name="orders",
+                infos=table_infos,
+                raise_error=True,
+            )
 
-    def test_missing_tag_api_returns_empty(self, table, mock_ws):
+    def test_missing_tag_api_returns_empty(self, tables, mock_ws, table_infos):
         # Some older workspaces / SDKs do not expose entity_tag_assignments.
         del mock_ws.entity_tag_assignments
         mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
 
-        result = table.fetch_all_infos()
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+            infos=table_infos,
+        )
 
         assert result.tags == ()
         assert result.column_tags == {}
 
-    def test_refresh_invalidates_cache(self, table, mock_ws, mock_client, table_infos):
+    def test_fetches_basic_infos_when_none_provided(self, tables, mock_ws, mock_client, table_infos):
+        mock_ws.tables.get.return_value = table_infos
         mock_ws.entity_tag_assignments.list.return_value = iter([])
         mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
+
+        result = tables.fetch_all_infos(
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+        )
+
+        mock_ws.tables.get.assert_called_once_with(full_name="main.sales.orders")
+        assert result.infos is table_infos
+
+
+# ── Table.all_infos cached property + mutualization with infos ────────────────
+
+
+class TestTableAllInfosProperty:
+    def test_all_infos_delegates_to_service_and_caches(
+        self, primed_table, tables, mock_ws, table_infos
+    ):
+        mock_ws.entity_tag_assignments.list.return_value = iter([])
+        mock_ws.grants.get.return_value = GetPermissionsResponse(
+            privilege_assignments=[_assignment("alice", [Privilege.SELECT])]
+        )
+        # Spy on the service method to count calls.
+        original = tables.fetch_all_infos
+        call_count = {"n": 0}
+
+        def spy(*args, **kwargs):
+            call_count["n"] += 1
+            return original(*args, **kwargs)
+
+        object.__setattr__(tables, "fetch_all_infos", spy)
+
+        snap1 = primed_table.all_infos
+        snap2 = primed_table.all_infos
+
+        assert snap1 is snap2  # cached on the Table
+        assert call_count["n"] == 1
+        assert isinstance(snap1, TableAllInfos)
+        assert snap1.infos is table_infos
+        assert [g.principal for g in snap1.grants] == ["alice"]
+
+    def test_all_infos_reuses_primed_infos_as_seed(
+        self, primed_table, tables, mock_ws, mock_client, table_infos
+    ):
+        mock_ws.entity_tag_assignments.list.return_value = iter([])
+        mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
+
+        _ = primed_table.all_infos
+
+        # The seed was supplied, so no basic lookup hit the SDK tables API.
+        mock_ws.tables.get.assert_not_called()
+
+    def test_all_infos_seeds_basic_infos_cache(
+        self, primed_table, tables, mock_ws, table_infos
+    ):
+        # Wipe the primed caches so we're sure the seeding path is what populates _infos.
+        primed_table._reset_cache()
 
         refreshed = TableInfo(
             catalog_name="main",
@@ -206,21 +302,55 @@ class TestFetchAllInfos:
             owner="carol@example.com",
             columns=[ColumnInfo(name="id", position=0)],
         )
-        mock_client.tables.find_table_remote.return_value = refreshed
+        mock_ws.tables.get.return_value = refreshed
+        mock_ws.entity_tag_assignments.list.return_value = iter([])
+        mock_ws.grants.get.return_value = GetPermissionsResponse(privilege_assignments=[])
 
-        result = table.fetch_all_infos(refresh=True)
+        snap = primed_table.all_infos
+        assert snap.infos is refreshed
 
-        mock_client.tables.find_table_remote.assert_called_once()
-        assert result.infos is refreshed
-        assert result.owner == "carol@example.com"
+        # A follow-up `infos` read should not re-fetch — it lives in _infos now.
+        mock_ws.tables.get.reset_mock()
+        assert primed_table.infos is refreshed
+        mock_ws.tables.get.assert_not_called()
+
+    def test_infos_expired_cache_triggers_refetch(
+        self, primed_table, mock_ws, table_infos
+    ):
+        # Age the basic-infos cache past the TTL horizon.
+        object.__setattr__(primed_table, "_infos_fetched_at", time.time() - 10_000)
+
+        refreshed = TableInfo(
+            catalog_name="main",
+            schema_name="sales",
+            name="orders",
+            table_id="tbl-123",
+            owner="carol@example.com",
+            columns=[ColumnInfo(name="id", position=0)],
+        )
+        mock_ws.tables.get.return_value = refreshed
+
+        result = primed_table.infos
+        assert result is refreshed
+
+    def test_reset_cache_clears_both_caches(self, primed_table, table_infos):
+        # Populate _all_infos manually.
+        snapshot = TableAllInfos(table=primed_table, infos=table_infos)
+        primed_table._store_all_infos(snapshot)
+
+        primed_table._reset_cache()
+
+        assert primed_table._infos is None
+        assert primed_table._all_infos is None
+        assert primed_table._columns is None
 
 
 # ── TableAllInfos helpers ─────────────────────────────────────────────────────
 
 
 class TestTableAllInfosHelpers:
-    def test_convenience_properties(self, table, table_infos):
-        snapshot = TableAllInfos(table=table, infos=table_infos)
+    def test_convenience_properties(self, primed_table, table_infos):
+        snapshot = TableAllInfos(table=primed_table, infos=table_infos)
 
         assert snapshot.full_name == "main.sales.orders"
         assert snapshot.owner == "alice@example.com"
@@ -229,7 +359,7 @@ class TestTableAllInfosHelpers:
         assert snapshot.properties == {"delta.enableChangeDataFeed": "true"}
         assert [c.name for c in snapshot.columns] == ["id", "amount"]
 
-    def test_to_dict_is_json_friendly(self, table, table_infos):
+    def test_to_dict_is_json_friendly(self, primed_table, table_infos):
         from yggdrasil.databricks.sql.grants import Grant
 
         grant = Grant(
@@ -243,7 +373,7 @@ class TestTableAllInfosHelpers:
         col_tag = _tag("columns", "main.sales.orders.id", "pk", "true")
 
         snapshot = TableAllInfos(
-            table=table,
+            table=primed_table,
             infos=table_infos,
             tags=(tag,),
             column_tags={"id": (col_tag,)},

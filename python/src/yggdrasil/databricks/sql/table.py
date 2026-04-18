@@ -145,6 +145,12 @@ class Table(DatabricksResource, GrantsMixin):
     _infos_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
+    _all_infos: Optional["TableAllInfos"] = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _all_infos_fetched_at: float | None = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
     _columns: Optional[list[Column]] = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
@@ -267,6 +273,8 @@ class Table(DatabricksResource, GrantsMixin):
 
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
+        object.__setattr__(self, "_all_infos", None)
+        object.__setattr__(self, "_all_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
 
     def clear(self) -> "Table":
@@ -289,139 +297,65 @@ class Table(DatabricksResource, GrantsMixin):
     def table_id(self) -> str:
         return self.infos.table_id
 
-    def _cache_expired(self) -> bool:
-        if self._infos is None:
-            return True
-        now = time.time()
-        age = now - (self._infos_fetched_at or 0.0)
-        return age >= INFOS_TTL
+    @staticmethod
+    def _is_fresh(fetched_at: float | None) -> bool:
+        if fetched_at is None:
+            return False
+        return (time.time() - fetched_at) < INFOS_TTL
+
+    def _store_infos(self, infos: TableInfo) -> TableInfo:
+        """Populate the lightweight infos + columns caches."""
+        object.__setattr__(self, "_infos", infos)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
+        object.__setattr__(self, "_columns", [
+            Column.from_api(table=self, infos=col_info)
+            for col_info in (infos.columns or [])
+        ])
+        return infos
+
+    def _store_all_infos(self, snapshot: "TableAllInfos") -> "TableAllInfos":
+        """Populate the full snapshot cache and mirror its ``infos`` into the basic cache."""
+        object.__setattr__(self, "_all_infos", snapshot)
+        object.__setattr__(self, "_all_infos_fetched_at", time.time())
+        self._store_infos(snapshot.infos)
+        return snapshot
 
     @property
     def infos(self) -> TableInfo:
-        if self._cache_expired():
-            infos = self.client.tables.find_table_remote(
+        """Basic :class:`TableInfo` — TTL-cached, fed by :attr:`all_infos` when available."""
+        if self._all_infos is not None and self._is_fresh(self._all_infos_fetched_at):
+            return self._all_infos.infos
+        if self._infos is not None and self._is_fresh(self._infos_fetched_at):
+            return self._infos
+
+        info = self.client.tables.find_table_remote(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+        )
+        self._store_infos(info)
+        return info
+
+    @property
+    def all_infos(self) -> "TableAllInfos":
+        """Full :class:`TableAllInfos` snapshot — cached with the same TTL as :attr:`infos`.
+
+        Delegates to :meth:`Tables.fetch_all_infos`, reusing a fresh
+        :attr:`_infos` cache as a seed so the basic ``TableInfo`` lookup
+        runs at most once.  The returned snapshot also re-seeds the
+        basic cache so a subsequent ``infos`` access is free.
+        """
+        if self._all_infos is None or not self._is_fresh(self._all_infos_fetched_at):
+            seed = self._infos if self._is_fresh(self._infos_fetched_at) else None
+            snapshot = self.sql.tables.fetch_all_infos(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
                 table_name=self.table_name,
+                table=self,
+                infos=seed,
             )
-
-            self._reset_cache()
-            object.__setattr__(self, "_infos", infos)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-            object.__setattr__(self, "_columns", [
-                Column.from_api(table=self, infos=col_info)
-                for col_info in self.infos.columns
-            ])
-        return self._infos
-
-    def fetch_all_infos(
-        self,
-        *,
-        refresh: bool = False,
-        include_tags: bool = True,
-        include_column_tags: bool = True,
-        include_grants: bool = True,
-        include_effective_grants: bool = False,
-        raise_error: bool = False,
-    ) -> "TableAllInfos":
-        """Collect a consolidated snapshot of this table's Unity Catalog info.
-
-        Covers both the basic :class:`TableInfo` payload (columns, comment,
-        owner, properties, row filter, table constraints, storage location)
-        *and* the data only reachable via separate Unity Catalog endpoints:
-
-        * entity-tag assignments on the table itself
-        * entity-tag assignments on each column
-        * grants assigned on the table (``effective=False``)
-        * effective (inherited) grants when requested
-
-        Per-endpoint failures — missing SDK API, permission errors,
-        workspace features not enabled — are logged and swallowed by
-        default so that the returned :class:`TableAllInfos` still carries
-        every section that *did* come back.  Pass ``raise_error=True`` to
-        bubble those failures up instead.
-
-        Args:
-            refresh:                  Drop the cached ``TableInfo`` before
-                                      fetching so the snapshot reflects the
-                                      current remote state.
-            include_tags:             Fetch table-level entity-tag assignments.
-            include_column_tags:      Fetch per-column entity-tag assignments.
-            include_grants:           Fetch grants assigned directly on the table.
-            include_effective_grants: Fetch effective (inherited) grants.
-            raise_error:              Re-raise per-endpoint failures instead of
-                                      logging and returning empty for that section.
-        """
-        if refresh:
-            self._reset_cache(invalidate_cache=True)
-
-        infos = self.infos  # triggers a remote fetch when the cache is cold
-        full_name = self.full_name()
-
-        ws = self.client.workspace_client()
-        tags_api = getattr(ws, "entity_tag_assignments", None)
-
-        def _collect_tags(entity_type: str, entity_name: str) -> tuple[Any, ...]:
-            if tags_api is None:
-                return ()
-            try:
-                return tuple(tags_api.list(entity_type=entity_type, entity_name=entity_name))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list %s tag assignments for %r",
-                    entity_type, entity_name, exc_info=True,
-                )
-                return ()
-
-        table_tags: tuple[Any, ...] = ()
-        if include_tags:
-            table_tags = _collect_tags("tables", full_name)
-
-        column_tags: dict[str, tuple[Any, ...]] = {}
-        if include_column_tags:
-            for col_info in (infos.columns or []):
-                col_name = col_info.name
-                if not col_name:
-                    continue
-                assignments = _collect_tags(
-                    "columns",
-                    f"{full_name}.{col_name}",
-                )
-                if assignments:
-                    column_tags[col_name] = assignments
-
-        direct_grants: tuple[Grant, ...] = ()
-        if include_grants:
-            try:
-                direct_grants = tuple(self.grants(effective=False))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list grants for %r", full_name, exc_info=True,
-                )
-
-        eff_grants: tuple[Grant, ...] = ()
-        if include_effective_grants:
-            try:
-                eff_grants = tuple(self.grants(effective=True))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list effective grants for %r", full_name, exc_info=True,
-                )
-
-        return TableAllInfos(
-            table=self,
-            infos=infos,
-            tags=table_tags,
-            column_tags=column_tags,
-            grants=direct_grants,
-            effective_grants=eff_grants,
-        )
+            self._store_all_infos(snapshot)
+        return self._all_infos
 
     # =========================================================================
     # Arrow schema introspection
@@ -1318,7 +1252,7 @@ class Table(DatabricksResource, GrantsMixin):
 
 
 # ===========================================================================
-# TableAllInfos — consolidated snapshot returned by Table.fetch_all_infos
+# TableAllInfos — consolidated snapshot returned by Tables.fetch_all_infos
 # ===========================================================================
 
 @dataclass
