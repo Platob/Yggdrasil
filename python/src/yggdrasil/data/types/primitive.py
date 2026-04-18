@@ -382,6 +382,16 @@ class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
         return None if nullable else b""
 
 
+_TEMPORAL_TYPE_IDS = frozenset(
+    {
+        DataTypeId.DATE,
+        DataTypeId.TIME,
+        DataTypeId.TIMESTAMP,
+        DataTypeId.DURATION,
+    }
+)
+
+
 @dataclass(frozen=True)
 class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     large: bool = False
@@ -395,6 +405,86 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     @property
     def type_id(self) -> DataTypeId:
         return DataTypeId.STRING
+
+    # ------------------------------------------------------------------
+    # Temporal source support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _source_is_temporal(options: "CastOptions") -> bool:
+        sf = options.source_field
+        return sf is not None and sf.dtype.type_id in _TEMPORAL_TYPE_IDS
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        options = options.check_source(array)
+
+        if self._source_is_temporal(options):
+            from ._temporal_cast import arrow_cast_to_string
+
+            casted = arrow_cast_to_string(array)
+            if self.to_arrow() != casted.type:
+                casted = pa.compute.cast(casted, self.to_arrow())
+            return options.fill_arrow_nulls(casted)
+
+        return super()._cast_arrow_array(array, options)
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        options.check_source(series)
+
+        if self._source_is_temporal(options):
+            pl = get_polars()
+            from ._temporal_cast import arrow_cast_to_string
+
+            arrow = arrow_cast_to_string(series.to_arrow())
+            casted = pl.Series(name=series.name, values=arrow, dtype=pl.String)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_polars_series(series, options)
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ):
+        if self._source_is_temporal(options):
+            pl = get_polars()
+            # Polars Expr path: format via the native dt accessor where possible.
+            src_id = options.source_field.dtype.type_id
+            if src_id in (DataTypeId.DATE, DataTypeId.TIMESTAMP):
+                return expr.dt.to_string("iso").cast(pl.String)
+            if src_id == DataTypeId.TIME:
+                return expr.cast(pl.String, strict=options.safe)
+            # Duration: render as integer count of source unit for round-trip.
+            return expr.dt.total_microseconds().cast(pl.String)
+
+        return super()._cast_polars_expr(expr, options)
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ):
+        options = options.check_source(column)
+
+        if self._source_is_temporal(options):
+            from ._temporal_cast import spark_temporal_to_string
+
+            casted = spark_temporal_to_string(column)
+            return self.fill_spark_column_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_spark_column(column, options)
 
     def _merge_with_same_id(
         self,
@@ -1043,13 +1133,26 @@ class TemporalType(PrimitiveType, ABC):
 
         array = self._nullify_empty_arrow_strings(array)
 
+        # options.safe=True means strict parsing. Best-effort ingestion
+        # (the default) keeps fractional seconds and reinterprets wall-clock
+        # when coercing naive timestamps to a target tz.
+        best_effort = not options.safe
+
         kind = self._arrow_target_kind()
         if kind == "date":
             casted = tc.arrow_cast_to_date(array)
         elif kind == "time":
-            casted = tc.arrow_cast_to_time(array, unit=self.unit)
+            casted = tc.arrow_cast_to_time(
+                array, unit=self.unit, keep_fractional=best_effort
+            )
         elif kind == "timestamp":
-            casted = tc.arrow_cast_to_timestamp(array, unit=self.unit, tz=self.tz)
+            casted = tc.arrow_cast_to_timestamp(
+                array,
+                unit=self.unit,
+                tz=self.tz,
+                keep_fractional=best_effort,
+                unsafe_tz=best_effort,
+            )
         else:  # duration
             casted = tc.arrow_cast_to_duration(array, unit=self.unit)
 
@@ -1176,11 +1279,15 @@ class TemporalType(PrimitiveType, ABC):
 
         column = self._nullify_empty_spark_strings(column, options)
 
+        best_effort = not options.safe
+
         kind = self._arrow_target_kind()
         if kind == "date":
             casted = tc.spark_to_date(column)
         elif kind == "timestamp":
-            casted = tc.spark_to_timestamp(column, unit=self.unit, tz=self.tz)
+            casted = tc.spark_to_timestamp(
+                column, unit=self.unit, tz=self.tz, unsafe_tz=best_effort
+            )
         elif kind == "time":
             # Spark has no TIME; we land as string per to_spark().
             casted = tc.spark_to_time_string(column)

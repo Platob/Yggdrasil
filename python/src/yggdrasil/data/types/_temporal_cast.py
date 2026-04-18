@@ -45,11 +45,18 @@ __all__ = [
     "arrow_cast_to_date",
     "arrow_cast_to_time",
     "arrow_cast_to_duration",
+    "arrow_cast_to_string",
+    "arrow_timestamp_to_string",
+    "arrow_date_to_string",
+    "arrow_time_to_string",
+    "arrow_duration_to_string",
     "arrow_temporal_to_string",
+    "attach_fractional_seconds",
     "spark_to_timestamp",
     "spark_to_date",
     "spark_to_time_string",
     "spark_to_duration_seconds",
+    "spark_temporal_to_string",
 ]
 
 
@@ -288,28 +295,118 @@ def _numeric_epoch_scale(array: pa.Array, target_unit: str) -> pa.Array:
     return pc.cast(picked, pa.int64(), safe=False)
 
 
+_UNIT_DIGITS = {"s": 0, "ms": 3, "us": 6, "ns": 9}
+
+
+def _strip_fractional_seconds(array: pa.Array) -> pa.Array:
+    """Drop the fractional-second segment before strptime.
+
+    Arrow's strptime is built on C ``strptime`` and doesn't understand ``%f``.
+    The extracted fraction can be re-attached via
+    :func:`attach_fractional_seconds` once the whole-second timestamp parses
+    cleanly.
+    """
+    # Match a leading ``.`` plus up to 9 digits. Keep whatever follows (tz
+    # offset, ``Z`` suffix, or end-of-string).
+    return pc.replace_substring_regex(array, pattern=r"\.\d{1,9}", replacement="")
+
+
+def _extract_fractional_as_duration(
+    source_strs: pa.Array,
+    unit: str,
+) -> pa.Array:
+    """Pull the ``.ddddd`` fragment out of a string column as a duration.
+
+    Empty / missing fractions map to a zero-length duration so the caller can
+    always ``pc.add`` the result to a parsed timestamp row-for-row.
+    """
+    digits = _UNIT_DIGITS.get(unit, 6)
+    target = pa.duration(unit)
+
+    if digits == 0:
+        return pa.array([0] * len(source_strs), type=target)
+
+    extracted = pc.extract_regex(source_strs, pattern=r"\.(?P<frac>\d+)")
+    frac = extracted.field("frac")
+
+    # Right-pad with zeros so ``.5`` becomes ``.500000`` (us) or ``.500000000``
+    # (ns), then clip to the target precision — anything beyond is silently
+    # truncated, matching Python's ``datetime`` behavior.
+    padded = pc.utf8_rpad(frac, width=digits, padding="0")
+    sliced = pc.utf8_slice_codeunits(padded, start=0, stop=digits)
+
+    empty = pa.scalar("", type=pa.string())
+    zero_str = pa.scalar("0", type=pa.string())
+    non_empty = pc.if_else(pc.equal(sliced, empty), zero_str, sliced)
+    as_int = pc.cast(non_empty, pa.int64(), safe=False)
+    as_int = pc.fill_null(as_int, 0)
+    return pc.cast(as_int, target)
+
+
+def attach_fractional_seconds(
+    timestamps: pa.Array,
+    source_strs: pa.Array,
+    unit: str,
+) -> pa.Array:
+    """Fold fractional-second precision from *source_strs* back onto *timestamps*.
+
+    Timestamps that parsed to null stay null. Rows without a fractional
+    segment get a zero offset, so this is always safe to chain after
+    :func:`_coalesce_strptime`.
+    """
+    frac_dur = _extract_fractional_as_duration(source_strs, unit=unit)
+    return pc.add(timestamps, frac_dur)
+
+
 def arrow_str_to_timestamp(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
     tz: str | None = None,
+    *,
+    keep_fractional: bool = True,
+    unsafe_tz: bool = True,
+    formats: tuple[str, ...] | list[str] | None = None,
 ) -> pa.Array | pa.ChunkedArray:
-    """Best-effort parse a string array to ``timestamp[unit, tz]``."""
+    """Best-effort parse a string array to ``timestamp[unit, tz]``.
+
+    Parameters
+    ----------
+    keep_fractional:
+        When ``True`` (default) sub-second precision from ``HH:MM:SS.ffffff``
+        strings is extracted separately and folded back onto the parsed
+        timestamp. Set to ``False`` to drop it (slightly faster, Arrow-native
+        parity with the pre-2024 behavior).
+    unsafe_tz:
+        Controls what happens when *array* has no recorded timezone but *tz*
+        is set. ``True`` (default, best-effort) reinterprets the wall-clock
+        time as the target zone — ``"2023-01-02 03:04"`` in ``tz="Europe/Paris"``
+        stays ``03:04`` Paris local. ``False`` (strict) assumes UTC and lets
+        pyarrow shift the display to the target zone.
+    formats:
+        Optional override of the format catalogue. tz-aware and naive
+        variants are tried in the order supplied.
+    """
 
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
-        chunk = _strip_fractional_seconds(chunk)
-        naive = _coalesce_strptime(
-            chunk,
-            ARROW_DATETIME_FORMATS_TZ + ARROW_DATETIME_FORMATS_NAIVE,
-            unit=unit,
-            strip_tz=True,
+        stripped = _strip_fractional_seconds(chunk)
+
+        chosen = (
+            tuple(formats)
+            if formats is not None
+            else ARROW_DATETIME_FORMATS_TZ + ARROW_DATETIME_FORMATS_NAIVE
         )
+        naive = _coalesce_strptime(stripped, chosen, unit=unit, strip_tz=True)
+
+        if keep_fractional:
+            naive = attach_fractional_seconds(naive, chunk, unit=unit)
+
         if tz:
-            # The tz-aware branch produced UTC wall-clock. Naive parses have no
-            # recorded tz, so we trust UTC here — that matches the scalar
-            # parser's default in data/cast/datetime.py.
-            stamped = pc.assume_timezone(naive, timezone="UTC")
+            assume = tz if unsafe_tz else "UTC"
+            stamped = pc.assume_timezone(naive, timezone=assume)
+            if assume == tz:
+                return stamped
             return pc.cast(stamped, pa.timestamp(unit, tz))
         return naive
 
@@ -318,6 +415,8 @@ def arrow_str_to_timestamp(
 
 def arrow_str_to_date(
     array: pa.Array | pa.ChunkedArray,
+    *,
+    formats: tuple[str, ...] | list[str] | None = None,
 ) -> pa.Array | pa.ChunkedArray:
     """Best-effort parse a string array to ``date32``."""
 
@@ -327,52 +426,49 @@ def arrow_str_to_date(
         chunk = _strip_fractional_seconds(chunk)
         # Reuse the datetime catalogue too — users frequently hand us a full
         # datetime string and expect the date portion.
-        parsed = _coalesce_strptime(
-            chunk,
-            ARROW_DATE_FORMATS + ARROW_DATETIME_FORMATS_NAIVE,
-            unit="us",
-            strip_tz=True,
+        chosen = (
+            tuple(formats)
+            if formats is not None
+            else ARROW_DATE_FORMATS + ARROW_DATETIME_FORMATS_NAIVE
         )
+        parsed = _coalesce_strptime(chunk, chosen, unit="us", strip_tz=True)
         return pc.cast(parsed, pa.date32())
 
     return _apply_chunked(array, _one)
 
 
-def _strip_fractional_seconds(array: pa.Array) -> pa.Array:
-    """Drop the fractional-second segment before strptime.
-
-    Arrow's strptime is built on C ``strptime`` and doesn't understand ``%f``
-    or ``%.f``. Sub-second precision is lost on this path — callers that need
-    it should parse strings into timestamps upstream.
-    """
-    # Match a leading ``.`` plus up to 9 digits. Keep whatever follows (tz
-    # offset, ``Z`` suffix, or end-of-string).
-    return pc.replace_substring_regex(array, pattern=r"\.\d{1,9}", replacement="")
-
-
 def arrow_str_to_time(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
+    *,
+    keep_fractional: bool = True,
+    formats: tuple[str, ...] | list[str] | None = None,
 ) -> pa.Array | pa.ChunkedArray:
     """Best-effort parse a string array to ``time32/time64``.
 
     Arrow's strptime cannot parse a bare ``HH:MM:SS`` — it always wants a date
     component. We prepend a placeholder date before parsing, then cast the
-    resulting timestamp back to ``time``.
+    resulting timestamp back to ``time``. Sub-second precision is extracted
+    separately and folded back on when ``keep_fractional=True``.
     """
     time_type = pa.time64(unit) if unit in {"us", "ns"} else pa.time32(unit)
 
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
-        chunk = _strip_fractional_seconds(chunk)
+        stripped = _strip_fractional_seconds(chunk)
 
         # Prepend a fixed date so strptime treats the input as a full timestamp.
-        prefix = pa.scalar("1970-01-01T", type=chunk.type)
-        prefixed = pc.binary_join_element_wise(prefix, chunk, "")
+        prefix = pa.scalar("1970-01-01T", type=stripped.type)
+        prefixed = pc.binary_join_element_wise(prefix, stripped, "")
 
-        full_formats = tuple(f"%Y-%m-%dT{fmt}" for fmt in ARROW_TIME_FORMATS)
+        base_formats = tuple(formats) if formats is not None else ARROW_TIME_FORMATS
+        full_formats = tuple(f"%Y-%m-%dT{fmt}" for fmt in base_formats)
         parsed = _coalesce_strptime(prefixed, full_formats, unit=unit)
+
+        if keep_fractional:
+            parsed = attach_fractional_seconds(parsed, chunk, unit=unit)
+
         return pc.cast(parsed, time_type)
 
     return _apply_chunked(array, _one)
@@ -464,12 +560,25 @@ def arrow_cast_to_timestamp(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
     tz: str | None = None,
+    *,
+    keep_fractional: bool = True,
+    unsafe_tz: bool = True,
 ) -> pa.Array | pa.ChunkedArray:
-    """Dispatch any source Arrow type to a ``timestamp[unit, tz]`` array."""
+    """Dispatch any source Arrow type to a ``timestamp[unit, tz]`` array.
+
+    See :func:`arrow_str_to_timestamp` for ``keep_fractional`` and
+    ``unsafe_tz`` semantics. They only matter on the string branch and on
+    naive→tz-aware transitions.
+    """
     src = array.type
     target = pa.timestamp(unit, tz)
 
     if pa.types.is_timestamp(src):
+        if src.tz is None and tz is not None and unsafe_tz:
+            # Reinterpret wall-clock in target zone instead of the default
+            # UTC-assumption that pyarrow applies on cast.
+            aligned = pc.cast(array, pa.timestamp(unit))
+            return pc.assume_timezone(aligned, timezone=tz)
         return pc.cast(array, target)
 
     if pa.types.is_date(src):
@@ -494,7 +603,13 @@ def arrow_cast_to_timestamp(
         return pc.cast(shifted, target)
 
     if pa.types.is_string(src) or pa.types.is_large_string(src):
-        return arrow_str_to_timestamp(array, unit=unit, tz=tz)
+        return arrow_str_to_timestamp(
+            array,
+            unit=unit,
+            tz=tz,
+            keep_fractional=keep_fractional,
+            unsafe_tz=unsafe_tz,
+        )
 
     if pa.types.is_integer(src) or pa.types.is_floating(src):
         return arrow_numeric_to_timestamp(array, unit=unit, tz=tz)
@@ -534,6 +649,8 @@ def arrow_cast_to_date(
 def arrow_cast_to_time(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
+    *,
+    keep_fractional: bool = True,
 ) -> pa.Array | pa.ChunkedArray:
     """Dispatch any source Arrow type to ``time[unit]``."""
     src = array.type
@@ -554,7 +671,7 @@ def arrow_cast_to_time(
         return pc.cast(shifted, time_type)
 
     if pa.types.is_string(src) or pa.types.is_large_string(src):
-        return arrow_str_to_time(array, unit=unit)
+        return arrow_str_to_time(array, unit=unit, keep_fractional=keep_fractional)
 
     if pa.types.is_integer(src) or pa.types.is_floating(src):
         return arrow_numeric_to_time(array, unit=unit)
@@ -611,33 +728,114 @@ def arrow_cast_to_duration(
     return pc.cast(array, target)
 
 
+def arrow_timestamp_to_string(
+    array: pa.Array | pa.ChunkedArray,
+    fmt: str | None = None,
+) -> pa.Array | pa.ChunkedArray:
+    """Format a timestamp array as strings. Default is ISO-8601.
+
+    Arrow's ``%S`` already emits the fractional-second suffix at the column's
+    native precision — no ``%f`` needed, and adding one would render a literal
+    ``.%f`` on top. Callers who want a different shape can pass ``fmt``.
+    """
+
+    def _one(chunk: pa.Array) -> pa.Array:
+        src = chunk.type
+        default_fmt = "%Y-%m-%dT%H:%M:%S%z" if src.tz else "%Y-%m-%dT%H:%M:%S"
+        return pc.strftime(chunk, format=fmt or default_fmt)
+
+    return _apply_chunked(array, _one)
+
+
+def arrow_date_to_string(
+    array: pa.Array | pa.ChunkedArray,
+    fmt: str | None = None,
+) -> pa.Array | pa.ChunkedArray:
+    """Format a date array as strings. Default is ``YYYY-MM-DD``."""
+
+    def _one(chunk: pa.Array) -> pa.Array:
+        return pc.strftime(chunk, format=fmt or "%Y-%m-%d")
+
+    return _apply_chunked(array, _one)
+
+
+def arrow_time_to_string(
+    array: pa.Array | pa.ChunkedArray,
+    fmt: str | None = None,
+) -> pa.Array | pa.ChunkedArray:
+    """Format a time array as strings.
+
+    pyarrow's ``strftime`` kernel doesn't accept ``time`` directly, so we lift
+    to a 1970-01-01 timestamp first when the caller passes a custom format;
+    otherwise we rely on the built-in ``pc.cast(time, string)`` which emits
+    ``HH:MM:SS.ffffff``.
+    """
+
+    def _one(chunk: pa.Array) -> pa.Array:
+        src = chunk.type
+        src_unit = src.unit
+        as_int = pc.cast(chunk, pa.int64())
+        as_dur = pc.cast(as_int, pa.duration(src_unit))
+        epoch = pa.scalar(0, type=pa.timestamp(src_unit))
+        ts = pc.add(epoch, as_dur)
+        if fmt is None:
+            return pc.strftime(ts, format="%H:%M:%S")
+        return pc.strftime(ts, format=fmt)
+
+    return _apply_chunked(array, _one)
+
+
+def arrow_duration_to_string(
+    array: pa.Array | pa.ChunkedArray,
+) -> pa.Array | pa.ChunkedArray:
+    """Render a duration as a plain integer string in the source unit.
+
+    Round-trips through :func:`arrow_str_to_duration` without precision loss,
+    which is what yggdrasil cares about more than human-friendly formatting.
+    """
+
+    def _one(chunk: pa.Array) -> pa.Array:
+        return pc.cast(pc.cast(chunk, pa.int64()), pa.string())
+
+    return _apply_chunked(array, _one)
+
+
+def arrow_cast_to_string(
+    array: pa.Array | pa.ChunkedArray,
+    fmt: str | None = None,
+) -> pa.Array | pa.ChunkedArray:
+    """Dispatch any source Arrow type to a ``string`` array.
+
+    The default stringification for non-temporal types is ``pc.cast(arr,
+    string())``. Temporal types get the custom helpers above so duration
+    works at all and timestamp/date formats can be tuned.
+    """
+    src = array.type
+
+    if pa.types.is_date(src):
+        return arrow_date_to_string(array, fmt=fmt)
+
+    if pa.types.is_time(src):
+        return arrow_time_to_string(array, fmt=fmt)
+
+    if pa.types.is_timestamp(src):
+        return arrow_timestamp_to_string(array, fmt=fmt)
+
+    if pa.types.is_duration(src):
+        return arrow_duration_to_string(array)
+
+    if pa.types.is_null(src):
+        return pa.nulls(len(array), type=pa.string())
+
+    return pc.cast(array, pa.string())
+
+
 def arrow_temporal_to_string(
     array: pa.Array | pa.ChunkedArray,
     fmt: str | None = None,
 ) -> pa.Array | pa.ChunkedArray:
-    """Format a temporal array as strings. Durations get an ISO-8601-ish repr."""
-
-    def _one(chunk: pa.Array) -> pa.Array:
-        src = chunk.type
-
-        if pa.types.is_date(src):
-            return pc.strftime(chunk, format=fmt or "%Y-%m-%d")
-
-        if pa.types.is_time(src):
-            return pc.cast(chunk, pa.string())
-
-        if pa.types.is_timestamp(src):
-            default_fmt = "%Y-%m-%dT%H:%M:%S.%f%z" if src.tz else "%Y-%m-%dT%H:%M:%S.%f"
-            return pc.strftime(chunk, format=fmt or default_fmt)
-
-        if pa.types.is_duration(src):
-            # strftime doesn't take duration. Render in the source unit so the
-            # string round-trips cleanly through arrow_str_to_duration.
-            return pc.cast(pc.cast(chunk, pa.int64()), pa.string())
-
-        return pc.cast(chunk, pa.string())
-
-    return _apply_chunked(array, _one)
+    """Back-compat alias for :func:`arrow_cast_to_string` on temporal inputs."""
+    return arrow_cast_to_string(array, fmt=fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +851,15 @@ def spark_to_timestamp(
     column: "ps.Column",
     unit: str = "us",
     tz: str | None = None,
+    *,
+    unsafe_tz: bool = True,
 ) -> "ps.Column":
-    """Best-effort cast a Spark column to a timestamp with tz handling."""
+    """Best-effort cast a Spark column to a timestamp.
+
+    ``unsafe_tz=True`` treats a tz-naive source's wall-clock as already
+    belonging to *tz* — the opposite of Spark's default UTC assumption on
+    ``to_timestamp``. Only matters when the source has no recorded zone.
+    """
     spark = get_spark_sql()
     F = spark.functions
     T = spark.types
@@ -691,10 +896,41 @@ def spark_to_timestamp(
             casted = casted.cast(T.TimestampNTZType())
         return casted
 
-    # from_utc_timestamp doesn't change stored instant on tz-aware columns; it
-    # returns wall-clock in the requested zone. Spark stores as instant anyway,
-    # so returning as-is is the closest match to Arrow's tz-aware type.
+    if unsafe_tz and source_type_name in {None, "timestamp_ntz", "string"}:
+        # Reinterpret naive/ambiguous wall-clock as *tz* instead of UTC.
+        # Spark stores timestamps as instants; to_utc_timestamp treats the
+        # input as *tz* local and returns the equivalent UTC instant —
+        # exactly the "no display shift" behavior callers want here.
+        return F.to_utc_timestamp(casted, tz)
+
     return casted
+
+
+def spark_temporal_to_string(
+    column: "ps.Column",
+    fmt: str | None = None,
+) -> "ps.Column":
+    """Render a temporal Spark column as a string using Java ``date_format``.
+
+    Source types without a schema (in-expression columns) fall back to a
+    plain ``cast(string)``.
+    """
+    spark = get_spark_sql()
+    F = spark.functions
+    T = spark.types
+
+    try:
+        source_type_name = column._jc.expr().dataType().typeName()  # type: ignore[attr-defined]
+    except Exception:
+        source_type_name = None
+
+    if source_type_name == "date":
+        return F.date_format(column, fmt or "yyyy-MM-dd")
+
+    if source_type_name in {"timestamp", "timestamp_ntz"}:
+        return F.date_format(column, fmt or "yyyy-MM-dd'T'HH:mm:ss.SSS")
+
+    return column.cast(T.StringType())
 
 
 def _spark_epoch_to_seconds(column: "ps.Column") -> "ps.Column":

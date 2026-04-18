@@ -20,15 +20,22 @@ from yggdrasil.data.types import (
     TimestampType,
     TimeType,
 )
+from yggdrasil.data.types import StringType
 from yggdrasil.data.types._temporal_cast import (
     arrow_cast_to_date,
     arrow_cast_to_duration,
+    arrow_cast_to_string,
     arrow_cast_to_timestamp,
+    arrow_date_to_string,
+    arrow_duration_to_string,
     arrow_str_to_date,
     arrow_str_to_duration,
     arrow_str_to_time,
     arrow_str_to_timestamp,
     arrow_temporal_to_string,
+    arrow_time_to_string,
+    arrow_timestamp_to_string,
+    attach_fractional_seconds,
     nullify_empty_strings,
 )
 
@@ -90,10 +97,16 @@ def test_arrow_str_to_time_multi_format() -> None:
     assert out.type == pa.time64("us")
     values = out.to_pylist()
     assert values[0] == dt.time(10, 30, 0)
-    # Sub-second precision isn't preserved — Arrow's strptime can't parse %f.
-    assert values[1] == dt.time(23, 59, 59)
+    # Fractional seconds are folded back on by default.
+    assert values[1] == dt.time(23, 59, 59, 123000)
     assert values[2] == dt.time(0, 0, 0)
     assert values[3] is None
+
+
+def test_arrow_str_to_time_drop_fractional_opt_out() -> None:
+    arr = pa.array(["23:59:59.987654321"])
+    out = arrow_str_to_time(arr, unit="us", keep_fractional=False)
+    assert out.to_pylist() == [dt.time(23, 59, 59)]
 
 
 def test_arrow_str_to_duration_integer_strings() -> None:
@@ -220,8 +233,14 @@ def test_time_type_cast_arrow_array_from_string() -> None:
     out = TimeType(unit="us")._cast_arrow_array(arr, CastOptions())
     values = out.to_pylist()
     assert values[0] == dt.time(10, 30)
-    # Fractional seconds are stripped — Arrow strptime doesn't parse %f.
-    assert values[1] == dt.time(23, 59, 59)
+    # Fractional seconds are folded in by default (best-effort mode).
+    assert values[1] == dt.time(23, 59, 59, 500000)
+
+
+def test_time_type_cast_arrow_array_safe_drops_fractional() -> None:
+    arr = pa.array(["23:59:59.5"])
+    out = TimeType(unit="us")._cast_arrow_array(arr, CastOptions(safe=True))
+    assert out.to_pylist() == [dt.time(23, 59, 59)]
 
 
 def test_duration_type_cast_arrow_array_from_integer_string() -> None:
@@ -311,3 +330,196 @@ def test_pandas_cast_int_to_duration_no_autoscale() -> None:
     s = pd.Series([60, 3600], dtype="int64")
     out = DurationType(unit="s")._cast_pandas_series(s, CastOptions())
     assert list(out) == [dt.timedelta(seconds=60), dt.timedelta(hours=1)]
+
+
+# ---------------------------------------------------------------------------
+# Fractional-second preservation
+# ---------------------------------------------------------------------------
+
+
+def test_attach_fractional_seconds_preserves_microseconds() -> None:
+    ts = pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))
+    source = pa.array(["2023-01-02T03:04:05.123"])
+    out = attach_fractional_seconds(ts, source, unit="us")
+    assert out.to_pylist() == [dt.datetime(2023, 1, 2, 3, 4, 5, 123000)]
+
+
+def test_attach_fractional_seconds_handles_mixed_rows() -> None:
+    ts = pa.array(
+        [
+            dt.datetime(2023, 1, 2, 3, 4, 5),
+            dt.datetime(2023, 5, 17, 14, 30, 0),
+            None,
+        ],
+        type=pa.timestamp("us"),
+    )
+    source = pa.array(["2023-01-02T03:04:05.123456789", "no fraction here", None])
+    out = attach_fractional_seconds(ts, source, unit="us")
+    assert out.to_pylist() == [
+        dt.datetime(2023, 1, 2, 3, 4, 5, 123456),  # truncated to us precision
+        dt.datetime(2023, 5, 17, 14, 30, 0),
+        None,
+    ]
+
+
+def test_arrow_str_to_timestamp_keeps_fractional_by_default() -> None:
+    arr = pa.array(["2023-01-02T03:04:05.123", "2023-05-17 14:30:00.5"])
+    out = arrow_str_to_timestamp(arr, unit="us")
+    assert out.to_pylist() == [
+        dt.datetime(2023, 1, 2, 3, 4, 5, 123000),
+        dt.datetime(2023, 5, 17, 14, 30, 0, 500000),
+    ]
+
+
+def test_arrow_str_to_timestamp_drops_fractional_when_disabled() -> None:
+    arr = pa.array(["2023-01-02T03:04:05.123"])
+    out = arrow_str_to_timestamp(arr, unit="us", keep_fractional=False)
+    assert out.to_pylist() == [dt.datetime(2023, 1, 2, 3, 4, 5)]
+
+
+def test_timestamp_type_preserves_fractional_seconds() -> None:
+    arr = pa.array(["2023-01-02T03:04:05.999"])
+    out = TimestampType(unit="us")._cast_arrow_array(arr, CastOptions())
+    assert out.to_pylist() == [dt.datetime(2023, 1, 2, 3, 4, 5, 999000)]
+
+
+# ---------------------------------------------------------------------------
+# Unsafe timezone casting
+# ---------------------------------------------------------------------------
+
+
+def test_arrow_str_to_timestamp_unsafe_tz_reinterprets_wall_clock() -> None:
+    arr = pa.array(["2023-01-02T03:04:05"])
+    out = arrow_str_to_timestamp(arr, unit="us", tz="Europe/Paris", unsafe_tz=True)
+    assert out.type == pa.timestamp("us", tz="Europe/Paris")
+    # Wall-clock 03:04:05 stays 03:04:05 in Paris.
+    assert out.to_pylist()[0].replace(tzinfo=None) == dt.datetime(2023, 1, 2, 3, 4, 5)
+
+
+def test_arrow_str_to_timestamp_safe_tz_assumes_utc() -> None:
+    arr = pa.array(["2023-01-02T03:04:05"])
+    out = arrow_str_to_timestamp(arr, unit="us", tz="Europe/Paris", unsafe_tz=False)
+    # UTC 03:04:05 → Paris wall-clock 04:04:05 (CET offset +1).
+    assert out.to_pylist()[0].replace(tzinfo=None) == dt.datetime(2023, 1, 2, 4, 4, 5)
+
+
+def test_arrow_cast_to_timestamp_unsafe_tz_on_naive_source() -> None:
+    naive = pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))
+    out = arrow_cast_to_timestamp(naive, unit="us", tz="Europe/Paris", unsafe_tz=True)
+    assert out.type == pa.timestamp("us", tz="Europe/Paris")
+    assert out.to_pylist()[0].replace(tzinfo=None) == dt.datetime(2023, 1, 2, 3, 4, 5)
+
+
+def test_timestamp_type_safe_mode_uses_utc_assumption() -> None:
+    arr = pa.array(["2023-01-02T03:04:05"])
+    out = TimestampType(unit="us", tz="Europe/Paris")._cast_arrow_array(
+        arr, CastOptions(safe=True)
+    )
+    assert out.to_pylist()[0].replace(tzinfo=None) == dt.datetime(2023, 1, 2, 4, 4, 5)
+
+
+def test_timestamp_type_best_effort_reinterprets_wall_clock() -> None:
+    arr = pa.array(["2023-01-02T03:04:05"])
+    out = TimestampType(unit="us", tz="Europe/Paris")._cast_arrow_array(
+        arr, CastOptions()
+    )
+    assert out.to_pylist()[0].replace(tzinfo=None) == dt.datetime(2023, 1, 2, 3, 4, 5)
+
+
+# ---------------------------------------------------------------------------
+# Temporal → string casters
+# ---------------------------------------------------------------------------
+
+
+def test_arrow_timestamp_to_string_default_format() -> None:
+    arr = pa.array([dt.datetime(2023, 1, 2, 3, 4, 5, 123000)], type=pa.timestamp("us"))
+    out = arrow_timestamp_to_string(arr)
+    s = out.to_pylist()[0]
+    assert s.startswith("2023-01-02T03:04:05")
+
+
+def test_arrow_timestamp_to_string_custom_format() -> None:
+    arr = pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))
+    out = arrow_timestamp_to_string(arr, fmt="%Y/%m/%d %H:%M")
+    assert out.to_pylist() == ["2023/01/02 03:04"]
+
+
+def test_arrow_date_to_string_default_iso() -> None:
+    arr = pa.array([dt.date(2023, 5, 17)], type=pa.date32())
+    out = arrow_date_to_string(arr)
+    assert out.to_pylist() == ["2023-05-17"]
+
+
+def test_arrow_time_to_string_default_vs_custom() -> None:
+    arr = pa.array([dt.time(10, 30, 0)], type=pa.time64("us"))
+    default_out = arrow_time_to_string(arr)
+    assert default_out.to_pylist() == ["10:30:00.000000"]
+
+    custom_out = arrow_time_to_string(arr, fmt="%H:%M")
+    assert custom_out.to_pylist() == ["10:30"]
+
+
+def test_arrow_duration_to_string_integer_roundtrip() -> None:
+    arr = pa.array([60, 3600], type=pa.duration("s"))
+    out = arrow_duration_to_string(arr)
+    assert out.to_pylist() == ["60", "3600"]
+
+
+def test_arrow_cast_to_string_dispatches_on_each_temporal() -> None:
+    ts = arrow_cast_to_string(
+        pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))
+    )
+    assert ts.to_pylist()[0].startswith("2023-01-02")
+
+    d = arrow_cast_to_string(pa.array([dt.date(2023, 1, 2)], type=pa.date32()))
+    assert d.to_pylist() == ["2023-01-02"]
+
+    dur = arrow_cast_to_string(pa.array([60], type=pa.duration("s")))
+    assert dur.to_pylist() == ["60"]
+
+
+def test_arrow_temporal_to_string_alias_keeps_working() -> None:
+    arr = pa.array([dt.date(2024, 1, 15)], type=pa.date32())
+    assert arrow_temporal_to_string(arr).to_pylist() == ["2024-01-15"]
+
+
+# ---------------------------------------------------------------------------
+# StringType target — temporal source dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_string_type_cast_arrow_timestamp_source() -> None:
+    arr = pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))
+    out = StringType()._cast_arrow_array(
+        arr,
+        CastOptions.check(source=arr),
+    )
+    assert out.to_pylist()[0].startswith("2023-01-02T03:04:05")
+
+
+def test_string_type_cast_arrow_date_source() -> None:
+    arr = pa.array([dt.date(2024, 5, 17)], type=pa.date32())
+    out = StringType()._cast_arrow_array(
+        arr,
+        CastOptions.check(source=arr),
+    )
+    assert out.to_pylist() == ["2024-05-17"]
+
+
+def test_string_type_cast_arrow_duration_source_survives() -> None:
+    arr = pa.array([60, 3600], type=pa.duration("s"))
+    out = StringType()._cast_arrow_array(
+        arr,
+        CastOptions.check(source=arr),
+    )
+    assert out.to_pylist() == ["60", "3600"]
+
+
+def test_field_cast_preserves_default_field_roundtrip() -> None:
+    from yggdrasil.data.data_field import Field
+
+    # Ensure normal non-temporal string casting still works.
+    arr = pa.array([1, 2, 3], type=pa.int64())
+    f = Field("n", StringType())
+    out = f.cast_arrow_array(arr)
+    assert out.to_pylist() == ["1", "2", "3"]
