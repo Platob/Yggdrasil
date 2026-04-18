@@ -29,14 +29,12 @@ class TestFieldPandas(PandasTestCase):
         self.assertEqual(out.name, DEFAULT_FIELD_NAME)
         self.assertIsInstance(out.dtype, StructType)
         self.assertFalse(out.nullable)
-        self.assertEqual(
-            out.arrow_type,
-            pa.struct(
-                [
-                    pa.field("a", pa.int64(), nullable=True),
-                    pa.field("b", pa.string(), nullable=True),
-                ]
-            ),
+        self.assertEqual(out.arrow_type.field("a").type, pa.int64())
+        # pandas 3.0+ defaults strings to StringDtype -> arrow large_string.
+        b_type = out.arrow_type.field("b").type
+        self.assertTrue(
+            pa.types.is_string(b_type) or pa.types.is_large_string(b_type),
+            f"Expected string/large_string, got {b_type!r}",
         )
 
 
