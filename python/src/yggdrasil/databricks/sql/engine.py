@@ -117,7 +117,6 @@ from .schemas import Schemas
 from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
 from .statement import Statement
-from .statement_result import StatementResult
 from .table import Table
 from .tables import Tables
 from .types import PrimaryKeySpec, ForeignKeySpec
@@ -136,7 +135,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SQLEngine",
-    "StatementResult",
 ]
 
 
@@ -220,7 +218,7 @@ class SQLEngine(DatabricksService):
         hash=False,
         compare=False,
     )
-    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(
+    _cached_queries: Optional[ExpiringDict[str, Statement]] = field(
         default=ExpiringDict,
         init=False,
         repr=False,
@@ -389,7 +387,7 @@ class SQLEngine(DatabricksService):
         - Otherwise the value is treated as tabular data, written to a fresh
           :class:`StagingPath` as Parquet, and the engine takes ownership of
           the new staging path so it can be cleaned up lazily when the
-          resulting :class:`StatementResult` is done.
+          resulting :class:`Statement` is done.
 
         Returns:
             A tuple ``(substitutions, owned_paths)`` where ``substitutions``
@@ -558,7 +556,7 @@ class SQLEngine(DatabricksService):
                 for key, stmt in items.items()
             )
 
-        results: OrderedDict[str, StatementResult] = OrderedDict()
+        results: OrderedDict[str, Statement] = OrderedDict()
 
         if parallel:
             for key, stmt in items.items():
@@ -662,7 +660,7 @@ class SQLEngine(DatabricksService):
         spark_session: Optional["SparkSession"] = None,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
-    ) -> StatementResult:
+    ) -> Statement:
         """
         Execute a SQL statement through Spark or the Databricks SQL API.
 
@@ -713,7 +711,7 @@ class SQLEngine(DatabricksService):
                 replaced with the corresponding ``parquet.`<path>``` source
                 clause. Tabular values are materialized to a fresh staging
                 path via Parquet. Engine-owned staging paths are attached to
-                the returned ``StatementResult`` and cleaned up lazily once
+                the returned ``Statement`` and cleaned up lazily once
                 it reaches a terminal state.  Merged on top of any temporary
                 tables already carried by ``statement``.
             parameters:
@@ -722,7 +720,7 @@ class SQLEngine(DatabricksService):
                 carried by ``statement``.
 
         Returns:
-            A `StatementResult` wrapping either a Spark result or a warehouse API
+            A `Statement` wrapping either a Spark result or a warehouse API
             statement execution result.
 
         Raises:
@@ -792,7 +790,7 @@ class SQLEngine(DatabricksService):
             if row_limit:
                 df = df.limit(row_limit)
 
-            object.__setattr__(prepared, "client", self.client)
+            object.__setattr__(prepared, "service", self.client.statements)
             object.__setattr__(prepared, "warehouse_id", "SparkSQL")
             object.__setattr__(prepared, "statement_id", "SparkSQL")
             object.__setattr__(prepared, "disposition", Disposition.EXTERNAL_LINKS)

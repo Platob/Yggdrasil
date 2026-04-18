@@ -59,7 +59,7 @@ class _FakeCleanupResource:
         self.calls.append(allow_not_found)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _FakeStatementResult(BaseStatementResult):
     """Concrete ``StatementResult`` used to exercise base-class behavior."""
 

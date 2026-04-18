@@ -160,21 +160,12 @@ def test_looks_like_query(text, expected):
 # ---------------------------------------------------------------------------
 
 
-def test_statement_is_frozen():
+def test_statement_has_default_service():
+    from yggdrasil.databricks.sql.statements import Statements
+
     stmt = Statement(text="SELECT 1")
-    with pytest.raises(Exception):
-        stmt.text = "SELECT 2"  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# StatementResult.statement property
-# ---------------------------------------------------------------------------
-
-
-def test_statement_result_alias_points_to_statement():
-    from yggdrasil.databricks.sql.statement_result import StatementResult
-
-    assert StatementResult is Statement
+    assert isinstance(stmt.service, Statements)
+    assert stmt.client is stmt.service.client
 
 
 def test_started_false_without_statement_id():
@@ -256,7 +247,10 @@ def test_cancel_calls_sdk_when_running():
 
     client = MagicMock()
     client.workspace_client.return_value = ws
-    object.__setattr__(stmt, "client", client)
+
+    service = MagicMock()
+    service.client = client
+    object.__setattr__(stmt, "service", service)
 
     result = stmt.cancel()
 

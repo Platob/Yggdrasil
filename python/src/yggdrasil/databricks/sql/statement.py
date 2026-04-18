@@ -33,7 +33,8 @@ from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
 
 from .exceptions import SQLError
-from ..client import DatabricksService
+from .statements import Statements
+from ..client import DatabricksResource
 
 if TYPE_CHECKING:
     from .warehouse import SQLWarehouse
@@ -63,10 +64,14 @@ FAILED_STATES = {
 }
 
 
-@dataclass(frozen=True)
-class Statement(BaseStatementResult, DatabricksService):
+@dataclass
+class Statement(BaseStatementResult, DatabricksResource):
     """Unified pre-execution and post-execution statement handler."""
 
+    service: Statements = field(
+        default_factory=Statements.current,
+        repr=False, compare=False, hash=False,
+    )
     text: str = ""
     parameters: Mapping[str, Any] = field(default_factory=dict)
     temporary_tables: Mapping[str, Any] = field(default_factory=dict)
@@ -75,6 +80,9 @@ class Statement(BaseStatementResult, DatabricksService):
     disposition: Optional[Disposition] = None
 
     _response: Optional[StatementResponse] = field(
+        default=None, repr=False, compare=False, hash=False,
+    )
+    _history: Optional[Mapping[str, Any]] = field(
         default=None, repr=False, compare=False, hash=False,
     )
 

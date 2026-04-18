@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from .sql.catalogs import Catalogs
     from .sql.schemas import Schemas
     from .sql.service import Warehouses
+    from .sql.statements import Statements
     from .sql.grants import Grants
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -762,6 +763,18 @@ class DatabricksClient(URLResource):
         )
 
     @property
+    def statements(self) -> "Statements":
+        """Collection-level SQL statement service for this client."""
+        from .sql.statements import Statements
+
+        return self.lazy_property(
+            self,
+            cache_attr="_statements",
+            factory=lambda: Statements(client=self),
+            use_cache=True,
+        )
+
+    @property
     def compute(self) -> "Compute":
         """Default cluster helper for this client."""
         from .compute.service import Compute
@@ -1037,6 +1050,11 @@ class DatabricksService(ABC):
     @property
     def warehouses(self) -> "Warehouses":
         return self.client.warehouses
+
+    @property
+    def statements(self) -> "Statements":
+        """SQL statement service (shorthand for ``client.statements``)."""
+        return self.client.statements
 
     @property
     def compute(self) -> "Compute":
