@@ -54,6 +54,7 @@ from .column import Column
 from .grants import Grant, GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
+    _build_fk_constraint_sql,
     _build_table_constraints_sql,
     _qualify_fk_ref,
     _safe_constraint_name,
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.sql.tables import Tables
     from yggdrasil.databricks.sql.catalog import Catalog
+    from yggdrasil.databricks.sql.columns import Columns
     from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
 
 __all__ = ["Table", "TableAllInfos"]
@@ -592,6 +594,90 @@ class Table(DatabricksResource, GrantsMixin):
             **options,
         )
 
+    def _columns_service(self) -> "Columns":
+        """Columns service scoped to this table's catalog/schema/table defaults."""
+        from .columns import Columns
+
+        return Columns(
+            client=self.client,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+        )
+
+    def _resolve_fk_field(
+        self,
+        data_field: Field,
+    ) -> tuple[Field, "ForeignKeySpec | None"]:
+        """Detect the ``catalog.schema.table.column`` FK pattern on ``data_field.name``.
+
+        When ``data_field.name`` contains ``.``, it is parsed through the
+        :class:`Columns` service (scoped to this table's defaults) as a
+        foreign-key reference:
+
+        =============================================  =======================================
+        Input name                                     Resolved as
+        =============================================  =======================================
+        ``"ref_table.col"``                            ``<this catalog>.<this schema>.ref_table.col``
+        ``"ref_schema.ref_table.col"``                 ``<this catalog>.ref_schema.ref_table.col``
+        ``"catalog.schema.ref_table.col"``             fully qualified
+        =============================================  =======================================
+
+        The referenced column is looked up via the Columns service so the
+        local column inherits its dtype (keeping the FK type-compatible).
+        The returned field is renamed to the leaf column name and the
+        returned :class:`ForeignKeySpec` carries the fully-qualified ref
+        plus a stable, FK-specific constraint name.
+
+        Safe fall-back: if the pattern can't be fully resolved, or the
+        reference points at this same table, the field is simply renamed
+        to the leaf name (dotted names are never valid column names) and
+        ``None`` is returned for the FK spec.
+        """
+        name = data_field.name or ""
+        if "." not in name:
+            return data_field, None
+
+        columns_service = self._columns_service()
+        cat, sch, tbl, col = columns_service.parse_location(name)
+
+        if not (cat and sch and tbl and col):
+            return data_field, None
+
+        local_field = data_field.with_name(col, inplace=False)
+
+        if (
+            cat == self.catalog_name
+            and sch == self.schema_name
+            and tbl == self.table_name
+        ):
+            return local_field, None
+
+        try:
+            ref_column = columns_service.column(
+                catalog_name=cat,
+                schema_name=sch,
+                table_name=tbl,
+                column_name=col,
+            )
+        except Exception:
+            logger.warning(
+                "Foreign key reference %r could not be resolved; skipping constraint.",
+                name, exc_info=True,
+            )
+            return local_field, None
+
+        local_field = local_field.with_dtype(ref_column.field.dtype, inplace=False)
+
+        fk_spec = ForeignKeySpec(
+            column=col,
+            ref=f"{cat}.{sch}.{tbl}.{col}",
+            constraint_name=_safe_constraint_name(
+                self.table_name, col, tbl, col, "fk",
+            ),
+        )
+        return local_field, fk_spec
+
     def update_column(
         self,
         column: Field,
@@ -612,10 +698,12 @@ class Table(DatabricksResource, GrantsMixin):
         mode = SaveMode.parse(mode, SaveMode.AUTO)
         statements: list[str] = []
         add_columns: list[str] = []
+        pending_fks: list[ForeignKeySpec] = []
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
 
         for column in columns:
             data_field = Field.from_any(column)
+            data_field, fk = self._resolve_fk_field(data_field)
 
             existing = self.column(name=data_field.name, safe=False, raise_error=False)
 
@@ -623,6 +711,8 @@ class Table(DatabricksResource, GrantsMixin):
                 add_columns.append(
                     f"`{data_field.name}` {data_field.dtype.to_databricks_ddl()}"
                 )
+                if fk is not None:
+                    pending_fks.append(fk)
             elif mode in (SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO):
                 if existing.name != data_field.name:
                     statements.append(
@@ -631,6 +721,17 @@ class Table(DatabricksResource, GrantsMixin):
 
         if add_columns:
             statements.append(f"{alter_table} ADD COLUMNS ({', '.join(add_columns)})")
+
+        for fk in pending_fks:
+            statements.append(
+                f"{alter_table} ADD "
+                + _build_fk_constraint_sql(
+                    self.table_name,
+                    fk,
+                    default_catalog=self.catalog_name,
+                    default_schema=self.schema_name,
+                )
+            )
 
         if statements:
             self.sql.execute_many(statements)
@@ -780,11 +881,14 @@ class Table(DatabricksResource, GrantsMixin):
         comment = comment or schema_info.comment
 
         pk_spec = PrimaryKeySpec.from_any(primary_keys, schema=schema_info)
-        fk_specs = ForeignKeySpec.from_any(foreign_keys, schema=schema_info)
+        fk_specs = list(ForeignKeySpec.from_any(foreign_keys, schema=schema_info))
 
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
         for f in schema_info.children_fields:
+            f, inferred_fk = self._resolve_fk_field(f)
+            if inferred_fk is not None:
+                fk_specs.append(inferred_fk)
             if f.primary_key and f.nullable:
                 f = f.with_nullable(False)
             effective_fields.append(f)
@@ -885,8 +989,9 @@ class Table(DatabricksResource, GrantsMixin):
         if schema_info.tags:
             self.set_tags(schema_info.tags)
 
-        for f in schema_info.values():
-            self.column(f.name).set_tags(f.tags)
+        for f in effective_fields:
+            if f.tags:
+                self.column(f.name).set_tags(f.tags)
 
         return self
 
