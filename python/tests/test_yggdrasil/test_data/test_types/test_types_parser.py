@@ -78,6 +78,197 @@ class TestParserAliases(unittest.TestCase):
                     ),
                 )
 
+    def test_bfloat16_alias(self):
+        for expr in ("bfloat16", "bf16", "BFLOAT16"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.FLOAT,
+                        DataTypeMetadata(byte_size=2),
+                    ),
+                )
+
+    def test_arrow_string_aliases(self):
+        for expr in ("utf8", "large_utf8", "large_string"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr).type_id, DataTypeId.STRING
+                )
+
+    def test_arrow_binary_aliases(self):
+        for expr in ("large_binary", "fixed_size_binary"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr).type_id, DataTypeId.BINARY
+                )
+
+    def test_arrow_list_aliases(self):
+        for expr in ("large_list", "fixed_size_list"):
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr).type_id, DataTypeId.ARRAY
+                )
+
+    def test_decimal_sized_aliases_with_params(self):
+        self.assertEqual(
+            parse_data_type("decimal128(18, 4)"),
+            ParsedDataType(
+                DataTypeId.DECIMAL,
+                DataTypeMetadata(precision=18, scale=4),
+            ),
+        )
+        self.assertEqual(
+            parse_data_type("decimal256(38, 10)"),
+            ParsedDataType(
+                DataTypeId.DECIMAL,
+                DataTypeMetadata(precision=38, scale=10),
+            ),
+        )
+
+
+class TestParserTemporalFastPaths(unittest.TestCase):
+
+    def test_date32_date64(self):
+        self.assertEqual(
+            parse_data_type("date32"),
+            ParsedDataType(
+                DataTypeId.DATE,
+                DataTypeMetadata(byte_size=4, unit="day"),
+            ),
+        )
+        self.assertEqual(
+            parse_data_type("date64"),
+            ParsedDataType(
+                DataTypeId.DATE,
+                DataTypeMetadata(byte_size=8, unit="ms"),
+            ),
+        )
+
+    def test_time32_time64_defaults(self):
+        self.assertEqual(
+            parse_data_type("time32"),
+            ParsedDataType(
+                DataTypeId.TIME,
+                DataTypeMetadata(byte_size=4, unit="ms"),
+            ),
+        )
+        self.assertEqual(
+            parse_data_type("time64"),
+            ParsedDataType(
+                DataTypeId.TIME,
+                DataTypeMetadata(byte_size=8, unit="ns"),
+            ),
+        )
+
+    def test_time_with_explicit_unit_suffix(self):
+        cases = [
+            ("time32_s", 4, "s"),
+            ("time32_ms", 4, "ms"),
+            ("time64_us", 8, "us"),
+            ("time64_ns", 8, "ns"),
+        ]
+        for expr, byte_size, unit in cases:
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.TIME,
+                        DataTypeMetadata(byte_size=byte_size, unit=unit),
+                    ),
+                )
+
+    def test_timestamp_unit_suffix(self):
+        for prefix in ("timestamp", "datetime"):
+            for unit in ("s", "ms", "us", "ns"):
+                expr = f"{prefix}_{unit}"
+                with self.subTest(expr=expr):
+                    self.assertEqual(
+                        parse_data_type(expr),
+                        ParsedDataType(
+                            DataTypeId.TIMESTAMP,
+                            DataTypeMetadata(unit=unit),
+                        ),
+                    )
+
+    def test_duration_and_interval_unit_suffix(self):
+        for prefix in ("duration", "interval"):
+            for unit in ("s", "ms", "us", "ns"):
+                expr = f"{prefix}_{unit}"
+                with self.subTest(expr=expr):
+                    self.assertEqual(
+                        parse_data_type(expr),
+                        ParsedDataType(
+                            DataTypeId.DURATION,
+                            DataTypeMetadata(unit=unit),
+                        ),
+                    )
+
+    def test_interval_compound_units(self):
+        cases = [
+            ("interval_year_month", "year_month"),
+            ("interval_day_time", "day_time"),
+            ("interval_month_day_nano", "month_day_nano"),
+        ]
+        for expr, unit in cases:
+            with self.subTest(expr=expr):
+                self.assertEqual(
+                    parse_data_type(expr),
+                    ParsedDataType(
+                        DataTypeId.DURATION,
+                        DataTypeMetadata(unit=unit),
+                    ),
+                )
+
+    def test_fast_paths_nest_inside_arrays_and_structs(self):
+        self.assertEqual(
+            parse_data_type("list<timestamp_ms>"),
+            ParsedDataType(
+                DataTypeId.ARRAY,
+                DataTypeMetadata(),
+                children=(
+                    ParsedDataType(
+                        DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            parse_data_type("struct<t:timestamp_us, d:date32>"),
+            ParsedDataType(
+                DataTypeId.STRUCT,
+                DataTypeMetadata(),
+                children=(
+                    ParsedDataType(
+                        DataTypeId.TIMESTAMP,
+                        DataTypeMetadata(unit="us"),
+                        name="t",
+                    ),
+                    ParsedDataType(
+                        DataTypeId.DATE,
+                        DataTypeMetadata(byte_size=4, unit="day"),
+                        name="d",
+                    ),
+                ),
+            ),
+        )
+
+    def test_existing_timezone_suffixes_still_work(self):
+        self.assertEqual(
+            parse_data_type("timestamp_ntz"),
+            ParsedDataType(
+                DataTypeId.TIMESTAMP,
+                DataTypeMetadata(timezone="ntz"),
+            ),
+        )
+        self.assertEqual(
+            parse_data_type("timestamp with time zone"),
+            ParsedDataType(
+                DataTypeId.TIMESTAMP,
+                DataTypeMetadata(timezone="with_time_zone"),
+            ),
+        )
+
     def test_numeric_wire_id(self):
         self.assertIs(ParsedDataType.parse_type_id("32"), DataTypeId.ARRAY)
         self.assertIs(ParsedDataType.parse_type_id("67"), DataTypeId.ENUM)

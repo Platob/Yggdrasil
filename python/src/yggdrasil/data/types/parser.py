@@ -48,6 +48,8 @@ def _default_float_byte_size(name: str) -> int | None:
         "f16": 2,
         "float16": 2,
         "half": 2,
+        "bfloat16": 2,
+        "bf16": 2,
         "f32": 4,
         "float32": 4,
         "float": 4,
@@ -213,6 +215,67 @@ _TYPE_METADATA_KEYS = {
     "index",
     "index_type",
 }
+
+
+def _fast_path_metadata() -> dict[str, tuple[DataTypeId, DataTypeMetadata]]:
+    """Single-token temporal/sized aliases that carry implicit metadata.
+
+    These cover Arrow sized temporal types (`date32`, `time64`) and the
+    unit-suffixed spellings (`timestamp_ms`, `duration_ns`, ...) that show up
+    in Spark/Databricks/Polars DDL. The aliases are terminal — users who need
+    combined metadata should fall back to the explicit `timestamp[...]` form.
+    """
+    return {
+        "timestamp_with_time_zone": (
+            DataTypeId.TIMESTAMP,
+            DataTypeMetadata(timezone="with_time_zone"),
+        ),
+        "timestamp_without_time_zone": (
+            DataTypeId.TIMESTAMP,
+            DataTypeMetadata(timezone="without_time_zone"),
+        ),
+        "timestamp_ntz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ntz")),
+        "timestamp_ltz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ltz")),
+        "timestamp_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
+        "timestamp_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
+        "timestamp_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
+        "timestamp_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
+        "datetime_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
+        "datetime_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
+        "datetime_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
+        "datetime_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
+        "duration_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
+        "duration_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
+        "duration_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
+        "duration_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
+        "interval_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
+        "interval_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
+        "interval_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
+        "interval_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
+        "interval_year_month": (
+            DataTypeId.DURATION,
+            DataTypeMetadata(unit="year_month"),
+        ),
+        "interval_day_time": (
+            DataTypeId.DURATION,
+            DataTypeMetadata(unit="day_time"),
+        ),
+        "interval_month_day_nano": (
+            DataTypeId.DURATION,
+            DataTypeMetadata(unit="month_day_nano"),
+        ),
+        "date32": (DataTypeId.DATE, DataTypeMetadata(byte_size=4, unit="day")),
+        "date64": (DataTypeId.DATE, DataTypeMetadata(byte_size=8, unit="ms")),
+        "time32": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
+        "time64": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
+        "time32_s": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="s")),
+        "time32_ms": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
+        "time64_us": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="us")),
+        "time64_ns": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
+    }
+
+
+_FAST_PATH_METADATA = _fast_path_metadata()
 
 
 class _Lexer:
@@ -442,29 +505,10 @@ class _Parser:
         raw_name = self._parse_type_head_name()
         canonical, dtype = _canonical_name(raw_name)
 
-        if canonical == "timestamp_with_time_zone":
-            return ParsedDataType(
-                type_id=DataTypeId.TIMESTAMP,
-                metadata=DataTypeMetadata(timezone="with_time_zone"),
-            )
-
-        if canonical == "timestamp_without_time_zone":
-            return ParsedDataType(
-                type_id=DataTypeId.TIMESTAMP,
-                metadata=DataTypeMetadata(timezone="without_time_zone"),
-            )
-
-        if canonical == "timestamp_ntz":
-            return ParsedDataType(
-                type_id=DataTypeId.TIMESTAMP,
-                metadata=DataTypeMetadata(timezone="ntz"),
-            )
-
-        if canonical == "timestamp_ltz":
-            return ParsedDataType(
-                type_id=DataTypeId.TIMESTAMP,
-                metadata=DataTypeMetadata(timezone="ltz"),
-            )
+        fast_path = _FAST_PATH_METADATA.get(canonical)
+        if fast_path is not None:
+            type_id, metadata = fast_path
+            return ParsedDataType(type_id=type_id, metadata=metadata)
 
         if canonical == "none":
             return ParsedDataType(type_id=DataTypeId.NULL)
@@ -1305,10 +1349,22 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "float32": ("float32", DataTypeId.FLOAT),
         "float64": ("float64", DataTypeId.FLOAT),
         "half": ("half", DataTypeId.FLOAT),
+        "bfloat16": ("bfloat16", DataTypeId.FLOAT),
+        "bf16": ("bfloat16", DataTypeId.FLOAT),
         "decimal": ("decimal", DataTypeId.DECIMAL),
+        "decimal128": ("decimal", DataTypeId.DECIMAL),
+        "decimal256": ("decimal", DataTypeId.DECIMAL),
         "numeric": ("decimal", DataTypeId.DECIMAL),
         "date": ("date", DataTypeId.DATE),
+        "date32": ("date32", DataTypeId.DATE),
+        "date64": ("date64", DataTypeId.DATE),
         "time": ("time", DataTypeId.TIME),
+        "time32": ("time32", DataTypeId.TIME),
+        "time64": ("time64", DataTypeId.TIME),
+        "time32_s": ("time32_s", DataTypeId.TIME),
+        "time32_ms": ("time32_ms", DataTypeId.TIME),
+        "time64_us": ("time64_us", DataTypeId.TIME),
+        "time64_ns": ("time64_ns", DataTypeId.TIME),
         "timestamp": ("timestamp", DataTypeId.TIMESTAMP),
         "datetime": ("timestamp", DataTypeId.TIMESTAMP),
         "timestamp_with_time_zone": ("timestamp_with_time_zone", DataTypeId.TIMESTAMP),
@@ -1318,22 +1374,48 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         ),
         "timestamp_ntz": ("timestamp_ntz", DataTypeId.TIMESTAMP),
         "timestamp_ltz": ("timestamp_ltz", DataTypeId.TIMESTAMP),
+        "timestamp_s": ("timestamp_s", DataTypeId.TIMESTAMP),
+        "timestamp_ms": ("timestamp_ms", DataTypeId.TIMESTAMP),
+        "timestamp_us": ("timestamp_us", DataTypeId.TIMESTAMP),
+        "timestamp_ns": ("timestamp_ns", DataTypeId.TIMESTAMP),
+        "datetime_s": ("datetime_s", DataTypeId.TIMESTAMP),
+        "datetime_ms": ("datetime_ms", DataTypeId.TIMESTAMP),
+        "datetime_us": ("datetime_us", DataTypeId.TIMESTAMP),
+        "datetime_ns": ("datetime_ns", DataTypeId.TIMESTAMP),
         "duration": ("duration", DataTypeId.DURATION),
+        "duration_s": ("duration_s", DataTypeId.DURATION),
+        "duration_ms": ("duration_ms", DataTypeId.DURATION),
+        "duration_us": ("duration_us", DataTypeId.DURATION),
+        "duration_ns": ("duration_ns", DataTypeId.DURATION),
         "interval": ("duration", DataTypeId.DURATION),
+        "interval_s": ("interval_s", DataTypeId.DURATION),
+        "interval_ms": ("interval_ms", DataTypeId.DURATION),
+        "interval_us": ("interval_us", DataTypeId.DURATION),
+        "interval_ns": ("interval_ns", DataTypeId.DURATION),
+        "interval_year_month": ("interval_year_month", DataTypeId.DURATION),
+        "interval_day_time": ("interval_day_time", DataTypeId.DURATION),
+        "interval_month_day_nano": ("interval_month_day_nano", DataTypeId.DURATION),
         "timedelta": ("duration", DataTypeId.DURATION),
         "binary": ("binary", DataTypeId.BINARY),
         "bytes": ("binary", DataTypeId.BINARY),
         "bytea": ("binary", DataTypeId.BINARY),
         "blob": ("binary", DataTypeId.BINARY),
+        "large_binary": ("binary", DataTypeId.BINARY),
+        "fixed_size_binary": ("binary", DataTypeId.BINARY),
         "string": ("string", DataTypeId.STRING),
         "str": ("string", DataTypeId.STRING),
         "text": ("string", DataTypeId.STRING),
+        "utf8": ("string", DataTypeId.STRING),
+        "large_utf8": ("string", DataTypeId.STRING),
+        "large_string": ("string", DataTypeId.STRING),
         "varchar": ("varchar", DataTypeId.STRING),
         "char": ("char", DataTypeId.STRING),
         "character_varying": ("character_varying", DataTypeId.STRING),
         "character": ("character", DataTypeId.STRING),
         "array": ("array", DataTypeId.ARRAY),
         "list": ("array", DataTypeId.ARRAY),
+        "large_list": ("array", DataTypeId.ARRAY),
+        "fixed_size_list": ("array", DataTypeId.ARRAY),
         "set": ("set", DataTypeId.ARRAY),
         "frozenset": ("frozenset", DataTypeId.ARRAY),
         "map": ("map", DataTypeId.MAP),
