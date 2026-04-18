@@ -32,8 +32,10 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
     Privilege,
     SecurableType,
+    TableConstraint,
     TableInfo,
     TableOperation,
+    TableRowFilter,
     TableType,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
@@ -49,7 +51,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
 from .column import Column
-from .grants import GrantsMixin
+from .grants import Grant, GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
     _build_table_constraints_sql,
@@ -72,7 +74,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.catalog import Catalog
     from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
 
-__all__ = ["Table"]
+__all__ = ["Table", "TableAllInfos"]
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +313,115 @@ class Table(DatabricksResource, GrantsMixin):
                 for col_info in self.infos.columns
             ])
         return self._infos
+
+    def fetch_all_infos(
+        self,
+        *,
+        refresh: bool = False,
+        include_tags: bool = True,
+        include_column_tags: bool = True,
+        include_grants: bool = True,
+        include_effective_grants: bool = False,
+        raise_error: bool = False,
+    ) -> "TableAllInfos":
+        """Collect a consolidated snapshot of this table's Unity Catalog info.
+
+        Covers both the basic :class:`TableInfo` payload (columns, comment,
+        owner, properties, row filter, table constraints, storage location)
+        *and* the data only reachable via separate Unity Catalog endpoints:
+
+        * entity-tag assignments on the table itself
+        * entity-tag assignments on each column
+        * grants assigned on the table (``effective=False``)
+        * effective (inherited) grants when requested
+
+        Per-endpoint failures — missing SDK API, permission errors,
+        workspace features not enabled — are logged and swallowed by
+        default so that the returned :class:`TableAllInfos` still carries
+        every section that *did* come back.  Pass ``raise_error=True`` to
+        bubble those failures up instead.
+
+        Args:
+            refresh:                  Drop the cached ``TableInfo`` before
+                                      fetching so the snapshot reflects the
+                                      current remote state.
+            include_tags:             Fetch table-level entity-tag assignments.
+            include_column_tags:      Fetch per-column entity-tag assignments.
+            include_grants:           Fetch grants assigned directly on the table.
+            include_effective_grants: Fetch effective (inherited) grants.
+            raise_error:              Re-raise per-endpoint failures instead of
+                                      logging and returning empty for that section.
+        """
+        if refresh:
+            self._reset_cache(invalidate_cache=True)
+
+        infos = self.infos  # triggers a remote fetch when the cache is cold
+        full_name = self.full_name()
+
+        ws = self.client.workspace_client()
+        tags_api = getattr(ws, "entity_tag_assignments", None)
+
+        def _collect_tags(entity_type: str, entity_name: str) -> tuple[Any, ...]:
+            if tags_api is None:
+                return ()
+            try:
+                return tuple(tags_api.list(entity_type=entity_type, entity_name=entity_name))
+            except Exception:
+                if raise_error:
+                    raise
+                logger.warning(
+                    "Failed to list %s tag assignments for %r",
+                    entity_type, entity_name, exc_info=True,
+                )
+                return ()
+
+        table_tags: tuple[Any, ...] = ()
+        if include_tags:
+            table_tags = _collect_tags("tables", full_name)
+
+        column_tags: dict[str, tuple[Any, ...]] = {}
+        if include_column_tags:
+            for col_info in (infos.columns or []):
+                col_name = col_info.name
+                if not col_name:
+                    continue
+                assignments = _collect_tags(
+                    "columns",
+                    f"{full_name}.{col_name}",
+                )
+                if assignments:
+                    column_tags[col_name] = assignments
+
+        direct_grants: tuple[Grant, ...] = ()
+        if include_grants:
+            try:
+                direct_grants = tuple(self.grants(effective=False))
+            except Exception:
+                if raise_error:
+                    raise
+                logger.warning(
+                    "Failed to list grants for %r", full_name, exc_info=True,
+                )
+
+        eff_grants: tuple[Grant, ...] = ()
+        if include_effective_grants:
+            try:
+                eff_grants = tuple(self.grants(effective=True))
+            except Exception:
+                if raise_error:
+                    raise
+                logger.warning(
+                    "Failed to list effective grants for %r", full_name, exc_info=True,
+                )
+
+        return TableAllInfos(
+            table=self,
+            infos=infos,
+            tags=table_tags,
+            column_tags=column_tags,
+            grants=direct_grants,
+            effective_grants=eff_grants,
+        )
 
     # =========================================================================
     # Arrow schema introspection
@@ -1204,6 +1315,98 @@ class Table(DatabricksResource, GrantsMixin):
             f"ON TABLE {self.full_name(safe=True)} "
             f"TO {quote_principal(principal)}"
         )
+
+
+# ===========================================================================
+# TableAllInfos — consolidated snapshot returned by Table.fetch_all_infos
+# ===========================================================================
+
+@dataclass
+class TableAllInfos:
+    """Aggregated Unity Catalog information for a single table.
+
+    Bundles together the basic :class:`TableInfo` (columns, comment, owner,
+    properties, row filter, constraints, storage metadata) with the data
+    only reachable from separate Unity Catalog endpoints — entity-tag
+    assignments on the table itself, entity-tag assignments keyed by
+    column name, and the grants assigned on the table (direct and,
+    optionally, inherited).
+
+    Any section that could not be fetched stays empty; the rest of the
+    snapshot remains usable.
+    """
+
+    table: "Table"
+    infos: TableInfo
+    tags: tuple[Any, ...] = ()
+    column_tags: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
+    grants: tuple[Grant, ...] = ()
+    effective_grants: tuple[Grant, ...] = ()
+
+    @property
+    def full_name(self) -> str:
+        return self.table.full_name()
+
+    @property
+    def columns(self) -> list[Any]:
+        return list(self.infos.columns or [])
+
+    @property
+    def comment(self) -> str | None:
+        return self.infos.comment
+
+    @property
+    def owner(self) -> str | None:
+        return self.infos.owner
+
+    @property
+    def row_filter(self) -> TableRowFilter | None:
+        return self.infos.row_filter
+
+    @property
+    def table_constraints(self) -> list[TableConstraint]:
+        return list(self.infos.table_constraints or [])
+
+    @property
+    def properties(self) -> Mapping[str, str]:
+        return self.infos.properties or {}
+
+    @property
+    def storage_location(self) -> str | None:
+        return self.infos.storage_location
+
+    @property
+    def table_type(self) -> TableType | None:
+        return self.infos.table_type
+
+    @staticmethod
+    def _serialize(value: Any) -> Any:
+        if hasattr(value, "as_dict"):
+            try:
+                return value.as_dict()
+            except Exception:
+                pass
+        return value
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-friendly dictionary (falls back to ``repr`` on opaque values)."""
+        return {
+            "full_name": self.full_name,
+            "infos": self._serialize(self.infos),
+            "tags": [self._serialize(t) for t in self.tags],
+            "column_tags": {
+                name: [self._serialize(t) for t in items]
+                for name, items in self.column_tags.items()
+            },
+            "grants": [
+                {"principal": g.principal, "privileges": list(g.privileges)}
+                for g in self.grants
+            ],
+            "effective_grants": [
+                {"principal": g.principal, "privileges": list(g.privileges)}
+                for g in self.effective_grants
+            ],
+        }
 
 
 # ===========================================================================
