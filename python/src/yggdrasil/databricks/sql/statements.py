@@ -61,9 +61,7 @@ def _sql_quote(value: str) -> str:
 
 
 def _to_timestamp_literal(value: Any) -> str:
-    parsed = any_to_datetime(value)
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(_dt.timezone.utc)
+    parsed = any_to_datetime(value, tz=_dt.timezone.utc)
     return f"TIMESTAMP {_sql_quote(parsed.isoformat(sep=' '))}"
 
 
