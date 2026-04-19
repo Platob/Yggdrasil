@@ -82,6 +82,12 @@ __all__ = [
 # strptime-style patterns. Arrow uses C strptime semantics — %.f is not valid
 # there, %f is. Each format is attempted independently; non-matching rows are
 # nulled via error_is_null=True so pc.coalesce can pick the first winner.
+#
+# Catalogues stay deliberately small — ISO 8601 (with T or space, with or
+# without seconds), the slash-separated EU and US calendars, and the
+# compact ``YYYYMMDD`` form. Month-name and dot-separated shapes
+# (``%b %d, %Y``, ``%d.%m.%Y``) cover so few real-world columns that adding
+# them mostly just trades parse cost for ambiguity.
 
 ARROW_DATETIME_FORMATS_TZ: tuple[str, ...] = (
     "%Y-%m-%dT%H:%M:%S%z",
@@ -95,23 +101,14 @@ ARROW_DATETIME_FORMATS_NAIVE: tuple[str, ...] = (
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M",
     "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
     "%Y/%m/%d %H:%M:%S",
-    "%Y/%m/%d %H:%M",
     "%Y/%m/%d",
     "%d/%m/%Y %H:%M:%S",
-    "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
     "%m/%d/%Y %H:%M:%S",
     "%m/%d/%Y",
-    "%d-%m-%Y %H:%M:%S",
-    "%d-%m-%Y",
-    "%Y%m%dT%H%M%S",
-    "%Y%m%d%H%M%S",
     "%Y%m%d",
-    "%d %b %Y %H:%M:%S",
-    "%d %b %Y",
-    "%b %d, %Y",
-    "%Y-%m-%d",
 )
 
 ARROW_DATE_FORMATS: tuple[str, ...] = (
@@ -119,18 +116,12 @@ ARROW_DATE_FORMATS: tuple[str, ...] = (
     "%Y/%m/%d",
     "%d/%m/%Y",
     "%m/%d/%Y",
-    "%d-%m-%Y",
     "%Y%m%d",
-    "%d %b %Y",
-    "%b %d, %Y",
-    "%d.%m.%Y",
 )
 
 ARROW_TIME_FORMATS: tuple[str, ...] = (
     "%H:%M:%S",
     "%H:%M",
-    "%I:%M:%S %p",
-    "%I:%M %p",
 )
 
 # Spark uses Java DateTimeFormatter patterns (not strptime). Mirrors the Arrow
@@ -146,21 +137,14 @@ SPARK_DATETIME_FORMATS: tuple[str, ...] = (
     "yyyy-MM-dd HH:mm:ss",
     "yyyy-MM-dd'T'HH:mm",
     "yyyy-MM-dd HH:mm",
+    "yyyy-MM-dd",
     "yyyy/MM/dd HH:mm:ss",
     "yyyy/MM/dd",
     "dd/MM/yyyy HH:mm:ss",
     "dd/MM/yyyy",
     "MM/dd/yyyy HH:mm:ss",
     "MM/dd/yyyy",
-    "dd-MM-yyyy HH:mm:ss",
-    "dd-MM-yyyy",
-    "yyyyMMdd'T'HHmmss",
-    "yyyyMMddHHmmss",
     "yyyyMMdd",
-    "dd MMM yyyy HH:mm:ss",
-    "dd MMM yyyy",
-    "MMM dd, yyyy",
-    "yyyy-MM-dd",
 )
 
 SPARK_DATE_FORMATS: tuple[str, ...] = (
@@ -168,19 +152,13 @@ SPARK_DATE_FORMATS: tuple[str, ...] = (
     "yyyy/MM/dd",
     "dd/MM/yyyy",
     "MM/dd/yyyy",
-    "dd-MM-yyyy",
     "yyyyMMdd",
-    "dd MMM yyyy",
-    "MMM dd, yyyy",
-    "dd.MM.yyyy",
 )
 
 SPARK_TIME_FORMATS: tuple[str, ...] = (
     "HH:mm:ss.SSS",
     "HH:mm:ss",
     "HH:mm",
-    "hh:mm:ss a",
-    "hh:mm a",
 )
 
 
@@ -337,23 +315,14 @@ POLARS_PARSE_DATETIME_FORMATS_NAIVE: tuple[str, ...] = (
     "%Y-%m-%d %H:%M:%S%.f",
     "%Y-%m-%dT%H:%M",
     "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
     "%Y/%m/%d %H:%M:%S",
-    "%Y/%m/%d %H:%M",
     "%Y/%m/%d",
     "%d/%m/%Y %H:%M:%S",
-    "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
     "%m/%d/%Y %H:%M:%S",
     "%m/%d/%Y",
-    "%d-%m-%Y %H:%M:%S",
-    "%d-%m-%Y",
-    "%Y%m%dT%H%M%S",
     "%Y%m%d",
-    "%d %b %Y %H:%M:%S",
-    "%d %b %Y",
-    "%b %d, %Y",
-    "%d.%m.%Y",
-    "%Y-%m-%d",
 )
 
 
@@ -1383,35 +1352,24 @@ def arrow_temporal_to_string(
 # disagree on tz state. The tz branch gets stripped to naive before merging.
 POLARS_DATETIME_FORMATS_TZ: tuple[str, ...] = (
     "%Y-%m-%dT%H:%M:%S%.f%z",
-    "%Y-%m-%dT%H:%M:%S%z",
     "%Y-%m-%d %H:%M:%S%.f%z",
-    "%Y-%m-%d %H:%M:%S%z",
+    "%Y-%m-%dT%H:%M%z",
     "%Y-%m-%d %H:%M%z",
 )
 
 POLARS_DATETIME_FORMATS_NAIVE: tuple[str, ...] = (
     "%Y-%m-%dT%H:%M:%S%.f",
-    "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M:%S%.f",
-    "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M",
     "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
     "%Y/%m/%d %H:%M:%S",
-    "%Y/%m/%d %H:%M",
     "%Y/%m/%d",
     "%d/%m/%Y %H:%M:%S",
-    "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
     "%m/%d/%Y %H:%M:%S",
     "%m/%d/%Y",
-    "%d-%m-%Y %H:%M:%S",
-    "%d-%m-%Y",
-    "%Y%m%dT%H%M%S",
     "%Y%m%d",
-    "%d %b %Y %H:%M:%S",
-    "%d %b %Y",
-    "%b %d, %Y",
-    "%Y-%m-%d",
 )
 
 POLARS_DATE_FORMATS: tuple[str, ...] = (
@@ -1419,19 +1377,13 @@ POLARS_DATE_FORMATS: tuple[str, ...] = (
     "%Y/%m/%d",
     "%d/%m/%Y",
     "%m/%d/%Y",
-    "%d-%m-%Y",
     "%Y%m%d",
-    "%d %b %Y",
-    "%b %d, %Y",
-    "%d.%m.%Y",
 )
 
 POLARS_TIME_FORMATS: tuple[str, ...] = (
     "%H:%M:%S%.f",
     "%H:%M:%S",
     "%H:%M",
-    "%I:%M:%S %p",
-    "%I:%M %p",
 )
 
 
