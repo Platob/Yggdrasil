@@ -558,12 +558,30 @@ def _normalize_utc_suffix(array: pa.Array) -> pa.Array:
     """Rewrite trailing named-UTC tags so the ``%z`` strptime branch picks them up.
 
     Real-world columns love suffixes like ``" UTC"`` or ``"UTC"`` that Arrow's
-    strptime can't map to a timezone. Normalizing to ``+00:00`` lets the
+    strptime can't map to a timezone. Normalizing to ``+0000`` lets the
     tz-aware format catalogue handle them identically to ``Z``.
     """
     # Trailing "UTC" with optional whitespace. Handles both " UTC" (space-
-    # separated, common in ISO-ish exports) and stuck-on "UTC".
-    return pc.replace_substring_regex(array, pattern=r"\s*UTC$", replacement="+00:00")
+    # separated, common in ISO-ish exports) and stuck-on "UTC". We collapse
+    # to the colon-less form so the next normalization step doesn't have to
+    # touch this row again, and so Arrow's strptime ``%z`` accepts it on
+    # every platform.
+    return pc.replace_substring_regex(array, pattern=r"\s*UTC$", replacement="+0000")
+
+
+def _normalize_utc_offset(array: pa.Array) -> pa.Array:
+    """Strip the colon out of trailing ``+HH:MM`` / ``-HH:MM`` offsets.
+
+    Arrow's strptime is built on the platform's C ``strptime``. glibc accepts
+    both ``+0200`` and ``+02:00`` for ``%z``; Windows MSVCRT (and several BSD
+    libc variants) only accept the colon-less form. Normalizing here keeps
+    the cross-platform parse behavior identical regardless of the host.
+    """
+    return pc.replace_substring_regex(
+        array,
+        pattern=r"([+-])(\d{2}):(\d{2})$",
+        replacement=r"\1\2\3",
+    )
 
 
 def arrow_str_to_timestamp(
@@ -599,6 +617,7 @@ def arrow_str_to_timestamp(
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
         normalized = _normalize_utc_suffix(chunk)
+        normalized = _normalize_utc_offset(normalized)
         stripped = _strip_fractional_seconds(normalized)
 
         chosen = (
@@ -631,6 +650,7 @@ def arrow_str_to_date(
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
         chunk = _normalize_utc_suffix(chunk)
+        chunk = _normalize_utc_offset(chunk)
         chunk = _strip_fractional_seconds(chunk)
         # Reuse both the tz-aware and naive datetime catalogues — users often
         # hand us a full datetime (with ``Z``, offset, or naive body) and
