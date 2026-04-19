@@ -325,8 +325,18 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @property
     def default(self):
-        if self.has_default:
-            return self.default_arrow_scalar.as_py()
+        if self.metadata is not None:
+            default = self.metadata.get(DEFAULT_VALUE_KEY)
+
+            if default is None:
+                return self.dtype.default_pyobj(nullable=self.nullable)
+
+            try:
+                default = json_module.loads(default, safe=False)
+            except Exception as e:
+                raise ValueError(f"Could not parse default value {default!r} for {self!r}: {e}") from e
+
+            return self.dtype.convert_pyobj(default, nullable=self.nullable, safe=False)
         return None
 
     @property
@@ -1455,7 +1465,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: pa.Scalar | None = None,
     ):
         if default_scalar is None and self.has_default:
-            default_scalar = self.default_arrow_scalar
+            default_scalar = self.default
 
         return self.dtype.fill_polars_array_nulls(
             series,
@@ -1484,8 +1494,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         *,
         default_scalar: pa.Scalar | None = None,
     ) -> "ps.Column":
-        if default_scalar is None and self.has_default:
-            default_scalar = self.default_arrow_scalar
+        if default_scalar is None:
+            default_scalar = self.default
 
         return self.dtype.fill_spark_column_nulls(
             column,
@@ -1507,7 +1517,10 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def default_polars_expr(self, alias: str | None = None):
-        return self.dtype.default_polars_expr(value=self.default, nullable=self.nullable, alias=alias or self.name)
+        return self.dtype.default_polars_expr(
+            value=self.default, nullable=self.nullable,
+            alias=alias or self.name
+        )
 
     def default_pandas_series(
         self,

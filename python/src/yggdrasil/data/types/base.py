@@ -174,7 +174,7 @@ class DataType(BaseChildrenFields, ABC):
         return self._convert_pyobj(value)
 
     def _convert_pyobj(self, value: Any, safe: bool = False):
-        return pa.scalar(value, type=self.to_arrow(), safe=safe).as_py()
+        return value
 
     def convert_arrow_scalar(
         self, value: pa.Scalar, nullable: bool, safe: bool = False
