@@ -1002,6 +1002,7 @@ class SQLEngine(DatabricksService):
         table: Optional[Table] = None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        merge_predicates: list[str] | None = None
     ) -> None:
         """
         Insert data into a Delta table using the most appropriate backend.
@@ -1090,6 +1091,7 @@ class SQLEngine(DatabricksService):
                 vacuum_hours=vacuum_hours,
                 table=table,
                 spark_session=spark_session,
+                merge_predicates=merge_predicates,
             )
 
         if spark_session is None:
@@ -1123,6 +1125,7 @@ class SQLEngine(DatabricksService):
                 table=table,
                 primary_keys=primary_keys,
                 foreign_keys=foreign_keys,
+                merge_predicates=merge_predicates,
             )
 
         return self.arrow_insert_into(
@@ -1145,6 +1148,7 @@ class SQLEngine(DatabricksService):
             table=table,
             primary_keys=primary_keys,
             foreign_keys=foreign_keys,
+            merge_predicates=merge_predicates,
         )
 
     def arrow_insert_into(
