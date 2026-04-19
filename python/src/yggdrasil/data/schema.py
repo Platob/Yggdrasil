@@ -77,29 +77,74 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     
     def equals(
         self,
-        other: "Schema",
+        other: Any,
         check_names: bool = True,
         check_dtypes: bool = True,
         check_metadata: bool = True,
     ) -> bool:
-        other = self.from_any(other)
+        """Structural equality check with configurable scope.
+
+        Mirrors :meth:`DataType.equals` / :meth:`Field.equals`. Coerces
+        *other* into a ``Schema`` so callers can pass a ``pa.Schema``,
+        mapping, etc. Returns ``False`` on coercion failure instead of
+        raising.
+
+        - ``check_names``: compare field names (a reordered schema is
+          still equal when names match). When ``False``, fields are
+          compared positionally and names are ignored at every depth.
+        - ``check_dtypes``: recurse into field dtypes and compare
+          per-field ``nullable``.
+        - ``check_metadata``: compare schema metadata and recurse.
+        """
+        if other is None:
+            return False
+        if not isinstance(other, Schema):
+            try:
+                other = self.from_any(other)
+            except Exception:
+                return False
 
         if check_metadata and self.metadata != other.metadata:
             return False
 
-        if len(self.inner_fields) != len(other.inner_fields):
+        self_fields = self.children_fields
+        other_fields = other.children_fields
+
+        if len(self_fields) != len(other_fields):
             return False
 
-        names = set(self.field_names() + other.field_names())
-        
-        return all(
-            self.field(name=name).equals(
-                other.field(name=name),
-                check_names=check_names, check_dtypes=check_dtypes,
-                check_metadata=check_metadata,
+        if not check_names:
+            return all(
+                s.equals(
+                    o,
+                    check_names=check_names,
+                    check_dtypes=check_dtypes,
+                    check_metadata=check_metadata,
+                )
+                for s, o in zip(self_fields, other_fields)
             )
-            for name in names
-        )
+
+        seen: set[str] = set()
+        for self_field in self_fields:
+            other_field = other.field_by(
+                name=self_field.name, raise_error=False
+            )
+            if other_field is None:
+                return False
+            if not self_field.equals(
+                other_field,
+                check_names=check_names,
+                check_dtypes=check_dtypes,
+                check_metadata=check_metadata,
+            ):
+                return False
+            seen.add(self_field.name)
+
+        for other_field in other_fields:
+            if other_field.name not in seen:
+                return False
+
+        return True
     
     def _empty_tags(self) -> None:
         return None

@@ -248,22 +248,45 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def equals(
         self,
-        other: "Field",
+        other: Any,
         check_names: bool = True,
         check_dtypes: bool = True,
         check_metadata: bool = True,
     ) -> bool:
-        if check_metadata and self.metadata != other.metadata:
+        """Structural equality check with configurable scope.
+
+        Mirrors :meth:`DataType.equals`. Coerces *other* to a ``Field`` so
+        that callers can pass a ``pa.Field`` / dict / etc. without manual
+        conversion. Returns ``False`` on coercion failure instead of raising.
+
+        - ``check_names``: compare this field's name and recurse into child
+          field names for nested types.
+        - ``check_dtypes``: recurse into the dtype and compare ``nullable``
+          (both are structural, schema-defining attributes).
+        - ``check_metadata``: compare this field's metadata and recurse.
+        """
+        if other is None:
             return False
+        if not isinstance(other, Field):
+            try:
+                other = Field.from_any(other)
+            except Exception:
+                return False
 
         if check_names and self.name != other.name:
             return False
-        
+
+        if check_dtypes and self.nullable != other.nullable:
+            return False
+
+        if check_metadata and self.metadata != other.metadata:
+            return False
+
         return self.dtype.equals(
             other.dtype,
             check_names=check_names,
             check_dtypes=check_dtypes,
-            check_metadata=check_metadata
+            check_metadata=check_metadata,
         )
         
     @property
