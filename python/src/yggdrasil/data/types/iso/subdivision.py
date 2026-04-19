@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping
 
 import pyarrow as pa
 
-from .base import ISOType, normalize_iso_token_keep_hyphen
+from .base import (
+    ISOType,
+    normalize_iso_token_keep_hyphen,
+    resolve_arrow_string_via_unique,
+)
 from .country import _ALPHA2_MAP, _VALID_ALPHA2
 
 if TYPE_CHECKING:
@@ -125,20 +129,17 @@ class ISOSubdivisionType(ISOType):
         return parse_subdivision_token(token)
 
     # ------------------------------------------------------------------
-    # Vectorized Arrow — row-wise Python to honour flexible parsing.
+    # Vectorized Arrow — dictionary-encode to collapse duplicates so the
+    # flexible Python parser runs once per unique raw input.
     # ------------------------------------------------------------------
     def _resolve_arrow_string(self, array: pa.Array) -> pa.Array:
-        out: list[str | None] = []
-        for s in array.to_pylist():
-            if s is None:
-                out.append(None)
-                continue
-            token = self._normalize(s)
-            if token is None:
-                out.append(None)
-                continue
-            out.append(parse_subdivision_token(token))
-        return pa.array(out, type=pa.string())
+        return resolve_arrow_string_via_unique(array, self._resolve_raw)
+
+    def _resolve_raw(self, raw: str) -> str | None:
+        token = self._normalize(raw)
+        if token is None:
+            return None
+        return parse_subdivision_token(token)
 
     @classmethod
     def _build_lookup_map(cls) -> Mapping[str, str]:

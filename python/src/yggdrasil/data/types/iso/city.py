@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping
 
 import pyarrow as pa
 
-from .base import ISOType, normalize_iso_token_keep_hyphen
+from .base import (
+    ISOType,
+    normalize_iso_token_keep_hyphen,
+    resolve_arrow_string_via_unique,
+)
 from .country import _ALPHA2_MAP, _VALID_ALPHA2
 
 if TYPE_CHECKING:
@@ -114,20 +118,17 @@ class ISOCityType(ISOType):
         return parse_city_token(token)
 
     # ------------------------------------------------------------------
-    # Arrow — row-wise Python (flexible parsing).
+    # Arrow — dictionary-encode so the flexible Python parser only runs
+    # once per *unique* raw value, then broadcast with ``pc.take``.
     # ------------------------------------------------------------------
     def _resolve_arrow_string(self, array: pa.Array) -> pa.Array:
-        out: list[str | None] = []
-        for s in array.to_pylist():
-            if s is None:
-                out.append(None)
-                continue
-            token = self._normalize(s)
-            if token is None:
-                out.append(None)
-                continue
-            out.append(parse_city_token(token))
-        return pa.array(out, type=pa.string())
+        return resolve_arrow_string_via_unique(array, self._resolve_raw)
+
+    def _resolve_raw(self, raw: str) -> str | None:
+        token = self._normalize(raw)
+        if token is None:
+            return None
+        return parse_city_token(token)
 
     @classmethod
     def _build_lookup_map(cls) -> Mapping[str, str]:

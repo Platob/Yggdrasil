@@ -619,30 +619,34 @@ def arrow_str_to_duration(
         # Mixed / non-numeric column: fall back to per-row parsing. ISO 8601
         # durations are short and the regex is anchored, so this stays cheap
         # in practice — and it's the only way to honour the calendar-unit
-        # defaults without a vectorized regex kernel.
-        units: list[int | None] = []
-        for raw in chunk.to_pylist():
+        # defaults without a vectorized regex kernel.  Dictionary-encode so
+        # each distinct string is parsed once even when the column has many
+        # repeated values (common in schedules / bucketed durations).
+        if len(chunk) == 0:
+            return pa.array([], type=target)
+
+        encoded = pc.dictionary_encode(chunk)
+        unique_raw = encoded.dictionary.to_pylist()
+
+        def _parse_one(raw: str | None) -> int | None:
             if raw is None:
-                units.append(None)
-                continue
+                return None
             s = raw.strip()
             if not s:
-                units.append(None)
-                continue
+                return None
             if _RE_INT_LITERAL.match(s):
-                units.append(int(s))
-                continue
+                return int(s)
             iso_nanos = parse_iso_duration_to_nanos(s)
             if iso_nanos is not None:
-                units.append(iso_nanos // nanos_per_unit)
-                continue
+                return iso_nanos // nanos_per_unit
             try:
-                # Plain float in *unit* — last resort before nulling.
-                units.append(int(round(float(s))))
+                return int(round(float(s)))
             except ValueError:
-                units.append(None)
+                return None
 
-        as_int = pa.array(units, type=pa.int64())
+        unique_units = [_parse_one(raw) for raw in unique_raw]
+        unique_arr = pa.array(unique_units, type=pa.int64())
+        as_int = pc.take(unique_arr, encoded.indices)
         return pc.cast(as_int, target)
 
     return _apply_chunked(array, _one)

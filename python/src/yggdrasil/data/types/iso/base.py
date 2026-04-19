@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Mapping
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -41,6 +41,7 @@ __all__ = [
     "ISOType",
     "normalize_iso_token",
     "normalize_iso_token_keep_hyphen",
+    "resolve_arrow_string_via_unique",
 ]
 
 
@@ -81,6 +82,35 @@ def normalize_iso_token_keep_hyphen(value: Any) -> str | None:
     text = _NON_ALNUM_KEEP_HYPHEN_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
     return text or None
+
+
+def resolve_arrow_string_via_unique(
+    array: pa.Array,
+    resolver: Callable[[str], str | None],
+) -> pa.Array:
+    """Apply a Python resolver per *unique* value, then broadcast with ``pc.take``.
+
+    This is the shared vectorized fallback for ISO types whose parsers
+    don't fit the straight ``pc.index_in`` + ``pc.take`` mold (e.g.
+    flexible city/subdivision tokenizers).  Dictionary-encoding collapses
+    duplicates so the Python work scales with the cardinality of unique
+    raw values instead of row count — typically 2-3 orders of magnitude
+    smaller for real-world columns like country names.
+
+    Nulls are preserved: ``pc.dictionary_encode`` puts them in the index
+    array (not the dictionary), and ``pc.take`` propagates them through
+    unchanged.
+    """
+    if len(array) == 0:
+        return pa.array([], type=pa.string())
+
+    encoded = pc.dictionary_encode(array)
+    unique_tokens = encoded.dictionary.to_pylist()
+    # ``dictionary_encode`` places non-null distinct values in the dictionary,
+    # so the Python call count is bounded by the column's cardinality.
+    resolved = [resolver(token) if token is not None else None for token in unique_tokens]
+    resolved_arr = pa.array(resolved, type=pa.string())
+    return pc.take(resolved_arr, encoded.indices)
 
 
 @dataclass(frozen=True)
