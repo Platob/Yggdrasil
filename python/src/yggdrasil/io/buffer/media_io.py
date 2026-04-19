@@ -50,13 +50,14 @@ import pyarrow as pa
 from yggdrasil.io.enums import MimeTypes, Codec, MediaType, MimeType, SaveMode
 from yggdrasil.pickle.serde import ObjectSerde
 from .bytes_io import BytesIO
-from .media_options import MediaOptions
+from .media_options import MediaOptions, _MISSING
 
 if TYPE_CHECKING:
     import pandas
     import polars
     import pyarrow
 
+    from yggdrasil.data.cast.options import CastOptionsArg
     from yggdrasil.data.schema import Schema
 
 
@@ -335,11 +336,51 @@ class MediaIO(ABC, Generic[O]):
         self,
         *args,
         options: Optional[O] = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **media_options,
     ) -> Iterator["pyarrow.RecordBatch"]:
-        """Yield Arrow record batches, transparently handling decompression."""
+        """Yield Arrow record batches, transparently handling decompression.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance for this format. When ``None`` a fresh
+            default is constructed and the explicit keyword arguments below
+            are merged on top.
+        columns:
+            Optional column projection — only these columns are materialized
+            when the format supports pushdown. Unknown names either raise or
+            get dropped depending on the format.
+        cast:
+            Arrow cast configuration applied to each batch after decode. Accepts
+            a :class:`~yggdrasil.data.cast.options.CastOptions`, a target
+            :class:`pyarrow.Schema` / :class:`pyarrow.Field` / :class:`pyarrow.DataType`,
+            or a dict forwarded to ``CastOptions(**cast)``.
+        use_threads:
+            Enable parallel Arrow decode where the format supports it.
+        ignore_empty:
+            Suppress zero-row batches so callers never see empty shells.
+        raise_error:
+            When ``True`` (default) cast failures propagate; when ``False`` the
+            uncast batch is yielded instead.
+        **media_options:
+            Format-specific knobs consumed by the concrete
+            :meth:`check_options` implementation (e.g. ``compression``,
+            ``delimiter``, ``member``).
+        """
         resolved = self.check_options(
-            options=options, *args, **media_options
+            options=options,
+            *args,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            **media_options,
         )
 
         buf, decompressed = self._decompressed_buffer()
@@ -367,12 +408,49 @@ class MediaIO(ABC, Generic[O]):
         self,
         *args,
         options: Optional[O] = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        lazy: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **media_options,
     ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
+        """Yield one Polars frame per Arrow record batch.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance, or ``None`` to start from defaults.
+        columns:
+            Optional column projection applied before materialization.
+        cast:
+            Arrow cast configuration applied to each batch before conversion.
+        use_threads:
+            Enable parallel Arrow decode where the format supports it.
+        ignore_empty:
+            Suppress zero-row batches.
+        lazy:
+            When ``True`` each yielded frame is wrapped as a
+            :class:`polars.LazyFrame` instead of a
+            :class:`polars.DataFrame`.
+        raise_error:
+            Control whether cast failures propagate.
+        **media_options:
+            Format-specific knobs forwarded to :meth:`check_options`.
+        """
         from yggdrasil.polars.lib import polars as _pl
 
         resolved = self.check_options(
-            options=options, *args, **media_options
+            options=options,
+            *args,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            lazy=lazy,
+            raise_error=raise_error,
+            **media_options,
         )
         for batch in self.read_arrow_batches(options=resolved):
             df = _pl.from_arrow(batch, rechunk=False)
@@ -476,6 +554,29 @@ class MediaIO(ABC, Generic[O]):
         return False
 
     # ------------------------------------------------------------------
+    # Option-merging helper (private)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_explicit_options(
+        kwargs: dict[str, Any],
+        **explicit: Any,
+    ) -> dict[str, Any]:
+        """Fold explicitly supplied base options back into ``kwargs``.
+
+        The public read/write methods list ``MediaOptions`` fields with a
+        ``_MISSING`` sentinel default so they show up in help/autocomplete.
+        Anything the caller actually passed lands in *explicit*; sentinels
+        are dropped so ``check_options`` sees only real overrides. An
+        explicit positional value wins over a duplicate entry in *kwargs*.
+        """
+        for key, value in explicit.items():
+            if value is _MISSING:
+                continue
+            kwargs[key] = value
+        return kwargs
+
+    # ------------------------------------------------------------------
     # Generic write dispatcher
     # ------------------------------------------------------------------
 
@@ -484,6 +585,11 @@ class MediaIO(ABC, Generic[O]):
         obj: Any,
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
         """Write a supported tabular object to the buffer.
@@ -507,7 +613,42 @@ class MediaIO(ABC, Generic[O]):
         normalized: the union of keys across rows is computed and missing
         entries are backfilled with ``None`` so no columns are silently
         dropped.
+
+        Parameters
+        ----------
+        obj:
+            The tabular payload to write. See "Supported inputs" above.
+        options:
+            Pre-built options instance for this format, or ``None`` for
+            defaults. Explicit keyword arguments below override fields on
+            *options*.
+        mode:
+            Write disposition when the buffer is non-empty. Accepts a
+            :class:`~yggdrasil.io.enums.save_mode.SaveMode` or its string
+            name (``"auto"``, ``"overwrite"``, ``"append"``, ``"upsert"``,
+            ``"ignore"``, ``"error_if_exists"``, ``"truncate"``).
+        match_by:
+            Column name or sequence of column names that identify rows when
+            *mode* is :attr:`SaveMode.UPSERT`. Ignored for other modes.
+        cast:
+            Arrow cast configuration applied to batches before encode.
+        use_threads:
+            Enable parallel encode where the format supports it.
+        raise_error:
+            Control whether cast failures propagate during write.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`
+            (e.g. ``compression``, ``include_header``, ``inner_media``).
         """
+        option_kwargs = self._merge_explicit_options(
+            option_kwargs,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
+        )
+
         if self._is_path_input(obj):
             from .local_path_io import LocalPathIO
 
@@ -716,10 +857,55 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
+        batch_size: "int | None | Any" = _MISSING,
         **option_kwargs,
     ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
-        """Read the buffer into a :class:`pyarrow.Table`."""
-        resolved = self.check_options(options=options, **option_kwargs)
+        """Read the buffer into a :class:`pyarrow.Table`.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance for this format, or ``None`` for
+            defaults. Explicit keyword arguments below override fields on
+            *options*.
+        columns:
+            Optional column projection — only these columns are
+            materialized when the format supports pushdown.
+        cast:
+            Arrow cast configuration applied to each batch after decode.
+        use_threads:
+            Enable parallel Arrow decode where supported.
+        ignore_empty:
+            Suppress zero-row batches.
+        raise_error:
+            Control whether cast failures propagate.
+        batch_size:
+            When ``> 0``, returns an iterator of :class:`pyarrow.Table`
+            chunks of at most *batch_size* rows instead of a single table.
+        **option_kwargs:
+            Format-specific read knobs forwarded to :meth:`check_options`.
+
+        Returns
+        -------
+        pyarrow.Table | Iterator[pyarrow.Table]
+            A single table, or an iterator of row-sliced tables when
+            *batch_size* is set.
+        """
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
         table = self._read_table_from_batches(options=resolved)
 
         bs = resolved.batch_size
@@ -732,11 +918,45 @@ class MediaIO(ABC, Generic[O]):
         table: "pyarrow.Table",
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
-        """Write a :class:`pyarrow.Table` to the buffer."""
+        """Write a :class:`pyarrow.Table` to the buffer.
+
+        Parameters
+        ----------
+        table:
+            The :class:`pyarrow.Table` to encode.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty (``auto``,
+            ``overwrite``, ``append``, ``upsert``, ``ignore``,
+            ``error_if_exists``, ``truncate``).
+        match_by:
+            Column(s) used as the identity key for
+            :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode.
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
+        """
         resolved = self.check_options(
-            options=options, **option_kwargs,
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
+            **option_kwargs,
         )
         if self.skip_write(mode=resolved.mode):
             return
@@ -780,10 +1000,47 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
+        batch_size: "int | None | Any" = _MISSING,
         **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
-        """Read the buffer as a list of row dicts."""
-        resolved = self.check_options(options=options, **option_kwargs)
+        """Read the buffer as a list of row dicts.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        columns:
+            Optional column projection applied before row materialization.
+        cast:
+            Arrow cast configuration applied before conversion to Python
+            objects.
+        use_threads:
+            Enable parallel Arrow decode where supported.
+        ignore_empty:
+            Suppress zero-row batches.
+        raise_error:
+            Control whether cast failures propagate.
+        batch_size:
+            When ``> 0``, returns a generator yielding successive
+            ``list[dict]`` chunks of at most *batch_size* rows.
+        **option_kwargs:
+            Format-specific read knobs forwarded to :meth:`check_options`.
+        """
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
         bs = resolved.batch_size
         if bs and bs > 0:
             return (
@@ -797,6 +1054,11 @@ class MediaIO(ABC, Generic[O]):
         data: Iterable[dict],
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
         """Write a list (or iterable/generator) of row dicts to the buffer.
@@ -804,11 +1066,36 @@ class MediaIO(ABC, Generic[O]):
         Accepts unstructured records: missing keys are filled with ``None``
         using the union of keys across rows, and all-``None`` columns are
         written with Arrow ``null`` type.
+
+        Parameters
+        ----------
+        data:
+            An iterable of row dicts. Sparse/heterogeneous keys are
+            normalized against the union of keys seen across rows.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty.
+        match_by:
+            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode.
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
         """
         tb = self._safe_table_from_pylist(data)
         self.write_arrow_table(
             table=tb,
             options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
             **option_kwargs,
         )
 
@@ -816,10 +1103,46 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
+        batch_size: "int | None | Any" = _MISSING,
         **option_kwargs,
     ) -> Union[dict[str, list], Iterator[dict[str, list]]]:
-        """Read the buffer as a column-oriented dict."""
-        resolved = self.check_options(options=options, **option_kwargs)
+        """Read the buffer as a column-oriented dict.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        columns:
+            Optional column projection.
+        cast:
+            Arrow cast configuration applied before conversion.
+        use_threads:
+            Enable parallel Arrow decode where supported.
+        ignore_empty:
+            Suppress zero-row batches.
+        raise_error:
+            Control whether cast failures propagate.
+        batch_size:
+            When ``> 0``, returns a generator yielding successive
+            ``dict[str, list]`` chunks of at most *batch_size* rows.
+        **option_kwargs:
+            Format-specific read knobs forwarded to :meth:`check_options`.
+        """
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
         bs = resolved.batch_size
         if bs and bs > 0:
             return (
@@ -833,13 +1156,43 @@ class MediaIO(ABC, Generic[O]):
         data: dict[str, list],
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
-        """Write a column-oriented dict to the buffer."""
+        """Write a column-oriented dict to the buffer.
+
+        Parameters
+        ----------
+        data:
+            A ``dict[str, list]`` where every value is a column-length list.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty.
+        match_by:
+            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode.
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
+        """
         tb = pa.Table.from_pydict(data) # noqa
         self.write_arrow_table(
             table=tb,
             options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
             **option_kwargs,
         )
 
@@ -851,10 +1204,46 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
+        batch_size: "int | None | Any" = _MISSING,
         **option_kwargs,
     ) -> Union["pandas.DataFrame", Iterator["pandas.DataFrame"]]:
-        """Read the buffer as a :class:`pandas.DataFrame`."""
-        resolved = self.check_options(options=options, **option_kwargs)
+        """Read the buffer as a :class:`pandas.DataFrame`.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        columns:
+            Optional column projection.
+        cast:
+            Arrow cast configuration applied before pandas conversion.
+        use_threads:
+            Enable parallel Arrow decode where supported.
+        ignore_empty:
+            Suppress zero-row batches.
+        raise_error:
+            Control whether cast failures propagate.
+        batch_size:
+            When ``> 0``, returns a generator yielding
+            :class:`pandas.DataFrame` chunks of at most *batch_size* rows.
+        **option_kwargs:
+            Format-specific read knobs forwarded to :meth:`check_options`.
+        """
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
         bs = resolved.batch_size
         if bs and bs > 0:
             return (
@@ -868,9 +1257,38 @@ class MediaIO(ABC, Generic[O]):
         frame: "pandas.DataFrame",
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
-        """Write a :class:`pandas.DataFrame` to the buffer."""
+        """Write a :class:`pandas.DataFrame` to the buffer.
+
+        The index is preserved only when it has a non-empty ``name``; an
+        unnamed ``RangeIndex`` is dropped to stay consistent with typical
+        tabular outputs.
+
+        Parameters
+        ----------
+        frame:
+            The :class:`pandas.DataFrame` to encode.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty.
+        match_by:
+            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode.
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
+        """
         tb = pa.Table.from_pandas(
             frame,
             preserve_index=bool(frame.index.name),
@@ -879,6 +1297,11 @@ class MediaIO(ABC, Generic[O]):
         self.write_arrow_table(
             table=tb,
             options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
             **option_kwargs,
         )
 
@@ -886,16 +1309,58 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
+        columns: "Sequence[str] | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        ignore_empty: "bool | Any" = _MISSING,
+        lazy: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
+        batch_size: "int | None | Any" = _MISSING,
         **option_kwargs,
     ) -> Union[
         "polars.DataFrame",
         "polars.LazyFrame",
         Iterator["polars.DataFrame"],
     ]:
-        """Read the buffer as a Polars frame."""
+        """Read the buffer as a Polars frame.
+
+        Parameters
+        ----------
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        columns:
+            Optional column projection.
+        cast:
+            Arrow cast configuration applied before Polars conversion.
+        use_threads:
+            Enable parallel Arrow decode where supported.
+        ignore_empty:
+            Suppress zero-row batches.
+        lazy:
+            When ``True`` the returned frame is a
+            :class:`polars.LazyFrame` instead of a
+            :class:`polars.DataFrame`. Ignored when *batch_size* is set.
+        raise_error:
+            Control whether cast failures propagate.
+        batch_size:
+            When ``> 0``, returns a generator yielding
+            :class:`polars.DataFrame` chunks of at most *batch_size* rows.
+        **option_kwargs:
+            Format-specific read knobs forwarded to :meth:`check_options`.
+        """
         from yggdrasil.polars.lib import polars as _pl
 
-        resolved = self.check_options(options=options, **option_kwargs)
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            lazy=lazy,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
         bs = resolved.batch_size
         if bs and bs > 0:
             return (
@@ -912,19 +1377,51 @@ class MediaIO(ABC, Generic[O]):
         frame: "polars.DataFrame | polars.LazyFrame",
         *,
         options: O | None = None,
+        mode: "SaveMode | str | None | Any" = _MISSING,
+        match_by: "Sequence[str] | str | None | Any" = _MISSING,
+        cast: "CastOptionsArg | Any" = _MISSING,
+        use_threads: "bool | Any" = _MISSING,
+        raise_error: "bool | Any" = _MISSING,
         **option_kwargs,
     ) -> None:
-        """Write a Polars DataFrame or LazyFrame to the buffer."""
+        """Write a Polars DataFrame or LazyFrame to the buffer.
+
+        A :class:`polars.LazyFrame` is collected before encode.
+
+        Parameters
+        ----------
+        frame:
+            The Polars frame to encode.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty.
+        match_by:
+            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode.
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
+        """
         from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
 
         resolved = self.check_options(
-            options=options, **option_kwargs,
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
+            **option_kwargs,
         )
 
         tb = polars_dataframe_to_arrow_table(frame, resolved.cast)
 
         self.write_arrow_table(
             table=tb,
-            options=options,
-            **option_kwargs,
+            options=resolved,
         )
