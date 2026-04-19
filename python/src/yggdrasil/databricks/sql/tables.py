@@ -34,6 +34,7 @@ from .table import Table, TableAllInfos
 
 if TYPE_CHECKING:
     from .catalog import Catalog
+    from .column import Column
     from .schema import Schema
 
 __all__ = ["Tables"]
@@ -92,6 +93,58 @@ class Tables(DatabricksService):
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name
+        )
+
+    # -------------------------------------------------------------------------
+    # Dict-like navigation — uses catalog/schema defaults on the service
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> "Table | Column":
+        """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
+
+        Service defaults fill any missing leading parts.
+
+        * ``tables["orders"]``                      → :class:`Table` (needs ``catalog_name`` + ``schema_name`` defaults)
+        * ``tables["sales.orders"]``                → :class:`Table` (needs ``catalog_name`` default)
+        * ``tables["main.sales.orders"]``           → :class:`Table`
+        * ``tables["main.sales.orders.price"]``     → :class:`Column`
+        """
+        parts = [p.strip().strip("`") for p in name.split(".")]
+        n = len(parts)
+
+        if n == 4:
+            return self.client.columns.column(".".join(parts))
+
+        if n == 1:
+            if not (self.catalog_name and self.schema_name):
+                raise ValueError(
+                    f"Cannot resolve one-part table name {name!r} without"
+                    " default catalog_name + schema_name — set them on the"
+                    " service or pass a fully-qualified name."
+                )
+            return self.table(
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                table_name=parts[0],
+            )
+        if n == 2:
+            if not self.catalog_name:
+                raise ValueError(
+                    f"Cannot resolve two-part table name {name!r} without"
+                    " a default catalog_name — set it on the service or"
+                    " pass a three-part 'catalog.schema.table' name."
+                )
+            return self.table(
+                catalog_name=self.catalog_name,
+                schema_name=parts[0],
+                table_name=parts[1],
+            )
+        if n == 3:
+            return self.table(location=".".join(parts))
+
+        raise KeyError(
+            f"Expected a 1- to 4-part dotted name (table[.column] or"
+            f" catalog.schema.table[.column]), got {name!r} with {n} parts"
         )
 
     def parse_catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:

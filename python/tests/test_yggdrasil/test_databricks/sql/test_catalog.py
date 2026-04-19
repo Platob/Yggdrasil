@@ -99,11 +99,22 @@ class TestCatalogsGetitem:
         mock_tables.table.assert_called_once_with(location="main.sales.orders")
         assert result is mock_tables.table.return_value
 
+    def test_4part_returns_column(self, cats, mock_client):
+        mock_columns = MagicMock()
+        mock_client.columns = mock_columns
+        result = cats["main.sales.orders.price"]
+        mock_columns.column.assert_called_once_with("main.sales.orders.price")
+        assert result is mock_columns.column.return_value
+
     def test_backtick_stripped(self, cats):
         result = cats["`main`.`sales`"]
         assert isinstance(result, Schema)
         assert result.catalog_name == "main"
         assert result.schema_name == "sales"
+
+    def test_too_many_parts_raises(self, cats):
+        with pytest.raises(KeyError, match="1- to 4-part"):
+            _ = cats["a.b.c.d.e"]
 
 
 class TestCatalogsFactories:
@@ -497,4 +508,25 @@ class TestCatalogIntegration(DatabricksCase):
         tbl = self.cats[first.catalog_name][schemas[0].schema_name][tables[0].table_name]
         from yggdrasil.databricks.sql import Table
         assert isinstance(tbl, Table)
+
+    def test_four_level_subscript_chain(self):
+        """client.catalogs["cat"]["schema"]["table"]["column"] resolves to a Column."""
+        (first, *_) = self.cats.list()
+        schemas = list(first.schemas())
+        if not schemas:
+            self.skipTest("No schemas in the first catalog")
+        tables = list(schemas[0].tables())
+        if not tables:
+            self.skipTest("No tables in the first schema")
+        cols = tables[0].columns
+        if not cols:
+            self.skipTest("No columns in the first table")
+        col = (
+            self.cats[first.catalog_name]
+            [schemas[0].schema_name]
+            [tables[0].table_name]
+            [cols[0].name]
+        )
+        from yggdrasil.databricks.sql import Column
+        assert isinstance(col, Column)
 

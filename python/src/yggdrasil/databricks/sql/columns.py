@@ -61,6 +61,22 @@ class Columns(DatabricksService):
     column_name: str | None = None
 
     # -------------------------------------------------------------------------
+    # Dict-like navigation — uses defaults on the service
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> "Column":
+        """Resolve a :class:`Column` from a 1- to 4-part dotted name.
+
+        Service defaults fill any missing leading parts.
+
+        * ``columns["price"]``                         → needs catalog + schema + table defaults
+        * ``columns["orders.price"]``                  → needs catalog + schema defaults
+        * ``columns["sales.orders.price"]``            → needs catalog default
+        * ``columns["main.sales.orders.price"]``       → fully qualified
+        """
+        return self.column(name)
+
+    # -------------------------------------------------------------------------
     # Parsing
     # -------------------------------------------------------------------------
 
