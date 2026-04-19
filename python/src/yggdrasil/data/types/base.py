@@ -1858,21 +1858,16 @@ class DataType(BaseChildrenFields, ABC):
         spark = get_spark_sql()
         F = spark.functions
 
-        if nullable:
-            return column
-
-        spark_type = self.to_spark()
-
         if default_scalar is None:
             default_scalar = self.default_spark_scalar(nullable=nullable)
 
         if default_scalar is None:
-            return column.cast(spark_type)
+            return column
 
         return (
             F.when(column.isNull(), F.lit(default_scalar))
             .otherwise(column)
-            .cast(spark_type)
+            .cast(self.to_spark())
         )
 
 

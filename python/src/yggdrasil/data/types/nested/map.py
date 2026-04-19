@@ -89,7 +89,7 @@ class MapType(NestedType):
         )
 
     def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else dict()
+        return None if nullable else {}
 
     @property
     def children_fields(self) -> list["Field"]:
@@ -439,9 +439,6 @@ class MapType(NestedType):
         if self.keys_sorted:
             base["keys_sorted"] = self.keys_sorted
         return base
-
-    def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else {}
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> dict | None:
         if isinstance(value, (bytes, bytearray, memoryview)):
