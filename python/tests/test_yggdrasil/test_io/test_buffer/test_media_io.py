@@ -1501,3 +1501,243 @@ class TestCollectSchema:
 
         full_schema = pio.collect_schema(full=True)
         assert set(full_schema.keys()) == {"x", "y"}
+
+
+# ===================================================================
+# Polars-native write_polars_frame implementation
+# ===================================================================
+
+class TestWritePolarsNative:
+    """Exercise the polars-native write path used by ``write_polars_frame``.
+
+    These tests target the branch that dispatches to
+    :meth:`polars.DataFrame.write_parquet` / ``write_ipc`` / ``write_csv``
+    / ``write_json`` directly instead of round-tripping through a
+    :class:`pyarrow.Table`, plus the Arrow-path fallback for formats
+    without a native Polars writer.
+    """
+
+    @staticmethod
+    def _pl():
+        from yggdrasil.polars.lib import polars as _pl
+        return _pl
+
+    def _sample_df(self):
+        pl = self._pl()
+        return pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+    @pytest.mark.parametrize(
+        "mime",
+        [MimeTypes.PARQUET, MimeTypes.ARROW_IPC, MimeTypes.JSON,
+         MimeTypes.CSV, MimeTypes.TSV],
+    )
+    def test_roundtrip_native_formats(self, mime):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mime)
+        mio.write_polars_frame(df)
+        result = mio.read_arrow_table()
+        assert result.num_rows == 3
+        assert result.column_names == ["a", "b"]
+        assert result.column("b").to_pylist() == ["x", "y", "z"]
+
+    def test_parquet_bytes_are_valid_parquet(self):
+        """Native write produces a file readable by pyarrow.parquet directly."""
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(df)
+        table = pq.read_table(io.BytesIO(buf.to_bytes()))
+        assert table.to_pylist() == SAMPLE_DICTS
+
+    def test_ipc_bytes_are_valid_ipc_file(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.ARROW_IPC)
+        mio.write_polars_frame(df)
+        reader = ipc.open_file(io.BytesIO(buf.to_bytes()))
+        assert reader.read_all().to_pylist() == SAMPLE_DICTS
+
+    def test_csv_bytes_have_header_and_separator(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.CSV)
+        mio.write_polars_frame(df)
+        text = buf.to_bytes().decode()
+        lines = text.strip().splitlines()
+        assert lines[0] == "a,b"
+        assert lines[1:] == ["1,x", "2,y", "3,z"]
+
+    def test_tsv_uses_tab_separator(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.TSV)
+        mio.write_polars_frame(df)
+        text = buf.to_bytes().decode()
+        assert "\t" in text.splitlines()[0]
+        assert "," not in text.splitlines()[0]
+
+    def test_json_bytes_are_array_of_records(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.JSON)
+        mio.write_polars_frame(df)
+        payload = json.loads(buf.to_bytes().decode())
+        assert payload == SAMPLE_DICTS
+
+    def test_lazyframe_is_collected_and_written(self):
+        pl = self._pl()
+        lf = pl.DataFrame({"a": [1, 2]}).lazy().with_columns(
+            (pl.col("a") * 10).alias("b")
+        )
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(lf)
+        table = mio.read_arrow_table()
+        assert table.to_pylist() == [{"a": 1, "b": 10}, {"a": 2, "b": 20}]
+
+    @pytest.mark.parametrize(
+        "mime",
+        [MimeTypes.PARQUET, MimeTypes.ARROW_IPC, MimeTypes.JSON, MimeTypes.CSV],
+    )
+    def test_native_write_with_gzip_codec_roundtrip(self, mime):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MediaType(mime, codec=GZIP))
+        mio.write_polars_frame(df)
+        # Stored payload must actually be gzip-compressed.
+        assert buf.to_bytes()[:2] == b"\x1f\x8b"
+        table = mio.read_arrow_table()
+        assert table.num_rows == 3
+
+    def test_append_via_polars_native_concat(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        mio.write_polars_frame(
+            pl.DataFrame({"x": [2, 3]}),
+            options=ParquetOptions(mode="append"),
+        )
+        result = mio.read_polars_frame()
+        assert result.to_dicts() == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+    def test_upsert_via_polars_native_anti_join(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"id": [1, 2, 3], "v": [10, 20, 30]}))
+        mio.write_polars_frame(
+            pl.DataFrame({"id": [2, 3], "v": [99, 100]}),
+            options=ParquetOptions(mode="upsert", match_by=["id"]),
+        )
+        rows = {r["id"]: r["v"] for r in mio.read_pylist()}
+        assert rows == {1: 10, 2: 99, 3: 100}
+
+    def test_upsert_missing_match_by_raises(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"id": [1], "v": [10]}))
+        with pytest.raises(ValueError, match="UPSERT requires match_by"):
+            mio.write_polars_frame(
+                pl.DataFrame({"id": [1], "v": [99]}),
+                options=ParquetOptions(mode="upsert"),
+            )
+
+    def test_upsert_match_by_not_in_existing_raises(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"a": [1]}))
+        with pytest.raises(ValueError, match="not in existing frame"):
+            mio.write_polars_frame(
+                pl.DataFrame({"b": [1]}),
+                options=ParquetOptions(mode="upsert", match_by=["b"]),
+            )
+
+    def test_ignore_mode_leaves_existing_buffer_untouched(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        original = buf.to_bytes()
+        mio.write_polars_frame(
+            pl.DataFrame({"x": [2]}),
+            options=ParquetOptions(mode="ignore"),
+        )
+        assert buf.to_bytes() == original
+        assert mio.read_pylist() == [{"x": 1}]
+
+    def test_error_if_exists_raises_on_nonempty_buffer(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        with pytest.raises(IOError):
+            mio.write_polars_frame(
+                pl.DataFrame({"x": [2]}),
+                options=ParquetOptions(mode="error_if_exists"),
+            )
+
+    def test_columns_projection_is_applied(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(df, options=ParquetOptions(columns=["a"]))
+        table = mio.read_arrow_table()
+        assert table.column_names == ["a"]
+        assert table.column("a").to_pylist() == [1, 2, 3]
+
+    def test_parquet_compression_level_forwarded(self):
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(
+            df,
+            options=ParquetOptions(compression="gzip", compression_level=3),
+        )
+        # Compression codec visible in the Parquet footer.
+        meta = pq.read_metadata(io.BytesIO(buf.to_bytes()))
+        col_meta = meta.row_group(0).column(0)
+        assert col_meta.compression.lower() == "gzip"
+
+    def test_pl_parquet_compression_normalizes_none(self):
+        assert MediaIO._pl_parquet_compression(None) == "zstd"
+        assert MediaIO._pl_parquet_compression("none") == "zstd"
+        assert MediaIO._pl_parquet_compression("off") == "zstd"
+        assert MediaIO._pl_parquet_compression("snappy") == "snappy"
+
+    def test_pl_parquet_compression_rejects_unknown(self):
+        with pytest.raises(ValueError, match="Polars Parquet writer rejects"):
+            MediaIO._pl_parquet_compression("bogus-codec")
+
+    def test_pl_ipc_compression_normalizes_none(self):
+        assert MediaIO._pl_ipc_compression(None) == "uncompressed"
+        assert MediaIO._pl_ipc_compression("none") == "uncompressed"
+        assert MediaIO._pl_ipc_compression("zstd") == "zstd"
+
+    def test_pl_ipc_compression_rejects_unknown(self):
+        with pytest.raises(ValueError, match="Polars IPC writer rejects"):
+            MediaIO._pl_ipc_compression("gzip")
+
+    @pytest.mark.parametrize("mime", [MimeTypes.XML, MimeTypes.NDJSON])
+    def test_non_native_mime_falls_back_to_arrow(self, mime):
+        """Formats without a native Polars writer must still round-trip."""
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mime)
+        mio.write_polars_frame(df)
+        table = mio.read_arrow_table()
+        assert table.num_rows == 3
+        assert set(table.column_names) == {"a", "b"}
+
+    def test_xlsx_fallback_roundtrip(self):
+        # XLSX is also outside the native set; it should use the Arrow path
+        # (which itself dispatches to polars write_excel internally).
+        df = self._sample_df()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.XLSX)
+        mio.write_polars_frame(df)
+        table = mio.read_arrow_table()
+        assert table.num_rows == 3
