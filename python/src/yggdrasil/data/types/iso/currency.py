@@ -7,11 +7,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .base import ISOType, normalize_iso_token
+from .base import ISOType, apply_arrow_lookup, normalize_iso_token
 from .data import CURRENCIES, CURRENCY_ALIASES
+from ..id import DataTypeId
 
 if TYPE_CHECKING:
     import polars
+    from ..base import DataType
+    from yggdrasil.data.cast.options import CastOptions
 
 
 __all__ = ["ISOCurrencyType"]
@@ -74,6 +77,11 @@ def _build_currency_map() -> dict[str, str]:
 
 _CURRENCY_MAP: dict[str, str] = _build_currency_map()
 _VALID_CODES: frozenset[str] = frozenset(alpha3 for alpha3, *_ in CURRENCIES)
+
+# Canonical alpha-3 → ISO 4217 numeric code / minor units.  Used by the
+# outgoing-cast hook for numeric/decimal targets.
+_CURRENCY_TO_NUMERIC: dict[str, int] = {alpha3: int(numeric) for alpha3, numeric, *_ in CURRENCIES}
+_CURRENCY_TO_MINOR: dict[str, int] = {alpha3: int(minor) for alpha3, _, minor, _ in CURRENCIES}
 
 
 @dataclass(frozen=True)
@@ -161,6 +169,40 @@ class ISOCurrencyType(ISOType):
             map_args.append(F.lit(v))
         lookup_map = F.create_map(*map_args)
         return F.element_at(lookup_map, normalized)
+
+    # ------------------------------------------------------------------
+    # Outgoing — currency → numeric ISO 4217 code.  Class-level cache so
+    # the (keys, values) Arrow arrays are built once and reused.
+    # ------------------------------------------------------------------
+    _outgoing_numeric_arrays_cache: ClassVar[tuple[pa.Array, pa.Array] | None] = None
+
+    @classmethod
+    def _outgoing_numeric_arrays(cls) -> tuple[pa.Array, pa.Array]:
+        cached = cls._outgoing_numeric_arrays_cache
+        if cached is not None:
+            return cached
+        keys = pa.array(list(_CURRENCY_TO_NUMERIC.keys()), type=pa.string())
+        values = pa.array(list(_CURRENCY_TO_NUMERIC.values()), type=pa.int32())
+        cached = (keys, values)
+        cls._outgoing_numeric_arrays_cache = cached
+        return cached
+
+    def _outgoing_cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        target: "DataType",
+        options: "CastOptions",
+    ) -> pa.Array | pa.ChunkedArray | None:
+        if target.type_id in {DataTypeId.INTEGER, DataTypeId.FLOAT, DataTypeId.DECIMAL}:
+            keys, values = self._outgoing_numeric_arrays()
+            return apply_arrow_lookup(
+                array,
+                keys,
+                values,
+                target.to_arrow(),
+                memory_pool=options.arrow_memory_pool,
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Dict

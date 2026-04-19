@@ -33,6 +33,7 @@ from yggdrasil.data.cast.registry import register_converter
 
 from .base import ISOType
 from .data.timezones import TIMEZONES, TIMEZONE_ALIASES
+from ..id import DataTypeId
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -41,6 +42,12 @@ except Exception:  # pragma: no cover
 
 if TYPE_CHECKING:
     import polars
+    from ..base import DataType
+    from yggdrasil.data.cast.options import CastOptions
+
+
+# Arrow type-id families used by the outgoing-cast hook.
+_TZ_NUMERIC_TARGETS = frozenset({DataTypeId.INTEGER, DataTypeId.FLOAT, DataTypeId.DECIMAL})
 
 __all__ = ["TimezoneType"]
 
@@ -422,6 +429,35 @@ class TimezoneType(ISOType):
         return F.coalesce(named, offset)
 
     # ------------------------------------------------------------------
+    # Outgoing — timezone → UTC-offset duration / numeric.
+    # Resolution per *unique* canonical value (dictionary-encode collapses
+    # the typical ~hundreds of IANA zones down to a handful of offsets),
+    # then pc.take broadcasts the result.
+    # ------------------------------------------------------------------
+    def _outgoing_cast_arrow_array(
+        self,
+        array: "pa.Array | pa.ChunkedArray",
+        target: "DataType",
+        options: "CastOptions",
+    ) -> "pa.Array | pa.ChunkedArray | None":
+        target_id = target.type_id
+
+        if target_id == DataTypeId.DURATION:
+            resolver = _timezone_resolver_duration(target.unit)
+            return _apply_tz_resolver(array, resolver, target.to_arrow())
+
+        if target_id in _TZ_NUMERIC_TARGETS:
+            # Default unit: seconds; callers who want minutes/hours can
+            # divide downstream — keeps the semantics unambiguous.
+            resolver = _timezone_resolver_seconds()
+            result = _apply_tz_resolver(array, resolver, pa.int64())
+            if result.type != target.to_arrow():
+                result = pc.cast(result, target.to_arrow(), safe=False)
+            return result
+
+        return None
+
+    # ------------------------------------------------------------------
     # Dict round-trip
     # ------------------------------------------------------------------
     @classmethod
@@ -429,6 +465,105 @@ class TimezoneType(ISOType):
         name = str(value.get("name", "")).upper()
         iso = str(value.get("iso", "")).lower()
         return name in {"TIMEZONETYPE", "TIMEZONE"} or iso == cls.iso_name
+
+
+# ---------------------------------------------------------------------------
+# Outgoing offset resolution (canonical timezone string → seconds).
+# ---------------------------------------------------------------------------
+
+
+_UNIT_TO_NANOS = {
+    "s": 1_000_000_000,
+    "ms": 1_000_000,
+    "us": 1_000,
+    "ns": 1,
+}
+
+
+def _timezone_string_to_offset_seconds(value: str | None) -> int | None:
+    """Canonical timezone string → current UTC offset in seconds.
+
+    Fixed-offset strings are parsed directly.  IANA zones consult
+    :class:`zoneinfo.ZoneInfo` using the current UTC wall clock (so
+    DST-aware zones return whichever offset applies *now* — this is the
+    conventional choice for point-in-time conversions).
+    """
+    if value is None:
+        return None
+
+    offset = _parse_offset_token(value)
+    if offset is not None:
+        sign = 1 if offset.startswith("+") else -1
+        hh, mm = offset[1:].split(":")
+        return sign * (int(hh) * 3600 + int(mm) * 60)
+
+    if ZoneInfo is None:
+        return None
+    try:
+        info = ZoneInfo(value)
+    except Exception:
+        return None
+    delta = info.utcoffset(dt.datetime.now(tz=dt.timezone.utc))
+    if delta is None:
+        return None
+    return int(delta.total_seconds())
+
+
+def _timezone_resolver_seconds():
+    """Return the canonical-string → int-seconds resolver (no per-call overhead)."""
+    return _timezone_string_to_offset_seconds
+
+
+def _timezone_resolver_duration(unit: str):
+    """Return a resolver that produces duration-unit integers for *unit*."""
+    nanos_per_unit = _UNIT_TO_NANOS.get(unit)
+    if nanos_per_unit is None:
+        raise ValueError(f"Unsupported duration unit: {unit!r}")
+
+    def resolver(value: str | None) -> int | None:
+        secs = _timezone_string_to_offset_seconds(value)
+        if secs is None:
+            return None
+        # secs -> unit-count.  The divisions are exact for s/ms/us/ns.
+        total_nanos = secs * 1_000_000_000
+        return total_nanos // nanos_per_unit
+
+    return resolver
+
+
+def _apply_tz_resolver(
+    array: "pa.Array | pa.ChunkedArray",
+    resolver,
+    target_type: pa.DataType,
+) -> "pa.Array | pa.ChunkedArray":
+    """Apply *resolver* per unique value, then ``pc.take`` back + cast.
+
+    Preserves the chunked layout of the input so callers can pass tables
+    through unchanged.  Delegates the per-unique-value loop to
+    :func:`resolve_arrow_string_via_unique`-style dictionary encoding.
+    """
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [_apply_tz_resolver(c, resolver, target_type) for c in array.chunks]
+        return pa.chunked_array(chunks, type=target_type)
+
+    if pa.types.is_large_string(array.type) or pa.types.is_string_view(array.type):
+        array = pc.cast(array, pa.string())
+    elif not pa.types.is_string(array.type):
+        array = pc.cast(array, pa.string())
+
+    if len(array) == 0:
+        return pa.array([], type=target_type)
+
+    encoded = pc.dictionary_encode(array)
+    unique_values = encoded.dictionary.to_pylist()
+    resolved_unique = [resolver(v) if v is not None else None for v in unique_values]
+
+    # Use int64 as the universal carrier; pc.cast narrows to the requested type.
+    resolved_arr = pa.array(resolved_unique, type=pa.int64())
+    broadcast = pc.take(resolved_arr, encoded.indices)
+    if broadcast.type != target_type:
+        broadcast = pc.cast(broadcast, target_type, safe=False)
+    return broadcast
 
 
 # ---------------------------------------------------------------------------

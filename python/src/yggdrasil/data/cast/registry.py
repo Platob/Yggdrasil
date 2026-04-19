@@ -359,6 +359,11 @@ def convert(
     raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
 
 
+def _is_noop_hint(hint: Any) -> bool:
+    """True for hints where per-element conversion is a pure no-op."""
+    return hint is Any or hint is object
+
+
 def convert_tuple(value: Any, args: tuple[Any, ...], options: "CastOptions") -> tuple[Any, ...]:
     """
     Convert an iterable into a tuple type.
@@ -366,6 +371,9 @@ def convert_tuple(value: Any, args: tuple[Any, ...], options: "CastOptions") -> 
     Supports:
       - tuple[T, ...]
       - tuple[T1, T2, ...] (fixed-length)
+
+    Fast path: a tuple with an ``Any`` / ``object`` element hint skips
+    per-element recursion.
     """
     if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
         raise TypeError("Cannot convert non-iterable to tuple")
@@ -375,14 +383,22 @@ def convert_tuple(value: Any, args: tuple[Any, ...], options: "CastOptions") -> 
     # tuple[T, ...]
     if len(args) == 2 and args[1] is Ellipsis:
         elem_hint = args[0]
+        if _is_noop_hint(elem_hint):
+            return values
         return tuple(convert(v, elem_hint, options=options) for v in values)
 
     # tuple[T1, T2, ...]
     if args and len(args) != len(values):
         raise TypeError("Tuple length does not match target annotation")
 
+    if not args:
+        return values
+
+    if all(_is_noop_hint(a) for a in args):
+        return values
+
     return tuple(
-        convert(v, target_hint=args[i] if args else Any, options=options)
+        convert(v, target_hint=args[i], options=options)
         for i, v in enumerate(values)
     )
 
@@ -395,12 +411,29 @@ def convert_mapping(
 ) -> Mapping[Any, Any]:
     """
     Convert a mapping into dict/Mapping[K, V] with recursive casting.
+
+    Fast path: if both key and value hints are ``Any``/``object`` the
+    mapping is constructed directly without per-element recursion.
     """
     if not isinstance(value, Mapping):
         raise TypeError("Cannot convert non-mapping to dict")
 
     key_hint, val_hint = (args + (Any, Any))[:2]
     ctor = dict if origin is Mapping else origin
+
+    if _is_noop_hint(key_hint) and _is_noop_hint(val_hint):
+        return ctor(value)
+
+    if _is_noop_hint(key_hint):
+        return ctor(
+            (k, convert(v, val_hint, options=options))
+            for k, v in value.items()
+        )
+    if _is_noop_hint(val_hint):
+        return ctor(
+            (convert(k, key_hint, options=options), v)
+            for k, v in value.items()
+        )
     return ctor(
         (convert(k, key_hint, options=options), convert(v, val_hint, options=options))
         for k, v in value.items()
@@ -411,37 +444,69 @@ def convert_mapping(
 # Built-in converters
 # ----------------------------
 
-def convert_to_python_enum(value: Any, target: type[enum.Enum], options: Optional["CastOptions"] = None) -> enum.Enum:
-    """
-    Convert to an Enum member.
+# Per-enum cache of (name_lookup, value_lookup, first_value_type).
+# Built once per Enum class and reused on every subsequent conversion so
+# `convert_to_python_enum` becomes two O(1) dict lookups instead of an
+# O(n) linear scan over members.
+_enum_lookup_cache: dict[type, tuple[dict[str, Any], dict[Any, Any], type]] = {}
 
-    Strategies:
-      1) If already instance -> return
-      2) If str -> match by member name or member.value (casefold)
-      3) Otherwise -> coerce to underlying value type of first member, then compare by equality
-    """
-    if isinstance(value, target):
-        return value
 
-    if isinstance(value, str):
-        s = value.casefold()
-        for m in target:
-            if m.name.casefold() == s or str(m.value).casefold() == s:
-                return m
+def _enum_lookups(target: type[enum.Enum]) -> tuple[dict[str, Any], dict[Any, Any], type]:
+    cached = _enum_lookup_cache.get(target)
+    if cached is not None:
+        return cached
 
     try:
         first = next(iter(target))
     except StopIteration as e:
         raise TypeError(f"Cannot convert to empty Enum {target.__name__}") from e
 
+    name_lookup: dict[str, Any] = {}
+    value_lookup: dict[Any, Any] = {}
+    for m in target:
+        name_lookup.setdefault(m.name.casefold(), m)
+        name_lookup.setdefault(str(m.value).casefold(), m)
+        try:
+            value_lookup.setdefault(m.value, m)
+        except TypeError:
+            # Unhashable member values fall back to the name-only path.
+            pass
+
+    cached = (name_lookup, value_lookup, type(first.value))
+    _enum_lookup_cache[target] = cached
+    return cached
+
+
+def convert_to_python_enum(value: Any, target: type[enum.Enum], options: Optional["CastOptions"] = None) -> enum.Enum:
+    """
+    Convert to an Enum member.
+
+    Strategies (all O(1) lookups via a cached per-class map):
+      1) Already an instance -> return as-is.
+      2) ``str`` -> case-insensitive lookup against member names and stringified values.
+      3) Otherwise -> coerce to the underlying value type of the first member, then equality-match.
+    """
+    if isinstance(value, target):
+        return value
+
+    name_lookup, value_lookup, first_value_type = _enum_lookups(target)
+
+    if isinstance(value, str):
+        hit = name_lookup.get(value.casefold())
+        if hit is not None:
+            return hit
+
     try:
-        coerced = convert(value, type(first.value), options=options)
+        coerced = convert(value, first_value_type, options=options)
     except Exception:
         coerced = value
 
-    for m in target:
-        if m.value == coerced:
-            return m
+    try:
+        hit = value_lookup.get(coerced)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return hit
 
     raise TypeError(f"No matching Enum member for {value!r} in {target.__name__}")
 
@@ -506,6 +571,11 @@ def convert_to_python_iterable(
 
     Special case: if `value` is a pyarrow container (Array/ChunkedArray/Table/RecordBatch),
     we try to cast it to an Arrow field inferred from the element hint, then call `.to_pylist()`.
+
+    Fast path: when the element hint is ``Any`` / ``object`` we skip the
+    per-element ``convert()`` call and materialize the container directly
+    from the iterator, which avoids a pure-Python loop with a function
+    call per element.
     """
     if isinstance(value, (str, bytes)):
         raise TypeError(f"No converter registered for {type(value)} -> {origin}")
@@ -521,6 +591,9 @@ def convert_to_python_iterable(
         except TypeError:
             pass
         value = value.to_pylist()
+
+    if _is_noop_hint(elem_hint):
+        return origin(value)
 
     return origin(convert(v, elem_hint, options=options) for v in value)
 
