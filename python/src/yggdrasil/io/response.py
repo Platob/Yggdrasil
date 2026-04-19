@@ -17,7 +17,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeTypes
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
-from .request import PreparedRequest, REQUEST_ARROW_SCHEMA
+from .request import PreparedRequest, REQUEST_SCHEMA
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -235,7 +235,7 @@ def _parse_status_code(obj: Mapping[str, Any], *, prefix: str) -> int:
     return int(status) if isinstance(status, int) else int(float(str(status).strip()))
 
 
-def _parse_received_at(obj: Mapping[str, Any], *, prefix: str) -> int:
+def _parse_received_at(obj: Mapping[str, Any], *, prefix: str) -> dt.datetime:
     keys = (
         "received_at_timestamp",
         "received_at",
@@ -248,21 +248,6 @@ def _parse_received_at(obj: Mapping[str, Any], *, prefix: str) -> int:
     if value is MISSING:
         return dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
     return any_to_datetime(value)
-
-
-def _arrow_ts_col_to_us(col: pa.ChunkedArray | pa.Array, i: int) -> int:
-    scalar = col[i]
-    if scalar is None or not scalar.is_valid:
-        return 0
-    value = scalar.as_py()
-    return any_to_datetime(value)
-
-
-def _first_present(cols: Mapping[str, Any], i: int, *names: str) -> Any:
-    for name in names:
-        if name in cols:
-            return cols[name][i].as_py()
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -292,18 +277,12 @@ _RESPONSE_BASE_SCHEMA_JSON_TAGS: dict[str, str] = {
     "namespace": "yggdrasil.io.response",
 }
 
-_RESPONSE_COMBINED_SCHEMA_JSON_TAGS: dict[str, str] = {
-    "domain": "http",
-    "entity": "response",
-    "layer": "bronze",
-    "namespace": "yggdrasil.io.response",
-}
-
 
 BASE_SCHEMA = schema(
     fields=[],
     metadata={
         "comment": "Response record (single row), designed for deterministic logging and replay.",
+        "time_column": "response_received_at",
     },
     tags=_RESPONSE_BASE_SCHEMA_JSON_TAGS,
 )
@@ -318,6 +297,7 @@ BASE_SCHEMA["response_status_code"] = schema_field(
     tags={
         "entity": "response",
         "group": "status",
+        "cluster_by": True,
     },
 )
 
@@ -505,13 +485,14 @@ BASE_SCHEMA["response_received_at"] = schema_field(
     tags={
         "entity": "response",
         "group": "timing",
+        "cluster_by": True,
+        "primary_key": True,
     },
 )
 
-RESPONSE_SCHEMA = REQUEST_ARROW_SCHEMA + BASE_SCHEMA
+RESPONSE_SCHEMA = REQUEST_SCHEMA + BASE_SCHEMA
 RESPONSE_ARROW_SCHEMA = RESPONSE_SCHEMA.to_arrow_schema()
 
-_RESPONSE_FIELD_NAMES: frozenset[str] = frozenset(RESPONSE_ARROW_SCHEMA.names)
 _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
     ("Host", "response_host"),
     ("User-Agent", "response_user_agent"),
@@ -882,12 +863,7 @@ class Response:
             yield from mio.read_arrow_batches(lazy=lazy, **media_options)
             return
 
-        values = self.arrow_values
-        arrays = [
-            pa.array([values[f.name]], type=f.type)
-            for f in RESPONSE_ARROW_SCHEMA
-        ]
-        yield pa.RecordBatch.from_arrays(arrays, schema=RESPONSE_ARROW_SCHEMA)
+        yield self._arrow_batch_from_values()
 
     def to_arrow_batch(
         self,
@@ -896,6 +872,9 @@ class Response:
         lazy: bool = False,
         **media_options: Any,
     ) -> pa.RecordBatch:
+        if not parse:
+            return self._arrow_batch_from_values()
+
         batches = list(self.to_arrow_batches(parse=parse, lazy=lazy, **media_options))
         return pa.concat_batches(batches)
 
@@ -906,8 +885,19 @@ class Response:
         lazy: bool = False,
         **media_options: Any,
     ) -> pa.Table:
+        if not parse:
+            return pa.Table.from_batches([self._arrow_batch_from_values()])
+
         batches = list(self.to_arrow_batches(parse=parse, lazy=lazy, **media_options))
         return pa.Table.from_batches(batches)
+
+    def _arrow_batch_from_values(self) -> pa.RecordBatch:
+        values = self.arrow_values
+        arrays = [
+            pa.array([values[f.name]], type=f.type)
+            for f in RESPONSE_ARROW_SCHEMA
+        ]
+        return pa.RecordBatch.from_arrays(arrays, schema=RESPONSE_ARROW_SCHEMA)
 
     # ------------------------------------------------------------------
     # Serialisation — Polars / pandas / Spark
@@ -1008,6 +998,8 @@ class Response:
     def from_arrow_tabular(
         cls,
         batch: pa.RecordBatch | pa.Table | Iterator[pa.RecordBatch | pa.Table],
+        *,
+        normalize: bool = False,
     ) -> Iterator["Response"]:
         def _iter_batches(
             obj: pa.RecordBatch | pa.Table | Iterator[pa.RecordBatch | pa.Table]
@@ -1020,9 +1012,58 @@ class Response:
                 for inner in obj:
                     yield from _iter_batches(inner)
 
+        response_cols = [f.name for f in RESPONSE_ARROW_SCHEMA]
+
         for rb in _iter_batches(batch):
-            for info in rb.to_pylist(maps_as_pydicts="lossy"):
-                yield cls.parse_mapping(info, normalize=False)
+            available = rb.schema.names
+            cols = {
+                name: rb.column(name)
+                for name in response_cols
+                if name in available
+            }
+            for i in range(rb.num_rows):
+                yield cls._from_arrow_cols(cols, i, normalize=normalize)
+
+    @classmethod
+    def _from_arrow_cols(
+        cls,
+        cols: dict[str, Any],
+        i: int,
+        *,
+        normalize: bool = False,
+    ) -> "Response":
+        def _get(name: str) -> Any:
+            if name in cols:
+                return cols[name][i].as_py()
+            return None
+
+        request = PreparedRequest._from_arrow_cols(cols, i, normalize=normalize)
+
+        headers = _map_to_str_dict(_get("response_headers"))
+        for header_name, field_name in _PROMOTED_RESPONSE_HEADER_FIELDS:
+            value = _get(field_name)
+            if value not in (None, ""):
+                headers[header_name] = str(value)
+
+        body_bytes = _get("response_body")
+        buffer = BytesIO() if body_bytes is None else BytesIO(body_bytes, copy=False)
+
+        if normalize:
+            headers = normalize_headers(headers, body=buffer, is_request=False)
+
+        out_class = cls
+        if cls is Response and request.url.is_http:
+            from .http_ import HTTPResponse
+            out_class = HTTPResponse
+
+        return out_class(
+            request=request,
+            status_code=_get("response_status_code") or 0,
+            headers=headers,
+            tags=_map_to_str_dict(_get("response_tags")),
+            buffer=buffer,
+            received_at=_get("response_received_at") or 0,
+        )
 
     # ------------------------------------------------------------------
     # ASGI helpers

@@ -65,6 +65,7 @@ REQUEST_SCHEMA["request_url_str"] = schema_field(
     tags={
         "entity": "request",
         "group": "url",
+        "primary_key": True,
     },
 )
 
@@ -348,6 +349,7 @@ REQUEST_SCHEMA["request_sent_at"] = schema_field(
     tags={
         "entity": "request",
         "group": "timing",
+        "primary_key": True,
     },
 )
 
