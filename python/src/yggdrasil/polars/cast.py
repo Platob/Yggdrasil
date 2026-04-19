@@ -792,6 +792,28 @@ def _cast_polars_array_impl(
                     array = pl.col(col_name).cast(tpdt, strict=safe)
                 else:
                     array = array.cast(tpdt, strict=safe)
+        elif (
+            spdt.is_integer()
+            and tpdt.is_integer()
+            and spdt.is_signed_integer() != tpdt.is_signed_integer()
+        ):
+            # Round-trip safe signed<->unsigned: polars' .cast(strict=False)
+            # nulls out overflowing values and strict=True raises, neither of
+            # which is round-trip-preserving. Reinterpret bits — the two's-
+            # complement flip preserves the integer bit pattern — then cast
+            # to the final width with matched signedness.
+            flipped_signed = tpdt.is_signed_integer()
+            if is_expr:
+                array = array.reinterpret(signed=flipped_signed).cast(tpdt, strict=False)
+            elif to_expr:
+                array = (
+                    pl.col(col_name)
+                    .reinterpret(signed=flipped_signed)
+                    .cast(tpdt, strict=False)
+                )
+            else:
+                array = array.reinterpret(signed=flipped_signed).cast(tpdt, strict=False)
+
         else:
             if is_expr:
                 array = array.cast(tpdt, strict=safe)
