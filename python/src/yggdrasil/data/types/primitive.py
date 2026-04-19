@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from yggdrasil.io import SaveMode
 
 from .base import DataType
@@ -26,6 +27,7 @@ __all__ = [
     "BooleanType",
     "NumericType",
     "IntegerType",
+    "XXHIntType",
     "FloatingPointType",
     "DecimalType",
     "TemporalType",
@@ -694,6 +696,42 @@ _INT_DDL_SIGNED = {1: "BYTE", 2: "SHORT", 4: "INT", 8: "BIGINT"}
 _INT_DDL_UNSIGNED = {1: "SHORT", 2: "INT", 4: "BIGINT", 8: "DECIMAL(20, 0)"}
 
 
+def _flip_arrow_int_signedness(dtype: pa.DataType) -> pa.DataType:
+    """Return the integer Arrow type with opposite signedness at the same bit width."""
+    bytes_ = dtype.bit_width // 8
+    mapping = _INT_ARROW_UNSIGNED if pa.types.is_signed_integer(dtype) else _INT_ARROW_SIGNED
+    return mapping[bytes_]()
+
+
+def _polars_flip_int_signedness(dtype: Any) -> Any:
+    """Return the polars integer dtype with opposite signedness at the same bit width."""
+    pl = get_polars()
+    flip = {
+        pl.Int8: pl.UInt8,
+        pl.Int16: pl.UInt16,
+        pl.Int32: pl.UInt32,
+        pl.Int64: pl.UInt64,
+        pl.UInt8: pl.Int8,
+        pl.UInt16: pl.Int16,
+        pl.UInt32: pl.Int32,
+        pl.UInt64: pl.Int64,
+    }
+    return flip[dtype]
+
+
+def _polars_is_integer(dtype: Any) -> bool:
+    pl = get_polars()
+    return dtype in {
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    }
+
+
+def _polars_is_signed_int(dtype: Any) -> bool:
+    pl = get_polars()
+    return dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64}
+
+
 @dataclass(frozen=True)
 class IntegerType(NumericType):
     signed: bool = True
@@ -709,6 +747,102 @@ class IntegerType(NumericType):
     @property
     def type_id(self) -> DataTypeId:
         return DataTypeId.INTEGER
+
+    # ------------------------------------------------------------------
+    # Round-trip safe signed <-> unsigned cast
+    # ------------------------------------------------------------------
+    # PyArrow's ``pc.cast`` with ``safe=True`` refuses values outside the
+    # target's range; with ``safe=False`` it does C-style wraparound, which
+    # is bit-preserving across the signed/unsigned flip. For integer-to-
+    # integer casts that only differ in signedness (at any width), that
+    # wraparound is the round-trip semantic we want: uint64 values above
+    # INT64_MAX land as negative int64 via two's complement, and
+    # round-tripping back gives the original bits. We force ``safe=False``
+    # for this specific case so callers don't have to relax ``options.safe``
+    # just to get the flip.
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        options = options.check_source(array)
+        src_type = array.type
+        tgt_type = self.to_arrow()
+
+        if (
+            pa.types.is_integer(src_type)
+            and pa.types.is_integer(tgt_type)
+            and pa.types.is_signed_integer(src_type)
+            != pa.types.is_signed_integer(tgt_type)
+        ):
+            casted = pc.cast(
+                array,
+                target_type=tgt_type,
+                safe=False,
+                memory_pool=options.arrow_memory_pool,
+            )
+            return options.fill_arrow_nulls(casted)
+
+        return super()._cast_arrow_array(array, options)
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        src_dtype = series.dtype
+        tgt_dtype = self.to_polars()
+
+        if (
+            _polars_is_integer(src_dtype)
+            and _polars_is_integer(tgt_dtype)
+            and _polars_is_signed_int(src_dtype) != _polars_is_signed_int(tgt_dtype)
+        ):
+            flipped_src_dtype = _polars_flip_int_signedness(src_dtype)
+            casted = series.reinterpret(
+                signed=_polars_is_signed_int(flipped_src_dtype)
+            )
+            if flipped_src_dtype != tgt_dtype:
+                # Width differs — cast between same-signedness widths where
+                # pyarrow/polars wraparound is well-defined.
+                casted = casted.cast(tgt_dtype, strict=False)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_polars_series(series, options)
+
+    def _cast_polars_expr(
+        self,
+        expr: "polars.Expr",
+        options: "CastOptions",
+    ):
+        pl = get_polars()
+        source_field = options.source_field
+        src_dtype = (
+            source_field.dtype.to_polars() if source_field is not None else None
+        )
+        if isinstance(src_dtype, type) and issubclass(src_dtype, pl.DataType):
+            src_dtype = src_dtype()
+        tgt_dtype = self.to_polars()
+
+        if (
+            src_dtype is not None
+            and _polars_is_integer(src_dtype)
+            and _polars_is_integer(tgt_dtype)
+            and _polars_is_signed_int(src_dtype) != _polars_is_signed_int(tgt_dtype)
+        ):
+            flipped_src_dtype = _polars_flip_int_signedness(src_dtype)
+            casted = expr.reinterpret(
+                signed=_polars_is_signed_int(flipped_src_dtype)
+            )
+            if flipped_src_dtype != tgt_dtype:
+                casted = casted.cast(tgt_dtype, strict=False)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(options)
+            )
+
+        return super()._cast_polars_expr(expr, options)
 
     def _merge_with_same_id(
         self,
@@ -858,6 +992,102 @@ class IntegerType(NumericType):
         tags = super().autotag()
         tags[b"signed"] = b"true" if self.signed else b"false"
         return tags
+
+
+@dataclass(frozen=True)
+class XXHIntType(IntegerType):
+    """64-bit integer type carrying ``xxhash`` semantics.
+
+    ``xxh3_64`` (and friends) produce unsigned 64-bit digests, but most
+    downstream stores — Spark, Hive/Iceberg, Parquet in the analytics path,
+    and every SQL engine that lacks a native ``UNSIGNED BIGINT`` — can only
+    carry a signed ``int64``. ``XXHIntType`` captures that intent and makes
+    the ``uint64 <-> int64`` flip a **bit-preserving round-trip**: a value
+    above ``INT64_MAX`` lands as a negative ``int64`` via two's-complement
+    reinterpretation, and casting back returns the original ``uint64`` bits.
+
+    The default physical representation is signed ``int64`` so the value
+    survives a trip through a signed-only store. Use
+    ``XXHIntType(signed=False)`` when uint64 storage is available (Arrow,
+    polars) and the unsigned domain should be exposed directly.
+    """
+
+    byte_size: int = 8
+    signed: bool = True
+
+    def __str__(self):
+        return "xxhint64" if self.signed else "xxhuint64"
+
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        # XXHIntType is a caller-declared intent, not a type that can be
+        # inferred from Arrow alone. Let IntegerType claim int64/uint64.
+        return False
+
+    @classmethod
+    def from_arrow_type(cls, dtype: pa.DataType) -> "XXHIntType":
+        if pa.types.is_int64(dtype):
+            return cls(signed=True)
+        if pa.types.is_uint64(dtype):
+            return cls(signed=False)
+        raise TypeError(
+            f"XXHIntType is a 64-bit hash integer; got Arrow type {dtype!r}. "
+            "Use XXHIntType(signed=True) for int64-backed hashes, "
+            "XXHIntType(signed=False) for uint64-backed hashes, "
+            "or IntegerType for generic integers."
+        )
+
+    @classmethod
+    def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
+        return False
+
+    @classmethod
+    def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
+        return False
+
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        if not cls._matches_dict(value, DataTypeId.INTEGER, "XXHINT", "XXHINT64"):
+            return False
+        name = str(value.get("name", "")).upper()
+        return name in {"XXHINT", "XXHINT64", "XXHUINT64"}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "XXHIntType":
+        name = str(value.get("name", "")).upper()
+        signed = value.get("signed")
+        if signed is None:
+            signed = name != "XXHUINT64"
+        return cls(byte_size=8, signed=bool(signed))
+
+    def to_dict(self) -> dict[str, Any]:
+        base = super().to_dict()
+        base["name"] = "XXHUINT64" if not self.signed else "XXHINT64"
+        base["xxhint"] = True
+        return base
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"xxhint"] = b"true"
+        return tags
+
+    def _merge_with_same_id(
+        self,
+        other: "DataType",
+        mode: SaveMode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ) -> "IntegerType":
+        # XXHIntType is a tagged int64; merging with another XXHIntType keeps
+        # the tag. Merging with a plain IntegerType widens/narrows normally
+        # and drops the xxhint intent so the wider schema is still correct.
+        if isinstance(other, XXHIntType):
+            if downcast == upcast:
+                return self
+            return XXHIntType(byte_size=8, signed=self.signed and other.signed)
+        return super()._merge_with_same_id(
+            other, mode=mode, downcast=downcast, upcast=upcast
+        )
 
 
 @dataclass(frozen=True)
