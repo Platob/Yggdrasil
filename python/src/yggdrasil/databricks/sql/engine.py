@@ -1157,6 +1157,7 @@ class SQLEngine(DatabricksService):
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
         narrow_merge: bool = True,
         concurrent_append_retries: int = 3,
+        sql_filters: Optional[list[str]] = None,
     ) -> None:
         """
         Insert data into a Delta table using the most appropriate backend.
@@ -1224,6 +1225,14 @@ class SQLEngine(DatabricksService):
                 FK constraints to apply when the table is created.
                 Accepts a ``{col: "cat.sch.tbl.col"}`` dict or a list of
                 :class:`~yggdrasil.databricks.sql.types.ForeignKeySpec`.
+            sql_filters:
+                Extra SQL predicates appended (AND-ed) to the MERGE / DELETE
+                ``ON`` clause when ``match_by`` is used.  Layered on top of
+                the auto-narrowing predicates; use when the auto-narrowing is
+                disabled or insufficient, e.g.
+                ``["T.`dt` >= '2026-01-01'"]`` on the warehouse paths or
+                ``["t.`dt` = current_date()"]`` on the Spark path.  Target
+                alias is ``T`` for the warehouse paths and ``t`` for Spark.
 
         Returns:
             None.
@@ -1247,6 +1256,7 @@ class SQLEngine(DatabricksService):
                 spark_session=spark_session,
                 narrow_merge=narrow_merge,
                 concurrent_append_retries=concurrent_append_retries,
+                sql_filters=sql_filters,
             )
 
         if spark_session is None:
@@ -1282,6 +1292,7 @@ class SQLEngine(DatabricksService):
                 foreign_keys=foreign_keys,
                 narrow_merge=narrow_merge,
                 concurrent_append_retries=concurrent_append_retries,
+                sql_filters=sql_filters,
             )
 
         return self.arrow_insert_into(
@@ -1306,6 +1317,7 @@ class SQLEngine(DatabricksService):
             foreign_keys=foreign_keys,
             narrow_merge=narrow_merge,
             concurrent_append_retries=concurrent_append_retries,
+            sql_filters=sql_filters,
         )
 
     def arrow_insert_into(
@@ -1332,6 +1344,7 @@ class SQLEngine(DatabricksService):
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
         narrow_merge: bool = True,
         concurrent_append_retries: int = 3,
+        sql_filters: Optional[list[str]] = None,
     ) -> None:
         """
         Insert data through the warehouse SQL path.
@@ -1483,6 +1496,8 @@ class SQLEngine(DatabricksService):
             logger.debug(
                 "Narrowing MERGE scope on %s by %s", location, narrow_cols,
             )
+        if sql_filters:
+            scope_predicates = [*scope_predicates, *sql_filters]
 
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
@@ -1614,6 +1629,7 @@ class SQLEngine(DatabricksService):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         narrow_merge: bool = True,
         concurrent_append_retries: int = 3,
+        sql_filters: Optional[list[str]] = None,
     ) -> None:
         """Insert into a Delta table from a SQL source.
 
@@ -1658,6 +1674,7 @@ class SQLEngine(DatabricksService):
                 vacuum_hours=vacuum_hours,
                 spark_session=spark_session,
                 table=table,
+                sql_filters=sql_filters,
             )
 
         # ---- Fast path 2: run in Spark for native Delta writes ----
@@ -1690,6 +1707,7 @@ class SQLEngine(DatabricksService):
                 table=table,
                 narrow_merge=narrow_merge,
                 concurrent_append_retries=concurrent_append_retries,
+                sql_filters=sql_filters,
             )
 
         # ---- Fallback: warehouse-side SQL merge ----
@@ -1748,6 +1766,8 @@ class SQLEngine(DatabricksService):
             logger.debug(
                 "Narrowing SQL merge scope on %s by %s", location, narrow_cols,
             )
+        if sql_filters:
+            scope_predicates = [*scope_predicates, *sql_filters]
 
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
@@ -1872,6 +1892,7 @@ class SQLEngine(DatabricksService):
         narrow_merge: bool = True,
         narrow_max_in_values: int = 500,
         concurrent_append_retries: int = 3,
+        sql_filters: Optional[list[str]] = None,
     ) -> None:
         """
         Insert data into a Delta table using Spark.
@@ -1958,6 +1979,7 @@ class SQLEngine(DatabricksService):
                 table=table,
                 narrow_merge=narrow_merge,
                 concurrent_append_retries=concurrent_append_retries,
+                sql_filters=sql_filters,
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -2025,6 +2047,8 @@ class SQLEngine(DatabricksService):
                         "Narrowing Spark merge scope on %s by %s",
                         table.full_name(), narrow_cols,
                     )
+        if sql_filters:
+            scope_predicates = [*scope_predicates, *sql_filters]
 
         def _run() -> None:
             if mode == SaveMode.TRUNCATE:

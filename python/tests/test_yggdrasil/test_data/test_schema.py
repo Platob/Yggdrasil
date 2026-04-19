@@ -528,6 +528,36 @@ def test_autotag_propagates_dtype_and_field_tags_per_column():
     assert out.metadata[b"t:layer"] == b"silver"
 
 
+def test_autotag_pops_partition_by_and_cluster_by_metadata():
+    s = schema(
+        [
+            _field_int("trade_date"),
+            _field_int("book_id"),
+            _field_int("trade_id"),
+        ],
+        metadata={
+            "partition_by": "trade_date",
+            "cluster_by": '["book_id", "trade_id"]',
+        },
+    )
+
+    out = s.autotag()
+
+    assert [f.name for f in out.partition_by] == ["trade_date"]
+    assert [f.name for f in out.cluster_by] == ["book_id", "trade_id"]
+
+    date_tags = out["trade_date"].tags or {}
+    assert date_tags[b"partition_by"] == b"true"
+
+    book_tags = out["book_id"].tags or {}
+    assert book_tags[b"cluster_by"] == b"true"
+
+    # Keys popped off the schema-level metadata so they don't leak to Arrow/Delta.
+    assert out.metadata is not None
+    assert b"partition_by" not in out.metadata
+    assert b"cluster_by" not in out.metadata
+
+
 def test_to_arrow_schema():
     s = schema(
         [_field_int("qty", nullable=False), _field_str("book")],
