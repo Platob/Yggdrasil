@@ -748,7 +748,22 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return table
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(table)
+            .check_target(self)
+        )
+
+        if not opts.need_cast(
+            check_names=True, check_dtypes=True, check_metadata=False
+        ):
+            return table
+
         return self._cast_polars_tabular(table, opts)
 
     def _cast_polars_tabular(
@@ -829,7 +844,22 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return data
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(data)
+            .check_target(self)
+        )
+
+        if not opts.need_cast(
+            check_names=True, check_dtypes=True, check_metadata=False
+        ):
+            return data
+
         return self.to_struct()._cast_pandas_tabular(data, opts)
 
     def _cast_pandas_tabular(
@@ -849,7 +879,22 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return table
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(table)
+            .check_target(self)
+        )
+
+        if not opts.need_cast(
+            check_names=True, check_dtypes=True, check_metadata=False
+        ):
+            return table
+
         return self._cast_arrow_tabular(table, opts)
 
     def _cast_arrow_tabular(
@@ -933,7 +978,22 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return data
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(data)
+            .check_target(self)
+        )
+
+        if not opts.need_cast(
+            check_names=True, check_dtypes=True, check_metadata=False
+        ):
+            return data
+
         return self._cast_spark_tabular(data, opts)
 
     def _cast_spark_tabular(

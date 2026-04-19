@@ -1186,6 +1186,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        # Object target is a variant — never touch the values.
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return array
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_arrow_array(array, options=options.with_target(self))
         filled = self.fill_arrow_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1197,6 +1200,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return table
         options = get_cast_options_class().check(options=options, **more)
         return self.to_struct().dtype.cast_arrow_tabular(table, options=options.with_target(self))
 
@@ -1206,6 +1211,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_series(series, options=options.with_target(self))
         filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1217,6 +1224,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_expr(series, options=options.with_target(self))
         filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1228,6 +1237,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.to_struct().dtype.cast_polars_tabular(data, options=options.with_target(self))
 
@@ -1237,6 +1248,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_pandas_series(series, options=options.with_target(self))
         filled = self.fill_pandas_series_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1250,6 +1263,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.dtype.cast_pandas_tabular(data, options=options.with_target(self))
 
@@ -1259,6 +1274,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return column
         options = get_cast_options_class().check(options=options, **more)
         options = options.with_target(self).check_source(column)
         casted = self.dtype.cast_spark_column(column, options=options)
@@ -1271,6 +1288,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.dtype.cast_spark_tabular(data, options=options.with_target(self))
 
