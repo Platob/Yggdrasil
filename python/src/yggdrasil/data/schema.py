@@ -475,19 +475,18 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         self,
         tags: dict[AnyStr, AnyStr] | None = None,
     ):
-        primary_key_names: set[str] | list[str] = set()
-        if self.metadata:
-            raw = self.metadata.pop(b"primary_key", None)
-            if raw:
-                if raw.startswith(b"[") and raw.endswith(b"]"):
-                    primary_key_names = set(json.loads(raw))
-                else:
-                    primary_key_names = raw.decode().split(".")
+        primary_key_names = self._pop_field_name_list(b"primary_key")
+        partition_by_names = self._pop_field_name_list(b"partition_by")
+        cluster_by_names = self._pop_field_name_list(b"cluster_by")
 
         inner_fields = OrderedDict()
         for name, f in self.inner_fields.items():
-            if primary_key_names and  name in primary_key_names:
+            if primary_key_names and name in primary_key_names:
                 f.with_primary_key(True, inplace=True)
+            if partition_by_names and name in partition_by_names:
+                f.with_partition_by(True, inplace=True)
+            if cluster_by_names and name in cluster_by_names:
+                f.with_cluster_by(True, inplace=True)
             inner_fields[name] = f.autotag()
 
         self.update_tags(tags)
@@ -496,6 +495,23 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
             inner_fields=inner_fields,
             metadata=self.metadata,
         )
+
+    def _pop_field_name_list(self, key: bytes) -> set[str]:
+        """Pop a ``key`` -> field-name-list entry off ``self.metadata``.
+
+        Accepts a JSON array (``'["a","b"]'``) or a dot-separated string
+        (``"a.b"``). Returns an empty set when the key is missing or empty —
+        and removes the key either way so it does not leak through to the
+        Arrow/Delta schema.
+        """
+        if not self.metadata:
+            return set()
+        raw = self.metadata.pop(key, None)
+        if not raw:
+            return set()
+        if raw.startswith(b"[") and raw.endswith(b"]"):
+            return set(json.loads(raw))
+        return set(raw.decode().split("."))
 
     def to_arrow_schema(self) -> pa.Schema:
         return pa.schema(

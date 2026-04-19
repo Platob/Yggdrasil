@@ -503,6 +503,24 @@ class Field(BaseMetadata, BaseChildrenFields):
                 return self.copy(tags={b"primary_key": True})
         return self
 
+    def with_partition_by(self, value: bool = True, inplace: bool = True) -> "Field":
+        if value:
+            if inplace:
+                self._set_tag_value(b"partition_by", True)
+                return self
+            else:
+                return self.copy(tags={b"partition_by": True})
+        return self
+
+    def with_cluster_by(self, value: bool = True, inplace: bool = True) -> "Field":
+        if value:
+            if inplace:
+                self._set_tag_value(b"cluster_by", True)
+                return self
+            else:
+                return self.copy(tags={b"cluster_by": True})
+        return self
+
     @property
     def foreign_key(self) -> str | None:
         return self._tag_text(b"foreign_key")
