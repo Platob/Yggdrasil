@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional, Iterator, TYPE_CHECKING
+from typing import Optional, Iterator, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
@@ -29,8 +29,7 @@ from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
-from .grants import Grant
-from .table import Table, TableAllInfos
+from .table import Table
 
 if TYPE_CHECKING:
     from .catalog import Catalog
@@ -398,138 +397,6 @@ class Tables(DatabricksService):
         if raise_error:
             raise ResourceDoesNotExist(f"Table {full_name} not found")
         return None
-
-    def fetch_all_infos(
-        self,
-        catalog_name: str,
-        schema_name: str,
-        table_name: str,
-        *,
-        table: "Table | None" = None,
-        infos: TableInfo | None = None,
-        include_tags: bool = True,
-        include_column_tags: bool = True,
-        include_grants: bool = True,
-        include_effective_grants: bool = False,
-        raise_error: bool = False,
-    ) -> TableAllInfos:
-        """Collect a consolidated Unity Catalog snapshot for a table.
-
-        Aggregates the basic :class:`TableInfo` (columns, comment, owner,
-        properties, row filter, constraints, storage location) with the data
-        only reachable from separate endpoints — entity-tag assignments on
-        the table and on each column, plus direct (and optionally inherited)
-        grants — into a single :class:`TableAllInfos`.
-
-        Mutualization with :meth:`find_table_remote`: pass ``infos`` to
-        reuse an already-fetched ``TableInfo`` and skip the basic lookup.
-        When omitted, the method calls :meth:`find_table_remote` itself.
-
-        Per-endpoint failures — missing SDK API, permission errors,
-        workspace features not enabled — are logged and swallowed by
-        default so that the returned :class:`TableAllInfos` still carries
-        every section that *did* come back.  Pass ``raise_error=True`` to
-        bubble those failures up instead.
-
-        Args:
-            catalog_name:             Parent catalog name.
-            schema_name:              Parent schema name.
-            table_name:               Table name.
-            table:                    Optional :class:`Table` to bind the
-                                      snapshot back to (used by
-                                      :attr:`Table.all_infos` caching).
-            infos:                    Pre-fetched ``TableInfo`` — skip the
-                                      remote basic lookup when supplied.
-            include_tags:             Fetch table-level entity-tag assignments.
-            include_column_tags:      Fetch per-column entity-tag assignments.
-            include_grants:           Fetch grants assigned directly on the table.
-            include_effective_grants: Fetch effective (inherited) grants.
-            raise_error:              Re-raise per-endpoint failures instead
-                                      of logging and returning empty for
-                                      that section.
-        """
-        if infos is None:
-            infos = self.find_table_remote(
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                table_name=table_name,
-                raise_error=True,
-            )
-
-        if table is None:
-            table = Table(
-                service=self,
-                catalog_name=infos.catalog_name or catalog_name,
-                schema_name=infos.schema_name or schema_name,
-                table_name=infos.name or table_name,
-            )
-
-        full_name = table.full_name()
-
-        ws = self.client.workspace_client()
-        tags_api = getattr(ws, "entity_tag_assignments", None)
-
-        def _collect_tags(entity_type: str, entity_name: str) -> tuple[Any, ...]:
-            if tags_api is None:
-                return ()
-            try:
-                return tuple(tags_api.list(entity_type=entity_type, entity_name=entity_name))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list %s tag assignments for %r",
-                    entity_type, entity_name, exc_info=True,
-                )
-                return ()
-
-        table_tags: tuple[Any, ...] = ()
-        if include_tags:
-            table_tags = _collect_tags("tables", full_name)
-
-        column_tags: dict[str, tuple[Any, ...]] = {}
-        if include_column_tags:
-            for col_info in (infos.columns or []):
-                col_name = col_info.name
-                if not col_name:
-                    continue
-                assignments = _collect_tags(
-                    "columns",
-                    f"{full_name}.{col_name}",
-                )
-                if assignments:
-                    column_tags[col_name] = assignments
-
-        direct_grants: tuple[Grant, ...] = ()
-        if include_grants:
-            try:
-                direct_grants = tuple(table.grants(effective=False))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list grants for %r", full_name, exc_info=True,
-                )
-
-        eff_grants: tuple[Grant, ...] = ()
-        if include_effective_grants:
-            try:
-                eff_grants = tuple(table.grants(effective=True))
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to list effective grants for %r", full_name, exc_info=True,
-                )
-
-        return TableAllInfos(
-            table=table,
-            infos=infos,
-            tags=table_tags,
-            column_tags=column_tags,
-            grants=direct_grants,
-            effective_grants=eff_grants,
-        )
 
     # -------------------------------------------------------------------------
     # Public API

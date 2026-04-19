@@ -7,15 +7,13 @@ instance-level methods only.  Collection operations (``find_table``,
 
 Caching strategy
 ----------------
-``_infos`` and ``_columns`` are instance-level one-shot caches.
+Expensive Unity Catalog lookups (basic ``TableInfo``, entity-tag
+assignments on the table and on each column) are cached on the instance
+with a shared TTL and loaded lazily on first access.
 
-    1. **Local** — return the cached value immediately if set.
-    2. **Remote** — call ``_fetch_infos_remote`` / ``_fetch_columns_remote``
-       only on a miss.
+    1. **Local** — return the cached value immediately when fresh.
+    2. **Remote** — hit the Databricks API only on miss / expiry.
     3. **Update** — store the fetched value so the next access is free.
-
-Debug-level log lines are emitted on every cache hit so you can trace the
-access pattern without grep-ing for API calls.
 """
 
 from __future__ import annotations
@@ -32,10 +30,8 @@ from databricks.sdk.service.catalog import (
     DataSourceFormat,
     Privilege,
     SecurableType,
-    TableConstraint,
     TableInfo,
     TableOperation,
-    TableRowFilter,
     TableType,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
@@ -51,7 +47,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
 from .column import Column
-from .grants import Grant, GrantsMixin
+from .grants import GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
     _build_fk_constraint_sql,
@@ -76,7 +72,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.columns import Columns
     from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
 
-__all__ = ["Table", "TableAllInfos"]
+__all__ = ["Table"]
 
 logger = logging.getLogger(__name__)
 
@@ -147,13 +143,19 @@ class Table(GrantsMixin):
     _infos_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
-    _all_infos: Optional["TableAllInfos"] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _all_infos_fetched_at: float | None = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
     _columns: Optional[list[Column]] = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _tags: Optional[tuple[Any, ...]] = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _tags_fetched_at: float | None = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _column_tags: Optional[dict[str, tuple[Any, ...]]] = field(
+        default=None, init=False, repr=False, compare=False, hash=False,
+    )
+    _column_tags_fetched_at: float | None = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
 
@@ -283,9 +285,11 @@ class Table(GrantsMixin):
 
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
-        object.__setattr__(self, "_all_infos", None)
-        object.__setattr__(self, "_all_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
+        object.__setattr__(self, "_tags", None)
+        object.__setattr__(self, "_tags_fetched_at", None)
+        object.__setattr__(self, "_column_tags", None)
+        object.__setattr__(self, "_column_tags_fetched_at", None)
 
     def clear(self) -> "Table":
         self._reset_cache()
@@ -323,18 +327,9 @@ class Table(GrantsMixin):
         ])
         return infos
 
-    def _store_all_infos(self, snapshot: "TableAllInfos") -> "TableAllInfos":
-        """Populate the full snapshot cache and mirror its ``infos`` into the basic cache."""
-        object.__setattr__(self, "_all_infos", snapshot)
-        object.__setattr__(self, "_all_infos_fetched_at", time.time())
-        self._store_infos(snapshot.infos)
-        return snapshot
-
     @property
     def infos(self) -> TableInfo:
-        """Basic :class:`TableInfo` — TTL-cached, fed by :attr:`all_infos` when available."""
-        if self._all_infos is not None and self._is_fresh(self._all_infos_fetched_at):
-            return self._all_infos.infos
+        """Basic :class:`TableInfo` — TTL-cached."""
         if self._infos is not None and self._is_fresh(self._infos_fetched_at):
             return self._infos
 
@@ -346,26 +341,69 @@ class Table(GrantsMixin):
         self._store_infos(info)
         return info
 
-    @property
-    def all_infos(self) -> "TableAllInfos":
-        """Full :class:`TableAllInfos` snapshot — cached with the same TTL as :attr:`infos`.
+    # =========================================================================
+    # Entity-tag assignments — lazy, TTL-cached
+    # =========================================================================
 
-        Delegates to :meth:`Tables.fetch_all_infos`, reusing a fresh
-        :attr:`_infos` cache as a seed so the basic ``TableInfo`` lookup
-        runs at most once.  The returned snapshot also re-seeds the
-        basic cache so a subsequent ``infos`` access is free.
+    def _list_tag_assignments(
+        self,
+        entity_type: str,
+        entity_name: str,
+    ) -> tuple[Any, ...]:
+        """Return entity-tag assignments for ``entity_name``.
+
+        Missing SDK API, permission errors, or disabled workspace features
+        are logged and produce an empty tuple; the caller can treat the
+        absence of tags as "none known".
         """
-        if self._all_infos is None or not self._is_fresh(self._all_infos_fetched_at):
-            seed = self._infos if self._is_fresh(self._infos_fetched_at) else None
-            snapshot = self.sql.tables.fetch_all_infos(
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
-                table_name=self.table_name,
-                table=self,
-                infos=seed,
+        tags_api = getattr(self.client.workspace_client(), "entity_tag_assignments", None)
+        if tags_api is None:
+            return ()
+        try:
+            return tuple(tags_api.list(entity_type=entity_type, entity_name=entity_name))
+        except Exception:
+            logger.warning(
+                "Failed to list %s tag assignments for %r",
+                entity_type, entity_name, exc_info=True,
             )
-            self._store_all_infos(snapshot)
-        return self._all_infos
+            return ()
+
+    @property
+    def tags(self) -> tuple[Any, ...]:
+        """Table-level entity-tag assignments — TTL-cached, lazy-loaded."""
+        if self._tags is not None and self._is_fresh(self._tags_fetched_at):
+            return self._tags
+
+        assignments = self._list_tag_assignments("tables", self.full_name())
+        object.__setattr__(self, "_tags", assignments)
+        object.__setattr__(self, "_tags_fetched_at", time.time())
+        return assignments
+
+    @property
+    def column_tags(self) -> Mapping[str, tuple[Any, ...]]:
+        """Per-column entity-tag assignments — TTL-cached, lazy-loaded.
+
+        Only columns that have at least one tag assignment appear in the
+        returned mapping.
+        """
+        if self._column_tags is not None and self._is_fresh(self._column_tags_fetched_at):
+            return self._column_tags
+
+        full_name = self.full_name()
+        assignments: dict[str, tuple[Any, ...]] = {}
+        for col_info in (self.infos.columns or []):
+            col_name = col_info.name
+            if not col_name:
+                continue
+            col_assignments = self._list_tag_assignments(
+                "columns", f"{full_name}.{col_name}",
+            )
+            if col_assignments:
+                assignments[col_name] = col_assignments
+
+        object.__setattr__(self, "_column_tags", assignments)
+        object.__setattr__(self, "_column_tags_fetched_at", time.time())
+        return assignments
 
     # =========================================================================
     # Arrow schema introspection
@@ -1385,98 +1423,6 @@ class Table(GrantsMixin):
             f"ON TABLE {self.full_name(safe=True)} "
             f"TO {quote_principal(principal)}"
         )
-
-
-# ===========================================================================
-# TableAllInfos — consolidated snapshot returned by Tables.fetch_all_infos
-# ===========================================================================
-
-@dataclass
-class TableAllInfos:
-    """Aggregated Unity Catalog information for a single table.
-
-    Bundles together the basic :class:`TableInfo` (columns, comment, owner,
-    properties, row filter, constraints, storage metadata) with the data
-    only reachable from separate Unity Catalog endpoints — entity-tag
-    assignments on the table itself, entity-tag assignments keyed by
-    column name, and the grants assigned on the table (direct and,
-    optionally, inherited).
-
-    Any section that could not be fetched stays empty; the rest of the
-    snapshot remains usable.
-    """
-
-    table: "Table"
-    infos: TableInfo
-    tags: tuple[Any, ...] = ()
-    column_tags: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
-    grants: tuple[Grant, ...] = ()
-    effective_grants: tuple[Grant, ...] = ()
-
-    @property
-    def full_name(self) -> str:
-        return self.table.full_name()
-
-    @property
-    def columns(self) -> list[Any]:
-        return list(self.infos.columns or [])
-
-    @property
-    def comment(self) -> str | None:
-        return self.infos.comment
-
-    @property
-    def owner(self) -> str | None:
-        return self.infos.owner
-
-    @property
-    def row_filter(self) -> TableRowFilter | None:
-        return self.infos.row_filter
-
-    @property
-    def table_constraints(self) -> list[TableConstraint]:
-        return list(self.infos.table_constraints or [])
-
-    @property
-    def properties(self) -> Mapping[str, str]:
-        return self.infos.properties or {}
-
-    @property
-    def storage_location(self) -> str | None:
-        return self.infos.storage_location
-
-    @property
-    def table_type(self) -> TableType | None:
-        return self.infos.table_type
-
-    @staticmethod
-    def _serialize(value: Any) -> Any:
-        if hasattr(value, "as_dict"):
-            try:
-                return value.as_dict()
-            except Exception:
-                pass
-        return value
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize to a JSON-friendly dictionary (falls back to ``repr`` on opaque values)."""
-        return {
-            "full_name": self.full_name,
-            "infos": self._serialize(self.infos),
-            "tags": [self._serialize(t) for t in self.tags],
-            "column_tags": {
-                name: [self._serialize(t) for t in items]
-                for name, items in self.column_tags.items()
-            },
-            "grants": [
-                {"principal": g.principal, "privileges": list(g.privileges)}
-                for g in self.grants
-            ],
-            "effective_grants": [
-                {"principal": g.principal, "privileges": list(g.privileges)}
-                for g in self.effective_grants
-            ],
-        }
 
 
 # ===========================================================================
