@@ -36,6 +36,8 @@ __all__ = [
     "POLARS_DATETIME_FORMATS_NAIVE",
     "POLARS_DATE_FORMATS",
     "POLARS_TIME_FORMATS",
+    "POLARS_PARSE_DATETIME_FORMATS_TZ",
+    "POLARS_PARSE_DATETIME_FORMATS_NAIVE",
     "SPARK_DATETIME_FORMATS",
     "SPARK_DATE_FORMATS",
     "SPARK_TIME_FORMATS",
@@ -294,6 +296,14 @@ def _is_chunked(array: Any) -> bool:
 # the system state, so we route tz transitions through polars whenever it's
 # importable and only fall back to pyarrow when polars isn't installed (or
 # doesn't support the requested unit — polars has no "s" time unit).
+#
+# String parsing follows the same preference: polars uses chrono format
+# strings which understand ``%.f`` for optional fractional seconds and ``%#z``
+# for timezone offsets in either ``+0200`` or ``+02:00`` form. Arrow's
+# strptime is built on the platform's C strptime kernel and silently rejects
+# patterns that work on glibc but not on MSVCRT — the colon in ``+02:00``
+# being the most common breakage point. Routing parse through polars makes
+# behavior identical across Linux / macOS / Windows.
 
 
 _POLARS_UNITS = frozenset({"ms", "us", "ns"})
@@ -305,6 +315,167 @@ def _polars_or_none():
 
         return pl
     except ImportError:
+        return None
+
+
+# Polars chrono parse formats — ``%#z`` matches ``+0200`` *and* ``+02:00``;
+# ``%.f`` matches an optional ``.fraction`` segment so a single format covers
+# both ``HH:MM:SS`` and ``HH:MM:SS.123456`` rows.
+POLARS_PARSE_DATETIME_FORMATS_TZ: tuple[str, ...] = (
+    "%Y-%m-%dT%H:%M:%S%.f%#z",
+    "%Y-%m-%d %H:%M:%S%.f%#z",
+    "%Y-%m-%dT%H:%M%#z",
+    "%Y-%m-%d %H:%M%#z",
+    "%Y-%m-%dT%H:%M:%S%.fZ",
+    "%Y-%m-%d %H:%M:%S%.fZ",
+    "%Y-%m-%dT%H:%MZ",
+    "%Y-%m-%d %H:%MZ",
+)
+
+POLARS_PARSE_DATETIME_FORMATS_NAIVE: tuple[str, ...] = (
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y",
+    "%Y%m%dT%H%M%S",
+    "%Y%m%d",
+    "%d %b %Y %H:%M:%S",
+    "%d %b %Y",
+    "%b %d, %Y",
+    "%d.%m.%Y",
+    "%Y-%m-%d",
+)
+
+
+def _polars_parse_str_to_timestamp(
+    array: pa.Array,
+    unit: str,
+    tz: str | None,
+    *,
+    unsafe_tz: bool,
+    keep_fractional: bool = True,
+    formats_tz: tuple[str, ...] | None = None,
+    formats_naive: tuple[str, ...] | None = None,
+) -> pa.Array | None:
+    """Parse a string array to ``timestamp[unit, tz]`` via polars.
+
+    Returns ``None`` when polars is unavailable or the unit isn't one polars
+    can store natively — the caller is expected to fall back to pyarrow's
+    strptime path in that case.
+
+    Semantics:
+
+    * tz-aware source rows (``+02:00``, ``+0200``, ``Z``, trailing ``UTC``)
+      are parsed into ``Datetime[unit, UTC]`` and converted to *tz* (or
+      replaced with naive when *tz* is ``None``).
+    * naive source rows are parsed into ``Datetime[unit]`` and either
+      reinterpreted as *tz* wall-clock (``unsafe_tz=True``) or assumed UTC
+      and shifted to *tz* (``unsafe_tz=False``).
+    * Per-row coalesce — tz-aware result wins when both branches resolve
+      the same row (mixed-shape columns Just Work).
+    """
+    pl = _polars_or_none()
+    if pl is None or unit not in _POLARS_UNITS:
+        return None
+
+    fmt_tz = formats_tz if formats_tz is not None else POLARS_PARSE_DATETIME_FORMATS_TZ
+    fmt_naive = (
+        formats_naive if formats_naive is not None else POLARS_PARSE_DATETIME_FORMATS_NAIVE
+    )
+
+    try:
+        series = pl.from_arrow(array)
+        # ``pl.from_arrow`` returns ChunkedArray-equivalent for ChunkedArray
+        # inputs; both flavors carry a ``.cast`` that lands on Series.
+        if not isinstance(series, pl.Series):
+            series = pl.Series(values=series)
+
+        # Cast to string up front so binary / large-string sources still parse
+        # without us having to branch on the Arrow type tag.
+        col = pl.col("v").cast(pl.String, strict=False).str.strip_chars()
+        # Trim blanks; an empty string can never satisfy any chrono format
+        # but ``strptime`` raises rather than returning null on some inputs.
+        col = (
+            pl.when(col.str.len_chars() == 0)
+            .then(pl.lit(None, dtype=pl.String))
+            .otherwise(col)
+        )
+        # ``" UTC"`` / ``"UTC"`` suffix → ``+0000`` so it falls through the
+        # numeric-offset branch in chrono.
+        col_norm = col.str.replace(r"\s*UTC$", "+0000")
+
+        utc_dtype = pl.Datetime(unit, "UTC")
+        bare_dtype = pl.Datetime(unit)
+
+        tz_branches = [
+            col_norm.str.strptime(
+                utc_dtype, fmt, strict=False, ambiguous="earliest"
+            )
+            for fmt in fmt_tz
+        ]
+        naive_branches = [
+            col.str.strptime(
+                bare_dtype, fmt, strict=False, ambiguous="earliest"
+            )
+            for fmt in fmt_naive
+        ]
+
+        tz_resolved_utc = pl.coalesce(tz_branches) if tz_branches else None
+        naive_resolved = pl.coalesce(naive_branches) if naive_branches else None
+
+        if tz is None:
+            # Output naive: tz-aware → drop UTC tag (already wall-clock UTC),
+            # then coalesce with naive branch.
+            parts = []
+            if tz_resolved_utc is not None:
+                parts.append(tz_resolved_utc.dt.replace_time_zone(None))
+            if naive_resolved is not None:
+                parts.append(naive_resolved)
+            result = pl.coalesce(parts) if len(parts) > 1 else parts[0]
+        else:
+            # Output tz-aware: tz-aware branch converts to *tz*, naive branch
+            # either reinterprets wall-clock as *tz* (unsafe_tz=True) or
+            # assumes UTC then shifts (unsafe_tz=False). Both end up in the
+            # same Datetime[unit, tz] dtype so coalesce can merge them.
+            parts = []
+            if tz_resolved_utc is not None:
+                parts.append(tz_resolved_utc.dt.convert_time_zone(tz))
+            if naive_resolved is not None:
+                if unsafe_tz:
+                    parts.append(
+                        naive_resolved.dt.replace_time_zone(
+                            tz, ambiguous="earliest"
+                        )
+                    )
+                else:
+                    parts.append(
+                        naive_resolved.dt.replace_time_zone(
+                            "UTC", ambiguous="earliest"
+                        ).dt.convert_time_zone(tz)
+                    )
+            result = pl.coalesce(parts) if len(parts) > 1 else parts[0]
+
+        if not keep_fractional:
+            # Polars' ``%.f`` always pulls in the fractional segment. Truncate
+            # back to whole-second precision when the caller explicitly opts
+            # out — matches the pyarrow path's strip-don't-reattach branch.
+            result = result.dt.truncate("1s")
+
+        out = pl.DataFrame({"v": series}).select(result.alias("v")).to_series()
+        return out.to_arrow()
+    except Exception:
+        # Anything polars surprises us with — fall through to the pyarrow
+        # path rather than letting an internal hiccup nuke the whole parse.
         return None
 
 
@@ -598,22 +769,44 @@ def arrow_str_to_timestamp(
     Parameters
     ----------
     keep_fractional:
-        When ``True`` (default) sub-second precision from ``HH:MM:SS.ffffff``
-        strings is extracted separately and folded back onto the parsed
-        timestamp. Set to ``False`` to drop it (slightly faster, Arrow-native
-        parity with the pre-2024 behavior).
+        Polars' ``%.f`` parses sub-second precision inline, so the flag
+        normally has no effect on the polars path. The pyarrow fallback —
+        used when polars isn't installed or the unit is one polars doesn't
+        support (``"s"``) — still strips and re-attaches the fraction
+        explicitly; setting ``keep_fractional=False`` drops the re-attach.
     unsafe_tz:
         Controls what happens when *array* has no recorded timezone but *tz*
         is set. ``True`` (default, best-effort) reinterprets the wall-clock
         time as the target zone — ``"2023-01-02 03:04"`` in ``tz="Europe/Paris"``
-        stays ``03:04`` Paris local. ``False`` (strict) assumes UTC and lets
-        pyarrow shift the display to the target zone.
+        stays ``03:04`` Paris local. ``False`` (strict) assumes UTC and
+        shifts the display to the target zone.
     formats:
-        Optional override of the format catalogue. tz-aware and naive
-        variants are tried in the order supplied.
+        Optional override of the format catalogue. The polars path treats
+        *formats* as tz-aware vs naive based on the presence of a ``%z`` /
+        ``%#z`` / ``%:z`` directive (or a literal ``Z``). The pyarrow
+        fallback tries the formats in the order supplied.
     """
 
-    def _one(chunk: pa.Array) -> pa.Array:
+    def _via_polars(chunk: pa.Array) -> pa.Array | None:
+        if formats is not None:
+            tz_fmts = tuple(
+                f for f in formats if "%z" in f or "%:z" in f or "%#z" in f or f.endswith("Z")
+            )
+            naive_fmts = tuple(f for f in formats if f not in tz_fmts)
+        else:
+            tz_fmts = None
+            naive_fmts = None
+        return _polars_parse_str_to_timestamp(
+            chunk,
+            unit=unit,
+            tz=tz,
+            unsafe_tz=unsafe_tz,
+            keep_fractional=keep_fractional,
+            formats_tz=tz_fmts,
+            formats_naive=naive_fmts,
+        )
+
+    def _via_arrow(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
         normalized = _normalize_utc_suffix(chunk)
@@ -636,6 +829,14 @@ def arrow_str_to_timestamp(
             )
         return naive
 
+    def _one(chunk: pa.Array) -> pa.Array:
+        chunk = _ensure_string(chunk)
+        chunk = nullify_empty_strings(chunk)
+        out = _via_polars(chunk)
+        if out is not None:
+            return out
+        return _via_arrow(chunk)
+
     return _apply_chunked(array, _one)
 
 
@@ -644,27 +845,22 @@ def arrow_str_to_date(
     *,
     formats: tuple[str, ...] | list[str] | None = None,
 ) -> pa.Array | pa.ChunkedArray:
-    """Best-effort parse a string array to ``date32``."""
+    """Best-effort parse a string array to ``date32``.
+
+    Reuses :func:`arrow_str_to_timestamp` (polars-first) so date columns
+    accept the same shapes — full ISO datetimes with offsets, ``Z`` suffix,
+    ``" UTC"`` tail, naive minute precision — and the result is cast to
+    ``date32``.
+    """
 
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
-        chunk = _normalize_utc_suffix(chunk)
-        chunk = _normalize_utc_offset(chunk)
-        chunk = _strip_fractional_seconds(chunk)
-        # Reuse both the tz-aware and naive datetime catalogues — users often
-        # hand us a full datetime (with ``Z``, offset, or naive body) and
-        # expect the date portion. ``strip_tz=True`` flattens tz-aware parses
-        # back to naive before we cast to ``date32``.
-        chosen = (
-            tuple(formats)
-            if formats is not None
-            else ARROW_DATE_FORMATS
-            + ARROW_DATETIME_FORMATS_TZ
-            + ARROW_DATETIME_FORMATS_NAIVE
+
+        ts = arrow_str_to_timestamp(
+            chunk, unit="us", tz=None, formats=formats, keep_fractional=False
         )
-        parsed = _coalesce_strptime(chunk, chosen, unit="us", strip_tz=True)
-        return pc.cast(parsed, pa.date32())
+        return pc.cast(ts, pa.date32())
 
     return _apply_chunked(array, _one)
 
