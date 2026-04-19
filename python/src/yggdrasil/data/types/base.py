@@ -171,7 +171,7 @@ class DataType(BaseChildrenFields, ABC):
     def convert_pyobj(self, value: Any, nullable: bool, safe: bool = False):
         if value is None:
             return self.default_pyobj(nullable=nullable)
-        return self._convert_pyobj(value)
+        return self._convert_pyobj(value, safe=safe)
 
     def _convert_pyobj(self, value: Any, safe: bool = False):
         return value

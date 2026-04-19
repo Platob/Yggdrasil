@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -318,6 +319,57 @@ class ArrayType(NestedType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else []
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> list | None:
+        # Priority path: str/bytes → JSON-decode, then fall through.
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: "
+                        f"{value!r}"
+                    )
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse array from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse array from {value!r} for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            value = decoded
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            items = list(value)
+        elif hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+            items = list(value.tolist())
+        else:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert {type(value).__name__} to array "
+                    f"for {type(self).__name__}: {value!r}."
+                )
+            return None
+
+        item_dtype = self.item_field.dtype
+        item_nullable = self.item_field.nullable
+        return [
+            item_dtype.convert_pyobj(item, nullable=item_nullable, safe=safe)
+            for item in items
+        ]
 
     def _cast_polars_series(
         self,

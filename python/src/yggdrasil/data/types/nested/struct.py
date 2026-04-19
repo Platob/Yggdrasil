@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -179,6 +180,73 @@ class StructType(NestedType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else {f.name: f.default for f in self.fields}
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dict | None:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: "
+                        f"{value!r}"
+                    )
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse struct from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse struct from {value!r} for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            value = decoded
+
+        if isinstance(value, dict):
+            source = value
+        elif isinstance(value, (list, tuple)):
+            if len(value) != len(self.fields):
+                if safe:
+                    raise ValueError(
+                        f"Positional struct input has {len(value)} items but "
+                        f"{type(self).__name__} expects {len(self.fields)}."
+                    )
+                # Best-effort: truncate or pad with None.
+                value = list(value)
+                if len(value) < len(self.fields):
+                    value = value + [None] * (len(self.fields) - len(value))
+                else:
+                    value = value[: len(self.fields)]
+            source = {f.name: v for f, v in zip(self.fields, value)}
+        elif hasattr(value, "asDict"):
+            source = value.asDict(recursive=True)
+        elif hasattr(value, "__dict__"):
+            source = dict(value.__dict__)
+        else:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert {type(value).__name__} to struct "
+                    f"for {type(self).__name__}: {value!r}."
+                )
+            return None
+
+        out: dict[str, Any] = {}
+        for child in self.fields:
+            raw = source.get(child.name)
+            out[child.name] = child.dtype.convert_pyobj(
+                raw, nullable=child.nullable, safe=safe
+            )
+        return out
 
     def _cast_arrow_array(
         self,
