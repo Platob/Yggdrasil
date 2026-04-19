@@ -564,12 +564,14 @@ class SQLEngine(DatabricksService):
 
         if parallel:
             def _runner(stmt: Statement) -> Statement:
+                # Non-blocking submit — the batch polls each statement's
+                # own ``refresh_status`` / ``done`` to manage the window.
                 return self.execute(
                     stmt,
                     row_limit=row_limit,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
-                    wait=True,
+                    wait=False,
                     raise_error=raise_error,
                     engine=engine,
                     warehouse_id=warehouse_id,
@@ -587,7 +589,6 @@ class SQLEngine(DatabricksService):
                     raise_error=raise_error,
                     runner=_runner,
                 )
-                batch.wait(wait=wait, raise_error=raise_error)
             except Exception:
                 batch.cancel()
                 raise

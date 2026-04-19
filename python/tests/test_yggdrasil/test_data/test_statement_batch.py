@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 import unittest
 from dataclasses import dataclass, field
@@ -15,14 +14,24 @@ from yggdrasil.data.statement import Statement as BaseStatement, StatementBatch
 
 @dataclass
 class _StubStatement(BaseStatement):
-    """Minimal ``Statement`` used to exercise batch orchestration."""
+    """Deterministic ``Statement`` that models submit + poll semantics.
+
+    ``start`` records submission and a completion deadline; ``refresh_status``
+    flips ``done`` once the deadline passes, so the batch's polling loop can
+    drive the statement to a terminal state without any real backend.
+    """
 
     name: str = ""
     fail: bool = False
-    sleep_on_start: float = 0.0
+    duration: float = 0.0
+    _submitted_at: float = field(default=0.0, init=False)
     _started: bool = field(default=False, init=False)
     _cancelled: bool = field(default=False, init=False)
     _finished: bool = field(default=False, init=False)
+
+    @property
+    def started(self) -> bool:
+        return self._started
 
     @property
     def done(self) -> bool:
@@ -30,29 +39,32 @@ class _StubStatement(BaseStatement):
 
     @property
     def failed(self) -> bool:
-        return self.fail
+        return self._finished and self.fail
 
     def raise_for_status(self) -> None:
-        if self.fail:
+        if self._finished and self.fail:
             raise RuntimeError(f"{self.name} failed")
 
     def refresh_status(self) -> None:
-        return None
-
-    def start(self, *, wait=True, raise_error=True, **_kwargs) -> "_StubStatement":
-        self._started = True
-        if self.sleep_on_start:
-            time.sleep(self.sleep_on_start)
-        if self.fail:
+        if self._cancelled or self._finished:
+            return
+        if self._started and (time.time() - self._submitted_at) >= self.duration:
             self._finished = True
-            if raise_error:
-                raise RuntimeError(f"{self.name} failed")
+
+    def start(self, *, wait=False, raise_error=True, **_kwargs) -> "_StubStatement":
+        if self._started:
             return self
-        self._finished = True
+        self._started = True
+        self._submitted_at = time.time()
+        if self.duration <= 0:
+            self._finished = True
+        if wait:
+            self.wait(wait=wait, raise_error=raise_error)
         return self
 
     def cancel(self) -> "_StubStatement":
-        self._cancelled = True
+        if not self._finished:
+            self._cancelled = True
         return self
 
     def collect_schema(self, full: bool = False) -> Schema:
@@ -85,72 +97,84 @@ class TestStatementBatchStart(unittest.TestCase):
         stmts = [_StubStatement(name=f"s{i}", **kwargs) for i in range(n)]
         return StatementBatch.from_results(stmts), stmts
 
-    def test_sequential_start_calls_each(self):
+    def test_sequential_start_runs_to_completion(self):
         batch, stmts = self._build(3)
         batch.start(parallel=False)
         for s in stmts:
             self.assertTrue(s._started)
             self.assertTrue(s._finished)
 
-    def test_pooled_start_completes_every_statement(self):
-        batch, stmts = self._build(6, sleep_on_start=0.01)
+    def test_pooled_start_fills_window_only(self):
+        batch, stmts = self._build(6, duration=0.05)
         batch.start(parallel=2)
-        batch.wait()
+        # Only the first two are submitted; the rest wait in the queue.
+        self.assertTrue(stmts[0]._started)
+        self.assertTrue(stmts[1]._started)
+        self.assertFalse(stmts[2]._started)
+        self.assertFalse(stmts[3]._started)
+        self.assertEqual(len(batch._in_flight), 2)
+        self.assertEqual(len(batch._pending_queue), 4)
+
+        batch.wait(wait={"interval": 0.005, "max_interval": 0.02, "timeout": 10})
+        for s in stmts:
+            self.assertTrue(s._started)
+            self.assertTrue(s._finished)
+        self.assertEqual(len(batch._in_flight), 0)
+        self.assertEqual(len(batch._pending_queue), 0)
+
+    def test_pool_caps_in_flight(self):
+        stmts = [
+            _StubStatement(name=f"s{i}", duration=0.03) for i in range(8)
+        ]
+        batch = StatementBatch.from_results(stmts)
+        batch.start(parallel=3)
+
+        self.assertLessEqual(len(batch._in_flight), 3)
+        started_count = sum(1 for s in stmts if s._started)
+        self.assertEqual(started_count, 3)
+
+        batch.wait(wait={"interval": 0.005, "max_interval": 0.02, "timeout": 10})
         for s in stmts:
             self.assertTrue(s._finished)
 
-    def test_pool_caps_concurrency(self):
-        running = 0
-        peak = 0
-        lock = threading.Lock()
-
-        @dataclass
-        class _TrackingStatement(_StubStatement):
-            def start(self, *, wait=True, raise_error=True, **_kwargs):
-                nonlocal running, peak
-                with lock:
-                    running += 1
-                    peak = max(peak, running)
-                try:
-                    time.sleep(0.02)
-                finally:
-                    with lock:
-                        running -= 1
-                self._started = True
-                self._finished = True
-                return self
-
-        stmts = [_TrackingStatement(name=f"s{i}") for i in range(8)]
-        batch = StatementBatch.from_results(stmts)
-        batch.start(parallel=3)
-        batch.wait()
-
-        self.assertLessEqual(peak, 3)
-        self.assertGreaterEqual(peak, 2)
+    def test_start_with_wait_true_drains_inline(self):
+        batch, stmts = self._build(4, duration=0.02)
+        batch.start(parallel=2, wait={"interval": 0.005, "timeout": 10})
+        for s in stmts:
+            self.assertTrue(s._finished)
+        self.assertEqual(len(batch._in_flight), 0)
+        self.assertEqual(len(batch._pending_queue), 0)
 
     def test_start_twice_raises(self):
-        batch, _ = self._build(2, sleep_on_start=0.01)
+        batch, _ = self._build(3, duration=0.1)
         batch.start(parallel=2)
-        with self.assertRaises(RuntimeError):
-            batch.start(parallel=2)
-        batch.wait()
+        try:
+            with self.assertRaises(RuntimeError):
+                batch.start(parallel=2)
+        finally:
+            batch.cancel()
 
 
 class TestStatementBatchErrorPropagation(unittest.TestCase):
     def test_pool_error_cancels_remaining(self):
         stmts = [
-            _StubStatement(name="ok0", sleep_on_start=0.02),
-            _StubStatement(name="boom", fail=True),
-            _StubStatement(name="slow", sleep_on_start=1.0),
-            _StubStatement(name="slower", sleep_on_start=1.0),
+            _StubStatement(name="ok0", duration=0.03),
+            _StubStatement(name="boom", fail=True, duration=0.0),
+            _StubStatement(name="queued1", duration=1.0),
+            _StubStatement(name="queued2", duration=1.0),
         ]
         batch = StatementBatch.from_results(stmts)
         batch.start(parallel=2)
 
         with self.assertRaises(RuntimeError):
-            batch.wait()
+            batch.wait(wait={"interval": 0.005, "timeout": 10})
 
-        self.assertTrue(stmts[2]._cancelled or stmts[3]._cancelled)
+        # Queued entries should never have been submitted.
+        self.assertFalse(stmts[2]._started)
+        self.assertFalse(stmts[3]._started)
+        # Their cancel() should still have been called as cleanup.
+        self.assertTrue(stmts[2]._cancelled)
+        self.assertTrue(stmts[3]._cancelled)
 
     def test_sequential_error_cancels_later_statements(self):
         stmts = [
@@ -168,20 +192,22 @@ class TestStatementBatchErrorPropagation(unittest.TestCase):
         self.assertTrue(stmts[2]._cancelled)
         self.assertTrue(stmts[3]._cancelled)
 
-    def test_raise_error_false_swallows_pool_errors(self):
+    def test_raise_error_false_swallows_failures(self):
         stmts = [
-            _StubStatement(name="ok"),
-            _StubStatement(name="boom", fail=True),
+            _StubStatement(name="ok", duration=0.01),
+            _StubStatement(name="boom", fail=True, duration=0.0),
         ]
         batch = StatementBatch.from_results(stmts)
         batch.start(parallel=2, raise_error=False)
-        # Returning cleanly is the assertion here.
-        batch.wait(raise_error=False)
+        batch.wait(
+            wait={"interval": 0.005, "timeout": 10},
+            raise_error=False,
+        )
 
 
 class TestStatementBatchCancel(unittest.TestCase):
     def test_cancel_calls_each_statement(self):
-        stmts = [_StubStatement(name=f"s{i}") for i in range(3)]
+        stmts = [_StubStatement(name=f"s{i}", duration=5.0) for i in range(3)]
         batch = StatementBatch.from_results(stmts)
         batch.cancel()
         for s in stmts:
@@ -189,22 +215,23 @@ class TestStatementBatchCancel(unittest.TestCase):
 
     def test_cancel_tears_down_pool(self):
         stmts = [
-            _StubStatement(name=f"s{i}", sleep_on_start=0.5) for i in range(4)
+            _StubStatement(name=f"s{i}", duration=5.0) for i in range(4)
         ]
         batch = StatementBatch.from_results(stmts)
         batch.start(parallel=2)
         batch.cancel()
-        self.assertIsNone(batch._executor)
-        self.assertEqual(len(batch._futures), 0)
+        self.assertEqual(len(batch._in_flight), 0)
+        self.assertEqual(len(batch._pending_queue), 0)
+        self.assertIsNone(batch._pool_runner)
 
 
 class TestStatementBatchWaitNoPool(unittest.TestCase):
     def test_wait_without_start_iterates_sequentially(self):
         stmts = [_StubStatement(name=f"s{i}") for i in range(3)]
         for s in stmts:
+            s._started = True
             s._finished = True
         batch = StatementBatch.from_results(stmts)
-        # No pool active — wait should return cleanly.
         batch.wait(wait=False)
 
 
