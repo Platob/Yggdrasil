@@ -30,10 +30,19 @@ def _default_tzdata_path() -> Path:
 
 
 def _canary() -> bool:
-    """Exercise the tzdata path the real error hits: create + cast a tz array."""
+    """Exercise the tzdata path the real error hits.
+
+    ``pa.array(..., type=timestamp(tz=...))`` only tags metadata — it doesn't
+    touch the tz database. ``compute.assume_timezone`` actually resolves the
+    zone, which is the call that raises
+    ``ArrowInvalid: Unable to get Timezone database version`` on Windows
+    when tzdata is missing.
+    """
     try:
-        arr = pyarrow.array([0], type=pyarrow.timestamp("ns", tz="UTC"))
-        arr.cast(pyarrow.timestamp("ns", tz="America/New_York"))
+        import pyarrow.compute as pc
+
+        naive = pyarrow.array([0], type=pyarrow.timestamp("ns"))
+        pc.assume_timezone(naive, "UTC")
         return True
     except Exception:
         return False
