@@ -456,25 +456,44 @@ class Table(GrantsMixin):
             raise ValueError(f"Column {name!r} not found in {self!r}")
         return None
 
-    @property
-    def data_schema(self) -> DataSchema:
-        """Return the field schema enriched with UC metadata.
+    def collect_schema(self, full: bool = False) -> DataSchema:
+        """Return the field schema, optionally enriched with UC metadata.
 
-        Per-field tags stamped by this method:
+        ``full=False`` (default) is the cheap, round-trip-free path: only
+        the cached column infos are consulted, and the resulting schema
+        carries the table-level identity metadata (``name``, ``engine``,
+        ``catalog_name``, ``schema_name``, ``table_name``).
+
+        ``full=True`` triggers the enriched view used for governance and
+        merge planning — it pulls ``TableInfo.table_constraints`` and the
+        lazy tag caches (fetching them on demand) to stamp each column:
 
         - ``primary_key`` — ``b"true"`` when the field is part of the
           table's PRIMARY KEY constraint.
         - ``foreign_key`` — ``b"<catalog>.<schema>.<ref_table>.<ref_col>"``
           for any column that is the child of a FOREIGN KEY constraint.
-        - any user-assigned tag keys from
-          :attr:`column_tags` (one ``EntityTagAssignment`` → one
-          ``tag_key``/``tag_value`` pair on the field).
+        - any user-assigned ``EntityTagAssignment`` (one ``tag_key`` →
+          one field tag).
 
-        Schema-level metadata picks up ``tag:<key>`` entries for each
-        table-level tag assignment, plus ``primary_key`` /
-        ``foreign_key`` lists so downstream consumers can rebuild the
-        full constraint graph without extra round trips.
+        Schema-level metadata also picks up ``tag:<key>`` entries for
+        each table-level tag and ``primary_key`` / ``foreign_key``
+        summaries so downstream consumers can rebuild the full
+        constraint graph without extra round trips.
         """
+        metadata: dict[bytes, bytes] = {
+            b"name": self.table_name.encode(),
+            b"engine": b"databricks",
+            b"catalog_name": self.catalog_name.encode(),
+            b"schema_name": self.schema_name.encode(),
+            b"table_name": self.table_name.encode(),
+        }
+
+        if not full:
+            return DataSchema.from_any_fields(
+                [c.field for c in self.columns],
+                metadata=metadata,
+            )
+
         pk_columns, fk_refs = self._constraint_summary()
         col_tags = self.column_tags
 
@@ -507,13 +526,6 @@ class Table(GrantsMixin):
             else:
                 fields.append(base)
 
-        metadata: dict[bytes, bytes] = {
-            b"name": self.table_name.encode(),
-            b"engine": b"databricks",
-            b"catalog_name": self.catalog_name.encode(),
-            b"schema_name": self.schema_name.encode(),
-            b"table_name": self.table_name.encode(),
-        }
         if pk_columns:
             metadata[b"primary_key"] = ",".join(pk_columns).encode("utf-8")
         if fk_refs:
@@ -530,6 +542,10 @@ class Table(GrantsMixin):
             metadata[f"tag:{key}".encode("utf-8")] = str(value).encode("utf-8")
 
         return DataSchema.from_any_fields(fields, metadata=metadata)
+
+    def collect_data_field(self, full: bool = False) -> Field:
+        """Return the struct :class:`Field` rollup of :meth:`collect_schema`."""
+        return self.collect_schema(full=full).to_field()
 
     def _constraint_summary(
         self,
@@ -570,20 +586,16 @@ class Table(GrantsMixin):
         return pk_columns, fk_refs
 
     @property
-    def data_field(self):
-        return self.data_schema.to_field()
-
-    @property
     def arrow_fields(self) -> list[pa.Field]:
         return [c.field.to_arrow_field() for c in self.columns]
 
     @property
     def arrow_schema(self) -> pa.Schema:
-        return self.data_schema.to_arrow_schema()
+        return self.collect_schema().to_arrow_schema()
 
     @property
     def arrow_field(self) -> pa.Field:
-        return self.data_field.to_arrow_field()
+        return self.collect_data_field().to_arrow_field()
 
     # =========================================================================
     # Constraint helpers — public ALTER TABLE DDL builders
