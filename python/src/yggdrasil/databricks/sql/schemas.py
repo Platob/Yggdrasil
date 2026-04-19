@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from typing import Iterator, Optional, Union
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -39,6 +38,7 @@ from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .catalog import Catalog
 from .schema import Schema
+from .sql_utils import is_glob_pattern, name_matcher
 from .table import Table
 
 __all__ = ["Schemas"]
@@ -207,16 +207,18 @@ class Schemas(DatabricksService):
 
         Args:
             name:         Optional schema-name filter.  When it contains ``*``,
-                          matching uses a case-insensitive glob.
+                          matching uses a case-insensitive glob (e.g.
+                          ``"sales_*"``, ``"*_raw"``, ``"*"``).
             catalog_name: Catalog to list (falls back to ``self.catalog_name``).
-                          When both are ``None`` the iteration fans out across
-                          every visible catalog.
+                          When ``None`` the iteration fans out across every
+                          visible catalog.  When it contains ``*`` the
+                          iteration fans out across catalogs matching the glob.
             use_cache:    Populate ``_SCHEMA_INFO_CACHE`` from results.
         """
         catalog_name = catalog_name if catalog_name is not None else self.catalog_name
 
-        if catalog_name is None:
-            for cat in self.client.catalogs.list(use_cache=use_cache):
+        if catalog_name is None or is_glob_pattern(catalog_name):
+            for cat in self.client.catalogs.list(name=catalog_name, use_cache=use_cache):
                 yield from self.list(
                     name=name,
                     catalog_name=cat.catalog_name,
@@ -225,16 +227,11 @@ class Schemas(DatabricksService):
             return
 
         uc = self.client.workspace_client().schemas
-        glob_name = name.casefold() if isinstance(name, str) and "*" in name else None
+        matcher = name_matcher(name)
 
         for info in uc.list(catalog_name=catalog_name):
-            if name is not None:
-                info_name = info.name or ""
-                if glob_name is not None:
-                    if not fnmatchcase(info_name.casefold(), glob_name):
-                        continue
-                elif info_name != name:
-                    continue
+            if matcher is not None and not matcher(info.name):
+                continue
 
             sch = Schema(
                 service=self,

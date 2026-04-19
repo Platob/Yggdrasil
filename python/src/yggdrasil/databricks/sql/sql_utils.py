@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import base64
 import re
-from typing import Any
+from fnmatch import fnmatchcase
+from typing import Any, Callable, Optional
 import hashlib
 
 __all__ = [
@@ -14,6 +15,8 @@ __all__ = [
     "_build_table_constraints_sql",
     "_qualify_fk_ref",
     "databricks_tag_literal",
+    "is_glob_pattern",
+    "name_matcher",
     "normalize_databricks_collation",
     "_safe_constraint_name",
     "_safe_str",
@@ -24,6 +27,28 @@ __all__ = [
     "quote_principal",
     "sql_literal",
 ]
+
+
+def is_glob_pattern(value: Any) -> bool:
+    """Return ``True`` when *value* is a string carrying a ``*`` wildcard."""
+    return isinstance(value, str) and "*" in value
+
+
+def name_matcher(pattern: str | None) -> Optional[Callable[[str | None], bool]]:
+    """Build a predicate for filtering resource names with optional globbing.
+
+    * ``None`` → ``None`` (caller skips filtering entirely).
+    * No ``*`` → exact-match predicate (case-sensitive).
+    * Contains ``*`` → case-insensitive :func:`fnmatch.fnmatchcase` predicate.
+
+    The predicate accepts ``None`` defensively and treats it as an empty name.
+    """
+    if pattern is None:
+        return None
+    if "*" in pattern:
+        folded = pattern.casefold()
+        return lambda name: fnmatchcase((name or "").casefold(), folded)
+    return lambda name: name == pattern
 
 DEFAULT_TAG_COLLATION = None
 _COLLATION_SUFFIXES = ("CI", "AI", "RTRIM")

@@ -35,6 +35,7 @@ from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .catalog import Catalog
 from .schema import Schema
+from .sql_utils import name_matcher
 from .table import Table
 
 __all__ = ["Catalogs"]
@@ -129,13 +130,25 @@ class Catalogs(DatabricksService):
 
     # ── listing ───────────────────────────────────────────────────────────────
 
-    def list(self, *, use_cache: bool = True) -> Iterator[Catalog]:
-        """Iterate over all visible catalogs, populating the local cache.
+    def list(
+        self,
+        name: str | None = None,
+        *,
+        use_cache: bool = True,
+    ) -> Iterator[Catalog]:
+        """Iterate over visible catalogs, populating the local cache.
 
         Args:
+            name:      Optional catalog-name filter.  When it contains ``*``,
+                       matching uses a case-insensitive glob (e.g. ``"prod_*"``,
+                       ``"*_raw"``, ``"*"``).  Without ``*`` it's an exact match.
             use_cache: Populate ``_CATALOG_INFO_CACHE`` from results.
         """
+        matcher = name_matcher(name)
         for info in self.client.workspace_client().catalogs.list():
+            if matcher is not None and not matcher(info.name):
+                continue
+
             cat = Catalog(service=self, catalog_name=info.name)
             object.__setattr__(cat, "_infos", info)
 
