@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+
 from databricks.sdk.service.catalog import CatalogInfo, SchemaInfo, TableInfo
 
 from yggdrasil.databricks.client import DatabricksClient
@@ -177,4 +178,78 @@ class TestTablesList:
         result = list(tables.list_tables(name="*"))
 
         assert [t.table_name for t in result] == ["a", "b"]
+
+
+class TestTablesGetitem:
+    def test_1part_uses_service_defaults(self, tables):
+        result = tables["orders"]
+        assert isinstance(result, Table)
+        assert result.catalog_name == "main"
+        assert result.schema_name == "sales"
+        assert result.table_name == "orders"
+
+    def test_1part_without_defaults_raises(self, mock_client):
+        svc = Tables(client=mock_client)
+        with pytest.raises(ValueError, match="default catalog_name"):
+            _ = svc["orders"]
+
+    def test_2part_uses_catalog_default(self, tables):
+        result = tables["analytics.events"]
+        assert isinstance(result, Table)
+        assert result.catalog_name == "main"
+        assert result.schema_name == "analytics"
+        assert result.table_name == "events"
+
+    def test_2part_without_catalog_default_raises(self, mock_client):
+        svc = Tables(client=mock_client)
+        with pytest.raises(ValueError, match="default catalog_name"):
+            _ = svc["analytics.events"]
+
+    def test_3part_fully_qualified(self, mock_client):
+        svc = Tables(client=mock_client)
+        result = svc["main.sales.orders"]
+        assert isinstance(result, Table)
+        assert (result.catalog_name, result.schema_name, result.table_name) == (
+            "main", "sales", "orders",
+        )
+
+    def test_4part_delegates_to_columns_service(self, tables, mock_client):
+        mock_columns = MagicMock()
+        mock_client.columns = mock_columns
+        result = tables["main.sales.orders.price"]
+        mock_columns.column.assert_called_once_with("main.sales.orders.price")
+        assert result is mock_columns.column.return_value
+
+    def test_backticks_stripped(self, tables):
+        result = tables["`analytics`.`events`"]
+        assert result.schema_name == "analytics"
+        assert result.table_name == "events"
+
+    def test_too_many_parts_raises(self, tables):
+        with pytest.raises(KeyError, match="1- to 4-part"):
+            _ = tables["a.b.c.d.e"]
+
+
+class TestTablesIter:
+    def test_iter_delegates_to_list_tables(self, tables, mock_ws):
+        mock_ws.tables.list.return_value = [
+            _tbl_info("orders"),
+            _tbl_info("customers"),
+        ]
+        result = list(iter(tables))
+        assert [t.table_name for t in result] == ["orders", "customers"]
+
+
+class TestTablesSetitem:
+    def test_setitem_renames_table_via_defaults(self, tables, mock_client):
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        tables["orders"] = "orders_v2"
+
+        mock_engine.execute.assert_called_once()
+        stmt = mock_engine.execute.call_args[0][0]
+        assert "ALTER TABLE" in stmt
+        assert "`main`.`sales`.`orders`" in stmt
+        assert "RENAME TO `orders_v2`" in stmt
 

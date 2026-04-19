@@ -10,11 +10,14 @@ Hierarchy
 ---------
 ::
 
-    client.catalogs["main"]               # Catalog
-    client.catalogs["main"]["sales"]      # Schema
-    client.catalogs["main.sales"]         # Schema  (dot-separated shorthand)
-    client.catalogs["main"]["sales"]["orders"]  # Table
-    client.catalogs.list()                # Iterator[Catalog]
+    client.catalogs["main"]                            # Catalog
+    client.catalogs["main"]["sales"]                   # Schema
+    client.catalogs["main.sales"]                      # Schema  (dot-separated shorthand)
+    client.catalogs["main"]["sales"]["orders"]         # Table
+    client.catalogs["main.sales.orders"]               # Table
+    client.catalogs["main"]["sales"]["orders"]["price"]  # Column
+    client.catalogs["main.sales.orders.price"]         # Column
+    client.catalogs.list_catalogs()                    # Iterator[Catalog]
 
 Caching strategy
 ----------------
@@ -34,6 +37,7 @@ from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .catalog import Catalog
+from .column import Column
 from .schema import Schema
 from .sql_utils import name_matcher
 from .table import Table
@@ -50,26 +54,28 @@ _CATALOG_INFO_CACHE: ExpiringDict[str, CatalogInfo] = ExpiringDict(default_ttl=3
 class Catalogs(DatabricksService):
     """Collection-level service for Unity Catalog catalogs and schemas.
 
-    Provides a dict-like interface for the three-level UC hierarchy::
+    Provides a dict-like interface for the full UC hierarchy::
 
         catalogs = client.catalogs
 
-        # navigate by subscript
-        catalog = catalogs["main"]                  # Catalog
-        schema  = catalogs["main"]["sales"]         # Schema
-        table   = catalogs["main"]["sales"]["orders"]  # Table
+        # navigate by subscript — each step returns the next level
+        catalog = catalogs["main"]                            # Catalog
+        schema  = catalogs["main"]["sales"]                   # Schema
+        table   = catalogs["main"]["sales"]["orders"]         # Table
+        column  = catalogs["main"]["sales"]["orders"]["price"]  # Column
 
         # shorthand dot-notation string
-        schema  = catalogs["main.sales"]            # Schema
-        table   = catalogs["main.sales.orders"]     # Table
+        schema  = catalogs["main.sales"]                      # Schema
+        table   = catalogs["main.sales.orders"]               # Table
+        column  = catalogs["main.sales.orders.price"]         # Column
 
         # explicit factory methods
-        catalog = catalogs.catalog("main")          # Catalog
-        schema  = catalogs.schema("main.sales")     # Schema
-        table   = catalogs.table("main.sales.orders")  # Table
+        catalog = catalogs.catalog("main")                    # Catalog
+        schema  = catalogs.schema("main.sales")               # Schema
+        table   = catalogs.table("main.sales.orders")         # Table
 
         # list
-        for cat in catalogs.list():
+        for cat in catalogs.list_catalogs():
             for sch in cat.schemas():
                 for tbl in sch.tables():
                     ...
@@ -77,19 +83,39 @@ class Catalogs(DatabricksService):
 
     # ── dict-like navigation ──────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> Union[Catalog, Schema, Table]:
-        """Route a 1-, 2-, or 3-part dotted name to the right resource.
+    def __getitem__(self, name: str) -> Union[Catalog, Schema, Table, Column]:
+        """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
 
-        * ``catalogs["main"]``               → :class:`Catalog`
-        * ``catalogs["main.sales"]``         → :class:`Schema`
-        * ``catalogs["main.sales.orders"]``  → :class:`Table`
+        * ``catalogs["main"]``                     → :class:`Catalog`
+        * ``catalogs["main.sales"]``               → :class:`Schema`
+        * ``catalogs["main.sales.orders"]``        → :class:`Table`
+        * ``catalogs["main.sales.orders.price"]``  → :class:`Column`
         """
         parts = [p.strip().strip("`") for p in name.split(".")]
         if len(parts) == 1:
             return self.catalog(parts[0])
         if len(parts) == 2:
             return self.schema(f"{parts[0]}.{parts[1]}")
-        return self.table(".".join(parts))
+        if len(parts) == 3:
+            return self.table(".".join(parts))
+        if len(parts) == 4:
+            return self.client.columns.column(".".join(parts))
+        raise KeyError(
+            f"Expected a 1- to 4-part dotted name (catalog[.schema[.table[.column]]]),"
+            f" got {name!r} with {len(parts)} parts"
+        )
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``catalogs[key] = "new"`` renames the resource identified by *key*.
+
+        *key* follows the same dotted routing as :meth:`__getitem__`; *new_name*
+        is the unqualified new name for the leaf (catalog, schema, table, or column).
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[Catalog]:
+        """Iterate over all visible catalogs (``self.list_catalogs()``)."""
+        return self.list_catalogs()
 
     # ── factory methods ───────────────────────────────────────────────────────
 
@@ -130,7 +156,7 @@ class Catalogs(DatabricksService):
 
     # ── listing ───────────────────────────────────────────────────────────────
 
-    def list(
+    def list_catalogs(
         self,
         name: str | None = None,
         *,

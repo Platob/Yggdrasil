@@ -34,6 +34,7 @@ from .table import Table, TableAllInfos
 
 if TYPE_CHECKING:
     from .catalog import Catalog
+    from .column import Column
     from .schema import Schema
 
 __all__ = ["Tables"]
@@ -93,6 +94,69 @@ class Tables(DatabricksService):
             schema_name=schema_name,
             table_name=table_name
         )
+
+    # -------------------------------------------------------------------------
+    # Dict-like navigation — uses catalog/schema defaults on the service
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> "Table | Column":
+        """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
+
+        Service defaults fill any missing leading parts.
+
+        * ``tables["orders"]``                      → :class:`Table` (needs ``catalog_name`` + ``schema_name`` defaults)
+        * ``tables["sales.orders"]``                → :class:`Table` (needs ``catalog_name`` default)
+        * ``tables["main.sales.orders"]``           → :class:`Table`
+        * ``tables["main.sales.orders.price"]``     → :class:`Column`
+        """
+        parts = [p.strip().strip("`") for p in name.split(".")]
+        n = len(parts)
+
+        if n == 4:
+            return self.client.columns.column(".".join(parts))
+
+        if n == 1:
+            if not (self.catalog_name and self.schema_name):
+                raise ValueError(
+                    f"Cannot resolve one-part table name {name!r} without"
+                    " default catalog_name + schema_name — set them on the"
+                    " service or pass a fully-qualified name."
+                )
+            return self.table(
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                table_name=parts[0],
+            )
+        if n == 2:
+            if not self.catalog_name:
+                raise ValueError(
+                    f"Cannot resolve two-part table name {name!r} without"
+                    " a default catalog_name — set it on the service or"
+                    " pass a three-part 'catalog.schema.table' name."
+                )
+            return self.table(
+                catalog_name=self.catalog_name,
+                schema_name=parts[0],
+                table_name=parts[1],
+            )
+        if n == 3:
+            return self.table(location=".".join(parts))
+
+        raise KeyError(
+            f"Expected a 1- to 4-part dotted name (table[.column] or"
+            f" catalog.schema.table[.column]), got {name!r} with {n} parts"
+        )
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``tables[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator["Table"]:
+        """Iterate over tables in the resolved catalog/schema scope."""
+        return self.list_tables()
 
     def parse_catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         parts = [_.strip("`") for _ in full_name.split(".")]
@@ -569,7 +633,7 @@ class Tables(DatabricksService):
         if catalog_name is None or is_glob_pattern(catalog_name):
             from .catalogs import Catalogs
 
-            for catalog in Catalogs(client=self.client).list(name=catalog_name):
+            for catalog in Catalogs(client=self.client).list_catalogs(name=catalog_name):
                 yield from self.list_tables(
                     name=name,
                     catalog_name=catalog.catalog_name,

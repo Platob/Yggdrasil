@@ -323,3 +323,22 @@ class Column:
         query = self.drop_foreign_key_ddl(if_exists=if_exists)
         self.engine.execute(query)
         return self
+
+    def rename(self, new_name: str) -> "Column":
+        """Rename this column in-place (``ALTER TABLE … RENAME COLUMN …``)."""
+        new_name = (new_name or "").strip().strip("`")
+        if not new_name:
+            raise ValueError("Cannot rename column to an empty name")
+        if new_name == self.name:
+            return self
+
+        self.engine.execute(
+            f"ALTER TABLE {self.table.full_name(safe=True)} "
+            f"RENAME COLUMN {self._qcol()} TO `{new_name}`"
+        )
+        # Frozen dataclass — mutate via object.__setattr__.
+        object.__setattr__(self, "name", new_name)
+        # Invalidate the parent table's column cache so the next lookup refetches.
+        if hasattr(self.table, "_reset_cache"):
+            self.table._reset_cache(invalidate_cache=True)
+        return self

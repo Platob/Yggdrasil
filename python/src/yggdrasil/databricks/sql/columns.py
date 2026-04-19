@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Iterator, Optional, TYPE_CHECKING
 
 from yggdrasil.databricks.client import DatabricksService
 
@@ -59,6 +59,30 @@ class Columns(DatabricksService):
     schema_name: str | None = None
     table_name: str | None = None
     column_name: str | None = None
+
+    # -------------------------------------------------------------------------
+    # Dict-like navigation — uses defaults on the service
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> "Column":
+        """Resolve a :class:`Column` from a 1- to 4-part dotted name.
+
+        Service defaults fill any missing leading parts.
+
+        * ``columns["price"]``                         → needs catalog + schema + table defaults
+        * ``columns["orders.price"]``                  → needs catalog + schema defaults
+        * ``columns["sales.orders.price"]``            → needs catalog default
+        * ``columns["main.sales.orders.price"]``       → fully qualified
+        """
+        return self.column(name)
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``columns[key] = "new"`` renames the resolved column."""
+        self.column(name).rename(new_name)
+
+    def __iter__(self) -> "Iterator[Column]":
+        """Iterate over the columns of the default table."""
+        return iter(self.list_columns())
 
     # -------------------------------------------------------------------------
     # Parsing

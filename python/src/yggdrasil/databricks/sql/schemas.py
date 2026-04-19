@@ -14,6 +14,7 @@ Hierarchy
     client.schemas["main.sales"]                 # Schema  (fully qualified)
     client.schemas["sales"]                      # Schema  (uses default catalog)
     client.schemas["main.sales.orders"]          # Table
+    client.schemas["main.sales.orders.price"]    # Column
     client.schemas.list()                        # Iterator[Schema]
     client.schemas.list(catalog_name="main")     # Iterator[Schema] in "main"
 
@@ -37,6 +38,7 @@ from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .catalog import Catalog
+from .column import Column
 from .schema import Schema
 from .sql_utils import is_glob_pattern, name_matcher
 from .table import Table
@@ -106,12 +108,13 @@ class Schemas(DatabricksService):
 
     # ── dict-like navigation ──────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> Union[Schema, Table]:
-        """Route a 1-, 2-, or 3-part dotted name to the right resource.
+    def __getitem__(self, name: str) -> Union[Schema, Table, Column]:
+        """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
 
-        * ``schemas["sales"]``                → :class:`Schema`  (uses ``self.catalog_name``)
-        * ``schemas["main.sales"]``           → :class:`Schema`
-        * ``schemas["main.sales.orders"]``    → :class:`Table`
+        * ``schemas["sales"]``                      → :class:`Schema`  (uses ``self.catalog_name``)
+        * ``schemas["main.sales"]``                 → :class:`Schema`
+        * ``schemas["main.sales.orders"]``          → :class:`Table`
+        * ``schemas["main.sales.orders.price"]``    → :class:`Column`
         """
         parts = [p.strip().strip("`") for p in name.split(".")]
         if len(parts) == 1:
@@ -124,7 +127,25 @@ class Schemas(DatabricksService):
             return self.schema(f"{self.catalog_name}.{parts[0]}")
         if len(parts) == 2:
             return self.schema(f"{parts[0]}.{parts[1]}")
-        return self.table(".".join(parts))
+        if len(parts) == 3:
+            return self.table(".".join(parts))
+        if len(parts) == 4:
+            return self.client.columns.column(".".join(parts))
+        raise KeyError(
+            f"Expected a 1- to 4-part dotted name (schema[.table[.column]] or"
+            f" catalog.schema[.table[.column]]), got {name!r} with {len(parts)} parts"
+        )
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``schemas[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[Schema]:
+        """Iterate over schemas in the resolved catalog scope (``self.list()``)."""
+        return self.list()
 
     # ── factory methods ───────────────────────────────────────────────────────
 
@@ -218,7 +239,7 @@ class Schemas(DatabricksService):
         catalog_name = catalog_name if catalog_name is not None else self.catalog_name
 
         if catalog_name is None or is_glob_pattern(catalog_name):
-            for cat in self.client.catalogs.list(name=catalog_name, use_cache=use_cache):
+            for cat in self.client.catalogs.list_catalogs(name=catalog_name, use_cache=use_cache):
                 yield from self.list(
                     name=name,
                     catalog_name=cat.catalog_name,

@@ -74,6 +74,14 @@ class Catalog(GrantsMixin):
         """``catalog["schema_name"]`` → :class:`Schema`."""
         return self.schema(name)
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``catalog["old_schema"] = "new_schema"`` renames a child schema."""
+        self.schema(name).rename(new_name)
+
+    def __iter__(self) -> Iterator["Schema"]:
+        """Iterate over every schema in this catalog."""
+        return self.schemas()
+
     # ── URL ───────────────────────────────────────────────────────────────────
 
     @property
@@ -343,6 +351,24 @@ class Catalog(GrantsMixin):
         info = self.client.workspace_client().catalogs.update(
             name=self.catalog_name, **kwargs
         )
+        object.__setattr__(self, "_infos", info)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
+        return self
+
+    # ── rename ────────────────────────────────────────────────────────────────
+
+    def rename(self, new_name: str) -> "Catalog":
+        """Rename this catalog in-place (``ALTER CATALOG … RENAME TO …``)."""
+        new_name = (new_name or "").strip().strip("`")
+        if not new_name:
+            raise ValueError("Cannot rename catalog to an empty name")
+        if new_name == self.catalog_name:
+            return self
+
+        info = self.client.workspace_client().catalogs.update(
+            name=self.catalog_name, new_name=new_name,
+        )
+        self.catalog_name = new_name
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self

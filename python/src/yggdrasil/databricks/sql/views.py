@@ -39,6 +39,7 @@ from .view import View
 
 if TYPE_CHECKING:
     from .catalog import Catalog
+    from .column import Column
     from .schema import Schema
 
 __all__ = ["Views"]
@@ -105,6 +106,67 @@ class Views(DatabricksService):
             schema_name=schema_name,
             view_name=view_name,
         )
+
+    # ── dict-like navigation — uses catalog/schema defaults ──────────────────
+
+    def __getitem__(self, name: str) -> "View | Column":
+        """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
+
+        Service defaults fill any missing leading parts.
+
+        * ``views["orders_summary"]``                     → :class:`View` (needs ``catalog_name`` + ``schema_name`` defaults)
+        * ``views["sales.orders_summary"]``               → :class:`View` (needs ``catalog_name`` default)
+        * ``views["main.sales.orders_summary"]``          → :class:`View`
+        * ``views["main.sales.orders_summary.price"]``    → :class:`Column`
+        """
+        parts = [p.strip().strip("`") for p in name.split(".")]
+        n = len(parts)
+
+        if n == 4:
+            return self.client.columns.column(".".join(parts))
+
+        if n == 1:
+            if not (self.catalog_name and self.schema_name):
+                raise ValueError(
+                    f"Cannot resolve one-part view name {name!r} without"
+                    " default catalog_name + schema_name — set them on the"
+                    " service or pass a fully-qualified name."
+                )
+            return self.view(
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                view_name=parts[0],
+            )
+        if n == 2:
+            if not self.catalog_name:
+                raise ValueError(
+                    f"Cannot resolve two-part view name {name!r} without"
+                    " a default catalog_name — set it on the service or"
+                    " pass a three-part 'catalog.schema.view' name."
+                )
+            return self.view(
+                catalog_name=self.catalog_name,
+                schema_name=parts[0],
+                view_name=parts[1],
+            )
+        if n == 3:
+            return self.view(location=".".join(parts))
+
+        raise KeyError(
+            f"Expected a 1- to 4-part dotted name (view[.column] or"
+            f" catalog.schema.view[.column]), got {name!r} with {n} parts"
+        )
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``views[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[View]:
+        """Iterate over views in the resolved catalog/schema scope."""
+        return self.list_views()
 
     # ── name parsing ──────────────────────────────────────────────────────────
 
@@ -406,7 +468,7 @@ class Views(DatabricksService):
         if catalog_name is None or is_glob_pattern(catalog_name):
             from .catalogs import Catalogs
 
-            for catalog in Catalogs(client=self.client).list(name=catalog_name):
+            for catalog in Catalogs(client=self.client).list_catalogs(name=catalog_name):
                 yield from self.list_views(
                     name=name,
                     catalog_name=catalog.catalog_name,

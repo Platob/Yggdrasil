@@ -118,6 +118,19 @@ class View(GrantsMixin):
     def __getitem__(self, item: str) -> Column:
         return self.column(item)
 
+    def __setitem__(self, item: str, new_name: str) -> None:
+        """``view["old_col"] = "new_col"`` renames a column.
+
+        Renaming view columns requires the view to expose a persisted ``ALTER``
+        path; Databricks supports this for :data:`TableType.VIEW` via
+        ``ALTER VIEW … RENAME COLUMN``.
+        """
+        self.column(item).rename(new_name)
+
+    def __iter__(self) -> Iterable[Column]:
+        """Iterate over the columns of this view."""
+        return iter(self.columns)
+
     # ── parsing ───────────────────────────────────────────────────────────────
 
     @classmethod
@@ -464,6 +477,27 @@ class View(GrantsMixin):
             Job.make(self.sql.execute, statement).fire_and_forget()
 
         self._reset_cache(invalidate_cache=True)
+        return self
+
+    # ── rename ────────────────────────────────────────────────────────────────
+
+    def rename(self, new_name: str) -> "View":
+        """Rename this view in-place (``ALTER VIEW … RENAME TO …``).
+
+        The catalog/schema parent is unchanged; *new_name* is the unqualified name.
+        """
+        new_name = (new_name or "").strip().strip("`")
+        if not new_name:
+            raise ValueError("Cannot rename view to an empty name")
+        if new_name == self.view_name:
+            return self
+
+        self.sql.execute(
+            f"ALTER VIEW {self.full_name(safe=True)} "
+            f"RENAME TO {quote_ident(new_name)}"
+        )
+        self._reset_cache(invalidate_cache=True)
+        self.view_name = new_name
         return self
 
     # ── tags ──────────────────────────────────────────────────────────────────
