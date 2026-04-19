@@ -589,6 +589,21 @@ class DataType(BaseChildrenFields, ABC):
                 typed_nulls = pa.chunked_array([typed_nulls], type=self.to_arrow())
             return opts.fill_arrow_nulls(typed_nulls)
 
+        # Source-driven outgoing cast: categorical/ISO types can translate
+        # themselves into numeric / temporal / etc. representations using
+        # domain knowledge that the generic pc.cast can't recover.  The hook
+        # returns None when the source has no special handling for this
+        # target, and we fall through to the standard target-side pipeline.
+        if src_field is not None:
+            try:
+                forwarded = src_field.dtype._outgoing_cast_arrow_array(array, self, opts)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
+                raise ValueError(
+                    f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}"
+                ) from e
+            if forwarded is not None:
+                return opts.fill_arrow_nulls(forwarded)
+
         try:
             if isinstance(array, pa.ChunkedArray):
                 return self._cast_chunked_array(array, opts)
@@ -628,6 +643,21 @@ class DataType(BaseChildrenFields, ABC):
             return pa.chunked_array(chunks, type=dtype)
 
         return pc.if_else(pc.equal(array, empty), null_scalar, array)
+
+    def _outgoing_cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        target: "DataType",
+        options: "CastOptions",
+    ) -> pa.Array | pa.ChunkedArray | None:
+        """Optional hook: cast *from* this type to *target* using source-specific knowledge.
+
+        Override on categorical source types (ISO codes, enums, dictionaries)
+        to translate into numeric / temporal / etc. representations that the
+        generic ``pc.cast`` pipeline can't recover.  Return ``None`` to defer
+        to the standard target-side pipeline.
+        """
+        return None
 
     def _cast_arrow_array(
         self,
@@ -688,6 +718,19 @@ class DataType(BaseChildrenFields, ABC):
             return self.fill_polars_array_nulls(
                 casted, nullable=self._target_nullable(opts)
             )
+
+        # Source-driven outgoing cast: delegate through Arrow when the
+        # source has categorical knowledge (ISO tables, enums) that Polars'
+        # ``cast`` / ``replace_strict`` can't recover on its own.  Eager
+        # ``pl.Series`` only — lazy ``pl.Expr`` has no in-band source dtype.
+        if src_field is not None and isinstance(series, pl.Series):
+            arrow_in = series.to_arrow()
+            forwarded = src_field.dtype._outgoing_cast_arrow_array(arrow_in, self, opts)
+            if forwarded is not None:
+                casted = pl.Series(name=series.name, values=forwarded, dtype=self.to_polars())
+                return self.fill_polars_array_nulls(
+                    casted, nullable=self._target_nullable(opts)
+                )
 
         series = self._nullify_empty_polars_strings(series)
 

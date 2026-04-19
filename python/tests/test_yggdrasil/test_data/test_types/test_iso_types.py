@@ -767,6 +767,129 @@ class TestTimezoneTypeDict(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Cross-type (outgoing) casts from ISO sources.
+# ---------------------------------------------------------------------------
+
+
+class TestISOCrossTypeArrow(ArrowTestCase):
+    """ISO code arrays should cast cleanly to numeric / string / duration
+    targets through the ``_outgoing_cast_arrow_array`` hook on the source type.
+    """
+
+    def _field(self, name, dtype):
+        from yggdrasil.data.data_field import Field
+        return Field(name=name, dtype=dtype)
+
+    def test_country_alpha2_to_int(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("n", IntegerType(byte_size=4, signed=True))
+        arr = pa.array(["FR", "US", "DE", None, "JP", "XX"])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [250, 840, 276, None, 392, None])
+        self.assertEqual(out.type, pa.int32())
+
+    def test_country_alpha3_to_int(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("c", ISOCountryType(alpha=3))
+        tgt = self._field("n", IntegerType(byte_size=2, signed=True))
+        arr = pa.array(["FRA", "USA", "DEU", None])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [250, 840, 276, None])
+        self.assertEqual(out.type, pa.int16())
+
+    def test_country_alpha_crossover(self):
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("c3", ISOCountryType(alpha=3))
+        arr = pa.array(["FR", "US", None, "DE"])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), ["FRA", "USA", None, "DEU"])
+
+    def test_country_to_float(self):
+        from yggdrasil.data.types import FloatingPointType
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("f", FloatingPointType(byte_size=8))
+        arr = pa.array(["FR", "US", None])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [250.0, 840.0, None])
+
+    def test_currency_to_int(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("ccy", ISOCurrencyType())
+        tgt = self._field("n", IntegerType(byte_size=4, signed=True))
+        arr = pa.array(["USD", "EUR", "JPY", None, "GBP", "NOTACCY"])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [840, 978, 392, None, 826, None])
+
+    def test_timezone_to_duration_seconds(self):
+        from yggdrasil.data.types import DurationType
+        src = self._field("tz", TimezoneType())
+        tgt = self._field("d", DurationType(byte_size=8, unit="s"))
+        arr = pa.array(["UTC", "+05:30", "-08:00", None])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        import datetime as dt
+        self.assertEqual(
+            out.to_pylist(),
+            [
+                dt.timedelta(0),
+                dt.timedelta(hours=5, minutes=30),
+                dt.timedelta(hours=-8),
+                None,
+            ],
+        )
+
+    def test_timezone_to_int_seconds(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("tz", TimezoneType())
+        tgt = self._field("n", IntegerType(byte_size=8, signed=True))
+        arr = pa.array(["UTC", "+05:30", "-08:00", None])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [0, 19800, -28800, None])
+
+    def test_outgoing_cast_preserves_chunks(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("n", IntegerType(byte_size=4, signed=True))
+        arr = pa.chunked_array([["FR", "US"], [None, "DE"]])
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertIsInstance(out, pa.ChunkedArray)
+        self.assertEqual(out.to_pylist(), [250, 840, None, 276])
+
+    def test_outgoing_cast_empty(self):
+        from yggdrasil.data.types import IntegerType
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("n", IntegerType(byte_size=4, signed=True))
+        arr = pa.array([], type=pa.string())
+        out = tgt.dtype.cast_arrow_array(arr, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_pylist(), [])
+        self.assertEqual(out.type, pa.int32())
+
+
+class TestISOCrossTypePolars(PolarsTestCase):
+    def _field(self, name, dtype):
+        from yggdrasil.data.data_field import Field
+        return Field(name=name, dtype=dtype)
+
+    def test_country_to_int(self):
+        from yggdrasil.data.types import IntegerType
+        pl = self.pl
+        src = self._field("c", ISOCountryType(alpha=2))
+        tgt = self._field("c", IntegerType(byte_size=4, signed=True))
+        s = pl.Series("c", ["FR", "US", "DE", None])
+        out = tgt.dtype.cast_polars_series(s, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_list(), [250, 840, 276, None])
+
+    def test_currency_to_int(self):
+        from yggdrasil.data.types import IntegerType
+        pl = self.pl
+        src = self._field("ccy", ISOCurrencyType())
+        tgt = self._field("ccy", IntegerType(byte_size=4, signed=True))
+        s = pl.Series("ccy", ["USD", "EUR", "JPY"])
+        out = tgt.dtype.cast_polars_series(s, source_field=src, target_field=tgt)
+        self.assertEqual(out.to_list(), [840, 978, 392])
+
+
 class TestISOTypeFrameworks(ArrowTestCase):
     def test_to_arrow(self):
         for t in (
