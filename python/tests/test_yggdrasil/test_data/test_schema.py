@@ -9,7 +9,7 @@ from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema, schema
 from yggdrasil.data.types.nested import StructType
-from yggdrasil.data.types.primitive import IntegerType, StringType
+from yggdrasil.data.types.primitive import IntegerType, StringType, TimestampType
 from yggdrasil.polars.tests import PolarsTestCase
 from yggdrasil.spark.tests import SparkTestCase
 
@@ -489,6 +489,46 @@ def test_autotag_returns_new_schema_and_updates_metadata_tags():
     assert list(out.keys()) == ["a"]
     assert out.metadata is not None
     assert out.metadata != s.metadata or out.metadata is s.metadata
+
+
+def test_autotag_propagates_dtype_and_field_tags_per_column():
+    s = schema(
+        [
+            _field_int("user_id", nullable=False),
+            _field_str("email"),
+            Field(
+                "created_at",
+                TimestampType(unit="us", tz="UTC"),
+                nullable=False,
+            ),
+        ],
+        metadata={"primary_key": "user_id"},
+    )
+
+    out = s.autotag(tags={"layer": "silver"})
+
+    id_tags = out["user_id"].tags or {}
+    assert id_tags[b"type_id"] == b"INTEGER"
+    assert id_tags[b"type_class"] == b"numeric"
+    assert id_tags[b"numeric_kind"] == b"integer"
+    assert id_tags[b"signed"] == b"true"
+    assert id_tags[b"nullable"] == b"false"
+    assert id_tags[b"role"] == b"identifier"
+    assert id_tags[b"primary_key"] == b"true"
+
+    email_tags = out["email"].tags or {}
+    assert email_tags[b"type_class"] == b"text"
+    assert email_tags[b"pii"] == b"email"
+
+    ts_tags = out["created_at"].tags or {}
+    assert ts_tags[b"type_class"] == b"temporal"
+    assert ts_tags[b"temporal_kind"] == b"timestamp"
+    assert ts_tags[b"tz_aware"] == b"true"
+    assert ts_tags[b"timezone"] == b"UTC"
+    assert ts_tags[b"role"] == b"audit_timestamp"
+
+    assert out.metadata is not None
+    assert out.metadata[b"t:layer"] == b"silver"
 
 
 def test_to_arrow_schema():

@@ -155,6 +155,12 @@ class PrimitiveType(DataType, ABC):
             base["byte_size"] = self.byte_size
         return base
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        if self.byte_size is not None:
+            tags[b"byte_size"] = str(self.byte_size).encode("utf-8")
+        return tags
+
     def _merge_with_same_id(
         self,
         other: "DataType",
@@ -381,6 +387,16 @@ class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else b""
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        if self.byte_size is not None:
+            tags[b"fixed_width"] = b"true"
+        if self.large:
+            tags[b"large"] = b"true"
+        if self.view:
+            tags[b"view"] = b"true"
+        return tags
+
 
 _TEMPORAL_TYPE_IDS = frozenset(
     {
@@ -591,6 +607,14 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else ""
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        if self.large:
+            tags[b"large"] = b"true"
+        if self.view:
+            tags[b"view"] = b"true"
+        return tags
 
 
 @dataclass(frozen=True)
@@ -848,6 +872,12 @@ class IntegerType(NumericType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"numeric_kind"] = b"integer"
+        tags[b"signed"] = b"true" if self.signed else b"false"
+        return tags
+
 
 @dataclass(frozen=True)
 class FloatingPointType(NumericType):
@@ -951,6 +981,11 @@ class FloatingPointType(NumericType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0.0
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"numeric_kind"] = b"float"
+        return tags
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1117,13 @@ class DecimalType(NumericType):
             return None
         from decimal import Decimal
         return Decimal(0)
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"numeric_kind"] = b"decimal"
+        tags[b"precision"] = str(self.precision).encode("utf-8")
+        tags[b"scale"] = str(self.scale).encode("utf-8")
+        return tags
 
 
 _TEMPORAL_UNIT_ORDER = {
@@ -1340,6 +1382,17 @@ class TemporalType(PrimitiveType, ABC):
             "unit": self.unit,
             "tz": self.tz,
         }
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"temporal_kind"] = self.type_id.name.lower().encode("utf-8")
+        if self.unit:
+            tags[b"unit"] = self.unit.encode("utf-8")
+        if self.type_id == DataTypeId.TIMESTAMP:
+            tags[b"tz_aware"] = b"true" if self.tz else b"false"
+            if self.tz:
+                tags[b"timezone"] = self.tz.encode("utf-8")
+        return tags
 
 
 @dataclass(frozen=True)

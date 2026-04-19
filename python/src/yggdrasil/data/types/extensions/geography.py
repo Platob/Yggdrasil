@@ -393,6 +393,13 @@ class GeographyType(DataType):
             d["model"] = self.model
         return d
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"srid"] = str(self.srid).encode("utf-8")
+        if self.model:
+            tags[b"model"] = self.model.encode("utf-8")
+        return tags
+
     # ------------------------------------------------------------------
     # Merge
     # ------------------------------------------------------------------

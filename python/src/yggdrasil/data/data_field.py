@@ -50,6 +50,36 @@ _TYPE_JSON_METADATA_KEY = b"to_json"
 _NONE_TYPE = type(None)
 
 
+# Name-based heuristics for Field.autotag(). These are intentionally
+# conservative: they fire on common, unambiguous column-name patterns that
+# downstream Unity Catalog governance (tag-based policies, masking rules,
+# lineage dashboards) can key off without touching column values.
+#
+# Each entry is (tag_key, predicate). The first matching predicate per key
+# wins; later entries for the same key are ignored so more specific patterns
+# take precedence over generic ones.
+_FIELD_NAME_HEURISTICS: tuple[tuple[bytes, bytes, tuple[str, ...], tuple[str, ...]], ...] = (
+    # (tag_key, tag_value, suffix_matches, substring_matches)
+    (b"pii", b"email",   ("_email", "email_"),   ("email",)),
+    (b"pii", b"phone",   ("_phone", "phone_"),   ("phone_number", "phonenumber")),
+    (b"pii", b"ssn",     ("_ssn",),              ("ssn", "social_security")),
+    (b"pii", b"address", ("_address",),          ("street_address", "mailing_address")),
+    (b"pii", b"name",    ("_first_name", "_last_name", "_full_name"), ("first_name", "last_name", "full_name")),
+    (b"sensitive", b"secret", ("_secret", "_token", "_api_key"), ("password", "secret", "api_key", "access_token", "refresh_token", "private_key")),
+)
+
+# Exact matches / suffixes that stamp the field as an identifier column.
+_IDENTIFIER_SUFFIXES: tuple[str, ...] = ("_id", "_uuid", "_key")
+_IDENTIFIER_EXACT: frozenset[str] = frozenset({"id", "uuid", "pk", "rowid", "row_id"})
+
+# Common audit-timestamp name patterns.
+_AUDIT_TIMESTAMP_EXACT: frozenset[str] = frozenset({
+    "created_at", "updated_at", "deleted_at", "modified_at",
+    "inserted_at", "event_time", "event_timestamp", "ingested_at",
+})
+_AUDIT_TIMESTAMP_SUFFIXES: tuple[str, ...] = ("_at", "_timestamp")
+
+
 def _attach_type_json_metadata(
     arrow_type: pa.DataType,
     metadata: dict[bytes, bytes] | None,
@@ -501,6 +531,47 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def autotag(self) -> "Field":
+        """Stamp this field with tags derived from its dtype, nullability, and name.
+
+        Writes Databricks-friendly auto-tags in place:
+
+        - Everything from :meth:`DataType.autotag` (``type_id``, ``type_class``,
+          and type-specific detail like ``precision`` / ``unit`` / ``timezone``).
+        - ``nullable`` and ``has_default`` for data-quality policies.
+        - Name-based heuristics for governance: ``role=identifier`` for
+          ``*_id`` / ``*_uuid``, ``role=audit_timestamp`` for ``created_at`` /
+          ``updated_at`` patterns, plus ``pii`` / ``sensitive`` stamps for
+          columns that obviously carry personal or credential data.
+
+        The field is returned for fluent chaining. Only the auto-derived
+        keys are written, so any custom tags set by the caller are left
+        intact. Calling ``autotag`` twice on the same field is idempotent
+        when the dtype and name are unchanged.
+        """
+        tags: dict[bytes, bytes] = dict(self.dtype.autotag())
+        tags[b"nullable"] = b"true" if self.nullable else b"false"
+        if self.has_default:
+            tags[b"has_default"] = b"true"
+
+        name = (self.name or "").strip().lower()
+        if name and name != DEFAULT_FIELD_NAME:
+            if name in _IDENTIFIER_EXACT or name.endswith(_IDENTIFIER_SUFFIXES):
+                tags[b"role"] = b"identifier"
+            elif (
+                name in _AUDIT_TIMESTAMP_EXACT
+                or name.endswith(_AUDIT_TIMESTAMP_SUFFIXES)
+            ):
+                tags[b"role"] = b"audit_timestamp"
+
+            for key, value, suffixes, substrings in _FIELD_NAME_HEURISTICS:
+                if key in tags:
+                    continue
+                if any(s in name for s in substrings) or (
+                    suffixes and name.endswith(suffixes)
+                ):
+                    tags[key] = value
+
+        self.update_tags(tags)
         return self
 
     @classmethod

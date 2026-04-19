@@ -513,6 +513,14 @@ class ISOType(DataType):
             "iso": type(self).iso_name,
         }
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        # ISO types sit on top of STRING; override to a more useful class so
+        # Databricks governance can reason about them as categorical codes.
+        tags[b"type_class"] = b"iso"
+        tags[b"iso"] = type(self).iso_name.encode("utf-8")
+        return tags
+
     # ------------------------------------------------------------------
     # Repr / str
     # ------------------------------------------------------------------
