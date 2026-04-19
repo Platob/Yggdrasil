@@ -50,7 +50,7 @@ import pyarrow as pa
 from yggdrasil.io.enums import MimeTypes, Codec, MediaType, MimeType, SaveMode
 from yggdrasil.pickle.serde import ObjectSerde
 from .bytes_io import BytesIO
-from .media_options import MediaOptions, _MISSING
+from .media_options import MediaOptions
 
 if TYPE_CHECKING:
     import pandas
@@ -336,11 +336,11 @@ class MediaIO(ABC, Generic[O]):
         self,
         *args,
         options: Optional[O] = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **media_options,
     ) -> Iterator["pyarrow.RecordBatch"]:
         """Yield Arrow record batches, transparently handling decompression.
@@ -408,12 +408,12 @@ class MediaIO(ABC, Generic[O]):
         self,
         *args,
         options: Optional[O] = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        lazy: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        lazy: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **media_options,
     ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
         """Yield one Polars frame per Arrow record batch.
@@ -565,13 +565,13 @@ class MediaIO(ABC, Generic[O]):
         """Fold explicitly supplied base options back into ``kwargs``.
 
         The public read/write methods list ``MediaOptions`` fields with a
-        ``_MISSING`` sentinel default so they show up in help/autocomplete.
+        ``...`` sentinel default so they show up in help/autocomplete.
         Anything the caller actually passed lands in *explicit*; sentinels
         are dropped so ``check_options`` sees only real overrides. An
         explicit positional value wins over a duplicate entry in *kwargs*.
         """
         for key, value in explicit.items():
-            if value is _MISSING:
+            if value is ...:
                 continue
             kwargs[key] = value
         return kwargs
@@ -585,11 +585,11 @@ class MediaIO(ABC, Generic[O]):
         obj: Any,
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a supported tabular object to the buffer.
@@ -857,12 +857,12 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
-        batch_size: "int | None | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
         """Read the buffer into a :class:`pyarrow.Table`.
@@ -918,11 +918,11 @@ class MediaIO(ABC, Generic[O]):
         table: "pyarrow.Table",
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a :class:`pyarrow.Table` to the buffer.
@@ -1000,12 +1000,12 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
-        batch_size: "int | None | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
         """Read the buffer as a list of row dicts.
@@ -1054,11 +1054,11 @@ class MediaIO(ABC, Generic[O]):
         data: Iterable[dict],
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a list (or iterable/generator) of row dicts to the buffer.
@@ -1103,12 +1103,12 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
-        batch_size: "int | None | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union[dict[str, list], Iterator[dict[str, list]]]:
         """Read the buffer as a column-oriented dict.
@@ -1156,11 +1156,11 @@ class MediaIO(ABC, Generic[O]):
         data: dict[str, list],
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a column-oriented dict to the buffer.
@@ -1204,12 +1204,12 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
-        batch_size: "int | None | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union["pandas.DataFrame", Iterator["pandas.DataFrame"]]:
         """Read the buffer as a :class:`pandas.DataFrame`.
@@ -1257,11 +1257,11 @@ class MediaIO(ABC, Generic[O]):
         frame: "pandas.DataFrame",
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a :class:`pandas.DataFrame` to the buffer.
@@ -1309,13 +1309,13 @@ class MediaIO(ABC, Generic[O]):
         self,
         *,
         options: O | None = None,
-        columns: "Sequence[str] | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        ignore_empty: "bool | Any" = _MISSING,
-        lazy: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
-        batch_size: "int | None | Any" = _MISSING,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        lazy: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union[
         "polars.DataFrame",
@@ -1377,11 +1377,11 @@ class MediaIO(ABC, Generic[O]):
         frame: "polars.DataFrame | polars.LazyFrame",
         *,
         options: O | None = None,
-        mode: "SaveMode | str | None | Any" = _MISSING,
-        match_by: "Sequence[str] | str | None | Any" = _MISSING,
-        cast: "CastOptionsArg | Any" = _MISSING,
-        use_threads: "bool | Any" = _MISSING,
-        raise_error: "bool | Any" = _MISSING,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
         """Write a Polars DataFrame or LazyFrame to the buffer.
@@ -1407,8 +1407,6 @@ class MediaIO(ABC, Generic[O]):
         **option_kwargs:
             Format-specific write knobs forwarded to :meth:`check_options`.
         """
-        from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
-
         resolved = self.check_options(
             options=options,
             mode=mode,
@@ -1418,10 +1416,9 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
-
-        tb = polars_dataframe_to_arrow_table(frame, resolved.cast)
+        casted = resolved.cast.cast_polars_tabular(frame)
 
         self.write_arrow_table(
-            table=tb,
+            table=casted.rechunk().to_arrow(),
             options=resolved,
         )

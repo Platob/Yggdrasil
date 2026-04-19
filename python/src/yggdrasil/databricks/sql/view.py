@@ -31,11 +31,9 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
-
 from .column import Column
 from .grants import GrantsMixin
 from .sql_utils import (

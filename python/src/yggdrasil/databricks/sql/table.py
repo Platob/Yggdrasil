@@ -39,7 +39,6 @@ from pyarrow.fs import FileSystem, S3FileSystem
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.schema import Schema as DataSchema
-from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.databricks.iam import IAMUser, IAMGroup
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg

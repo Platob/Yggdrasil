@@ -1,7 +1,7 @@
-"""Base options dataclass for :class:`~yggdrasil.io.buffer.media_io.MediaIO`.
+"""Base options dataclass for: class:`~yggdrasil.io.buffer.media_io.MediaIO`.
 
 :class:`MediaOptions` collects every parameter that can influence how an
-Arrow table is read from / written to a :class:`~yggdrasil.io.buffer.BytesIO`
+Arrow table is read from / written to a: class:`~yggdrasil.io.buffer.BytesIO`
 buffer. Format-specific subclasses extend it with codec-level knobs, but the
 fields defined here are shared across all formats.
 """
@@ -16,14 +16,13 @@ from ..enums.save_mode import SaveMode
 
 __all__ = ["MediaOptions"]
 
-_MISSING = object()
 
 _ALLOWED_COMPRESSION = {"auto", "none", "off", "zstd", "snappy", "gzip", "lz4"}
 
 
 @dataclass
 class MediaOptions:
-    """Base options shared by all :class:`MediaIO` subclasses."""
+    """Base options shared by all: class:`MediaIO` subclasses."""
 
     # global read properties
     columns: Sequence[str] | None = None
@@ -62,15 +61,15 @@ class MediaOptions:
         cls,
         options: MediaOptions | None = None,
         *,
-        mode: SaveMode | str | None | Any = _MISSING,
-        match_by: Sequence[str] | str | None | Any = _MISSING,
-        columns: Optional[Sequence[str]] | Any = _MISSING,
-        cast: CastOptions | dict[str, Any] | None | Any = _MISSING,
-        use_threads: bool | Any = _MISSING,
-        ignore_empty: bool | Any = _MISSING,
-        lazy: bool | Any = _MISSING,
-        raise_error: bool | Any = _MISSING,
-        batch_size: int | None | Any = _MISSING,
+        mode: SaveMode | str | None | Any = ...,
+        match_by: Sequence[str] | str | None | Any = ...,
+        columns: Optional[Sequence[str]] | Any = ...,
+        cast: CastOptions | dict[str, Any] | None | Any = ...,
+        use_threads: bool | Any = ...,
+        ignore_empty: bool | Any = ...,
+        lazy: bool | Any = ...,
+        raise_error: bool | Any = ...,
+        batch_size: int | None | Any = ...,
         **kwargs: Any,
     ) -> MediaOptions:
         base = cls._coerce_options(options)
@@ -121,7 +120,7 @@ class MediaOptions:
         return {
             key: value
             for key, value in kwargs.items()
-            if key in names and value is not _MISSING
+            if key in names and value is not ...
         }
 
     @staticmethod

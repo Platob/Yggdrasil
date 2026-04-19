@@ -334,6 +334,7 @@ REQUEST_SCHEMA["request_body_hash"] = schema_field(
         "entity": "request",
         "group": "payload",
         "algorithm": "xxh3_64",
+        "primary_key": True,
     },
 )
 
@@ -349,7 +350,6 @@ REQUEST_SCHEMA["request_sent_at"] = schema_field(
     tags={
         "entity": "request",
         "group": "timing",
-        "primary_key": True,
     },
 )
 

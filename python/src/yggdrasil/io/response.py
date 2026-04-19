@@ -297,7 +297,6 @@ BASE_SCHEMA["response_status_code"] = schema_field(
     tags={
         "entity": "response",
         "group": "status",
-        "cluster_by": True,
     },
 )
 
@@ -485,8 +484,6 @@ BASE_SCHEMA["response_received_at"] = schema_field(
     tags={
         "entity": "response",
         "group": "timing",
-        "cluster_by": True,
-        "primary_key": True,
     },
 )
 

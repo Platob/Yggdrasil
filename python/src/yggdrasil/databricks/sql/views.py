@@ -547,7 +547,7 @@ class Views(DatabricksService):
 
     def concat_tables(
         self,
-        tables: Iterable["Table"],
+        tables: Iterable["Table | View"],
         *,
         view_name: str | None = None,
         catalog_name: str | None = None,
@@ -596,7 +596,7 @@ class Views(DatabricksService):
                 t.table_name for t in tables_list
             )
             if not view_name:
-                input_names = [t.table_name for t in tables_list]
+                input_names = [t.name for t in tables_list]
                 raise ValueError(
                     "concat_tables could not derive a view name from "
                     f"{input_names!r}; the input tables share no common "

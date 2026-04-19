@@ -211,8 +211,8 @@ class Tables(DatabricksService):
     ) -> "Table":
         """Return a :class:`~yggdrasil.databricks.sql.table.Table` bound to this service."""
 
-        return Table.parse_str(
-            location=location,
+        return Table.parse(
+            obj=location,
             service=self,
             catalog_name=catalog_name or self.catalog_name,
             schema_name=schema_name or self.schema_name,

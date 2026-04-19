@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 
 import pyarrow as pa
 import pytest
-from yggdrasil.data.statement import StatementResult as BaseStatementResult
 
 from yggdrasil.data import Schema
+from yggdrasil.data.statement import StatementResult as BaseStatementResult
 from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.sql.engine import (
     _apply_external_table_aliases,
