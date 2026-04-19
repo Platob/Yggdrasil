@@ -50,6 +50,7 @@ __all__ = [
     "arrow_cast_to_date",
     "arrow_cast_to_time",
     "arrow_cast_to_duration",
+    "retimestamp_prefer_polars",
     "arrow_cast_to_string",
     "arrow_timestamp_to_string",
     "arrow_date_to_string",
@@ -272,6 +273,105 @@ def parse_iso_duration_to_nanos(value: str) -> int | None:
 
 def _is_chunked(array: Any) -> bool:
     return isinstance(array, pa.ChunkedArray)
+
+
+# ---------------------------------------------------------------------------
+# Timezone helpers — polars-first, pyarrow fallback
+# ---------------------------------------------------------------------------
+#
+# pyarrow's tz kernels (``pc.assume_timezone``, ``pc.cast`` across tz-aware
+# timestamp types) resolve zones against Arrow C++'s tz database. On Windows
+# that database has to be downloaded manually and corporate proxies routinely
+# block it, producing ``ArrowInvalid: Unable to get Timezone database version``.
+# polars ships its own tz database via ``chrono-tz`` and doesn't care about
+# the system state, so we route tz transitions through polars whenever it's
+# importable and only fall back to pyarrow when polars isn't installed (or
+# doesn't support the requested unit — polars has no "s" time unit).
+
+
+_POLARS_UNITS = frozenset({"ms", "us", "ns"})
+
+
+def _polars_or_none():
+    try:
+        import polars as pl
+
+        return pl
+    except ImportError:
+        return None
+
+
+def _pa_retimestamp(
+    array: pa.Array, unit: str, tz: str | None, *, unsafe_tz: bool
+) -> pa.Array:
+    """Pure-pyarrow retimestamp — the fallback path, uses tz database."""
+    src_tz = array.type.tz
+    target = pa.timestamp(unit, tz)
+    if src_tz is None and tz is not None and unsafe_tz:
+        aligned = pc.cast(array, pa.timestamp(unit))
+        stamped = pc.assume_timezone(aligned, timezone=tz)
+        return stamped
+    return pc.cast(array, target)
+
+
+def retimestamp_prefer_polars(
+    array: pa.Array,
+    unit: str,
+    tz: str | None,
+    *,
+    unsafe_tz: bool = True,
+) -> pa.Array:
+    """Cast a ``pa.timestamp`` array to ``pa.timestamp(unit, tz)``.
+
+    Semantics match the pyarrow path:
+
+    * naive → naive:  unit conversion only (no tz database lookup).
+    * naive → tz-aware with ``unsafe_tz=True``: reinterpret the wall-clock
+      time as living in ``tz`` (``"2023-01-02 03:04"`` Paris stays ``03:04``
+      Paris).
+    * naive → tz-aware with ``unsafe_tz=False``: treat the wall-clock as
+      UTC, then shift to ``tz``.
+    * tz-aware → tz-aware: convert to the target zone (same instant).
+    * tz-aware → naive: shift to UTC and drop the zone tag.
+
+    Prefers polars for the tz arithmetic because it bundles its own tz
+    database; falls back to pyarrow's ``pc.cast`` /
+    ``pc.assume_timezone`` when polars is not importable or when the
+    requested unit is one polars does not support.
+    """
+    src_tz = array.type.tz
+
+    # No tz on either side — pyarrow is fine, no tz database involved.
+    if src_tz is None and tz is None:
+        return pc.cast(array, pa.timestamp(unit))
+
+    pl = _polars_or_none()
+    if pl is None or unit not in _POLARS_UNITS:
+        return _pa_retimestamp(array, unit, tz, unsafe_tz=unsafe_tz)
+
+    try:
+        s = pl.from_arrow(array)
+        if s.dtype.time_unit != unit:
+            s = s.cast(pl.Datetime(unit, s.dtype.time_zone))
+
+        current_tz = s.dtype.time_zone  # type: ignore[attr-defined]
+
+        if current_tz is None:
+            assume = tz if unsafe_tz else "UTC"
+            s = s.dt.replace_time_zone(assume, ambiguous="earliest")
+            current_tz = assume
+
+        if tz is None:
+            # tz-aware → naive: convert to UTC, then drop the zone tag.
+            s = s.dt.convert_time_zone("UTC").dt.replace_time_zone(None)
+        elif current_tz != tz:
+            s = s.dt.convert_time_zone(tz)
+
+        return s.to_arrow()
+    except Exception:
+        # Any polars surprise (dtype mismatch, from_arrow quirk) — defer
+        # to the pyarrow fallback rather than raising from the helper.
+        return _pa_retimestamp(array, unit, tz, unsafe_tz=unsafe_tz)
 
 
 def _apply_chunked(array: Any, fn):
@@ -505,11 +605,9 @@ def arrow_str_to_timestamp(
             naive = attach_fractional_seconds(naive, normalized, unit=unit)
 
         if tz:
-            assume = tz if unsafe_tz else "UTC"
-            stamped = pc.assume_timezone(naive, timezone=assume)
-            if assume == tz:
-                return stamped
-            return pc.cast(stamped, pa.timestamp(unit, tz))
+            return retimestamp_prefer_polars(
+                naive, unit=unit, tz=tz, unsafe_tz=unsafe_tz,
+            )
         return naive
 
     return _apply_chunked(array, _one)
@@ -731,12 +829,9 @@ def arrow_cast_to_timestamp(
     target = pa.timestamp(unit, tz)
 
     if pa.types.is_timestamp(src):
-        if src.tz is None and tz is not None and unsafe_tz:
-            # Reinterpret wall-clock in target zone instead of the default
-            # UTC-assumption that pyarrow applies on cast.
-            aligned = pc.cast(array, pa.timestamp(unit))
-            return pc.assume_timezone(aligned, timezone=tz)
-        return pc.cast(array, target)
+        return retimestamp_prefer_polars(
+            array, unit=unit, tz=tz, unsafe_tz=unsafe_tz,
+        )
 
     if pa.types.is_date(src):
         return pc.cast(pc.cast(array, pa.timestamp(unit)), target)
