@@ -260,6 +260,45 @@ class TestStatementBatchWaitNoPool(unittest.TestCase):
         batch.wait(wait=False)
 
 
+class TestStatementBatchStartCancels(unittest.TestCase):
+    """``start`` cancels every remaining statement on any inner error."""
+
+    def test_sequential_runner_error_cancels_all(self):
+        stmts = [_StubStatement(name=f"s{i}") for i in range(4)]
+
+        def bad_runner(result):
+            if result.name == "s1":
+                raise RuntimeError("submit failed")
+            result._started = True
+            result._finished = True
+
+        batch = StatementBatch.from_results(stmts)
+        with self.assertRaises(RuntimeError):
+            batch.start(parallel=False, runner=bad_runner)
+
+        # s0 already done, s1 was the failing one; s2/s3 must have been
+        # cancelled when the batch unwound.
+        self.assertTrue(stmts[2]._cancelled)
+        self.assertTrue(stmts[3]._cancelled)
+
+    def test_pool_runner_error_cancels_everything(self):
+        stmts = [_StubStatement(name=f"s{i}") for i in range(5)]
+
+        def bad_runner(result):
+            raise RuntimeError("submit failed")
+
+        batch = StatementBatch.from_results(stmts)
+        with self.assertRaises(RuntimeError):
+            batch.start(parallel=3, runner=bad_runner)
+
+        # After the teardown, every result in the batch has been cancelled.
+        for s in stmts:
+            self.assertTrue(s._cancelled)
+        # Pool bookkeeping is wiped.
+        self.assertFalse(batch._in_flight)
+        self.assertFalse(batch._pending_queue)
+
+
 class TestStatementBatchEngineDefaultRunner(unittest.TestCase):
     """When ``engine`` is bound to the batch, ``start`` uses ``engine.execute``."""
 
@@ -305,20 +344,23 @@ class TestStatementBatchEngineDefaultRunner(unittest.TestCase):
         self.assertEqual(seen, stmts)
 
 
+class _StubBatch(StatementBatch):
+    """Batch subclass that builds :class:`_StubStatement` results."""
+
+    def factory(self, statement):
+        return _StubStatement(statement=statement)
+
+
 class TestFromStatements(unittest.TestCase):
-    def test_from_statements_builds_results_via_factory(self):
+    def test_from_statements_uses_subclass_factory(self):
         configs = [
             PreparedStatement(text="SELECT 1"),
             PreparedStatement(text="SELECT 2", parameters={"x": 1}),
         ]
-        batch = StatementBatch.from_statements(
-            configs,
-            factory=lambda cfg: _StubStatement(statement=cfg, name=cfg.text),
-        )
+        batch = _StubBatch.from_statements(configs)
         assert list(batch.results.keys()) == ["0", "1"]
         assert batch["0"].statement.text == "SELECT 1"
         assert batch["1"].statement.parameters == {"x": 1}
-        # Each wrapped result carries the original config.
         assert batch.statements["0"] is configs[0]
 
     def test_from_statements_accepts_mapping(self):
@@ -326,13 +368,30 @@ class TestFromStatements(unittest.TestCase):
             "a": "SELECT 1",
             "b": PreparedStatement(text="SELECT 2"),
         }
-        batch = StatementBatch.from_statements(
-            configs,
-            factory=lambda cfg: _StubStatement(statement=cfg),
-        )
+        batch = _StubBatch.from_statements(configs)
         assert list(batch.results.keys()) == ["a", "b"]
         assert batch["a"].text == "SELECT 1"
         assert batch["b"].text == "SELECT 2"
+
+    def test_from_statements_without_engine_or_override_raises(self):
+        with self.assertRaises(NotImplementedError):
+            StatementBatch.from_statements([PreparedStatement(text="SELECT 1")])
+
+    def test_from_statements_delegates_to_engine_when_bound(self):
+        built = []
+
+        class _FakeEngine:
+            def statement_result(self, cfg):
+                result = _StubStatement(statement=cfg, name=cfg.text)
+                built.append(result)
+                return result
+
+        batch = StatementBatch.from_statements(
+            ["SELECT 1", "SELECT 2"],
+            engine=_FakeEngine(),
+        )
+        assert len(built) == 2
+        assert list(batch.results.values()) == built
 
 
 if __name__ == "__main__":  # pragma: no cover

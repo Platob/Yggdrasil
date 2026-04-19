@@ -742,35 +742,50 @@ class StatementBatch(Mapping[str, "StatementResult"]):
     def from_statements(
         cls,
         statements: Iterable[PreparedStatement | str] | Mapping[str, PreparedStatement | str],
-        factory: Optional[Callable[[PreparedStatement], StatementResult]] = None,
         *,
         engine: Optional["SQLEngine"] = None,
     ) -> StatementBatch:
         """Build a batch from :class:`PreparedStatement` configs (or strings).
 
-        Each entry is normalized via :meth:`PreparedStatement.prepare` and passed to
-        ``factory`` to build the corresponding :class:`StatementResult`.  When
-        ``factory`` is omitted, the engine layer must supply one — typically
-        ``lambda cfg: StatementResult(statement=cfg)``.  When ``engine`` is
-        provided, :meth:`start` uses ``engine.execute`` as the default runner.
+        Each entry is normalized via :meth:`PreparedStatement.prepare` and
+        handed to :meth:`factory` to build the corresponding
+        :class:`StatementResult`.  The default factory delegates to
+        ``engine.statement_result`` — subclasses may override :meth:`factory`
+        for custom construction.
         """
-        if factory is None:
-            raise ValueError(
-                "from_statements requires a ``factory`` callable "
-                "(stmt: PreparedStatement) -> StatementResult"
-            )
-
         items = (
             statements.items()
             if isinstance(statements, Mapping)
             else enumerate(statements)
         )
 
+        # Seed with an empty batch so ``factory`` can run as an instance
+        # method and pick up the bound engine.
+        batch = cls(results=OrderedDict(), engine=engine)
         results: OrderedDict[str, StatementResult] = OrderedDict()
         for key, raw in items:
             cfg = PreparedStatement.prepare(raw)
-            results[str(key)] = factory(cfg)
-        return cls(results=results, engine=engine)
+            results[str(key)] = batch.factory(cfg)
+        object.__setattr__(batch, "results", results)
+        return batch
+
+    def factory(self, statement: PreparedStatement) -> StatementResult:
+        """Build an unstarted :class:`StatementResult` for ``statement``.
+
+        Default implementation delegates to the bound engine's
+        ``statement_result`` — that's the cleanest way to build a
+        backend-specific result from a generic config.  Subclasses may
+        override for custom construction; callers with no engine to hand
+        over must either attach one at construction time or provide a
+        subclass.
+        """
+        if self.engine is None:
+            raise NotImplementedError(
+                "StatementBatch.factory needs an engine bound to the batch "
+                "(``engine=`` kwarg on from_statements / from_results) or a "
+                "subclass override."
+            )
+        return self.engine.statement_result(statement)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.results)
@@ -995,50 +1010,54 @@ class StatementBatch(Mapping[str, "StatementResult"]):
 
         effective_runner = runner or _default_runner
 
-        if workers == 1 or len(self.results) <= 1:
-            # Sequential submission: each statement is fully drained before the
-            # next is submitted so later statements can observe earlier writes.
-            # The caller's ``wait`` only applies to the final statement — every
-            # preceding one is forced to ``wait=True``.
-            items = list(self.results.items())
-            last_index = len(items) - 1
-            for idx, (key, stmt) in enumerate(items):
-                stmt_wait = wait if idx == last_index else True
-                try:
+        try:
+            if workers == 1 or len(self.results) <= 1:
+                # Sequential submission: each statement is fully drained
+                # before the next is submitted so later statements can
+                # observe earlier writes.  The caller's ``wait`` only
+                # applies to the final statement — every preceding one is
+                # forced to ``wait=True``.
+                items = list(self.results.items())
+                last_index = len(items) - 1
+                for idx, (key, stmt) in enumerate(items):
+                    stmt_wait = wait if idx == last_index else True
                     effective_runner(stmt)
                     stmt.wait(wait=stmt_wait, raise_error=raise_error)
-                except Exception:
-                    self._cancel_siblings(after_key=key)
-                    if raise_error:
-                        raise
-            return self
+                return self
 
-        object.__setattr__(self, "_pool_runner", effective_runner)
-        object.__setattr__(self, "_pool_raise_error", raise_error)
-        object.__setattr__(
-            self,
-            "_pending_queue",
-            deque(self.results.items()),
-        )
+            object.__setattr__(self, "_pool_runner", effective_runner)
+            object.__setattr__(self, "_pool_raise_error", raise_error)
+            object.__setattr__(
+                self,
+                "_pending_queue",
+                deque(self.results.items()),
+            )
 
-        # Fill the initial window.
-        try:
+            # Fill the initial window.
             while self._pending_queue and len(self._in_flight) < workers:
                 key, stmt = self._pending_queue.popleft()
                 self._submit(key, stmt, effective_runner)
+
+            if wait:
+                self.wait(wait=wait, raise_error=raise_error)
+
+            return self
         except Exception:
-            self._cancel_in_flight()
-            self._discard_pending()
-            self._cancel_siblings(after_key=None)
-            self._clear_pool_state()
+            # Any submission or wait error: tear everything down.  Cancel
+            # in-flight statements, drop the pending queue, then run
+            # :meth:`cancel` to cover every result in the batch (covers
+            # the sequential path where earlier statements already
+            # completed and are untracked by the pool).
+            try:
+                self.cancel()
+            except Exception:
+                logger.debug(
+                    "StatementBatch.cancel() after start() failure raised",
+                    exc_info=True,
+                )
             if raise_error:
                 raise
             return self
-
-        if wait:
-            self.wait(wait=wait, raise_error=raise_error)
-
-        return self
 
     def wait(
         self,
