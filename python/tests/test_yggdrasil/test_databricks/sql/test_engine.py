@@ -78,6 +78,12 @@ class _FakeStatement(BaseStatement):
     def refresh_status(self) -> None:
         return None
 
+    def start(self, *, wait=True, raise_error=True, **_kwargs) -> "_FakeStatement":
+        return self
+
+    def cancel(self) -> "_FakeStatement":
+        return self
+
     def collect_schema(self, full=False) -> Schema:
         return Schema.from_any_fields([], metadata={})
 

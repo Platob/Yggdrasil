@@ -445,7 +445,7 @@ class SQLEngine(DatabricksService):
         byte_limit: int | None = None,
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
-        parallel: bool = False,
+        parallel: int | bool = False,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementBatch:
         """
@@ -456,13 +456,16 @@ class SQLEngine(DatabricksService):
         - Statements are normalized with ``strip()``
         - Empty statements are ignored
         - Execution order is preserved in the returned batch
-        - When ``parallel=False``:
+        - When ``parallel`` is ``False`` (default):
           - all statements except the last are executed with ``wait=True``
           - the final statement uses the caller-provided ``wait`` value
-        - When ``parallel=True``:
-          - all statements are submitted immediately
-          - each statement uses the caller-provided ``wait`` value
-          - results are returned in input order, but execution order is not enforced
+        - When ``parallel`` is truthy (``True`` or an ``int >= 2``):
+          - statements are submitted to a bounded thread pool so at most
+            ``parallel`` statements are executing on the warehouse at once
+            (``True`` maps to the default pool size of 4)
+          - the batch returns once every statement reaches a terminal state
+          - if any statement fails, the remaining pooled statements are
+            cancelled and their staging resources are cleaned up
 
         Args:
             statements:
@@ -496,8 +499,11 @@ class SQLEngine(DatabricksService):
             spark_session:
                 Explicit SparkSession override.
             parallel:
-                When ``True``, submit all statements without sequential dependency
-                waiting. Use only when statements are independent.
+                Pool sizing for parallel execution.  ``False`` (default) runs
+                sequentially.  ``True`` uses a bounded pool of 4.  An
+                ``int >= 2`` caps concurrency to that many statements running
+                on the warehouse at once.  Inner polling is managed by the
+                batch — callers do not need to handle futures or join threads.
             temporary_tables:
                 Optional mapping of alias → :class:`StagingPath` or tabular
                 data. Aliases referenced in statements as ``{alias}`` are
@@ -510,7 +516,7 @@ class SQLEngine(DatabricksService):
                 :class:`Statement` inputs.
 
         Returns:
-            A :class:`StatementResultBatch` containing results in input order.
+            A :class:`StatementBatch` containing results in input order.
 
         Raises:
             ValueError:
@@ -556,16 +562,14 @@ class SQLEngine(DatabricksService):
                 for key, stmt in items.items()
             )
 
-        results: OrderedDict[str, Statement] = OrderedDict()
-
         if parallel:
-            for key, stmt in items.items():
-                results[key] = self.execute(
+            def _runner(stmt: Statement) -> Statement:
+                return self.execute(
                     stmt,
                     row_limit=row_limit,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
-                    wait=False,
+                    wait=True,
                     raise_error=raise_error,
                     engine=engine,
                     warehouse_id=warehouse_id,
@@ -575,12 +579,27 @@ class SQLEngine(DatabricksService):
                     spark_session=spark_session,
                 )
 
+            batch = StatementBatch(results=items)
+            try:
+                batch.start(
+                    parallel=parallel,
+                    wait=wait,
+                    raise_error=raise_error,
+                    runner=_runner,
+                )
+                batch.wait(wait=wait, raise_error=raise_error)
+            except Exception:
+                batch.cancel()
+                raise
+
             if owned_staging:
-                for result in results.values():
+                for result in batch.results.values():
                     result.attach_temporary_tables(owned_staging)
+                    result._maybe_cleanup_temporary_tables()
 
-            return StatementBatch(results=results).wait(wait=wait, raise_error=raise_error)
+            return batch
 
+        results: OrderedDict[str, Statement] = OrderedDict()
         keys = list(items.keys())
 
         for key in keys[:-1]:

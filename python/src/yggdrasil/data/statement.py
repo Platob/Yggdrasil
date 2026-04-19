@@ -5,14 +5,18 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, wait as futures_wait
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
 import pyarrow as pa
+from yggdrasil.concurrent.pool import JobPoolExecutor
 from yggdrasil.data import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PARALLEL = 4
 
 if TYPE_CHECKING:
     import pandas
@@ -221,6 +225,31 @@ class Statement(ABC):
     @abstractmethod
     def refresh_status(self) -> None:
         """Refresh execution state from the backend."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def start(
+        self,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs: Any,
+    ) -> Statement:
+        """Submit the statement for execution.
+
+        Implementations must be idempotent: calling ``start()`` on an already
+        started statement returns ``self`` unchanged.  Subclasses are free to
+        accept additional backend-specific keyword arguments.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel(self) -> Statement:
+        """Request cancellation of a running statement.
+
+        Implementations must be idempotent and a no-op when the statement has
+        not been started or has already reached a terminal state.
+        """
         raise NotImplementedError
 
     def wait(
@@ -518,9 +547,25 @@ class StatementBatch(Mapping[str, Statement]):
     Polars ``how="diagonal_relaxed"`` semantics.
 
     Use ``concat=None`` to preserve per-statement outputs.
+
+    Lifecycle
+    ---------
+    :meth:`start`, :meth:`wait` and :meth:`cancel` orchestrate execution across
+    every statement in the batch.  When ``parallel`` is ``True`` or an integer
+    greater than ``1``, :meth:`start` submits work to a bounded thread pool so
+    that at most ``parallel`` statements are executing on the backend at once.
+    When any pool worker raises, the remaining statements are cancelled
+    (futures first, then the underlying ``Statement.cancel()``).
     """
 
     results: OrderedDict[str, Statement]
+
+    _executor: Optional[JobPoolExecutor] = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _futures: OrderedDict[str, Future] = field(
+        default_factory=OrderedDict, init=False, repr=False, compare=False,
+    )
 
     @classmethod
     def from_results(
@@ -597,14 +642,231 @@ class StatementBatch(Mapping[str, Statement]):
                 raise RuntimeError(f"Statement batch item {key!r} failed.") from exc
         return self
 
+    # ------------------------------------------------------------------
+    # Parallel execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_parallel(parallel: int | bool | None) -> int:
+        """Return the effective pool size.
+
+        - ``False`` / ``None`` / ``0`` → ``1`` (sequential).
+        - ``True`` → ``DEFAULT_PARALLEL`` (4).
+        - ``int >= 1`` → the integer itself.
+        """
+        if parallel is True:
+            return DEFAULT_PARALLEL
+        if not parallel:
+            return 1
+        if isinstance(parallel, int):
+            return max(1, parallel)
+        raise TypeError(
+            "parallel must be a bool or non-negative int, "
+            f"got {type(parallel).__name__}: {parallel!r}"
+        )
+
+    def _cancel_siblings(self, after_key: str | None) -> None:
+        """Cancel every statement that appears after ``after_key``.
+
+        When ``after_key`` is ``None`` every statement is cancelled.
+        """
+        seen = after_key is None
+        for key, stmt in self.results.items():
+            if not seen:
+                if key == after_key:
+                    seen = True
+                continue
+            try:
+                stmt.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel sibling statement %r after %r",
+                    key, after_key, exc_info=True,
+                )
+
+    def start(
+        self,
+        parallel: int | bool = True,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        runner: Optional[Callable[[Statement], Any]] = None,
+    ) -> StatementBatch:
+        """Submit every statement for execution.
+
+        Parameters
+        ----------
+        parallel
+            Pool sizing.  ``False`` (or ``0``) runs sequentially.  ``True``
+            defaults to a pool of ``DEFAULT_PARALLEL`` (4).  An ``int >= 2``
+            caps concurrency to that many statements executing at once.
+        wait
+            Waiting policy handed to each worker.  When truthy, each pool
+            slot holds until its statement reaches a terminal state — this
+            is what provides back-pressure on the backend.  When falsy,
+            workers return as soon as the statement is submitted.
+        raise_error
+            Forwarded to the per-statement ``start``/``wait`` calls.
+        runner
+            Optional callable invoked once per statement instead of
+            ``stmt.start(wait=wait, raise_error=raise_error)``.  Useful for
+            engines that need to resolve execution context (warehouse,
+            catalog, …) before delegating to the backend.
+
+        Notes
+        -----
+        ``start`` is not re-entrant: calling it twice on the same batch
+        without first draining (:meth:`wait`) or tearing down (:meth:`cancel`)
+        the existing pool raises ``RuntimeError``.
+        """
+        if self._executor is not None or self._futures:
+            raise RuntimeError(
+                "StatementBatch.start() was already called; call wait() or "
+                "cancel() before starting again."
+            )
+
+        workers = self._resolve_parallel(parallel)
+
+        def _default_runner(stmt: Statement) -> Any:
+            return stmt.start(wait=wait, raise_error=raise_error)
+
+        effective_runner = runner or _default_runner
+
+        if workers == 1 or len(self.results) <= 1:
+            for key, stmt in self.results.items():
+                try:
+                    effective_runner(stmt)
+                except Exception:
+                    self._cancel_siblings(after_key=key)
+                    if raise_error:
+                        raise
+            return self
+
+        executor = JobPoolExecutor(max_workers=workers)
+        futures: OrderedDict[str, Future] = OrderedDict()
+        for key, stmt in self.results.items():
+            futures[key] = executor.submit(effective_runner, stmt)
+
+        object.__setattr__(self, "_executor", executor)
+        object.__setattr__(self, "_futures", futures)
+        return self
+
+    def cancel(self) -> StatementBatch:
+        """Cancel the pool and every underlying statement.
+
+        Safe to call whether or not :meth:`start` has been invoked.  Pending
+        futures are cancelled first (so queued workers never run), then each
+        statement's own ``cancel()`` is invoked to tear down any backend-side
+        execution handle.
+        """
+        for fut in self._futures.values():
+            fut.cancel()
+
+        for key, stmt in self.results.items():
+            try:
+                stmt.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel statement %r", key, exc_info=True,
+                )
+
+        self._teardown_pool()
+        return self
+
+    def _teardown_pool(self) -> None:
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                logger.debug("Executor shutdown failed", exc_info=True)
+            object.__setattr__(self, "_executor", None)
+        if self._futures:
+            object.__setattr__(self, "_futures", OrderedDict())
+
     def wait(
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> StatementBatch:
-        for result in self.results.values():
-            result.wait(wait=wait, raise_error=raise_error)
+        """Block until every statement reaches a terminal state.
+
+        When :meth:`start` created a background pool, this drains it: the
+        first worker to raise causes every remaining future and every
+        still-running statement to be cancelled, and the original exception
+        is re-raised when ``raise_error`` is ``True``.
+
+        When no pool is active, statements are waited on in order via their
+        own ``wait()``.  A failure in one statement cancels every later
+        statement in the batch before the exception propagates.
+        """
+        if self._executor is not None or self._futures:
+            self._drain_pool(raise_error=raise_error)
+            return self
+
+        for key, result in self.results.items():
+            try:
+                result.wait(wait=wait, raise_error=raise_error)
+            except Exception:
+                self._cancel_siblings(after_key=key)
+                if raise_error:
+                    raise
         return self
+
+    def _drain_pool(self, *, raise_error: bool) -> None:
+        first_exc: Optional[BaseException] = None
+        failed_key: Optional[str] = None
+
+        pending = OrderedDict(self._futures)
+        while pending:
+            done_set, _ = futures_wait(
+                list(pending.values()), return_when=FIRST_COMPLETED,
+            )
+            if not done_set:
+                break
+
+            for fut in done_set:
+                key = next(
+                    (k for k, f in pending.items() if f is fut), None,
+                )
+                if key is not None:
+                    pending.pop(key, None)
+
+                try:
+                    exc = fut.exception()
+                except Exception:
+                    exc = None
+
+                if exc is not None and first_exc is None:
+                    first_exc = exc
+                    failed_key = key
+                    for pkey, pfut in pending.items():
+                        pfut.cancel()
+                        pstmt = self.results.get(pkey)
+                        if pstmt is None:
+                            continue
+                        try:
+                            pstmt.cancel()
+                        except Exception:
+                            logger.debug(
+                                "Failed to cancel %r after pool error",
+                                pkey, exc_info=True,
+                            )
+
+            if first_exc is not None:
+                break
+
+        for pfut in pending.values():
+            try:
+                pfut.result(timeout=0.001)
+            except Exception:
+                pass
+
+        self._teardown_pool()
+
+        if first_exc is not None and raise_error:
+            raise RuntimeError(
+                f"Statement batch item {failed_key!r} failed."
+            ) from first_exc
 
     def persist(
         self,
