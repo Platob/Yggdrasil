@@ -11,7 +11,7 @@ from .schemas import Schemas
 from .service import Warehouses
 from .sql_utils import *
 from .staging import StagingPath
-from .statement import Statement
+from .statement import PreparedStatement, StatementResult
 from .statements import Statements
 from .table import Table
 from .tables import Tables

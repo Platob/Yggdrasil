@@ -39,7 +39,7 @@ from .service import (
     _jitter_sleep_seconds,
     safeEndpointInfo,
 )
-from .statement import Statement
+from .statement import PreparedStatement, StatementResult
 from ..client import DatabricksResource
 
 __all__ = [
@@ -369,7 +369,7 @@ class SQLWarehouse(DatabricksResource):
 
     def execute(
         self,
-        statement: "str | Statement | None" = None,
+        statement: "str | PreparedStatement | StatementResult | None" = None,
         *,
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
@@ -385,16 +385,20 @@ class SQLWarehouse(DatabricksResource):
         wait: WaitingConfigArg = True,
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
-    ) -> Statement:
+    ) -> StatementResult:
         """Execute a SQL statement on this (or another) warehouse.
 
-        ``statement`` may be raw SQL or a :class:`Statement`.  When a
-        :class:`Statement` is supplied its parameters take precedence over
+        ``statement`` may be raw SQL, a :class:`PreparedStatement` config, or an
+        unstarted :class:`StatementResult`.  When a :class:`PreparedStatement`
+        config is supplied its parameters take precedence over
         ``parameters``.
         """
-        prepared = Statement.prepare(statement) if statement is not None else Statement(text="")
+        if statement is None:
+            prepared = StatementResult()
+        else:
+            prepared = StatementResult.prepare(statement)
         if parameters is None:
-            parameters = prepared.to_parameter_list()
+            parameters = prepared.statement.to_parameter_list()
 
         if format is None:
             format = Format.ARROW_STREAM
@@ -491,7 +495,7 @@ class SQLWarehouse(DatabricksResource):
 
                 iteration += 1
 
-        # Record execution state on the prepared Statement so it becomes
+        # Record execution state on the prepared PreparedStatement so it becomes
         # a started handler (``statement_id`` is now set).
         object.__setattr__(prepared, "service", self.client.statements)
         object.__setattr__(prepared, "warehouse_id", resolved_wh_id)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Union
 
 import pyarrow as pa
 from yggdrasil.data import Schema
@@ -14,11 +15,14 @@ from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PARALLEL = 4
+
 if TYPE_CHECKING:
     import pandas
     import polars
     import pyarrow.dataset as ds
     import pyspark.sql
+    from databricks.sdk.service.sql import StatementParameterListItem
 
 BatchConcatMode = Literal[
     "vertical",
@@ -29,14 +33,126 @@ BatchConcatMode = Literal[
 
 __all__ = [
     "BatchConcatMode",
-    "Statement",
+    "PreparedStatement",
     "StatementBatch",
+    "StatementResult",
 ]
 
 
+_SQL_COMMENT_OR_WS_RE = re.compile(
+    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)+",
+    re.DOTALL,
+)
+_SQL_QUERY_LEAD_RE = re.compile(
+    r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PreparedStatement:
+    """Configuration for a single statement execution.
+
+    ``PreparedStatement`` is a plain value object — it carries the SQL text, any
+    named parameters, and a map of temporary-table aliases that the engine
+    should substitute before submission.  Runtime/execution state
+    (backend handle, response, cached results) lives on
+    :class:`StatementResult`.
+
+    Instances are frozen: every mutator (``bind``, ``with_temporary_tables``,
+    ``clear``) returns a new ``PreparedStatement``.
+    """
+
+    text: str = ""
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    temporary_tables: Mapping[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def looks_like_query(text: Any) -> bool:
+        """Fast heuristic: return ``True`` when ``text`` looks like a SQL query.
+
+        Leading whitespace and SQL comments are skipped; a string is treated
+        as a query when its first keyword is ``SELECT``, ``WITH``, ``VALUES``,
+        ``TABLE``, or ``FROM``.  Non-string inputs return ``False``.
+        """
+        if not isinstance(text, str) or not text:
+            return False
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+        while True:
+            match = _SQL_COMMENT_OR_WS_RE.match(stripped)
+            if not match:
+                break
+            stripped = stripped[match.end():]
+        return bool(_SQL_QUERY_LEAD_RE.match(stripped))
+
+    @classmethod
+    def prepare(
+        cls,
+        statement: "PreparedStatement | str",
+        *,
+        parameters: Mapping[str, Any] | None = None,
+        temporary_tables: Mapping[str, Any] | None = None,
+    ) -> "PreparedStatement":
+        """Coerce ``statement`` into a :class:`PreparedStatement`, merging extra args."""
+        if isinstance(statement, cls):
+            prepared = statement
+            if parameters:
+                prepared = prepared.bind(**parameters)
+            if temporary_tables:
+                prepared = prepared.with_temporary_tables(**temporary_tables)
+            return prepared
+
+        return cls(
+            text=str(statement),
+            parameters=dict(parameters) if parameters else {},
+            temporary_tables=dict(temporary_tables) if temporary_tables else {},
+        )
+
+    def bind(self, **parameters: Any) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with additional named parameters merged."""
+        if not parameters:
+            return self
+        return replace(self, parameters={**self.parameters, **parameters})
+
+    def with_temporary_tables(self, **tables: Any) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with additional temporary-table aliases."""
+        if not tables:
+            return self
+        return replace(self, temporary_tables={**self.temporary_tables, **tables})
+
+    def clear(self) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with text and all bound arguments cleared."""
+        return replace(self, text="", parameters={}, temporary_tables={})
+
+    def with_text(self, text: str) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with ``text`` replaced."""
+        if text == self.text:
+            return self
+        return replace(self, text=text)
+
+    def to_parameter_list(self) -> Optional[List["StatementParameterListItem"]]:
+        """Render bound parameters as Databricks ``StatementParameterListItem``.
+
+        Lazy-imports the Databricks SDK type so base installs without the
+        ``databricks`` extra keep working.
+        """
+        if not self.parameters:
+            return None
+        from databricks.sdk.service.sql import StatementParameterListItem
+        return [
+            StatementParameterListItem(
+                name=str(name),
+                value=None if value is None else str(value),
+            )
+            for name, value in self.parameters.items()
+        ]
+
+
 @dataclass
-class Statement(ABC):
-    """Arrow-first wrapper around a statement execution result.
+class StatementResult(ABC):
+    """Arrow-first result handler for a :class:`PreparedStatement`.
 
     This class defines a small execution contract plus a rich set of conversion helpers.
     Concrete implementations only need to provide status handling and a way to expose
@@ -54,7 +170,8 @@ class Statement(ABC):
     - ``failed``: whether execution failed or was canceled
     - ``raise_for_status()``: raise on failure or cancellation
     - ``refresh_status()``: pull fresh execution state from the backend
-    - ``make_data_schema()``: schema for the result
+    - ``start()`` / ``cancel()``: submit / cancel on the backend
+    - ``collect_schema()``: schema for the result
     - ``to_arrow_reader()``: stream the result as Arrow record batches
 
     Notes
@@ -64,6 +181,8 @@ class Statement(ABC):
     - Some conversions materialize data locally and may collect all rows to the driver.
       Those cases are called out in method docs.
     """
+
+    statement: PreparedStatement = field(default_factory=PreparedStatement)
 
     _data_schema: Optional[Schema] = field(init=False, default=None, repr=False, compare=False)
     _arrow_table: Optional[pa.Table] = field(init=False, default=None, repr=False, compare=False)
@@ -142,7 +261,7 @@ class Statement(ABC):
         mode: Literal["arrow", "spark", "auto"] = "auto",
         *,
         data: Optional[Union[pa.Table, "pyspark.sql.DataFrame"]] = None,
-    ) -> Statement:
+    ) -> StatementResult:
         """Materialize and cache the result.
 
         Parameters
@@ -157,7 +276,7 @@ class Statement(ABC):
 
         Returns
         -------
-        Statement
+        StatementResult
             ``self`` with cache fields updated.
 
         Notes
@@ -223,11 +342,52 @@ class Statement(ABC):
         """Refresh execution state from the backend."""
         raise NotImplementedError
 
+    # -------------------------------------------------------------------------
+    # Config shortcuts
+    # -------------------------------------------------------------------------
+
+    @property
+    def text(self) -> str:
+        return self.statement.text
+
+    @property
+    def parameters(self) -> Mapping[str, Any]:
+        return self.statement.parameters
+
+    @property
+    def temporary_tables(self) -> Mapping[str, Any]:
+        return self.statement.temporary_tables
+
+    @abstractmethod
+    def start(
+        self,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs: Any,
+    ) -> StatementResult:
+        """Submit the statement for execution.
+
+        Implementations must be idempotent: calling ``start()`` on an already
+        started statement returns ``self`` unchanged.  Subclasses are free to
+        accept additional backend-specific keyword arguments.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel(self) -> StatementResult:
+        """Request cancellation of a running statement.
+
+        Implementations must be idempotent and a no-op when the statement has
+        not been started or has already reached a terminal state.
+        """
+        raise NotImplementedError
+
     def wait(
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-    ) -> Statement:
+    ) -> StatementResult:
         """Wait until execution reaches a terminal state.
 
         Parameters
@@ -242,7 +402,7 @@ class Statement(ABC):
 
         Returns
         -------
-        Statement
+        StatementResult
             ``self``
 
         Notes
@@ -277,7 +437,7 @@ class Statement(ABC):
     # Temporary table cleanup
     # -------------------------------------------------------------------------
 
-    def attach_temporary_tables(self, tables: Iterable[Any]) -> Statement:
+    def attach_temporary_tables(self, tables: Iterable[Any]) -> StatementResult:
         """Attach temporary staging resources to be cleaned up when ``done``.
 
         Each entry must expose ``cleanup(allow_not_found: bool = True)``.
@@ -511,22 +671,51 @@ class Statement(ABC):
 
 
 @dataclass(frozen=True)
-class StatementBatch(Mapping[str, Statement]):
-    """Ordered batch wrapper around multiple statement results.
+class StatementBatch(Mapping[str, "StatementResult"]):
+    """Ordered batch wrapper around multiple :class:`StatementResult` handlers.
+
+    Construct via :meth:`from_results` (already-built handlers) or
+    :meth:`from_statements` (configs + a factory callable that turns each
+    :class:`PreparedStatement` config into an unstarted :class:`StatementResult`).
 
     By default, materialized conversions concatenate inner tabular results using
     Polars ``how="diagonal_relaxed"`` semantics.
 
     Use ``concat=None`` to preserve per-statement outputs.
+
+    Lifecycle
+    ---------
+    :meth:`start`, :meth:`wait` and :meth:`cancel` orchestrate execution across
+    every result in the batch.  When ``parallel`` is ``True`` or an integer
+    greater than ``1``, :meth:`start` keeps at most ``parallel`` statements
+    in flight on the backend at a time by driving each result's own
+    :meth:`StatementResult.start` / :meth:`StatementResult.refresh_status` /
+    :meth:`StatementResult.cancel` — no extra threads are created.  When any
+    in-flight statement fails, every remaining submission is cancelled
+    before the exception propagates.
     """
 
-    results: OrderedDict[str, Statement]
+    results: OrderedDict[str, StatementResult]
+
+    _in_flight: OrderedDict[str, StatementResult] = field(
+        default_factory=OrderedDict, init=False, repr=False, compare=False,
+    )
+    _pending_queue: deque = field(
+        default_factory=deque, init=False, repr=False, compare=False,
+    )
+    _pool_runner: Optional[Callable[[StatementResult], Any]] = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _pool_raise_error: bool = field(
+        default=True, init=False, repr=False, compare=False,
+    )
 
     @classmethod
     def from_results(
         cls,
-        results: Iterable[Statement] | Mapping[str, Statement],
+        results: Iterable[StatementResult] | Mapping[str, StatementResult],
     ) -> StatementBatch:
+        """Build a batch from already-constructed :class:`StatementResult` handlers."""
         if isinstance(results, Mapping):
             return cls(results=OrderedDict(results.items()))
 
@@ -537,23 +726,54 @@ class StatementBatch(Mapping[str, Statement]):
             )
         )
 
+    @classmethod
+    def from_statements(
+        cls,
+        statements: Iterable[PreparedStatement | str] | Mapping[str, PreparedStatement | str],
+        factory: Callable[[PreparedStatement], StatementResult],
+    ) -> StatementBatch:
+        """Build a batch from :class:`PreparedStatement` configs (or strings).
+
+        Each entry is normalized via :meth:`PreparedStatement.prepare` and passed to
+        ``factory`` to build the corresponding :class:`StatementResult`.
+        """
+        items = (
+            statements.items()
+            if isinstance(statements, Mapping)
+            else enumerate(statements)
+        )
+
+        results: OrderedDict[str, StatementResult] = OrderedDict()
+        for key, raw in items:
+            cfg = PreparedStatement.prepare(raw)
+            results[str(key)] = factory(cfg)
+        return cls(results=results)
+
     def __iter__(self) -> Iterator[str]:
         return iter(self.results)
 
     def __len__(self) -> int:
         return len(self.results)
 
-    def __getitem__(self, key: str) -> Statement:
+    def __getitem__(self, key: str) -> StatementResult:
         return self.results[key]
 
     @property
-    def first(self) -> Statement | None:
+    def statements(self) -> OrderedDict[str, PreparedStatement]:
+        """Config view of the batch: each result's :class:`PreparedStatement`."""
+        return OrderedDict(
+            (key, result.statement)
+            for key, result in self.results.items()
+        )
+
+    @property
+    def first(self) -> StatementResult | None:
         for result in self.results.values():
             return result
         return None
 
     @property
-    def last(self) -> Statement | None:
+    def last(self) -> StatementResult | None:
         if not self.results:
             return None
         return next(reversed(self.results.values()))
@@ -594,7 +814,200 @@ class StatementBatch(Mapping[str, Statement]):
             try:
                 result.raise_for_status()
             except Exception as exc:
-                raise RuntimeError(f"Statement batch item {key!r} failed.") from exc
+                raise RuntimeError(f"PreparedStatement batch item {key!r} failed.") from exc
+        return self
+
+    # ------------------------------------------------------------------
+    # Parallel execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_parallel(parallel: int | bool | None) -> int:
+        """Return the effective pool size.
+
+        - ``False`` / ``None`` / ``0`` → ``1`` (sequential).
+        - ``True`` → ``DEFAULT_PARALLEL`` (4).
+        - ``int >= 1`` → the integer itself.
+        """
+        if parallel is True:
+            return DEFAULT_PARALLEL
+        if not parallel:
+            return 1
+        if isinstance(parallel, int):
+            return max(1, parallel)
+        raise TypeError(
+            "parallel must be a bool or non-negative int, "
+            f"got {type(parallel).__name__}: {parallel!r}"
+        )
+
+    def _cancel_siblings(self, after_key: str | None) -> None:
+        """Cancel every statement that appears after ``after_key``.
+
+        When ``after_key`` is ``None`` every statement is cancelled.
+        """
+        seen = after_key is None
+        for key, stmt in self.results.items():
+            if not seen:
+                if key == after_key:
+                    seen = True
+                continue
+            try:
+                stmt.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel sibling statement %r after %r",
+                    key, after_key, exc_info=True,
+                )
+
+    def _cancel_in_flight(self) -> None:
+        """Cancel every statement currently submitted to the backend."""
+        for key, stmt in self._in_flight.items():
+            try:
+                stmt.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel in-flight statement %r", key, exc_info=True,
+                )
+
+    def _discard_pending(self) -> None:
+        object.__setattr__(self, "_pending_queue", deque())
+
+    def _clear_pool_state(self) -> None:
+        object.__setattr__(self, "_in_flight", OrderedDict())
+        object.__setattr__(self, "_pending_queue", deque())
+        object.__setattr__(self, "_pool_runner", None)
+
+    @staticmethod
+    def _refresh_any_done(
+        in_flight: Mapping[str, StatementResult],
+        wait_cfg: WaitingConfig,
+    ) -> tuple[str, StatementResult]:
+        """Poll ``in_flight`` statements until at least one reaches a terminal state.
+
+        Statements are refreshed in submission order; the first ``done`` one
+        is returned as ``(key, statement)``.  Between full passes the
+        configured backoff is applied via ``wait_cfg.sleep``.
+        """
+        iteration = 0
+        start_ts = time.time()
+        while True:
+            for key, stmt in in_flight.items():
+                try:
+                    stmt.refresh_status()
+                except Exception:
+                    # Surface refresh errors as terminal for this statement so
+                    # the caller can decide whether to re-raise.
+                    return key, stmt
+                if stmt.done:
+                    return key, stmt
+            wait_cfg.sleep(iteration=iteration, start=start_ts)
+            iteration += 1
+
+    def _submit(
+        self,
+        key: str,
+        result: StatementResult,
+        runner: Callable[[StatementResult], Any],
+    ) -> None:
+        runner(result)
+        self._in_flight[key] = result
+
+    def start(
+        self,
+        parallel: int | bool = True,
+        *,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = True,
+        runner: Optional[Callable[[StatementResult], Any]] = None,
+    ) -> StatementBatch:
+        """Submit every statement result for execution.
+
+        Parameters
+        ----------
+        parallel
+            Concurrency window.  ``False`` (or ``0``) runs sequentially and
+            waits on each statement before moving to the next.  ``True``
+            defaults to a window of ``DEFAULT_PARALLEL`` (4).  An ``int >= 2``
+            caps the number of statements that may be in flight on the
+            backend at any one time.
+        wait
+            When falsy (default), ``start`` returns as soon as the window is
+            filled.  The remaining statements stay queued and are submitted
+            as slots free up inside :meth:`wait`.  When truthy, ``start``
+            also drains every pending statement before returning.
+        raise_error
+            Whether to raise on per-statement failure.  When ``True`` and
+            any statement fails, every in-flight and queued result is
+            cancelled before the exception propagates.
+        runner
+            Optional callable invoked once per result instead of
+            ``result.start(wait=False, raise_error=raise_error)``.  Useful for
+            engines that need to resolve execution context (warehouse,
+            catalog, …) before delegating to the backend.  Runners should
+            submit without blocking — the batch handles polling.
+
+        Notes
+        -----
+        ``start`` is not re-entrant: calling it twice on the same batch
+        without first draining (:meth:`wait`) or tearing down (:meth:`cancel`)
+        the active window raises ``RuntimeError``.
+        """
+        if self._in_flight or self._pending_queue:
+            raise RuntimeError(
+                "StatementBatch.start() was already called; call wait() or "
+                "cancel() before starting again."
+            )
+
+        workers = self._resolve_parallel(parallel)
+
+        def _default_runner(result: StatementResult) -> Any:
+            return result.start(wait=False, raise_error=raise_error)
+
+        effective_runner = runner or _default_runner
+
+        if workers == 1 or len(self.results) <= 1:
+            # Sequential submission: each statement is fully drained before the
+            # next is submitted so later statements can observe earlier writes.
+            # The caller's ``wait`` only applies to the final statement — every
+            # preceding one is forced to ``wait=True``.
+            items = list(self.results.items())
+            last_index = len(items) - 1
+            for idx, (key, stmt) in enumerate(items):
+                stmt_wait = wait if idx == last_index else True
+                try:
+                    effective_runner(stmt)
+                    stmt.wait(wait=stmt_wait, raise_error=raise_error)
+                except Exception:
+                    self._cancel_siblings(after_key=key)
+                    if raise_error:
+                        raise
+            return self
+
+        object.__setattr__(self, "_pool_runner", effective_runner)
+        object.__setattr__(self, "_pool_raise_error", raise_error)
+        object.__setattr__(
+            self,
+            "_pending_queue",
+            deque(self.results.items()),
+        )
+
+        # Fill the initial window.
+        try:
+            while self._pending_queue and len(self._in_flight) < workers:
+                key, stmt = self._pending_queue.popleft()
+                self._submit(key, stmt, effective_runner)
+        except Exception:
+            self._cancel_in_flight()
+            self._discard_pending()
+            self._cancel_siblings(after_key=None)
+            self._clear_pool_state()
+            if raise_error:
+                raise
+            return self
+
+        if wait:
+            self.wait(wait=wait, raise_error=raise_error)
+
         return self
 
     def wait(
@@ -602,8 +1015,103 @@ class StatementBatch(Mapping[str, Statement]):
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
     ) -> StatementBatch:
-        for result in self.results.values():
-            result.wait(wait=wait, raise_error=raise_error)
+        """Block until every statement reaches a terminal state.
+
+        When a pool is active (``start`` was called without ``wait``), this
+        drains it: as each in-flight statement completes, the next queued
+        submission takes its slot.  A failure causes every remaining
+        submission and every still-running statement to be cancelled before
+        the original exception is re-raised (when ``raise_error`` is ``True``).
+
+        When no pool is active, statements are waited on in submission order
+        via their own ``wait()``.  A failure in one statement cancels every
+        later statement before the exception propagates.
+        """
+        if self._in_flight or self._pending_queue:
+            self._drain(wait=wait, raise_error=raise_error)
+            return self
+
+        for key, result in self.results.items():
+            try:
+                result.wait(wait=wait, raise_error=raise_error)
+            except Exception:
+                self._cancel_siblings(after_key=key)
+                if raise_error:
+                    raise
+        return self
+
+    def _drain(
+        self,
+        *,
+        wait: WaitingConfigArg,
+        raise_error: bool,
+    ) -> None:
+        wait_cfg = WaitingConfig.check_arg(wait) if wait else WaitingConfig.default()
+        effective_runner = self._pool_runner
+
+        first_exc: Optional[BaseException] = None
+        failed_key: Optional[str] = None
+
+        try:
+            while self._in_flight:
+                key, stmt = self._refresh_any_done(self._in_flight, wait_cfg)
+                self._in_flight.pop(key, None)
+
+                try:
+                    stmt.raise_for_status()
+                except Exception as exc:
+                    first_exc = exc
+                    failed_key = key
+                    break
+
+                if self._pending_queue and effective_runner is not None:
+                    next_key, next_stmt = self._pending_queue.popleft()
+                    try:
+                        self._submit(next_key, next_stmt, effective_runner)
+                    except Exception as exc:
+                        first_exc = exc
+                        failed_key = next_key
+                        break
+
+            if first_exc is not None:
+                self._cancel_in_flight()
+                for pkey, pstmt in self._pending_queue:
+                    try:
+                        pstmt.cancel()
+                    except Exception:
+                        logger.debug(
+                            "Failed to cancel queued statement %r",
+                            pkey, exc_info=True,
+                        )
+        finally:
+            self._clear_pool_state()
+
+        if first_exc is not None and raise_error:
+            raise RuntimeError(
+                f"PreparedStatement batch item {failed_key!r} failed."
+            ) from first_exc
+
+    def cancel(self) -> StatementBatch:
+        """Cancel the active window and every underlying statement.
+
+        Safe to call whether or not :meth:`start` has been invoked.  Queued
+        statements are dropped, every in-flight statement is cancelled on the
+        backend, and every remaining statement in the batch has its own
+        ``cancel()`` invoked so backend handles are released even if the
+        batch was started eagerly with ``parallel=False``.
+        """
+        self._cancel_in_flight()
+        self._discard_pending()
+
+        for key, stmt in self.results.items():
+            try:
+                stmt.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel statement %r", key, exc_info=True,
+                )
+
+        self._clear_pool_state()
         return self
 
     def persist(

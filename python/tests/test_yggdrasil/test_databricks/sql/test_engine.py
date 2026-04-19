@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import pyarrow as pa
 import pytest
-from yggdrasil.data.statement import Statement as BaseStatement
+from yggdrasil.data.statement import StatementResult as BaseStatementResult
 
 from yggdrasil.data import Schema
 from yggdrasil.databricks.sql import SQLEngine
@@ -59,7 +59,7 @@ class _FakeCleanupResource:
 
 
 @dataclass
-class _FakeStatement(BaseStatement):
+class _FakeStatement(BaseStatementResult):
     """Concrete ``StatementResult`` used to exercise base-class behavior."""
 
     _fake_done: bool = field(default=False)
@@ -78,11 +78,70 @@ class _FakeStatement(BaseStatement):
     def refresh_status(self) -> None:
         return None
 
+    def start(self, *, wait=True, raise_error=True, **_kwargs) -> "_FakeStatement":
+        return self
+
+    def cancel(self) -> "_FakeStatement":
+        return self
+
     def collect_schema(self, full=False) -> Schema:
         return Schema.from_any_fields([], metadata={})
 
     def to_arrow_reader(self, **_: object) -> pa.RecordBatchReader:  # pragma: no cover
         raise NotImplementedError
+
+
+class TestSqlInsertIntoSmartDispatch(unittest.TestCase):
+    """``sql_insert_into`` should route cached/Spark/warehouse paths correctly."""
+
+    def _make_engine(self):
+        from unittest.mock import MagicMock
+        engine = MagicMock(spec=["sql_insert_into", "insert_into", "spark_insert_into"])
+        # Use the real sql_insert_into wired onto the mock.
+        from yggdrasil.databricks.sql.engine import SQLEngine
+        engine.sql_insert_into = SQLEngine.sql_insert_into.__get__(engine)
+        engine.catalog_name = None
+        engine.schema_name = None
+        return engine
+
+    def test_cached_spark_df_is_reused(self):
+        from unittest.mock import MagicMock, patch
+        from yggdrasil.databricks.sql.statement import StatementResult
+        from yggdrasil.data.statement import PreparedStatement
+
+        engine = self._make_engine()
+        result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
+        spark_df = MagicMock()
+        object.__setattr__(result, "_spark_df", spark_df)
+
+        with patch("yggdrasil.environ.PyEnv.spark_session", return_value=None):
+            engine.sql_insert_into(result, location="main.s.t")
+
+        engine.insert_into.assert_called_once()
+        kwargs = engine.insert_into.call_args.kwargs
+        self.assertIs(kwargs["data"], spark_df)
+
+    def test_spark_session_runs_sql_and_dispatches_to_spark_insert(self):
+        from unittest.mock import MagicMock, patch
+        from yggdrasil.data.statement import PreparedStatement
+
+        engine = self._make_engine()
+        stmt = PreparedStatement(text="SELECT 1")
+
+        spark_session = MagicMock()
+        df = MagicMock()
+        spark_session.sql.return_value = df
+
+        with patch(
+            "yggdrasil.environ.PyEnv.spark_session",
+            return_value=spark_session,
+        ):
+            engine.sql_insert_into(stmt, location="main.s.t")
+
+        spark_session.sql.assert_called_once_with("SELECT 1")
+        engine.spark_insert_into.assert_called_once()
+        kwargs = engine.spark_insert_into.call_args.kwargs
+        self.assertIs(kwargs["data"], df)
 
 
 class TestTemporaryTableCleanup(unittest.TestCase):

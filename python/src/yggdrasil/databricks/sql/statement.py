@@ -1,19 +1,19 @@
-"""Single access point for managing a Databricks SQL statement.
+"""Single access point for managing a Databricks SQL statement execution.
 
-``Statement`` combines pre-execution state (query text, parameters, temporary
-tables) with execution state (warehouse, statement id, response) and the
-Arrow-first result interface provided by :class:`BaseStatementResult`.
+``StatementResult`` binds a :class:`~yggdrasil.data.statement.PreparedStatement`
+configuration to the Databricks backend: it carries the submission state
+(``warehouse_id``, ``statement_id``, the cached response) and exposes the
+Arrow-first result interface provided by
+:class:`~yggdrasil.data.statement.StatementResult`.
 
-A Statement is ``started`` once a ``statement_id`` is present; :meth:`start`
+A result is ``started`` once a ``statement_id`` is present; :meth:`start`
 submits the query to a warehouse when it is not yet started.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Iterator, List, Optional, TYPE_CHECKING
+from typing import Iterable, Iterator, List, Optional, TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.ipc as pipc
@@ -21,7 +21,6 @@ import urllib3
 from databricks.sdk.service.sql import (
     Disposition,
     ExternalLink,
-    StatementParameterListItem,
     StatementResponse,
     StatementState,
     StatementStatus,
@@ -30,7 +29,8 @@ from databricks.sdk.service.sql import (
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Field, Schema, schema
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.statement import Statement as BaseStatement
+from yggdrasil.data.statement import PreparedStatement
+from yggdrasil.data.statement import StatementResult as BaseStatementResult
 
 from .exceptions import SQLError
 from .statements import Statements
@@ -39,17 +39,8 @@ from ..client import DatabricksResource
 if TYPE_CHECKING:
     from .warehouse import SQLWarehouse
 
-__all__ = ["Statement"]
+__all__ = ["PreparedStatement", "StatementResult"]
 
-
-_SQL_COMMENT_OR_WS_RE = re.compile(
-    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)+",
-    re.DOTALL,
-)
-_SQL_QUERY_LEAD_RE = re.compile(
-    r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
-    re.IGNORECASE,
-)
 
 DONE_STATES = {
     StatementState.CANCELED,
@@ -65,16 +56,20 @@ FAILED_STATES = {
 
 
 @dataclass
-class Statement(BaseStatement, DatabricksResource):
-    """Unified pre-execution and post-execution statement handler."""
+class StatementResult(BaseStatementResult, DatabricksResource):
+    """Databricks-backed :class:`StatementResult` handler.
 
+    Wraps a :class:`PreparedStatement` configuration together with the per-execution
+    state (``warehouse_id``, ``statement_id``, cached ``StatementResponse``)
+    that Databricks needs.  All config — text, parameters, temporary tables —
+    lives on ``self.statement``.
+    """
+
+    statement: PreparedStatement = field(default_factory=PreparedStatement)
     service: Statements = field(
         default_factory=Statements.current,
         repr=False, compare=False, hash=False,
     )
-    text: str = ""
-    parameters: Mapping[str, Any] = field(default_factory=dict)
-    temporary_tables: Mapping[str, Any] = field(default_factory=dict)
     warehouse_id: str | None = None
     statement_id: str | None = None
     disposition: Optional[Disposition] = None
@@ -82,7 +77,7 @@ class Statement(BaseStatement, DatabricksResource):
     _response: Optional[StatementResponse] = field(
         default=None, repr=False, compare=False, hash=False,
     )
-    _history: Optional[Mapping[str, Any]] = field(
+    _history: Optional[dict] = field(
         default=None, repr=False, compare=False, hash=False,
     )
 
@@ -90,87 +85,73 @@ class Statement(BaseStatement, DatabricksResource):
     # Construction helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def looks_like_query(text: Any) -> bool:
-        """Fast heuristic: return ``True`` when ``text`` looks like a SQL query.
-
-        Leading whitespace and SQL comments are skipped; a string is treated
-        as a query when its first keyword is ``SELECT``, ``WITH``, ``VALUES``,
-        ``TABLE``, or ``FROM``.  Non-string inputs return ``False``.
-        """
-        if not isinstance(text, str) or not text:
-            return False
-        stripped = text.lstrip()
-        if not stripped:
-            return False
-        while True:
-            match = _SQL_COMMENT_OR_WS_RE.match(stripped)
-            if not match:
-                break
-            stripped = stripped[match.end():]
-        return bool(_SQL_QUERY_LEAD_RE.match(stripped))
-
     @classmethod
     def prepare(
         cls,
-        statement: "Statement | str",
+        statement: "StatementResult | PreparedStatement | str",
         *,
-        parameters: Mapping[str, Any] | None = None,
-        temporary_tables: Mapping[str, Any] | None = None,
-    ) -> "Statement":
-        """Coerce ``statement`` into a :class:`Statement`, merging extra args."""
+        parameters=None,
+        temporary_tables=None,
+    ) -> "StatementResult":
+        """Coerce ``statement`` into a :class:`StatementResult`.
+
+        - Existing ``StatementResult`` instances are reused; extra ``parameters``
+          / ``temporary_tables`` are merged into their inner
+          :class:`PreparedStatement` config.
+        - Plain :class:`PreparedStatement` configs are wrapped in an unstarted
+          :class:`StatementResult`.
+        - Strings are coerced via :meth:`PreparedStatement.prepare`.
+        """
         if isinstance(statement, cls):
-            prepared = statement
-            if parameters:
-                prepared = prepared.bind(**parameters)
-            if temporary_tables:
-                prepared = prepared.with_temporary_tables(**temporary_tables)
-            return prepared
+            if parameters or temporary_tables:
+                merged = PreparedStatement.prepare(
+                    statement.statement,
+                    parameters=parameters,
+                    temporary_tables=temporary_tables,
+                )
+                return replace(statement, statement=merged)
+            return statement
 
-        return cls(
-            text=str(statement),
-            parameters=dict(parameters) if parameters else {},
-            temporary_tables=dict(temporary_tables) if temporary_tables else {},
+        cfg = PreparedStatement.prepare(
+            statement,
+            parameters=parameters,
+            temporary_tables=temporary_tables,
         )
+        return cls(statement=cfg)
 
-    def bind(self, **parameters: Any) -> "Statement":
-        """Return a new Statement with additional named parameters bound."""
+    def bind(self, **parameters) -> "StatementResult":
+        """Return a copy with additional named parameters bound on the config."""
         if not parameters:
             return self
-        return replace(
-            self,
-            parameters={**self.parameters, **parameters},
-        )
+        return replace(self, statement=self.statement.bind(**parameters))
 
-    def with_temporary_tables(self, **tables: Any) -> "Statement":
-        """Return a new Statement with additional temporary tables registered."""
+    def with_temporary_tables(self, **tables) -> "StatementResult":
+        """Return a copy with additional temporary-table aliases on the config."""
         if not tables:
             return self
         return replace(
             self,
-            temporary_tables={**self.temporary_tables, **tables},
+            statement=self.statement.with_temporary_tables(**tables),
         )
 
-    def clear(self) -> "Statement":
-        """Return a new Statement with text and all bound arguments cleared."""
-        return replace(
-            self,
-            text="",
-            parameters={},
-            temporary_tables={},
-        )
+    def with_text(self, text: str) -> "StatementResult":
+        """Return a copy with the SQL text replaced on the config."""
+        if text == self.statement.text:
+            return self
+        return replace(self, statement=self.statement.with_text(text))
 
-    def to_parameter_list(self) -> Optional[List[StatementParameterListItem]]:
-        """Render bound parameters as Databricks ``StatementParameterListItem``."""
-        if not self.parameters:
-            return None
-        return [
-            StatementParameterListItem(
-                name=str(name),
-                value=None if value is None else str(value),
-            )
-            for name, value in self.parameters.items()
-        ]
+    def clear(self) -> "StatementResult":
+        """Return a copy with an empty :class:`PreparedStatement` config."""
+        return replace(self, statement=PreparedStatement())
+
+    def to_parameter_list(self):
+        """Delegate to :meth:`PreparedStatement.to_parameter_list`."""
+        return self.statement.to_parameter_list()
+
+    # Back-compat: ``looks_like_query`` used to live on the Databricks class.
+    @staticmethod
+    def looks_like_query(text):
+        return PreparedStatement.looks_like_query(text)
 
     # ------------------------------------------------------------------
     # Execution lifecycle
@@ -194,10 +175,10 @@ class Statement(BaseStatement, DatabricksResource):
         disposition: Optional[Disposition] = None,
         wait=True,
         raise_error: bool = True,
-    ) -> "Statement":
+    ) -> "StatementResult":
         """Submit the statement to a warehouse if not already started.
 
-        When the statement is already started (``statement_id`` is set), the
+        When the result is already started (``statement_id`` is set) the
         existing instance is returned unchanged.  Otherwise the query is
         submitted to ``warehouse`` (or to the warehouse resolved by
         ``warehouse_id`` / ``warehouse_name``); ``statement_id``, response,
@@ -227,7 +208,7 @@ class Statement(BaseStatement, DatabricksResource):
 
         return self
 
-    def cancel(self) -> "Statement":
+    def cancel(self) -> "StatementResult":
         """Cancel the running statement on Databricks.
 
         No-op when the statement has not been started or has already
@@ -253,11 +234,11 @@ class Statement(BaseStatement, DatabricksResource):
 
     def __repr__(self) -> str:
         if self.started:
-            return f"Statement(url='{self.monitoring_url}')"
-        return f"Statement(text={self.text!r})"
+            return f"StatementResult(url='{self.monitoring_url}')"
+        return f"StatementResult(text={self.statement.text!r})"
 
     def __str__(self) -> str:
-        return self.monitoring_url if self.started else self.text
+        return self.monitoring_url if self.started else self.statement.text
 
     @property
     def monitoring_url(self) -> str:
@@ -315,7 +296,7 @@ class Statement(BaseStatement, DatabricksResource):
 
     @property
     def status(self) -> StatementStatus:
-        """Statement status object."""
+        """PreparedStatement status object."""
         return self.response.status
 
     @property
@@ -333,7 +314,7 @@ class Statement(BaseStatement, DatabricksResource):
         """True when the statement failed or was canceled."""
         return self.state in FAILED_STATES
 
-    def raise_for_status(self) -> "Statement":
+    def raise_for_status(self) -> "StatementResult":
         """Raise ``SQLError`` if the statement is in a failed state."""
         if self.failed:
             error = SQLError.from_statement(self)
