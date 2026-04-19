@@ -1643,25 +1643,27 @@ class DataType(BaseChildrenFields, ABC):
             if isinstance(value, DataType):
                 return value
 
-        if hasattr(value, "data_schema"):
-            from yggdrasil.data.schema import Schema
-            data_schema = value.data_schema
+        for attr in ("collect_schema", "data_schema"):
+            if hasattr(value, attr):
+                from yggdrasil.data.schema import Schema
+                data_schema = getattr(value, attr)
 
-            if callable(data_schema):
-                data_schema = data_schema()
+                if callable(data_schema):
+                    data_schema = data_schema()
 
-            if isinstance(data_schema, Schema):
-                return data_schema.dtype
+                if isinstance(data_schema, Schema):
+                    return data_schema.dtype
 
-        if hasattr(value, "data_field"):
-            from yggdrasil.data.data_field import Field
-            data_field = value.data_field
+        for attr in ("collect_data_field", "data_field"):
+            if hasattr(value, attr):
+                from yggdrasil.data.data_field import Field
+                data_field = getattr(value, attr)
 
-            if callable(data_field):
-                data_field = data_field()
+                if callable(data_field):
+                    data_field = data_field()
 
-            if isinstance(data_field, Field):
-                return data_field.dtype
+                if isinstance(data_field, Field):
+                    return data_field.dtype
 
         if hasattr(value, "to_arrow_field"):
             return cls.from_arrow_field(value.to_arrow_field())

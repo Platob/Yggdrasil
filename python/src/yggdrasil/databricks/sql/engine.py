@@ -1525,8 +1525,10 @@ class SQLEngine(DatabricksService):
             primary_keys=primary_keys, foreign_keys=foreign_keys
         )
         location = table.full_name(safe=True)
-        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
-        existing_schema = table.data_schema
+        existing_schema = table.collect_schema()
+        cast_options = CastOptions.check(options=cast_options).check_target(
+            existing_schema.to_field(),
+        )
 
         logger.debug("Inserting %s into %s", type(data), location)
 
@@ -1814,7 +1816,7 @@ class SQLEngine(DatabricksService):
             )
 
         location = table.full_name(safe=True)
-        fields = list(table.data_schema.fields)
+        fields = list(table.collect_schema().fields)
         columns = [f.name for f in fields]
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
         cast_projection = ", ".join(
@@ -2094,7 +2096,9 @@ class SQLEngine(DatabricksService):
             schema_mode=schema_mode,
             primary_keys=primary_keys, foreign_keys=foreign_keys
         )
-        cast_options = CastOptions.check(options=cast_options).check_target(table.data_field)
+        cast_options = CastOptions.check(options=cast_options).check_target(
+            table.collect_data_field(),
+        )
         data_df = any_to_spark_dataframe(data, cast_options)
         target = table.delta_spark()
 

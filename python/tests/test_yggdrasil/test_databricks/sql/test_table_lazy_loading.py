@@ -215,12 +215,25 @@ class TestTableInfosCache:
         assert primed_table._column_tags_fetched_at is None
 
 
-# ── Table.data_schema — enrichment with tags + constraints ────────────────────
+# ── Table.collect_schema — enrichment with tags + constraints ────────────────
 
 
-class TestDataSchemaEnrichment:
-    def test_data_schema_stamps_primary_key_and_foreign_key_and_tags(
-        self, primed_table, mock_ws
+class TestCollectSchemaEnrichment:
+    def test_default_returns_basic_schema_without_tag_or_constraint_lookup(
+        self, primed_table, mock_ws,
+    ):
+        schema = primed_table.collect_schema()
+
+        assert [f.name for f in schema.fields] == ["id", "amount"]
+        # Cheap path: no tag round trips, no constraint summary leakage.
+        mock_ws.entity_tag_assignments.list.assert_not_called()
+        assert schema.metadata is not None
+        assert b"primary_key" not in schema.metadata
+        assert b"foreign_key" not in schema.metadata
+        assert schema.metadata[b"table_name"] == b"orders"
+
+    def test_collect_schema_full_stamps_primary_key_foreign_key_and_tags(
+        self, primed_table, mock_ws,
     ):
         # Primary key on `id`, foreign key from `amount` to `finance.payments.id`.
         primed_table._infos.table_constraints = [
@@ -254,7 +267,7 @@ class TestDataSchemaEnrichment:
 
         mock_ws.entity_tag_assignments.list.side_effect = _fake_list
 
-        schema = primed_table.data_schema
+        schema = primed_table.collect_schema(full=True)
 
         id_field = schema["id"]
         amount_field = schema["amount"]
