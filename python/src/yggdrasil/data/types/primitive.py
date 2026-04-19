@@ -431,7 +431,7 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
         options = options.check_source(array)
 
         if self._source_is_temporal(options):
-            from ._temporal_cast import arrow_cast_to_string
+            from .temporal import arrow_cast_to_string
 
             casted = arrow_cast_to_string(array)
             if self.to_arrow() != casted.type:
@@ -449,7 +449,7 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
 
         if self._source_is_temporal(options):
             pl = get_polars()
-            from ._temporal_cast import arrow_cast_to_string
+            from .temporal import arrow_cast_to_string
 
             arrow = arrow_cast_to_string(series.to_arrow())
             casted = pl.Series(name=series.name, values=arrow, dtype=pl.String)
@@ -485,7 +485,7 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
         options = options.check_source(column)
 
         if self._source_is_temporal(options):
-            from ._temporal_cast import spark_temporal_to_string
+            from .temporal import spark_temporal_to_string
 
             casted = spark_temporal_to_string(column)
             return self.fill_spark_column_nulls(
@@ -1347,7 +1347,7 @@ def _temporal_cast_module():
     linear and the helper module doesn't reach back into us while we're still
     being defined.
     """
-    from . import _temporal_cast as tc
+    from . import temporal as tc
 
     return tc
 
@@ -1461,7 +1461,7 @@ class TemporalType(PrimitiveType, ABC):
                 casted, nullable=self._target_nullable(options)
             )
 
-        from yggdrasil.polars.cast import cast_polars_array_to_temporal
+        from .temporal import cast_polars_array_to_temporal
 
         pl = get_polars()
         source_dtype = series.dtype
@@ -1485,7 +1485,7 @@ class TemporalType(PrimitiveType, ABC):
         expr: Any,
         options: "CastOptions",
     ):
-        from yggdrasil.polars.cast import cast_polars_array_to_temporal
+        from .temporal import cast_polars_array_to_temporal
 
         pl = get_polars()
 

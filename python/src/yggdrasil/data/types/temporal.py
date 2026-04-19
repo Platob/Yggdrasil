@@ -3,25 +3,27 @@
 User data hitting the library is messy — strings in a dozen formats, epoch
 numbers in seconds/ms/us/ns, naive timestamps tagged with timezones after the
 fact, durations spelled as plain integers. This module turns that chaos into
-Arrow/Spark-native temporal arrays without ever looping in Python.
+Arrow / Polars / Spark-native temporal arrays without ever looping in Python.
 
-Everything here is vectorized: pyarrow.compute for Arrow arrays,
-pyspark.sql.functions for Spark columns. Pure-Python loops are deliberately
-avoided so ingestion stays fast even on wide, deep inputs.
+Everything here is vectorized: pyarrow.compute for Arrow arrays, polars
+expressions for polars Series / Expr, pyspark.sql.functions for Spark
+columns. Pure-Python loops are deliberately avoided so ingestion stays fast
+even on wide, deep inputs.
 """
 
 from __future__ import annotations
 
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .support import get_spark_sql
+from .support import get_polars, get_spark_sql
 
 if TYPE_CHECKING:
+    import polars as pl  # noqa: F401
     import pyspark.sql as ps
 
 
@@ -30,6 +32,10 @@ __all__ = [
     "ARROW_DATETIME_FORMATS_NAIVE",
     "ARROW_DATE_FORMATS",
     "ARROW_TIME_FORMATS",
+    "POLARS_DATETIME_FORMATS_TZ",
+    "POLARS_DATETIME_FORMATS_NAIVE",
+    "POLARS_DATE_FORMATS",
+    "POLARS_TIME_FORMATS",
     "SPARK_DATETIME_FORMATS",
     "SPARK_DATE_FORMATS",
     "SPARK_TIME_FORMATS",
@@ -58,6 +64,7 @@ __all__ = [
     "arrow_duration_to_string",
     "arrow_temporal_to_string",
     "attach_fractional_seconds",
+    "cast_polars_array_to_temporal",
     "spark_to_timestamp",
     "spark_to_date",
     "spark_to_time_string",
@@ -1088,6 +1095,383 @@ def arrow_temporal_to_string(
 ) -> pa.Array | pa.ChunkedArray:
     """Back-compat alias for :func:`arrow_cast_to_string` on temporal inputs."""
     return arrow_cast_to_string(array, fmt=fmt)
+
+
+# ---------------------------------------------------------------------------
+# Polars helpers
+# ---------------------------------------------------------------------------
+#
+# Polars uses chrono format strings (https://docs.rs/chrono/latest/chrono/format/strftime/),
+# which overlap with C strptime but diverge for sub-second precision: ``%.f``
+# matches an optional fractional-second segment, while ``%f`` is a fixed-width
+# microseconds field. Polars' multi-format coalesce path leans on ``%.f`` so a
+# single format covers both ``HH:MM:SS`` and ``HH:MM:SS.123456`` rows.
+
+# Formats with an embedded UTC offset — strptime returns ``Datetime[tu, UTC]``.
+# We parse those separately from naive formats because polars'
+# ``pl.coalesce([naive, tz_aware])`` raises ``SchemaError`` when the branches
+# disagree on tz state. The tz branch gets stripped to naive before merging.
+POLARS_DATETIME_FORMATS_TZ: tuple[str, ...] = (
+    "%Y-%m-%dT%H:%M:%S%.f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%d %H:%M:%S%.f%z",
+    "%Y-%m-%d %H:%M:%S%z",
+    "%Y-%m-%d %H:%M%z",
+)
+
+POLARS_DATETIME_FORMATS_NAIVE: tuple[str, ...] = (
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y",
+    "%Y%m%dT%H%M%S",
+    "%Y%m%d",
+    "%d %b %Y %H:%M:%S",
+    "%d %b %Y",
+    "%b %d, %Y",
+    "%Y-%m-%d",
+)
+
+POLARS_DATE_FORMATS: tuple[str, ...] = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d-%m-%Y",
+    "%Y%m%d",
+    "%d %b %Y",
+    "%b %d, %Y",
+    "%d.%m.%Y",
+)
+
+POLARS_TIME_FORMATS: tuple[str, ...] = (
+    "%H:%M:%S%.f",
+    "%H:%M:%S",
+    "%H:%M",
+    "%I:%M:%S %p",
+    "%I:%M %p",
+)
+
+
+def _polars_numeric_classes() -> tuple:
+    pl = get_polars()
+    return (
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+        pl.Float32, pl.Float64,
+    )
+
+
+def _polars_dtype_class(dtype: Any) -> Any:
+    """Return the polars dtype *class* whether *dtype* is a class or instance."""
+    return dtype if isinstance(dtype, type) else dtype.__class__
+
+
+def _polars_safe_strptime(expr: Any, dtype: Any, fmt: str) -> Any:
+    """Single strptime attempt that yields null on mismatch (strict=False)."""
+    return expr.str.strptime(dtype, fmt, strict=False, ambiguous="earliest")
+
+
+def _polars_coalesce_strptime(
+    expr: Any, dtype: Any, formats: tuple[str, ...] | list[str]
+) -> Any:
+    """Try each format in order; first non-null result wins (per row)."""
+    pl = get_polars()
+    return pl.coalesce([_polars_safe_strptime(expr, dtype, fmt) for fmt in formats])
+
+
+def _polars_normalize_utc_suffix(expr: Any) -> Any:
+    """Rewrite trailing ``UTC`` tags to ``+00:00`` so ``%z`` formats catch them.
+
+    Mirrors :func:`_normalize_utc_suffix` on the arrow side so a single column
+    can mix ``Z``, ``+0000``, and ``"UTC"`` suffixes and parse via the same
+    tz-aware format catalogue.
+    """
+    return expr.str.replace(r"\s*UTC$", "+00:00")
+
+
+def _polars_normalize_utc_offset(expr: Any) -> Any:
+    """Rewrite ``+01:00`` style offsets to ``+0100`` so ``%z`` matches.
+
+    Polars' chrono ``%z`` accepts ``+0100`` but not ``+01:00`` — strip the
+    colon up front so both shapes parse identically.
+    """
+    return expr.str.replace(r"([+-])(\d{2}):(\d{2})$", r"${1}${2}${3}")
+
+
+def _polars_string_to_datetime(expr: Any, target: Any) -> Any:
+    """Best-effort string→Datetime parse using the polars format catalogues."""
+    pl = get_polars()
+    tu = getattr(target, "time_unit", "us") or "us"
+    bare = pl.Datetime(tu)
+    utc = pl.Datetime(tu, "UTC")
+
+    normalized = _polars_normalize_utc_suffix(expr)
+    normalized = _polars_normalize_utc_offset(normalized)
+
+    tz_parsed = [
+        _polars_safe_strptime(normalized, utc, fmt)
+        .dt.convert_time_zone("UTC")
+        .dt.replace_time_zone(None)
+        for fmt in POLARS_DATETIME_FORMATS_TZ
+    ]
+    naive_parsed = [
+        _polars_safe_strptime(expr, bare, fmt) for fmt in POLARS_DATETIME_FORMATS_NAIVE
+    ]
+    return pl.coalesce(tz_parsed + naive_parsed)
+
+
+def _polars_string_to_date(expr: Any) -> Any:
+    pl = get_polars()
+    return _polars_coalesce_strptime(expr, pl.Date(), POLARS_DATE_FORMATS)
+
+
+def _polars_string_to_time(expr: Any) -> Any:
+    pl = get_polars()
+    return _polars_coalesce_strptime(expr, pl.Time(), POLARS_TIME_FORMATS)
+
+
+def _polars_string_to_duration(expr: Any, target: Any) -> Any:
+    """Interpret integer / decimal strings as a count in the target unit.
+
+    Mirrors the arrow ``arrow_str_to_duration`` integer fast-path so polars
+    columns of plain numeric strings ingest without falling through to the
+    pure-Python ISO-8601 branch on every value.
+    """
+    pl = get_polars()
+    tu = getattr(target, "time_unit", "us") or "us"
+    return expr.cast(pl.Int64, strict=False).cast(pl.Duration(tu), strict=False)
+
+
+def _polars_apply_tz(expr: Any, src_tz: str | None, tgt_tz: str | None) -> Any:
+    """Transition a Datetime expression from *src_tz* to *tgt_tz*.
+
+    Mirrors the pyarrow ``retimestamp_prefer_polars`` semantics on the polars
+    side so naive ↔ aware transitions behave the same regardless of which
+    engine the caller routes through.
+    """
+    if src_tz is None and tgt_tz is None:
+        return expr
+    if src_tz is None:
+        return expr.dt.replace_time_zone(tgt_tz, ambiguous="earliest")
+    if tgt_tz is None:
+        return (
+            expr.dt.replace_time_zone(src_tz, ambiguous="earliest")
+            .dt.convert_time_zone("UTC")
+            .dt.replace_time_zone(None)
+        )
+    if src_tz == tgt_tz:
+        return expr.dt.replace_time_zone(src_tz, ambiguous="earliest")
+    return (
+        expr.dt.replace_time_zone(src_tz, ambiguous="earliest")
+        .dt.convert_time_zone(tgt_tz)
+    )
+
+
+def _eval_expr_on_series(series: Any, expr: Any, *, col_name: str, out_name: str) -> Any:
+    """Evaluate *expr* against *series*, preserving the original name."""
+    out = series.to_frame(name=col_name).select(expr).to_series()
+    return out.rename(out_name) if out_name else out
+
+
+def cast_polars_array_to_temporal(
+    array: Union["pl.Series", "pl.Expr"],
+    source: Any,
+    target: Any,
+    safe: bool,
+    source_tz: str | None = None,
+    target_tz: str | None = None,
+    to_expr: bool = False,
+    parent_name: str | None = None,
+) -> Union["pl.Series", "pl.Expr"]:
+    """Cast *array* to a temporal Polars dtype with full timezone handling.
+
+    Accepts a ``pl.Series`` or a ``pl.Expr`` and dispatches by the Polars
+    dtype class of *target*. ``safe=False`` (the default) enables the
+    multi-format string coalesce path; ``safe=True`` falls back to a single
+    strict polars cast, leaving rows that don't match the canonical form as
+    nulls / errors per polars' default behavior.
+    """
+    pl = get_polars()
+    is_expr = isinstance(array, pl.Expr)
+    series_name = "" if is_expr else (array.name or "")
+
+    if parent_name and series_name:
+        col_name = f"{parent_name}.{series_name}"
+    else:
+        col_name = series_name or parent_name or "__col__"
+
+    working: Any = array if is_expr else pl.col(col_name)
+
+    src_cls = _polars_dtype_class(source)
+    tgt_cls = _polars_dtype_class(target)
+
+    # Pull tz off either the dtype itself (when the caller passed a dtype
+    # *instance*) or from the explicit source_tz / target_tz kwargs.
+    src_tz = (
+        getattr(source, "time_zone", None) if not isinstance(source, type) else None
+    ) or source_tz
+    tgt_tz = (
+        getattr(target, "time_zone", None) if not isinstance(target, type) else None
+    ) or target_tz
+
+    string_classes = (pl.String, pl.Utf8)
+    numeric_classes = _polars_numeric_classes()
+
+    if tgt_cls is pl.Datetime:
+        tu = getattr(target, "time_unit", "us") or "us"
+
+        if src_cls is pl.Datetime:
+            working = working.cast(pl.Datetime(tu), strict=safe)
+            working = _polars_apply_tz(working, src_tz, tgt_tz)
+        elif src_cls in string_classes:
+            if safe:
+                working = working.str.strptime(
+                    pl.Datetime(tu), strict=True, ambiguous="earliest"
+                )
+            else:
+                working = _polars_string_to_datetime(working, pl.Datetime(tu, tgt_tz))
+            working = _polars_apply_tz(working, src_tz, tgt_tz)
+        elif src_cls is pl.Date:
+            working = working.cast(pl.Datetime(tu), strict=safe)
+            working = _polars_apply_tz(working, None, tgt_tz)
+        elif src_cls is pl.Time:
+            epoch = pl.lit(0).cast(pl.Datetime(tu))
+            working = epoch + working.cast(pl.Duration(tu), strict=safe)
+            working = _polars_apply_tz(working, None, tgt_tz)
+        elif src_cls is pl.Duration:
+            epoch = pl.lit(0).cast(pl.Datetime(tu))
+            working = epoch + working.cast(pl.Duration(tu), strict=safe)
+            working = _polars_apply_tz(working, None, tgt_tz)
+        elif src_cls in numeric_classes:
+            working = working.cast(pl.Int64, strict=safe).cast(
+                pl.Datetime(tu), strict=safe
+            )
+            working = _polars_apply_tz(working, src_tz, tgt_tz)
+        else:
+            working = working.cast(pl.Datetime(tu, tgt_tz), strict=safe)
+
+    elif tgt_cls is pl.Date:
+        if src_cls is pl.Date:
+            pass
+        elif src_cls in string_classes:
+            if safe:
+                working = working.str.strptime(
+                    pl.Date(), strict=True, ambiguous="earliest"
+                )
+            else:
+                # Cover full-datetime strings too — users routinely hand date
+                # columns ISO timestamps and expect just the date portion.
+                normalized = _polars_normalize_utc_suffix(working)
+                normalized = _polars_normalize_utc_offset(normalized)
+                date_branch = _polars_coalesce_strptime(
+                    working, pl.Date(), POLARS_DATE_FORMATS
+                )
+                bare_dt = pl.Datetime("us")
+                utc_dt = pl.Datetime("us", "UTC")
+                tz_branches = [
+                    _polars_safe_strptime(normalized, utc_dt, fmt)
+                    .dt.convert_time_zone("UTC")
+                    .dt.replace_time_zone(None)
+                    .dt.date()
+                    for fmt in POLARS_DATETIME_FORMATS_TZ
+                ]
+                naive_branches = [
+                    _polars_safe_strptime(working, bare_dt, fmt).dt.date()
+                    for fmt in POLARS_DATETIME_FORMATS_NAIVE
+                ]
+                working = pl.coalesce([date_branch, *tz_branches, *naive_branches])
+        elif src_cls is pl.Datetime:
+            if src_tz:
+                working = working.dt.replace_time_zone(src_tz, ambiguous="earliest")
+            if tgt_tz and tgt_tz != src_tz:
+                working = working.dt.convert_time_zone(tgt_tz)
+            working = working.dt.date()
+        elif src_cls in numeric_classes:
+            working = working.cast(pl.Int32, strict=safe).cast(pl.Date, strict=safe)
+        else:
+            working = working.cast(pl.Date, strict=safe)
+
+    elif tgt_cls is pl.Time:
+        if src_cls is pl.Time:
+            pass
+        elif src_cls in string_classes:
+            if safe:
+                working = working.str.strptime(
+                    pl.Time(), strict=True, ambiguous="earliest"
+                )
+            else:
+                working = _polars_string_to_time(working)
+        elif src_cls is pl.Datetime:
+            if src_tz:
+                working = working.dt.replace_time_zone(src_tz, ambiguous="earliest")
+            if tgt_tz and tgt_tz != src_tz:
+                working = working.dt.convert_time_zone(tgt_tz)
+            working = working.dt.time()
+        elif src_cls is pl.Duration:
+            working = working.cast(pl.Int64, strict=safe).cast(pl.Time, strict=safe)
+        elif src_cls in numeric_classes:
+            working = working.cast(pl.Int64, strict=safe).cast(pl.Time, strict=safe)
+        else:
+            working = working.cast(pl.Time, strict=safe)
+
+    elif tgt_cls is pl.Duration:
+        tu = getattr(target, "time_unit", "us") or "us"
+
+        if src_cls is pl.Duration:
+            working = working.cast(pl.Duration(tu), strict=safe)
+        elif src_cls in string_classes:
+            if safe:
+                # Polars has no safe string→Duration kernel; fall back to the
+                # integer-string fast path so callers still get something sane.
+                working = working.cast(pl.Int64, strict=True).cast(
+                    pl.Duration(tu), strict=True
+                )
+            else:
+                working = _polars_string_to_duration(working, pl.Duration(tu))
+        elif src_cls in numeric_classes:
+            working = working.cast(pl.Int64, strict=safe).cast(
+                pl.Duration(tu), strict=safe
+            )
+        elif src_cls is pl.Datetime:
+            if src_tz:
+                working = (
+                    working.dt.replace_time_zone(src_tz, ambiguous="earliest")
+                    .dt.convert_time_zone("UTC")
+                    .dt.replace_time_zone(None)
+                )
+            epoch = pl.lit(0).cast(pl.Datetime(tu))
+            working = working.cast(pl.Datetime(tu), strict=safe) - epoch
+        elif src_cls is pl.Date:
+            epoch = pl.lit(0).cast(pl.Date)
+            working = (working - epoch).cast(pl.Duration(tu), strict=safe)
+        else:
+            working = working.cast(pl.Duration(tu), strict=safe)
+
+    else:
+        raise TypeError(f"Unsupported temporal target type: {target!r}")
+
+    if series_name:
+        working = working.alias(series_name)
+
+    if is_expr or to_expr:
+        return working
+
+    return _eval_expr_on_series(
+        array, working, col_name=col_name, out_name=series_name
+    )
 
 
 # ---------------------------------------------------------------------------

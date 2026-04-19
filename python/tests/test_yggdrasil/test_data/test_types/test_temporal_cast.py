@@ -21,7 +21,7 @@ from yggdrasil.data.types import (
     TimeType,
 )
 from yggdrasil.data.types import StringType
-from yggdrasil.data.types._temporal_cast import (
+from yggdrasil.data.types.temporal import (
     ISO_DURATION_DAYS_PER_MONTH,
     ISO_DURATION_DAYS_PER_YEAR,
     arrow_cast_to_date,
