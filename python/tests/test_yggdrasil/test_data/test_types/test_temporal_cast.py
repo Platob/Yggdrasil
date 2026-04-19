@@ -571,6 +571,51 @@ def test_arrow_duration_to_string_integer_roundtrip() -> None:
     assert out.to_pylist() == ["60", "3600"]
 
 
+def test_arrow_timestamp_to_string_tz_aware_default_uses_colon_offset() -> None:
+    # Defaults route through polars, so the tz-aware default emits ``+02:00``
+    # (with colon) — a form chrono will round-trip back through
+    # ``arrow_str_to_timestamp`` on every platform.
+    arr = pa.array(
+        [dt.datetime(2023, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)],
+        type=pa.timestamp("us", tz="UTC"),
+    )
+    out = arrow_timestamp_to_string(arr)
+    s = out.to_pylist()[0]
+    assert s.startswith("2023-01-02T03:04:05")
+    assert s.endswith("+00:00")
+
+
+def test_arrow_timestamp_to_string_emits_fractional_only_when_present() -> None:
+    arr = pa.array(
+        [
+            dt.datetime(2023, 1, 2, 3, 4, 5),
+            dt.datetime(2023, 1, 2, 3, 4, 5, 500000),
+            dt.datetime(2023, 1, 2, 3, 4, 5, 123456),
+        ],
+        type=pa.timestamp("us"),
+    )
+    values = arrow_timestamp_to_string(arr).to_pylist()
+    # ``%.f`` skips the fractional suffix on whole seconds and otherwise
+    # picks the narrowest 3 / 6 / 9-digit shape that fits without truncation
+    # — chrono's standard rendering rules.
+    assert values[0] == "2023-01-02T03:04:05"
+    assert values[1] == "2023-01-02T03:04:05.500"
+    assert values[2] == "2023-01-02T03:04:05.123456"
+
+
+def test_arrow_temporal_to_string_round_trips_through_str_to_timestamp() -> None:
+    original = pa.array(
+        [
+            dt.datetime(2023, 1, 2, 3, 4, 5, 123456, tzinfo=dt.timezone.utc),
+            dt.datetime(2023, 5, 17, 14, 30, 0, tzinfo=dt.timezone.utc),
+        ],
+        type=pa.timestamp("us", tz="UTC"),
+    )
+    rendered = arrow_timestamp_to_string(original)
+    parsed = arrow_str_to_timestamp(rendered, unit="us", tz="UTC")
+    assert parsed.to_pylist() == original.to_pylist()
+
+
 def test_arrow_cast_to_string_dispatches_on_each_temporal() -> None:
     ts = arrow_cast_to_string(
         pa.array([dt.datetime(2023, 1, 2, 3, 4, 5)], type=pa.timestamp("us"))

@@ -1203,18 +1203,65 @@ def arrow_cast_to_duration(
     return pc.cast(array, target)
 
 
+def _polars_format_temporal(
+    array: pa.Array,
+    fmt: str | None,
+    kind: str,
+) -> pa.Array | None:
+    """Format a temporal arrow array as strings via polars chrono.
+
+    Returns ``None`` when polars is unavailable or the source dtype isn't
+    one polars stringifies cleanly — the caller falls back to pyarrow's
+    ``pc.strftime`` in that case. polars' ``%.f`` only emits a fractional
+    suffix when the value carries one, which matches the chrono parser on
+    the way back in.
+    """
+    pl = _polars_or_none()
+    if pl is None:
+        return None
+
+    if kind == "timestamp":
+        src_tz = array.type.tz
+        default = (
+            "%Y-%m-%dT%H:%M:%S%.f%:z" if src_tz else "%Y-%m-%dT%H:%M:%S%.f"
+        )
+    elif kind == "date":
+        default = "%Y-%m-%d"
+    elif kind == "time":
+        # Match the historical pyarrow ``cast(time, string)`` shape: always
+        # emit six fractional digits so the output round-trips against
+        # ``arrow_str_to_time`` regardless of source precision.
+        default = "%H:%M:%S%.6f"
+    else:
+        return None
+
+    try:
+        series = pl.from_arrow(array)
+        if not isinstance(series, pl.Series):
+            series = pl.Series(values=series)
+        out = series.dt.to_string(fmt or default)
+        return out.to_arrow()
+    except Exception:
+        return None
+
+
 def arrow_timestamp_to_string(
     array: pa.Array | pa.ChunkedArray,
     fmt: str | None = None,
 ) -> pa.Array | pa.ChunkedArray:
     """Format a timestamp array as strings. Default is ISO-8601.
 
-    Arrow's ``%S`` already emits the fractional-second suffix at the column's
-    native precision — no ``%f`` needed, and adding one would render a literal
-    ``.%f`` on top. Callers who want a different shape can pass ``fmt``.
+    Polars chrono is the primary path so timezone offsets (``%:z`` →
+    ``+02:00``) and fractional seconds (``%.f``, only emitted when the
+    value carries them) render the same way on every platform. pyarrow's
+    ``pc.strftime`` is the fallback for environments without polars; it
+    emits subseconds inline through ``%S`` so the visual shape stays close.
     """
 
     def _one(chunk: pa.Array) -> pa.Array:
+        out = _polars_format_temporal(chunk, fmt, kind="timestamp")
+        if out is not None:
+            return out
         src = chunk.type
         default_fmt = "%Y-%m-%dT%H:%M:%S%z" if src.tz else "%Y-%m-%dT%H:%M:%S"
         return pc.strftime(chunk, format=fmt or default_fmt)
@@ -1229,6 +1276,9 @@ def arrow_date_to_string(
     """Format a date array as strings. Default is ``YYYY-MM-DD``."""
 
     def _one(chunk: pa.Array) -> pa.Array:
+        out = _polars_format_temporal(chunk, fmt, kind="date")
+        if out is not None:
+            return out
         return pc.strftime(chunk, format=fmt or "%Y-%m-%d")
 
     return _apply_chunked(array, _one)
@@ -1240,13 +1290,17 @@ def arrow_time_to_string(
 ) -> pa.Array | pa.ChunkedArray:
     """Format a time array as strings.
 
-    pyarrow's ``strftime`` kernel doesn't accept ``time`` directly, so we lift
-    to a 1970-01-01 timestamp first when the caller passes a custom format;
-    otherwise we rely on the built-in ``pc.cast(time, string)`` which emits
-    ``HH:MM:SS.ffffff``.
+    Default emits ``HH:MM:SS.ffffff`` (six fractional digits, zero-padded)
+    so the result round-trips through :func:`arrow_str_to_time` regardless
+    of source precision. Polars handles ``time`` directly; the pyarrow
+    fallback bounces through a 1970-01-01 timestamp because ``pc.strftime``
+    refuses ``time`` inputs.
     """
 
     def _one(chunk: pa.Array) -> pa.Array:
+        out = _polars_format_temporal(chunk, fmt, kind="time")
+        if out is not None:
+            return out
         src = chunk.type
         src_unit = src.unit
         as_int = pc.cast(chunk, pa.int64())
