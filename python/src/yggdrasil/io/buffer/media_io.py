@@ -38,6 +38,7 @@ Typical usage::
 """
 from __future__ import annotations
 
+import io as _stdlib_io
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -51,6 +52,20 @@ from yggdrasil.io.enums import MimeTypes, Codec, MediaType, MimeType, SaveMode
 from yggdrasil.pickle.serde import ObjectSerde
 from .bytes_io import BytesIO
 from .media_options import MediaOptions
+
+_POLARS_NATIVE_MIMES: frozenset = frozenset({
+    MimeTypes.PARQUET,
+    MimeTypes.ARROW_IPC,
+    MimeTypes.ARROW_IPC_STREAM,
+    MimeTypes.JSON,
+    MimeTypes.CSV,
+    MimeTypes.TSV,
+})
+
+_POLARS_PARQUET_COMPRESSIONS: frozenset = frozenset(
+    {"uncompressed", "snappy", "gzip", "lzo", "brotli", "lz4", "zstd"}
+)
+_POLARS_IPC_COMPRESSIONS: frozenset = frozenset({"uncompressed", "lz4", "zstd"})
 
 if TYPE_CHECKING:
     import pandas
@@ -1386,7 +1401,17 @@ class MediaIO(ABC, Generic[O]):
     ) -> None:
         """Write a Polars DataFrame or LazyFrame to the buffer.
 
-        A :class:`polars.LazyFrame` is collected before encode.
+        For formats with a native Polars writer (Parquet, Arrow IPC,
+        CSV/TSV, JSON) the frame is serialized directly via
+        :meth:`polars.DataFrame.write_parquet` / ``write_ipc`` /
+        ``write_csv`` / ``write_json`` — the buffer never round-trips
+        through a :class:`pyarrow.Table`. Other formats fall back to the
+        Arrow-table write path.
+
+        A :class:`polars.LazyFrame` is collected before encode. Save-mode
+        merging (:attr:`SaveMode.APPEND`, :attr:`SaveMode.UPSERT`) is applied
+        using Polars-native ``concat`` / anti-join when the format supports
+        a native writer, and defers to the Arrow path otherwise.
 
         Parameters
         ----------
@@ -1407,6 +1432,8 @@ class MediaIO(ABC, Generic[O]):
         **option_kwargs:
             Format-specific write knobs forwarded to :meth:`check_options`.
         """
+        from yggdrasil.polars.lib import polars as _pl
+
         resolved = self.check_options(
             options=options,
             mode=mode,
@@ -1416,9 +1443,202 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
-        casted = resolved.cast.cast_polars_tabular(frame)
 
-        self.write_arrow_table(
-            table=casted.rechunk().to_arrow(),
-            options=resolved,
+        mime = self.media_type.mime_type if self.media_type is not None else None
+
+        # Formats without a native Polars writer fall back to the Arrow path
+        # (which also owns save-mode merging + codec wrapping for them).
+        if mime not in _POLARS_NATIVE_MIMES:
+            casted = resolved.cast.cast_polars_tabular(frame)
+            if isinstance(casted, _pl.LazyFrame):
+                casted = casted.collect()
+            self.write_arrow_table(
+                table=casted.rechunk().to_arrow(),
+                options=resolved,
+            )
+            return
+
+        if self.skip_write(mode=resolved.mode):
+            return
+
+        df = self._prepare_polars_frame(frame, options=resolved)
+
+        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
+            existing = self._read_existing_polars_frame()
+            df = self._apply_polars_save_mode(
+                existing,
+                df,
+                mode=resolved.mode,
+                match_by=resolved.match_by,
+            )
+
+        payload = self._encode_polars_frame(df, mime=mime, options=resolved)
+
+        codec = self.codec
+        if codec is not None:
+            plain = BytesIO(payload, config=self.buffer.config)
+            try:
+                self._compress_into_buffer(plain)
+            finally:
+                plain.close()
+        else:
+            self.buffer.replace_with_payload(payload)
+
+    # ------------------------------------------------------------------
+    # Polars-native write helpers (private)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_polars_frame(
+        frame: "polars.DataFrame | polars.LazyFrame",
+        *,
+        options: O,
+    ) -> "polars.DataFrame":
+        """Collect a LazyFrame, apply the configured cast, rechunk."""
+        from yggdrasil.polars.lib import polars as _pl
+
+        casted = options.cast.cast_polars_tabular(frame)
+        if isinstance(casted, _pl.LazyFrame):
+            casted = casted.collect()
+
+        if options.columns is not None:
+            keep = [c for c in options.columns if c in casted.columns]
+            casted = casted.select(keep)
+
+        return casted.rechunk()
+
+    def _read_existing_polars_frame(self) -> "polars.DataFrame | None":
+        """Read current buffer contents as a Polars DataFrame, or ``None``."""
+        if self.buffer.size <= 0:
+            return None
+        try:
+            from yggdrasil.polars.lib import polars as _pl
+
+            table = self.read_arrow_table()
+            if not isinstance(table, pa.Table):
+                return None
+            frame = _pl.from_arrow(table, rechunk=False)
+            if isinstance(frame, _pl.Series):
+                frame = frame.to_frame()
+            return frame
+        except Exception:
+            return None
+
+    @staticmethod
+    def _apply_polars_save_mode(
+        existing: "polars.DataFrame | None",
+        incoming: "polars.DataFrame",
+        *,
+        mode: SaveMode,
+        match_by: "Sequence[str] | None",
+    ) -> "polars.DataFrame":
+        """Combine *existing* and *incoming* Polars frames according to *mode*."""
+        from yggdrasil.polars.lib import polars as _pl
+
+        if existing is None or existing.height == 0:
+            return incoming
+
+        if mode in (SaveMode.AUTO, SaveMode.OVERWRITE, SaveMode.TRUNCATE):
+            return incoming
+
+        if mode == SaveMode.APPEND:
+            return _pl.concat([existing, incoming], how="diagonal_relaxed")
+
+        if mode == SaveMode.UPSERT:
+            if not match_by:
+                raise ValueError(
+                    "SaveMode.UPSERT requires match_by columns, got None/empty"
+                )
+            keys = list(match_by)
+            for col in keys:
+                if col not in existing.columns:
+                    raise ValueError(
+                        f"UPSERT match_by column {col!r} not in existing frame "
+                        f"(columns: {existing.columns})"
+                    )
+                if col not in incoming.columns:
+                    raise ValueError(
+                        f"UPSERT match_by column {col!r} not in incoming frame "
+                        f"(columns: {incoming.columns})"
+                    )
+
+            surviving = existing.join(incoming.select(keys), on=keys, how="anti")
+            return _pl.concat([surviving, incoming], how="diagonal_relaxed")
+
+        return incoming
+
+    @classmethod
+    def _encode_polars_frame(
+        cls,
+        df: "polars.DataFrame",
+        *,
+        mime: "MimeType",
+        options: O,
+    ) -> bytes:
+        """Serialize *df* through the Polars native writer for *mime*."""
+        buf = _stdlib_io.BytesIO()
+
+        if mime is MimeTypes.PARQUET:
+            df.write_parquet(
+                buf,
+                compression=cls._pl_parquet_compression(
+                    getattr(options, "compression", None)
+                ),
+                compression_level=getattr(options, "compression_level", None),
+                statistics=getattr(options, "use_statistics", True),
+                use_pyarrow=False,
+            )
+            return buf.getvalue()
+
+        if mime is MimeTypes.ARROW_IPC or mime is MimeTypes.ARROW_IPC_STREAM:
+            df.write_ipc(
+                buf,
+                compression=cls._pl_ipc_compression(
+                    getattr(options, "compression", None)
+                ),
+            )
+            return buf.getvalue()
+
+        if mime is MimeTypes.JSON:
+            # Polars 1.x writes a JSON array of row dicts, matching JsonIO.
+            df.write_json(buf)
+            return buf.getvalue()
+
+        if mime is MimeTypes.CSV or mime is MimeTypes.TSV:
+            separator = getattr(options, "delimiter", None)
+            if not separator:
+                separator = "\t" if mime is MimeTypes.TSV else ","
+            df.write_csv(
+                buf,
+                separator=separator,
+                include_header=getattr(options, "include_header", True),
+            )
+            return buf.getvalue()
+
+        raise NotImplementedError(
+            f"No native Polars writer registered for mime type {mime!r}"
+        )
+
+    @staticmethod
+    def _pl_parquet_compression(value: Any) -> str:
+        """Map ygg's compression sentinels to Polars Parquet codec names."""
+        if value in (None, "", "none", "off", "auto"):
+            return "zstd"
+        if value in _POLARS_PARQUET_COMPRESSIONS:
+            return value
+        raise ValueError(
+            f"Polars Parquet writer rejects compression={value!r}; "
+            f"valid values: {sorted(_POLARS_PARQUET_COMPRESSIONS)}"
+        )
+
+    @staticmethod
+    def _pl_ipc_compression(value: Any) -> str:
+        """Map ygg's compression sentinels to Polars IPC codec names."""
+        if value in (None, "", "none", "off", "auto"):
+            return "uncompressed"
+        if value in _POLARS_IPC_COMPRESSIONS:
+            return value
+        raise ValueError(
+            f"Polars IPC writer rejects compression={value!r}; "
+            f"valid values: {sorted(_POLARS_IPC_COMPRESSIONS)}"
         )
