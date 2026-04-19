@@ -28,9 +28,9 @@ from databricks.sdk.service.sql import (
 )
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.data import Field, Schema
+from yggdrasil.data import Field, Schema, schema
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
+from yggdrasil.data.statement import Statement as BaseStatement
 
 from .exceptions import SQLError
 from .statements import Statements
@@ -65,7 +65,7 @@ FAILED_STATES = {
 
 
 @dataclass
-class Statement(BaseStatementResult, DatabricksResource):
+class Statement(BaseStatement, DatabricksResource):
     """Unified pre-execution and post-execution statement handler."""
 
     service: Statements = field(
@@ -356,7 +356,7 @@ class Statement(BaseStatementResult, DatabricksResource):
         self.wait()
         return self.response.result
 
-    def make_data_schema(self) -> Schema:
+    def collect_schema(self, full: bool = False) -> Schema:
         manifest = self.manifest
         metadata = {
             "engine": "databricks-sql",
@@ -364,7 +364,7 @@ class Statement(BaseStatementResult, DatabricksResource):
         }
 
         if manifest is None:
-            return pa.schema([], metadata=metadata)
+            return schema([], metadata=metadata)
 
         return Schema.from_any_fields(
             [Field.from_databricks(c) for c in (manifest.schema.columns or [])],

@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 import pytest
+
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.arrow_ipc_io import IPCIO, IPCOptions
 from yggdrasil.io.buffer.csv_io import CsvIO, CsvOptions
@@ -31,7 +32,7 @@ from yggdrasil.io.buffer.media_io import MediaIO
 from yggdrasil.io.buffer.parquet_io import ParquetIO, ParquetOptions
 from yggdrasil.io.buffer.xml_io import XmlIO
 from yggdrasil.io.buffer.zip_io import ZipIO, ZipOptions
-from yggdrasil.io.enums import MediaType, MimeType, SaveMode, GZIP
+from yggdrasil.io.enums import MediaType, SaveMode, GZIP
 from yggdrasil.io.enums.mime_type import MimeTypes
 
 # ---------------------------------------------------------------------------

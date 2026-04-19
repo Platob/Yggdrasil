@@ -42,11 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Schema(DatabricksResource, GrantsMixin):
+class Schema(GrantsMixin):
     """A single Unity Catalog schema — lifecycle, table navigation, tags."""
-
-    service: DatabricksService
-
     catalog_name: str | None = None
     schema_name: str | None = None
 

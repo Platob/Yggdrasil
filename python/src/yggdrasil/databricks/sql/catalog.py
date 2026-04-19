@@ -27,7 +27,6 @@ from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.databricks.client import DatabricksResource, DatabricksService
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from .grants import GrantsMixin
@@ -43,11 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Catalog(DatabricksResource, GrantsMixin):
+class Catalog(GrantsMixin):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags."""
-
-    service: DatabricksService
-
     catalog_name: str | None = None
 
     # TTL for the _infos cache (seconds).  None disables expiry.

@@ -103,6 +103,7 @@ from databricks.sdk.service.sql import Disposition
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.statement import StatementBatch
 from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
@@ -123,7 +124,6 @@ from .types import PrimaryKeySpec, ForeignKeySpec
 from .warehouse import SQLWarehouse
 from ..client import DatabricksService
 from ..fs.path import DatabricksPath
-from ...data.statement_result import StatementResultBatch
 
 logger = logging.getLogger(__name__)
 
@@ -447,7 +447,7 @@ class SQLEngine(DatabricksService):
         spark_session: Optional["SparkSession"] = None,
         parallel: bool = False,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
-    ) -> StatementResultBatch:
+    ) -> StatementBatch:
         """
         Execute multiple SQL statements.
 
@@ -579,7 +579,7 @@ class SQLEngine(DatabricksService):
                 for result in results.values():
                     result.attach_temporary_tables(owned_staging)
 
-            return StatementResultBatch(results=results).wait(wait=wait, raise_error=raise_error)
+            return StatementBatch(results=results).wait(wait=wait, raise_error=raise_error)
 
         keys = list(items.keys())
 
@@ -620,7 +620,7 @@ class SQLEngine(DatabricksService):
                 result.attach_temporary_tables(owned_staging)
                 result._maybe_cleanup_temporary_tables()
 
-        batch = StatementResultBatch(results=results)
+        batch = StatementBatch(results=results)
 
         return batch
 

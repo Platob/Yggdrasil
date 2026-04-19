@@ -5,7 +5,7 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from . import CastOptionsArg
 
 if TYPE_CHECKING:
-    from .statement_result import StatementResult
+    from .statement_result import Statement
 
 __all__ = [
     "DataTable"
@@ -20,7 +20,7 @@ class DataTable(ABC):
         statement: str,
         *,
         wait: WaitingConfigArg = None
-    ) -> StatementResult:
+    ) -> Statement:
         pass
 
     @abstractmethod

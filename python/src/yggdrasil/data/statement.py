@@ -29,13 +29,13 @@ BatchConcatMode = Literal[
 
 __all__ = [
     "BatchConcatMode",
-    "StatementResult",
-    "StatementResultBatch",
+    "Statement",
+    "StatementBatch",
 ]
 
 
 @dataclass
-class StatementResult(ABC):
+class Statement(ABC):
     """Arrow-first wrapper around a statement execution result.
 
     This class defines a small execution contract plus a rich set of conversion helpers.
@@ -142,7 +142,7 @@ class StatementResult(ABC):
         mode: Literal["arrow", "spark", "auto"] = "auto",
         *,
         data: Optional[Union[pa.Table, "pyspark.sql.DataFrame"]] = None,
-    ) -> StatementResult:
+    ) -> Statement:
         """Materialize and cache the result.
 
         Parameters
@@ -157,7 +157,7 @@ class StatementResult(ABC):
 
         Returns
         -------
-        StatementResult
+        Statement
             ``self`` with cache fields updated.
 
         Notes
@@ -227,7 +227,7 @@ class StatementResult(ABC):
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-    ) -> StatementResult:
+    ) -> Statement:
         """Wait until execution reaches a terminal state.
 
         Parameters
@@ -242,7 +242,7 @@ class StatementResult(ABC):
 
         Returns
         -------
-        StatementResult
+        Statement
             ``self``
 
         Notes
@@ -277,7 +277,7 @@ class StatementResult(ABC):
     # Temporary table cleanup
     # -------------------------------------------------------------------------
 
-    def attach_temporary_tables(self, tables: Iterable[Any]) -> StatementResult:
+    def attach_temporary_tables(self, tables: Iterable[Any]) -> Statement:
         """Attach temporary staging resources to be cleaned up when ``done``.
 
         Each entry must expose ``cleanup(allow_not_found: bool = True)``.
@@ -324,7 +324,7 @@ class StatementResult(ABC):
     @property
     def data_schema(self) -> Schema:
         if self._data_schema is None:
-            schema = self.make_data_schema()
+            schema = self.collect_schema()
             object.__setattr__(self, "_data_schema", schema)
         return self._data_schema
 
@@ -333,7 +333,7 @@ class StatementResult(ABC):
         return self.data_schema.to_arrow_schema()
 
     @abstractmethod
-    def make_data_schema(self) -> Schema:
+    def collect_schema(self, full: bool = False) -> Schema:
         """Generate and cache the result schema."""
         raise NotImplementedError
 
@@ -511,7 +511,7 @@ class StatementResult(ABC):
 
 
 @dataclass(frozen=True)
-class StatementResultBatch(Mapping[str, StatementResult]):
+class StatementBatch(Mapping[str, Statement]):
     """Ordered batch wrapper around multiple statement results.
 
     By default, materialized conversions concatenate inner tabular results using
@@ -520,13 +520,13 @@ class StatementResultBatch(Mapping[str, StatementResult]):
     Use ``concat=None`` to preserve per-statement outputs.
     """
 
-    results: OrderedDict[str, StatementResult]
+    results: OrderedDict[str, Statement]
 
     @classmethod
     def from_results(
         cls,
-        results: Iterable[StatementResult] | Mapping[str, StatementResult],
-    ) -> StatementResultBatch:
+        results: Iterable[Statement] | Mapping[str, Statement],
+    ) -> StatementBatch:
         if isinstance(results, Mapping):
             return cls(results=OrderedDict(results.items()))
 
@@ -543,17 +543,17 @@ class StatementResultBatch(Mapping[str, StatementResult]):
     def __len__(self) -> int:
         return len(self.results)
 
-    def __getitem__(self, key: str) -> StatementResult:
+    def __getitem__(self, key: str) -> Statement:
         return self.results[key]
 
     @property
-    def first(self) -> StatementResult | None:
+    def first(self) -> Statement | None:
         for result in self.results.values():
             return result
         return None
 
     @property
-    def last(self) -> StatementResult | None:
+    def last(self) -> Statement | None:
         if not self.results:
             return None
         return next(reversed(self.results.values()))
@@ -584,12 +584,12 @@ class StatementResultBatch(Mapping[str, StatementResult]):
             for key, result in self.results.items()
         )
 
-    def refresh_status(self) -> StatementResultBatch:
+    def refresh_status(self) -> StatementBatch:
         for result in self.results.values():
             result.refresh_status()
         return self
 
-    def raise_for_status(self) -> StatementResultBatch:
+    def raise_for_status(self) -> StatementBatch:
         for key, result in self.results.items():
             try:
                 result.raise_for_status()
@@ -601,7 +601,7 @@ class StatementResultBatch(Mapping[str, StatementResult]):
         self,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-    ) -> StatementResultBatch:
+    ) -> StatementBatch:
         for result in self.results.values():
             result.wait(wait=wait, raise_error=raise_error)
         return self
@@ -609,7 +609,7 @@ class StatementResultBatch(Mapping[str, StatementResult]):
     def persist(
         self,
         mode: Literal["arrow", "spark", "auto"] = "auto",
-    ) -> StatementResultBatch:
+    ) -> StatementBatch:
         for result in self.results.values():
             result.persist(mode=mode)
         return self
@@ -779,7 +779,7 @@ class StatementResultBatch(Mapping[str, StatementResult]):
         maintain_order: bool = False,
         stream: bool = True,
         concat: BatchConcatMode | None = "diagonal_relaxed",
-    ) -> OrderedDict[str, "pandas.DataFrame"] | "pandas.DataFrame":
+    ) -> "OrderedDict[str, pandas.DataFrame] | pandas.DataFrame":
         result = self.to_arrow_table(
             max_workers=max_workers,
             max_in_flight=max_in_flight,
@@ -808,7 +808,7 @@ class StatementResultBatch(Mapping[str, StatementResult]):
         maintain_order: bool = False,
         stream: bool = True,
         concat: BatchConcatMode | None = "diagonal_relaxed",
-    ) -> OrderedDict[str, "polars.LazyFrame | polars.DataFrame"] | "polars.LazyFrame | polars.DataFrame":
+    ) -> "OrderedDict[str, polars.LazyFrame | polars.DataFrame] | polars.LazyFrame | polars.DataFrame":
         from ..polars.lib import polars
 
         if concat is None:
@@ -852,7 +852,7 @@ class StatementResultBatch(Mapping[str, StatementResult]):
         prefer_cached: bool = True,
         cache_result: bool = True,
         concat: BatchConcatMode | None = "diagonal_relaxed",
-    ) -> OrderedDict[str, "pyspark.sql.DataFrame"] | "pyspark.sql.DataFrame":
+    ) -> "OrderedDict[str, pyspark.sql.DataFrame] | pyspark.sql.DataFrame":
         if concat is None:
             return OrderedDict(
                 (

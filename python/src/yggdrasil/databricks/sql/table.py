@@ -130,7 +130,7 @@ INFOS_TTL: float = 300.0
 # ===========================================================================
 
 @dataclass
-class Table(DatabricksResource, GrantsMixin):
+class Table(GrantsMixin):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
     catalog_name: str = "default"
@@ -713,7 +713,7 @@ class Table(DatabricksResource, GrantsMixin):
                 )
                 if fk is not None:
                     pending_fks.append(fk)
-            elif mode in (SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO):
+            elif mode in (SaveMode.UPSERT, SaveMode.AUTO, SaveMode.OVERWRITE):
                 if existing.name != data_field.name:
                     statements.append(
                         f"{alter_table} RENAME COLUMN `{existing.name}` TO `{data_field.name}`"
@@ -734,7 +734,7 @@ class Table(DatabricksResource, GrantsMixin):
             )
 
         if statements:
-            self.sql.execute_many(statements)
+            self.sql.execute_many(statements, parallel=True)
             self._reset_cache(invalidate_cache=True)
 
         return self

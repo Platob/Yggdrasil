@@ -1,13 +1,12 @@
 import datetime as dt
 import unittest
 from dataclasses import dataclass, field
-from typing import Optional
 
 import pyarrow as pa
 import pytest
+from yggdrasil.data.statement import Statement as BaseStatement
 
 from yggdrasil.data import Schema
-from yggdrasil.data.statement_result import StatementResult as BaseStatementResult
 from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.sql.engine import (
     _apply_temporary_table_aliases,
@@ -60,7 +59,7 @@ class _FakeCleanupResource:
 
 
 @dataclass
-class _FakeStatementResult(BaseStatementResult):
+class _FakeStatement(BaseStatement):
     """Concrete ``StatementResult`` used to exercise base-class behavior."""
 
     _fake_done: bool = field(default=False)
@@ -79,7 +78,7 @@ class _FakeStatementResult(BaseStatementResult):
     def refresh_status(self) -> None:
         return None
 
-    def make_data_schema(self) -> Schema:
+    def collect_schema(self, full=False) -> Schema:
         return Schema.from_any_fields([], metadata={})
 
     def to_arrow_reader(self, **_: object) -> pa.RecordBatchReader:  # pragma: no cover
@@ -90,7 +89,7 @@ class TestTemporaryTableCleanup(unittest.TestCase):
     """Behavior of ``attach_temporary_tables`` / lazy cleanup on base result."""
 
     def test_cleanup_skipped_while_not_done(self):
-        result = _FakeStatementResult()
+        result = _FakeStatement()
         resource = _FakeCleanupResource()
         result.attach_temporary_tables([resource])
 
@@ -101,7 +100,7 @@ class TestTemporaryTableCleanup(unittest.TestCase):
     def test_cleanup_runs_once_when_done(self):
         resource_a = _FakeCleanupResource()
         resource_b = _FakeCleanupResource()
-        result = _FakeStatementResult()
+        result = _FakeStatement()
         result.attach_temporary_tables([resource_a, resource_b])
 
         object.__setattr__(result, "_fake_done", True)
@@ -120,7 +119,7 @@ class TestTemporaryTableCleanup(unittest.TestCase):
                 raise RuntimeError("boom")
 
         ok = _FakeCleanupResource()
-        result = _FakeStatementResult()
+        result = _FakeStatement()
         result.attach_temporary_tables([Broken(), ok])
         object.__setattr__(result, "_fake_done", True)
 
@@ -130,7 +129,7 @@ class TestTemporaryTableCleanup(unittest.TestCase):
         self.assertTrue(result._temporary_tables_cleaned)
 
     def test_wait_triggers_cleanup(self):
-        result = _FakeStatementResult()
+        result = _FakeStatement()
         resource = _FakeCleanupResource()
         result.attach_temporary_tables([resource])
         object.__setattr__(result, "_fake_done", True)
@@ -140,7 +139,7 @@ class TestTemporaryTableCleanup(unittest.TestCase):
         self.assertEqual(resource.calls, [True])
 
     def test_attach_no_tables_is_noop(self):
-        result = _FakeStatementResult()
+        result = _FakeStatement()
         result.attach_temporary_tables([])
         self.assertEqual(result._temporary_tables, ())
         self.assertFalse(result._temporary_tables_cleaned)

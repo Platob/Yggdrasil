@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses as dc
 import logging
-from abc import abstractmethod
+from abc import abstractmethod, ABC
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Union
 
@@ -392,7 +392,7 @@ class Grants(DatabricksService):
         )
 
 
-class GrantsMixin:
+class GrantsMixin(DatabricksResource, ABC):
     """Convenience mix-in adding Unity Catalog grant management to a securable.
 
     Implementers must provide :meth:`_grants_securable_type` and

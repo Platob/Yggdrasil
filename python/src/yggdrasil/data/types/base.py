@@ -79,6 +79,7 @@ _FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
     ("polars", "from_polars"),
     ("pandas", "from_pandas"),
     ("pyspark", "from_spark"),
+    ("yggdrasil", "from_yggdrasil")
 )
 
 
@@ -1567,6 +1568,46 @@ class DataType(BaseChildrenFields, ABC):
             if subclass.handles_spark_type(value):
                 return subclass.from_spark_type(value)
         raise ValueError(f"Unknown DataType payload: {value!r}")
+
+    @classmethod
+    def from_yggdrasil(
+        cls,
+        value: Any,
+        *,
+        cls_name: str | None = None
+    ) -> "DataType":
+        if hasattr(value, "dtype"):
+            value = value.dtype
+
+            if isinstance(value, DataType):
+                return value
+
+        if hasattr(value, "data_schema"):
+            from yggdrasil.data.schema import Schema
+            data_schema = value.data_schema
+
+            if callable(data_schema):
+                data_schema = data_schema()
+
+            if isinstance(data_schema, Schema):
+                return data_schema.dtype
+
+        if hasattr(value, "data_field"):
+            from yggdrasil.data.data_field import Field
+            data_field = value.data_field
+
+            if callable(data_field):
+                data_field = data_field()
+
+            if isinstance(data_field, Field):
+                return data_field.dtype
+
+        if hasattr(value, "to_arrow_field"):
+            return cls.from_arrow_field(value.to_arrow_field())
+
+        raise TypeError(
+            f"Unsupported Yggdrasil data type for {cls_name or 'DataType'}: {value!r}"
+        )
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:

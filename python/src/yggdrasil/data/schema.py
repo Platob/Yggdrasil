@@ -28,7 +28,7 @@ __all__ = [
 
 
 def schema(
-    fields: Iterable[Field | pa.Field],
+    fields: Iterable[Field | pa.Field | str],
     *other: Field | pa.Field,
     metadata: dict[bytes | str, bytes | str | object] | None = None,
     tags: dict[bytes | str, bytes | str | object] | None = None,
@@ -38,6 +38,9 @@ def schema(
     elif isinstance(fields, Field):
         fields = [fields]
     elif isinstance(fields, Schema):
+        if not metadata:
+            metadata = fields.metadata
+
         fields = fields.children_fields
     elif not isinstance(fields, (list, set, tuple)):
         fields = [fields]
@@ -483,7 +486,7 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
 
         inner_fields = OrderedDict()
         for name, f in self.inner_fields.items():
-            if name in primary_key_names:
+            if primary_key_names and  name in primary_key_names:
                 f.with_primary_key(True, inplace=True)
             inner_fields[name] = f.autotag()
 

@@ -61,7 +61,7 @@ INFOS_TTL: float = 300.0
 
 
 @dataclass
-class View(DatabricksResource, GrantsMixin):
+class View(GrantsMixin):
     """A single Unity Catalog view — DDL, schema, grants and tags."""
 
     catalog_name: str = "default"
