@@ -429,15 +429,6 @@ class MapType(NestedType):
     def to_databricks_ddl(self) -> str:
         return f"MAP<{self.key_field.dtype.to_databricks_ddl()}, {self.value_field.dtype.to_databricks_ddl()}>"
 
-    def autotag(self) -> dict[bytes, bytes]:
-        tags = super().autotag()
-        tags[b"nested_kind"] = b"map"
-        tags[b"key_type_id"] = self.key_field.dtype.type_id.name.encode("utf-8")
-        tags[b"value_type_id"] = self.value_field.dtype.type_id.name.encode("utf-8")
-        if self.keys_sorted:
-            tags[b"keys_sorted"] = b"true"
-        return tags
-
     def to_dict(self) -> dict[str, Any]:
         base = super(MapType, self).to_dict()
         base["item_field"] = self.item_field.to_dict()

@@ -151,12 +151,6 @@ class StructType(NestedType):
         )
         return f"STRUCT<{fields_ddl}>"
 
-    def autotag(self) -> dict[bytes, bytes]:
-        tags = super().autotag()
-        tags[b"nested_kind"] = b"struct"
-        tags[b"num_fields"] = str(len(self.fields)).encode("utf-8")
-        return tags
-
     def to_dict(self) -> dict[str, Any]:
         base = super(StructType, self).to_dict()
         base["fields"] = [f.to_dict() for f in self.fields]

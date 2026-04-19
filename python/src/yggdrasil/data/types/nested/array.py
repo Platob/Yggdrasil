@@ -291,18 +291,6 @@ class ArrayType(NestedType):
     def to_databricks_ddl(self) -> str:
         return f"ARRAY<{self.item_field.dtype.to_databricks_ddl()}>"
 
-    def autotag(self) -> dict[bytes, bytes]:
-        tags = super().autotag()
-        tags[b"nested_kind"] = b"array"
-        tags[b"element_type_id"] = self.item_field.dtype.type_id.name.encode("utf-8")
-        if self.list_size is not None:
-            tags[b"fixed_size"] = str(self.list_size).encode("utf-8")
-        if self.large:
-            tags[b"large"] = b"true"
-        if self.view:
-            tags[b"view"] = b"true"
-        return tags
-
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
         base["item_field"] = self.item_field.to_dict()

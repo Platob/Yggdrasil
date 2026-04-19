@@ -83,33 +83,6 @@ _FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
 )
 
 
-# Coarse grouping used by autotag(): a stable classification that downstream
-# Databricks tooling (tag-based policies, governance dashboards, cost
-# attribution) can key off without re-deriving it from each engine's native
-# type. Keep this aligned with DataTypeId — new ids should map here too.
-_TYPE_CLASS_BY_ID: dict[DataTypeId, str] = {
-    DataTypeId.OBJECT: "variant",
-    DataTypeId.NULL: "null",
-    DataTypeId.BOOL: "boolean",
-    DataTypeId.INTEGER: "numeric",
-    DataTypeId.FLOAT: "numeric",
-    DataTypeId.DECIMAL: "numeric",
-    DataTypeId.DATE: "temporal",
-    DataTypeId.TIME: "temporal",
-    DataTypeId.TIMESTAMP: "temporal",
-    DataTypeId.DURATION: "temporal",
-    DataTypeId.BINARY: "binary",
-    DataTypeId.STRING: "text",
-    DataTypeId.ARRAY: "nested",
-    DataTypeId.MAP: "nested",
-    DataTypeId.STRUCT: "nested",
-    DataTypeId.UNION: "nested",
-    DataTypeId.EXTENSION: "extension",
-    DataTypeId.DICTIONARY: "text",
-    DataTypeId.JSON: "text",
-    DataTypeId.ENUM: "text",
-    DataTypeId.GEOGRAPHY: "geography",
-}
 
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
@@ -353,21 +326,18 @@ class DataType(BaseChildrenFields, ABC):
     def autotag(self) -> dict[bytes, bytes]:
         """Return a dict of Databricks-friendly tags derived from this type.
 
-        These are *auto*-tags: they describe shape, not intent. The keys are
-        stable so tag-based Unity Catalog policies can match on them (``type_id``
-        for the exact logical type, ``type_class`` for the coarse grouping
-        like ``numeric`` / ``temporal`` / ``text``). Subclasses extend this
-        with dtype-specific detail (precision, unit, timezone, etc.) — always
-        via ``super().autotag()`` so the base keys stay present.
+        These are *auto*-tags: they describe shape, not intent. The base
+        output is a single ``kind`` key — a lowercase form of ``type_id``
+        (``"integer"``, ``"string"``, ``"timestamp"``, ``"array"``, ...) that
+        tag-based Unity Catalog policies can match on. Subclasses extend this
+        with dtype-specific detail (``unit``, ``tz``, ``precision`` /
+        ``scale``, ``signed``, ``srid``, ...) — always via ``super().autotag()``
+        so the ``kind`` key stays present.
 
-        The returned dict uses bare keys (no ``t:`` prefix) — prefixing is
-        handled by ``BaseMetadata.update_tags`` when these land on a Field.
+        Keys are bare (no ``t:`` prefix) — prefixing is handled by
+        ``BaseMetadata.update_tags`` when these land on a Field.
         """
-        tags: dict[bytes, bytes] = {
-            b"type_id": self.type_id.name.encode("utf-8"),
-            b"type_class": _TYPE_CLASS_BY_ID.get(self.type_id, "other").encode("utf-8"),
-        }
-        return tags
+        return {b"kind": self.type_id.name.lower().encode("utf-8")}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.to_arrow()})"

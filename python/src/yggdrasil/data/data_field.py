@@ -531,27 +531,24 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def autotag(self) -> "Field":
-        """Stamp this field with tags derived from its dtype, nullability, and name.
+        """Stamp this field with tags derived from its dtype and name.
 
         Writes Databricks-friendly auto-tags in place:
 
-        - Everything from :meth:`DataType.autotag` (``type_id``, ``type_class``,
-          and type-specific detail like ``precision`` / ``unit`` / ``timezone``).
-        - ``nullable`` and ``has_default`` for data-quality policies.
+        - Everything from :meth:`DataType.autotag` (``kind`` plus dtype
+          detail like ``unit`` / ``tz`` / ``precision`` / ``scale`` /
+          ``signed`` / ``iso`` / ``srid``).
+        - ``nullable`` for data-quality policies.
         - Name-based heuristics for governance: ``role=identifier`` for
-          ``*_id`` / ``*_uuid``, ``role=audit_timestamp`` for ``created_at`` /
-          ``updated_at`` patterns, plus ``pii`` / ``sensitive`` stamps for
-          columns that obviously carry personal or credential data.
+          ``*_id`` / ``*_uuid``, ``role=audit_timestamp`` for ``created_at``
+          patterns, plus ``pii`` / ``sensitive`` stamps for columns that
+          obviously carry personal or credential data.
 
-        The field is returned for fluent chaining. Only the auto-derived
-        keys are written, so any custom tags set by the caller are left
-        intact. Calling ``autotag`` twice on the same field is idempotent
-        when the dtype and name are unchanged.
+        Returns self for fluent chaining. Idempotent when the dtype and name
+        are unchanged.
         """
         tags: dict[bytes, bytes] = dict(self.dtype.autotag())
         tags[b"nullable"] = b"true" if self.nullable else b"false"
-        if self.has_default:
-            tags[b"has_default"] = b"true"
 
         name = (self.name or "").strip().lower()
         if name and name != DEFAULT_FIELD_NAME:

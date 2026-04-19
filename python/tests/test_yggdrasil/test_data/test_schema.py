@@ -508,23 +508,20 @@ def test_autotag_propagates_dtype_and_field_tags_per_column():
     out = s.autotag(tags={"layer": "silver"})
 
     id_tags = out["user_id"].tags or {}
-    assert id_tags[b"type_id"] == b"INTEGER"
-    assert id_tags[b"type_class"] == b"numeric"
-    assert id_tags[b"numeric_kind"] == b"integer"
+    assert id_tags[b"kind"] == b"integer"
     assert id_tags[b"signed"] == b"true"
     assert id_tags[b"nullable"] == b"false"
     assert id_tags[b"role"] == b"identifier"
     assert id_tags[b"primary_key"] == b"true"
 
     email_tags = out["email"].tags or {}
-    assert email_tags[b"type_class"] == b"text"
+    assert email_tags[b"kind"] == b"string"
     assert email_tags[b"pii"] == b"email"
 
     ts_tags = out["created_at"].tags or {}
-    assert ts_tags[b"type_class"] == b"temporal"
-    assert ts_tags[b"temporal_kind"] == b"timestamp"
-    assert ts_tags[b"tz_aware"] == b"true"
-    assert ts_tags[b"timezone"] == b"UTC"
+    assert ts_tags[b"kind"] == b"timestamp"
+    assert ts_tags[b"unit"] == b"us"
+    assert ts_tags[b"tz"] == b"UTC"
     assert ts_tags[b"role"] == b"audit_timestamp"
 
     assert out.metadata is not None

@@ -384,7 +384,7 @@ class ExtensionType(DataType):
         tags = super().autotag()
         name = type(self).extension_name
         if name:
-            tags[b"extension_name"] = name.encode("utf-8")
+            tags[b"extension"] = name.encode("utf-8")
         return tags
 
     # ------------------------------------------------------------------
