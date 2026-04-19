@@ -98,6 +98,38 @@ def _parse_clock_duration(token: str) -> dt.timedelta | None:
         total = -total
     return dt.timedelta(seconds=total)
 
+
+def _is_large_string_to_string_cast(
+    source_type: pa.DataType,
+    target_type: pa.DataType,
+) -> bool:
+    return pa.types.is_large_string(source_type) and pa.types.is_string(target_type)
+
+
+def _cast_large_string_array_to_string_chunked(
+    array: pa.Array,
+    *,
+    safe: bool,
+    memory_pool: pa.MemoryPool | None = None,
+    max_rows_per_slice: int = 100_000,
+) -> pa.ChunkedArray:
+    chunks: list[pa.Array] = []
+    size = len(array)
+
+    for start in range(0, size, max_rows_per_slice):
+        chunk = array.slice(start, max_rows_per_slice)
+        chunks.append(
+            pc.cast(
+                chunk,
+                target_type=pa.string(),
+                safe=safe,
+                memory_pool=memory_pool,
+            )
+        )
+
+    return pa.chunked_array(chunks, type=pa.string())
+
+
 if TYPE_CHECKING:
     import polars
     import pyspark.sql.types as pst
@@ -152,20 +184,41 @@ class _JsonEncodeTargetMixin:
         self,
         array: pa.Array,
         options: "CastOptions",
-    ) -> pa.Array:
+    ) -> pa.Array | pa.ChunkedArray:
         options = options.check_source(array)
 
-        (
-            cast_arrow_json_encode_array,
-            _,
-            _,
-            is_json_nested_source,
-        ) = _json_encode_helpers()
+        if self._source_is_temporal(options):
+            from .temporal import arrow_cast_to_string
 
-        if is_json_nested_source(options.source_field.dtype.type_id):
-            return cast_arrow_json_encode_array(array, options)
+            casted = arrow_cast_to_string(array)
+            if self.to_arrow() != casted.type:
+                casted = pa.compute.cast(casted, self.to_arrow())
+            return options.fill_arrow_nulls(casted)
 
-        return super()._cast_arrow_array(array, options)
+        array = self._nullify_empty_arrow_strings(array)
+        target_type = self.to_arrow()
+
+        try:
+            casted = pc.cast(
+                array,
+                target_type=target_type,
+                safe=options.safe,
+                memory_pool=options.arrow_memory_pool,
+            )
+        except pa.ArrowInvalid as exc:
+            if not _is_large_string_to_string_cast(array.type, target_type):
+                raise
+
+            try:
+                casted = _cast_large_string_array_to_string_chunked(
+                    array,
+                    safe=options.safe,
+                    memory_pool=options.arrow_memory_pool,
+                )
+            except pa.ArrowInvalid:
+                raise exc
+
+        return options.fill_arrow_nulls(casted)
 
     def _cast_polars_series(
         self,

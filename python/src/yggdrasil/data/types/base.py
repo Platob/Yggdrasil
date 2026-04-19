@@ -622,14 +622,9 @@ class DataType(BaseChildrenFields, ABC):
             if forwarded is not None:
                 return opts.fill_arrow_nulls(forwarded)
 
-        try:
-            if isinstance(array, pa.ChunkedArray):
-                return self._cast_chunked_array(array, opts)
-            return self._cast_arrow_array(array, opts)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
-            raise ValueError(
-                f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}"
-            ) from e
+        if isinstance(array, pa.ChunkedArray):
+            return self._cast_chunked_array(array, opts)
+        return self._cast_arrow_array(array, opts)
 
     @staticmethod
     def _nullify_empty_arrow_strings(
@@ -685,13 +680,28 @@ class DataType(BaseChildrenFields, ABC):
         options = options.check_source(array)
 
         array = self._nullify_empty_arrow_strings(array)
+        target_type = self.to_arrow()
 
-        casted = pc.cast(
-            array,
-            target_type=self.to_arrow(),
-            safe=options.safe,
-            memory_pool=options.arrow_memory_pool,
-        )
+        try:
+            casted = pc.cast(
+                array,
+                target_type=target_type,
+                safe=options.safe,
+                memory_pool=options.arrow_memory_pool,
+            )
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            pl = get_polars()
+            array = (
+                pl.from_arrow(array)
+                .cast(dtype=self.to_polars(), strict=options.safe)
+                .to_arrow()
+            )
+            casted = pc.cast(
+                array,
+                target_type=target_type,
+                safe=options.safe,
+                memory_pool=options.arrow_memory_pool,
+            )
 
         return options.fill_arrow_nulls(casted)
 
@@ -737,19 +747,6 @@ class DataType(BaseChildrenFields, ABC):
                 casted, nullable=self._target_nullable(opts)
             )
 
-        # Source-driven outgoing cast: delegate through Arrow when the
-        # source has categorical knowledge (ISO tables, enums) that Polars'
-        # ``cast`` / ``replace_strict`` can't recover on its own.  Eager
-        # ``pl.Series`` only — lazy ``pl.Expr`` has no in-band source dtype.
-        if src_field is not None and isinstance(series, pl.Series):
-            arrow_in = series.to_arrow()
-            forwarded = src_field.dtype._outgoing_cast_arrow_array(arrow_in, self, opts)
-            if forwarded is not None:
-                casted = pl.Series(name=series.name, values=forwarded, dtype=self.to_polars())
-                return self.fill_polars_array_nulls(
-                    casted, nullable=self._target_nullable(opts)
-                )
-
         series = self._nullify_empty_polars_strings(series)
 
         if isinstance(series, pl.Expr):
@@ -789,7 +786,7 @@ class DataType(BaseChildrenFields, ABC):
         except Exception:
             pl = get_polars()
             arrow = self._cast_arrow_array(
-                series.to_arrow(),
+                series.to_arrow(compat_level=polars.CompatLevel.newest()),
                 options,
             )
             casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
