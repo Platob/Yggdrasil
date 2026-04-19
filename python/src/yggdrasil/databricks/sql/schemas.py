@@ -239,7 +239,7 @@ class Schemas(DatabricksService):
         catalog_name = catalog_name if catalog_name is not None else self.catalog_name
 
         if catalog_name is None or is_glob_pattern(catalog_name):
-            for cat in self.client.catalogs.list(name=catalog_name, use_cache=use_cache):
+            for cat in self.client.catalogs.list_catalogs(name=catalog_name, use_cache=use_cache):
                 yield from self.list(
                     name=name,
                     catalog_name=cat.catalog_name,

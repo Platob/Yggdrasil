@@ -17,7 +17,7 @@ Hierarchy
     client.catalogs["main.sales.orders"]               # Table
     client.catalogs["main"]["sales"]["orders"]["price"]  # Column
     client.catalogs["main.sales.orders.price"]         # Column
-    client.catalogs.list()                             # Iterator[Catalog]
+    client.catalogs.list_catalogs()                    # Iterator[Catalog]
 
 Caching strategy
 ----------------
@@ -75,7 +75,7 @@ class Catalogs(DatabricksService):
         table   = catalogs.table("main.sales.orders")         # Table
 
         # list
-        for cat in catalogs.list():
+        for cat in catalogs.list_catalogs():
             for sch in cat.schemas():
                 for tbl in sch.tables():
                     ...
@@ -114,8 +114,8 @@ class Catalogs(DatabricksService):
         self[name].rename(new_name)
 
     def __iter__(self) -> Iterator[Catalog]:
-        """Iterate over all visible catalogs (``self.list()``)."""
-        return self.list()
+        """Iterate over all visible catalogs (``self.list_catalogs()``)."""
+        return self.list_catalogs()
 
     # ── factory methods ───────────────────────────────────────────────────────
 
@@ -156,7 +156,7 @@ class Catalogs(DatabricksService):
 
     # ── listing ───────────────────────────────────────────────────────────────
 
-    def list(
+    def list_catalogs(
         self,
         name: str | None = None,
         *,

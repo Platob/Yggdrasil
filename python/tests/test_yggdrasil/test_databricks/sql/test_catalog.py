@@ -180,7 +180,7 @@ class TestCatalogsParseLocation:
 class TestCatalogsList:
     def test_list_yields_catalog_objects(self, cats, mock_ws):
         mock_ws.catalogs.list.return_value = [_cat_info("main"), _cat_info("hive")]
-        result = list(cats.list())
+        result = list(cats.list_catalogs())
         assert len(result) == 2
         assert all(isinstance(c, Catalog) for c in result)
         assert [c.catalog_name for c in result] == ["main", "hive"]
@@ -188,13 +188,13 @@ class TestCatalogsList:
     def test_list_sets_infos_on_yielded_objects(self, cats, mock_ws):
         info = _cat_info("main", comment="prod")
         mock_ws.catalogs.list.return_value = [info]
-        (cat,) = cats.list()
+        (cat,) = cats.list_catalogs()
         assert cat._infos is info
 
     def test_list_populates_module_cache(self, cats, mock_ws):
         from yggdrasil.databricks.sql.catalogs import _CATALOG_INFO_CACHE
         mock_ws.catalogs.list.return_value = [_cat_info("main")]
-        list(cats.list(use_cache=True))
+        list(cats.list_catalogs(use_cache=True))
         host = mock_client_url = "https://adb-123.azuredatabricks.net"
         assert any("main" in k for k in _CATALOG_INFO_CACHE._store)  # noqa: SLF001
 
@@ -203,7 +203,7 @@ class TestCatalogsList:
             _cat_info("main"),
             _cat_info("staging"),
         ]
-        result = list(cats.list(name="staging"))
+        result = list(cats.list_catalogs(name="staging"))
         assert [c.catalog_name for c in result] == ["staging"]
 
     def test_list_name_glob_is_case_insensitive(self, cats, mock_ws):
@@ -212,7 +212,7 @@ class TestCatalogsList:
             _cat_info("prod_staging"),
             _cat_info("dev_main"),
         ]
-        result = list(cats.list(name="prod_*"))
+        result = list(cats.list_catalogs(name="prod_*"))
         assert [c.catalog_name for c in result] == ["Prod_Main", "prod_staging"]
 
     def test_list_name_star_matches_all(self, cats, mock_ws):
@@ -220,7 +220,7 @@ class TestCatalogsList:
             _cat_info("main"),
             _cat_info("hive"),
         ]
-        result = list(cats.list(name="*"))
+        result = list(cats.list_catalogs(name="*"))
         assert [c.catalog_name for c in result] == ["main", "hive"]
 
     def test_list_name_middle_wildcard(self, cats, mock_ws):
@@ -229,7 +229,7 @@ class TestCatalogsList:
             _cat_info("prefix_b_cat"),
             _cat_info("other"),
         ]
-        result = list(cats.list(name="prefix_*_cat"))
+        result = list(cats.list_catalogs(name="prefix_*_cat"))
         assert [c.catalog_name for c in result] == ["prefix_a_cat", "prefix_b_cat"]
 
 
@@ -526,31 +526,31 @@ class TestCatalogIntegration(DatabricksCase):
     # ── read-only probes (safe to run on any workspace) ────────────────────
 
     def test_list_yields_at_least_one_catalog(self):
-        result = list(self.cats.list())
+        result = list(self.cats.list_catalogs())
         assert len(result) >= 1
         assert all(isinstance(c, Catalog) for c in result)
 
     def test_catalog_subscript_returns_catalog(self):
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         cat = self.cats[first.catalog_name]
         assert isinstance(cat, Catalog)
         assert cat.catalog_name == first.catalog_name
 
     def test_catalog_infos_has_name(self):
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         assert first.infos.name == first.catalog_name
 
     def test_catalog_exists_is_true(self):
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         assert first.exists is True
 
     def test_catalog_schemas_returns_schemas(self):
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         schemas = list(first.schemas())
         assert all(isinstance(s, Schema) for s in schemas)
 
     def test_catalog_schema_subscript_chains_to_schema(self):
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         schemas = list(first.schemas())
         if not schemas:
             self.skipTest("No schemas in the first catalog")
@@ -560,7 +560,7 @@ class TestCatalogIntegration(DatabricksCase):
 
     def test_three_level_subscript_chain(self):
         """client.catalogs["cat"]["schema"]["table"] resolves correctly."""
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         schemas = list(first.schemas())
         if not schemas:
             self.skipTest("No schemas in the first catalog")
@@ -573,7 +573,7 @@ class TestCatalogIntegration(DatabricksCase):
 
     def test_four_level_subscript_chain(self):
         """client.catalogs["cat"]["schema"]["table"]["column"] resolves to a Column."""
-        (first, *_) = self.cats.list()
+        (first, *_) = self.cats.list_catalogs()
         schemas = list(first.schemas())
         if not schemas:
             self.skipTest("No schemas in the first catalog")

@@ -633,7 +633,7 @@ class Tables(DatabricksService):
         if catalog_name is None or is_glob_pattern(catalog_name):
             from .catalogs import Catalogs
 
-            for catalog in Catalogs(client=self.client).list(name=catalog_name):
+            for catalog in Catalogs(client=self.client).list_catalogs(name=catalog_name):
                 yield from self.list_tables(
                     name=name,
                     catalog_name=catalog.catalog_name,
