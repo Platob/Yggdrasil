@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -1669,7 +1670,6 @@ class DateType(TemporalType):
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
-        import datetime as dt
         return dt.date(1970, 1, 1)
 
 
@@ -1744,7 +1744,6 @@ class TimeType(TemporalType):
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
-        import datetime as dt
         return dt.time(0, 0, 0)
 
 
@@ -1827,7 +1826,6 @@ class TimestampType(TemporalType):
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
-        import datetime as dt
         if self.tz:
             return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         return dt.datetime(1970, 1, 1)
@@ -1903,6 +1901,5 @@ class DurationType(TemporalType):
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
-        import datetime as dt
         return dt.timedelta(0)
 

@@ -50,6 +50,17 @@ class ArrayType(NestedType):
     def type_id(self) -> DataTypeId:
         return DataTypeId.ARRAY
 
+    def default_pyobj(self, nullable: bool) -> Any:
+        if nullable:
+            return None
+
+        if not self.list_size:
+            return []
+        elif self.list_size < 0:
+            raise ValueError("list_size must be non-negative")
+
+        return [self.item_field.default for _ in range(self.list_size)]
+
     def _merge_with_same_id(
         self,
         other: "ArrayType",

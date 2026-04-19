@@ -420,7 +420,7 @@ BASE_SCHEMA["response_transfer_encoding"] = schema_field(
 BASE_SCHEMA["response_headers"] = schema_field(
     "response_headers",
     pa.map_(pa.string(), pa.string()),
-    nullable=False,
+    nullable=True,
     metadata={
         "comment": "Response headers excluding promoted common headers",
         "keys_sorted": "false",
@@ -434,7 +434,7 @@ BASE_SCHEMA["response_headers"] = schema_field(
 BASE_SCHEMA["response_tags"] = schema_field(
     "response_tags",
     pa.map_(pa.string(), pa.string()),
-    nullable=False,
+    nullable=True,
     metadata={
         "comment": "Arbitrary string tags attached to this response",
     },

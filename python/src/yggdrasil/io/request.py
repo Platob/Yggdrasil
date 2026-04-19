@@ -285,7 +285,7 @@ REQUEST_SCHEMA["request_transfer_encoding"] = schema_field(
 REQUEST_SCHEMA["request_headers"] = schema_field(
     "request_headers",
     pa.map_(pa.string(), pa.string()),
-    nullable=False,
+    nullable=True,
     metadata={
         "comment": "Request headers excluding promoted common headers",
         "keys_sorted": "false",

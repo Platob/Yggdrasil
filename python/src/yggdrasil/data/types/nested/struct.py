@@ -45,6 +45,12 @@ class StructType(NestedType):
     def __post_init__(self):
         object.__setattr__(self, "fields", tuple(self.fields))
 
+    def default_pyobj(self, nullable: bool) -> Any:
+        return None if nullable else {
+            f.name: f.default
+            for f in self.fields
+        }
+
     @property
     def children_fields(self) -> tuple["Field"]:
         return self.fields

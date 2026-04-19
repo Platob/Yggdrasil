@@ -353,13 +353,13 @@ class DataType(BaseChildrenFields, ABC):
         return pa.scalar(self.default_pyobj(nullable=nullable), type=self.to_arrow())
 
     def default_polars_scalar(self, nullable: bool = True) -> Any:
-        return self.default_arrow_scalar(nullable=nullable).as_py()
+        return self.default_pyobj(nullable=nullable)
 
     def default_pandas_scalar(self, nullable: bool = True) -> Any:
-        return self.default_arrow_scalar(nullable=nullable).as_py()
+        return self.default_pyobj(nullable=nullable)
 
     def default_spark_scalar(self, nullable: bool = True) -> Any:
-        return self.default_arrow_scalar(nullable=nullable).as_py()
+        return self.default_pyobj(nullable=nullable)
 
     def default_polars_expr(
         self,

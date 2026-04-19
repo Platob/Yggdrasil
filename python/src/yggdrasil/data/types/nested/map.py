@@ -87,6 +87,9 @@ class MapType(NestedType):
             keys_sorted=self.keys_sorted or other.keys_sorted,
         )
 
+    def default_pyobj(self, nullable: bool) -> Any:
+        return None if nullable else dict()
+
     @property
     def children_fields(self) -> list["Field"]:
         return [self.item_field]
