@@ -22,6 +22,8 @@ from yggdrasil.data.types import (
 )
 from yggdrasil.data.types import StringType
 from yggdrasil.data.types._temporal_cast import (
+    ISO_DURATION_DAYS_PER_MONTH,
+    ISO_DURATION_DAYS_PER_YEAR,
     arrow_cast_to_date,
     arrow_cast_to_duration,
     arrow_cast_to_string,
@@ -37,6 +39,7 @@ from yggdrasil.data.types._temporal_cast import (
     arrow_timestamp_to_string,
     attach_fractional_seconds,
     nullify_empty_strings,
+    parse_iso_duration_to_nanos,
 )
 
 # ---------------------------------------------------------------------------
@@ -117,6 +120,109 @@ def test_arrow_str_to_duration_integer_strings() -> None:
     assert values[0] == dt.timedelta(seconds=60)
     assert values[1] == dt.timedelta(seconds=3600)
     assert values[2] is None
+
+
+def test_parse_iso_duration_to_nanos_canonical_components() -> None:
+    assert parse_iso_duration_to_nanos("PT1S") == 1_000_000_000
+    assert parse_iso_duration_to_nanos("PT15M") == 15 * 60 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("PT4H") == 4 * 3600 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("P1D") == 86400 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("P1W") == 7 * 86400 * 1_000_000_000
+
+
+def test_parse_iso_duration_to_nanos_calendar_defaults() -> None:
+    # Year and month default to fixed-day equivalents — that's the whole
+    # point of this helper. Both must round-trip to the documented constants.
+    year_nanos = ISO_DURATION_DAYS_PER_YEAR * 86400 * 1_000_000_000
+    month_nanos = ISO_DURATION_DAYS_PER_MONTH * 86400 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("P1Y") == year_nanos
+    assert parse_iso_duration_to_nanos("P1M") == month_nanos
+    assert parse_iso_duration_to_nanos("P2M") == 2 * month_nanos
+
+
+def test_parse_iso_duration_to_nanos_combined_components() -> None:
+    # P1Y2M3DT4H5M6S — the full kitchen-sink form.
+    expected = (
+        ISO_DURATION_DAYS_PER_YEAR * 86400
+        + 2 * ISO_DURATION_DAYS_PER_MONTH * 86400
+        + 3 * 86400
+        + 4 * 3600
+        + 5 * 60
+        + 6
+    ) * 1_000_000_000
+    assert parse_iso_duration_to_nanos("P1Y2M3DT4H5M6S") == expected
+
+
+def test_parse_iso_duration_to_nanos_signed_and_decimal_and_comma() -> None:
+    # Negative sign, comma decimals, lowercase letters — all common in the
+    # wild and all should normalize to the same nanos.
+    assert parse_iso_duration_to_nanos("-PT30S") == -30 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("+PT30S") == 30 * 1_000_000_000
+    assert parse_iso_duration_to_nanos("PT1.5H") == int(1.5 * 3600 * 1_000_000_000)
+    assert parse_iso_duration_to_nanos("PT1,5H") == int(1.5 * 3600 * 1_000_000_000)
+    assert parse_iso_duration_to_nanos("pt15m") == 15 * 60 * 1_000_000_000
+
+
+def test_parse_iso_duration_to_nanos_rejects_garbage_and_empty() -> None:
+    assert parse_iso_duration_to_nanos("") is None
+    assert parse_iso_duration_to_nanos("   ") is None
+    assert parse_iso_duration_to_nanos("not-a-duration") is None
+    # Bare "P" / "PT" technically match the regex but encode no value;
+    # treat them as unparseable so the caller can null them.
+    assert parse_iso_duration_to_nanos("P") is None
+    assert parse_iso_duration_to_nanos("PT") is None
+
+
+def test_arrow_str_to_duration_iso_8601_basic() -> None:
+    arr = pa.array(["PT15M", "P1D", "PT1H30M", None])
+    out = arrow_str_to_duration(arr, unit="s")
+    assert out.type == pa.duration("s")
+    assert out.to_pylist() == [
+        dt.timedelta(minutes=15),
+        dt.timedelta(days=1),
+        dt.timedelta(hours=1, minutes=30),
+        None,
+    ]
+
+
+def test_arrow_str_to_duration_iso_8601_calendar_defaults() -> None:
+    arr = pa.array(["P1Y", "P1M", "P1W"])
+    out = arrow_str_to_duration(arr, unit="s")
+    assert out.to_pylist() == [
+        dt.timedelta(days=ISO_DURATION_DAYS_PER_YEAR),
+        dt.timedelta(days=ISO_DURATION_DAYS_PER_MONTH),
+        dt.timedelta(days=7),
+    ]
+
+
+def test_arrow_str_to_duration_iso_8601_signed_and_fractional() -> None:
+    arr = pa.array(["-PT30S", "PT1.5H", "PT0.001S"])
+    out = arrow_str_to_duration(arr, unit="ms")
+    assert out.type == pa.duration("ms")
+    assert out.to_pylist() == [
+        dt.timedelta(seconds=-30),
+        dt.timedelta(hours=1, minutes=30),
+        dt.timedelta(milliseconds=1),
+    ]
+
+
+def test_arrow_str_to_duration_mixed_integer_iso_and_garbage() -> None:
+    arr = pa.array(["60", "PT15M", "garbage", "", None])
+    out = arrow_str_to_duration(arr, unit="s")
+    assert out.to_pylist() == [
+        dt.timedelta(seconds=60),
+        dt.timedelta(minutes=15),
+        None,
+        None,
+        None,
+    ]
+
+
+def test_duration_type_cast_arrow_array_from_iso_string() -> None:
+    # End-to-end through DurationType so the cast registry path is exercised.
+    arr = pa.array(["PT15M", "P1D"])
+    out = DurationType(unit="s")._cast_arrow_array(arr, CastOptions())
+    assert out.to_pylist() == [dt.timedelta(minutes=15), dt.timedelta(days=1)]
 
 
 def test_arrow_cast_to_timestamp_handles_numeric_epoch_scales() -> None:
