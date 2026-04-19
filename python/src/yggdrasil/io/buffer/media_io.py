@@ -453,6 +453,9 @@ class MediaIO(ABC, Generic[O]):
         if mt is MimeTypes.ARROW_IPC:
             from .arrow_ipc_io import IPCIO
             return IPCIO(media_type=media, buffer=buffer)
+        if mt is MimeTypes.XLSX:
+            from .xlsx_io import XlsxIO
+            return XlsxIO(media_type=media, buffer=buffer)
 
         raise NotImplementedError(f"Cannot create media IO for {media!r}")
 
