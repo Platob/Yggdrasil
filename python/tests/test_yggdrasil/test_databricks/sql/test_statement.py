@@ -1,14 +1,14 @@
-"""Unit tests for :mod:`yggdrasil.databricks.sql.statement`."""
+"""Unit tests for :mod:`yggdrasil.databricks.sql.statement` and :class:`Statement`."""
 
 from __future__ import annotations
 
 import pytest
 
-from yggdrasil.databricks.sql.statement import Statement
+from yggdrasil.databricks.sql.statement import Statement, StatementResult
 
 
 # ---------------------------------------------------------------------------
-# Construction / prepare
+# Statement (config) — prepare / mutators / parameter list / looks_like_query
 # ---------------------------------------------------------------------------
 
 
@@ -51,11 +51,6 @@ class TestStatementPrepare:
         assert out.text == "SELECT :x"
         assert out.parameters == {"x": 1}
         assert out.temporary_tables == {"t": "A"}
-
-
-# ---------------------------------------------------------------------------
-# bind / with_temporary_tables / clear
-# ---------------------------------------------------------------------------
 
 
 class TestStatementMutators:
@@ -101,10 +96,16 @@ class TestStatementMutators:
         assert base.parameters == {"x": 1}
         assert base.temporary_tables == {"a": "A"}
 
+    def test_with_text_returns_new_instance(self):
+        base = Statement(text="SELECT 1", parameters={"x": 1})
+        out = base.with_text("SELECT 2")
+        assert out is not base
+        assert out.text == "SELECT 2"
+        assert out.parameters == {"x": 1}
 
-# ---------------------------------------------------------------------------
-# to_parameter_list
-# ---------------------------------------------------------------------------
+    def test_with_text_same_text_returns_self(self):
+        base = Statement(text="SELECT 1")
+        assert base.with_text("SELECT 1") is base
 
 
 class TestStatementToParameterList:
@@ -123,11 +124,6 @@ class TestStatementToParameterList:
         items = stmt.to_parameter_list()
         assert items is not None
         assert items[0].value is None
-
-
-# ---------------------------------------------------------------------------
-# looks_like_query
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -156,46 +152,103 @@ def test_looks_like_query(text, expected):
 
 
 # ---------------------------------------------------------------------------
-# Immutability
+# StatementResult (Databricks handler)
 # ---------------------------------------------------------------------------
 
 
-def test_statement_has_default_service():
+class TestStatementResultPrepare:
+    def test_prepare_from_string_wraps_in_result(self):
+        result = StatementResult.prepare("SELECT 1")
+        assert isinstance(result, StatementResult)
+        assert result.statement.text == "SELECT 1"
+        assert result.text == "SELECT 1"  # via property
+
+    def test_prepare_from_config_wraps_in_result(self):
+        cfg = Statement(text="SELECT :x", parameters={"x": 1})
+        result = StatementResult.prepare(cfg)
+        assert result.statement is cfg
+
+    def test_prepare_reuses_existing_result(self):
+        result = StatementResult(statement=Statement(text="SELECT 1"))
+        out = StatementResult.prepare(result)
+        assert out is result
+
+    def test_prepare_merges_parameters_into_existing_result(self):
+        result = StatementResult(statement=Statement(text="SELECT 1", parameters={"x": 1}))
+        out = StatementResult.prepare(result, parameters={"y": 2})
+        assert out is not result
+        assert out.statement.parameters == {"x": 1, "y": 2}
+
+
+class TestStatementResultConfigShortcuts:
+    def test_text_property_delegates_to_statement(self):
+        result = StatementResult(statement=Statement(text="SELECT 1"))
+        assert result.text == "SELECT 1"
+
+    def test_parameters_property_delegates(self):
+        result = StatementResult(statement=Statement(text="X", parameters={"x": 1}))
+        assert result.parameters == {"x": 1}
+
+    def test_temporary_tables_property_delegates(self):
+        result = StatementResult(statement=Statement(text="X", temporary_tables={"t": "A"}))
+        assert result.temporary_tables == {"t": "A"}
+
+    def test_with_text_returns_new_result(self):
+        result = StatementResult(statement=Statement(text="SELECT 1", parameters={"x": 1}))
+        out = result.with_text("SELECT 2")
+        assert out is not result
+        assert out.statement.text == "SELECT 2"
+        assert out.statement.parameters == {"x": 1}
+
+    def test_bind_returns_new_result(self):
+        result = StatementResult(statement=Statement(text="SELECT :x"))
+        out = result.bind(x=1)
+        assert out is not result
+        assert out.statement.parameters == {"x": 1}
+
+    def test_with_temporary_tables_returns_new_result(self):
+        result = StatementResult(statement=Statement(text="SELECT * FROM {a}"))
+        out = result.with_temporary_tables(a="X")
+        assert out is not result
+        assert out.statement.temporary_tables == {"a": "X"}
+
+
+def test_statement_result_has_default_service():
     from yggdrasil.databricks.sql.statements import Statements
 
-    stmt = Statement(text="SELECT 1")
-    assert isinstance(stmt.service, Statements)
-    assert stmt.client is stmt.service.client
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    assert isinstance(result.service, Statements)
+    assert result.client is result.service.client
 
 
 def test_started_false_without_statement_id():
-    stmt = Statement(text="SELECT 1")
-    assert stmt.started is False
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    assert result.started is False
 
 
 def test_started_true_when_statement_id_set():
-    stmt = Statement(text="SELECT 1")
-    object.__setattr__(stmt, "statement_id", "abc123")
-    assert stmt.started is True
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    object.__setattr__(result, "statement_id", "abc123")
+    assert result.started is True
 
 
 def test_start_is_idempotent_when_started():
-    stmt = Statement(text="SELECT 1")
-    object.__setattr__(stmt, "statement_id", "abc123")
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    object.__setattr__(result, "statement_id", "abc123")
     # Should return self without submitting (warehouse arg is unused).
-    assert stmt.start() is stmt
+    assert result.start() is result
 
 
 def test_cancel_noop_when_not_started():
-    stmt = Statement(text="SELECT 1")
+    result = StatementResult(statement=Statement(text="SELECT 1"))
     # Not started -> no client calls, returns self.
-    assert stmt.cancel() is stmt
+    assert result.cancel() is result
 
 
 def test_cancel_noop_for_spark_statements():
-    stmt = Statement(text="SELECT 1")
-    object.__setattr__(stmt, "statement_id", "SparkSQL")
-    assert stmt.cancel() is stmt
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    object.__setattr__(result, "statement_id", "SparkSQL")
+    assert result.cancel() is result
 
 
 def test_cancel_noop_when_already_done():
@@ -205,17 +258,17 @@ def test_cancel_noop_when_already_done():
         StatementStatus,
     )
 
-    stmt = Statement(text="SELECT 1")
-    object.__setattr__(stmt, "statement_id", "abc123")
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    object.__setattr__(result, "statement_id", "abc123")
     object.__setattr__(
-        stmt,
+        result,
         "_response",
         StatementResponse(
             statement_id="abc123",
             status=StatementStatus(state=StatementState.SUCCEEDED),
         ),
     )
-    assert stmt.cancel() is stmt
+    assert result.cancel() is result
 
 
 def test_cancel_calls_sdk_when_running():
@@ -227,10 +280,10 @@ def test_cancel_calls_sdk_when_running():
         StatementStatus,
     )
 
-    stmt = Statement(text="SELECT 1")
-    object.__setattr__(stmt, "statement_id", "abc123")
+    result = StatementResult(statement=Statement(text="SELECT 1"))
+    object.__setattr__(result, "statement_id", "abc123")
     object.__setattr__(
-        stmt,
+        result,
         "_response",
         StatementResponse(
             statement_id="abc123",
@@ -250,10 +303,10 @@ def test_cancel_calls_sdk_when_running():
 
     service = MagicMock()
     service.client = client
-    object.__setattr__(stmt, "service", service)
+    object.__setattr__(result, "service", service)
 
-    result = stmt.cancel()
+    out = result.cancel()
 
-    assert result is stmt
+    assert out is result
     ws.statement_execution.cancel_execution.assert_called_once_with(statement_id="abc123")
-    assert stmt._response.status.state == StatementState.CANCELED
+    assert result._response.status.state == StatementState.CANCELED

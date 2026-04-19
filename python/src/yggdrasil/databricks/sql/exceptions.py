@@ -7,7 +7,7 @@ from databricks.sdk.service.sql import ServiceErrorCode, StatementState
 from ..lib import DatabricksError
 
 if TYPE_CHECKING:
-    from .statement import Statement
+    from .statement import StatementResult
 
 __all__ = [
     "SQLError",
@@ -35,7 +35,7 @@ class SQLError(DatabricksError):
         return f"SqlStatementError(url={self.url!r}, message={self.message!r})"
 
     @classmethod
-    def from_statement(cls, stmt: "Statement") -> "SQLError":
+    def from_statement(cls, stmt: "StatementResult") -> "SQLError":
         statement_id = stmt.statement_id or "<unknown>"
         state = stmt.state
         status = stmt.status

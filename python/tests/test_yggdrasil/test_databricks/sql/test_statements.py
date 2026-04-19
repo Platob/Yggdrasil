@@ -14,7 +14,7 @@ from databricks.sdk.service.sql import (
 )
 
 from yggdrasil.databricks.client import DatabricksClient, DatabricksService
-from yggdrasil.databricks.sql.statement import Statement
+from yggdrasil.databricks.sql.statement import Statement, StatementResult
 from yggdrasil.databricks.sql.statements import Statements
 
 
@@ -43,22 +43,22 @@ def test_client_exposes_statements_property():
 # ---------------------------------------------------------------------------
 
 
-def test_statement_factory_builds_bound_statement():
+def test_statement_factory_builds_bound_result():
     client = DatabricksClient(host="https://example.cloud.databricks.com")
     svc = client.statements
 
     stmt = svc.statement("SELECT :x", parameters={"x": 1})
 
-    assert isinstance(stmt, Statement)
+    assert isinstance(stmt, StatementResult)
     assert stmt.service is svc
     assert stmt.text == "SELECT :x"
     assert stmt.parameters == {"x": 1}
 
 
-def test_statement_factory_accepts_existing_statement():
+def test_statement_factory_accepts_existing_result():
     client = DatabricksClient(host="https://example.cloud.databricks.com")
     svc = client.statements
-    original = Statement(text="SELECT 1")
+    original = StatementResult(statement=Statement(text="SELECT 1"))
 
     rebound = svc.statement(original)
 
@@ -71,7 +71,7 @@ def test_statement_factory_accepts_existing_statement():
 # ---------------------------------------------------------------------------
 
 
-def test_find_statement_returns_statement_bound_to_service():
+def test_find_statement_returns_result_bound_to_service():
     client = DatabricksClient(host="https://example.cloud.databricks.com")
     svc = client.statements
 
@@ -83,7 +83,7 @@ def test_find_statement_returns_statement_bound_to_service():
     with patch.object(type(client), "workspace_client", return_value=ws):
         stmt = svc.find_statement("abc")
 
-    assert isinstance(stmt, Statement)
+    assert isinstance(stmt, StatementResult)
     assert stmt.service is svc
     assert stmt.statement_id == "abc"
     assert stmt._response.status.state == StatementState.SUCCEEDED
@@ -194,7 +194,7 @@ def test_list_statements_yields_statement_resources():
         statements = list(svc.list_statements())
 
     assert [s.statement_id for s in statements] == ["s1", "s2"]
-    assert all(isinstance(s, Statement) for s in statements)
+    assert all(isinstance(s, StatementResult) for s in statements)
     assert all(s.service is svc for s in statements)
     assert statements[0]._history == rows[0]
 

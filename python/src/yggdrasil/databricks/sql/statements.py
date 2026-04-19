@@ -5,9 +5,10 @@ The :class:`Statements` service wraps the workspace
 ``statement_execution`` SDK for single-statement lookups and reads
 ``system.query.history`` for listing historical executions.
 
-Per-statement lifecycle operations (``start``, ``cancel``, ``wait``,
-``to_arrow``…) live on the :class:`~yggdrasil.databricks.sql.statement.Statement`
-resource returned by this service.
+Per-execution lifecycle operations (``start``, ``cancel``, ``wait``,
+``to_arrow``…) live on the
+:class:`~yggdrasil.databricks.sql.statement.StatementResult` handler
+returned by this service.
 """
 
 from __future__ import annotations
@@ -21,12 +22,13 @@ from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.sql import StatementResponse, StatementState
 
 from yggdrasil.data import any_to_datetime
+from yggdrasil.data.statement import Statement
 from yggdrasil.databricks.client import DatabricksService
 
 from .sql_utils import escape_sql_string
 
 if TYPE_CHECKING:
-    from .statement import Statement
+    from .statement import StatementResult
 
 __all__ = ["Statements"]
 
@@ -93,18 +95,18 @@ class Statements(DatabricksService):
 
     def statement(
         self,
-        text: "str | Statement" = "",
+        text: "str | Statement | StatementResult" = "",
         *,
         parameters: Optional[dict] = None,
         temporary_tables: Optional[dict] = None,
         statement_id: str | None = None,
         warehouse_id: str | None = None,
-    ) -> "Statement":
-        """Return an unstarted :class:`Statement` bound to this service."""
-        from .statement import Statement
+    ) -> "StatementResult":
+        """Return an unstarted :class:`StatementResult` bound to this service."""
+        from .statement import StatementResult
 
-        if isinstance(text, Statement):
-            prepared = Statement.prepare(
+        if isinstance(text, StatementResult):
+            prepared = StatementResult.prepare(
                 text,
                 parameters=parameters,
                 temporary_tables=temporary_tables,
@@ -116,11 +118,14 @@ class Statements(DatabricksService):
                 object.__setattr__(prepared, "warehouse_id", warehouse_id)
             return prepared
 
-        return Statement(
+        cfg = Statement.prepare(
+            text,
+            parameters=parameters,
+            temporary_tables=temporary_tables,
+        )
+        return StatementResult(
+            statement=cfg,
             service=self,
-            text=str(text),
-            parameters=dict(parameters) if parameters else {},
-            temporary_tables=dict(temporary_tables) if temporary_tables else {},
             statement_id=statement_id,
             warehouse_id=warehouse_id or self.warehouse_id,
         )
@@ -143,14 +148,14 @@ class Statements(DatabricksService):
         statement_id: str,
         *,
         raise_error: bool = True,
-    ) -> Optional["Statement"]:
-        """Resolve a :class:`Statement` by ``statement_id``.
+    ) -> Optional["StatementResult"]:
+        """Resolve a :class:`StatementResult` by ``statement_id``.
 
         Uses the workspace ``GetStatement`` endpoint to fetch live status
-        and binds the response onto a resource handle.  When the id is
+        and binds the response onto a result handle.  When the id is
         not found and ``raise_error`` is False, returns ``None``.
         """
-        from .statement import Statement
+        from .statement import StatementResult
 
         try:
             response = self.get_statement_response(statement_id)
@@ -170,7 +175,7 @@ class Statements(DatabricksService):
         if manifest is not None:
             warehouse_id = getattr(manifest, "warehouse_id", None) or warehouse_id
 
-        stmt = Statement(
+        stmt = StatementResult(
             service=self,
             statement_id=response.statement_id,
             warehouse_id=warehouse_id or self.warehouse_id,
@@ -257,8 +262,8 @@ class Statements(DatabricksService):
         limit: int | None = 1000,
         order_by: str = "start_time DESC",
         fetch_response: bool = False,
-    ) -> Iterator["Statement"]:
-        """Yield :class:`Statement` resources from ``system.query.history``.
+    ) -> Iterator["StatementResult"]:
+        """Yield :class:`StatementResult` handlers from ``system.query.history``.
 
         Defaults inherited from the service (``warehouse_id``,
         ``executed_by``) are applied when the per-call argument is not
@@ -290,7 +295,7 @@ class Statements(DatabricksService):
             values.  Slower but accurate.  When ``False`` (default),
             resources carry only the values from the history snapshot.
         """
-        from .statement import Statement
+        from .statement import StatementResult
 
         effective_warehouse = warehouse_id or self.warehouse_id
         effective_executed_by = executed_by or self.executed_by
@@ -336,11 +341,11 @@ class Statements(DatabricksService):
                 yield stmt
                 continue
 
-            stmt = Statement(
+            stmt = StatementResult(
+                statement=Statement(text=row.get("statement_text") or ""),
                 service=self,
                 statement_id=row_stmt_id,
                 warehouse_id=row.get("warehouse_id") or effective_warehouse,
-                text=row.get("statement_text") or "",
             )
             object.__setattr__(stmt, "_history", row)
             yield stmt
@@ -349,7 +354,7 @@ class Statements(DatabricksService):
     # Dict-like access by statement_id
     # ------------------------------------------------------------------ #
 
-    def __getitem__(self, statement_id: str) -> "Statement":
+    def __getitem__(self, statement_id: str) -> "StatementResult":
         stmt = self.find_statement(statement_id, raise_error=True)
         assert stmt is not None  # find_statement raises when not found
         return stmt

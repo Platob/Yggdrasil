@@ -103,7 +103,7 @@ from databricks.sdk.service.sql import Disposition
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.statement import StatementBatch
+from yggdrasil.data.statement import Statement, StatementBatch
 from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
@@ -117,7 +117,7 @@ from .grants import Grants
 from .schemas import Schemas
 from .service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from .staging import StagingPath
-from .statement import Statement
+from .statement import StatementResult
 from .table import Table
 from .tables import Tables
 from .types import PrimaryKeySpec, ForeignKeySpec
@@ -218,7 +218,7 @@ class SQLEngine(DatabricksService):
         hash=False,
         compare=False,
     )
-    _cached_queries: Optional[ExpiringDict[str, Statement]] = field(
+    _cached_queries: Optional[ExpiringDict[str, StatementResult]] = field(
         default=ExpiringDict,
         init=False,
         repr=False,
@@ -432,7 +432,7 @@ class SQLEngine(DatabricksService):
 
     def execute_many(
         self,
-        statements: "Iterable[str | Statement] | Mapping[str, str | Statement]",
+        statements: "Iterable[str | Statement | StatementResult] | Mapping[str, str | Statement | StatementResult]",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -524,15 +524,16 @@ class SQLEngine(DatabricksService):
         """
         items: OrderedDict[str, Statement] = OrderedDict()
 
-        def _add(key: str, raw: "str | Statement") -> None:
-            prepared = Statement.prepare(raw)
-            stripped = prepared.text.strip()
+        def _add(key: str, raw: "str | Statement | StatementResult") -> None:
+            # Accept plain SQL, a Statement config, or a pre-built StatementResult.
+            if isinstance(raw, StatementResult):
+                cfg = raw.statement
+            else:
+                cfg = Statement.prepare(raw)
+            stripped = cfg.text.strip()
             if not stripped:
                 return
-            items[key] = (
-                prepared if prepared.text == stripped
-                else replace(prepared, text=stripped)
-            )
+            items[key] = cfg.with_text(stripped)
 
         if isinstance(statements, Mapping):
             for key, raw in statements.items():
@@ -554,20 +555,19 @@ class SQLEngine(DatabricksService):
             items = OrderedDict(
                 (
                     key,
-                    replace(
-                        stmt,
-                        text=_apply_temporary_table_aliases(stmt.text, substitutions),
+                    cfg.with_text(
+                        _apply_temporary_table_aliases(cfg.text, substitutions),
                     ),
                 )
-                for key, stmt in items.items()
+                for key, cfg in items.items()
             )
 
         if parallel:
-            def _runner(stmt: Statement) -> Statement:
+            def _runner(result: StatementResult) -> StatementResult:
                 # Non-blocking submit — the batch polls each statement's
                 # own ``refresh_status`` / ``done`` to manage the window.
                 return self.execute(
-                    stmt,
+                    result,
                     row_limit=row_limit,
                     catalog_name=catalog_name,
                     schema_name=schema_name,
@@ -581,7 +581,10 @@ class SQLEngine(DatabricksService):
                     spark_session=spark_session,
                 )
 
-            batch = StatementBatch(results=items)
+            batch = StatementBatch.from_statements(
+                items,
+                factory=lambda cfg: StatementResult(statement=cfg),
+            )
             try:
                 batch.start(
                     parallel=parallel,
@@ -600,7 +603,7 @@ class SQLEngine(DatabricksService):
 
             return batch
 
-        results: OrderedDict[str, Statement] = OrderedDict()
+        results: OrderedDict[str, StatementResult] = OrderedDict()
         keys = list(items.keys())
 
         for key in keys[:-1]:
@@ -646,26 +649,27 @@ class SQLEngine(DatabricksService):
 
     def prepare(
         self,
-        statement: "str | Statement",
+        statement: "str | Statement | StatementResult",
         *,
         parameters: Mapping[str, Any] | None = None,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> Statement:
-        """Build a :class:`Statement` from a string or existing ``Statement``.
+        """Build a :class:`Statement` config from a string or existing statement.
 
         Extra ``parameters`` and ``temporary_tables`` are merged on top of
-        any values carried by ``statement``.  The returned ``Statement`` can
-        be passed to :meth:`execute` later.
+        any values carried by ``statement``.  The returned :class:`Statement`
+        config can be passed to :meth:`execute` later.
         """
+        base = statement.statement if isinstance(statement, StatementResult) else statement
         return Statement.prepare(
-            statement,
+            base,
             parameters=parameters,
             temporary_tables=temporary_tables,
         )
 
     def execute(
         self,
-        statement: "str | Statement",
+        statement: "str | Statement | StatementResult",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -680,7 +684,7 @@ class SQLEngine(DatabricksService):
         spark_session: Optional["SparkSession"] = None,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
-    ) -> Statement:
+    ) -> StatementResult:
         """
         Execute a SQL statement through Spark or the Databricks SQL API.
 
@@ -748,7 +752,7 @@ class SQLEngine(DatabricksService):
                 If Spark execution is requested and no SparkSession can be
                 resolved.
         """
-        prepared = Statement.prepare(
+        prepared = StatementResult.prepare(
             statement,
             parameters=parameters,
             temporary_tables=temporary_tables,
@@ -758,14 +762,13 @@ class SQLEngine(DatabricksService):
         schema_name = schema_name or self.schema_name
 
         substitutions, owned_staging = self._stage_temporary_tables(
-            prepared.temporary_tables,
+            prepared.statement.temporary_tables,
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
         if substitutions:
-            prepared = replace(
-                prepared,
-                text=_apply_temporary_table_aliases(prepared.text, substitutions),
+            prepared = prepared.with_text(
+                _apply_temporary_table_aliases(prepared.statement.text, substitutions),
             )
 
         if not engine:
@@ -787,11 +790,11 @@ class SQLEngine(DatabricksService):
         if spark_session is not None:
             engine = "spark"
 
-        prepared = replace(prepared, text=prepared.text.strip())
+        prepared = prepared.with_text(prepared.statement.text.strip())
 
         if cache_for is not None:
             cache_for = WaitingConfig.check_arg(cache_for)
-            existing = self._cached_queries.get(prepared.text)
+            existing = self._cached_queries.get(prepared.statement.text)
             if existing is not None:
                 return existing
 
@@ -806,7 +809,7 @@ class SQLEngine(DatabricksService):
                 else spark_session
             )
 
-            df = spark_session.sql(prepared.text)
+            df = spark_session.sql(prepared.statement.text)
             if row_limit:
                 df = df.limit(row_limit)
 
@@ -846,7 +849,7 @@ class SQLEngine(DatabricksService):
 
         if cache_for is not None:
             self._cached_queries.set(
-                key=prepared.text,
+                key=prepared.statement.text,
                 value=result,
                 ttl=cache_for.timeout_total_seconds,
             )
@@ -985,7 +988,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, Statement) or Statement.looks_like_query(data):
+        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1147,7 +1150,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, Statement) or Statement.looks_like_query(data):
+        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1344,7 +1347,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
     def sql_insert_into(
         self,
-        statement: "Statement | str",
+        statement: "Statement | StatementResult | str",
         *,
         mode: SaveMode | str | None = None,
         location: str | None = None,
@@ -1370,7 +1373,8 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         The target table must already exist; its column list drives the
         target columns and the projection over the source subquery.
         """
-        prepared = Statement.prepare(statement)
+        base = statement.statement if isinstance(statement, StatementResult) else statement
+        prepared = Statement.prepare(base)
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
@@ -1411,7 +1415,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
         logger.debug("Inserting query into %s", location)
 
-        statements: list["Statement | str"] = []
+        statements: list["Statement | str"] = []  # each entry is Statement config or raw SQL
 
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
@@ -1602,7 +1606,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
-        if isinstance(data, Statement) or Statement.looks_like_query(data):
+        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,

@@ -9,12 +9,16 @@ from dataclasses import dataclass, field
 import pyarrow as pa
 
 from yggdrasil.data import Schema
-from yggdrasil.data.statement import Statement as BaseStatement, StatementBatch
+from yggdrasil.data.statement import (
+    Statement,
+    StatementBatch,
+    StatementResult as BaseStatementResult,
+)
 
 
 @dataclass
-class _StubStatement(BaseStatement):
-    """Deterministic ``Statement`` that models submit + poll semantics.
+class _StubStatement(BaseStatementResult):
+    """Deterministic ``StatementResult`` that models submit + poll semantics.
 
     ``start`` records submission and a completion deadline; ``refresh_status``
     flips ``done`` once the deadline passes, so the batch's polling loop can
@@ -233,6 +237,36 @@ class TestStatementBatchWaitNoPool(unittest.TestCase):
             s._finished = True
         batch = StatementBatch.from_results(stmts)
         batch.wait(wait=False)
+
+
+class TestFromStatements(unittest.TestCase):
+    def test_from_statements_builds_results_via_factory(self):
+        configs = [
+            Statement(text="SELECT 1"),
+            Statement(text="SELECT 2", parameters={"x": 1}),
+        ]
+        batch = StatementBatch.from_statements(
+            configs,
+            factory=lambda cfg: _StubStatement(statement=cfg, name=cfg.text),
+        )
+        assert list(batch.results.keys()) == ["0", "1"]
+        assert batch["0"].statement.text == "SELECT 1"
+        assert batch["1"].statement.parameters == {"x": 1}
+        # Each wrapped result carries the original config.
+        assert batch.statements["0"] is configs[0]
+
+    def test_from_statements_accepts_mapping(self):
+        configs = {
+            "a": "SELECT 1",
+            "b": Statement(text="SELECT 2"),
+        }
+        batch = StatementBatch.from_statements(
+            configs,
+            factory=lambda cfg: _StubStatement(statement=cfg),
+        )
+        assert list(batch.results.keys()) == ["a", "b"]
+        assert batch["a"].text == "SELECT 1"
+        assert batch["b"].text == "SELECT 2"
 
 
 if __name__ == "__main__":  # pragma: no cover

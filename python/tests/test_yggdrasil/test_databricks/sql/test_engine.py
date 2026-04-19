@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import pyarrow as pa
 import pytest
-from yggdrasil.data.statement import Statement as BaseStatement
+from yggdrasil.data.statement import StatementResult as BaseStatementResult
 
 from yggdrasil.data import Schema
 from yggdrasil.databricks.sql import SQLEngine
@@ -59,7 +59,7 @@ class _FakeCleanupResource:
 
 
 @dataclass
-class _FakeStatement(BaseStatement):
+class _FakeStatement(BaseStatementResult):
     """Concrete ``StatementResult`` used to exercise base-class behavior."""
 
     _fake_done: bool = field(default=False)
