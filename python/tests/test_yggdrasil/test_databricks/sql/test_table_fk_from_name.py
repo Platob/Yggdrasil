@@ -129,7 +129,18 @@ class TestResolveFkField:
         assert fk is None
 
 
-# ── sql_create inlines resolved FKs ───────────────────────────────────────────
+# ── sql_create applies resolved FKs via the table_constraints API ────────────
+
+
+class _TableConstraintsSpy:
+    """Captures ``table_constraints.create`` calls for assertions."""
+
+    def __init__(self) -> None:
+        self.created: list = []
+
+    def create(self, *, full_name_arg, constraint):
+        self.created.append((full_name_arg, constraint))
+        return constraint
 
 
 class TestSqlCreateInlinesInferredFk:
@@ -155,20 +166,35 @@ class TestSqlCreateInlinesInferredFk:
             ],
         )
 
+        # Wire the table_constraints spy onto the mocked workspace client.
+        constraints_spy = _TableConstraintsSpy()
+        mock_client.workspace_client.return_value.table_constraints = constraints_spy
+
         schema = Schema.from_any_fields([
             Field(name="id", dtype=DataType.from_any("bigint"), nullable=False),
             Field(name="customers.id", dtype=DataType.from_any("string")),
         ])
         table.sql_create(schema, if_not_exists=False)
 
-        assert len(captured) == 1
-        ddl = captured[0]
+        create_ddls = [s for s in captured if s.startswith("CREATE TABLE")]
+        assert len(create_ddls) == 1
+        ddl = create_ddls[0]
 
         # Leaf name is used as the local column.
         assert "`id` BIGINT" in ddl
-        # The FK constraint is inlined.
-        assert "FOREIGN KEY (`id`)" in ddl
-        assert "REFERENCES `main`.`sales`.`customers` (`id`)" in ddl
+        # CREATE TABLE no longer carries inline constraints.
+        assert "FOREIGN KEY" not in ddl
+        assert "REFERENCES" not in ddl
+
+        # FK is applied via the UC table_constraints API after CREATE.
+        assert len(constraints_spy.created) == 1
+        full_name, constraint = constraints_spy.created[0]
+        assert full_name == "main.sales.orders"
+        fk = constraint.foreign_key_constraint
+        assert fk is not None
+        assert fk.child_columns == ["id"]
+        assert fk.parent_table == "main.sales.customers"
+        assert fk.parent_columns == ["id"]
 
 
 # ── update_columns applies FK after ADD COLUMNS ──────────────────────────────
@@ -198,9 +224,13 @@ class TestUpdateColumnsAppliesInferredFk:
 
         mock_client.sql.execute_many.side_effect = fake_execute_many
 
+        # Wire the table_constraints spy onto the mocked workspace client.
+        constraints_spy = _TableConstraintsSpy()
+        mock_client.workspace_client.return_value.table_constraints = constraints_spy
+
         table.update_columns([Field(name="customers.id", dtype=DataType.from_any("string"))])
 
-        # Both ADD COLUMNS and ADD CONSTRAINT FOREIGN KEY go through execute_many.
+        # ADD COLUMNS still goes through execute_many; FK no longer does.
         assert len(executed_many) == 1
         stmts = executed_many[0]
 
@@ -209,9 +239,14 @@ class TestUpdateColumnsAppliesInferredFk:
 
         assert len(add_sqls) == 1
         assert "ADD COLUMNS (`id` BIGINT)" in add_sqls[0]
+        assert fk_sqls == []
 
-        assert len(fk_sqls) == 1
-        assert "REFERENCES" in fk_sqls[0]
-        assert "`main`.`sales`.`customers`" in fk_sqls[0]
-        assert "(`id`)" in fk_sqls[0]
-        assert fk_sqls[0].startswith("ALTER TABLE `main`.`sales`.`orders` ADD CONSTRAINT")
+        # FK applied via the UC API instead.
+        assert len(constraints_spy.created) == 1
+        full_name, constraint = constraints_spy.created[0]
+        assert full_name == "main.sales.orders"
+        fk = constraint.foreign_key_constraint
+        assert fk is not None
+        assert fk.child_columns == ["id"]
+        assert fk.parent_table == "main.sales.customers"
+        assert fk.parent_columns == ["id"]

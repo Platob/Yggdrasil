@@ -50,6 +50,7 @@ class StagingPath:
     owned: bool = False
 
     _shutdown_hook: Any = field(default=None, init=False, repr=False, compare=False)
+    last_read_frame: Any = field(default=None, init=False, repr=False, compare=False)
 
     _EXPIRED_SWEEP_DONE: ClassVar[set[str]] = set()
     _EXPIRED_SWEEP_LOCK: ClassVar[threading.Lock] = threading.Lock()
@@ -133,6 +134,7 @@ class StagingPath:
         data: Any,
         *,
         cast_options: Optional["CastOptions"] = None,
+        read_columns: Optional[list[str]] = None,
     ) -> "StagingPath":
         """Serialize ``data`` to Parquet and upload it to this staging path.
 
@@ -140,11 +142,25 @@ class StagingPath:
         :class:`yggdrasil.io.buffer.media_io.MediaIO` using Parquet, and
         writes the resulting bytes to ``self.path``.
 
+        When ``read_columns`` is set, the in-memory Parquet buffer is
+        projected back as a Polars frame (reading only the requested
+        columns) and stashed on ``self.last_read_frame`` so callers —
+        e.g. the MERGE-narrowing path in
+        :meth:`~yggdrasil.databricks.sql.engine.SQLEngine.arrow_insert_into`
+        — can compute distinct values without an extra round trip to
+        the staged file. The previous value is cleared on every write
+        so a stale frame is never observable.
+
         Args:
             data:
                 Any tabular input supported by ``MediaIO.write_table``.
             cast_options:
                 Optional :class:`CastOptions` forwarded to the Parquet writer.
+            read_columns:
+                Optional subset of columns to project back off the
+                serialized Parquet buffer. When supplied the resulting
+                :class:`polars.DataFrame` is stored on
+                ``self.last_read_frame``.
 
         Returns:
             ``self`` so calls can be chained.
@@ -158,11 +174,19 @@ class StagingPath:
 
         options = ParquetOptions(cast=cast_options) if cast_options else ParquetOptions()
 
+        # Clear any frame from a previous write so stale data can't leak.
+        object.__setattr__(self, "last_read_frame", None)
+
         with BytesIO() as buffer:
             mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
             mio.write_table(data, options=options)
             mio.buffer.seek(0)
             self.path.write_bytes(mio.buffer.memoryview())
+
+            if read_columns:
+                mio.buffer.seek(0)
+                frame = mio.read_polars_frame(columns=list(read_columns))
+                object.__setattr__(self, "last_read_frame", frame)
 
         return self
 

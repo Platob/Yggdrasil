@@ -13,6 +13,9 @@ import pytest
 from databricks.sdk.service.catalog import (
     ColumnInfo,
     EntityTagAssignment,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    TableConstraint,
     TableInfo,
     TableRowFilter,
 )
@@ -210,3 +213,63 @@ class TestTableInfosCache:
         assert primed_table._tags_fetched_at is None
         assert primed_table._column_tags is None
         assert primed_table._column_tags_fetched_at is None
+
+
+# ── Table.data_schema — enrichment with tags + constraints ────────────────────
+
+
+class TestDataSchemaEnrichment:
+    def test_data_schema_stamps_primary_key_and_foreign_key_and_tags(
+        self, primed_table, mock_ws
+    ):
+        # Primary key on `id`, foreign key from `amount` to `finance.payments.id`.
+        primed_table._infos.table_constraints = [
+            TableConstraint(
+                primary_key_constraint=PrimaryKeyConstraint(
+                    name="orders_id_pk",
+                    child_columns=["id"],
+                ),
+            ),
+            TableConstraint(
+                foreign_key_constraint=ForeignKeyConstraint(
+                    name="orders_amount_fk",
+                    child_columns=["amount"],
+                    parent_table="main.finance.payments",
+                    parent_columns=["id"],
+                ),
+            ),
+        ]
+
+        # Table + column tags returned by the workspace client.
+        def _fake_list(*, entity_type, entity_name, **_):
+            if entity_type == "tables":
+                return iter([
+                    _tag("tables", entity_name, "domain", "power"),
+                ])
+            if entity_type == "columns" and entity_name.endswith(".amount"):
+                return iter([
+                    _tag("columns", entity_name, "owner", "nika"),
+                ])
+            return iter([])
+
+        mock_ws.entity_tag_assignments.list.side_effect = _fake_list
+
+        schema = primed_table.data_schema
+
+        id_field = schema["id"]
+        amount_field = schema["amount"]
+
+        id_tags = id_field.tags or {}
+        amount_tags = amount_field.tags or {}
+
+        assert id_tags.get(b"primary_key") == b"true"
+        assert b"foreign_key" not in id_tags
+
+        assert amount_tags.get(b"foreign_key") == b"main.finance.payments.id"
+        assert amount_tags.get(b"owner") == b"nika"
+
+        # Schema-level metadata picks up the table tag and constraint summary.
+        assert schema.metadata is not None
+        assert schema.metadata[b"primary_key"] == b"id"
+        assert schema.metadata[b"foreign_key"] == b"amount=main.finance.payments.id"
+        assert schema.metadata[b"tag:domain"] == b"power"

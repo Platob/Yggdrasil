@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
-from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
+from databricks.sdk.service.catalog import (
+    ColumnInfo as CatalogColumnInfo,
+    ForeignKeyConstraint,
+    PrimaryKeyConstraint,
+    TableConstraint,
+)
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
 from yggdrasil.data import Field
 
@@ -22,42 +27,110 @@ def sql(executed: list[str]):
     return SimpleNamespace(execute=executed.append)
 
 
+class _TableConstraintsAPIStub:
+    """Captures ``table_constraints.create`` / ``.delete`` calls for assertions."""
+
+    def __init__(self) -> None:
+        self.created: list[tuple[str, TableConstraint]] = []
+        self.deleted: list[tuple[str, str, bool]] = []
+
+    def create(self, *, full_name_arg, constraint):
+        self.created.append((full_name_arg, constraint))
+        return constraint
+
+    def delete(self, *, full_name, constraint_name, cascade):
+        self.deleted.append((full_name, constraint_name, cascade))
+
+
 @pytest.fixture
-def client():
+def table_constraints_api() -> _TableConstraintsAPIStub:
+    return _TableConstraintsAPIStub()
+
+
+@pytest.fixture
+def client(table_constraints_api):
+    workspace = SimpleNamespace(table_constraints=table_constraints_api)
     return SimpleNamespace(
         tables=SimpleNamespace(
             find_table=lambda **kwargs: None,
-        )
+        ),
+        workspace_client=lambda: workspace,
     )
+
+
+def _make_table_stub(client, sql, *, catalog, schema, name, constraints=()):
+    table = SimpleNamespace(
+        client=client,
+        sql=sql,
+        catalog_name=catalog,
+        schema_name=schema,
+        table_name=name,
+        name=name,
+        full_name=lambda safe=False, q_schema=schema, q_catalog=catalog, q_name=name: (
+            f"`{q_catalog}`.`{q_schema}`.`{q_name}`" if safe
+            else f"{q_catalog}.{q_schema}.{q_name}"
+        ),
+        infos=SimpleNamespace(table_constraints=list(constraints)),
+        _reset_cache=lambda invalidate_cache=False: None,
+    )
+
+    def _set_pk(columns, *, constraint_name=None, rely=False, timeseries=None):
+        from yggdrasil.databricks.sql.constraints_api import apply_primary_key
+        from yggdrasil.databricks.sql.types import PrimaryKeySpec
+
+        apply_primary_key(
+            table,
+            PrimaryKeySpec(
+                columns=list(columns) if not isinstance(columns, str) else [columns],
+                constraint_name=constraint_name,
+                rely=rely,
+                timeseries=timeseries,
+            ),
+        )
+        return table
+
+    def _drop_pk(*, if_exists=True, cascade=False):
+        from yggdrasil.databricks.sql.constraints_api import delete_constraint
+
+        pk_name = None
+        for c in table.infos.table_constraints:
+            pk = getattr(c, "primary_key_constraint", None)
+            if pk and getattr(pk, "name", None):
+                pk_name = pk.name
+                break
+        if pk_name is None:
+            if not if_exists:
+                raise ValueError("no PK")
+            return table
+        delete_constraint(table, pk_name, cascade=cascade, if_exists=if_exists)
+        return table
+
+    def _fk_name(column: str):
+        for c in table.infos.table_constraints:
+            fk = getattr(c, "foreign_key_constraint", None)
+            if fk is None:
+                continue
+            if column in (fk.child_columns or ()):
+                return fk.name
+        return None
+
+    table.set_primary_key = _set_pk
+    table.drop_primary_key = _drop_pk
+    table._foreign_key_constraint_name = _fk_name
+    return table
 
 
 @pytest.fixture
 def table(client, sql):
-    return SimpleNamespace(
-        client=client,
-        sql=sql,
-        catalog_name="main",
-        schema_name="analytics",
-        table_name="trades",
-        name="trades",
-        full_name=lambda safe=False: (
-            "`main`.`analytics`.`trades`" if safe else "main.analytics.trades"
-        ),
+    return _make_table_stub(
+        client, sql, catalog="main", schema="analytics", name="trades",
     )
 
 
 @pytest.fixture
 def ref_table(client, sql):
-    return SimpleNamespace(
-        client=client,
-        sql=sql,
-        catalog_name="main",
-        schema_name="refined",
-        table_name="books",
-        name="books",
-        full_name=lambda safe=False: (
-            "`main`.`refined`.`books`" if safe else "main.refined.books"
-        ),
+    return _make_table_stub(
+        client, sql, catalog="main", schema="refined", name="books",
     )
 
 
@@ -159,19 +232,33 @@ def test_rename_strips_backticks(column, executed):
     assert "RENAME COLUMN `trade_id` TO `price`" in executed[0]
 
 
-def test_set_tags_executes(column, executed):
-    result = column.set_tags({"owner": "nika"})
+def test_set_tags_executes(column, client):
+    entity_tags = []
+
+    def _create(*, tag_assignment):
+        entity_tags.append(tag_assignment)
+        return tag_assignment
+
+    ws = client.workspace_client()
+    ws.entity_tag_assignments = SimpleNamespace(create=_create)
+
+    result = column.set_tags({"owner": "nika", "domain": "power"})
+
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "ALTER COLUMN `trade_id` SET TAGS ('owner' = 'nika')"
+    assert [(t.entity_type, t.entity_name, t.tag_key, t.tag_value) for t in entity_tags] == [
+        ("columns", "main.analytics.trades.trade_id", "owner", "nika"),
+        ("columns", "main.analytics.trades.trade_id", "domain", "power"),
     ]
 
 
-def test_set_tags_noop_when_none(column, executed):
+def test_set_tags_noop_when_none(column, client):
+    ws = client.workspace_client()
+    ws.entity_tag_assignments = SimpleNamespace(
+        create=lambda **_: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
     result = column.set_tags(None)
     assert result is column
-    assert executed == []
 
 
 def test_add_primary_key_ddl_default(column):
@@ -197,15 +284,17 @@ def test_add_primary_key_ddl_with_options(column):
     )
 
 
-def test_set_primary_key_executes(column, executed):
-    cname = _safe_constraint_name("trades", "trade_id", "pk")
+def test_set_primary_key_executes(column, table_constraints_api):
+    cname = _safe_constraint_name("trades_trade_id_pk")
     result = column.set_primary_key(rely=True)
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        f"ADD CONSTRAINT `{cname}` "
-        "PRIMARY KEY (`trade_id`) RELY"
-    ]
+    assert len(table_constraints_api.created) == 1
+    full_name, constraint = table_constraints_api.created[0]
+    assert full_name == "main.analytics.trades"
+    assert constraint.primary_key_constraint is not None
+    assert constraint.primary_key_constraint.name == cname
+    assert constraint.primary_key_constraint.child_columns == ["trade_id"]
+    assert constraint.primary_key_constraint.rely is True
 
 
 def test_drop_primary_key_ddl_default(column):
@@ -222,11 +311,19 @@ def test_drop_primary_key_ddl_variation(column):
     )
 
 
-def test_unset_primary_key_executes(column, executed):
+def test_unset_primary_key_executes(column, table_constraints_api):
+    column.table.infos.table_constraints = [
+        TableConstraint(
+            primary_key_constraint=PrimaryKeyConstraint(
+                name="trades_trade_id_pk",
+                child_columns=["trade_id"],
+            ),
+        ),
+    ]
     result = column.unset_primary_key(if_exists=False, cascade=True)
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` " "DROP PRIMARY KEY CASCADE"
+    assert table_constraints_api.deleted == [
+        ("main.analytics.trades", "trades_trade_id_pk", True),
     ]
 
 
@@ -263,20 +360,26 @@ def test_add_foreign_key_ddl_with_options(column, ref_table, ref_column):
     )
 
 
-def test_set_foreign_key_executes(column, ref_table, executed):
-    cname = _safe_constraint_name("trades", "trade_id", "books", "book_id", "fk")
+def test_set_foreign_key_executes(column, ref_table, table_constraints_api):
+    cname = _safe_constraint_name(
+        "trades", "trade_id", "main.refined.books", "book_id", "fk",
+    )
     result = column.set_foreign_key(
         ref_table=ref_table,
         ref_column="book_id",
         rely=True,
     )
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        f"ADD CONSTRAINT `{cname}` "
-        "FOREIGN KEY (`trade_id`) "
-        "REFERENCES `main`.`refined`.`books` (`book_id`) RELY"
-    ]
+    assert len(table_constraints_api.created) == 1
+    full_name, constraint = table_constraints_api.created[0]
+    assert full_name == "main.analytics.trades"
+    fk = constraint.foreign_key_constraint
+    assert fk is not None
+    assert fk.name == cname
+    assert fk.child_columns == ["trade_id"]
+    assert fk.parent_table == "main.refined.books"
+    assert fk.parent_columns == ["book_id"]
+    assert fk.rely is True
 
 
 def test_drop_foreign_key_ddl_default(column):
@@ -294,11 +397,21 @@ def test_drop_foreign_key_ddl_variation(column):
     )
 
 
-def test_unset_foreign_key_executes(column, executed):
+def test_unset_foreign_key_executes(column, table_constraints_api):
+    column.table.infos.table_constraints = [
+        TableConstraint(
+            foreign_key_constraint=ForeignKeyConstraint(
+                name="trades_trade_id_books_book_id_fk",
+                child_columns=["trade_id"],
+                parent_table="main.refined.books",
+                parent_columns=["book_id"],
+            ),
+        ),
+    ]
     result = column.unset_foreign_key(if_exists=False)
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` " "DROP FOREIGN KEY (`trade_id`)"
+    assert table_constraints_api.deleted == [
+        ("main.analytics.trades", "trades_trade_id_books_book_id_fk", False),
     ]
 
 

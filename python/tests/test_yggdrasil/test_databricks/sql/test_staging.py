@@ -111,5 +111,76 @@ class TestStageExternalTablesOwnedHandoff(unittest.TestCase):
         self.assertEqual(owned, [])
 
 
+class TestStagingWriteTableReadColumns(unittest.TestCase):
+    """``read_columns`` populates ``last_read_frame`` from the buffer."""
+
+    def _staging_with_recorder(self, written: list[bytes]):
+        path = _fake_volume_path()
+        # ``write_bytes`` is what staging calls after serializing to the
+        # in-memory Parquet buffer — capture the payload, ignore the volume.
+        path.write_bytes = lambda view: written.append(bytes(view))
+        path.parent = MagicMock()
+        return StagingPath(
+            path=path,
+            catalog_name="c", schema_name="s", table_name="v",
+            start_ts=0, end_ts=1, token="abc",
+        )
+
+    def test_read_columns_projection_populates_last_read_frame(self):
+        import pyarrow as pa
+
+        written: list[bytes] = []
+        staging = self._staging_with_recorder(written)
+
+        data = pa.table(
+            {
+                "dt": ["2026-04-01", "2026-04-02", "2026-04-01"],
+                "id": [1, 2, 3],
+                "payload": ["a", "b", "c"],
+            }
+        )
+
+        out = staging.write_table(data, read_columns=["dt"])
+
+        self.assertIs(out, staging)
+        self.assertEqual(len(written), 1)
+        self.assertGreater(len(written[0]), 0)
+
+        frame = staging.last_read_frame
+        self.assertIsNotNone(frame)
+        # Only the requested column should have been projected back.
+        self.assertEqual(list(frame.columns), ["dt"])
+        self.assertEqual(
+            frame.get_column("dt").to_list(),
+            ["2026-04-01", "2026-04-02", "2026-04-01"],
+        )
+
+    def test_without_read_columns_last_read_frame_is_none(self):
+        import pyarrow as pa
+
+        written: list[bytes] = []
+        staging = self._staging_with_recorder(written)
+
+        staging.write_table(pa.table({"dt": ["2026-04-01"], "id": [1]}))
+
+        self.assertIsNone(staging.last_read_frame)
+
+    def test_write_clears_previous_read_frame(self):
+        import pyarrow as pa
+
+        written: list[bytes] = []
+        staging = self._staging_with_recorder(written)
+
+        staging.write_table(
+            pa.table({"dt": ["2026-04-01"]}),
+            read_columns=["dt"],
+        )
+        self.assertIsNotNone(staging.last_read_frame)
+
+        staging.write_table(pa.table({"dt": ["2026-04-02"]}))
+        # No ``read_columns`` on the second write → frame cleared.
+        self.assertIsNone(staging.last_read_frame)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
