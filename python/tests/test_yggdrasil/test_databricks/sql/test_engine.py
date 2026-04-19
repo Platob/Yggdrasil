@@ -15,6 +15,8 @@ from yggdrasil.databricks.sql.engine import (
     _delta_partition_columns,
     _is_concurrent_append,
     _narrow_target_columns,
+    _narrowing_predicate_from_values,
+    _narrowing_predicates_from_polars,
     _narrowing_predicates_via_subquery,
     _retry_concurrent_append,
     _staging_parquet_ref,
@@ -238,6 +240,52 @@ class TestDeltaConcurrentAppendNarrowing(unittest.TestCase):
         self.assertEqual(
             on_clause, "T.`id` <=> S.`id` AND T.`dt` IS NOT NULL"
         )
+
+    def test_narrowing_predicate_from_values_emits_in_list(self):
+        pred = _narrowing_predicate_from_values(
+            "dt", ["2026-04-01", "2026-04-02", None],
+            target_alias="T", max_in_values=500,
+        )
+        assert pred == "(T.`dt` IN ('2026-04-01', '2026-04-02') OR T.`dt` IS NULL)"
+
+    def test_narrowing_predicate_from_values_falls_back_to_between(self):
+        values = list(range(600))
+        pred = _narrowing_predicate_from_values(
+            "dt", values,
+            target_alias="T", max_in_values=500,
+        )
+        assert pred == "T.`dt` BETWEEN 0 AND 599"
+
+    def test_narrowing_predicate_from_values_all_null_returns_is_null(self):
+        pred = _narrowing_predicate_from_values(
+            "dt", [None, None], target_alias="T", max_in_values=500,
+        )
+        assert pred == "T.`dt` IS NULL"
+
+    def test_narrowing_predicate_from_values_empty_returns_none(self):
+        assert _narrowing_predicate_from_values(
+            "dt", [], target_alias="T", max_in_values=500,
+        ) is None
+
+    def test_narrowing_predicates_from_polars_reads_distinct_values(self):
+        import polars as pl
+
+        frame = pl.DataFrame(
+            {
+                "dt": ["2026-04-01", "2026-04-02", "2026-04-01"],
+                "region": ["EU", "EU", "US"],
+            }
+        )
+
+        predicates = _narrowing_predicates_from_polars(
+            frame, ["dt", "region"], target_alias="T",
+        )
+
+        assert len(predicates) == 2
+        assert "T.`dt` IN (" in predicates[0]
+        assert "'2026-04-01'" in predicates[0]
+        assert "'2026-04-02'" in predicates[0]
+        assert "T.`region` IN (" in predicates[1]
 
     def test_narrowing_predicates_via_subquery_produces_in_clause(self):
         predicates = _narrowing_predicates_via_subquery(
