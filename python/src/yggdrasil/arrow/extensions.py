@@ -1,10 +1,5 @@
-import os
-from .lib import pyarrow
+from .tzdata import ensure_tzdata
 
-if os.name == "nt":
-    try:
-        pyarrow.util.download_tzdata_on_windows()
-    except:
-        pass
+ensure_tzdata()
 
-__all__ = []
+__all__ = ["ensure_tzdata"]
