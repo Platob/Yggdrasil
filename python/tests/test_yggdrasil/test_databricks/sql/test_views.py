@@ -72,3 +72,40 @@ class TestViewsGetitem:
     def test_too_many_parts_raises(self, views):
         with pytest.raises(KeyError, match="1- to 4-part"):
             _ = views["a.b.c.d.e"]
+
+
+@pytest.fixture()
+def mock_ws(mock_client):
+    ws = MagicMock()
+    mock_client.workspace_client.return_value = ws
+    return ws
+
+
+class TestViewsIter:
+    def test_iter_delegates_to_list_views(self, views, mock_ws):
+        from databricks.sdk.service.catalog import TableInfo, TableType
+
+        def _view(name):
+            return TableInfo(
+                catalog_name="main", schema_name="sales", name=name,
+                table_type=TableType.VIEW,
+            )
+
+        mock_ws.tables.list.return_value = [_view("v1"), _view("v2")]
+
+        result = list(iter(views))
+        assert [v.view_name for v in result] == ["v1", "v2"]
+
+
+class TestViewsSetitem:
+    def test_setitem_renames_view_via_defaults(self, views, mock_client):
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        views["orders_summary"] = "orders_summary_v2"
+
+        mock_engine.execute.assert_called_once()
+        stmt = mock_engine.execute.call_args[0][0]
+        assert "ALTER VIEW" in stmt
+        assert "`main`.`sales`.`orders_summary`" in stmt
+        assert "RENAME TO `orders_summary_v2`" in stmt

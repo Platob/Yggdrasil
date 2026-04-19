@@ -229,3 +229,27 @@ class TestTablesGetitem:
         with pytest.raises(KeyError, match="1- to 4-part"):
             _ = tables["a.b.c.d.e"]
 
+
+class TestTablesIter:
+    def test_iter_delegates_to_list_tables(self, tables, mock_ws):
+        mock_ws.tables.list.return_value = [
+            _tbl_info("orders"),
+            _tbl_info("customers"),
+        ]
+        result = list(iter(tables))
+        assert [t.table_name for t in result] == ["orders", "customers"]
+
+
+class TestTablesSetitem:
+    def test_setitem_renames_table_via_defaults(self, tables, mock_client):
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        tables["orders"] = "orders_v2"
+
+        mock_engine.execute.assert_called_once()
+        stmt = mock_engine.execute.call_args[0][0]
+        assert "ALTER TABLE" in stmt
+        assert "`main`.`sales`.`orders`" in stmt
+        assert "RENAME TO `orders_v2`" in stmt
+

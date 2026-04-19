@@ -105,6 +105,18 @@ class Catalogs(DatabricksService):
             f" got {name!r} with {len(parts)} parts"
         )
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``catalogs[key] = "new"`` renames the resource identified by *key*.
+
+        *key* follows the same dotted routing as :meth:`__getitem__`; *new_name*
+        is the unqualified new name for the leaf (catalog, schema, table, or column).
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[Catalog]:
+        """Iterate over all visible catalogs (``self.list()``)."""
+        return self.list()
+
     # ── factory methods ───────────────────────────────────────────────────────
 
     def catalog(self, name: str) -> Catalog:

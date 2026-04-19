@@ -265,6 +265,14 @@ class Table(GrantsMixin):
     def __getitem__(self, item: str) -> Column:
         return self.column(item)
 
+    def __setitem__(self, item: str, new_name: str) -> None:
+        """``table["old_col"] = "new_col"`` renames a column."""
+        self.column(item).rename(new_name)
+
+    def __iter__(self) -> Iterable[Column]:
+        """Iterate over the columns of this table."""
+        return iter(self.columns)
+
     # =========================================================================
     # Cache management
     # =========================================================================
@@ -1081,6 +1089,29 @@ class Table(GrantsMixin):
             Job.make(uc.delete, self.full_name()).fire_and_forget()
 
         self._reset_cache(invalidate_cache=True)
+        return self
+
+    # =========================================================================
+    # Rename
+    # =========================================================================
+
+    def rename(self, new_name: str) -> "Table":
+        """Rename this table in-place (``ALTER TABLE … RENAME TO …``).
+
+        The catalog/schema parent is unchanged; *new_name* is the unqualified name.
+        """
+        new_name = (new_name or "").strip().strip("`")
+        if not new_name:
+            raise ValueError("Cannot rename table to an empty name")
+        if new_name == self.table_name:
+            return self
+
+        self.sql.execute(
+            f"ALTER TABLE {self.full_name(safe=True)} "
+            f"RENAME TO {quote_ident(new_name)}"
+        )
+        self._reset_cache(invalidate_cache=True)
+        self.table_name = new_name
         return self
 
     # =========================================================================

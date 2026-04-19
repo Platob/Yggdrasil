@@ -136,6 +136,17 @@ class Schemas(DatabricksService):
             f" catalog.schema[.table[.column]]), got {name!r} with {len(parts)} parts"
         )
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``schemas[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[Schema]:
+        """Iterate over schemas in the resolved catalog scope (``self.list()``)."""
+        return self.list()
+
     # ── factory methods ───────────────────────────────────────────────────────
 
     def schema(

@@ -135,6 +135,30 @@ def test_set_tags_ddl_returns_none_when_empty(column):
     assert column.set_tags_ddl({"": "", "x": ""}) is None
 
 
+def test_rename_executes_alter_table_rename_column(column, executed):
+    column.rename("price")
+    assert executed == [
+        "ALTER TABLE `main`.`analytics`.`trades` RENAME COLUMN `trade_id` TO `price`"
+    ]
+    assert column.name == "price"
+
+
+def test_rename_noop_on_same_name(column, executed):
+    column.rename("trade_id")
+    assert executed == []
+
+
+def test_rename_empty_raises(column):
+    with pytest.raises(ValueError):
+        column.rename("")
+
+
+def test_rename_strips_backticks(column, executed):
+    column.rename("`price`")
+    assert column.name == "price"
+    assert "RENAME COLUMN `trade_id` TO `price`" in executed[0]
+
+
 def test_set_tags_executes(column, executed):
     result = column.set_tags({"owner": "nika"})
     assert result is column

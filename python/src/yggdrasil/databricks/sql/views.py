@@ -157,6 +157,17 @@ class Views(DatabricksService):
             f" catalog.schema.view[.column]), got {name!r} with {n} parts"
         )
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``views[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator[View]:
+        """Iterate over views in the resolved catalog/schema scope."""
+        return self.list_views()
+
     # ── name parsing ──────────────────────────────────────────────────────────
 
     def parse_catalog_schema_view_names(

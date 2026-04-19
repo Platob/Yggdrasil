@@ -147,6 +147,17 @@ class Tables(DatabricksService):
             f" catalog.schema.table[.column]), got {name!r} with {n} parts"
         )
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``tables[key] = "new"`` renames the resource identified by *key*.
+
+        Routing follows :meth:`__getitem__`; *new_name* is the unqualified new name.
+        """
+        self[name].rename(new_name)
+
+    def __iter__(self) -> Iterator["Table"]:
+        """Iterate over tables in the resolved catalog/schema scope."""
+        return self.list_tables()
+
     def parse_catalog_schema_table_names(self, full_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         parts = [_.strip("`") for _ in full_name.split(".")]
 

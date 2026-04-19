@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Iterator, Optional, TYPE_CHECKING
 
 from yggdrasil.databricks.client import DatabricksService
 
@@ -75,6 +75,14 @@ class Columns(DatabricksService):
         * ``columns["main.sales.orders.price"]``       → fully qualified
         """
         return self.column(name)
+
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``columns[key] = "new"`` renames the resolved column."""
+        self.column(name).rename(new_name)
+
+    def __iter__(self) -> "Iterator[Column]":
+        """Iterate over the columns of the default table."""
+        return iter(self.list_columns())
 
     # -------------------------------------------------------------------------
     # Parsing

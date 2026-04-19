@@ -68,3 +68,38 @@ class TestColumnsGetitem:
         svc = Columns(client=mock_client)
         with pytest.raises(AssertionError):
             _ = svc["price"]
+
+
+class TestColumnsIter:
+    def test_iter_delegates_to_list_columns(self, mock_client):
+        svc = Columns(
+            client=mock_client,
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+        )
+        mock_table = MagicMock()
+        mock_col_a, mock_col_b = MagicMock(), MagicMock()
+        mock_table.columns = [mock_col_a, mock_col_b]
+        mock_client.tables.find_table.return_value = mock_table
+
+        result = list(iter(svc))
+        assert result == [mock_col_a, mock_col_b]
+
+
+class TestColumnsSetitem:
+    def test_setitem_delegates_to_column_rename(self, mock_client):
+        svc = Columns(
+            client=mock_client,
+            catalog_name="main",
+            schema_name="sales",
+            table_name="orders",
+        )
+        mock_table = MagicMock()
+        mock_column = MagicMock()
+        mock_table.column.return_value = mock_column
+        mock_client.tables.find_table.return_value = mock_table
+
+        svc["price"] = "unit_price"
+
+        mock_column.rename.assert_called_once_with("unit_price")

@@ -117,6 +117,29 @@ class TestCatalogsGetitem:
             _ = cats["a.b.c.d.e"]
 
 
+class TestCatalogsIter:
+    def test_iter_delegates_to_list(self, cats, mock_ws):
+        mock_ws.catalogs.list.return_value = [_cat_info("main"), _cat_info("hive")]
+        result = list(iter(cats))
+        assert [c.catalog_name for c in result] == ["main", "hive"]
+
+
+class TestCatalogsSetitem:
+    def test_setitem_renames_catalog(self, cats, mock_ws):
+        mock_ws.catalogs.update.return_value = _cat_info("renamed")
+        cats["main"] = "renamed"
+        mock_ws.catalogs.update.assert_called_once_with(
+            name="main", new_name="renamed",
+        )
+
+    def test_setitem_renames_schema_via_2part_key(self, cats, mock_ws):
+        mock_ws.schemas.update.return_value = None
+        cats["main.sales"] = "sales_v2"
+        mock_ws.schemas.update.assert_called_once_with(
+            full_name="main.sales", new_name="sales_v2",
+        )
+
+
 class TestCatalogsFactories:
     def test_catalog_factory(self, cats):
         cat = cats.catalog("staging")
@@ -253,6 +276,45 @@ class TestCatalogNavigation:
 
     def test_full_name(self, cat):
         assert cat.full_name() == "main"
+
+    def test_iter_delegates_to_schemas(self, cat, mock_ws):
+        mock_ws.schemas.list.return_value = [
+            _sch_info("main", "sales"),
+            _sch_info("main", "analytics"),
+        ]
+        result = list(iter(cat))
+        assert [s.schema_name for s in result] == ["sales", "analytics"]
+
+    def test_setitem_renames_child_schema(self, cat, mock_ws):
+        cat["sales"] = "sales_v2"
+        mock_ws.schemas.update.assert_called_once_with(
+            full_name="main.sales", new_name="sales_v2",
+        )
+
+
+class TestCatalogRename:
+    def test_rename_calls_update_with_new_name(self, cat, mock_ws):
+        mock_ws.catalogs.update.return_value = _cat_info("new_main")
+        cat.rename("new_main")
+        mock_ws.catalogs.update.assert_called_once_with(
+            name="main", new_name="new_main",
+        )
+        assert cat.catalog_name == "new_main"
+
+    def test_rename_noop_on_same_name(self, cat, mock_ws):
+        cat.rename("main")
+        mock_ws.catalogs.update.assert_not_called()
+
+    def test_rename_empty_raises(self, cat):
+        with pytest.raises(ValueError):
+            cat.rename("")
+
+    def test_rename_strips_backticks(self, cat, mock_ws):
+        mock_ws.catalogs.update.return_value = _cat_info("x")
+        cat.rename("`x`")
+        mock_ws.catalogs.update.assert_called_once_with(
+            name="main", new_name="x",
+        )
 
 
 class TestCatalogInfos:

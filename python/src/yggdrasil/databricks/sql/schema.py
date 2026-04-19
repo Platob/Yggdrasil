@@ -78,6 +78,14 @@ class Schema(GrantsMixin):
         """``schema["table_name"]`` → :class:`Table`."""
         return self.table(name)
 
+    def __setitem__(self, name: str, new_name: str) -> None:
+        """``schema["old_table"] = "new_table"`` renames a child table."""
+        self.table(name).rename(new_name)
+
+    def __iter__(self) -> Iterator["Table"]:
+        """Iterate over every table in this schema."""
+        return self.tables()
+
     # ── URL ───────────────────────────────────────────────────────────────────
 
     @property
@@ -321,6 +329,27 @@ class Schema(GrantsMixin):
         info = self.client.workspace_client().schemas.update(
             full_name=self.full_name(), **kwargs
         )
+        object.__setattr__(self, "_infos", info)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
+        return self
+
+    # ── rename ────────────────────────────────────────────────────────────────
+
+    def rename(self, new_name: str) -> "Schema":
+        """Rename this schema in-place (``ALTER SCHEMA … RENAME TO …``).
+
+        The catalog parent is unchanged; *new_name* is the unqualified schema name.
+        """
+        new_name = (new_name or "").strip().strip("`")
+        if not new_name:
+            raise ValueError("Cannot rename schema to an empty name")
+        if new_name == self.schema_name:
+            return self
+
+        info = self.client.workspace_client().schemas.update(
+            full_name=self.full_name(), new_name=new_name,
+        )
+        self.schema_name = new_name
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
