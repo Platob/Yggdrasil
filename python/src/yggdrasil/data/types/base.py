@@ -566,6 +566,10 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ) -> pa.Array | pa.ChunkedArray:
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return array
+
         opts = get_cast_options_class().check(options, **more_options)
         opts = opts.check_source(array).check_target(self)
 
@@ -573,6 +577,16 @@ class DataType(BaseChildrenFields, ABC):
             check_names=True, check_dtypes=True, check_metadata=False
         ):
             return array
+
+        # Null-typed source carries no values; reinterpret as typed-null
+        # instead of routing through pc.cast / empty-string nullifying.
+        src_field = opts.source_field
+        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
+            length = array.length() if isinstance(array, pa.ChunkedArray) else len(array)
+            typed_nulls = pa.nulls(length, type=self.to_arrow())
+            if isinstance(array, pa.ChunkedArray):
+                typed_nulls = pa.chunked_array([typed_nulls], type=self.to_arrow())
+            return opts.fill_arrow_nulls(typed_nulls)
 
         try:
             if isinstance(array, pa.ChunkedArray):
@@ -647,8 +661,15 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ) -> "polars.Series | polars.Expr":
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return series
+
         opts = (
-            get_cast_options_class().check(options, **more_options).check_source(series)
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(series)
+            .check_target(self)
         )
 
         if not opts.need_cast(
@@ -657,6 +678,15 @@ class DataType(BaseChildrenFields, ABC):
             return series
 
         pl = get_polars()
+
+        # Null-typed source: reinterpret with target dtype, skip empty-string
+        # nullify and value-level cast.
+        src_field = opts.source_field
+        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
+            casted = series.cast(self.to_polars(), strict=False)
+            return self.fill_polars_array_nulls(
+                casted, nullable=self._target_nullable(opts)
+            )
 
         series = self._nullify_empty_polars_strings(series)
 
@@ -738,7 +768,35 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return series
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_source(series)
+            .check_target(self)
+        )
+
+        if not opts.need_cast(
+            check_names=True, check_dtypes=True, check_metadata=False
+        ):
+            return series
+
+        # Null-typed source: build a typed null series directly, skip Arrow.
+        src_field = opts.source_field
+        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
+            pd = get_pandas()
+            nullable = self._target_nullable(opts)
+            value = self.default_pandas_scalar(nullable=nullable) if not nullable else None
+            out = pd.Series(
+                [value] * len(series),
+                index=series.index,
+                name=series.name,
+            )
+            return self.fill_pandas_series_nulls(out, nullable=nullable)
+
         return self._cast_pandas_series(series, opts)
 
     def _cast_pandas_series(
@@ -811,7 +869,15 @@ class DataType(BaseChildrenFields, ABC):
         options: "CastOptions | None" = None,
         **more_options,
     ):
-        opts = get_cast_options_class().check(options, **more_options)
+        # Object target is a variant — never touch the values.
+        if self.type_id == DataTypeId.OBJECT:
+            return column
+
+        opts = (
+            get_cast_options_class()
+            .check(options, **more_options)
+            .check_target(self)
+        )
 
         if not opts.need_cast(
             check_names=True,
@@ -819,6 +885,15 @@ class DataType(BaseChildrenFields, ABC):
             check_metadata=False,
         ):
             return column
+
+        # Null-typed source: a plain .cast() is already a metadata-only op on
+        # a NullType column; skip the empty-string nullify pass.
+        src_field = opts.source_field
+        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
+            casted = column.cast(self.to_spark())
+            return self.fill_spark_column_nulls(
+                casted, nullable=self._target_nullable(opts)
+            )
 
         return self._cast_spark_column(column, opts)
 
