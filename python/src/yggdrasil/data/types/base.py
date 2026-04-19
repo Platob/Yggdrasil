@@ -313,6 +313,23 @@ class DataType(BaseChildrenFields, ABC):
     def to_spark(self) -> Any:
         raise NotImplementedError
 
+    def to_polars_flavor(self) -> "polars.DataType":
+        """Return the Polars-native counterpart for this object.
+
+        On ``DataType`` the counterpart is a Polars dtype; on ``Field`` /
+        ``Schema`` it's a ``pl.Field`` / ``pl.Schema``. The method name is
+        uniform across the three classes so callers can dispatch on whatever
+        Yggdrasil object they hold.
+        """
+        return self.to_polars()
+
+    def to_spark_flavor(self) -> "pst.DataType":
+        """Return the Spark-native counterpart for this object.
+
+        See :meth:`to_polars_flavor` for the shared contract.
+        """
+        return self.to_spark()
+
     @abstractmethod
     def to_databricks_ddl(self) -> str:
         raise NotImplementedError

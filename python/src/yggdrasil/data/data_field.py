@@ -1222,6 +1222,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             pass
         return built
 
+    def to_polars_flavor(self) -> "polars.Field":
+        """Polars-native counterpart for this field — a ``pl.Field``."""
+        return self.to_polars_field()
+
     @classmethod
     def from_spark(
         cls,
@@ -1284,6 +1288,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             self.nullable,
             metadata=metadata,
         )
+
+    def to_spark_flavor(self) -> "pst.StructField":
+        """Spark-native counterpart for this field — a ``StructField``."""
+        return self.to_pyspark_field()
 
     def to_schema(self) -> "Schema":
         from .schema import Schema

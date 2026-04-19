@@ -536,6 +536,14 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
             [f.to_pyspark_field() for f in self.inner_fields.values()]
         )
 
+    def to_polars_flavor(self) -> "polars.Schema":
+        """Polars-native counterpart for this schema — a ``pl.Schema``."""
+        return self.to_polars_schema()
+
+    def to_spark_flavor(self) -> "pst.StructType":
+        """Spark-native counterpart for this schema — a ``StructType``."""
+        return self.to_spark_schema()
+
     @classmethod
     def from_(cls, obj: Any):
         if isinstance(obj, Schema):
