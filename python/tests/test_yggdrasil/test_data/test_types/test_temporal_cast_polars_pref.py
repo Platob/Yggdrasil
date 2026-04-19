@@ -146,10 +146,16 @@ def test_arrow_cast_to_timestamp_uses_polars_helper():
     assert out.type == pa.timestamp("us", "Europe/Paris")
 
 
-def test_arrow_str_to_timestamp_uses_polars_helper():
-    """arrow_str_to_timestamp must route the tz tail through the helper."""
+def test_arrow_str_to_timestamp_uses_polars_parser():
+    """arrow_str_to_timestamp must route string parsing through the polars
+    chrono path so the cross-platform offset / fractional / minute-precision
+    coverage is the same on Linux, macOS, and Windows."""
     arr = pa.array(["2023-01-02T03:04:05"])
-    with patch.object(tc, "retimestamp_prefer_polars", wraps=tc.retimestamp_prefer_polars) as spy:
-        out = tc.arrow_str_to_timestamp(arr, unit="us", tz="Europe/Paris", unsafe_tz=True)
+    with patch.object(
+        tc, "_polars_parse_str_to_timestamp", wraps=tc._polars_parse_str_to_timestamp
+    ) as spy:
+        out = tc.arrow_str_to_timestamp(
+            arr, unit="us", tz="Europe/Paris", unsafe_tz=True
+        )
     spy.assert_called_once()
     assert out.type == pa.timestamp("us", "Europe/Paris")

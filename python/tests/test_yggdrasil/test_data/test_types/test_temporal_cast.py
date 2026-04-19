@@ -705,6 +705,37 @@ def test_arrow_str_to_timestamp_tz_aware_shape(
     assert out.to_pylist() == [expected]
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Colon and colon-less numeric offsets — both must parse cross-platform.
+        ("2023-01-02T03:04:05+02:00", dt.datetime(2023, 1, 2, 1, 4, 5, tzinfo=_UTC)),
+        ("2023-01-02T03:04:05+0200", dt.datetime(2023, 1, 2, 1, 4, 5, tzinfo=_UTC)),
+        ("2023-05-17 14:30:00+0000", dt.datetime(2023, 5, 17, 14, 30, tzinfo=_UTC)),
+        # Negative offset.
+        ("2023-01-02T05:04:05-04:00", dt.datetime(2023, 1, 2, 9, 4, 5, tzinfo=_UTC)),
+        # Minute precision (no seconds).
+        ("2023-01-02T03:04+02:00", dt.datetime(2023, 1, 2, 1, 4, tzinfo=_UTC)),
+        ("2023-01-02 03:04Z", dt.datetime(2023, 1, 2, 3, 4, tzinfo=_UTC)),
+        # Fractional + colon offset.
+        (
+            "2023-01-02T03:04:05.5+02:00",
+            dt.datetime(2023, 1, 2, 1, 4, 5, 500000, tzinfo=_UTC),
+        ),
+        (
+            "2023-01-02T03:04:05.123456-05:30",
+            dt.datetime(2023, 1, 2, 8, 34, 5, 123456, tzinfo=_UTC),
+        ),
+    ],
+)
+def test_arrow_str_to_timestamp_offset_shapes_are_cross_platform(
+    value: str, expected: dt.datetime
+) -> None:
+    arr = pa.array([value])
+    out = arrow_str_to_timestamp(arr, unit="us", tz="UTC")
+    assert out.to_pylist() == [expected]
+
+
 def test_arrow_str_to_timestamp_mixed_utc_and_z_in_one_column() -> None:
     arr = pa.array(
         [
