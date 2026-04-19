@@ -966,10 +966,17 @@ class StatementBatch(Mapping[str, "StatementResult"]):
         effective_runner = runner or _default_runner
 
         if workers == 1 or len(self.results) <= 1:
-            for key, stmt in self.results.items():
+            # Sequential submission: each statement is fully drained before the
+            # next is submitted so later statements can observe earlier writes.
+            # The caller's ``wait`` only applies to the final statement — every
+            # preceding one is forced to ``wait=True``.
+            items = list(self.results.items())
+            last_index = len(items) - 1
+            for idx, (key, stmt) in enumerate(items):
+                stmt_wait = wait if idx == last_index else True
                 try:
                     effective_runner(stmt)
-                    stmt.wait(wait=wait, raise_error=raise_error)
+                    stmt.wait(wait=stmt_wait, raise_error=raise_error)
                 except Exception:
                     self._cancel_siblings(after_key=key)
                     if raise_error:

@@ -108,6 +108,27 @@ class TestStatementBatchStart(unittest.TestCase):
             self.assertTrue(s._started)
             self.assertTrue(s._finished)
 
+    def test_sequential_waits_all_but_last_when_wait_false(self):
+        """``wait=False`` only affects the final statement; earlier ones wait."""
+        # Non-zero duration + wait=False means the statement does NOT reach a
+        # terminal state from a single ``start`` call — ``wait`` must be True
+        # for that to happen.  We use this to probe which statements actually
+        # got a ``wait(wait=True)``.
+        stmts = [_StubStatement(name=f"s{i}", duration=0.01) for i in range(3)]
+        batch = StatementBatch.from_results(stmts)
+        batch.start(parallel=False, wait=False)
+
+        # All submitted.
+        for s in stmts:
+            self.assertTrue(s._started)
+
+        # Earlier two MUST be fully done (batch forced wait=True).
+        self.assertTrue(stmts[0]._finished)
+        self.assertTrue(stmts[1]._finished)
+
+        # The last one respected wait=False — still in-flight on the "backend".
+        self.assertFalse(stmts[2]._finished)
+
     def test_pooled_start_fills_window_only(self):
         batch, stmts = self._build(6, duration=0.05)
         batch.start(parallel=2)

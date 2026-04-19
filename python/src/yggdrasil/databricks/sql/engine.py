@@ -562,57 +562,14 @@ class SQLEngine(DatabricksService):
                 for key, cfg in items.items()
             )
 
-        if parallel:
-            def _runner(result: StatementResult) -> StatementResult:
-                # Non-blocking submit — the batch polls each statement's
-                # own ``refresh_status`` / ``done`` to manage the window.
-                return self.execute(
-                    result,
-                    row_limit=row_limit,
-                    catalog_name=catalog_name,
-                    schema_name=schema_name,
-                    wait=False,
-                    raise_error=raise_error,
-                    engine=engine,
-                    warehouse_id=warehouse_id,
-                    warehouse_name=warehouse_name,
-                    byte_limit=byte_limit,
-                    cache_for=cache_for,
-                    spark_session=spark_session,
-                )
-
-            batch = StatementBatch.from_statements(
-                items,
-                factory=lambda cfg: StatementResult(statement=cfg),
-            )
-            try:
-                batch.start(
-                    parallel=parallel,
-                    wait=wait,
-                    raise_error=raise_error,
-                    runner=_runner,
-                )
-            except Exception:
-                batch.cancel()
-                raise
-
-            if owned_staging:
-                for result in batch.results.values():
-                    result.attach_temporary_tables(owned_staging)
-                    result._maybe_cleanup_temporary_tables()
-
-            return batch
-
-        results: OrderedDict[str, StatementResult] = OrderedDict()
-        keys = list(items.keys())
-
-        for key in keys[:-1]:
-            results[key] = self.execute(
-                items[key],
+        def _runner(result: StatementResult) -> StatementResult:
+            # Non-blocking submit; the batch manages per-statement waiting.
+            return self.execute(
+                result,
                 row_limit=row_limit,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
-                wait=True,
+                wait=False,
                 raise_error=raise_error,
                 engine=engine,
                 warehouse_id=warehouse_id,
@@ -622,28 +579,25 @@ class SQLEngine(DatabricksService):
                 spark_session=spark_session,
             )
 
-        last_key = keys[-1]
-        results[last_key] = self.execute(
-            items[last_key],
-            row_limit=row_limit,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            wait=wait,
-            raise_error=raise_error,
-            engine=engine,
-            warehouse_id=warehouse_id,
-            warehouse_name=warehouse_name,
-            byte_limit=byte_limit,
-            cache_for=cache_for,
-            spark_session=spark_session,
+        batch = StatementBatch.from_statements(
+            items,
+            factory=lambda cfg: StatementResult(statement=cfg),
         )
+        try:
+            batch.start(
+                parallel=parallel,
+                wait=wait,
+                raise_error=raise_error,
+                runner=_runner,
+            )
+        except Exception:
+            batch.cancel()
+            raise
 
         if owned_staging:
-            for result in results.values():
+            for result in batch.results.values():
                 result.attach_temporary_tables(owned_staging)
                 result._maybe_cleanup_temporary_tables()
-
-        batch = StatementBatch(results=results)
 
         return batch
 
@@ -1325,12 +1279,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
         try:
             if statements:
-                if len(statements) == 1:
-                    self.execute(statements[0], wait=wait, raise_error=raise_error)
-                else:
-                    for stmt in statements[:-1]:
-                        self.execute(stmt, wait=True, raise_error=raise_error)
-                    self.execute(statements[-1], wait=wait, raise_error=raise_error)
+                self.execute_many(statements, wait=wait, raise_error=raise_error)
         finally:
             if wait:
                 if staging is not None:
@@ -1568,12 +1517,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             statements.append(replace(prepared, text=insert_sql))
 
         if statements:
-            if len(statements) == 1:
-                self.execute(statements[0], wait=wait, raise_error=raise_error)
-            else:
-                for stmt in statements[:-1]:
-                    self.execute(stmt, wait=True, raise_error=raise_error)
-                self.execute(statements[-1], wait=wait, raise_error=raise_error)
+            self.execute_many(statements, wait=wait, raise_error=raise_error)
 
         logger.info("SQL inserted into %s", location)
 
