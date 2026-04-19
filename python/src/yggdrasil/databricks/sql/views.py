@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Iterator, Optional, TYPE_CHECKING
+from typing import Iterable, Iterator, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo, TableType
@@ -34,6 +34,7 @@ from databricks.sdk.service.catalog import TableInfo, TableType
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.io.enums.save_mode import SaveMode, SaveModeArg
 
 from .view import View
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from .catalog import Catalog
     from .column import Column
     from .schema import Schema
+    from .table import Table
 
 __all__ = ["Views"]
 
@@ -517,3 +519,103 @@ class Views(DatabricksService):
                 if _VIEW_CACHE.get(key) is None:
                     _VIEW_CACHE.set(key, vw, ttl=cache_ttl)
             yield vw
+
+    # ── concat_tables — create/update a UNION view over multiple tables ──────
+
+    @staticmethod
+    def _common_table_name_root(names: Iterable[str]) -> str:
+        """Longest shared prefix across ``names``, stripped of trailing separators.
+
+        Returns an empty string when the inputs share no leading characters.
+        Trailing ``_ - . `` are trimmed so a prefix like ``"sales_"`` becomes
+        a valid unqualified view name (``"sales"``).
+        """
+        name_list = [n for n in names if n]
+        if not name_list:
+            return ""
+        if len(name_list) == 1:
+            return name_list[0].rstrip("_-. ")
+
+        prefix = name_list[0]
+        for other in name_list[1:]:
+            # Shrink until ``prefix`` is a prefix of ``other``.
+            while not other.startswith(prefix):
+                prefix = prefix[:-1]
+                if not prefix:
+                    return ""
+        return prefix.rstrip("_-. ")
+
+    def concat_tables(
+        self,
+        tables: Iterable["Table"],
+        *,
+        view_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        by_name: bool = True,
+        comment: str | None = None,
+        mode: SaveModeArg = SaveMode.OVERWRITE,
+    ) -> View:
+        """Create or update a view that concatenates *tables* with ``UNION ALL``.
+
+        Args:
+            tables:
+                Iterable of :class:`Table` objects to union.  Each table
+                contributes ``SELECT * FROM <table.full_name>`` to the view
+                definition.
+            view_name:
+                Unqualified view name.  When omitted, the longest shared
+                prefix of the input table names (trimmed of trailing
+                ``_ - . ``) is used.  Raises ``ValueError`` when the inputs
+                share no common prefix.
+            catalog_name, schema_name:
+                Override the view location.  Fall back to the service
+                defaults, then to the first input table's catalog/schema.
+            by_name:
+                When ``True`` (default), emit ``UNION ALL BY NAME`` so
+                columns are aligned by name and missing columns are padded
+                with ``NULL`` — useful when tables have slightly different
+                schemas.  When ``False``, emit plain ``UNION ALL`` (columns
+                aligned by position).
+            comment:
+                Optional ``COMMENT`` on the view.
+            mode:
+                Passed through to :meth:`View.create`.  Defaults to
+                :attr:`SaveMode.OVERWRITE` so the view is created or
+                replaced atomically.
+
+        Returns:
+            The :class:`View` that was created or updated.
+        """
+        tables_list = list(tables)
+        if not tables_list:
+            raise ValueError("concat_tables requires at least one Table")
+
+        if not view_name:
+            view_name = self._common_table_name_root(
+                t.table_name for t in tables_list
+            )
+            if not view_name:
+                input_names = [t.table_name for t in tables_list]
+                raise ValueError(
+                    "concat_tables could not derive a view name from "
+                    f"{input_names!r}; the input tables share no common "
+                    "prefix.  Pass view_name explicitly."
+                )
+
+        first = tables_list[0]
+        catalog_name = catalog_name or self.catalog_name or first.catalog_name
+        schema_name = schema_name or self.schema_name or first.schema_name
+
+        separator = "\nUNION ALL BY NAME\n" if by_name else "\nUNION ALL\n"
+        query = separator.join(
+            f"SELECT * FROM {t.full_name(safe=True)}"
+            for t in tables_list
+        )
+
+        view = self.view(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            view_name=view_name,
+        )
+        return view.create(query, mode=mode, comment=comment)
