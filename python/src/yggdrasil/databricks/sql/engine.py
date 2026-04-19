@@ -96,7 +96,19 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union, Iterable, OrderedDict, Mapping
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Literal,
+    Mapping,
+    Optional,
+    OrderedDict,
+    TypeVar,
+    Union,
+)
 
 import pyarrow as pa
 from databricks.sdk.service.sql import Disposition
@@ -104,7 +116,7 @@ from databricks.sdk.service.sql import Disposition
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementBatch
-from yggdrasil.databricks.sql.sql_utils import quote_ident
+from yggdrasil.databricks.sql.sql_utils import quote_ident, sql_literal
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import SaveMode
@@ -132,6 +144,8 @@ __all__ = [
     "SQLEngine",
 ]
 
+R = TypeVar("R")
+
 
 def _build_match_condition(
     match_by: list[str],
@@ -139,12 +153,251 @@ def _build_match_condition(
     left_alias: str,
     right_alias: str,
     null_safe: bool = True,
+    extra_predicates: Optional[Iterable[str]] = None,
 ) -> str:
+    """Build a merge ``ON`` expression from key columns and optional extras.
+
+    ``extra_predicates`` are already-rendered SQL fragments (e.g. partition or
+    cluster-column scope filters). They are AND-ed onto the equality clause so
+    Delta can prune files and narrow its OCC read set — the fix for
+    ``DELTA_CONCURRENT_APPEND.WHOLE_TABLE_READ`` conflicts.
+    """
     op = "<=>" if null_safe else "="
-    return " AND ".join(
+    clauses = [
         f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
         for k in match_by
-    )
+    ]
+    if extra_predicates:
+        clauses.extend(p for p in extra_predicates if p)
+    return " AND ".join(clauses)
+
+
+# Delta's DELTA_CONCURRENT_APPEND conflict surfaces under both the Spark and
+# warehouse paths. We match on the stable error-code + class-name tokens so the
+# detection works across SDK/PyPI versions.
+_CONCURRENT_APPEND_TOKENS = (
+    "DELTA_CONCURRENT_APPEND",
+    "ConcurrentAppendException",
+)
+
+
+def _is_concurrent_append(exc: BaseException) -> bool:
+    """Return ``True`` when *exc* is a Delta concurrent-append conflict."""
+    pieces = [type(exc).__name__, str(exc)]
+    for attr in ("error_code", "message"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            pieces.append(str(value))
+    blob = "\n".join(pieces)
+    return any(token in blob for token in _CONCURRENT_APPEND_TOKENS)
+
+
+def _delta_partition_columns(table: Table) -> list[str]:
+    """Target-side partition columns, in partition order.
+
+    Pulled straight from :class:`~databricks.sdk.service.catalog.TableInfo`
+    (``columns[*].partition_index``) so no extra round-trip is needed beyond
+    the TTL-cached ``table.infos`` fetch.
+    """
+    try:
+        cols = [
+            c for c in (table.infos.columns or [])
+            if getattr(c, "partition_index", None) is not None
+        ]
+    except Exception:
+        logger.debug(
+            "Failed to read partition columns for %s", table.full_name(),
+            exc_info=True,
+        )
+        return []
+    cols.sort(key=lambda c: c.partition_index)
+    return [c.name for c in cols if getattr(c, "name", None)]
+
+
+def _delta_cluster_columns(table: Table) -> list[str]:
+    """Target-side liquid-cluster columns, read from ``TBLPROPERTIES``.
+
+    Databricks stores them as ``clusteringColumns`` — a JSON list of
+    ``[column_path]`` entries. We return the leaf names in declared order.
+    """
+    try:
+        props = table.infos.properties or {}
+    except Exception:
+        logger.debug(
+            "Failed to read cluster columns for %s", table.full_name(),
+            exc_info=True,
+        )
+        return []
+
+    raw = props.get("clusteringColumns")
+    if not raw:
+        return []
+
+    import json
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return []
+
+    cols: list[str] = []
+    for item in parsed or ():
+        if isinstance(item, (list, tuple)) and item:
+            cols.append(str(item[0]))
+        elif isinstance(item, str):
+            cols.append(item)
+    return [c for c in cols if c]
+
+
+def _narrow_target_columns(
+    table: Table,
+    *,
+    match_by: Iterable[str] | None,
+) -> list[str]:
+    """Columns to narrow the merge scan on — partitions first, then cluster keys.
+
+    Columns already in ``match_by`` are dropped (equality already narrows
+    them), and duplicates are removed preserving order.
+    """
+    used: set[str] = set(match_by or ())
+    out: list[str] = []
+    for col in (*_delta_partition_columns(table), *_delta_cluster_columns(table)):
+        if col and col not in used:
+            used.add(col)
+            out.append(col)
+    return out
+
+
+def _narrowing_predicates_via_subquery(
+    cols: Iterable[str],
+    *,
+    target_alias: str,
+    source_expr: str,
+) -> list[str]:
+    """Render ``alias.col IN (SELECT DISTINCT col FROM <source>)`` predicates.
+
+    ``source_expr`` is inlined — for the warehouse path it can be an
+    ``{src}`` staging alias (substituted later by
+    :func:`_apply_external_table_aliases`) or a full ``(SELECT ...) AS src``
+    subquery. Lets Delta prune target files without us pre-scanning the batch.
+    """
+    return [
+        f"{target_alias}.{quote_ident(col)} IN "
+        f"(SELECT DISTINCT {quote_ident(col)} FROM {source_expr})"
+        for col in cols
+    ]
+
+
+def _narrowing_predicates_from_spark(
+    data_df: Any,
+    cols: Iterable[str],
+    *,
+    target_alias: str,
+    max_in_values: int = 500,
+) -> list[str]:
+    """Collect distinct narrowing values from a Spark DataFrame.
+
+    Falls back to ``BETWEEN min AND max`` when a column's cardinality exceeds
+    ``max_in_values`` (keeps the generated SQL from blowing past parser
+    limits on wide partition spaces). NULLs are re-introduced with an
+    explicit ``OR col IS NULL`` when present in the batch.
+
+    Returns an empty list on any failure — the caller falls back to the
+    plain key-only merge predicate.
+    """
+    cols = [c for c in cols if c in getattr(data_df, "columns", [])]
+    if not cols:
+        return []
+
+    import pyspark.sql.functions as F
+
+    predicates: list[str] = []
+    for col in cols:
+        try:
+            rows = (
+                data_df.select(F.col(col))
+                .distinct()
+                .limit(max_in_values + 1)
+                .collect()
+            )
+        except Exception:
+            logger.debug(
+                "Failed to collect distinct %r for merge narrowing", col,
+                exc_info=True,
+            )
+            continue
+
+        values = [r[0] for r in rows]
+        if not values:
+            continue
+
+        has_null = any(v is None for v in values)
+        non_null = [v for v in values if v is not None]
+        qcol = f"{target_alias}.{quote_ident(col)}"
+
+        if not non_null:
+            predicates.append(f"{qcol} IS NULL")
+            continue
+
+        if len(non_null) <= max_in_values:
+            in_list = ", ".join(sql_literal(v) for v in non_null)
+            pred = f"{qcol} IN ({in_list})"
+        else:
+            try:
+                mm = data_df.agg(F.min(col), F.max(col)).collect()[0]
+                lo, hi = mm[0], mm[1]
+            except Exception:
+                logger.debug(
+                    "Failed to collect min/max for %r", col, exc_info=True,
+                )
+                continue
+            if lo is None or hi is None:
+                continue
+            pred = f"{qcol} BETWEEN {sql_literal(lo)} AND {sql_literal(hi)}"
+
+        if has_null:
+            pred = f"({pred} OR {qcol} IS NULL)"
+        predicates.append(pred)
+
+    return predicates
+
+
+def _retry_concurrent_append(
+    fn: Callable[[], R],
+    *,
+    attempts: int,
+    base_delay: float = 1.0,
+    backoff: float = 2.0,
+    max_delay: float = 30.0,
+    op: str = "delta merge",
+) -> R:
+    """Retry ``fn`` when Delta reports a concurrent-append conflict.
+
+    Other exceptions propagate immediately — we only retry the specific
+    ``DELTA_CONCURRENT_APPEND`` case, which is safe because an OCC abort
+    means no target changes were committed.
+    """
+    if attempts < 1:
+        attempts = 1
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — routed by _is_concurrent_append
+            if not _is_concurrent_append(exc):
+                raise
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            delay = min(max_delay, base_delay * (backoff ** (attempt - 1)))
+            import random as _random
+            jittered = delay * (0.5 + _random.random())
+            logger.warning(
+                "%s hit DELTA_CONCURRENT_APPEND (attempt %d/%d); "
+                "retrying in %.1fs", op, attempt, attempts, jittered,
+            )
+            time.sleep(jittered)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _staging_parquet_ref(path: StagingPath) -> str:
@@ -902,6 +1155,8 @@ class SQLEngine(DatabricksService):
         table: Optional[Table] = None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        narrow_merge: bool = True,
+        concurrent_append_retries: int = 3,
     ) -> None:
         """
         Insert data into a Delta table using the most appropriate backend.
@@ -990,6 +1245,8 @@ class SQLEngine(DatabricksService):
                 vacuum_hours=vacuum_hours,
                 table=table,
                 spark_session=spark_session,
+                narrow_merge=narrow_merge,
+                concurrent_append_retries=concurrent_append_retries,
             )
 
         if spark_session is None:
@@ -1023,6 +1280,8 @@ class SQLEngine(DatabricksService):
                 table=table,
                 primary_keys=primary_keys,
                 foreign_keys=foreign_keys,
+                narrow_merge=narrow_merge,
+                concurrent_append_retries=concurrent_append_retries,
             )
 
         return self.arrow_insert_into(
@@ -1045,6 +1304,8 @@ class SQLEngine(DatabricksService):
             table=table,
             primary_keys=primary_keys,
             foreign_keys=foreign_keys,
+            narrow_merge=narrow_merge,
+            concurrent_append_retries=concurrent_append_retries,
         )
 
     def arrow_insert_into(
@@ -1069,6 +1330,8 @@ class SQLEngine(DatabricksService):
         temp_volume_path=None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        narrow_merge: bool = True,
+        concurrent_append_retries: int = 3,
     ) -> None:
         """
         Insert data through the warehouse SQL path.
@@ -1208,6 +1471,19 @@ class SQLEngine(DatabricksService):
         # and hands the owned staging off to result-lifecycle cleanup.
         source_sql = f"SELECT {cols_quoted} FROM {{src}}"
 
+        # Narrow the MERGE/DELETE scope using partition + liquid-cluster
+        # columns from the target — keeps Delta OCC from taking a whole-table
+        # read and throwing DELTA_CONCURRENT_APPEND.WHOLE_TABLE_READ.
+        narrow_cols = _narrow_target_columns(table, match_by=match_by) if narrow_merge else []
+        narrow_cols = [c for c in narrow_cols if c in columns]
+        scope_predicates = _narrowing_predicates_via_subquery(
+            narrow_cols, target_alias="T", source_expr="{src}",
+        ) if narrow_cols else []
+        if scope_predicates:
+            logger.debug(
+                "Narrowing MERGE scope on %s by %s", location, narrow_cols,
+            )
+
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
                 f"INSERT INTO {location} ({cols_quoted})\n{source_sql}"
@@ -1222,6 +1498,7 @@ class SQLEngine(DatabricksService):
                     left_alias="T",
                     right_alias="S",
                     null_safe=True,
+                    extra_predicates=scope_predicates,
                 )
                 delete_sql = (
                     f"DELETE FROM {location} AS T\n"
@@ -1244,6 +1521,7 @@ class SQLEngine(DatabricksService):
                 left_alias="T",
                 right_alias="S",
                 null_safe=True,
+                extra_predicates=scope_predicates,
             )
             insert_clause = (
                 f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
@@ -1302,11 +1580,15 @@ class SQLEngine(DatabricksService):
         # each one reaches a terminal state.  ``owned=False`` staging paths
         # supplied by the caller are substituted but never deleted.
         if statements:
-            self.execute_many(
-                statements,
-                wait=wait,
-                raise_error=raise_error,
-                external_tables={"src": staging},
+            _retry_concurrent_append(
+                lambda: self.execute_many(
+                    statements,
+                    wait=wait,
+                    raise_error=raise_error,
+                    external_tables={"src": staging},
+                ),
+                attempts=max(1, concurrent_append_retries + 1),
+                op=f"arrow merge into {location}",
             )
 
         logger.info("Arrow inserted into %s", location)
@@ -1330,6 +1612,8 @@ class SQLEngine(DatabricksService):
         vacuum_hours: int | None = None,
         table: Optional[Table] = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
+        narrow_merge: bool = True,
+        concurrent_append_retries: int = 3,
     ) -> None:
         """Insert into a Delta table from a SQL source.
 
@@ -1404,6 +1688,8 @@ class SQLEngine(DatabricksService):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 table=table,
+                narrow_merge=narrow_merge,
+                concurrent_append_retries=concurrent_append_retries,
             )
 
         # ---- Fallback: warehouse-side SQL merge ----
@@ -1451,6 +1737,18 @@ class SQLEngine(DatabricksService):
 
         statements: list["PreparedStatement | str"] = []  # each entry is PreparedStatement config or raw SQL
 
+        # Narrow the merge scope by partition + cluster columns against the
+        # source subquery — keeps Delta from a whole-table read.
+        narrow_cols = _narrow_target_columns(table, match_by=match_by) if narrow_merge else []
+        narrow_cols = [c for c in narrow_cols if c in columns]
+        scope_predicates = _narrowing_predicates_via_subquery(
+            narrow_cols, target_alias="T", source_expr=f"{source_sql} AS src",
+        ) if narrow_cols else []
+        if scope_predicates:
+            logger.debug(
+                "Narrowing SQL merge scope on %s by %s", location, narrow_cols,
+            )
+
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
                 f"INSERT INTO {location} ({cols_quoted})\n"
@@ -1463,6 +1761,7 @@ class SQLEngine(DatabricksService):
                     left_alias="T",
                     right_alias="S",
                     null_safe=True,
+                    extra_predicates=scope_predicates,
                 )
                 delete_sql = (
                     f"DELETE FROM {location} AS T\n"
@@ -1483,6 +1782,7 @@ class SQLEngine(DatabricksService):
                 left_alias="T",
                 right_alias="S",
                 null_safe=True,
+                extra_predicates=scope_predicates,
             )
             insert_clause = (
                 f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
@@ -1536,7 +1836,13 @@ class SQLEngine(DatabricksService):
             statements.append(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
 
         if statements:
-            self.execute_many(statements, wait=wait, raise_error=raise_error)
+            _retry_concurrent_append(
+                lambda: self.execute_many(
+                    statements, wait=wait, raise_error=raise_error,
+                ),
+                attempts=max(1, concurrent_append_retries + 1),
+                op=f"sql merge into {location}",
+            )
 
         logger.info("SQL inserted into %s", location)
         return None
@@ -1563,6 +1869,9 @@ class SQLEngine(DatabricksService):
         table: Optional[Table] = None,
         primary_keys: "list[str] | PrimaryKeySpec | None" = None,
         foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
+        narrow_merge: bool = True,
+        narrow_max_in_values: int = 500,
+        concurrent_append_retries: int = 3,
     ) -> None:
         """
         Insert data into a Delta table using Spark.
@@ -1647,6 +1956,8 @@ class SQLEngine(DatabricksService):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 table=table,
+                narrow_merge=narrow_merge,
+                concurrent_append_retries=concurrent_append_retries,
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -1694,6 +2005,27 @@ class SQLEngine(DatabricksService):
         if overwrite_schema:
             _spark_options["overwriteSchema"] = "true"
 
+        # Narrow the merge scope by the target's partition + cluster columns
+        # so Delta OCC reads a small file set instead of the whole table.
+        # Computed once before ``_run`` so retries don't re-scan the batch.
+        narrow_cols: list[str] = []
+        scope_predicates: list[str] = []
+        if narrow_merge and match_by:
+            narrow_cols = _narrow_target_columns(table, match_by=match_by)
+            narrow_cols = [c for c in narrow_cols if c in data_df.columns]
+            if narrow_cols:
+                scope_predicates = _narrowing_predicates_from_spark(
+                    data_df,
+                    narrow_cols,
+                    target_alias="t",
+                    max_in_values=narrow_max_in_values,
+                )
+                if scope_predicates:
+                    logger.debug(
+                        "Narrowing Spark merge scope on %s by %s",
+                        table.full_name(), narrow_cols,
+                    )
+
         def _run() -> None:
             if mode == SaveMode.TRUNCATE:
                 cond = _build_match_condition(
@@ -1701,6 +2033,7 @@ class SQLEngine(DatabricksService):
                     left_alias="t",
                     right_alias="s",
                     null_safe=True,
+                    extra_predicates=scope_predicates,
                 ) if match_by else None
 
                 if match_by:
@@ -1708,11 +2041,15 @@ class SQLEngine(DatabricksService):
                         "Spark truncate (match_by=%s): Delta delete matching keys", match_by
                     )
                     distinct_keys = data_df.select(list(match_by)).distinct()
-                    (
-                        target.alias("t")
-                        .merge(distinct_keys.alias("s"), cond)
-                        .whenMatchedDelete()
-                        .execute()
+                    _retry_concurrent_append(
+                        lambda: (
+                            target.alias("t")
+                            .merge(distinct_keys.alias("s"), cond)
+                            .whenMatchedDelete()
+                            .execute()
+                        ),
+                        attempts=max(1, concurrent_append_retries + 1),
+                        op=f"spark truncate merge into {table.full_name()}",
                     )
                 else:
                     logger.info("Spark truncate: Delta delete all rows")
@@ -1733,14 +2070,19 @@ class SQLEngine(DatabricksService):
                     left_alias="t",
                     right_alias="s",
                     null_safe=True,
+                    extra_predicates=scope_predicates,
                 )
 
                 if mode == SaveMode.APPEND:
-                    (
-                        target.alias("t")
-                        .merge(data_df.alias("s"), cond)
-                        .whenNotMatchedInsertAll()
-                        .execute()
+                    _retry_concurrent_append(
+                        lambda: (
+                            target.alias("t")
+                            .merge(data_df.alias("s"), cond)
+                            .whenNotMatchedInsertAll()
+                            .execute()
+                        ),
+                        attempts=max(1, concurrent_append_retries + 1),
+                        op=f"spark append merge into {table.full_name()}",
                     )
                 else:
                     update_cols_effective = (
@@ -1752,13 +2094,17 @@ class SQLEngine(DatabricksService):
                         c: F.expr(f"s.{quote_ident(c)}")
                         for c in update_cols_effective
                     }
-                    builder = target.alias("t").merge(data_df.alias("s"), cond)
-                    if set_expr:
-                        builder = builder.whenMatchedUpdate(set=set_expr)
-                    (
-                        builder
-                        .whenNotMatchedInsertAll()
-                        .execute()
+
+                    def _upsert() -> None:
+                        builder = target.alias("t").merge(data_df.alias("s"), cond)
+                        if set_expr:
+                            builder = builder.whenMatchedUpdate(set=set_expr)
+                        builder.whenNotMatchedInsertAll().execute()
+
+                    _retry_concurrent_append(
+                        _upsert,
+                        attempts=max(1, concurrent_append_retries + 1),
+                        op=f"spark upsert merge into {table.full_name()}",
                     )
             else:
                 logger.info("Spark write saveAsTable mode=append")

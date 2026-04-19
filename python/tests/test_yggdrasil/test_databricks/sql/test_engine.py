@@ -10,6 +10,13 @@ from yggdrasil.data.statement import StatementResult as BaseStatementResult
 from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.sql.engine import (
     _apply_external_table_aliases,
+    _build_match_condition,
+    _delta_cluster_columns,
+    _delta_partition_columns,
+    _is_concurrent_append,
+    _narrow_target_columns,
+    _narrowing_predicates_via_subquery,
+    _retry_concurrent_append,
     _staging_parquet_ref,
 )
 from yggdrasil.databricks.sql.exceptions import SQLError
@@ -202,6 +209,183 @@ class TestExternalTableCleanup(unittest.TestCase):
         result.attach_external_tables([])
         self.assertEqual(result._external_tables, ())
         self.assertFalse(result._external_tables_cleaned)
+
+
+class TestDeltaConcurrentAppendNarrowing(unittest.TestCase):
+    """Coverage for the DELTA_CONCURRENT_APPEND.WHOLE_TABLE_READ mitigation."""
+
+    def test_build_match_condition_appends_extra_predicates(self):
+        on_clause = _build_match_condition(
+            ["id"],
+            left_alias="T",
+            right_alias="S",
+            extra_predicates=["T.`dt` IN (SELECT DISTINCT `dt` FROM {src})"],
+        )
+        self.assertIn("T.`id` <=> S.`id`", on_clause)
+        self.assertIn(
+            "T.`dt` IN (SELECT DISTINCT `dt` FROM {src})",
+            on_clause,
+        )
+        self.assertTrue(on_clause.count(" AND ") == 1)
+
+    def test_build_match_condition_skips_falsy_extras(self):
+        on_clause = _build_match_condition(
+            ["id"],
+            left_alias="T",
+            right_alias="S",
+            extra_predicates=["", None, "T.`dt` IS NOT NULL"],  # type: ignore[list-item]
+        )
+        self.assertEqual(
+            on_clause, "T.`id` <=> S.`id` AND T.`dt` IS NOT NULL"
+        )
+
+    def test_narrowing_predicates_via_subquery_produces_in_clause(self):
+        predicates = _narrowing_predicates_via_subquery(
+            ["dt", "region"],
+            target_alias="T",
+            source_expr="{src}",
+        )
+        self.assertEqual(
+            predicates,
+            [
+                "T.`dt` IN (SELECT DISTINCT `dt` FROM {src})",
+                "T.`region` IN (SELECT DISTINCT `region` FROM {src})",
+            ],
+        )
+
+    def test_delta_partition_columns_reads_from_table_info(self):
+        class _Col:
+            def __init__(self, name, idx=None):
+                self.name = name
+                self.partition_index = idx
+
+        class _Info:
+            columns = [
+                _Col("id", None),
+                _Col("dt", 0),
+                _Col("region", 1),
+                _Col("value", None),
+            ]
+
+        class _Table:
+            infos = _Info()
+
+            def full_name(self, safe=False):
+                return "c.s.t"
+
+        self.assertEqual(_delta_partition_columns(_Table()), ["dt", "region"])
+
+    def test_delta_cluster_columns_parses_tbl_properties_json(self):
+        class _Info:
+            properties = {
+                "clusteringColumns": '[["dt"], ["region"]]',
+                "other": "value",
+            }
+
+        class _Table:
+            infos = _Info()
+
+            def full_name(self, safe=False):
+                return "c.s.t"
+
+        self.assertEqual(_delta_cluster_columns(_Table()), ["dt", "region"])
+
+    def test_delta_cluster_columns_handles_missing_or_bad_props(self):
+        class _Info:
+            properties = {"clusteringColumns": "not-json"}
+
+        class _Table:
+            infos = _Info()
+
+            def full_name(self, safe=False):
+                return "c.s.t"
+
+        self.assertEqual(_delta_cluster_columns(_Table()), [])
+
+    def test_narrow_target_columns_skips_match_keys_and_dedupes(self):
+        class _Col:
+            def __init__(self, name, idx=None):
+                self.name = name
+                self.partition_index = idx
+
+        class _Info:
+            columns = [_Col("id"), _Col("dt", 0), _Col("region", 1)]
+            properties = {"clusteringColumns": '[["dt"], ["bucket"]]'}
+
+        class _Table:
+            infos = _Info()
+
+            def full_name(self, safe=False):
+                return "c.s.t"
+
+        cols = _narrow_target_columns(_Table(), match_by=["id", "region"])
+        # Partitions first (minus ``region`` which is a match key),
+        # then cluster columns (``dt`` deduped, ``bucket`` kept).
+        self.assertEqual(cols, ["dt", "bucket"])
+
+    def test_is_concurrent_append_matches_delta_error_text(self):
+        class _Err(Exception):
+            def __init__(self, msg):
+                super().__init__(msg)
+                self.error_code = "INTERNAL_ERROR"
+                self.message = msg
+
+        exc = _Err(
+            "[DELTA_CONCURRENT_APPEND.WHOLE_TABLE_READ] Transaction conflict"
+        )
+        self.assertTrue(_is_concurrent_append(exc))
+
+        self.assertFalse(
+            _is_concurrent_append(RuntimeError("something totally unrelated"))
+        )
+
+        class _SparkLike(Exception):
+            pass
+
+        _SparkLike.__name__ = "ConcurrentAppendException"
+        self.assertTrue(_is_concurrent_append(_SparkLike("boom")))
+
+    def test_retry_concurrent_append_retries_then_succeeds(self):
+        class _Err(Exception):
+            error_code = "CONCURRENT_DELTA_TABLE_WRITE"
+            message = "DELTA_CONCURRENT_APPEND"
+
+        calls = {"n": 0}
+
+        def _op() -> str:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise _Err("DELTA_CONCURRENT_APPEND transient")
+            return "ok"
+
+        from unittest.mock import patch
+
+        with patch("yggdrasil.databricks.sql.engine.time.sleep"):
+            out = _retry_concurrent_append(_op, attempts=5, base_delay=0.0)
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(calls["n"], 3)
+
+    def test_retry_concurrent_append_propagates_other_errors(self):
+        def _op() -> None:
+            raise ValueError("boom")
+
+        with self.assertRaises(ValueError):
+            _retry_concurrent_append(_op, attempts=3, base_delay=0.0)
+
+    def test_retry_concurrent_append_reraises_after_last_attempt(self):
+        class _Err(Exception):
+            error_code = "DELTA_CONCURRENT_APPEND"
+            message = "DELTA_CONCURRENT_APPEND keeps losing"
+
+        def _op() -> None:
+            raise _Err("DELTA_CONCURRENT_APPEND keeps losing")
+
+        from unittest.mock import patch
+
+        with patch("yggdrasil.databricks.sql.engine.time.sleep"):
+            with self.assertRaises(_Err):
+                _retry_concurrent_append(_op, attempts=2, base_delay=0.0)
 
 
 class TestStagingParquetRef(unittest.TestCase):
