@@ -3,14 +3,23 @@
 pyarrow ships without a bundled IANA timezone database. On Windows it looks
 at ``%PYARROW_TZDATA_PATH%`` (or ``%USERPROFILE%\\Downloads\\tzdata`` if
 unset) and fails with ``ArrowInvalid: Unable to get Timezone database
-version`` when that directory is missing, empty, or stale. This module
-repairs that state at import time and exposes a manual re-run entry point.
+version`` when that directory is missing, empty, or stale.
+
+pyarrow's own ``pyarrow.util.download_tzdata_on_windows()`` has no retry,
+no timeout, and no meaningful error — it silently leaves the target
+directory in an unusable state when a corporate proxy blocks the IANA
+download. This module repairs that state: it probes with
+``pyarrow.compute.assume_timezone`` (the call that actually hits the tz
+database), cleans up partial installs, runs pyarrow's downloader, and
+falls back to a manual stdlib download with retries if that fails.
 """
 from __future__ import annotations
 
 import logging
 import os
 import shutil
+import tarfile
+import time
 from pathlib import Path
 
 from .lib import pyarrow
@@ -19,6 +28,12 @@ __all__ = ["ensure_tzdata"]
 
 _log = logging.getLogger("yggdrasil")
 _ENSURED: bool | None = None
+
+_TZDATA_URL = "https://data.iana.org/time-zones/tzdata-latest.tar.gz"
+_WINDOWS_ZONES_URL = (
+    "https://raw.githubusercontent.com/unicode-org/cldr/master/"
+    "common/supplemental/windowsZones.xml"
+)
 
 
 def _default_tzdata_path() -> Path:
@@ -54,6 +69,56 @@ def _looks_partial(path: Path) -> bool:
     return path.is_dir() and not (path / "version").is_file()
 
 
+def _urlretrieve(url: str, out_path: Path, *, timeout: float, attempts: int) -> None:
+    """Download ``url`` to ``out_path`` via stdlib urllib.
+
+    Retries with exponential backoff on any exception. Honors standard
+    proxy env vars (``HTTPS_PROXY``, ``HTTP_PROXY``) — urllib picks them
+    up automatically. A User-Agent is set because some corporate
+    proxies block the default python-urllib agent.
+    """
+    from urllib.request import Request, urlopen
+
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            req = Request(url, headers={"User-Agent": "yggdrasil-tzdata"})
+            with urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            if len(data) < 1024:
+                raise IOError(
+                    f"Downloaded only {len(data)} bytes from {url}; "
+                    f"expected a real payload"
+                )
+            out_path.write_bytes(data)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(2 ** (attempt - 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _manual_download(path: Path) -> None:
+    """Populate ``path`` with tzdata via a direct stdlib download.
+
+    Used as a fallback when ``pyarrow.util.download_tzdata_on_windows``
+    raises or leaves the directory unusable. Structure matches what
+    pyarrow's own helper produces: ``tzdata.tar.gz`` plus
+    ``windowsZones.xml`` at the root, with the tarball extracted in place.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    tarball = path / "tzdata.tar.gz"
+    windows_zones = path / "windowsZones.xml"
+
+    _urlretrieve(_TZDATA_URL, tarball, timeout=30, attempts=3)
+    _urlretrieve(_WINDOWS_ZONES_URL, windows_zones, timeout=30, attempts=3)
+
+    with tarfile.open(tarball) as tf:
+        tf.extractall(path)
+
+
 def _install_tzdata_package() -> bool:
     """Best-effort install of the ``tzdata`` PyPI package.
 
@@ -74,14 +139,33 @@ def _install_tzdata_package() -> bool:
         return False
 
 
-def ensure_tzdata(*, force: bool = False) -> bool:
+def _manual_instructions(path: Path) -> str:
+    return (
+        f"pyarrow cannot read an IANA tzdata database at {path}. "
+        f"To fix manually: download {_TZDATA_URL} and extract it to that "
+        f"directory, and also drop {_WINDOWS_ZONES_URL} as "
+        f"'windowsZones.xml' alongside the extracted files. "
+        f"Alternatively set PYARROW_TZDATA_PATH to a directory that already "
+        f"contains a valid tzdata source tree."
+    )
+
+
+def ensure_tzdata(*, force: bool = False, raise_on_failure: bool = False) -> bool:
     """Make pyarrow's tzdata lookup succeed on Windows.
 
-    Returns ``True`` when a timezone-aware timestamp cast works at the end of
-    the call, ``False`` otherwise. No-op (returns ``True``) on non-Windows
-    platforms and on repeat calls once a positive result has been cached.
+    Returns ``True`` when a timezone-aware timestamp operation works at the
+    end of the call, ``False`` otherwise. No-op (returns ``True``) on
+    non-Windows platforms and on repeat calls once a positive result has
+    been cached.
 
-    Set ``force=True`` to bypass the cache and rerun the probe + repair.
+    Parameters
+    ----------
+    force:
+        Bypass the cached positive result and rerun the probe + repair.
+    raise_on_failure:
+        Raise ``RuntimeError`` with manual-fix instructions when the final
+        canary still fails. Useful at the top of scripts/tests that depend
+        on timezone support.
     """
     global _ENSURED
 
@@ -100,24 +184,40 @@ def ensure_tzdata(*, force: bool = False) -> bool:
 
     if _looks_partial(path):
         _log.warning(
-            "Removing partial tzdata directory at %s (no 'version' file). "
-            "pyarrow will re-download.",
+            "Removing partial tzdata directory at %s (no 'version' file).",
             path,
         )
         shutil.rmtree(path, ignore_errors=True)
 
+    primary_exc: BaseException | None = None
     try:
         pyarrow.util.download_tzdata_on_windows()
     except Exception as exc:
+        primary_exc = exc
         _log.warning(
             "pyarrow.util.download_tzdata_on_windows() failed: %s. "
-            "Timezone-aware operations may raise ArrowInvalid. "
-            "Set PYARROW_TZDATA_PATH to a populated IANA tzdata directory, "
-            "or run pyarrow.util.download_tzdata_on_windows() manually.",
+            "Falling back to manual download.",
             exc,
+        )
+
+    if _canary():
+        _ENSURED = True
+        return True
+
+    if _looks_partial(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+    try:
+        _manual_download(path)
+    except Exception as exc:
+        _log.warning(
+            "Manual tzdata download failed: %s (primary error: %s). %s",
+            exc, primary_exc, _manual_instructions(path),
         )
         _install_tzdata_package()
         _ENSURED = False
+        if raise_on_failure:
+            raise RuntimeError(_manual_instructions(path)) from exc
         return False
 
     if _canary():
@@ -125,11 +225,11 @@ def ensure_tzdata(*, force: bool = False) -> bool:
         return True
 
     _log.warning(
-        "pyarrow tzdata download completed but the canary cast still fails. "
-        "Inspected path: %s. Set PYARROW_TZDATA_PATH to a valid IANA tzdata "
-        "directory, or reinstall pyarrow.",
-        path,
+        "tzdata files are present at %s but pyarrow's canary still fails. %s",
+        path, _manual_instructions(path),
     )
     _install_tzdata_package()
     _ENSURED = False
+    if raise_on_failure:
+        raise RuntimeError(_manual_instructions(path))
     return False
