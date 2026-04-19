@@ -80,5 +80,36 @@ class TestStagingPathFromVolume(unittest.TestCase):
         self.assertTrue(staging.owned)
 
 
+class TestStageTemporaryTablesOwnedHandoff(unittest.TestCase):
+    """``_stage_temporary_tables`` respects the ``owned`` flag on StagingPaths."""
+
+    def _make_engine(self):
+        from yggdrasil.databricks.sql.engine import SQLEngine
+        # Bind the real method onto a lightweight object; we don't need a
+        # live Databricks client because the test never stages raw data.
+        engine = object.__new__(SQLEngine)
+        object.__setattr__(engine, "catalog_name", None)
+        object.__setattr__(engine, "schema_name", None)
+        return engine
+
+    def test_owned_staging_is_returned_for_cleanup(self):
+        engine = self._make_engine()
+        path = _fake_volume_path()
+        staging = StagingPath.from_volume(path, owned=True)
+
+        substitutions, owned = engine._stage_temporary_tables({"src": staging})
+        self.assertIn("src", substitutions)
+        self.assertEqual(owned, [staging])
+
+    def test_non_owned_staging_is_substituted_only(self):
+        engine = self._make_engine()
+        path = _fake_volume_path()
+        staging = StagingPath.from_volume(path, owned=False)
+
+        substitutions, owned = engine._stage_temporary_tables({"src": staging})
+        self.assertIn("src", substitutions)
+        self.assertEqual(owned, [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

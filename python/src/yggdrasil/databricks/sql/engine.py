@@ -376,18 +376,21 @@ class SQLEngine(DatabricksService):
 
         For each entry:
 
-        - If the value is already a :class:`StagingPath`, it is reused directly
-          and its path is substituted into the SQL. The engine does not take
-          ownership of pre-existing paths.
+        - If the value is already a :class:`StagingPath`, its path is
+          substituted into the SQL.  When the staging path reports
+          ``owned=True`` it is also returned for cleanup handoff (caller
+          explicitly asked the engine to manage it); ``owned=False`` paths
+          are used read-only and never cleaned up.
         - Otherwise the value is treated as tabular data, written to a fresh
           :class:`StagingPath` as Parquet, and the engine takes ownership of
           the new staging path so it can be cleaned up lazily when the
-          resulting :class:`PreparedStatement` is done.
+          resulting :class:`StatementResult` is done.
 
         Returns:
             A tuple ``(substitutions, owned_paths)`` where ``substitutions``
             maps each alias to the ``parquet.`<path>``` SQL source clause and
-            ``owned_paths`` lists every staging path the engine created.
+            ``owned_paths`` lists every staging path the engine is responsible
+            for cleaning up.
         """
         if not temporary_tables:
             return {}, []
@@ -401,6 +404,8 @@ class SQLEngine(DatabricksService):
         for alias, value in temporary_tables.items():
             if isinstance(value, StagingPath):
                 substitutions[alias] = _staging_parquet_ref(value)
+                if value.owned:
+                    owned.append(value)
                 continue
 
             if not effective_catalog or not effective_schema:
@@ -1192,24 +1197,25 @@ class SQLEngine(DatabricksService):
                 temp_volume_path, client=self.client, owned=False,
             )
         staging.write_table(data, cast_options=cast_options)
-        temp_volume_path = staging.path
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
 
         statements: list[str] = []
 
+        # SQL uses the ``{src}`` alias — ``execute_many`` substitutes it
+        # with ``parquet.`<staging path>``` via the temporary_tables kwarg,
+        # and hands the owned staging off to result-lifecycle cleanup.
+        source_sql = f"SELECT {cols_quoted} FROM {{src}}"
+
         if mode == SaveMode.TRUNCATE:
-            source_sql = (
-                f"SELECT {cols_quoted} "
-                f"FROM parquet.{quote_ident(str(temp_volume_path))}"
+            insert_sql = (
+                f"INSERT INTO {location} ({cols_quoted})\n{source_sql}"
             )
-            insert_sql = f"""INSERT INTO {location} ({cols_quoted})
-{source_sql}""".strip()
 
             if match_by:
-                # Delete every existing row whose key appears in the incoming
-                # batch, then insert all rows from that batch.
+                # Delete every existing row whose key appears in the
+                # incoming batch, then insert all rows from that batch.
                 key_cols = ", ".join(quote_ident(k) for k in match_by)
                 on_condition = _build_match_condition(
                     match_by,
@@ -1217,12 +1223,13 @@ class SQLEngine(DatabricksService):
                     right_alias="S",
                     null_safe=True,
                 )
-                delete_sql = f"""DELETE FROM {location} AS T
-USING (
-SELECT DISTINCT {key_cols}
-FROM parquet.{quote_ident(str(temp_volume_path))}
-) AS S
-ON {on_condition}""".strip()
+                delete_sql = (
+                    f"DELETE FROM {location} AS T\n"
+                    f"USING (\n"
+                    f"SELECT DISTINCT {key_cols}\nFROM {{src}}\n"
+                    f") AS S\n"
+                    f"ON {on_condition}"
+                )
                 statements.extend([delete_sql, insert_sql])
             else:
                 # Wipe the table in-place (schema kept), then insert all rows.
@@ -1232,30 +1239,24 @@ ON {on_condition}""".strip()
                 ])
 
         elif match_by and mode != SaveMode.OVERWRITE:
-            source_sql = (
-                f"SELECT {cols_quoted} "
-                f"FROM parquet.{quote_ident(str(temp_volume_path))}"
-            )
             on_condition = _build_match_condition(
                 match_by,
                 left_alias="T",
                 right_alias="S",
                 null_safe=True,
             )
+            insert_clause = (
+                f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+                f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+            )
 
             if mode == SaveMode.APPEND:
-                insert_clause = (
-                    f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                    f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+                merge_sql = (
+                    f"MERGE INTO {location} AS T\n"
+                    f"USING (\n{source_sql}\n) AS S\n"
+                    f"ON {on_condition}\n"
+                    f"{insert_clause}"
                 )
-
-                merge_sql = f"""MERGE INTO {location} AS T
-USING (
-{source_sql}
-) AS S
-ON {on_condition}
-{insert_clause}""".strip()
-
                 statements.append(merge_sql)
             else:
                 update_cols_effective = (
@@ -1271,25 +1272,18 @@ ON {on_condition}
                     )
                     update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}"
 
-                insert_clause = (
-                    f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-                    f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+                merge_sql = (
+                    f"MERGE INTO {location} AS T\n"
+                    f"USING (\n{source_sql}\n) AS S\n"
+                    f"ON {on_condition}\n"
+                    f"{update_clause}\n"
+                    f"{insert_clause}"
                 )
-
-                merge_sql = f"""MERGE INTO {location} AS T
-USING (
-{source_sql}
-) AS S
-ON {on_condition}
-{update_clause}
-{insert_clause}""".strip()
-
                 statements.append(merge_sql)
         else:
-            insert_sql = f"""INSERT INTO {location} ({cols_quoted})
-SELECT {cols_quoted}
-FROM parquet.{quote_ident(str(temp_volume_path))}"""
-            statements.append(insert_sql)
+            statements.append(
+                f"INSERT INTO {location} ({cols_quoted})\n{source_sql}"
+            )
 
         # Chain DML + post-write maintenance in a single sequential batch so
         # the wait-all-but-last logic covers every step.  Only the final
@@ -1302,12 +1296,18 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         if vacuum_hours is not None:
             statements.append(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
 
-        try:
-            if statements:
-                self.execute_many(statements, wait=wait, raise_error=raise_error)
-        finally:
-            if wait:
-                staging.cleanup(allow_not_found=True, unregister=True)
+        # ``temporary_tables`` carries the staging into ``execute_many`` —
+        # if ``staging.owned`` is True the engine will attach it to every
+        # resulting :class:`StatementResult` so cleanup fires lazily when
+        # each one reaches a terminal state.  ``owned=False`` staging paths
+        # supplied by the caller are substituted but never deleted.
+        if statements:
+            self.execute_many(
+                statements,
+                wait=wait,
+                raise_error=raise_error,
+                temporary_tables={"src": staging},
+            )
 
         logger.info("Arrow inserted into %s", location)
         return None
