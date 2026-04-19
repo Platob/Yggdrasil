@@ -486,6 +486,7 @@ BASE_SCHEMA["response_received_at"] = schema_field(
         "entity": "response",
         "group": "timing",
         "cluster_by": True,
+        "primary_key": True,
     },
 )
 
