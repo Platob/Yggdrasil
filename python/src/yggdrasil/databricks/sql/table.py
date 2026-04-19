@@ -741,11 +741,34 @@ class Table(GrantsMixin):
         *,
         mode: SaveMode | str | None = None,
     ):
+        """Evolve this table's schema to match *columns*.
+
+        Matching is case-insensitive: an input field whose name differs only
+        in case from an existing column is treated as the same column and
+        renamed to the supplied casing.
+
+        Mode semantics
+        --------------
+        ``UPSERT`` (and ``AUTO``)
+            Rename case-insensitive matches, add new columns, update the data
+            type of existing columns whose dtype no longer matches the input.
+        ``OVERWRITE``
+            Everything ``UPSERT`` does, plus drop columns that do not appear
+            in *columns* so the resulting schema matches the input exactly.
+        Any other mode
+            Only adds new columns and renames case-insensitive matches, so
+            the call remains non-destructive.
+        """
         mode = SaveMode.parse(mode, SaveMode.AUTO)
-        statements: list[str] = []
+        alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
+        update_dtype = mode in (SaveMode.UPSERT, SaveMode.AUTO, SaveMode.OVERWRITE)
+        drop_missing = mode == SaveMode.OVERWRITE
+
+        rename_statements: list[str] = []
+        type_statements: list[str] = []
         add_columns: list[str] = []
         pending_fks: list[ForeignKeySpec] = []
-        alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
+        matched_existing: set[str] = set()
 
         for column in columns:
             data_field = Field.from_any(column)
@@ -759,28 +782,82 @@ class Table(GrantsMixin):
                 )
                 if fk is not None:
                     pending_fks.append(fk)
-            elif mode in (SaveMode.UPSERT, SaveMode.AUTO, SaveMode.OVERWRITE):
-                if existing.name != data_field.name:
-                    statements.append(
-                        f"{alter_table} RENAME COLUMN `{existing.name}` TO `{data_field.name}`"
+                continue
+
+            matched_existing.add(existing.name)
+            current_name = existing.name
+
+            if existing.name != data_field.name:
+                rename_statements.append(
+                    f"{alter_table} RENAME COLUMN `{existing.name}` "
+                    f"TO `{data_field.name}`"
+                )
+                current_name = data_field.name
+
+            if update_dtype:
+                existing_ddl = existing.field.dtype.to_databricks_ddl()
+                new_ddl = data_field.dtype.to_databricks_ddl()
+                if existing_ddl != new_ddl:
+                    type_statements.append(
+                        f"{alter_table} ALTER COLUMN `{current_name}` "
+                        f"TYPE {new_ddl}"
                     )
 
-        if add_columns:
-            statements.append(f"{alter_table} ADD COLUMNS ({', '.join(add_columns)})")
+        drop_names: list[str] = []
+        if drop_missing:
+            drop_names = [
+                col.name for col in self.columns
+                if col.name not in matched_existing
+            ]
 
-        for fk in pending_fks:
-            statements.append(
-                f"{alter_table} ADD "
-                + _build_fk_constraint_sql(
-                    self.table_name,
-                    fk,
-                    default_catalog=self.catalog_name,
-                    default_schema=self.schema_name,
-                )
+        add_col_statement: str | None = None
+        if add_columns:
+            add_col_statement = (
+                f"{alter_table} ADD COLUMNS ({', '.join(add_columns)})"
             )
 
-        if statements:
-            self.sql.execute_many(statements, parallel=True)
+        fk_statements = [
+            f"{alter_table} ADD "
+            + _build_fk_constraint_sql(
+                self.table_name,
+                fk,
+                default_catalog=self.catalog_name,
+                default_schema=self.schema_name,
+            )
+            for fk in pending_fks
+        ]
+
+        # Renames must complete before we reference the new names in ALTER
+        # COLUMN TYPE; split those into an earlier phase when both exist.
+        needs_phase_split = bool(rename_statements and type_statements)
+
+        first_phase: list[str] = []
+        second_phase: list[str] = []
+
+        if needs_phase_split:
+            first_phase.extend(rename_statements)
+        else:
+            second_phase.extend(rename_statements)
+
+        second_phase.extend(type_statements)
+        if drop_names:
+            second_phase.append(
+                f"{alter_table} DROP COLUMNS "
+                + "(" + ", ".join(f"`{n}`" for n in drop_names) + ")"
+            )
+        if add_col_statement is not None:
+            second_phase.append(add_col_statement)
+        second_phase.extend(fk_statements)
+
+        executed = False
+        if first_phase:
+            self.sql.execute_many(first_phase, parallel=True)
+            executed = True
+        if second_phase:
+            self.sql.execute_many(second_phase, parallel=True)
+            executed = True
+
+        if executed:
             self._reset_cache(invalidate_cache=True)
 
         return self

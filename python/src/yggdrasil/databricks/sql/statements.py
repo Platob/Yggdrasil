@@ -98,7 +98,7 @@ class Statements(DatabricksService):
         text: "str | PreparedStatement | StatementResult" = "",
         *,
         parameters: Optional[dict] = None,
-        temporary_tables: Optional[dict] = None,
+        external_tables: Optional[dict] = None,
         statement_id: str | None = None,
         warehouse_id: str | None = None,
     ) -> "StatementResult":
@@ -109,7 +109,7 @@ class Statements(DatabricksService):
             prepared = StatementResult.prepare(
                 text,
                 parameters=parameters,
-                temporary_tables=temporary_tables,
+                external_tables=external_tables,
             )
             object.__setattr__(prepared, "service", self)
             if statement_id is not None:
@@ -121,7 +121,7 @@ class Statements(DatabricksService):
         cfg = PreparedStatement.prepare(
             text,
             parameters=parameters,
-            temporary_tables=temporary_tables,
+            external_tables=external_tables,
         )
         return StatementResult(
             statement=cfg,

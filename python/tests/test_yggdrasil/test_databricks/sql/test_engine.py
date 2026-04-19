@@ -9,7 +9,7 @@ from yggdrasil.data.statement import StatementResult as BaseStatementResult
 from yggdrasil.data import Schema
 from yggdrasil.databricks.sql import SQLEngine
 from yggdrasil.databricks.sql.engine import (
-    _apply_temporary_table_aliases,
+    _apply_external_table_aliases,
     _staging_parquet_ref,
 )
 from yggdrasil.databricks.sql.exceptions import SQLError
@@ -24,16 +24,16 @@ integration = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 
-class TestTemporaryTableAliasing(unittest.TestCase):
+class TestExternalTableAliasing(unittest.TestCase):
     """Pure-function coverage for the alias substitution helpers."""
 
     def test_no_substitutions_returns_statement_unchanged(self):
         stmt = "SELECT * FROM t"
-        self.assertIs(_apply_temporary_table_aliases(stmt, {}), stmt)
+        self.assertIs(_apply_external_table_aliases(stmt, {}), stmt)
 
     def test_replaces_multiple_aliases(self):
         stmt = "SELECT * FROM {left} JOIN {right} ON {left}.id = {right}.id"
-        out = _apply_temporary_table_aliases(
+        out = _apply_external_table_aliases(
             stmt,
             {"left": "parquet.`/a.parquet`", "right": "parquet.`/b.parquet`"},
         )
@@ -44,7 +44,7 @@ class TestTemporaryTableAliasing(unittest.TestCase):
 
     def test_missing_alias_leaves_placeholder_intact(self):
         stmt = "SELECT * FROM {foo} WHERE {bar} > 1"
-        out = _apply_temporary_table_aliases(stmt, {"foo": "X"})
+        out = _apply_external_table_aliases(stmt, {"foo": "X"})
         self.assertEqual(out, "SELECT * FROM X WHERE {bar} > 1")
 
 
@@ -144,33 +144,33 @@ class TestSqlInsertIntoSmartDispatch(unittest.TestCase):
         self.assertIs(kwargs["data"], df)
 
 
-class TestTemporaryTableCleanup(unittest.TestCase):
-    """Behavior of ``attach_temporary_tables`` / lazy cleanup on base result."""
+class TestExternalTableCleanup(unittest.TestCase):
+    """Behavior of ``attach_external_tables`` / lazy cleanup on base result."""
 
     def test_cleanup_skipped_while_not_done(self):
         result = _FakeStatement()
         resource = _FakeCleanupResource()
-        result.attach_temporary_tables([resource])
+        result.attach_external_tables([resource])
 
-        result._maybe_cleanup_temporary_tables()
+        result._maybe_cleanup_external_tables()
         self.assertEqual(resource.calls, [])
-        self.assertFalse(result._temporary_tables_cleaned)
+        self.assertFalse(result._external_tables_cleaned)
 
     def test_cleanup_runs_once_when_done(self):
         resource_a = _FakeCleanupResource()
         resource_b = _FakeCleanupResource()
         result = _FakeStatement()
-        result.attach_temporary_tables([resource_a, resource_b])
+        result.attach_external_tables([resource_a, resource_b])
 
         object.__setattr__(result, "_fake_done", True)
 
-        result._maybe_cleanup_temporary_tables()
-        result._maybe_cleanup_temporary_tables()
+        result._maybe_cleanup_external_tables()
+        result._maybe_cleanup_external_tables()
 
         self.assertEqual(resource_a.calls, [True])
         self.assertEqual(resource_b.calls, [True])
-        self.assertTrue(result._temporary_tables_cleaned)
-        self.assertEqual(result._temporary_tables, ())
+        self.assertTrue(result._external_tables_cleaned)
+        self.assertEqual(result._external_tables, ())
 
     def test_cleanup_swallows_per_resource_errors(self):
         class Broken:
@@ -179,18 +179,18 @@ class TestTemporaryTableCleanup(unittest.TestCase):
 
         ok = _FakeCleanupResource()
         result = _FakeStatement()
-        result.attach_temporary_tables([Broken(), ok])
+        result.attach_external_tables([Broken(), ok])
         object.__setattr__(result, "_fake_done", True)
 
-        result._maybe_cleanup_temporary_tables()
+        result._maybe_cleanup_external_tables()
 
         self.assertEqual(ok.calls, [True])
-        self.assertTrue(result._temporary_tables_cleaned)
+        self.assertTrue(result._external_tables_cleaned)
 
     def test_wait_triggers_cleanup(self):
         result = _FakeStatement()
         resource = _FakeCleanupResource()
-        result.attach_temporary_tables([resource])
+        result.attach_external_tables([resource])
         object.__setattr__(result, "_fake_done", True)
 
         result.wait(wait=False)
@@ -199,9 +199,9 @@ class TestTemporaryTableCleanup(unittest.TestCase):
 
     def test_attach_no_tables_is_noop(self):
         result = _FakeStatement()
-        result.attach_temporary_tables([])
-        self.assertEqual(result._temporary_tables, ())
-        self.assertFalse(result._temporary_tables_cleaned)
+        result.attach_external_tables([])
+        self.assertEqual(result._external_tables, ())
+        self.assertFalse(result._external_tables_cleaned)
 
 
 class TestStagingParquetRef(unittest.TestCase):
@@ -346,8 +346,8 @@ class TestSQLEngine(DatabricksCase):
 
 @requires_databricks
 @integration
-class TestSQLEngineTemporaryTables(DatabricksCase):
-    """Temporary-table staging through ``execute`` and ``execute_many``."""
+class TestSQLEngineExternalTables(DatabricksCase):
+    """External-table staging through ``execute`` and ``execute_many``."""
 
     engine: SQLEngine
 
@@ -379,7 +379,7 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
 
         result = self.engine.execute(
             "SELECT id, name FROM {src} ORDER BY id",
-            temporary_tables={"src": data},
+            external_tables={"src": data},
             engine="api",
         )
 
@@ -389,8 +389,8 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
 
         # Staging is owned by the engine and cleaned up once the result is done.
         self.assertTrue(result.done)
-        self.assertTrue(result._temporary_tables_cleaned)
-        self.assertEqual(result._temporary_tables, ())
+        self.assertTrue(result._external_tables_cleaned)
+        self.assertEqual(result._external_tables, ())
 
     def test_execute_accepts_prebuilt_staging_path(self):
         data = self._make_left()
@@ -407,21 +407,21 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
         try:
             result = self.engine.execute(
                 "SELECT COUNT(*) AS n FROM {src}",
-                temporary_tables={"src": staging},
+                external_tables={"src": staging},
                 engine="api",
             )
             row = result.to_arrow_table().to_pylist()[0]
             self.assertEqual(row["n"], data.num_rows)
 
             # User-owned StagingPaths are not attached for cleanup.
-            self.assertEqual(result._temporary_tables, ())
+            self.assertEqual(result._external_tables, ())
 
             # The staging file is still present because the engine did not own it.
             self.assertTrue(staging.path.exists())
         finally:
             staging.cleanup(allow_not_found=True)
 
-    def test_execute_many_shares_temporary_tables(self):
+    def test_execute_many_shares_external_tables(self):
         left = self._make_left()
         right = self._make_right()
 
@@ -434,7 +434,7 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
                     "ORDER BY l.id"
                 ),
             ],
-            temporary_tables={"left": left, "right": right},
+            external_tables={"left": left, "right": right},
             engine="api",
         )
 
@@ -447,7 +447,7 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
 
         # Staging is cleaned up after the batch resolves.
         for result in batch.results.values():
-            self.assertTrue(result._temporary_tables_cleaned)
+            self.assertTrue(result._external_tables_cleaned)
 
     def test_execute_many_parallel_cleans_up(self):
         left = self._make_left()
@@ -457,7 +457,7 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
                 "q1": "SELECT COUNT(*) AS n FROM {src}",
                 "q2": "SELECT MAX(id) AS m FROM {src}",
             },
-            temporary_tables={"src": left},
+            external_tables={"src": left},
             parallel=True,
             engine="api",
         )
@@ -466,14 +466,14 @@ class TestSQLEngineTemporaryTables(DatabricksCase):
         self.assertEqual(batch["q2"].to_arrow_table().to_pylist()[0]["m"], 3)
 
         for result in batch.results.values():
-            self.assertTrue(result._temporary_tables_cleaned)
+            self.assertTrue(result._external_tables_cleaned)
 
-    def test_temporary_tables_requires_catalog_and_schema(self):
+    def test_external_tables_requires_catalog_and_schema(self):
         bare_engine = self.workspace.sql()  # no catalog/schema bound
 
         with self.assertRaises(ValueError):
             bare_engine.execute(
                 "SELECT * FROM {src}",
-                temporary_tables={"src": self._make_left()},
+                external_tables={"src": self._make_left()},
                 engine="api",
             )

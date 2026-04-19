@@ -61,7 +61,7 @@ class StatementResult(BaseStatementResult, DatabricksResource):
 
     Wraps a :class:`PreparedStatement` configuration together with the per-execution
     state (``warehouse_id``, ``statement_id``, cached ``StatementResponse``)
-    that Databricks needs.  All config — text, parameters, temporary tables —
+    that Databricks needs.  All config — text, parameters, external tables —
     lives on ``self.statement``.
     """
 
@@ -91,23 +91,23 @@ class StatementResult(BaseStatementResult, DatabricksResource):
         statement: "StatementResult | PreparedStatement | str",
         *,
         parameters=None,
-        temporary_tables=None,
+        external_tables=None,
     ) -> "StatementResult":
         """Coerce ``statement`` into a :class:`StatementResult`.
 
         - Existing ``StatementResult`` instances are reused; extra ``parameters``
-          / ``temporary_tables`` are merged into their inner
+          / ``external_tables`` are merged into their inner
           :class:`PreparedStatement` config.
         - Plain :class:`PreparedStatement` configs are wrapped in an unstarted
           :class:`StatementResult`.
         - Strings are coerced via :meth:`PreparedStatement.prepare`.
         """
         if isinstance(statement, cls):
-            if parameters or temporary_tables:
+            if parameters or external_tables:
                 merged = PreparedStatement.prepare(
                     statement.statement,
                     parameters=parameters,
-                    temporary_tables=temporary_tables,
+                    external_tables=external_tables,
                 )
                 return replace(statement, statement=merged)
             return statement
@@ -115,7 +115,7 @@ class StatementResult(BaseStatementResult, DatabricksResource):
         cfg = PreparedStatement.prepare(
             statement,
             parameters=parameters,
-            temporary_tables=temporary_tables,
+            external_tables=external_tables,
         )
         return cls(statement=cfg)
 
@@ -125,13 +125,13 @@ class StatementResult(BaseStatementResult, DatabricksResource):
             return self
         return replace(self, statement=self.statement.bind(**parameters))
 
-    def with_temporary_tables(self, **tables) -> "StatementResult":
-        """Return a copy with additional temporary-table aliases on the config."""
+    def with_external_tables(self, **tables) -> "StatementResult":
+        """Return a copy with additional external-table aliases on the config."""
         if not tables:
             return self
         return replace(
             self,
-            statement=self.statement.with_temporary_tables(**tables),
+            statement=self.statement.with_external_tables(**tables),
         )
 
     def with_text(self, text: str) -> "StatementResult":
