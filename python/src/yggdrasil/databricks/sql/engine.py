@@ -562,33 +562,44 @@ class SQLEngine(DatabricksService):
                 for key, cfg in items.items()
             )
 
-        def _runner(result: StatementResult) -> StatementResult:
-            # Non-blocking submit; the batch manages per-statement waiting.
-            return self.execute(
-                result,
-                row_limit=row_limit,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                wait=False,
-                raise_error=raise_error,
-                engine=engine,
-                warehouse_id=warehouse_id,
-                warehouse_name=warehouse_name,
-                byte_limit=byte_limit,
-                cache_for=cache_for,
-                spark_session=spark_session,
-            )
-
         batch = StatementBatch.from_statements(
             items,
             factory=lambda cfg: StatementResult(statement=cfg),
+            engine=self,
         )
+
+        # Build a runner only when the caller overrode one of the engine's
+        # per-call defaults.  Otherwise the batch's default runner
+        # (``engine.execute(result, wait=False)``) already does the right
+        # thing and we avoid the closure.
+        overrides = {
+            name: value
+            for name, value in (
+                ("row_limit", row_limit),
+                ("catalog_name", catalog_name),
+                ("schema_name", schema_name),
+                ("engine", engine),
+                ("warehouse_id", warehouse_id),
+                ("warehouse_name", warehouse_name),
+                ("byte_limit", byte_limit),
+                ("cache_for", cache_for),
+                ("spark_session", spark_session),
+            )
+            if value is not None
+        }
+        runner = None
+        if overrides:
+            def runner(result: StatementResult) -> StatementResult:
+                return self.execute(
+                    result, wait=False, raise_error=raise_error, **overrides,
+                )
+
         try:
             batch.start(
                 parallel=parallel,
                 wait=wait,
                 raise_error=raise_error,
-                runner=_runner,
+                runner=runner,
             )
         except Exception:
             batch.cancel()

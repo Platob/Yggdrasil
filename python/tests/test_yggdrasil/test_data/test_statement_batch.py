@@ -260,6 +260,51 @@ class TestStatementBatchWaitNoPool(unittest.TestCase):
         batch.wait(wait=False)
 
 
+class TestStatementBatchEngineDefaultRunner(unittest.TestCase):
+    """When ``engine`` is bound to the batch, ``start`` uses ``engine.execute``."""
+
+    def test_engine_is_used_as_default_runner(self):
+        stmts = [_StubStatement(name=f"s{i}") for i in range(3)]
+
+        class _FakeEngine:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, result, *, wait, raise_error, **kw):
+                self.calls.append((result, wait, raise_error, kw))
+                result._started = True
+                result._finished = True
+                return result
+
+        engine = _FakeEngine()
+        batch = StatementBatch.from_results(stmts, engine=engine)
+        batch.start(parallel=False)
+
+        self.assertEqual(len(engine.calls), 3)
+        for result, wait, raise_error, kw in engine.calls:
+            self.assertFalse(wait)
+            self.assertTrue(raise_error)
+            self.assertEqual(kw, {})
+
+    def test_explicit_runner_overrides_engine_default(self):
+        stmts = [_StubStatement(name="only")]
+
+        class _FakeEngine:
+            def execute(self, *a, **kw):  # pragma: no cover - should not run
+                raise AssertionError("engine.execute should be bypassed")
+
+        seen = []
+
+        def custom(result):
+            seen.append(result)
+            result._started = True
+            result._finished = True
+
+        batch = StatementBatch.from_results(stmts, engine=_FakeEngine())
+        batch.start(parallel=False, runner=custom)
+        self.assertEqual(seen, stmts)
+
+
 class TestFromStatements(unittest.TestCase):
     def test_from_statements_builds_results_via_factory(self):
         configs = [
