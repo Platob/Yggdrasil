@@ -7,11 +7,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .base import ISOType
+from .base import ISOType, apply_arrow_lookup
 from .data import COUNTRIES, COUNTRY_ALIASES
+from ..id import DataTypeId
 
 if TYPE_CHECKING:
     import polars
+    from ..base import DataType
+    from yggdrasil.data.cast.options import CastOptions
 
 __all__ = ["ISOCountryType"]
 
@@ -55,6 +58,14 @@ def _build_country_maps() -> tuple[dict[str, str], dict[str, str]]:
 _ALPHA2_MAP, _ALPHA3_MAP = _build_country_maps()
 _VALID_ALPHA2: frozenset[str] = frozenset(a2 for a2, *_ in COUNTRIES)
 _VALID_ALPHA3: frozenset[str] = frozenset(a3 for _, a3, *_ in COUNTRIES)
+
+# Canonical code → numeric ISO 3166-1 (as int).  Built once; used by the
+# outgoing-cast hook to convert country arrays to numeric / string targets
+# via pc.index_in + pc.take (no Python per-row loop).
+_ALPHA2_TO_NUMERIC: dict[str, int] = {a2: int(numeric) for a2, _, numeric, _ in COUNTRIES}
+_ALPHA3_TO_NUMERIC: dict[str, int] = {a3: int(numeric) for _, a3, numeric, _ in COUNTRIES}
+_ALPHA2_TO_ALPHA3: dict[str, str] = {a2: a3 for a2, a3, _, _ in COUNTRIES}
+_ALPHA3_TO_ALPHA2: dict[str, str] = {a3: a2 for a2, a3, _, _ in COUNTRIES}
 
 
 @dataclass(frozen=True)
@@ -130,6 +141,74 @@ class ISOCountryType(ISOType):
         _, keys, values = self._lookup_arrays_instance()
         indices = pc.index_in(normalized, value_set=keys)
         return pc.take(values, indices)
+
+    # ------------------------------------------------------------------
+    # Outgoing — country → numeric / string / other country-alpha.
+    # Vectorized via pc.index_in + pc.take; no per-row Python.
+    # ------------------------------------------------------------------
+    _outgoing_numeric_cache: ClassVar[dict[int, tuple[pa.Array, pa.Array]]] = {}
+    _outgoing_alpha_cache: ClassVar[dict[tuple[int, int], tuple[pa.Array, pa.Array]]] = {}
+
+    @classmethod
+    def _outgoing_numeric_arrays(cls, alpha: int) -> tuple[pa.Array, pa.Array]:
+        cached = cls._outgoing_numeric_cache.get(alpha)
+        if cached is not None:
+            return cached
+        mapping = _ALPHA3_TO_NUMERIC if alpha == 3 else _ALPHA2_TO_NUMERIC
+        keys = pa.array(list(mapping.keys()), type=pa.string())
+        values = pa.array(list(mapping.values()), type=pa.int32())
+        cached = (keys, values)
+        cls._outgoing_numeric_cache[alpha] = cached
+        return cached
+
+    @classmethod
+    def _outgoing_alpha_arrays(cls, src_alpha: int, dst_alpha: int) -> tuple[pa.Array, pa.Array]:
+        cached = cls._outgoing_alpha_cache.get((src_alpha, dst_alpha))
+        if cached is not None:
+            return cached
+        if src_alpha == 2 and dst_alpha == 3:
+            mapping = _ALPHA2_TO_ALPHA3
+        elif src_alpha == 3 and dst_alpha == 2:
+            mapping = _ALPHA3_TO_ALPHA2
+        else:
+            mapping = {k: k for k in (_VALID_ALPHA3 if src_alpha == 3 else _VALID_ALPHA2)}
+        keys = pa.array(list(mapping.keys()), type=pa.string())
+        values = pa.array(list(mapping.values()), type=pa.string())
+        cached = (keys, values)
+        cls._outgoing_alpha_cache[(src_alpha, dst_alpha)] = cached
+        return cached
+
+    def _outgoing_cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        target: "DataType",
+        options: "CastOptions",
+    ) -> pa.Array | pa.ChunkedArray | None:
+        target_id = target.type_id
+
+        # Country → numeric ISO 3166-1 code.
+        if target_id in {DataTypeId.INTEGER, DataTypeId.FLOAT, DataTypeId.DECIMAL}:
+            keys, values = self._outgoing_numeric_arrays(self.alpha)
+            return apply_arrow_lookup(
+                array,
+                keys,
+                values,
+                target.to_arrow(),
+                memory_pool=options.arrow_memory_pool,
+            )
+
+        # Country → another ISOCountryType with different alpha width.
+        if isinstance(target, ISOCountryType) and target.alpha != self.alpha:
+            keys, values = self._outgoing_alpha_arrays(self.alpha, target.alpha)
+            return apply_arrow_lookup(
+                array,
+                keys,
+                values,
+                target.to_arrow(),
+                memory_pool=options.arrow_memory_pool,
+            )
+
+        return None
 
     # ------------------------------------------------------------------
     # Polars lazy override — alpha-specific map.

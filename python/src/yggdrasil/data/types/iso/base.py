@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ISOType",
+    "apply_arrow_lookup",
     "normalize_iso_token",
     "normalize_iso_token_keep_hyphen",
     "resolve_arrow_string_via_unique",
@@ -82,6 +83,42 @@ def normalize_iso_token_keep_hyphen(value: Any) -> str | None:
     text = _NON_ALNUM_KEEP_HYPHEN_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
     return text or None
+
+
+def apply_arrow_lookup(
+    array: pa.Array | pa.ChunkedArray,
+    keys: pa.Array,
+    values: pa.Array,
+    target_arrow_type: pa.DataType,
+    memory_pool: pa.MemoryPool | None = None,
+) -> pa.Array | pa.ChunkedArray:
+    """Translate a string/categorical array to *values* via ``pc.index_in`` + ``pc.take``.
+
+    Normalizes the source to plain utf-8 when needed so the compute kernels
+    accept it, preserves the chunked layout, and casts the final result to
+    *target_arrow_type* (e.g. a smaller int width) in one shot.
+    """
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            apply_arrow_lookup(chunk, keys, values, target_arrow_type, memory_pool)
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(chunks, type=target_arrow_type)
+
+    src = array
+    if pa.types.is_large_string(src.type) or pa.types.is_string_view(src.type):
+        src = pc.cast(src, pa.string())
+    elif not pa.types.is_string(src.type):
+        # Non-string sources can happen if the ISO column is stored under a
+        # non-canonical Arrow dtype (e.g. dictionary-encoded).  Fall through
+        # to pc.cast which will raise if truly incompatible.
+        src = pc.cast(src, pa.string())
+
+    indices = pc.index_in(src, value_set=keys)
+    resolved = pc.take(values, indices, memory_pool=memory_pool)
+    if resolved.type != target_arrow_type:
+        resolved = pc.cast(resolved, target_arrow_type, memory_pool=memory_pool)
+    return resolved
 
 
 def resolve_arrow_string_via_unique(
