@@ -14,7 +14,7 @@ from databricks.sdk.service.sql import (
 )
 
 from yggdrasil.databricks.client import DatabricksClient, DatabricksService
-from yggdrasil.databricks.sql.statement import Statement, StatementResult
+from yggdrasil.databricks.sql.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.sql.statements import Statements
 
 
@@ -58,7 +58,7 @@ def test_statement_factory_builds_bound_result():
 def test_statement_factory_accepts_existing_result():
     client = DatabricksClient(host="https://example.cloud.databricks.com")
     svc = client.statements
-    original = StatementResult(statement=Statement(text="SELECT 1"))
+    original = StatementResult(statement=PreparedStatement(text="SELECT 1"))
 
     rebound = svc.statement(original)
 

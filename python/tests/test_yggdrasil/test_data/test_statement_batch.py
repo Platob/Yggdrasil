@@ -10,7 +10,7 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema
 from yggdrasil.data.statement import (
-    Statement,
+    PreparedStatement,
     StatementBatch,
     StatementResult as BaseStatementResult,
 )
@@ -242,8 +242,8 @@ class TestStatementBatchWaitNoPool(unittest.TestCase):
 class TestFromStatements(unittest.TestCase):
     def test_from_statements_builds_results_via_factory(self):
         configs = [
-            Statement(text="SELECT 1"),
-            Statement(text="SELECT 2", parameters={"x": 1}),
+            PreparedStatement(text="SELECT 1"),
+            PreparedStatement(text="SELECT 2", parameters={"x": 1}),
         ]
         batch = StatementBatch.from_statements(
             configs,
@@ -258,7 +258,7 @@ class TestFromStatements(unittest.TestCase):
     def test_from_statements_accepts_mapping(self):
         configs = {
             "a": "SELECT 1",
-            "b": Statement(text="SELECT 2"),
+            "b": PreparedStatement(text="SELECT 2"),
         }
         batch = StatementBatch.from_statements(
             configs,

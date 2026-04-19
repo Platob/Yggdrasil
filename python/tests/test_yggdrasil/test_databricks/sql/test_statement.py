@@ -1,49 +1,49 @@
-"""Unit tests for :mod:`yggdrasil.databricks.sql.statement` and :class:`Statement`."""
+"""Unit tests for :mod:`yggdrasil.databricks.sql.statement` and :class:`PreparedStatement`."""
 
 from __future__ import annotations
 
 import pytest
 
-from yggdrasil.databricks.sql.statement import Statement, StatementResult
+from yggdrasil.databricks.sql.statement import PreparedStatement, StatementResult
 
 
 # ---------------------------------------------------------------------------
-# Statement (config) — prepare / mutators / parameter list / looks_like_query
+# PreparedStatement (config) — prepare / mutators / parameter list / looks_like_query
 # ---------------------------------------------------------------------------
 
 
 class TestStatementPrepare:
     def test_prepare_from_string_wraps_text(self):
-        stmt = Statement.prepare("SELECT 1")
-        assert isinstance(stmt, Statement)
+        stmt = PreparedStatement.prepare("SELECT 1")
+        assert isinstance(stmt, PreparedStatement)
         assert stmt.text == "SELECT 1"
         assert stmt.parameters == {}
         assert stmt.temporary_tables == {}
 
     def test_prepare_returns_existing_statement_untouched(self):
-        original = Statement(text="SELECT 1", parameters={"x": 1})
-        out = Statement.prepare(original)
+        original = PreparedStatement(text="SELECT 1", parameters={"x": 1})
+        out = PreparedStatement.prepare(original)
         assert out is original
 
     def test_prepare_merges_parameters_on_existing_statement(self):
-        original = Statement(text="SELECT 1", parameters={"x": 1})
-        out = Statement.prepare(original, parameters={"y": 2})
+        original = PreparedStatement(text="SELECT 1", parameters={"x": 1})
+        out = PreparedStatement.prepare(original, parameters={"y": 2})
         assert out is not original
         assert out.parameters == {"x": 1, "y": 2}
         assert out.text == "SELECT 1"
 
     def test_prepare_merges_parameters_overriding_existing(self):
-        original = Statement(text="SELECT :x", parameters={"x": 1})
-        out = Statement.prepare(original, parameters={"x": 99})
+        original = PreparedStatement(text="SELECT :x", parameters={"x": 1})
+        out = PreparedStatement.prepare(original, parameters={"x": 99})
         assert out.parameters == {"x": 99}
 
     def test_prepare_merges_temporary_tables_on_existing_statement(self):
-        original = Statement(text="SELECT * FROM {t}", temporary_tables={"t": "A"})
-        out = Statement.prepare(original, temporary_tables={"u": "B"})
+        original = PreparedStatement(text="SELECT * FROM {t}", temporary_tables={"t": "A"})
+        out = PreparedStatement.prepare(original, temporary_tables={"u": "B"})
         assert out.temporary_tables == {"t": "A", "u": "B"}
 
     def test_prepare_builds_fresh_statement_from_string(self):
-        out = Statement.prepare(
+        out = PreparedStatement.prepare(
             "SELECT :x",
             parameters={"x": 1},
             temporary_tables={"t": "A"},
@@ -55,34 +55,34 @@ class TestStatementPrepare:
 
 class TestStatementMutators:
     def test_bind_returns_new_instance(self):
-        base = Statement(text="SELECT :x")
+        base = PreparedStatement(text="SELECT :x")
         out = base.bind(x=1)
         assert out is not base
         assert base.parameters == {}
         assert out.parameters == {"x": 1}
 
     def test_bind_with_no_args_returns_same_instance(self):
-        base = Statement(text="SELECT 1")
+        base = PreparedStatement(text="SELECT 1")
         assert base.bind() is base
 
     def test_bind_merges_over_existing(self):
-        base = Statement(text="SELECT :x", parameters={"x": 1, "y": 2})
+        base = PreparedStatement(text="SELECT :x", parameters={"x": 1, "y": 2})
         out = base.bind(y=99, z=3)
         assert out.parameters == {"x": 1, "y": 99, "z": 3}
 
     def test_with_temporary_tables_returns_new_instance(self):
-        base = Statement(text="SELECT * FROM {a}")
+        base = PreparedStatement(text="SELECT * FROM {a}")
         out = base.with_temporary_tables(a="X")
         assert out is not base
         assert base.temporary_tables == {}
         assert out.temporary_tables == {"a": "X"}
 
     def test_with_temporary_tables_no_args_returns_same_instance(self):
-        base = Statement(text="SELECT 1")
+        base = PreparedStatement(text="SELECT 1")
         assert base.with_temporary_tables() is base
 
     def test_clear_resets_all_fields(self):
-        base = Statement(
+        base = PreparedStatement(
             text="SELECT :x FROM {a}",
             parameters={"x": 1},
             temporary_tables={"a": "A"},
@@ -97,30 +97,30 @@ class TestStatementMutators:
         assert base.temporary_tables == {"a": "A"}
 
     def test_with_text_returns_new_instance(self):
-        base = Statement(text="SELECT 1", parameters={"x": 1})
+        base = PreparedStatement(text="SELECT 1", parameters={"x": 1})
         out = base.with_text("SELECT 2")
         assert out is not base
         assert out.text == "SELECT 2"
         assert out.parameters == {"x": 1}
 
     def test_with_text_same_text_returns_self(self):
-        base = Statement(text="SELECT 1")
+        base = PreparedStatement(text="SELECT 1")
         assert base.with_text("SELECT 1") is base
 
 
 class TestStatementToParameterList:
     def test_empty_parameters_returns_none(self):
-        assert Statement(text="SELECT 1").to_parameter_list() is None
+        assert PreparedStatement(text="SELECT 1").to_parameter_list() is None
 
     def test_parameter_list_renders_named_items(self):
-        stmt = Statement(text="SELECT :x", parameters={"x": 42, "y": "hi"})
+        stmt = PreparedStatement(text="SELECT :x", parameters={"x": 42, "y": "hi"})
         items = stmt.to_parameter_list()
         assert items is not None
         assert [i.name for i in items] == ["x", "y"]
         assert [i.value for i in items] == ["42", "hi"]
 
     def test_parameter_list_preserves_none_values(self):
-        stmt = Statement(text="SELECT :x", parameters={"x": None})
+        stmt = PreparedStatement(text="SELECT :x", parameters={"x": None})
         items = stmt.to_parameter_list()
         assert items is not None
         assert items[0].value is None
@@ -148,7 +148,7 @@ class TestStatementToParameterList:
     ],
 )
 def test_looks_like_query(text, expected):
-    assert Statement.looks_like_query(text) is expected
+    assert PreparedStatement.looks_like_query(text) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +164,17 @@ class TestStatementResultPrepare:
         assert result.text == "SELECT 1"  # via property
 
     def test_prepare_from_config_wraps_in_result(self):
-        cfg = Statement(text="SELECT :x", parameters={"x": 1})
+        cfg = PreparedStatement(text="SELECT :x", parameters={"x": 1})
         result = StatementResult.prepare(cfg)
         assert result.statement is cfg
 
     def test_prepare_reuses_existing_result(self):
-        result = StatementResult(statement=Statement(text="SELECT 1"))
+        result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
         out = StatementResult.prepare(result)
         assert out is result
 
     def test_prepare_merges_parameters_into_existing_result(self):
-        result = StatementResult(statement=Statement(text="SELECT 1", parameters={"x": 1}))
+        result = StatementResult(statement=PreparedStatement(text="SELECT 1", parameters={"x": 1}))
         out = StatementResult.prepare(result, parameters={"y": 2})
         assert out is not result
         assert out.statement.parameters == {"x": 1, "y": 2}
@@ -182,32 +182,32 @@ class TestStatementResultPrepare:
 
 class TestStatementResultConfigShortcuts:
     def test_text_property_delegates_to_statement(self):
-        result = StatementResult(statement=Statement(text="SELECT 1"))
+        result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
         assert result.text == "SELECT 1"
 
     def test_parameters_property_delegates(self):
-        result = StatementResult(statement=Statement(text="X", parameters={"x": 1}))
+        result = StatementResult(statement=PreparedStatement(text="X", parameters={"x": 1}))
         assert result.parameters == {"x": 1}
 
     def test_temporary_tables_property_delegates(self):
-        result = StatementResult(statement=Statement(text="X", temporary_tables={"t": "A"}))
+        result = StatementResult(statement=PreparedStatement(text="X", temporary_tables={"t": "A"}))
         assert result.temporary_tables == {"t": "A"}
 
     def test_with_text_returns_new_result(self):
-        result = StatementResult(statement=Statement(text="SELECT 1", parameters={"x": 1}))
+        result = StatementResult(statement=PreparedStatement(text="SELECT 1", parameters={"x": 1}))
         out = result.with_text("SELECT 2")
         assert out is not result
         assert out.statement.text == "SELECT 2"
         assert out.statement.parameters == {"x": 1}
 
     def test_bind_returns_new_result(self):
-        result = StatementResult(statement=Statement(text="SELECT :x"))
+        result = StatementResult(statement=PreparedStatement(text="SELECT :x"))
         out = result.bind(x=1)
         assert out is not result
         assert out.statement.parameters == {"x": 1}
 
     def test_with_temporary_tables_returns_new_result(self):
-        result = StatementResult(statement=Statement(text="SELECT * FROM {a}"))
+        result = StatementResult(statement=PreparedStatement(text="SELECT * FROM {a}"))
         out = result.with_temporary_tables(a="X")
         assert out is not result
         assert out.statement.temporary_tables == {"a": "X"}
@@ -216,37 +216,37 @@ class TestStatementResultConfigShortcuts:
 def test_statement_result_has_default_service():
     from yggdrasil.databricks.sql.statements import Statements
 
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     assert isinstance(result.service, Statements)
     assert result.client is result.service.client
 
 
 def test_started_false_without_statement_id():
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     assert result.started is False
 
 
 def test_started_true_when_statement_id_set():
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     object.__setattr__(result, "statement_id", "abc123")
     assert result.started is True
 
 
 def test_start_is_idempotent_when_started():
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     object.__setattr__(result, "statement_id", "abc123")
     # Should return self without submitting (warehouse arg is unused).
     assert result.start() is result
 
 
 def test_cancel_noop_when_not_started():
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     # Not started -> no client calls, returns self.
     assert result.cancel() is result
 
 
 def test_cancel_noop_for_spark_statements():
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     object.__setattr__(result, "statement_id", "SparkSQL")
     assert result.cancel() is result
 
@@ -258,7 +258,7 @@ def test_cancel_noop_when_already_done():
         StatementStatus,
     )
 
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     object.__setattr__(result, "statement_id", "abc123")
     object.__setattr__(
         result,
@@ -280,7 +280,7 @@ def test_cancel_calls_sdk_when_running():
         StatementStatus,
     )
 
-    result = StatementResult(statement=Statement(text="SELECT 1"))
+    result = StatementResult(statement=PreparedStatement(text="SELECT 1"))
     object.__setattr__(result, "statement_id", "abc123")
     object.__setattr__(
         result,

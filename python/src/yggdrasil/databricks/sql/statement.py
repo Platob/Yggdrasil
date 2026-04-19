@@ -1,6 +1,6 @@
 """Single access point for managing a Databricks SQL statement execution.
 
-``StatementResult`` binds a :class:`~yggdrasil.data.statement.Statement`
+``StatementResult`` binds a :class:`~yggdrasil.data.statement.PreparedStatement`
 configuration to the Databricks backend: it carries the submission state
 (``warehouse_id``, ``statement_id``, the cached response) and exposes the
 Arrow-first result interface provided by
@@ -29,7 +29,7 @@ from databricks.sdk.service.sql import (
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Field, Schema, schema
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.statement import Statement
+from yggdrasil.data.statement import PreparedStatement
 from yggdrasil.data.statement import StatementResult as BaseStatementResult
 
 from .exceptions import SQLError
@@ -39,7 +39,7 @@ from ..client import DatabricksResource
 if TYPE_CHECKING:
     from .warehouse import SQLWarehouse
 
-__all__ = ["Statement", "StatementResult"]
+__all__ = ["PreparedStatement", "StatementResult"]
 
 
 DONE_STATES = {
@@ -59,13 +59,13 @@ FAILED_STATES = {
 class StatementResult(BaseStatementResult, DatabricksResource):
     """Databricks-backed :class:`StatementResult` handler.
 
-    Wraps a :class:`Statement` configuration together with the per-execution
+    Wraps a :class:`PreparedStatement` configuration together with the per-execution
     state (``warehouse_id``, ``statement_id``, cached ``StatementResponse``)
     that Databricks needs.  All config — text, parameters, temporary tables —
     lives on ``self.statement``.
     """
 
-    statement: Statement = field(default_factory=Statement)
+    statement: PreparedStatement = field(default_factory=PreparedStatement)
     service: Statements = field(
         default_factory=Statements.current,
         repr=False, compare=False, hash=False,
@@ -88,7 +88,7 @@ class StatementResult(BaseStatementResult, DatabricksResource):
     @classmethod
     def prepare(
         cls,
-        statement: "StatementResult | Statement | str",
+        statement: "StatementResult | PreparedStatement | str",
         *,
         parameters=None,
         temporary_tables=None,
@@ -97,14 +97,14 @@ class StatementResult(BaseStatementResult, DatabricksResource):
 
         - Existing ``StatementResult`` instances are reused; extra ``parameters``
           / ``temporary_tables`` are merged into their inner
-          :class:`Statement` config.
-        - Plain :class:`Statement` configs are wrapped in an unstarted
+          :class:`PreparedStatement` config.
+        - Plain :class:`PreparedStatement` configs are wrapped in an unstarted
           :class:`StatementResult`.
-        - Strings are coerced via :meth:`Statement.prepare`.
+        - Strings are coerced via :meth:`PreparedStatement.prepare`.
         """
         if isinstance(statement, cls):
             if parameters or temporary_tables:
-                merged = Statement.prepare(
+                merged = PreparedStatement.prepare(
                     statement.statement,
                     parameters=parameters,
                     temporary_tables=temporary_tables,
@@ -112,7 +112,7 @@ class StatementResult(BaseStatementResult, DatabricksResource):
                 return replace(statement, statement=merged)
             return statement
 
-        cfg = Statement.prepare(
+        cfg = PreparedStatement.prepare(
             statement,
             parameters=parameters,
             temporary_tables=temporary_tables,
@@ -141,17 +141,17 @@ class StatementResult(BaseStatementResult, DatabricksResource):
         return replace(self, statement=self.statement.with_text(text))
 
     def clear(self) -> "StatementResult":
-        """Return a copy with an empty :class:`Statement` config."""
-        return replace(self, statement=Statement())
+        """Return a copy with an empty :class:`PreparedStatement` config."""
+        return replace(self, statement=PreparedStatement())
 
     def to_parameter_list(self):
-        """Delegate to :meth:`Statement.to_parameter_list`."""
+        """Delegate to :meth:`PreparedStatement.to_parameter_list`."""
         return self.statement.to_parameter_list()
 
     # Back-compat: ``looks_like_query`` used to live on the Databricks class.
     @staticmethod
     def looks_like_query(text):
-        return Statement.looks_like_query(text)
+        return PreparedStatement.looks_like_query(text)
 
     # ------------------------------------------------------------------
     # Execution lifecycle
@@ -296,7 +296,7 @@ class StatementResult(BaseStatementResult, DatabricksResource):
 
     @property
     def status(self) -> StatementStatus:
-        """Statement status object."""
+        """PreparedStatement status object."""
         return self.response.status
 
     @property

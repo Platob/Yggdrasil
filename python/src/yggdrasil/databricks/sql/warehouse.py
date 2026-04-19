@@ -39,7 +39,7 @@ from .service import (
     _jitter_sleep_seconds,
     safeEndpointInfo,
 )
-from .statement import Statement, StatementResult
+from .statement import PreparedStatement, StatementResult
 from ..client import DatabricksResource
 
 __all__ = [
@@ -369,7 +369,7 @@ class SQLWarehouse(DatabricksResource):
 
     def execute(
         self,
-        statement: "str | Statement | StatementResult | None" = None,
+        statement: "str | PreparedStatement | StatementResult | None" = None,
         *,
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
@@ -388,8 +388,8 @@ class SQLWarehouse(DatabricksResource):
     ) -> StatementResult:
         """Execute a SQL statement on this (or another) warehouse.
 
-        ``statement`` may be raw SQL, a :class:`Statement` config, or an
-        unstarted :class:`StatementResult`.  When a :class:`Statement`
+        ``statement`` may be raw SQL, a :class:`PreparedStatement` config, or an
+        unstarted :class:`StatementResult`.  When a :class:`PreparedStatement`
         config is supplied its parameters take precedence over
         ``parameters``.
         """
@@ -495,7 +495,7 @@ class SQLWarehouse(DatabricksResource):
 
                 iteration += 1
 
-        # Record execution state on the prepared Statement so it becomes
+        # Record execution state on the prepared PreparedStatement so it becomes
         # a started handler (``statement_id`` is now set).
         object.__setattr__(prepared, "service", self.client.statements)
         object.__setattr__(prepared, "warehouse_id", resolved_wh_id)

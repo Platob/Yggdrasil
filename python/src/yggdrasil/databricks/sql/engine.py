@@ -5,7 +5,7 @@ This module provides a thin execution and table-management layer across two
 Databricks runtimes:
 
 - Spark SQL / Delta Lake, when a SparkSession is available
-- Databricks SQL Statement Execution API, when running outside Spark
+- Databricks SQL PreparedStatement Execution API, when running outside Spark
 
 It is designed to keep read and write behavior as consistent as possible
 between both paths, especially for Delta insert and merge workflows.
@@ -103,7 +103,7 @@ from databricks.sdk.service.sql import Disposition
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.cast import CastOptions
-from yggdrasil.data.statement import Statement, StatementBatch
+from yggdrasil.data.statement import PreparedStatement, StatementBatch
 from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
@@ -184,7 +184,7 @@ class SQLEngine(DatabricksService):
     - performing optional post-write maintenance such as OPTIMIZE or VACUUM
 
     The engine prefers Spark execution when a SparkSession is available and
-    falls back to the Databricks SQL Statement Execution API otherwise.
+    falls back to the Databricks SQL PreparedStatement Execution API otherwise.
 
     Scope
     -----
@@ -387,7 +387,7 @@ class SQLEngine(DatabricksService):
         - Otherwise the value is treated as tabular data, written to a fresh
           :class:`StagingPath` as Parquet, and the engine takes ownership of
           the new staging path so it can be cleaned up lazily when the
-          resulting :class:`Statement` is done.
+          resulting :class:`PreparedStatement` is done.
 
         Returns:
             A tuple ``(substitutions, owned_paths)`` where ``substitutions``
@@ -432,7 +432,7 @@ class SQLEngine(DatabricksService):
 
     def execute_many(
         self,
-        statements: "Iterable[str | Statement | StatementResult] | Mapping[str, str | Statement | StatementResult]",
+        statements: "Iterable[str | PreparedStatement | StatementResult] | Mapping[str, str | PreparedStatement | StatementResult]",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -472,10 +472,10 @@ class SQLEngine(DatabricksService):
                 SQL statements to execute.
 
                 Accepts either:
-                - an iterable of SQL strings or :class:`Statement` objects,
+                - an iterable of SQL strings or :class:`PreparedStatement` objects,
                   keyed as ``"0"``, ``"1"``, ...
                 - a mapping of ``{name: statement}``, preserving mapping order,
-                  where each value is a SQL string or :class:`Statement`
+                  where each value is a SQL string or :class:`PreparedStatement`
             row_limit:
                 Optional row limit forwarded to each statement execution.
             catalog_name:
@@ -513,7 +513,7 @@ class SQLEngine(DatabricksService):
                 every result in the batch and cleaned up lazily once those
                 results reach a terminal state.  Merged on top of any
                 per-statement temporary tables already carried by
-                :class:`Statement` inputs.
+                :class:`PreparedStatement` inputs.
 
         Returns:
             A :class:`StatementBatch` containing results in input order.
@@ -522,14 +522,14 @@ class SQLEngine(DatabricksService):
             ValueError:
                 If no non-empty SQL statements were provided.
         """
-        items: OrderedDict[str, Statement] = OrderedDict()
+        items: OrderedDict[str, PreparedStatement] = OrderedDict()
 
-        def _add(key: str, raw: "str | Statement | StatementResult") -> None:
-            # Accept plain SQL, a Statement config, or a pre-built StatementResult.
+        def _add(key: str, raw: "str | PreparedStatement | StatementResult") -> None:
+            # Accept plain SQL, a PreparedStatement config, or a pre-built StatementResult.
             if isinstance(raw, StatementResult):
                 cfg = raw.statement
             else:
-                cfg = Statement.prepare(raw)
+                cfg = PreparedStatement.prepare(raw)
             stripped = cfg.text.strip()
             if not stripped:
                 return
@@ -649,19 +649,19 @@ class SQLEngine(DatabricksService):
 
     def prepare(
         self,
-        statement: "str | Statement | StatementResult",
+        statement: "str | PreparedStatement | StatementResult",
         *,
         parameters: Mapping[str, Any] | None = None,
         temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
-    ) -> Statement:
-        """Build a :class:`Statement` config from a string or existing statement.
+    ) -> PreparedStatement:
+        """Build a :class:`PreparedStatement` config from a string or existing statement.
 
         Extra ``parameters`` and ``temporary_tables`` are merged on top of
-        any values carried by ``statement``.  The returned :class:`Statement`
+        any values carried by ``statement``.  The returned :class:`PreparedStatement`
         config can be passed to :meth:`execute` later.
         """
         base = statement.statement if isinstance(statement, StatementResult) else statement
-        return Statement.prepare(
+        return PreparedStatement.prepare(
             base,
             parameters=parameters,
             temporary_tables=temporary_tables,
@@ -669,7 +669,7 @@ class SQLEngine(DatabricksService):
 
     def execute(
         self,
-        statement: "str | Statement | StatementResult",
+        statement: "str | PreparedStatement | StatementResult",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -702,9 +702,9 @@ class SQLEngine(DatabricksService):
 
         Args:
             statement:
-                SQL text to execute, or a :class:`Statement` carrying both
+                SQL text to execute, or a :class:`PreparedStatement` carrying both
                 the text and its bound arguments.  Strings are coerced via
-                :meth:`Statement.prepare` together with any ``parameters``
+                :meth:`PreparedStatement.prepare` together with any ``parameters``
                 or ``temporary_tables`` passed to this call.
             row_limit:
                 Optional row limit. Applied through `limit()` on Spark results
@@ -735,7 +735,7 @@ class SQLEngine(DatabricksService):
                 replaced with the corresponding ``parquet.`<path>``` source
                 clause. Tabular values are materialized to a fresh staging
                 path via Parquet. Engine-owned staging paths are attached to
-                the returned ``Statement`` and cleaned up lazily once
+                the returned ``PreparedStatement`` and cleaned up lazily once
                 it reaches a terminal state.  Merged on top of any temporary
                 tables already carried by ``statement``.
             parameters:
@@ -744,7 +744,7 @@ class SQLEngine(DatabricksService):
                 carried by ``statement``.
 
         Returns:
-            A `Statement` wrapping either a Spark result or a warehouse API
+            A `PreparedStatement` wrapping either a Spark result or a warehouse API
             statement execution result.
 
         Raises:
@@ -896,7 +896,8 @@ class SQLEngine(DatabricksService):
             dict,
             list,
             str,
-            Statement,
+            PreparedStatement,
+            StatementResult,
             "pandas.DataFrame",
             "polars.DataFrame",
             "pyspark.sql.DataFrame",
@@ -928,8 +929,13 @@ class SQLEngine(DatabricksService):
 
         Routing behavior
         ----------------
-        - If a SparkSession is available, use the Spark write path
-        - Otherwise, use the warehouse SQL path with staged Parquet
+        - If ``data`` is a :class:`PreparedStatement`, :class:`StatementResult`,
+          or SQL-like string, dispatch to :meth:`sql_insert_into` which
+          smart-routes between a cached :class:`StatementResult`, the Spark
+          SQL path, and the warehouse SQL path.
+        - Else if a SparkSession is available, use :meth:`spark_insert_into`.
+        - Otherwise, use :meth:`arrow_insert_into` (warehouse SQL with
+          staged Parquet).
 
         Args:
             data:
@@ -988,7 +994,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
+        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1004,6 +1010,7 @@ class SQLEngine(DatabricksService):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 table=table,
+                spark_session=spark_session,
             )
 
         if spark_session is None:
@@ -1150,7 +1157,7 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
+        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,
@@ -1347,7 +1354,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
     def sql_insert_into(
         self,
-        statement: "Statement | StatementResult | str",
+        statement: "PreparedStatement | StatementResult | str",
         *,
         mode: SaveMode | str | None = None,
         location: str | None = None,
@@ -1362,19 +1369,86 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         table: Optional[Table] = None,
+        spark_session: Optional["pyspark.sql.SparkSession"] = None,
     ) -> None:
-        """Insert into a Delta table directly from a SQL query.
+        """Insert into a Delta table from a SQL source.
 
-        No data is read by the client: the query runs on the warehouse and
-        its output is written into the target table with
-        ``INSERT INTO ... SELECT``, ``MERGE INTO ... USING (<query>)``,
-        or ``DELETE`` + ``INSERT`` depending on ``mode`` and ``match_by``.
+        Smart dispatch
+        --------------
+        1. If ``statement`` is a :class:`StatementResult` that has already
+           been materialized (``persisted=True``), the cached Spark
+           DataFrame or Arrow table is reused via :meth:`insert_into` — the
+           query is not re-executed.
+        2. Otherwise, if a SparkSession is available, the source SQL is
+           executed in Spark and the resulting DataFrame is handed to
+           :meth:`spark_insert_into`, which uses native Delta
+           ``MERGE`` / append / overwrite APIs.
+        3. Otherwise, the query runs on the warehouse and its output is
+           written into the target table via ``INSERT INTO ... SELECT``,
+           ``MERGE INTO ... USING (<query>)``, or ``DELETE`` + ``INSERT``
+           depending on ``mode`` and ``match_by``.
 
         The target table must already exist; its column list drives the
         target columns and the projection over the source subquery.
         """
+        # ---- Fast path 1: cached StatementResult ----
+        if isinstance(statement, StatementResult) and statement.persisted:
+            cached = (
+                statement._spark_df
+                if statement._spark_df is not None
+                else statement.to_arrow_table()
+            )
+            return self.insert_into(
+                data=cached,
+                mode=mode,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
+                raise_error=raise_error,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                spark_session=spark_session,
+                table=table,
+            )
+
+        # ---- Fast path 2: run in Spark for native Delta writes ----
+        if spark_session is None:
+            spark_session = PyEnv.spark_session(
+                create=False,
+                import_error=False,
+                install_spark=False,
+            )
+        if spark_session is not None:
+            cfg = (
+                statement.statement
+                if isinstance(statement, StatementResult)
+                else PreparedStatement.prepare(statement)
+            )
+            df = spark_session.sql(cfg.text)
+            return self.spark_insert_into(
+                data=df,
+                mode=mode,
+                location=location,
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                table_name=table_name,
+                match_by=match_by,
+                update_cols=update_cols,
+                wait=wait,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+                table=table,
+            )
+
+        # ---- Fallback: warehouse-side SQL merge ----
         base = statement.statement if isinstance(statement, StatementResult) else statement
-        prepared = Statement.prepare(base)
+        prepared = PreparedStatement.prepare(base)
         mode = SaveMode.parse(mode, default=SaveMode.AUTO)
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
@@ -1415,7 +1489,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
 
         logger.debug("Inserting query into %s", location)
 
-        statements: list["Statement | str"] = []  # each entry is Statement config or raw SQL
+        statements: list["PreparedStatement | str"] = []  # each entry is PreparedStatement config or raw SQL
 
         if mode == SaveMode.TRUNCATE:
             insert_sql = (
@@ -1606,7 +1680,7 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
         Returns:
             None.
         """
-        if isinstance(data, (Statement, StatementResult)) or Statement.looks_like_query(data):
+        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,

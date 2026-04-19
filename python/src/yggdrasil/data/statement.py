@@ -33,7 +33,7 @@ BatchConcatMode = Literal[
 
 __all__ = [
     "BatchConcatMode",
-    "Statement",
+    "PreparedStatement",
     "StatementBatch",
     "StatementResult",
 ]
@@ -50,17 +50,17 @@ _SQL_QUERY_LEAD_RE = re.compile(
 
 
 @dataclass(frozen=True)
-class Statement:
+class PreparedStatement:
     """Configuration for a single statement execution.
 
-    ``Statement`` is a plain value object — it carries the SQL text, any
+    ``PreparedStatement`` is a plain value object — it carries the SQL text, any
     named parameters, and a map of temporary-table aliases that the engine
     should substitute before submission.  Runtime/execution state
     (backend handle, response, cached results) lives on
     :class:`StatementResult`.
 
     Instances are frozen: every mutator (``bind``, ``with_temporary_tables``,
-    ``clear``) returns a new ``Statement``.
+    ``clear``) returns a new ``PreparedStatement``.
     """
 
     text: str = ""
@@ -90,12 +90,12 @@ class Statement:
     @classmethod
     def prepare(
         cls,
-        statement: "Statement | str",
+        statement: "PreparedStatement | str",
         *,
         parameters: Mapping[str, Any] | None = None,
         temporary_tables: Mapping[str, Any] | None = None,
-    ) -> "Statement":
-        """Coerce ``statement`` into a :class:`Statement`, merging extra args."""
+    ) -> "PreparedStatement":
+        """Coerce ``statement`` into a :class:`PreparedStatement`, merging extra args."""
         if isinstance(statement, cls):
             prepared = statement
             if parameters:
@@ -110,24 +110,24 @@ class Statement:
             temporary_tables=dict(temporary_tables) if temporary_tables else {},
         )
 
-    def bind(self, **parameters: Any) -> "Statement":
-        """Return a new ``Statement`` with additional named parameters merged."""
+    def bind(self, **parameters: Any) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with additional named parameters merged."""
         if not parameters:
             return self
         return replace(self, parameters={**self.parameters, **parameters})
 
-    def with_temporary_tables(self, **tables: Any) -> "Statement":
-        """Return a new ``Statement`` with additional temporary-table aliases."""
+    def with_temporary_tables(self, **tables: Any) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with additional temporary-table aliases."""
         if not tables:
             return self
         return replace(self, temporary_tables={**self.temporary_tables, **tables})
 
-    def clear(self) -> "Statement":
-        """Return a new ``Statement`` with text and all bound arguments cleared."""
+    def clear(self) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with text and all bound arguments cleared."""
         return replace(self, text="", parameters={}, temporary_tables={})
 
-    def with_text(self, text: str) -> "Statement":
-        """Return a new ``Statement`` with ``text`` replaced."""
+    def with_text(self, text: str) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with ``text`` replaced."""
         if text == self.text:
             return self
         return replace(self, text=text)
@@ -152,7 +152,7 @@ class Statement:
 
 @dataclass
 class StatementResult(ABC):
-    """Arrow-first result handler for a :class:`Statement`.
+    """Arrow-first result handler for a :class:`PreparedStatement`.
 
     This class defines a small execution contract plus a rich set of conversion helpers.
     Concrete implementations only need to provide status handling and a way to expose
@@ -182,7 +182,7 @@ class StatementResult(ABC):
       Those cases are called out in method docs.
     """
 
-    statement: Statement = field(default_factory=Statement)
+    statement: PreparedStatement = field(default_factory=PreparedStatement)
 
     _data_schema: Optional[Schema] = field(init=False, default=None, repr=False, compare=False)
     _arrow_table: Optional[pa.Table] = field(init=False, default=None, repr=False, compare=False)
@@ -676,7 +676,7 @@ class StatementBatch(Mapping[str, "StatementResult"]):
 
     Construct via :meth:`from_results` (already-built handlers) or
     :meth:`from_statements` (configs + a factory callable that turns each
-    :class:`Statement` config into an unstarted :class:`StatementResult`).
+    :class:`PreparedStatement` config into an unstarted :class:`StatementResult`).
 
     By default, materialized conversions concatenate inner tabular results using
     Polars ``how="diagonal_relaxed"`` semantics.
@@ -729,12 +729,12 @@ class StatementBatch(Mapping[str, "StatementResult"]):
     @classmethod
     def from_statements(
         cls,
-        statements: Iterable[Statement | str] | Mapping[str, Statement | str],
-        factory: Callable[[Statement], StatementResult],
+        statements: Iterable[PreparedStatement | str] | Mapping[str, PreparedStatement | str],
+        factory: Callable[[PreparedStatement], StatementResult],
     ) -> StatementBatch:
-        """Build a batch from :class:`Statement` configs (or strings).
+        """Build a batch from :class:`PreparedStatement` configs (or strings).
 
-        Each entry is normalized via :meth:`Statement.prepare` and passed to
+        Each entry is normalized via :meth:`PreparedStatement.prepare` and passed to
         ``factory`` to build the corresponding :class:`StatementResult`.
         """
         items = (
@@ -745,7 +745,7 @@ class StatementBatch(Mapping[str, "StatementResult"]):
 
         results: OrderedDict[str, StatementResult] = OrderedDict()
         for key, raw in items:
-            cfg = Statement.prepare(raw)
+            cfg = PreparedStatement.prepare(raw)
             results[str(key)] = factory(cfg)
         return cls(results=results)
 
@@ -759,8 +759,8 @@ class StatementBatch(Mapping[str, "StatementResult"]):
         return self.results[key]
 
     @property
-    def statements(self) -> OrderedDict[str, Statement]:
-        """Config view of the batch: each result's :class:`Statement`."""
+    def statements(self) -> OrderedDict[str, PreparedStatement]:
+        """Config view of the batch: each result's :class:`PreparedStatement`."""
         return OrderedDict(
             (key, result.statement)
             for key, result in self.results.items()
@@ -814,7 +814,7 @@ class StatementBatch(Mapping[str, "StatementResult"]):
             try:
                 result.raise_for_status()
             except Exception as exc:
-                raise RuntimeError(f"Statement batch item {key!r} failed.") from exc
+                raise RuntimeError(f"PreparedStatement batch item {key!r} failed.") from exc
         return self
 
     # ------------------------------------------------------------------
@@ -1081,7 +1081,7 @@ class StatementBatch(Mapping[str, "StatementResult"]):
 
         if first_exc is not None and raise_error:
             raise RuntimeError(
-                f"Statement batch item {failed_key!r} failed."
+                f"PreparedStatement batch item {failed_key!r} failed."
             ) from first_exc
 
     def cancel(self) -> StatementBatch:

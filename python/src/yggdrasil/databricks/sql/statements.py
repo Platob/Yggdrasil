@@ -22,7 +22,7 @@ from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.sql import StatementResponse, StatementState
 
 from yggdrasil.data import any_to_datetime
-from yggdrasil.data.statement import Statement
+from yggdrasil.data.statement import PreparedStatement
 from yggdrasil.databricks.client import DatabricksService
 
 from .sql_utils import escape_sql_string
@@ -73,7 +73,7 @@ class Statements(DatabricksService):
 
     Provides ``list_statements`` / ``find_statement`` operations plus
     :meth:`statement` to build an unstarted
-    :class:`~yggdrasil.databricks.sql.statement.Statement` resource bound
+    :class:`~yggdrasil.databricks.sql.statement.PreparedStatement` resource bound
     to this service.
 
     Listing queries the Unity Catalog ``system.query.history`` table.
@@ -95,7 +95,7 @@ class Statements(DatabricksService):
 
     def statement(
         self,
-        text: "str | Statement | StatementResult" = "",
+        text: "str | PreparedStatement | StatementResult" = "",
         *,
         parameters: Optional[dict] = None,
         temporary_tables: Optional[dict] = None,
@@ -118,7 +118,7 @@ class Statements(DatabricksService):
                 object.__setattr__(prepared, "warehouse_id", warehouse_id)
             return prepared
 
-        cfg = Statement.prepare(
+        cfg = PreparedStatement.prepare(
             text,
             parameters=parameters,
             temporary_tables=temporary_tables,
@@ -342,7 +342,7 @@ class Statements(DatabricksService):
                 continue
 
             stmt = StatementResult(
-                statement=Statement(text=row.get("statement_text") or ""),
+                statement=PreparedStatement(text=row.get("statement_text") or ""),
                 service=self,
                 statement_id=row_stmt_id,
                 warehouse_id=row.get("warehouse_id") or effective_warehouse,
