@@ -1858,7 +1858,10 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None:
             default_scalar = self.default_spark_scalar(nullable=nullable)
 
-        if default_scalar is None:
+        if default_scalar is None or self.type_id == (
+            DataTypeId.NULL,
+            DataTypeId.MAP, DataTypeId.ARRAY, DataTypeId.STRUCT
+        ):
             return column
 
         return (
