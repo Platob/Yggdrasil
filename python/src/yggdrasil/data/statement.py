@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as ds
     import pyspark.sql
     from databricks.sdk.service.sql import StatementParameterListItem
+    from yggdrasil.databricks.sql.engine import SQLEngine
 
 BatchConcatMode = Literal[
     "vertical",
@@ -696,6 +697,9 @@ class StatementBatch(Mapping[str, "StatementResult"]):
     """
 
     results: OrderedDict[str, StatementResult]
+    engine: Optional["SQLEngine"] = field(
+        default=None, repr=False, compare=False,
+    )
 
     _in_flight: OrderedDict[str, StatementResult] = field(
         default_factory=OrderedDict, init=False, repr=False, compare=False,
@@ -714,29 +718,48 @@ class StatementBatch(Mapping[str, "StatementResult"]):
     def from_results(
         cls,
         results: Iterable[StatementResult] | Mapping[str, StatementResult],
+        *,
+        engine: Optional["SQLEngine"] = None,
     ) -> StatementBatch:
-        """Build a batch from already-constructed :class:`StatementResult` handlers."""
+        """Build a batch from already-constructed :class:`StatementResult` handlers.
+
+        When ``engine`` is provided, :meth:`start` uses
+        ``engine.execute(result, wait=False)`` as its default submission
+        callable — callers no longer need to pass a custom ``runner``.
+        """
         if isinstance(results, Mapping):
-            return cls(results=OrderedDict(results.items()))
+            return cls(results=OrderedDict(results.items()), engine=engine)
 
         return cls(
             results=OrderedDict(
                 (str(i), result)
                 for i, result in enumerate(results)
-            )
+            ),
+            engine=engine,
         )
 
     @classmethod
     def from_statements(
         cls,
         statements: Iterable[PreparedStatement | str] | Mapping[str, PreparedStatement | str],
-        factory: Callable[[PreparedStatement], StatementResult],
+        factory: Optional[Callable[[PreparedStatement], StatementResult]] = None,
+        *,
+        engine: Optional["SQLEngine"] = None,
     ) -> StatementBatch:
         """Build a batch from :class:`PreparedStatement` configs (or strings).
 
         Each entry is normalized via :meth:`PreparedStatement.prepare` and passed to
-        ``factory`` to build the corresponding :class:`StatementResult`.
+        ``factory`` to build the corresponding :class:`StatementResult`.  When
+        ``factory`` is omitted, the engine layer must supply one — typically
+        ``lambda cfg: StatementResult(statement=cfg)``.  When ``engine`` is
+        provided, :meth:`start` uses ``engine.execute`` as the default runner.
         """
+        if factory is None:
+            raise ValueError(
+                "from_statements requires a ``factory`` callable "
+                "(stmt: PreparedStatement) -> StatementResult"
+            )
+
         items = (
             statements.items()
             if isinstance(statements, Mapping)
@@ -747,7 +770,7 @@ class StatementBatch(Mapping[str, "StatementResult"]):
         for key, raw in items:
             cfg = PreparedStatement.prepare(raw)
             results[str(key)] = factory(cfg)
-        return cls(results=results)
+        return cls(results=results, engine=engine)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.results)
@@ -961,6 +984,13 @@ class StatementBatch(Mapping[str, "StatementResult"]):
         workers = self._resolve_parallel(parallel)
 
         def _default_runner(result: StatementResult) -> Any:
+            # Prefer the bound engine when one is attached — lets callers
+            # hand off execution context (catalog, warehouse, caching, etc.)
+            # without wiring a custom runner.
+            if self.engine is not None:
+                return self.engine.execute(
+                    result, wait=False, raise_error=raise_error,
+                )
             return result.start(wait=False, raise_error=raise_error)
 
         effective_runner = runner or _default_runner
