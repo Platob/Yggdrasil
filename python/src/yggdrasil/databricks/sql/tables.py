@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from typing import Any, Optional, Iterator, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
 from yggdrasil.databricks.client import DatabricksService
-from yggdrasil.databricks.sql.sql_utils import quote_ident
+from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .grants import Grant
@@ -548,23 +547,29 @@ class Tables(DatabricksService):
     ) -> Iterator["Table"]:
         """Iterate over tables in the resolved catalog/schema scope.
 
+        Any of ``name``, ``catalog_name``, or ``schema_name`` may be a
+        case-insensitive glob (``"sales_*"``, ``"*_raw"``, ``"prefix_*_table"``,
+        ``"*"``).  Globbed catalog/schema names fan out across the matching
+        resources; ``None`` still means "all" at that level.
+
         Args:
-            name:         Optional table-name filter. When it contains ``*``,
-                          matching uses a case-insensitive glob.
+            name:         Optional table-name filter (exact or glob).
             catalog_name: Override catalog (falls back to service default).
+                          Accepts a glob to fan out across catalogs.
             schema_name:  Override schema (falls back to service default).
-                          When omitted, iterates every schema in the resolved
-                          catalog scope. When both are omitted, iterates every
-                          visible catalog and schema.
+                          Accepts a glob to fan out across schemas.
+                          When ``None``, iterates every schema in the resolved
+                          catalog scope.  When both catalog and schema are
+                          ``None``, iterates every visible catalog and schema.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
         """
         catalog_name = self.catalog_name if catalog_name is None else catalog_name
         schema_name = self.schema_name if schema_name is None else schema_name
 
-        if catalog_name is None:
+        if catalog_name is None or is_glob_pattern(catalog_name):
             from .catalogs import Catalogs
 
-            for catalog in Catalogs(client=self.client).list():
+            for catalog in Catalogs(client=self.client).list(name=catalog_name):
                 yield from self.list_tables(
                     name=name,
                     catalog_name=catalog.catalog_name,
@@ -573,27 +578,27 @@ class Tables(DatabricksService):
                 )
             return
 
-        if schema_name is None:
-            for schema in self.catalog(catalog_name).schemas():
+        if schema_name is None or is_glob_pattern(schema_name):
+            schema_matcher = name_matcher(schema_name)
+            for schema_info in self.client.workspace_client().schemas.list(
+                catalog_name=catalog_name,
+            ):
+                if schema_matcher is not None and not schema_matcher(schema_info.name):
+                    continue
                 yield from self.list_tables(
                     name=name,
                     catalog_name=catalog_name,
-                    schema_name=schema.schema_name,
+                    schema_name=schema_info.name,
                     cache_ttl=cache_ttl,
                 )
             return
 
         uc = self.client.workspace_client().tables
-        glob_name = name.casefold() if isinstance(name, str) and "*" in name else None
+        matcher = name_matcher(name)
 
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
-            if name is not None:
-                info_name = info.name or ""
-                if glob_name is not None:
-                    if not fnmatchcase(info_name.casefold(), glob_name):
-                        continue
-                elif info_name != name:
-                    continue
+            if matcher is not None and not matcher(info.name):
+                continue
 
             tb = Table(
                 service=self,

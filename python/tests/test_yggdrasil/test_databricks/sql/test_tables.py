@@ -119,3 +119,62 @@ class TestTablesList:
             ("staging", "raw", "events"),
         ]
 
+    def test_list_tables_glob_catalog_fans_out_across_matching_catalogs(self, mock_client, mock_ws):
+        tables = Tables(client=mock_client, schema_name="sales")
+        mock_ws.catalogs.list.return_value = [
+            _cat_info("prod_main"),
+            _cat_info("prod_staging"),
+            _cat_info("dev_main"),
+        ]
+        mock_ws.tables.list.side_effect = [
+            [_tbl_info("orders", catalog="prod_main", schema="sales")],
+            [_tbl_info("events", catalog="prod_staging", schema="sales")],
+        ]
+
+        result = list(tables.list_tables(catalog_name="prod_*"))
+
+        assert [(t.catalog_name, t.table_name) for t in result] == [
+            ("prod_main", "orders"),
+            ("prod_staging", "events"),
+        ]
+
+    def test_list_tables_glob_schema_fans_out_across_matching_schemas(self, mock_client, mock_ws):
+        tables = Tables(client=mock_client, catalog_name="main")
+        mock_ws.schemas.list.return_value = [
+            _sch_info("sales_us", catalog="main"),
+            _sch_info("sales_eu", catalog="main"),
+            _sch_info("analytics", catalog="main"),
+        ]
+        mock_ws.tables.list.side_effect = [
+            [_tbl_info("orders", catalog="main", schema="sales_us")],
+            [_tbl_info("orders", catalog="main", schema="sales_eu")],
+        ]
+
+        result = list(tables.list_tables(schema_name="sales_*"))
+
+        assert [(t.schema_name, t.table_name) for t in result] == [
+            ("sales_us", "orders"),
+            ("sales_eu", "orders"),
+        ]
+
+    def test_list_tables_glob_name_with_middle_wildcard(self, tables, mock_ws):
+        mock_ws.tables.list.return_value = [
+            _tbl_info("prefix_a_table"),
+            _tbl_info("prefix_b_table"),
+            _tbl_info("other"),
+        ]
+
+        result = list(tables.list_tables(name="prefix_*_table"))
+
+        assert [t.table_name for t in result] == ["prefix_a_table", "prefix_b_table"]
+
+    def test_list_tables_star_name_matches_all(self, tables, mock_ws):
+        mock_ws.tables.list.return_value = [
+            _tbl_info("a"),
+            _tbl_info("b"),
+        ]
+
+        result = list(tables.list_tables(name="*"))
+
+        assert [t.table_name for t in result] == ["a", "b"]
+

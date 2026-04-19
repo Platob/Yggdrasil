@@ -164,6 +164,40 @@ class TestCatalogsList:
         host = mock_client_url = "https://adb-123.azuredatabricks.net"
         assert any("main" in k for k in _CATALOG_INFO_CACHE._store)  # noqa: SLF001
 
+    def test_list_name_exact_filter(self, cats, mock_ws):
+        mock_ws.catalogs.list.return_value = [
+            _cat_info("main"),
+            _cat_info("staging"),
+        ]
+        result = list(cats.list(name="staging"))
+        assert [c.catalog_name for c in result] == ["staging"]
+
+    def test_list_name_glob_is_case_insensitive(self, cats, mock_ws):
+        mock_ws.catalogs.list.return_value = [
+            _cat_info("Prod_Main"),
+            _cat_info("prod_staging"),
+            _cat_info("dev_main"),
+        ]
+        result = list(cats.list(name="prod_*"))
+        assert [c.catalog_name for c in result] == ["Prod_Main", "prod_staging"]
+
+    def test_list_name_star_matches_all(self, cats, mock_ws):
+        mock_ws.catalogs.list.return_value = [
+            _cat_info("main"),
+            _cat_info("hive"),
+        ]
+        result = list(cats.list(name="*"))
+        assert [c.catalog_name for c in result] == ["main", "hive"]
+
+    def test_list_name_middle_wildcard(self, cats, mock_ws):
+        mock_ws.catalogs.list.return_value = [
+            _cat_info("prefix_a_cat"),
+            _cat_info("prefix_b_cat"),
+            _cat_info("other"),
+        ]
+        result = list(cats.list(name="prefix_*_cat"))
+        assert [c.catalog_name for c in result] == ["prefix_a_cat", "prefix_b_cat"]
+
 
 # ===========================================================================
 # Unit — Catalog resource

@@ -26,14 +26,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from typing import Iterator, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo, TableType
 
 from yggdrasil.databricks.client import DatabricksService
-from yggdrasil.databricks.sql.sql_utils import quote_ident
+from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .view import View
@@ -380,12 +379,19 @@ class Views(DatabricksService):
     ) -> Iterator[View]:
         """Iterate over views in the resolved catalog/schema scope.
 
+        Any of ``name``, ``catalog_name``, or ``schema_name`` may be a
+        case-insensitive glob (``"v_*"``, ``"*_summary"``, ``"*"``).  Globbed
+        catalog/schema names fan out across the matching resources; ``None``
+        still means "all" at that level.
+
         Args:
-            name:         Optional view-name filter (glob when ``*`` present).
+            name:         Optional view-name filter (exact or glob).
             catalog_name: Override catalog (falls back to service default).
-                          When omitted, iterates every visible catalog.
+                          Accepts a glob to fan out across catalogs.
+                          When ``None``, iterates every visible catalog.
             schema_name:  Override schema (falls back to service default).
-                          When omitted, iterates every schema in the scope.
+                          Accepts a glob to fan out across schemas.
+                          When ``None``, iterates every schema in the scope.
             table_types:  Restrict which view subtypes to yield.  Defaults to
                           ``{VIEW, MATERIALIZED_VIEW, METRIC_VIEW}``.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
@@ -397,10 +403,10 @@ class Views(DatabricksService):
             frozenset(table_types) if table_types is not None else _VIEW_TABLE_TYPES
         )
 
-        if catalog_name is None:
+        if catalog_name is None or is_glob_pattern(catalog_name):
             from .catalogs import Catalogs
 
-            for catalog in Catalogs(client=self.client).list():
+            for catalog in Catalogs(client=self.client).list(name=catalog_name):
                 yield from self.list_views(
                     name=name,
                     catalog_name=catalog.catalog_name,
@@ -410,31 +416,31 @@ class Views(DatabricksService):
                 )
             return
 
-        if schema_name is None:
-            for schema in self.catalog(catalog_name).schemas():
+        if schema_name is None or is_glob_pattern(schema_name):
+            schema_matcher = name_matcher(schema_name)
+            for schema_info in self.client.workspace_client().schemas.list(
+                catalog_name=catalog_name,
+            ):
+                if schema_matcher is not None and not schema_matcher(schema_info.name):
+                    continue
                 yield from self.list_views(
                     name=name,
                     catalog_name=catalog_name,
-                    schema_name=schema.schema_name,
+                    schema_name=schema_info.name,
                     table_types=allowed,
                     cache_ttl=cache_ttl,
                 )
             return
 
         uc = self.client.workspace_client().tables
-        glob_name = name.casefold() if isinstance(name, str) and "*" in name else None
+        matcher = name_matcher(name)
 
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
             if info.table_type not in allowed:
                 continue
 
-            if name is not None:
-                info_name = info.name or ""
-                if glob_name is not None:
-                    if not fnmatchcase(info_name.casefold(), glob_name):
-                        continue
-                elif info_name != name:
-                    continue
+            if matcher is not None and not matcher(info.name):
+                continue
 
             vw = View(
                 service=self,
