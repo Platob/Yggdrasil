@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
@@ -441,6 +442,86 @@ class MapType(NestedType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else {}
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dict | None:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: "
+                        f"{value!r}"
+                    )
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse map from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse map from {value!r} for {type(self).__name__}."
+                    )
+                return None
+            value = decoded
+
+        # A JSON list of [key, value] pairs is a valid map representation.
+        if isinstance(value, (list, tuple)):
+            pairs: list[tuple[Any, Any]] = []
+            for entry in value:
+                if isinstance(entry, dict):
+                    k = entry.get(self.key_field.name, entry.get("key"))
+                    v = entry.get(self.value_field.name, entry.get("value"))
+                elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                    k, v = entry
+                else:
+                    if safe:
+                        raise ValueError(
+                            f"Cannot parse map entry {entry!r} for "
+                            f"{type(self).__name__}."
+                        )
+                    return None
+                pairs.append((k, v))
+        elif isinstance(value, dict):
+            pairs = list(value.items())
+        elif hasattr(value, "asDict"):
+            pairs = list(value.asDict(recursive=True).items())
+        else:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert {type(value).__name__} to map "
+                    f"for {type(self).__name__}: {value!r}."
+                )
+            return None
+
+        key_dtype = self.key_field.dtype
+        value_dtype = self.value_field.dtype
+        value_nullable = self.value_field.nullable
+
+        out: dict[Any, Any] = {}
+        for raw_key, raw_value in pairs:
+            converted_key = key_dtype.convert_pyobj(
+                raw_key, nullable=False, safe=safe
+            )
+            if converted_key is None:
+                if safe:
+                    raise ValueError(
+                        f"Map key {raw_key!r} converted to None for "
+                        f"{type(self).__name__}; map keys must be non-null."
+                    )
+                continue
+            out[converted_key] = value_dtype.convert_pyobj(
+                raw_value, nullable=value_nullable, safe=safe
+            )
+        return out
 
 
 _STRING_KEY_SOURCE_FIELD: "Field | None" = None

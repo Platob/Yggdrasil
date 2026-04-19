@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import decimal
+import re
 from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -12,6 +14,89 @@ from yggdrasil.io import SaveMode
 from .base import DataType
 from .id import DataTypeId
 from .support import get_polars, get_spark_sql
+
+
+# ---------------------------------------------------------------------------
+# Shared str/bytes coercion helpers for _convert_pyobj
+# ---------------------------------------------------------------------------
+
+def _bytes_to_str(value: bytes | bytearray | memoryview) -> str | None:
+    """Decode bytes-like to UTF-8 str, returning None on failure."""
+    try:
+        return bytes(value).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _coerce_str(value: Any) -> str | None:
+    """Return value as str when it is a str/bytes/bytearray/memoryview."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _bytes_to_str(value)
+    return None
+
+
+_BOOL_TRUE = frozenset({"true", "t", "1", "yes", "y", "on"})
+_BOOL_FALSE = frozenset({"false", "f", "0", "no", "n", "off", ""})
+
+
+_TEMPORAL_UNIT_SECONDS = {
+    "s": 1.0,
+    "ms": 1e-3,
+    "us": 1e-6,
+    "ns": 1e-9,
+}
+
+
+# Durations as "HH:MM:SS[.ffffff]" — optional leading minus.
+_DURATION_CLOCK_RE = re.compile(
+    r"^-?\d+:\d{1,2}:\d{1,2}(?:\.\d+)?$"
+)
+
+# ISO 8601 durations — PnDTnHnMnS (subset sufficient for round-tripping).
+_DURATION_ISO_RE = re.compile(
+    r"^(?P<sign>-?)P"
+    r"(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:T"
+    r"(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?"
+    r")?$"
+)
+
+
+def _parse_iso_duration(token: str) -> dt.timedelta | None:
+    match = _DURATION_ISO_RE.match(token.strip())
+    if match is None:
+        return None
+    parts = match.groupdict()
+    if not any(parts[k] for k in ("days", "hours", "minutes", "seconds")):
+        return None
+    sign = -1.0 if parts["sign"] == "-" else 1.0
+    days = float(parts["days"] or 0.0)
+    hours = float(parts["hours"] or 0.0)
+    minutes = float(parts["minutes"] or 0.0)
+    seconds = float(parts["seconds"] or 0.0)
+    return dt.timedelta(
+        days=sign * days,
+        hours=sign * hours,
+        minutes=sign * minutes,
+        seconds=sign * seconds,
+    )
+
+
+def _parse_clock_duration(token: str) -> dt.timedelta | None:
+    token = token.strip()
+    if not _DURATION_CLOCK_RE.match(token):
+        return None
+    negative = token.startswith("-")
+    body = token[1:] if negative else token
+    h_str, m_str, s_str = body.split(":")
+    total = float(h_str) * 3600 + float(m_str) * 60 + float(s_str)
+    if negative:
+        total = -total
+    return dt.timedelta(seconds=total)
 
 if TYPE_CHECKING:
     import polars
@@ -261,6 +346,9 @@ class NullType(PrimitiveType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> None:
+        return None
+
 
 @dataclass(frozen=True)
 class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
@@ -389,6 +477,48 @@ class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else b""
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> bytes | None:
+        if isinstance(value, bytes):
+            out = value
+        elif isinstance(value, (bytearray, memoryview)):
+            out = bytes(value)
+        elif isinstance(value, str):
+            out = value.encode("utf-8")
+        elif isinstance(value, bool):
+            out = b"\x01" if value else b"\x00"
+        elif isinstance(value, int):
+            length = max(1, (value.bit_length() + 8) // 8)
+            try:
+                out = value.to_bytes(length, byteorder="big", signed=value < 0)
+            except OverflowError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot encode {value!r} as bytes for {type(self).__name__}."
+                    )
+                return None
+        else:
+            try:
+                out = bytes(value)
+            except TypeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert value of type {type(value).__name__} to bytes "
+                        f"for {type(self).__name__}: {value!r}"
+                    )
+                return None
+
+        if self.byte_size is not None:
+            if len(out) < self.byte_size:
+                out = out.ljust(self.byte_size, b"\x00")
+            elif len(out) > self.byte_size:
+                if safe:
+                    raise ValueError(
+                        f"Binary value of length {len(out)} exceeds fixed "
+                        f"byte_size={self.byte_size}: {out!r}"
+                    )
+                out = out[: self.byte_size]
+        return out
 
 
 _TEMPORAL_TYPE_IDS = frozenset(
@@ -601,6 +731,34 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else ""
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            decoded = _bytes_to_str(value)
+            if decoded is None:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: {value!r}"
+                    )
+                return None
+            return decoded
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, decimal.Decimal)):
+            return str(value)
+        if isinstance(value, (dt.date, dt.time, dt.datetime, dt.timedelta)):
+            return value.isoformat()
+        try:
+            return str(value)
+        except Exception:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert value of type {type(value).__name__} to str "
+                    f"for {type(self).__name__}: {value!r}"
+                )
+            return None
+
 
 @dataclass(frozen=True)
 class BooleanType(PrimitiveType):
@@ -684,6 +842,33 @@ class BooleanType(PrimitiveType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else False
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> bool | None:
+        token = _coerce_str(value)
+        if token is not None:
+            normalized = token.strip().lower()
+            if normalized in _BOOL_TRUE:
+                return True
+            if normalized in _BOOL_FALSE:
+                return False
+            if safe:
+                raise ValueError(
+                    f"Cannot parse bool from {value!r}. "
+                    f"Expected one of true/false/yes/no/on/off/1/0."
+                )
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, decimal.Decimal):
+            return bool(value)
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to bool "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
 
 
 @dataclass(frozen=True)
@@ -989,6 +1174,65 @@ class IntegerType(NumericType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> int | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse int from empty string for {type(self).__name__}."
+                    )
+                return None
+            try:
+                # Go through int(str, 0) so "0x1a", "0b10", "0o7" are accepted;
+                # fall back to float→int when the token carries a decimal point
+                # or scientific notation.
+                return int(stripped, 0)
+            except ValueError:
+                try:
+                    return int(float(stripped))
+                except (TypeError, ValueError):
+                    if safe:
+                        raise ValueError(
+                            f"Cannot parse int from {value!r} for {type(self).__name__}."
+                        )
+                    return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            import math
+
+            if math.isnan(value) or math.isinf(value):
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert non-finite float {value!r} to int "
+                        f"for {type(self).__name__}."
+                    )
+                return None
+            return int(value)
+        if isinstance(value, decimal.Decimal):
+            if value.is_nan() or value.is_infinite():
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert non-finite Decimal {value!r} to int "
+                        f"for {type(self).__name__}."
+                    )
+                return None
+            return int(value)
+        if isinstance(value, dt.datetime):
+            return int(value.timestamp())
+        if isinstance(value, dt.timedelta):
+            return int(value.total_seconds())
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to int "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
+
     def autotag(self) -> dict[bytes, bytes]:
         tags = super().autotag()
         tags[b"signed"] = b"true" if self.signed else b"false"
@@ -1194,6 +1438,37 @@ class FloatingPointType(NumericType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0.0
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> float | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse float from empty string for {type(self).__name__}."
+                    )
+                return None
+            try:
+                return float(stripped)
+            except (TypeError, ValueError):
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse float from {value!r} for {type(self).__name__}."
+                    )
+                return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, decimal.Decimal):
+            return float(value)
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to float "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
+
 
 @dataclass(frozen=True)
 class DecimalType(NumericType):
@@ -1324,6 +1599,48 @@ class DecimalType(NumericType):
             return None
         from decimal import Decimal
         return Decimal(0)
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> decimal.Decimal | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse Decimal from empty string for {type(self).__name__}."
+                    )
+                return None
+            try:
+                return decimal.Decimal(stripped)
+            except (decimal.InvalidOperation, ValueError):
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse Decimal from {value!r} for {type(self).__name__}."
+                    )
+                return None
+        if isinstance(value, decimal.Decimal):
+            return value
+        if isinstance(value, bool):
+            return decimal.Decimal(int(value))
+        if isinstance(value, int):
+            return decimal.Decimal(value)
+        if isinstance(value, float):
+            import math
+
+            if math.isnan(value) or math.isinf(value):
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert non-finite float {value!r} to Decimal "
+                        f"for {type(self).__name__}."
+                    )
+                return None
+            return decimal.Decimal(str(value))
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to Decimal "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
 
     def autotag(self) -> dict[bytes, bytes]:
         tags = super().autotag()
@@ -1672,6 +1989,49 @@ class DateType(TemporalType):
             return None
         return dt.date(1970, 1, 1)
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dt.date | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse date from empty string for {type(self).__name__}."
+                    )
+                return None
+            try:
+                return dt.date.fromisoformat(stripped)
+            except ValueError:
+                pass
+            try:
+                return dt.datetime.fromisoformat(stripped.replace("Z", "+00:00")).date()
+            except ValueError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse date from {value!r} for {type(self).__name__}."
+                    )
+                return None
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return (dt.date(1970, 1, 1) + dt.timedelta(days=int(value)))
+            except (OverflowError, ValueError):
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert {value!r} to date "
+                        f"for {type(self).__name__}."
+                    )
+                return None
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to date "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
+
 
 @dataclass(frozen=True)
 class TimeType(TemporalType):
@@ -1745,6 +2105,47 @@ class TimeType(TemporalType):
         if nullable:
             return None
         return dt.time(0, 0, 0)
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dt.time | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse time from empty string for {type(self).__name__}."
+                    )
+                return None
+            try:
+                return dt.time.fromisoformat(stripped)
+            except ValueError:
+                pass
+            try:
+                return dt.datetime.fromisoformat(
+                    stripped.replace("Z", "+00:00")
+                ).time()
+            except ValueError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse time from {value!r} for {type(self).__name__}."
+                    )
+                return None
+        if isinstance(value, dt.datetime):
+            return value.time()
+        if isinstance(value, dt.time):
+            return value
+        if isinstance(value, dt.timedelta):
+            total = value.total_seconds() % 86400.0
+            hours, remainder = divmod(total, 3600.0)
+            minutes, seconds = divmod(remainder, 60.0)
+            micro = int(round((seconds - int(seconds)) * 1_000_000))
+            return dt.time(int(hours), int(minutes), int(seconds), micro)
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to time "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
 
 
 @dataclass(frozen=True)
@@ -1830,6 +2231,81 @@ class TimestampType(TemporalType):
             return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         return dt.datetime(1970, 1, 1)
 
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dt.datetime | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse timestamp from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            # Accept trailing 'Z' as UTC and 'T'/' ' separators interchangeably.
+            normalized = stripped.replace("Z", "+00:00")
+            parsed: dt.datetime | None = None
+            try:
+                parsed = dt.datetime.fromisoformat(normalized)
+            except ValueError:
+                try:
+                    parsed = dt.datetime.fromisoformat(normalized.replace(" ", "T"))
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                try:
+                    date_only = dt.date.fromisoformat(stripped)
+                    parsed = dt.datetime(date_only.year, date_only.month, date_only.day)
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse timestamp from {value!r} for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            return self._apply_tz(parsed)
+        if isinstance(value, dt.datetime):
+            return self._apply_tz(value)
+        if isinstance(value, dt.date):
+            return self._apply_tz(
+                dt.datetime(value.year, value.month, value.day)
+            )
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            factor = _TEMPORAL_UNIT_SECONDS.get(self.unit, 1e-6)
+            try:
+                seconds = float(value) * factor
+                ts = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                if safe:
+                    raise ValueError(
+                        f"Cannot convert epoch value {value!r} to timestamp "
+                        f"for {type(self).__name__}."
+                    )
+                return None
+            if self.tz is None:
+                return ts.replace(tzinfo=None)
+            return self._apply_tz(ts)
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to timestamp "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
+
+    def _apply_tz(self, value: dt.datetime) -> dt.datetime:
+        # Naive-target: strip tz. Aware-target: attach UTC when caller gave a
+        # naive value, otherwise preserve the original offset — the downstream
+        # Arrow cast normalizes to ``self.tz``.
+        if self.tz is None:
+            if value.tzinfo is None:
+                return value
+            return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value
+
 
 @dataclass(frozen=True)
 class DurationType(TemporalType):
@@ -1902,4 +2378,49 @@ class DurationType(TemporalType):
         if nullable:
             return None
         return dt.timedelta(0)
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dt.timedelta | None:
+        token = _coerce_str(value)
+        if token is not None:
+            stripped = token.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse duration from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            parsed = _parse_iso_duration(stripped) or _parse_clock_duration(stripped)
+            if parsed is not None:
+                return parsed
+            # Plain numeric string → interpret as count of self.unit.
+            try:
+                numeric = float(stripped)
+            except ValueError:
+                numeric = None
+            if numeric is not None:
+                return self._timedelta_from_numeric(numeric)
+            if safe:
+                raise ValueError(
+                    f"Cannot parse duration from {value!r} for {type(self).__name__}."
+                )
+            return None
+        if isinstance(value, dt.timedelta):
+            return value
+        if isinstance(value, bool):
+            return self._timedelta_from_numeric(float(value))
+        if isinstance(value, (int, float)):
+            return self._timedelta_from_numeric(float(value))
+        if isinstance(value, decimal.Decimal):
+            return self._timedelta_from_numeric(float(value))
+        if safe:
+            raise ValueError(
+                f"Cannot convert {type(value).__name__} to duration "
+                f"for {type(self).__name__}: {value!r}."
+            )
+        return None
+
+    def _timedelta_from_numeric(self, value: float) -> dt.timedelta:
+        factor = _TEMPORAL_UNIT_SECONDS.get(self.unit, 1e-6)
+        return dt.timedelta(seconds=value * factor)
 
