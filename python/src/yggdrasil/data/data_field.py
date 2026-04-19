@@ -1328,26 +1328,28 @@ class Field(BaseMetadata, BaseChildrenFields):
         self,
         series: "polars.Series",
         options: "CastOptions | None" = None,
+        default_scalar: Any = None,
         **more,
     ):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_series(series, options=options.with_target(self))
-        filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
+        filled = self.fill_polars_array_nulls(casted, default_scalar=default_scalar)
         return filled.alias(self.name) if self.name and self.name != DEFAULT_FIELD_NAME else filled
 
     def cast_polars_expr(
         self,
         series: "polars.Expr",
         options: "CastOptions | None" = None,
+        default_scalar: Any = None,
         **more,
     ):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_expr(series, options=options.with_target(self))
-        filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
+        filled = self.fill_polars_array_nulls(casted, default_scalar=default_scalar)
         return filled.alias(self.name) if self.name and self.name != DEFAULT_FIELD_NAME else filled
 
     def cast_polars_tabular(
@@ -1365,13 +1367,14 @@ class Field(BaseMetadata, BaseChildrenFields):
         self,
         series: "pd.Series",
         options: "CastOptions | None" = None,
+        default_scalar: Any = None,
         **more,
     ):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_pandas_series(series, options=options.with_target(self))
-        filled = self.fill_pandas_series_nulls(casted, default_scalar=self.default_arrow_scalar)
+        filled = self.fill_pandas_series_nulls(casted, default_scalar=default_scalar)
         if self.name and self.name != DEFAULT_FIELD_NAME:
             filled.name = self.name
         return filled
@@ -1391,6 +1394,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         self,
         column: "ps.Column",
         options: "CastOptions | None" = None,
+        default_scalar: Any = None,
         **more,
     ):
         if self.dtype.type_id == DataTypeId.OBJECT:
@@ -1398,7 +1402,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         options = get_cast_options_class().check(options=options, **more)
         options = options.with_target(self).check_source(column)
         casted = self.dtype.cast_spark_column(column, options=options)
-        filled = self.fill_spark_column_nulls(casted, default_scalar=self.default_arrow_scalar)
+        filled = self.fill_spark_column_nulls(casted, default_scalar=default_scalar)
         return filled.alias(self.name) if self.name and self.name != DEFAULT_FIELD_NAME else filled
 
     def cast_spark_tabular(
@@ -1462,7 +1466,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         self,
         series: "polars.Series | polars.Expr",
         *,
-        default_scalar: pa.Scalar | None = None,
+        default_scalar: Any = None,
     ):
         if default_scalar is None and self.has_default:
             default_scalar = self.default

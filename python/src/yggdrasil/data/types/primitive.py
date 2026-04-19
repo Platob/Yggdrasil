@@ -476,7 +476,12 @@ class BinaryType(_JsonEncodeTargetMixin, PrimitiveType):
         return "BINARY"
 
     def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else b""
+        if nullable:
+            return None
+
+        if self.byte_size is not None and self.byte_size > 0:
+            return b"\x00" * self.byte_size
+        return b""
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> bytes | None:
         if isinstance(value, bytes):
@@ -729,7 +734,12 @@ class StringType(_JsonEncodeTargetMixin, PrimitiveType):
         return "STRING"
 
     def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else ""
+        if nullable:
+            return None
+
+        if self.byte_size is not None and self.byte_size > 0:
+            return "X" * self.byte_size
+        return ""
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> str | None:
         if isinstance(value, str):
