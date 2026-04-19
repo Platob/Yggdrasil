@@ -12,6 +12,7 @@ avoided so ingestion stays fast even on wide, deep inputs.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +33,11 @@ __all__ = [
     "SPARK_DATETIME_FORMATS",
     "SPARK_DATE_FORMATS",
     "SPARK_TIME_FORMATS",
+    "ISO_DURATION_DAYS_PER_YEAR",
+    "ISO_DURATION_DAYS_PER_MONTH",
+    "ISO_DURATION_DAYS_PER_WEEK",
     "nullify_empty_strings",
+    "parse_iso_duration_to_nanos",
     "arrow_str_to_timestamp",
     "arrow_str_to_date",
     "arrow_str_to_time",
@@ -179,6 +184,90 @@ _TIME_UNIT_PER_SECOND = {
     "us": 1_000_000,
     "ns": 1_000_000_000,
 }
+
+# Calendar units in ISO 8601 durations (Y, M, W) have no fixed second-count.
+# Real calendars vary; for ingestion into a fixed-width ``duration[unit]``
+# we collapse them to whole-day defaults — the convention most data sources
+# (Postgres ``interval``, ``isodate``, Java ``Duration.parse``) settle on.
+ISO_DURATION_DAYS_PER_YEAR = 365
+ISO_DURATION_DAYS_PER_MONTH = 30
+ISO_DURATION_DAYS_PER_WEEK = 7
+
+# ``P[n]Y[n]M[n]W[n]D[T[n]H[n]M[n]S]``. Fields are independently optional but
+# at least one must be present (handled in :func:`parse_iso_duration_to_nanos`
+# — the regex alone would happily match a bare ``P``). Decimals are accepted
+# on every component, including the ISO-permitted comma separator. A ``+`` /
+# ``-`` sign prefix is a common extension; we accept both.
+_RE_ISO_DURATION = re.compile(
+    r"^(?P<sign>[+-])?P"
+    r"(?:(?P<years>\d+(?:[.,]\d+)?)Y)?"
+    r"(?:(?P<months>\d+(?:[.,]\d+)?)M)?"
+    r"(?:(?P<weeks>\d+(?:[.,]\d+)?)W)?"
+    r"(?:(?P<days>\d+(?:[.,]\d+)?)D)?"
+    r"(?:T"
+    r"(?:(?P<hours>\d+(?:[.,]\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:[.,]\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:[.,]\d+)?)S)?"
+    r")?$",
+    re.IGNORECASE,
+)
+
+# Looks-like-an-integer for the count-of-unit fast path. Accepts an optional
+# sign and surrounding whitespace; rejects decimals so they fall through to
+# the float-parse branch.
+_RE_INT_LITERAL = re.compile(r"^[+-]?\d+$")
+
+
+def parse_iso_duration_to_nanos(value: str) -> int | None:
+    """Parse an ISO 8601 duration string to total nanoseconds.
+
+    Recognises the standard ``P[n]Y[n]M[n]W[n]D[T[n]H[n]M[n]S]`` shape and a
+    handful of common extensions: leading ``+`` / ``-`` sign, ``,`` as decimal
+    separator, lowercase letters, and decimals on any component.
+
+    Calendar fields collapse via the module-level day defaults
+    (:data:`ISO_DURATION_DAYS_PER_YEAR` etc.) — ``P1Y`` becomes 365 days,
+    ``P1M`` becomes 30 days, ``P1W`` stays at 7 days. The ISO spec leaves
+    those values implementation-defined; we pick the widely-used "30/365"
+    convention rather than tracking a reference date the caller doesn't have.
+
+    Returns ``None`` when *value* is not a recognisable ISO duration, when
+    every component is absent (``"P"`` / ``"PT"`` carry no information), or
+    when *value* is empty / ``None``-ish.
+    """
+    if not value:
+        return None
+
+    m = _RE_ISO_DURATION.fullmatch(value.strip())
+    if m is None:
+        return None
+
+    parts = {
+        name: m.group(name)
+        for name in ("years", "months", "weeks", "days", "hours", "minutes", "seconds")
+    }
+    if not any(parts.values()):
+        # Bare "P" / "PT" — syntactically the regex permits it, but it
+        # encodes no duration. Treat as unparseable so the caller can null it.
+        return None
+
+    sign = -1 if m.group("sign") == "-" else 1
+
+    def _f(name: str) -> float:
+        raw = parts[name]
+        return 0.0 if raw is None else float(raw.replace(",", "."))
+
+    total_seconds = (
+        _f("years") * ISO_DURATION_DAYS_PER_YEAR * 86400.0
+        + _f("months") * ISO_DURATION_DAYS_PER_MONTH * 86400.0
+        + _f("weeks") * ISO_DURATION_DAYS_PER_WEEK * 86400.0
+        + _f("days") * 86400.0
+        + _f("hours") * 3600.0
+        + _f("minutes") * 60.0
+        + _f("seconds")
+    )
+
+    return int(round(sign * total_seconds * 1_000_000_000))
 
 
 def _is_chunked(array: Any) -> bool:
@@ -496,18 +585,64 @@ def arrow_str_to_duration(
     array: pa.Array | pa.ChunkedArray,
     unit: str = "us",
 ) -> pa.Array | pa.ChunkedArray:
-    """Parse an integer-valued string array into ``duration[unit]``.
+    """Parse a string array into ``duration[unit]``.
 
-    Real duration string parsing (``"PT15M"``, ``"1d 02:30"``) is scalar-only
-    via :mod:`yggdrasil.data.cast.datetime`. For bulk ingest we accept the
-    common case where the column holds stringified counts in *unit*.
+    Recognises three shapes per row:
+
+    * Plain integer (``"60"``) — interpreted as a count in *unit*. This is
+      the historical behaviour; pyarrow handles it vectorized when the whole
+      column conforms.
+    * Plain decimal (``"1.5"``) — interpreted as a float count in *unit*,
+      rounded to the nearest integer.
+    * ISO 8601 duration (``"PT15M"``, ``"P1D"``, ``"P1Y2M3DT4H5.5S"``,
+      ``"-PT30S"``) — calendar fields collapse to whole days using the
+      module-level ``ISO_DURATION_DAYS_PER_{YEAR,MONTH,WEEK}`` defaults.
+      See :func:`parse_iso_duration_to_nanos` for the exact contract.
+
+    Rows that match none of the above are nulled.
     """
     target = pa.duration(unit)
+    nanos_per_unit = 1_000_000_000 // _TIME_UNIT_PER_SECOND[unit]
 
     def _one(chunk: pa.Array) -> pa.Array:
         chunk = _ensure_string(chunk)
         chunk = nullify_empty_strings(chunk)
-        as_int = pc.cast(chunk, pa.int64(), safe=False)
+
+        # Fast path: every non-null entry is a plain integer literal. This is
+        # the common bulk-ingest shape and stays fully vectorized.
+        try:
+            as_int = pc.cast(chunk, pa.int64(), safe=True)
+            return pc.cast(as_int, target)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            pass
+
+        # Mixed / non-numeric column: fall back to per-row parsing. ISO 8601
+        # durations are short and the regex is anchored, so this stays cheap
+        # in practice — and it's the only way to honour the calendar-unit
+        # defaults without a vectorized regex kernel.
+        units: list[int | None] = []
+        for raw in chunk.to_pylist():
+            if raw is None:
+                units.append(None)
+                continue
+            s = raw.strip()
+            if not s:
+                units.append(None)
+                continue
+            if _RE_INT_LITERAL.match(s):
+                units.append(int(s))
+                continue
+            iso_nanos = parse_iso_duration_to_nanos(s)
+            if iso_nanos is not None:
+                units.append(iso_nanos // nanos_per_unit)
+                continue
+            try:
+                # Plain float in *unit* — last resort before nulling.
+                units.append(int(round(float(s))))
+            except ValueError:
+                units.append(None)
+
+        as_int = pa.array(units, type=pa.int64())
         return pc.cast(as_int, target)
 
     return _apply_chunked(array, _one)
