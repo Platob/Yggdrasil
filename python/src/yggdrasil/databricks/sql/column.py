@@ -140,12 +140,13 @@ class Column:
         rely: bool = False,
         timeseries: bool = False,
     ):
-        query = self.add_primary_key_ddl(
+        """Create a single-column PRIMARY KEY constraint via the UC API."""
+        self.table.set_primary_key(
+            [self.name],
             constraint_name=constraint_name,
             rely=rely,
-            timeseries=timeseries,
+            timeseries=self.name if timeseries else None,
         )
-        self.engine.execute(query)
         return self
 
     def drop_primary_key_ddl(
@@ -168,11 +169,8 @@ class Column:
         if_exists: bool = True,
         cascade: bool = False,
     ):
-        query = self.drop_primary_key_ddl(
-            if_exists=if_exists,
-            cascade=cascade,
-        )
-        self.engine.execute(query)
+        """Drop the table's PRIMARY KEY constraint via the UC API."""
+        self.table.drop_primary_key(if_exists=if_exists, cascade=cascade)
         return self
 
     def add_foreign_key_ddl(
@@ -289,18 +287,28 @@ class Column:
         on_update_no_action: bool = False,
         on_delete_no_action: bool = False,
     ):
-        ref_table, ref_column = self._resolve_ref_args(column, ref_table, ref_column)
+        """Create a single-column FOREIGN KEY constraint via the UC API."""
+        from .constraints_api import apply_foreign_key
+        from .types import ForeignKeySpec
 
-        query = self.add_foreign_key_ddl(
-            ref_table=ref_table,
-            ref_column=ref_column,
-            constraint_name=constraint_name,
-            rely=rely,
-            match_full=match_full,
-            on_update_no_action=on_update_no_action,
-            on_delete_no_action=on_delete_no_action,
+        ref_table, ref_column = self._resolve_ref_args(column, ref_table, ref_column)
+        ref_column_name = (
+            ref_column.name if isinstance(ref_column, Column) else ref_column
         )
-        self.engine.execute(query)
+
+        apply_foreign_key(
+            self.table,
+            ForeignKeySpec(
+                column=self.name,
+                ref=f"{ref_table.full_name()}.{ref_column_name}",
+                constraint_name=constraint_name,
+                rely=rely,
+                match_full=match_full,
+                on_update_no_action=on_update_no_action,
+                on_delete_no_action=on_delete_no_action,
+            ),
+        )
+        self.table._reset_cache(invalidate_cache=True)
         return self
 
     def drop_foreign_key_ddl(
@@ -320,8 +328,19 @@ class Column:
         *,
         if_exists: bool = True,
     ):
-        query = self.drop_foreign_key_ddl(if_exists=if_exists)
-        self.engine.execute(query)
+        """Drop this column's FOREIGN KEY constraint via the UC API."""
+        from .constraints_api import delete_constraint
+
+        name = self.table._foreign_key_constraint_name(self.name)
+        if name is None:
+            if not if_exists:
+                raise ValueError(
+                    f"{self.table!r} has no FOREIGN KEY constraint on {self.name!r}"
+                )
+            return self
+
+        delete_constraint(self.table, name, if_exists=if_exists)
+        self.table._reset_cache(invalidate_cache=True)
         return self
 
     def rename(self, new_name: str) -> "Column":
