@@ -380,6 +380,13 @@ class ExtensionType(DataType):
         base.update(self._own_field_values())
         return base
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        name = type(self).extension_name
+        if name:
+            tags[b"extension"] = name.encode("utf-8")
+        return tags
+
     # ------------------------------------------------------------------
     # Merge
     # ------------------------------------------------------------------

@@ -513,6 +513,11 @@ class ISOType(DataType):
             "iso": type(self).iso_name,
         }
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"iso"] = type(self).iso_name.encode("utf-8")
+        return tags
+
     # ------------------------------------------------------------------
     # Repr / str
     # ------------------------------------------------------------------

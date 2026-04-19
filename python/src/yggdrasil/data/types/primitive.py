@@ -155,6 +155,12 @@ class PrimitiveType(DataType, ABC):
             base["byte_size"] = self.byte_size
         return base
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        if self.byte_size is not None:
+            tags[b"byte_size"] = str(self.byte_size).encode("utf-8")
+        return tags
+
     def _merge_with_same_id(
         self,
         other: "DataType",
@@ -848,6 +854,11 @@ class IntegerType(NumericType):
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else 0
 
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"signed"] = b"true" if self.signed else b"false"
+        return tags
+
 
 @dataclass(frozen=True)
 class FloatingPointType(NumericType):
@@ -1082,6 +1093,12 @@ class DecimalType(NumericType):
             return None
         from decimal import Decimal
         return Decimal(0)
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        tags[b"precision"] = str(self.precision).encode("utf-8")
+        tags[b"scale"] = str(self.scale).encode("utf-8")
+        return tags
 
 
 _TEMPORAL_UNIT_ORDER = {
@@ -1340,6 +1357,14 @@ class TemporalType(PrimitiveType, ABC):
             "unit": self.unit,
             "tz": self.tz,
         }
+
+    def autotag(self) -> dict[bytes, bytes]:
+        tags = super().autotag()
+        if self.unit:
+            tags[b"unit"] = self.unit.encode("utf-8")
+        if self.tz:
+            tags[b"tz"] = self.tz.encode("utf-8")
+        return tags
 
 
 @dataclass(frozen=True)

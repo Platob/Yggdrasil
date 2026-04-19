@@ -83,6 +83,8 @@ _FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
 )
 
 
+
+
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
     return (
         isinstance(obj, type)
@@ -320,6 +322,22 @@ class DataType(BaseChildrenFields, ABC):
             "id": self.type_id.value,
             "name": self.type_id.name,
         }
+
+    def autotag(self) -> dict[bytes, bytes]:
+        """Return a dict of Databricks-friendly tags derived from this type.
+
+        These are *auto*-tags: they describe shape, not intent. The base
+        output is a single ``kind`` key — a lowercase form of ``type_id``
+        (``"integer"``, ``"string"``, ``"timestamp"``, ``"array"``, ...) that
+        tag-based Unity Catalog policies can match on. Subclasses extend this
+        with dtype-specific detail (``unit``, ``tz``, ``precision`` /
+        ``scale``, ``signed``, ``srid``, ...) — always via ``super().autotag()``
+        so the ``kind`` key stays present.
+
+        Keys are bare (no ``t:`` prefix) — prefixing is handled by
+        ``BaseMetadata.update_tags`` when these land on a Field.
+        """
+        return {b"kind": self.type_id.name.lower().encode("utf-8")}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.to_arrow()})"
