@@ -562,11 +562,7 @@ class SQLEngine(DatabricksService):
                 for key, cfg in items.items()
             )
 
-        batch = StatementBatch.from_statements(
-            items,
-            factory=lambda cfg: StatementResult(statement=cfg),
-            engine=self,
-        )
+        batch = StatementBatch.from_statements(items, engine=self)
 
         # Build a runner only when the caller overrode one of the engine's
         # per-call defaults.  Otherwise the batch's default runner
@@ -594,16 +590,14 @@ class SQLEngine(DatabricksService):
                     result, wait=False, raise_error=raise_error, **overrides,
                 )
 
-        try:
-            batch.start(
-                parallel=parallel,
-                wait=wait,
-                raise_error=raise_error,
-                runner=runner,
-            )
-        except Exception:
-            batch.cancel()
-            raise
+        # ``batch.start`` owns the full lifecycle — it submits, drives
+        # polling, and cancels everything on failure before re-raising.
+        batch.start(
+            parallel=parallel,
+            wait=wait,
+            raise_error=raise_error,
+            runner=runner,
+        )
 
         if owned_staging:
             for result in batch.results.values():
@@ -611,6 +605,26 @@ class SQLEngine(DatabricksService):
                 result._maybe_cleanup_temporary_tables()
 
         return batch
+
+    def statement_result(
+        self,
+        statement: "str | PreparedStatement | StatementResult" = "",
+        *,
+        parameters: Mapping[str, Any] | None = None,
+        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+    ) -> StatementResult:
+        """Build an unstarted :class:`StatementResult` bound to this engine.
+
+        Accepts a string, a :class:`PreparedStatement` config, or an
+        existing :class:`StatementResult` (in which case extra ``parameters``
+        / ``temporary_tables`` are merged onto its config).  Used as the
+        default factory for :class:`StatementBatch`.
+        """
+        return StatementResult.prepare(
+            statement,
+            parameters=parameters,
+            temporary_tables=temporary_tables,
+        )
 
     def prepare(
         self,
