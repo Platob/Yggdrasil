@@ -760,7 +760,7 @@ class Table(GrantsMixin):
         """
         mode = SaveMode.parse(mode, SaveMode.AUTO)
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
-        update_dtype = mode in (SaveMode.UPSERT, SaveMode.AUTO, SaveMode.OVERWRITE)
+        update_dtype = mode in (SaveMode.UPSERT, SaveMode.OVERWRITE)
         drop_missing = mode == SaveMode.OVERWRITE
 
         rename_statements: list[str] = []

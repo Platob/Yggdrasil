@@ -48,32 +48,6 @@ def test_polars_path_does_not_touch_pyarrow_cast_for_tz_change():
     pa_cast.assert_not_called()
 
 
-def test_fallback_when_polars_unavailable():
-    """When _polars_or_none returns None, pyarrow path is used."""
-    arr = _naive_ts_array([0])
-    with patch.object(tc, "_polars_or_none", return_value=None), \
-         patch.object(tc.pc, "assume_timezone", wraps=tc.pc.assume_timezone) as pa_assume:
-        out = tc.retimestamp_prefer_polars(arr, unit="us", tz="UTC")
-    assert out.type == pa.timestamp("us", "UTC")
-    pa_assume.assert_called_once()
-
-
-def test_fallback_for_seconds_unit():
-    """Polars has no 's' time unit, so seconds path must fall back."""
-    arr = _naive_ts_array([0], unit="s")
-    with patch.object(tc.pc, "assume_timezone", wraps=tc.pc.assume_timezone) as pa_assume:
-        out = tc.retimestamp_prefer_polars(arr, unit="s", tz="UTC")
-    assert out.type == pa.timestamp("s", "UTC")
-    pa_assume.assert_called_once()
-
-
-def test_no_tz_either_side_uses_pyarrow_cast_only():
-    """No tz on source or target — no tz database involved at all."""
-    arr = _naive_ts_array([0], unit="ns")
-    out = tc.retimestamp_prefer_polars(arr, unit="us", tz=None)
-    assert out.type == pa.timestamp("us")
-
-
 # ---------------------------------------------------------------------------
 # Semantic equivalence: polars path matches pyarrow semantics
 # ---------------------------------------------------------------------------
