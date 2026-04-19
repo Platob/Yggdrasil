@@ -315,13 +315,26 @@ class Table(GrantsMixin):
         return (time.time() - fetched_at) < INFOS_TTL
 
     def _store_infos(self, infos: TableInfo) -> TableInfo:
-        """Populate the lightweight infos + columns caches."""
+        """Populate the lightweight infos + columns caches.
+
+        ``_infos_fetched_at`` is the single TTL marker for every cached
+        view derived from this fetch (table tags, column tags, and
+        ``table_constraints``). The tag caches remain lazy so we don't
+        pay an N+1 round-trip tax on every ``infos`` refresh — they
+        populate on first access and share the same freshness horizon.
+        """
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         object.__setattr__(self, "_columns", [
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
         ])
+        # Tags were invalidated when infos expired — a fresh ``infos``
+        # means they need to be (re)loaded on next access.
+        object.__setattr__(self, "_tags", None)
+        object.__setattr__(self, "_tags_fetched_at", None)
+        object.__setattr__(self, "_column_tags", None)
+        object.__setattr__(self, "_column_tags_fetched_at", None)
         return infos
 
     @property
@@ -339,7 +352,7 @@ class Table(GrantsMixin):
         return info
 
     # =========================================================================
-    # Entity-tag assignments — lazy, TTL-cached
+    # Entity-tag assignments — lazy, share the ``infos`` TTL
     # =========================================================================
 
     def _list_tag_assignments(
@@ -353,17 +366,13 @@ class Table(GrantsMixin):
         are logged and produce an empty tuple; the caller can treat the
         absence of tags as "none known".
         """
-        tags_api = getattr(self.client.workspace_client(), "entity_tag_assignments", None)
-        if tags_api is None:
-            return ()
-        try:
-            return tuple(tags_api.list(entity_type=entity_type, entity_name=entity_name))
-        except Exception:
-            logger.warning(
-                "Failed to list %s tag assignments for %r",
-                entity_type, entity_name, exc_info=True,
-            )
-            return ()
+        from .tags_api import list_tag_assignments
+
+        return list_tag_assignments(
+            self.client,
+            entity_type=entity_type,
+            entity_name=entity_name,
+        )
 
     @property
     def tags(self) -> tuple[Any, ...]:
@@ -381,26 +390,38 @@ class Table(GrantsMixin):
         """Per-column entity-tag assignments — TTL-cached, lazy-loaded.
 
         Only columns that have at least one tag assignment appear in the
-        returned mapping.
+        returned mapping. Fetches are parallelised so wide tables pay
+        one aggregate wall-clock round trip rather than N sequential ones.
         """
         if self._column_tags is not None and self._is_fresh(self._column_tags_fetched_at):
             return self._column_tags
 
         full_name = self.full_name()
-        assignments: dict[str, tuple[Any, ...]] = {}
+        jobs: dict[str, Any] = {}
         for col_info in (self.infos.columns or []):
             col_name = col_info.name
             if not col_name:
                 continue
-            col_assignments = self._list_tag_assignments(
-                "columns", f"{full_name}.{col_name}",
-            )
+            jobs[col_name] = Job.make(
+                self._list_tag_assignments,
+                "columns",
+                f"{full_name}.{col_name}",
+            ).fire_and_forget()
+
+        assignments: dict[str, tuple[Any, ...]] = {}
+        for col_name, job in jobs.items():
+            col_assignments = tuple(job.wait() or ())
             if col_assignments:
                 assignments[col_name] = col_assignments
 
         object.__setattr__(self, "_column_tags", assignments)
         object.__setattr__(self, "_column_tags_fetched_at", time.time())
         return assignments
+
+    @property
+    def table_constraints(self) -> tuple[Any, ...]:
+        """Table constraints (PK / FK / named) from ``TableInfo``."""
+        return tuple(getattr(self.infos, "table_constraints", None) or ())
 
     # =========================================================================
     # Arrow schema introspection
@@ -437,16 +458,116 @@ class Table(GrantsMixin):
 
     @property
     def data_schema(self) -> DataSchema:
-        return DataSchema.from_any_fields(
-            [c.field for c in self.columns],
-            metadata={
-                b"name": self.table_name.encode(),
-                b"engine": b"databricks",
-                b"catalog_name": self.catalog_name.encode(),
-                b"schema_name": self.schema_name.encode(),
-                b"table_name": self.table_name.encode(),
-            }
-        )
+        """Return the field schema enriched with UC metadata.
+
+        Per-field tags stamped by this method:
+
+        - ``primary_key`` — ``b"true"`` when the field is part of the
+          table's PRIMARY KEY constraint.
+        - ``foreign_key`` — ``b"<catalog>.<schema>.<ref_table>.<ref_col>"``
+          for any column that is the child of a FOREIGN KEY constraint.
+        - any user-assigned tag keys from
+          :attr:`column_tags` (one ``EntityTagAssignment`` → one
+          ``tag_key``/``tag_value`` pair on the field).
+
+        Schema-level metadata picks up ``tag:<key>`` entries for each
+        table-level tag assignment, plus ``primary_key`` /
+        ``foreign_key`` lists so downstream consumers can rebuild the
+        full constraint graph without extra round trips.
+        """
+        pk_columns, fk_refs = self._constraint_summary()
+        col_tags = self.column_tags
+
+        fields: list[Field] = []
+        for column in self.columns:
+            base = column.field
+            extra_tags: dict[bytes, bytes] = {}
+
+            if column.name in pk_columns:
+                extra_tags[b"primary_key"] = b"true"
+
+            fk_ref = fk_refs.get(column.name)
+            if fk_ref:
+                extra_tags[b"foreign_key"] = fk_ref.encode("utf-8")
+
+            for assignment in col_tags.get(column.name, ()):
+                key = getattr(assignment, "tag_key", None)
+                if not key:
+                    continue
+                value = getattr(assignment, "tag_value", None) or ""
+                extra_tags[key.encode("utf-8")] = str(value).encode("utf-8")
+
+            if extra_tags:
+                fields.append(
+                    base.copy(
+                        metadata=dict(base.metadata or {}),
+                        tags=extra_tags,
+                    )
+                )
+            else:
+                fields.append(base)
+
+        metadata: dict[bytes, bytes] = {
+            b"name": self.table_name.encode(),
+            b"engine": b"databricks",
+            b"catalog_name": self.catalog_name.encode(),
+            b"schema_name": self.schema_name.encode(),
+            b"table_name": self.table_name.encode(),
+        }
+        if pk_columns:
+            metadata[b"primary_key"] = ",".join(pk_columns).encode("utf-8")
+        if fk_refs:
+            # Dot-joined ``col=ref`` pairs keep the format parseable by
+            # ``ForeignKeySpec.from_any`` without a JSON round trip.
+            metadata[b"foreign_key"] = ",".join(
+                f"{col}={ref}" for col, ref in fk_refs.items()
+            ).encode("utf-8")
+        for assignment in self.tags:
+            key = getattr(assignment, "tag_key", None)
+            if not key:
+                continue
+            value = getattr(assignment, "tag_value", None) or ""
+            metadata[f"tag:{key}".encode("utf-8")] = str(value).encode("utf-8")
+
+        return DataSchema.from_any_fields(fields, metadata=metadata)
+
+    def _constraint_summary(
+        self,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Flatten ``TableInfo.table_constraints`` into ``(pk_cols, fk_refs)``.
+
+        ``fk_refs`` maps child column → ``parent_table.parent_column`` (the
+        first parent column when the FK is multi-column — this matches the
+        single-column ``foreign_key`` metadata convention used by
+        :class:`~yggdrasil.data.Field`).
+        """
+        pk_columns: tuple[str, ...] = ()
+        fk_refs: dict[str, str] = {}
+        for constraint in self.table_constraints:
+            pk = getattr(constraint, "primary_key_constraint", None)
+            if pk is not None:
+                cols = getattr(pk, "child_columns", None) or ()
+                if cols:
+                    pk_columns = tuple(cols)
+                continue
+
+            fk = getattr(constraint, "foreign_key_constraint", None)
+            if fk is not None:
+                child_cols = getattr(fk, "child_columns", None) or ()
+                parent_table = getattr(fk, "parent_table", None) or ""
+                parent_cols = getattr(fk, "parent_columns", None) or ()
+                if not (child_cols and parent_table and parent_cols):
+                    continue
+                # Zip child→parent column-wise; pad parent_cols with the
+                # last element if the API ever returns mismatched lengths.
+                for idx, child in enumerate(child_cols):
+                    parent = (
+                        parent_cols[idx]
+                        if idx < len(parent_cols)
+                        else parent_cols[-1]
+                    )
+                    fk_refs[child] = f"{parent_table}.{parent}"
+        return pk_columns, fk_refs
 
     @property
     def data_field(self):
@@ -665,9 +786,48 @@ class Table(GrantsMixin):
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
     ) -> "Table":
+        """Apply table-level tags via the UC ``entity_tag_assignments`` API.
+
+        The legacy ``ALTER TABLE ... SET TAGS (...)`` DDL is no longer
+        executed; ``set_tags_ddl`` is retained for dry-run / logging only.
+        ``tag_collation`` is accepted for API compatibility and ignored.
+        """
+        del tag_collation  # tag collations are a SQL-literal concern only.
         if not tags:
             return self
-        self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
+
+        from .tags_api import apply_tags
+
+        apply_tags(
+            self.client,
+            entity_type="tables",
+            entity_name=self.full_name(),
+            tags=tags,
+        )
+        # Tags were mutated — drop the per-entity tag cache so the next
+        # accessor pulls the fresh assignments from the server.
+        object.__setattr__(self, "_tags", None)
+        object.__setattr__(self, "_tags_fetched_at", None)
+        return self
+
+    def unset_tags(
+        self,
+        tag_keys: Iterable[str],
+        *,
+        if_exists: bool = True,
+    ) -> "Table":
+        """Delete table-level tag assignments by key."""
+        from .tags_api import delete_tags
+
+        delete_tags(
+            self.client,
+            entity_type="tables",
+            entity_name=self.full_name(),
+            tag_keys=tag_keys,
+            if_exists=if_exists,
+        )
+        object.__setattr__(self, "_tags", None)
+        object.__setattr__(self, "_tags_fetched_at", None)
         return self
 
     # =========================================================================

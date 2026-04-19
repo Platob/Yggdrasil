@@ -232,19 +232,33 @@ def test_rename_strips_backticks(column, executed):
     assert "RENAME COLUMN `trade_id` TO `price`" in executed[0]
 
 
-def test_set_tags_executes(column, executed):
-    result = column.set_tags({"owner": "nika"})
+def test_set_tags_executes(column, client):
+    entity_tags = []
+
+    def _create(*, tag_assignment):
+        entity_tags.append(tag_assignment)
+        return tag_assignment
+
+    ws = client.workspace_client()
+    ws.entity_tag_assignments = SimpleNamespace(create=_create)
+
+    result = column.set_tags({"owner": "nika", "domain": "power"})
+
     assert result is column
-    assert executed == [
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "ALTER COLUMN `trade_id` SET TAGS ('owner' = 'nika')"
+    assert [(t.entity_type, t.entity_name, t.tag_key, t.tag_value) for t in entity_tags] == [
+        ("columns", "main.analytics.trades.trade_id", "owner", "nika"),
+        ("columns", "main.analytics.trades.trade_id", "domain", "power"),
     ]
 
 
-def test_set_tags_noop_when_none(column, executed):
+def test_set_tags_noop_when_none(column, client):
+    ws = client.workspace_client()
+    ws.entity_tag_assignments = SimpleNamespace(
+        create=lambda **_: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
     result = column.set_tags(None)
     assert result is column
-    assert executed == []
 
 
 def test_add_primary_key_ddl_default(column):

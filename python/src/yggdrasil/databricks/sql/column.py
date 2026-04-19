@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
@@ -98,10 +98,47 @@ class Column:
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
     ):
-        if tags:
-            query = self.set_tags_ddl(tags, tag_collation=tag_collation)
-            if query:
-                self.engine.execute(query)
+        """Apply column-level tags via the UC ``entity_tag_assignments`` API.
+
+        ``tag_collation`` is accepted for API compatibility and ignored —
+        collations only matter for the legacy DDL literal form.
+        """
+        del tag_collation
+        if not tags:
+            return self
+
+        from .tags_api import apply_tags
+
+        apply_tags(
+            self.table.client,
+            entity_type="columns",
+            entity_name=f"{self.table.full_name()}.{self.name}",
+            tags=tags,
+        )
+        # Invalidate the table-side column-tag cache so the next read sees
+        # the new assignments.
+        object.__setattr__(self.table, "_column_tags", None)
+        object.__setattr__(self.table, "_column_tags_fetched_at", None)
+        return self
+
+    def unset_tags(
+        self,
+        tag_keys: "Iterable[str]",
+        *,
+        if_exists: bool = True,
+    ):
+        """Delete column-level tag assignments by key."""
+        from .tags_api import delete_tags
+
+        delete_tags(
+            self.table.client,
+            entity_type="columns",
+            entity_name=f"{self.table.full_name()}.{self.name}",
+            tag_keys=tag_keys,
+            if_exists=if_exists,
+        )
+        object.__setattr__(self.table, "_column_tags", None)
+        object.__setattr__(self.table, "_column_tags_fetched_at", None)
         return self
 
     def add_primary_key_ddl(
