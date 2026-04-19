@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pyarrow as pa
 import pytest
 
@@ -236,3 +238,48 @@ def test_xlsxio_empty_buffer_read_returns_empty_table():
     io_ = MediaIO.make(buf, MimeTypes.XLSX)
     out = io_.read_arrow_table()
     assert out.num_rows == 0
+
+
+# ------------------------------------------------------------------
+# Media-type inference from path: BytesIO(path).media_io() should
+# pick XlsxIO for *.xlsx files, not the generic ZipIO the ZIP magic
+# bytes would otherwise suggest (XLSX is a ZIP container).
+# ------------------------------------------------------------------
+
+
+def test_bytesio_from_xlsx_path_media_io_returns_xlsxio(tmp_path: Path):
+    xlsx_path = tmp_path / "forecasts_filtered.xlsx"
+
+    # Build a real .xlsx file using the built-in fallback writer so this
+    # test does not depend on any optional writer backend.
+    seed = BytesIO()
+    MediaIO.make(seed, MimeTypes.XLSX).write_arrow_table(
+        _make_table(),
+        engine="fallback",
+    )
+    xlsx_path.write_bytes(seed.to_bytes())
+
+    buf = BytesIO(xlsx_path)
+
+    assert buf.media_type.mime_type is MimeTypes.XLSX
+    mio = buf.media_io()
+    assert isinstance(mio, XlsxIO)
+
+    out = mio.read_arrow_table(engine="fallback")
+    assert out.column_names == ["id", "name", "price"]
+    assert out.num_rows == 3
+
+
+def test_bytesio_from_xlsx_path_explicit_media_override(tmp_path: Path):
+    xlsx_path = tmp_path / "data.xlsx"
+    seed = BytesIO()
+    MediaIO.make(seed, MimeTypes.XLSX).write_arrow_table(
+        _make_table(),
+        engine="fallback",
+    )
+    xlsx_path.write_bytes(seed.to_bytes())
+
+    # Passing MimeTypes.XLSX explicitly must also produce an XlsxIO,
+    # even if automatic inference were somehow to guess differently.
+    mio = BytesIO(xlsx_path).media_io(MimeTypes.XLSX)
+    assert isinstance(mio, XlsxIO)

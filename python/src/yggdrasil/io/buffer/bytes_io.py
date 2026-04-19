@@ -496,6 +496,14 @@ class BytesIO(io.RawIOBase):
     @property
     def media_type(self) -> MediaType:
         if self._media_type is None:
+            if self._path is not None:
+                # Path extensions are far more reliable than magic bytes for
+                # ZIP-based container formats (XLSX, DOCX, …) that would
+                # otherwise be detected as generic ZIP.
+                from_path = MediaType.parse(str(self._path), default=None)
+                if from_path is not None and from_path.mime_type is not MimeTypes.OCTET_STREAM:
+                    self._media_type = from_path
+                    return self._media_type
             self._media_type = MediaType.parse(self, default=MediaType(MimeTypes.OCTET_STREAM))
         return self._media_type
 
