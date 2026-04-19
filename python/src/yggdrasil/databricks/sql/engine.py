@@ -152,7 +152,7 @@ def _staging_parquet_ref(path: StagingPath) -> str:
     return f"parquet.{quote_ident(str(path.path))}"
 
 
-def _apply_temporary_table_aliases(
+def _apply_external_table_aliases(
     statement: str,
     substitutions: Mapping[str, str],
 ) -> str:
@@ -365,14 +365,14 @@ class SQLEngine(DatabricksService):
 
         return self.default_warehouse
 
-    def _stage_temporary_tables(
+    def _stage_external_tables(
         self,
-        temporary_tables: Mapping[str, Any] | None,
+        external_tables: Mapping[str, Any] | None,
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> tuple[Dict[str, str], list[StagingPath]]:
-        """Resolve ``temporary_tables`` into SQL substitutions and owned staging paths.
+        """Resolve ``external_tables`` into SQL substitutions and owned staging paths.
 
         For each entry:
 
@@ -392,7 +392,7 @@ class SQLEngine(DatabricksService):
             ``owned_paths`` lists every staging path the engine is responsible
             for cleaning up.
         """
-        if not temporary_tables:
+        if not external_tables:
             return {}, []
 
         effective_catalog = catalog_name or self.catalog_name
@@ -401,7 +401,7 @@ class SQLEngine(DatabricksService):
         substitutions: Dict[str, str] = {}
         owned: list[StagingPath] = []
 
-        for alias, value in temporary_tables.items():
+        for alias, value in external_tables.items():
             if isinstance(value, StagingPath):
                 substitutions[alias] = _staging_parquet_ref(value)
                 if value.owned:
@@ -410,7 +410,7 @@ class SQLEngine(DatabricksService):
 
             if not effective_catalog or not effective_schema:
                 raise ValueError(
-                    "temporary_tables requires catalog_name and schema_name "
+                    "external_tables requires catalog_name and schema_name "
                     "to be resolvable on the engine or provided explicitly; "
                     f"cannot stage alias {alias!r}."
                 )
@@ -446,7 +446,7 @@ class SQLEngine(DatabricksService):
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
         parallel: int | bool = False,
-        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+        external_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementBatch:
         """
         Execute multiple SQL statements.
@@ -504,7 +504,7 @@ class SQLEngine(DatabricksService):
                 ``int >= 2`` caps concurrency to that many statements running
                 on the warehouse at once.  Inner polling is managed by the
                 batch — callers do not need to handle futures or join threads.
-            temporary_tables:
+            external_tables:
                 Optional mapping of alias → :class:`StagingPath` or tabular
                 data. Aliases referenced in statements as ``{alias}`` are
                 replaced with the corresponding ``parquet.`<path>``` source
@@ -512,7 +512,7 @@ class SQLEngine(DatabricksService):
                 path via Parquet. Engine-owned staging paths are attached to
                 every result in the batch and cleaned up lazily once those
                 results reach a terminal state.  Merged on top of any
-                per-statement temporary tables already carried by
+                per-statement external tables already carried by
                 :class:`PreparedStatement` inputs.
 
         Returns:
@@ -545,8 +545,8 @@ class SQLEngine(DatabricksService):
         if not items:
             raise ValueError("No non-empty SQL statements were provided.")
 
-        substitutions, owned_staging = self._stage_temporary_tables(
-            temporary_tables,
+        substitutions, owned_staging = self._stage_external_tables(
+            external_tables,
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
@@ -556,7 +556,7 @@ class SQLEngine(DatabricksService):
                 (
                     key,
                     cfg.with_text(
-                        _apply_temporary_table_aliases(cfg.text, substitutions),
+                        _apply_external_table_aliases(cfg.text, substitutions),
                     ),
                 )
                 for key, cfg in items.items()
@@ -601,8 +601,8 @@ class SQLEngine(DatabricksService):
 
         if owned_staging:
             for result in batch.results.values():
-                result.attach_temporary_tables(owned_staging)
-                result._maybe_cleanup_temporary_tables()
+                result.attach_external_tables(owned_staging)
+                result._maybe_cleanup_external_tables()
 
         return batch
 
@@ -611,19 +611,19 @@ class SQLEngine(DatabricksService):
         statement: "str | PreparedStatement | StatementResult" = "",
         *,
         parameters: Mapping[str, Any] | None = None,
-        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+        external_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> StatementResult:
         """Build an unstarted :class:`StatementResult` bound to this engine.
 
         Accepts a string, a :class:`PreparedStatement` config, or an
         existing :class:`StatementResult` (in which case extra ``parameters``
-        / ``temporary_tables`` are merged onto its config).  Used as the
+        / ``external_tables`` are merged onto its config).  Used as the
         default factory for :class:`StatementBatch`.
         """
         return StatementResult.prepare(
             statement,
             parameters=parameters,
-            temporary_tables=temporary_tables,
+            external_tables=external_tables,
         )
 
     def prepare(
@@ -631,11 +631,11 @@ class SQLEngine(DatabricksService):
         statement: "str | PreparedStatement | StatementResult",
         *,
         parameters: Mapping[str, Any] | None = None,
-        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+        external_tables: Mapping[str, "StagingPath | Any"] | None = None,
     ) -> PreparedStatement:
         """Build a :class:`PreparedStatement` config from a string or existing statement.
 
-        Extra ``parameters`` and ``temporary_tables`` are merged on top of
+        Extra ``parameters`` and ``external_tables`` are merged on top of
         any values carried by ``statement``.  The returned :class:`PreparedStatement`
         config can be passed to :meth:`execute` later.
         """
@@ -643,7 +643,7 @@ class SQLEngine(DatabricksService):
         return PreparedStatement.prepare(
             base,
             parameters=parameters,
-            temporary_tables=temporary_tables,
+            external_tables=external_tables,
         )
 
     def execute(
@@ -661,7 +661,7 @@ class SQLEngine(DatabricksService):
         byte_limit: int | None = None,
         cache_for: WaitingConfigArg = None,
         spark_session: Optional["SparkSession"] = None,
-        temporary_tables: Mapping[str, "StagingPath | Any"] | None = None,
+        external_tables: Mapping[str, "StagingPath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
     ) -> StatementResult:
         """
@@ -684,7 +684,7 @@ class SQLEngine(DatabricksService):
                 SQL text to execute, or a :class:`PreparedStatement` carrying both
                 the text and its bound arguments.  Strings are coerced via
                 :meth:`PreparedStatement.prepare` together with any ``parameters``
-                or ``temporary_tables`` passed to this call.
+                or ``external_tables`` passed to this call.
             row_limit:
                 Optional row limit. Applied through `limit()` on Spark results
                 or forwarded to the SQL API.
@@ -708,14 +708,14 @@ class SQLEngine(DatabricksService):
                 Optional TTL for statement result caching.
             spark_session:
                 Explicit SparkSession override.
-            temporary_tables:
+            external_tables:
                 Optional mapping of alias → :class:`StagingPath` or tabular
                 data. Aliases referenced in ``statement`` as ``{alias}`` are
                 replaced with the corresponding ``parquet.`<path>``` source
                 clause. Tabular values are materialized to a fresh staging
                 path via Parquet. Engine-owned staging paths are attached to
                 the returned ``PreparedStatement`` and cleaned up lazily once
-                it reaches a terminal state.  Merged on top of any temporary
+                it reaches a terminal state.  Merged on top of any external
                 tables already carried by ``statement``.
             parameters:
                 Optional named parameters bound to ``:name`` placeholders in
@@ -734,20 +734,20 @@ class SQLEngine(DatabricksService):
         prepared = StatementResult.prepare(
             statement,
             parameters=parameters,
-            temporary_tables=temporary_tables,
+            external_tables=external_tables,
         )
 
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name
 
-        substitutions, owned_staging = self._stage_temporary_tables(
-            prepared.statement.temporary_tables,
+        substitutions, owned_staging = self._stage_external_tables(
+            prepared.statement.external_tables,
             catalog_name=catalog_name,
             schema_name=schema_name,
         )
         if substitutions:
             prepared = prepared.with_text(
-                _apply_temporary_table_aliases(prepared.statement.text, substitutions),
+                _apply_external_table_aliases(prepared.statement.text, substitutions),
             )
 
         if not engine:
@@ -823,8 +823,8 @@ class SQLEngine(DatabricksService):
             )
 
         if owned_staging:
-            result.attach_temporary_tables(owned_staging)
-            result._maybe_cleanup_temporary_tables()
+            result.attach_external_tables(owned_staging)
+            result._maybe_cleanup_external_tables()
 
         if cache_for is not None:
             self._cached_queries.set(
@@ -1204,7 +1204,7 @@ class SQLEngine(DatabricksService):
         statements: list[str] = []
 
         # SQL uses the ``{src}`` alias — ``execute_many`` substitutes it
-        # with ``parquet.`<staging path>``` via the temporary_tables kwarg,
+        # with ``parquet.`<staging path>``` via the external_tables kwarg,
         # and hands the owned staging off to result-lifecycle cleanup.
         source_sql = f"SELECT {cols_quoted} FROM {{src}}"
 
@@ -1296,7 +1296,7 @@ class SQLEngine(DatabricksService):
         if vacuum_hours is not None:
             statements.append(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
 
-        # ``temporary_tables`` carries the staging into ``execute_many`` —
+        # ``external_tables`` carries the staging into ``execute_many`` —
         # if ``staging.owned`` is True the engine will attach it to every
         # resulting :class:`StatementResult` so cleanup fires lazily when
         # each one reaches a terminal state.  ``owned=False`` staging paths
@@ -1306,7 +1306,7 @@ class SQLEngine(DatabricksService):
                 statements,
                 wait=wait,
                 raise_error=raise_error,
-                temporary_tables={"src": staging},
+                external_tables={"src": staging},
             )
 
         logger.info("Arrow inserted into %s", location)

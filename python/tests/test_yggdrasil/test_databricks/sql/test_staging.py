@@ -80,8 +80,8 @@ class TestStagingPathFromVolume(unittest.TestCase):
         self.assertTrue(staging.owned)
 
 
-class TestStageTemporaryTablesOwnedHandoff(unittest.TestCase):
-    """``_stage_temporary_tables`` respects the ``owned`` flag on StagingPaths."""
+class TestStageExternalTablesOwnedHandoff(unittest.TestCase):
+    """``_stage_external_tables`` respects the ``owned`` flag on StagingPaths."""
 
     def _make_engine(self):
         from yggdrasil.databricks.sql.engine import SQLEngine
@@ -97,7 +97,7 @@ class TestStageTemporaryTablesOwnedHandoff(unittest.TestCase):
         path = _fake_volume_path()
         staging = StagingPath.from_volume(path, owned=True)
 
-        substitutions, owned = engine._stage_temporary_tables({"src": staging})
+        substitutions, owned = engine._stage_external_tables({"src": staging})
         self.assertIn("src", substitutions)
         self.assertEqual(owned, [staging])
 
@@ -106,7 +106,7 @@ class TestStageTemporaryTablesOwnedHandoff(unittest.TestCase):
         path = _fake_volume_path()
         staging = StagingPath.from_volume(path, owned=False)
 
-        substitutions, owned = engine._stage_temporary_tables({"src": staging})
+        substitutions, owned = engine._stage_external_tables({"src": staging})
         self.assertIn("src", substitutions)
         self.assertEqual(owned, [])
 

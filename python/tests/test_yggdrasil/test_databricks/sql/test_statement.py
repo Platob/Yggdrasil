@@ -18,7 +18,7 @@ class TestStatementPrepare:
         assert isinstance(stmt, PreparedStatement)
         assert stmt.text == "SELECT 1"
         assert stmt.parameters == {}
-        assert stmt.temporary_tables == {}
+        assert stmt.external_tables == {}
 
     def test_prepare_returns_existing_statement_untouched(self):
         original = PreparedStatement(text="SELECT 1", parameters={"x": 1})
@@ -37,20 +37,20 @@ class TestStatementPrepare:
         out = PreparedStatement.prepare(original, parameters={"x": 99})
         assert out.parameters == {"x": 99}
 
-    def test_prepare_merges_temporary_tables_on_existing_statement(self):
-        original = PreparedStatement(text="SELECT * FROM {t}", temporary_tables={"t": "A"})
-        out = PreparedStatement.prepare(original, temporary_tables={"u": "B"})
-        assert out.temporary_tables == {"t": "A", "u": "B"}
+    def test_prepare_merges_external_tables_on_existing_statement(self):
+        original = PreparedStatement(text="SELECT * FROM {t}", external_tables={"t": "A"})
+        out = PreparedStatement.prepare(original, external_tables={"u": "B"})
+        assert out.external_tables == {"t": "A", "u": "B"}
 
     def test_prepare_builds_fresh_statement_from_string(self):
         out = PreparedStatement.prepare(
             "SELECT :x",
             parameters={"x": 1},
-            temporary_tables={"t": "A"},
+            external_tables={"t": "A"},
         )
         assert out.text == "SELECT :x"
         assert out.parameters == {"x": 1}
-        assert out.temporary_tables == {"t": "A"}
+        assert out.external_tables == {"t": "A"}
 
 
 class TestStatementMutators:
@@ -70,31 +70,31 @@ class TestStatementMutators:
         out = base.bind(y=99, z=3)
         assert out.parameters == {"x": 1, "y": 99, "z": 3}
 
-    def test_with_temporary_tables_returns_new_instance(self):
+    def test_with_external_tables_returns_new_instance(self):
         base = PreparedStatement(text="SELECT * FROM {a}")
-        out = base.with_temporary_tables(a="X")
+        out = base.with_external_tables(a="X")
         assert out is not base
-        assert base.temporary_tables == {}
-        assert out.temporary_tables == {"a": "X"}
+        assert base.external_tables == {}
+        assert out.external_tables == {"a": "X"}
 
-    def test_with_temporary_tables_no_args_returns_same_instance(self):
+    def test_with_external_tables_no_args_returns_same_instance(self):
         base = PreparedStatement(text="SELECT 1")
-        assert base.with_temporary_tables() is base
+        assert base.with_external_tables() is base
 
     def test_clear_resets_all_fields(self):
         base = PreparedStatement(
             text="SELECT :x FROM {a}",
             parameters={"x": 1},
-            temporary_tables={"a": "A"},
+            external_tables={"a": "A"},
         )
         cleared = base.clear()
         assert cleared.text == ""
         assert cleared.parameters == {}
-        assert cleared.temporary_tables == {}
+        assert cleared.external_tables == {}
         # Original unchanged
         assert base.text == "SELECT :x FROM {a}"
         assert base.parameters == {"x": 1}
-        assert base.temporary_tables == {"a": "A"}
+        assert base.external_tables == {"a": "A"}
 
     def test_with_text_returns_new_instance(self):
         base = PreparedStatement(text="SELECT 1", parameters={"x": 1})
@@ -189,9 +189,9 @@ class TestStatementResultConfigShortcuts:
         result = StatementResult(statement=PreparedStatement(text="X", parameters={"x": 1}))
         assert result.parameters == {"x": 1}
 
-    def test_temporary_tables_property_delegates(self):
-        result = StatementResult(statement=PreparedStatement(text="X", temporary_tables={"t": "A"}))
-        assert result.temporary_tables == {"t": "A"}
+    def test_external_tables_property_delegates(self):
+        result = StatementResult(statement=PreparedStatement(text="X", external_tables={"t": "A"}))
+        assert result.external_tables == {"t": "A"}
 
     def test_with_text_returns_new_result(self):
         result = StatementResult(statement=PreparedStatement(text="SELECT 1", parameters={"x": 1}))
@@ -206,11 +206,11 @@ class TestStatementResultConfigShortcuts:
         assert out is not result
         assert out.statement.parameters == {"x": 1}
 
-    def test_with_temporary_tables_returns_new_result(self):
+    def test_with_external_tables_returns_new_result(self):
         result = StatementResult(statement=PreparedStatement(text="SELECT * FROM {a}"))
-        out = result.with_temporary_tables(a="X")
+        out = result.with_external_tables(a="X")
         assert out is not result
-        assert out.statement.temporary_tables == {"a": "X"}
+        assert out.statement.external_tables == {"a": "X"}
 
 
 def test_statement_result_has_default_service():

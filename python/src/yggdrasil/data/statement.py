@@ -55,18 +55,18 @@ class PreparedStatement:
     """Configuration for a single statement execution.
 
     ``PreparedStatement`` is a plain value object — it carries the SQL text, any
-    named parameters, and a map of temporary-table aliases that the engine
+    named parameters, and a map of external-table aliases that the engine
     should substitute before submission.  Runtime/execution state
     (backend handle, response, cached results) lives on
     :class:`StatementResult`.
 
-    Instances are frozen: every mutator (``bind``, ``with_temporary_tables``,
+    Instances are frozen: every mutator (``bind``, ``with_external_tables``,
     ``clear``) returns a new ``PreparedStatement``.
     """
 
     text: str = ""
     parameters: Mapping[str, Any] = field(default_factory=dict)
-    temporary_tables: Mapping[str, Any] = field(default_factory=dict)
+    external_tables: Mapping[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def looks_like_query(text: Any) -> bool:
@@ -94,21 +94,21 @@ class PreparedStatement:
         statement: "PreparedStatement | str",
         *,
         parameters: Mapping[str, Any] | None = None,
-        temporary_tables: Mapping[str, Any] | None = None,
+        external_tables: Mapping[str, Any] | None = None,
     ) -> "PreparedStatement":
         """Coerce ``statement`` into a :class:`PreparedStatement`, merging extra args."""
         if isinstance(statement, cls):
             prepared = statement
             if parameters:
                 prepared = prepared.bind(**parameters)
-            if temporary_tables:
-                prepared = prepared.with_temporary_tables(**temporary_tables)
+            if external_tables:
+                prepared = prepared.with_external_tables(**external_tables)
             return prepared
 
         return cls(
             text=str(statement),
             parameters=dict(parameters) if parameters else {},
-            temporary_tables=dict(temporary_tables) if temporary_tables else {},
+            external_tables=dict(external_tables) if external_tables else {},
         )
 
     def bind(self, **parameters: Any) -> "PreparedStatement":
@@ -117,15 +117,15 @@ class PreparedStatement:
             return self
         return replace(self, parameters={**self.parameters, **parameters})
 
-    def with_temporary_tables(self, **tables: Any) -> "PreparedStatement":
-        """Return a new ``PreparedStatement`` with additional temporary-table aliases."""
+    def with_external_tables(self, **tables: Any) -> "PreparedStatement":
+        """Return a new ``PreparedStatement`` with additional external-table aliases."""
         if not tables:
             return self
-        return replace(self, temporary_tables={**self.temporary_tables, **tables})
+        return replace(self, external_tables={**self.external_tables, **tables})
 
     def clear(self) -> "PreparedStatement":
         """Return a new ``PreparedStatement`` with text and all bound arguments cleared."""
-        return replace(self, text="", parameters={}, temporary_tables={})
+        return replace(self, text="", parameters={}, external_tables={})
 
     def with_text(self, text: str) -> "PreparedStatement":
         """Return a new ``PreparedStatement`` with ``text`` replaced."""
@@ -193,13 +193,13 @@ class StatementResult(ABC):
         repr=False,
         compare=False,
     )
-    _temporary_tables: tuple[Any, ...] = field(
+    _external_tables: tuple[Any, ...] = field(
         init=False,
         default=(),
         repr=False,
         compare=False,
     )
-    _temporary_tables_cleaned: bool = field(
+    _external_tables_cleaned: bool = field(
         init=False,
         default=False,
         repr=False,
@@ -356,8 +356,8 @@ class StatementResult(ABC):
         return self.statement.parameters
 
     @property
-    def temporary_tables(self) -> Mapping[str, Any]:
-        return self.statement.temporary_tables
+    def external_tables(self) -> Mapping[str, Any]:
+        return self.statement.external_tables
 
     @abstractmethod
     def start(
@@ -415,7 +415,7 @@ class StatementResult(ABC):
         if not wait:
             if raise_error:
                 self.raise_for_status()
-            self._maybe_cleanup_temporary_tables()
+            self._maybe_cleanup_external_tables()
             return self
 
         iteration = 0
@@ -430,34 +430,34 @@ class StatementResult(ABC):
         if raise_error:
             self.raise_for_status()
 
-        self._maybe_cleanup_temporary_tables()
+        self._maybe_cleanup_external_tables()
 
         return self
 
     # -------------------------------------------------------------------------
-    # Temporary table cleanup
+    # External table cleanup
     # -------------------------------------------------------------------------
 
-    def attach_temporary_tables(self, tables: Iterable[Any]) -> StatementResult:
-        """Attach temporary staging resources to be cleaned up when ``done``.
+    def attach_external_tables(self, tables: Iterable[Any]) -> StatementResult:
+        """Attach external staging resources to be cleaned up when ``done``.
 
         Each entry must expose ``cleanup(allow_not_found: bool = True)``.
         Cleanup is best-effort and idempotent; it runs lazily the first time
-        the statement reaches a terminal state (see ``_maybe_cleanup_temporary_tables``).
+        the statement reaches a terminal state (see ``_maybe_cleanup_external_tables``).
         """
         items = tuple(tables)
         if not items:
             return self
         object.__setattr__(
             self,
-            "_temporary_tables",
-            tuple(self._temporary_tables) + items,
+            "_external_tables",
+            tuple(self._external_tables) + items,
         )
-        object.__setattr__(self, "_temporary_tables_cleaned", False)
+        object.__setattr__(self, "_external_tables_cleaned", False)
         return self
 
-    def _maybe_cleanup_temporary_tables(self) -> None:
-        if self._temporary_tables_cleaned or not self._temporary_tables:
+    def _maybe_cleanup_external_tables(self) -> None:
+        if self._external_tables_cleaned or not self._external_tables:
             return
         try:
             is_done = self.done
@@ -466,17 +466,17 @@ class StatementResult(ABC):
         if not is_done:
             return
 
-        for resource in self._temporary_tables:
+        for resource in self._external_tables:
             try:
                 resource.cleanup(allow_not_found=True)
             except Exception:
                 logger.debug(
-                    "Failed to cleanup temporary staging resource %r",
+                    "Failed to cleanup external staging resource %r",
                     resource,
                     exc_info=True,
                 )
-        object.__setattr__(self, "_temporary_tables_cleaned", True)
-        object.__setattr__(self, "_temporary_tables", ())
+        object.__setattr__(self, "_external_tables_cleaned", True)
+        object.__setattr__(self, "_external_tables", ())
 
     # -------------------------------------------------------------------------
     # Arrow contract
