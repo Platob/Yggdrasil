@@ -1,4 +1,4 @@
-"""Tests for the polars-first tz helper in ``_temporal_cast``.
+"""Tests for the polars-first tz helper in ``temporal``.
 
 The helper exists so timezone-aware arrow casts do not touch pyarrow's
 Arrow C++ tz database (which fails on Windows without IANA tzdata set up).
@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.types import _temporal_cast as tc
+from yggdrasil.data.types import temporal as tc
 
 
 pl = pytest.importorskip("polars")
