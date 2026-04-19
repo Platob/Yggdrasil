@@ -248,22 +248,45 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def equals(
         self,
-        other: "Field",
+        other: Any,
         check_names: bool = True,
         check_dtypes: bool = True,
         check_metadata: bool = True,
     ) -> bool:
-        if check_metadata and self.metadata != other.metadata:
+        """Structural equality check with configurable scope.
+
+        Mirrors :meth:`DataType.equals`. Coerces *other* to a ``Field`` so
+        that callers can pass a ``pa.Field`` / dict / etc. without manual
+        conversion. Returns ``False`` on coercion failure instead of raising.
+
+        - ``check_names``: compare this field's name and recurse into child
+          field names for nested types.
+        - ``check_dtypes``: recurse into the dtype and compare ``nullable``
+          (both are structural, schema-defining attributes).
+        - ``check_metadata``: compare this field's metadata and recurse.
+        """
+        if other is None:
             return False
+        if not isinstance(other, Field):
+            try:
+                other = Field.from_any(other)
+            except Exception:
+                return False
 
         if check_names and self.name != other.name:
             return False
-        
+
+        if check_dtypes and self.nullable != other.nullable:
+            return False
+
+        if check_metadata and self.metadata != other.metadata:
+            return False
+
         return self.dtype.equals(
             other.dtype,
             check_names=check_names,
             check_dtypes=check_dtypes,
-            check_metadata=check_metadata
+            check_metadata=check_metadata,
         )
         
     @property
@@ -1186,6 +1209,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        # Object target is a variant — never touch the values.
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return array
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_arrow_array(array, options=options.with_target(self))
         filled = self.fill_arrow_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1197,6 +1223,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return table
         options = get_cast_options_class().check(options=options, **more)
         return self.to_struct().dtype.cast_arrow_tabular(table, options=options.with_target(self))
 
@@ -1206,6 +1234,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_series(series, options=options.with_target(self))
         filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1217,6 +1247,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_polars_expr(series, options=options.with_target(self))
         filled = self.fill_polars_array_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1228,6 +1260,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.to_struct().dtype.cast_polars_tabular(data, options=options.with_target(self))
 
@@ -1237,6 +1271,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return series
         options = get_cast_options_class().check(options=options, **more)
         casted = self.dtype.cast_pandas_series(series, options=options.with_target(self))
         filled = self.fill_pandas_series_nulls(casted, default_scalar=self.default_arrow_scalar)
@@ -1250,6 +1286,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.dtype.cast_pandas_tabular(data, options=options.with_target(self))
 
@@ -1259,6 +1297,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return column
         options = get_cast_options_class().check(options=options, **more)
         options = options.with_target(self).check_source(column)
         casted = self.dtype.cast_spark_column(column, options=options)
@@ -1271,6 +1311,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         options: "CastOptions | None" = None,
         **more,
     ):
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return data
         options = get_cast_options_class().check(options=options, **more)
         return self.dtype.cast_spark_tabular(data, options=options.with_target(self))
 
