@@ -330,6 +330,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         return None
 
     @property
+    def default_pyobj(self) -> Any:
+        # Cascading Python-level default: explicit per-field override from
+        # metadata takes precedence, otherwise fall back to the dtype's own
+        # default given this field's nullability. Used by nested types to
+        # build recursively meaningful defaults for non-nullable children.
+        if self.has_default:
+            return self.default
+        return self.dtype.default_pyobj(nullable=self.nullable)
+
+    @property
     def default_arrow_scalar(self) -> pa.Scalar | None:
         if self.metadata is not None:
             default = self.metadata.get(DEFAULT_VALUE_KEY)

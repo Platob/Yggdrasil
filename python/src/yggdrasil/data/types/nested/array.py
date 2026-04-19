@@ -50,17 +50,6 @@ class ArrayType(NestedType):
     def type_id(self) -> DataTypeId:
         return DataTypeId.ARRAY
 
-    def default_pyobj(self, nullable: bool) -> Any:
-        if nullable:
-            return None
-
-        if not self.list_size:
-            return []
-        elif self.list_size < 0:
-            raise ValueError("list_size must be non-negative")
-
-        return [self.item_field.default for _ in range(self.list_size)]
-
     def _merge_with_same_id(
         self,
         other: "ArrayType",
@@ -317,7 +306,18 @@ class ArrayType(NestedType):
         return base
 
     def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else []
+        if nullable:
+            return None
+
+        # Variable-size lists default to an empty list; fixed-size lists must
+        # produce exactly ``list_size`` items so ``pa.scalar(...)`` accepts the
+        # result against ``pa.list_(item, list_size)``. Negative sizes are
+        # treated as "variable" at construction time, so we only need to guard
+        # list_size == 0 (legal, yields []) and positive sizes.
+        if not self.list_size:
+            return []
+
+        return [self.item_field.default_pyobj for _ in range(self.list_size)]
 
     def _cast_polars_series(
         self,

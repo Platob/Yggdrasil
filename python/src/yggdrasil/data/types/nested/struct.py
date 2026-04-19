@@ -45,12 +45,6 @@ class StructType(NestedType):
     def __post_init__(self):
         object.__setattr__(self, "fields", tuple(self.fields))
 
-    def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else {
-            f.name: f.default
-            for f in self.fields
-        }
-
     @property
     def children_fields(self) -> tuple["Field"]:
         return self.fields
@@ -178,7 +172,13 @@ class StructType(NestedType):
         return self.__class__(fields=tuple(fields))
 
     def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else {f.name: f.default for f in self.fields}
+        # Cascade through each child so non-nullable children get the dtype's
+        # own default instead of silently degrading to ``None`` — that
+        # guarantees ``pa.scalar(default, type=struct_type)`` round-trips and
+        # recursively fills nested structs / arrays / maps.
+        if nullable:
+            return None
+        return {f.name: f.default_pyobj for f in self.fields}
 
     def _cast_arrow_array(
         self,

@@ -1846,6 +1846,20 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None:
             return series
 
+        # pandas.Series.fillna treats list / dict / tuple values as index-
+        # aligned lookups or raises outright, so it cannot broadcast a nested
+        # default onto every missing row. Assign positionally on the NaN mask
+        # instead — this keeps object-dtype series (our nested-type carrier)
+        # filled with a single shared default without pandas trying to unpack
+        # it as a per-index mapping.
+        if isinstance(default_scalar, (list, tuple, dict, set)):
+            mask = series.isna()
+            if not mask.any():
+                return series
+            out = series.copy()
+            out.loc[mask] = [default_scalar] * int(mask.sum())
+            return out
+
         return series.fillna(default_scalar)
 
     def fill_spark_column_nulls(
