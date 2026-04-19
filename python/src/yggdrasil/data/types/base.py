@@ -1741,16 +1741,20 @@ class DataType(BaseChildrenFields, ABC):
         *,
         nullable: bool = False,
         default_scalar: pa.Scalar | None = None,
-    ):
+    ) -> pa.Array | pa.ChunkedArray:
         if nullable:
+            return array
+
+        if array.null_count == 0:
             return array
 
         if default_scalar is None:
             default_scalar = self.default_arrow_scalar(nullable=nullable)
 
+        if default_scalar is None:
+            return array
+
         if isinstance(array, pa.ChunkedArray):
-            if array.null_count == 0:
-                return array
             chunks = [
                 self.fill_arrow_array_nulls(
                     chunk,
@@ -1760,9 +1764,6 @@ class DataType(BaseChildrenFields, ABC):
                 for chunk in array.chunks
             ]
             return pa.chunked_array(chunks, type=array.type)
-
-        if array.null_count == 0:
-            return array
 
         return pc.fill_null(array, default_scalar)
 
@@ -1813,45 +1814,46 @@ class DataType(BaseChildrenFields, ABC):
         series: "polars.Series | polars.Expr",
         *,
         nullable: bool = False,
-        default_scalar: pa.Scalar | None = None,
-    ):
-        pl = get_polars()
-
+        default_scalar: Any = None,
+    ) -> "polars.Series | polars.Expr":
         if nullable:
             return series
 
         if default_scalar is None:
-            default_scalar = self.default_arrow_scalar(nullable=nullable)
+            default_scalar = self.default_polars_scalar(nullable=nullable)
 
-        if isinstance(series, pl.Expr):
-            return series.fill_null(default_scalar.as_py())
+        if default_scalar is None:
+            return series
 
-        return series.fill_null(default_scalar.as_py())
+        return series.fill_null(default_scalar)
 
     def fill_pandas_series_nulls(
         self,
         series: "pd.Series",
         *,
         nullable: bool = False,
-        default_scalar: pa.Scalar | None = None,
-    ):
+        default_scalar: Any = None,
+    ) -> "pd.Series":
         if nullable:
             return series
 
+        if not series.isna().any():
+            return series
+
         if default_scalar is None:
-            default_scalar = self.default_arrow_scalar(nullable=nullable)
+            default_scalar = self.default_pandas_scalar(nullable=nullable)
 
-        if series.isna().any():
-            return series.fillna(default_scalar.as_py())
+        if default_scalar is None:
+            return series
 
-        return series
+        return series.fillna(default_scalar)
 
     def fill_spark_column_nulls(
         self,
         column: "ps.Column",
         *,
         nullable: bool = False,
-        default_scalar: pa.Scalar | None = None,
+        default_scalar: Any = None,
     ) -> "ps.Column":
         spark = get_spark_sql()
         F = spark.functions
@@ -1859,13 +1861,18 @@ class DataType(BaseChildrenFields, ABC):
         if nullable:
             return column
 
+        spark_type = self.to_spark()
+
         if default_scalar is None:
-            default_scalar = self.default_arrow_scalar(nullable=nullable)
+            default_scalar = self.default_spark_scalar(nullable=nullable)
+
+        if default_scalar is None:
+            return column.cast(spark_type)
 
         return (
-            F.when(column.isNull(), F.lit(default_scalar.as_py()))
+            F.when(column.isNull(), F.lit(default_scalar))
             .otherwise(column)
-            .cast(self.to_spark())
+            .cast(spark_type)
         )
 
 
