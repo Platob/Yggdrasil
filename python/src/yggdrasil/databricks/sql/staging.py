@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.environ import shutdown as yg_shutdown
 
-from ..fs.path import DatabricksPath
+from ..fs.path import DatabricksPath, VolumePath
 
 if TYPE_CHECKING:
     from yggdrasil.data.cast import CastOptions
@@ -30,15 +30,24 @@ class StagingPath:
         tmp-{start_ts}-{end_ts}-{token}.parquet
 
     ``end_ts - start_ts`` is always clamped to at most 3600 seconds.
+
+    ``owned``
+        ``True`` when the :class:`StagingPath` was created by
+        :meth:`for_table` and so the engine is responsible for removing the
+        file afterwards.  ``False`` (the default and the value used by
+        :meth:`from_volume`) means the path was supplied by the caller;
+        :meth:`cleanup` becomes a best-effort no-op so user-owned volume
+        files are never deleted behind the caller's back.
     """
 
-    path: DatabricksPath
+    path: VolumePath
     catalog_name: str
     schema_name: str
     table_name: str
     start_ts: int
     end_ts: int
     token: str
+    owned: bool = False
 
     _shutdown_hook: Any = field(default=None, init=False, repr=False, compare=False)
 
@@ -169,6 +178,7 @@ class StagingPath:
         start_ts: int | None = None,
         token: str | None = None,
     ) -> "StagingPath":
+        """Build an engine-owned staging path under the ``tmp/.sql`` tree."""
         catalog = cls._clean_part(catalog_name)
         schema = cls._clean_part(schema_name)
         table = cls._clean_part(table_name)
@@ -188,6 +198,10 @@ class StagingPath:
         base = f"/Volumes/{catalog}/{schema}/tmp/.sql/{catalog}/{schema}/{table}"
         name = f"tmp-{start}-{end}-{rnd}.parquet"
         path = DatabricksPath.parse(f"{base}/{name}", client=client)
+        if not isinstance(path, VolumePath):
+            raise TypeError(
+                f"StagingPath.for_table expected a VolumePath, got {type(path).__name__}"
+            )
 
         return cls(
             path=path,
@@ -197,6 +211,65 @@ class StagingPath:
             start_ts=start,
             end_ts=end,
             token=rnd,
+            owned=True,
+        )
+
+    @classmethod
+    def from_volume(
+        cls,
+        path: "VolumePath | str",
+        *,
+        client=None,
+        owned: bool = False,
+        start_ts: int | None = None,
+        max_lifetime: float | None = None,
+        token: str | None = None,
+    ) -> "StagingPath":
+        """Wrap an existing :class:`VolumePath` as a non-owned staging path.
+
+        Useful when the caller already has a volume path they want the engine
+        to insert from: the engine treats the path as read-only (``owned=False``),
+        so :meth:`cleanup` will leave the underlying file alone.
+
+        ``catalog_name`` / ``schema_name`` / ``table_name`` are parsed from
+        the volume path's ``sql_volume_or_table_parts`` decomposition; when
+        the path does not correspond to a volume root (edge case), they fall
+        back to empty strings.
+        """
+        if isinstance(path, str):
+            if client is None:
+                raise ValueError(
+                    "StagingPath.from_volume(str_path) requires ``client`` so "
+                    "the path can be resolved against a workspace."
+                )
+            parsed = DatabricksPath.parse(path, client=client)
+        else:
+            parsed = path
+
+        if not isinstance(parsed, VolumePath):
+            raise TypeError(
+                f"StagingPath.from_volume expected a VolumePath, "
+                f"got {type(parsed).__name__}"
+            )
+
+        try:
+            catalog, schema, volume_name, _rel = parsed.sql_volume_or_table_parts()
+        except Exception:
+            catalog, schema, volume_name = "", "", ""
+
+        start = int(time.time() if start_ts is None else start_ts)
+        end = start + cls._lifetime_seconds(max_lifetime)
+        rnd = token or os.urandom(4).hex()
+
+        return cls(
+            path=parsed,
+            catalog_name=catalog,
+            schema_name=schema,
+            table_name=volume_name,
+            start_ts=start,
+            end_ts=end,
+            token=rnd,
+            owned=owned,
         )
 
     def register_shutdown_cleanup(self) -> None:
@@ -233,9 +306,19 @@ class StagingPath:
             )
 
     def cleanup(self, *, allow_not_found: bool = True, unregister: bool = True) -> None:
-        """Best-effort staging file cleanup."""
+        """Best-effort staging file cleanup.
+
+        Only engine-owned paths (``owned=True``) are deleted; user-supplied
+        paths created via :meth:`from_volume` are left untouched so the
+        caller retains control of their own data.  Shutdown hook
+        unregistration runs regardless, because a ``from_volume`` path that
+        was opted into shutdown cleanup still needs its hook cleared.
+        """
         if unregister:
             self.unregister_shutdown_cleanup()
+
+        if not self.owned:
+            return
 
         try:
             self.path.remove(recursive=True, allow_not_found=allow_not_found)

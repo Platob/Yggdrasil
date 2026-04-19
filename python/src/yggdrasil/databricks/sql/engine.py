@@ -107,11 +107,7 @@ from yggdrasil.data.statement import PreparedStatement, StatementBatch
 from yggdrasil.databricks.sql.sql_utils import quote_ident
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
-from yggdrasil.io import BytesIO
-from yggdrasil.io.buffer.media_io import MediaIO
-from yggdrasil.io.buffer.parquet_io import ParquetOptions
 from yggdrasil.io.enums import SaveMode
-from yggdrasil.io.enums.media_type import MediaTypes
 from .catalogs import Catalogs
 from .grants import Grants
 from .schemas import Schemas
@@ -123,7 +119,6 @@ from .tables import Tables
 from .types import PrimaryKeySpec, ForeignKeySpec
 from .warehouse import SQLWarehouse
 from ..client import DatabricksService
-from ..fs.path import DatabricksPath
 
 logger = logging.getLogger(__name__)
 
@@ -1183,7 +1178,6 @@ class SQLEngine(DatabricksService):
 
         logger.debug("Inserting %s into %s", type(data), location)
 
-        staging: Optional[StagingPath] = None
         if temp_volume_path is None:
             staging = StagingPath.for_table(
                 client=self.client,
@@ -1193,17 +1187,12 @@ class SQLEngine(DatabricksService):
                 max_lifetime=3600,
             )
             staging.register_shutdown_cleanup()
-            staging.write_table(data, cast_options=cast_options)
-            temp_volume_path = staging.path
         else:
-            temp_volume_path = DatabricksPath.parse(obj=temp_volume_path, client=self.client)
-            temp_volume_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with BytesIO() as buffer:
-                mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
-                mio.write_table(data, options=ParquetOptions(cast=cast_options))
-                mio.buffer.seek(0)
-                temp_volume_path.write_bytes(mio.buffer.memoryview())
+            staging = StagingPath.from_volume(
+                temp_volume_path, client=self.client, owned=False,
+            )
+        staging.write_table(data, cast_options=cast_options)
+        temp_volume_path = staging.path
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
@@ -1302,28 +1291,25 @@ SELECT {cols_quoted}
 FROM parquet.{quote_ident(str(temp_volume_path))}"""
             statements.append(insert_sql)
 
+        # Chain DML + post-write maintenance in a single sequential batch so
+        # the wait-all-but-last logic covers every step.  Only the final
+        # statement respects the caller's ``wait``.
+        if zorder_by:
+            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
+            statements.append(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
+        if optimize_after_merge and match_by:
+            statements.append(f"OPTIMIZE {location}")
+        if vacuum_hours is not None:
+            statements.append(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
+
         try:
             if statements:
                 self.execute_many(statements, wait=wait, raise_error=raise_error)
         finally:
             if wait:
-                if staging is not None:
-                    staging.cleanup(allow_not_found=True, unregister=True)
-                else:
-                    temp_volume_path.remove()
+                staging.cleanup(allow_not_found=True, unregister=True)
 
         logger.info("Arrow inserted into %s", location)
-
-        if zorder_by:
-            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
-            self.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
-
-        if optimize_after_merge and match_by:
-            self.execute(f"OPTIMIZE {location}")
-
-        if vacuum_hours is not None:
-            self.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
-
         return None
 
     def sql_insert_into(
@@ -1541,21 +1527,18 @@ FROM parquet.{quote_ident(str(temp_volume_path))}"""
             )
             statements.append(replace(prepared, text=insert_sql))
 
+        if zorder_by:
+            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
+            statements.append(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
+        if optimize_after_merge and match_by:
+            statements.append(f"OPTIMIZE {location}")
+        if vacuum_hours is not None:
+            statements.append(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
+
         if statements:
             self.execute_many(statements, wait=wait, raise_error=raise_error)
 
         logger.info("SQL inserted into %s", location)
-
-        if zorder_by:
-            zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
-            self.execute(f"OPTIMIZE {location} ZORDER BY ({zorder_cols})")
-
-        if optimize_after_merge and match_by:
-            self.execute(f"OPTIMIZE {location}")
-
-        if vacuum_hours is not None:
-            self.execute(f"VACUUM {location} RETAIN {int(vacuum_hours)} HOURS")
-
         return None
 
     def spark_insert_into(
