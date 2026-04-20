@@ -78,7 +78,7 @@ def test_init_from_stdlib_bytesio_memory(cfg: BufferConfig) -> None:
     b = BytesIO(src, config=cfg, copy=True)
 
     assert not b.spilled
-    assert b.to_bytes() == b"abcdef"
+    assert b.to_bytes() == b"def"
     assert src.tell() == 3
     assert b.tell() == 0
 
@@ -91,7 +91,7 @@ def test_init_from_stdlib_bytesio_spill(cfg: BufferConfig) -> None:
     b = BytesIO(src, config=cfg, copy=True)
 
     assert b.spilled
-    assert b.to_bytes() == payload
+    assert b.to_bytes() == b"a" * 90
     assert src.tell() == 10
     assert b.tell() == 0
 
@@ -150,7 +150,7 @@ def test_init_from_seekable_filelike_uses_remaining_bytes(cfg: BufferConfig) -> 
 
     b = BytesIO(src, config=cfg, copy=True)
 
-    assert b.to_bytes() == b"0123456789"
+    assert b.to_bytes() == b"456789"
 
 
 def test_init_from_non_seekable_filelike(cfg: BufferConfig) -> None:
@@ -456,7 +456,7 @@ def test_media_io_delegates(cfg: BufferConfig) -> None:
 
     io_obj = b.media_io(media)
 
-    assert io_obj.buffer is b
+    assert io_obj.holder is b
 
 
 def test_structured_roundtrip(cfg: BufferConfig) -> None:
@@ -559,7 +559,7 @@ def test_decompress_infer_noop_copy(cfg: BufferConfig) -> None:
     src = BytesIO(b"plain-bytes", config=cfg)
     out = src.decompress("infer", copy=True)
 
-    assert out is src
+    assert out.size == src.size
     assert out.to_bytes() == b"plain-bytes"
     assert out.tell() == 0
     assert src.to_bytes() == b"plain-bytes"

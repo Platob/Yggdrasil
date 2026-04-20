@@ -1241,7 +1241,10 @@ class SQLEngine(DatabricksService):
         Returns:
             None.
         """
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
+        if isinstance(
+            data,
+            (PreparedStatement, StatementResult)
+        ) or PreparedStatement.looks_like_query(data):
             return self.sql_insert_into(
                 data,
                 mode=mode,

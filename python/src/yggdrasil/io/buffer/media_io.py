@@ -38,14 +38,14 @@ Typical usage::
 """
 from __future__ import annotations
 
-import io as _stdlib_io
 import itertools
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator as AbcIterator, Generator as AbcGenerator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union, Generator
 
+import polars as pl
 import pyarrow as pa
 
 from yggdrasil.io.enums import MimeTypes, Codec, MediaType, MimeType, SaveMode
@@ -53,23 +53,8 @@ from yggdrasil.pickle.serde import ObjectSerde
 from .bytes_io import BytesIO
 from .media_options import MediaOptions
 
-_POLARS_NATIVE_MIMES: frozenset = frozenset({
-    MimeTypes.PARQUET,
-    MimeTypes.ARROW_IPC,
-    MimeTypes.ARROW_IPC_STREAM,
-    MimeTypes.JSON,
-    MimeTypes.CSV,
-    MimeTypes.TSV,
-})
-
-_POLARS_PARQUET_COMPRESSIONS: frozenset = frozenset(
-    {"uncompressed", "snappy", "gzip", "lzo", "brotli", "lz4", "zstd"}
-)
-_POLARS_IPC_COMPRESSIONS: frozenset = frozenset({"uncompressed", "lz4", "zstd"})
-
 if TYPE_CHECKING:
     import pandas
-    import polars
     import pyarrow
 
     from yggdrasil.data.cast.options import CastOptionsArg
@@ -86,7 +71,63 @@ class MediaIO(ABC, Generic[O]):
     """Abstract base for format-specific I/O on a :class:`BytesIO` buffer."""
 
     media_type: MediaType
-    buffer: BytesIO
+    holder: BytesIO
+    buffer: BytesIO | None = field(init=False, default=None)
+    _dirty: bool = field(init=False, default=False)
+
+    @property
+    def opened(self) -> bool:
+        return self.buffer is not None
+
+    @property
+    def closed(self) -> bool:
+        return self.buffer is None
+
+    def open(self) -> "MediaIO":
+        if self.opened:
+            raise RuntimeError(f"MediaIO {self!r} is already open")
+
+        codec = self.codec
+        if codec is None:
+            # share the holder's storage; writes will mark _dirty
+            self.buffer = self.holder
+        else:
+            self.buffer = self.holder.decompress(codec=codec, copy=True)
+        return self
+
+    def mark_dirty(self) -> None:
+        """Call from _write_arrow_batches paths to signal flush-on-close."""
+        self._dirty = True
+
+    def close(self) -> None:
+        if not self.opened:
+            return
+
+        try:
+            # only write back if we actually mutated a detached buffer
+            if self._dirty and self.buffer is not self.holder:
+                self.holder = self.buffer.compress(codec=self.codec, copy=False)
+        finally:
+            self.buffer = None
+            self._dirty = False
+
+    def __enter__(self) -> "MediaIO":
+        return self.open() if not self.opened else self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        # best-effort only; never raise from __del__
+        try:
+            if self.opened:
+                self.close()
+        except Exception:
+            pass
+
+    def __repr__(self):
+        opened: str = "opened" if self.opened else "closed"
+        return f"{type(self).__name__}({self.media_type!r}, {self.holder!r}, {opened!r})"
 
     # ------------------------------------------------------------------
     # Codec helpers (private)
@@ -97,61 +138,6 @@ class MediaIO(ABC, Generic[O]):
         """Return the transport compression codec, or ``None``."""
         return self.media_type.codec if self.media_type else None
 
-    def _decompressed_buffer(self) -> tuple[BytesIO, bool]:
-        """Return ``(buffer, was_decompressed)``.
-
-        If the media type has a codec the buffer is decompressed into a
-        **copy** (the original buffer is not mutated). The caller must
-        close the copy when done.
-        """
-        codec = self.codec
-        if codec is not None and self.buffer.size > 0:
-            return self.buffer.decompress(codec=codec, copy=True), True
-        return self.buffer, False
-
-    def _compress_into_buffer(self, plain: BytesIO) -> None:
-        """Compress *plain* with :attr:`codec` and replace :attr:`buffer` contents."""
-        codec = self.codec
-        if codec is not None:
-            compressed = plain.compress(codec=codec, copy=True)
-            self.buffer.replace_with_payload(compressed.to_bytes())
-        else:
-            self.buffer.replace_with_payload(plain.to_bytes())
-
-    # ------------------------------------------------------------------
-    # Cast helpers (private)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _apply_cast(
-        data: "pyarrow.Table | pyarrow.RecordBatch",
-        *,
-        options: O,
-    ) -> "pyarrow.Table | pyarrow.RecordBatch":
-        """Apply configured Arrow cast when requested."""
-        cast = options.cast
-        if cast is None:
-            return data
-
-        try:
-            return cast.cast_arrow_tabular(data)
-        except Exception:
-            if options.raise_error:
-                raise
-            return data
-
-    # ------------------------------------------------------------------
-    # Iterable inference helpers (private)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_nonstring_iterable(obj: Any) -> bool:
-        """Return True for iterables not handled by dedicated branches."""
-        return (
-            isinstance(obj, Iterable)
-            and not isinstance(obj, (str, bytes, bytearray, dict, list, pa.Table))
-        )
-
     @staticmethod
     def _is_path_input(obj: Any) -> bool:
         """Return True for ``str`` / ``Path`` / ``os.PathLike`` inputs."""
@@ -160,139 +146,111 @@ class MediaIO(ABC, Generic[O]):
         return hasattr(obj, "__fspath__")
 
     @staticmethod
-    def _peek_iterable(obj: Iterable[Any]) -> tuple[Any, Iterator[Any]]:
-        """Return first item and a rebuilt iterator including that first item."""
-        iterator = iter(obj)
-        first = next(iterator)
-        return first, itertools.chain((first,), iterator)
+    def polars_to_arrow_table(df: "pl.DataFrame") -> "pyarrow.Table":
+        """Convert a polars DataFrame to an Arrow table."""
+        return df.rechunk().to_arrow(compat_level=pl.CompatLevel.newest())
 
     @staticmethod
-    def _normalize_dict_records(records: Iterable[Any]) -> list[dict]:
-        """Materialize an iterable of dicts into a row-complete list.
+    def iter_arrow_batches(
+        tb: pa.Table | pa.RecordBatch | Iterator[pa.Table | pa.RecordBatch],
+    ) -> Iterator[pa.RecordBatch]:
+        """Iterate Arrow record batches from a wide range of tabular inputs.
 
-        Collects the **union** of keys across all rows and fills missing
-        keys with ``None``. This lets :func:`pyarrow.Table.from_pylist`
-        safely ingest unstructured / sparse records (e.g. ``[{"id": 1},
-        {"name": "a"}]`` or ``[{"id": None}]``) without silently dropping
-        keys that don't appear in the first row.
+        Dispatch order (important — do NOT reorder without care):
+
+        1. Arrow-native types (Table, RecordBatch).
+        2. Column-oriented dicts.
+        3. Polars / pandas frames — these happen to be iterable, but
+           iterating them yields column names or row scalars rather
+           than batches. Must dispatch by namespace BEFORE the generic
+           iterable fallback, or else ``pd.DataFrame`` recursively
+           iterates strings → characters → infinite recursion.
+        4. Lists / tuples — materialized containers that are NOT
+           iterators. A list of row dicts is treated as bulk input
+           (sparse-key normalized via :meth:`_normalize_records`);
+           anything else is walked elementwise.
+        5. Generic iterators — narrowed to actual iterators
+           (``__next__`` defined) via :class:`collections.abc.Iterator`.
+           This deliberately excludes strings, DataFrames, and other
+           "iterable" objects that would cause misdispatch.
+        6. Fallback TypeError.
         """
-        materialized: list[dict] = []
-        key_order: list[str] = []
-        seen: set[str] = set()
-
-        for row in records:
-            if row is None:
-                materialized.append({})
-                continue
-            if not isinstance(row, dict):
-                raise TypeError(
-                    "Expected dict rows for write_table(iterable[dict]); "
-                    f"got item of type {type(row).__name__}"
-                )
-            materialized.append(row)
-            for key in row:
-                if key not in seen:
-                    seen.add(key)
-                    key_order.append(key)
-
-        if not key_order:
-            return []
-
-        return [{k: row.get(k) for k in key_order} for row in materialized]
-
-    @classmethod
-    def _safe_table_from_pylist(cls, records: Iterable[Any]) -> "pyarrow.Table":
-        """Build an Arrow table from dict records, tolerating sparse keys and null-only columns."""
-        normalized = cls._normalize_dict_records(records)
-        if not normalized:
-            return pa.table({})
-        return pa.Table.from_pylist(normalized)  # noqa
-
-    @classmethod
-    def _table_from_tabular_iterable(cls, obj: Iterable[Any]) -> "pyarrow.Table":
-        """Infer an Arrow table from an iterable of supported tabular objects."""
-        first, iterator = cls._peek_iterable(obj)
-
-        if isinstance(first, dict):
-            return cls._safe_table_from_pylist(iterator)
-
-        if isinstance(first, pa.RecordBatch):
-            return pa.Table.from_batches(list(iterator))
-
-        if isinstance(first, pa.Table):
-            tables = list(iterator)
-            if not tables:
-                return pa.table({})
-            return pa.concat_tables(tables, promote_options="default")
-
-        raise TypeError(
-            "Unsupported iterable for write_table: expected an iterable of "
-            "dict, pyarrow.RecordBatch, or pyarrow.Table, got first item "
-            f"of type {type(first)!r}"
-        )
-
-    @classmethod
-    def _iter_to_batches(
-        cls,
-        obj: Iterable[Any],
-    ) -> tuple[Iterator["pyarrow.RecordBatch"], "pyarrow.Schema"]:
-        """Infer a batch iterator and schema from an iterable of tabular objects."""
-        first, iterator = cls._peek_iterable(obj)
-
-        if isinstance(first, dict):
-            table = cls._safe_table_from_pylist(iterator)
-            return iter(table.to_batches()), table.schema
-
-        if isinstance(first, pa.RecordBatch):
-            return iterator, first.schema
-
-        if isinstance(first, pa.Table):
-            def batch_iter() -> Iterator["pyarrow.RecordBatch"]:
-                for tb in iterator:
-                    yield from tb.to_batches()
-
-            return batch_iter(), first.schema
-
-        raise TypeError(
-            "Unsupported iterable for write_table: expected an iterable of "
-            "dict, pyarrow.RecordBatch, or pyarrow.Table, got first item "
-            f"of type {type(first)!r}"
-        )
-
-    def _write_batches_iterable(
-        self,
-        obj: Iterable[Any],
-        *,
-        options: O,
-    ) -> None:
-        """Write an iterable of tabular chunks to the buffer."""
-        try:
-            batches, schema = self._iter_to_batches(obj)
-        except StopIteration:
-            self._write_single_table(pa.table({}), options)
+        # --- (1) Arrow-native ------------------------------------------
+        if isinstance(tb, pa.Table):
+            yield from tb.to_batches()
+            return
+        if isinstance(tb, pa.RecordBatch):
+            yield tb
             return
 
-        codec = self.codec
-        if codec is not None:
-            plain = BytesIO(config=self.buffer.config)
-            orig_buffer = self.buffer
-            self.buffer = plain
-            try:
-                self._write_arrow_batches(
-                    batches=batches,
-                    schema=schema,
-                    options=options,
+        # --- (2) Column-oriented dict ----------------------------------
+        # Only treat dicts as column-oriented when values look like
+        # sequences. Row-shaped dicts (scalar values) would fail
+        # pa.Table.from_pydict with a confusing error; detect and
+        # reject explicitly.
+        if isinstance(tb, dict):
+            if tb and not all(
+                isinstance(v, (list, tuple, pa.Array, pa.ChunkedArray))
+                for v in tb.values()
+            ):
+                raise TypeError(
+                    "iter_arrow_batches received a dict with non-sequence "
+                    "values; did you mean a list of row dicts?"
                 )
-            finally:
-                self.buffer = orig_buffer
-            self._compress_into_buffer(plain)
-            plain.close()
-        else:
-            self._write_arrow_batches(
-                batches=batches,
-                schema=schema,
-                options=options,
+            yield from pa.Table.from_pydict(tb).to_batches()
+            return
+
+        # --- (3) Namespace dispatch (polars, pandas) BEFORE iterable ----
+        ns, _ = ObjectSerde.module_and_name(tb)
+
+        if ns.startswith("polars"):
+            if isinstance(tb, pl.LazyFrame):
+                tb = tb.collect()
+            if isinstance(tb, pl.DataFrame):
+                arrow_table = MediaIO.polars_to_arrow_table(tb)
+                yield from arrow_table.to_batches()
+                return
+            raise TypeError(
+                f"Unsupported polars object for iter_arrow_batches: {type(tb)!r}"
             )
+
+        if ns.startswith("pandas"):
+            import pandas
+            if isinstance(tb, pandas.DataFrame):
+                arrow_table = pa.Table.from_pandas(tb)
+                yield from arrow_table.to_batches()
+                return
+            raise TypeError(
+                f"Unsupported pandas object for iter_arrow_batches: {type(tb)!r}"
+            )
+
+        # --- (4) List / tuple (materialized, NOT iterator) --------------
+        if isinstance(tb, (list, tuple)):
+            if tb and all(isinstance(item, dict) for item in tb):
+                # list[dict] → build a table with sparse-key normalization.
+                yield from pa.Table.from_pylist(
+                    MediaIO._normalize_records(tb)
+                ).to_batches()
+                return
+            # Heterogeneous list of tables/batches/etc — recurse elementwise.
+            for sub_tb in tb:
+                yield from MediaIO.iter_arrow_batches(sub_tb)
+            return
+
+        # --- (5) Generic iterator (collections.abc.Iterator ONLY) --------
+        # Catches generators, pyarrow ChunkedArray-based streams, and
+        # anything else with __next__. Does NOT catch pandas/polars
+        # DataFrames or strings — those either matched earlier or fall
+        # through to the TypeError below.
+        if isinstance(tb, AbcIterator):
+            for sub_tb in tb:
+                yield from MediaIO.iter_arrow_batches(sub_tb)
+            return
+
+        # --- (6) Nothing matched ----------------------------------------
+        raise TypeError(
+            f"Unsupported object for iter_arrow_batches: {type(tb)!r}"
+        )
 
     # ------------------------------------------------------------------
     # Schema inspection
@@ -347,160 +305,17 @@ class MediaIO(ABC, Generic[O]):
     def check_options(cls, options: Optional[O], *args, **kwargs) -> O:
         """Validate and merge caller-supplied options into a concrete instance."""
 
-    def read_arrow_batches(
-        self,
-        *args,
-        options: Optional[O] = None,
-        columns: "Sequence[str] | None | Any" = ...,
-        cast: "CastOptionsArg | Any" = ...,
-        use_threads: "bool | Any" = ...,
-        ignore_empty: "bool | Any" = ...,
-        raise_error: "bool | Any" = ...,
-        **media_options,
-    ) -> Iterator["pyarrow.RecordBatch"]:
-        """Yield Arrow record batches, transparently handling decompression.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance for this format. When ``None`` a fresh
-            default is constructed and the explicit keyword arguments below
-            are merged on top.
-        columns:
-            Optional column projection — only these columns are materialized
-            when the format supports pushdown. Unknown names either raise or
-            get dropped depending on the format.
-        cast:
-            Arrow cast configuration applied to each batch after decode. Accepts
-            a :class:`~yggdrasil.data.cast.options.CastOptions`, a target
-            :class:`pyarrow.Schema` / :class:`pyarrow.Field` / :class:`pyarrow.DataType`,
-            or a dict forwarded to ``CastOptions(**cast)``.
-        use_threads:
-            Enable parallel Arrow decode where the format supports it.
-        ignore_empty:
-            Suppress zero-row batches so callers never see empty shells.
-        raise_error:
-            When ``True`` (default) cast failures propagate; when ``False`` the
-            uncast batch is yielded instead.
-        **media_options:
-            Format-specific knobs consumed by the concrete
-            :meth:`check_options` implementation (e.g. ``compression``,
-            ``delimiter``, ``member``).
-        """
-        resolved = self.check_options(
-            options=options,
-            *args,
-            columns=columns,
-            cast=cast,
-            use_threads=use_threads,
-            ignore_empty=ignore_empty,
-            raise_error=raise_error,
-            **media_options,
-        )
-
-        buf, decompressed = self._decompressed_buffer()
-        orig_buffer = self.buffer
-        try:
-            if decompressed:
-                self.buffer = buf
-
-            for batch in self._read_arrow_batches(options=resolved):
-                casted = self._apply_cast(batch, options=resolved)
-                if isinstance(casted, pa.Table):
-                    yield from casted.to_batches()
-                else:
-                    yield casted
-        finally:
-            if decompressed:
-                self.buffer = orig_buffer
-                buf.close()
-
     @abstractmethod
-    def _read_arrow_batches(self, *, options: O) -> Iterator["pyarrow.RecordBatch"]:
+    def _read_arrow_batches(self, options: O) -> Iterator["pyarrow.RecordBatch"]:
         """Yield record batches from the **uncompressed** buffer."""
-
-    def read_polars_frames(
-        self,
-        *args,
-        options: Optional[O] = None,
-        columns: "Sequence[str] | None | Any" = ...,
-        cast: "CastOptionsArg | Any" = ...,
-        use_threads: "bool | Any" = ...,
-        ignore_empty: "bool | Any" = ...,
-        lazy: "bool | Any" = ...,
-        raise_error: "bool | Any" = ...,
-        **media_options,
-    ) -> Iterator["polars.DataFrame | polars.LazyFrame"]:
-        """Yield one Polars frame per Arrow record batch.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance, or ``None`` to start from defaults.
-        columns:
-            Optional column projection applied before materialization.
-        cast:
-            Arrow cast configuration applied to each batch before conversion.
-        use_threads:
-            Enable parallel Arrow decode where the format supports it.
-        ignore_empty:
-            Suppress zero-row batches.
-        lazy:
-            When ``True`` each yielded frame is wrapped as a
-            :class:`polars.LazyFrame` instead of a
-            :class:`polars.DataFrame`.
-        raise_error:
-            Control whether cast failures propagate.
-        **media_options:
-            Format-specific knobs forwarded to :meth:`check_options`.
-        """
-        from yggdrasil.polars.lib import polars as _pl
-
-        resolved = self.check_options(
-            options=options,
-            *args,
-            columns=columns,
-            cast=cast,
-            use_threads=use_threads,
-            ignore_empty=ignore_empty,
-            lazy=lazy,
-            raise_error=raise_error,
-            **media_options,
-        )
-        for batch in self.read_arrow_batches(options=resolved):
-            df = _pl.from_arrow(batch, rechunk=False)
-            yield df.lazy() if resolved.lazy else df
 
     @abstractmethod
     def _write_arrow_batches(
         self,
-        *,
         batches: Iterator["pyarrow.RecordBatch"],
-        schema: "pyarrow.Schema",
         options: O,
     ) -> None:
         """Consume record batches and write into the **uncompressed** buffer."""
-
-    # ------------------------------------------------------------------
-    # Internal helpers: table ↔ batches bridge
-    # ------------------------------------------------------------------
-
-    def _read_table_from_batches(self, *, options: O) -> "pyarrow.Table":
-        """Collect all batches from :meth:`read_arrow_batches` into one table."""
-        batches = list(self.read_arrow_batches(options=options))
-        if not batches:
-            return pa.table({})
-        return pa.Table.from_batches(batches)
-
-    def _write_table_as_batches(self, *, table: "pyarrow.Table", options: O) -> None:
-        """Convert *table* to batches and forward to :meth:`_write_arrow_batches`."""
-        casted = options.cast.cast_arrow_tabular(table)
-
-        self._write_arrow_batches(
-            batches=iter(casted.to_batches()),
-            schema=casted.schema,
-            options=options.with_cast(None),
-        )
 
     # ------------------------------------------------------------------
     # Factory
@@ -509,7 +324,7 @@ class MediaIO(ABC, Generic[O]):
     @classmethod
     def make(
         cls,
-        buffer: "BytesIO | str | Path | Any",
+        buffer: "BytesIO | str | Path | Any" = None,
         media: "MediaType | MimeType | str | None" = None,
     ) -> "MediaIO[MediaOptions]":
         if not isinstance(buffer, BytesIO):
@@ -530,25 +345,25 @@ class MediaIO(ABC, Generic[O]):
 
         if mt is MimeTypes.PARQUET:
             from .parquet_io import ParquetIO
-            return ParquetIO(media_type=media, buffer=buffer)
+            return ParquetIO(media_type=media, holder=buffer)
         if mt is MimeTypes.CSV or mt is MimeTypes.TSV:
             from .csv_io import CsvIO
-            return CsvIO(media_type=media, buffer=buffer)
+            return CsvIO(media_type=media, holder=buffer)
         if mt is MimeTypes.JSON or mt is MimeTypes.NDJSON:
             from .json_io import JsonIO
-            return JsonIO(media_type=media, buffer=buffer)
+            return JsonIO(media_type=media, holder=buffer)
         if mt is MimeTypes.XML:
             from .xml_io import XmlIO
-            return XmlIO(media_type=media, buffer=buffer)
+            return XmlIO(media_type=media, holder=buffer)
         if mt is MimeTypes.ZIP:
             from .zip_io import ZipIO
-            return ZipIO(media_type=media, buffer=buffer)
+            return ZipIO(media_type=media, holder=buffer)
         if mt is MimeTypes.ARROW_IPC:
             from .arrow_ipc_io import IPCIO
-            return IPCIO(media_type=media, buffer=buffer)
+            return IPCIO(media_type=media, holder=buffer)
         if mt is MimeTypes.XLSX:
             from .xlsx_io import XlsxIO
-            return XlsxIO(media_type=media, buffer=buffer)
+            return XlsxIO(media_type=media, holder=buffer)
 
         raise NotImplementedError(f"Cannot create media IO for {media!r}")
 
@@ -568,28 +383,145 @@ class MediaIO(ABC, Generic[O]):
                 )
         return False
 
+    # ==================================================================
+    # PUBLIC API — each method resolves options once, then delegates to
+    # the matching `_*` private method that takes only (payload, options).
+    # ==================================================================
+
     # ------------------------------------------------------------------
-    # Option-merging helper (private)
+    # Arrow batches (primary read path)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _merge_explicit_options(
-        kwargs: dict[str, Any],
-        **explicit: Any,
-    ) -> dict[str, Any]:
-        """Fold explicitly supplied base options back into ``kwargs``.
+    def read_arrow_batches(
+        self,
+        *,
+        options: Optional[O] = None,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        **option_kwargs,
+    ) -> Iterator["pyarrow.RecordBatch"]:
+        """Yield Arrow record batches, transparently handling decompression.
 
-        The public read/write methods list ``MediaOptions`` fields with a
-        ``...`` sentinel default so they show up in help/autocomplete.
-        Anything the caller actually passed lands in *explicit*; sentinels
-        are dropped so ``check_options`` sees only real overrides. An
-        explicit positional value wins over a duplicate entry in *kwargs*.
+        Parameters
+        ----------
+        options:
+            Pre-built options instance for this format. When ``None`` a fresh
+            default is constructed and the explicit keyword arguments below
+            are merged on top.
+        columns:
+            Optional column projection — only these columns are materialized
+            when the format supports pushdown. Unknown names either raise or
+            get dropped depending on the format.
+        cast:
+            Arrow cast configuration applied to each batch after decode.
+        use_threads:
+            Enable parallel Arrow decode where the format supports it.
+        ignore_empty:
+            Suppress zero-row batches so callers never see empty shells.
+        raise_error:
+            When ``True`` (default) cast failures propagate; when ``False`` the
+            uncast batch is yielded instead.
+        **option_kwargs:
+            Format-specific knobs consumed by the concrete
+            :meth:`check_options` implementation.
         """
-        for key, value in explicit.items():
-            if value is ...:
-                continue
-            kwargs[key] = value
-        return kwargs
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            **option_kwargs,
+        )
+        yield from self._read_arrow_batches(resolved)
+
+    # ------------------------------------------------------------------
+    # Arrow table
+    # ------------------------------------------------------------------
+
+    def read_arrow_table(
+        self,
+        *,
+        options: O | None = None,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        batch_size: "int | None | Any" = ...,
+        **option_kwargs,
+    ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
+        """Read the buffer into a :class:`pyarrow.Table`.
+
+        When *batch_size* is a positive integer, returns an iterator of
+        :class:`pyarrow.Table` chunks of at most *batch_size* rows.
+        """
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            raise_error=raise_error,
+            batch_size=batch_size,
+            **option_kwargs,
+        )
+        return self._read_arrow_table(resolved)
+
+    def _read_arrow_table(
+        self,
+        options: O,
+    ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
+        batches = self._read_arrow_batches(options)
+
+        if getattr(options, "batch_size", 0) and options.batch_size > 0:
+            def iter_tables() -> Iterator["pa.Table"]:
+                for batch in batches:
+                    yield pa.Table.from_batches([batch])
+            return iter_tables()
+
+        all_batches = list(batches)
+        if not all_batches:
+            return pa.Table.from_batches(all_batches, schema=pa.schema([]))
+        return pa.Table.from_batches(all_batches)
+
+    def write_arrow_table(
+        self,
+        table: "pyarrow.Table",
+        *,
+        options: O | None = None,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        **option_kwargs,
+    ) -> None:
+        """Write a :class:`pyarrow.Table` to the buffer."""
+        resolved = self.check_options(
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
+            **option_kwargs,
+        )
+        return self._write_arrow_table(table, resolved)
+
+    def _write_arrow_table(
+        self,
+        table: "pyarrow.Table",
+        options: O,
+    ) -> None:
+        return self._write_arrow_batches(
+            self.iter_arrow_batches(table),
+            options,
+        )
 
     # ------------------------------------------------------------------
     # Generic write dispatcher
@@ -617,91 +549,49 @@ class MediaIO(ABC, Generic[O]):
         - ``polars.DataFrame`` / ``polars.LazyFrame``
         - ``list[dict]`` or any ``Iterable[dict]`` (including generators)
         - ``dict[str, list]`` (column-oriented)
-        - ``str`` / :class:`pathlib.Path` / ``os.PathLike`` pointing to a
-          file or directory readable by
-          :class:`~yggdrasil.io.buffer.path_io.PathIO` — the source is
-          streamed through Arrow batches into this buffer, enabling
-          format conversion (e.g. Parquet → JSON).
-
-        Unstructured record streams (heterogeneous or sparse keys, all-``None``
-        values, e.g. ``[{"id": None}]`` or ``[{"a": 1}, {"b": "x"}]``) are
-        normalized: the union of keys across rows is computed and missing
-        entries are backfilled with ``None`` so no columns are silently
-        dropped.
-
-        Parameters
-        ----------
-        obj:
-            The tabular payload to write. See "Supported inputs" above.
-        options:
-            Pre-built options instance for this format, or ``None`` for
-            defaults. Explicit keyword arguments below override fields on
-            *options*.
-        mode:
-            Write disposition when the buffer is non-empty. Accepts a
-            :class:`~yggdrasil.io.enums.save_mode.SaveMode` or its string
-            name (``"auto"``, ``"overwrite"``, ``"append"``, ``"upsert"``,
-            ``"ignore"``, ``"error_if_exists"``, ``"truncate"``).
-        match_by:
-            Column name or sequence of column names that identify rows when
-            *mode* is :attr:`SaveMode.UPSERT`. Ignored for other modes.
-        cast:
-            Arrow cast configuration applied to batches before encode.
-        use_threads:
-            Enable parallel encode where the format supports it.
-        raise_error:
-            Control whether cast failures propagate during write.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`
-            (e.g. ``compression``, ``include_header``, ``inner_media``).
+        - ``str`` / :class:`pathlib.Path` / ``os.PathLike``
         """
-        option_kwargs = self._merge_explicit_options(
-            option_kwargs,
+        resolved = self.check_options(
+            options=options,
             mode=mode,
             match_by=match_by,
             cast=cast,
             use_threads=use_threads,
             raise_error=raise_error,
+            **option_kwargs,
         )
+        return self._write_table(obj, resolved)
 
+    def _write_table(
+        self,
+        obj: Any,
+        options: O,
+    ) -> None:
+        # Path-like: stream-convert from source format into this buffer.
         if self._is_path_input(obj):
             from .local_path_io import LocalPathIO
 
-            source = LocalPathIO.make(obj)
-            return self.write_table(
-                source.read_arrow_batches(),
-                options=options,
-                **option_kwargs,
-            )
+            with LocalPathIO.make(obj) as source:
+                return self._write_arrow_batches(
+                    source.read_arrow_batches(options=options),
+                    options,
+                )
 
+        # Arrow natives.
         if isinstance(obj, pa.Table):
-            return self.write_arrow_table(
-                table=obj,
-                options=options,
-                **option_kwargs,
-            )
-        elif isinstance(obj, pa.RecordBatch):
-            return self.write_arrow_table(
-                pa.Table.from_batches([obj]),
-                options=options,
-                **option_kwargs,
-            )
+            return self._write_arrow_table(obj, options)
+        if isinstance(obj, pa.RecordBatch):
+            return self._write_arrow_table(pa.Table.from_batches([obj]), options)
 
+        # Polars / pandas frames (non-iterator).
         ns, _ = ObjectSerde.module_and_name(obj)
 
         if ns.startswith("polars"):
-            return self.write_polars_frame(
-                obj,
-                options=options,
-                **option_kwargs,
-            )
-        elif ns.startswith("pandas"):
-            return self.write_pandas_frame(
-                obj,
-                options=options,
-                **option_kwargs
-            )
+            return self._write_polars_frame(obj, options)
+        if ns.startswith("pandas"):
+            return self._write_pandas_frame(obj, options)
 
+        # list[dict].
         if isinstance(obj, list):
             if obj:
                 bad = next(
@@ -713,58 +603,30 @@ class MediaIO(ABC, Generic[O]):
                         "write_table(list) expects list[dict], "
                         f"got element of type {type(bad).__name__}"
                     )
-            self.write_pylist(
-                data=obj,
-                options=options,
-                **option_kwargs,
-            )
-            return
+            return self._write_pylist(obj, options)
 
+        # dict[str, list].
         if isinstance(obj, dict):
-            self.write_pydict(
-                data=obj,
-                options=options,
-                **option_kwargs,
+            return self._write_pydict(obj, options)
+
+        # Generic iterator: peek to decide the concrete path.
+        if isinstance(obj, Iterator):
+            first = next(obj, None)
+            if first is None:
+                return None
+
+            chained = itertools.chain((first,), obj)
+            first_ns, _ = ObjectSerde.module_and_name(first)
+
+            if first_ns.startswith("polars"):
+                return self._write_polars_frames(chained, options)
+
+            # Everything else (Arrow tables/batches, pandas frames, dicts)
+            # is handled by iter_arrow_batches.
+            return self._write_arrow_batches(
+                self.iter_arrow_batches(chained),
+                options,
             )
-            return
-
-        if self._is_nonstring_iterable(obj):
-            resolved = self.check_options(options=options, **option_kwargs)
-            if self.skip_write(mode=resolved.mode):
-                return
-
-            if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
-                table = self._table_from_tabular_iterable(obj)
-                existing = self._read_existing_table()
-                table = self._apply_save_mode(
-                    existing,
-                    table,
-                    mode=resolved.mode,
-                    match_by=resolved.match_by,
-                )
-                self._write_single_table(table, resolved)
-                return
-
-            self._write_batches_iterable(obj, options=resolved)
-            return
-
-        ns = ObjectSerde.full_namespace(obj)
-
-        if ns.startswith("pandas."):
-            self.write_pandas_frame(
-                frame=obj,
-                options=options,
-                **option_kwargs,
-            )
-            return
-
-        if ns.startswith("polars."):
-            self.write_polars_frame(
-                frame=obj,
-                options=options,
-                **option_kwargs,
-            )
-            return
 
         raise TypeError(
             "Unsupported tabular object for write_table: "
@@ -775,240 +637,7 @@ class MediaIO(ABC, Generic[O]):
         )
 
     # ------------------------------------------------------------------
-    # Save-mode helpers (private)
-    # ------------------------------------------------------------------
-
-    def _read_existing_table(self) -> "pyarrow.Table | None":
-        """Read the current buffer contents as an Arrow table, or ``None``."""
-        if self.buffer.size <= 0:
-            return None
-        try:
-            table = self.read_arrow_table()
-            return table if isinstance(table, pa.Table) else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _apply_save_mode(
-        existing: "pyarrow.Table | None",
-        incoming: "pyarrow.Table",
-        *,
-        mode: SaveMode,
-        match_by: "Sequence[str] | None",
-    ) -> "pyarrow.Table":
-        """Combine *existing* and *incoming* tables according to *mode*."""
-        if existing is None or existing.num_rows == 0:
-            return incoming
-
-        if mode in (SaveMode.AUTO, SaveMode.OVERWRITE, SaveMode.TRUNCATE):
-            return incoming
-
-        if mode == SaveMode.APPEND:
-            return pa.concat_tables([existing, incoming], promote_options="default")
-
-        if mode == SaveMode.UPSERT:
-            if not match_by:
-                raise ValueError(
-                    "SaveMode.UPSERT requires match_by columns, got None/empty"
-                )
-            match_by = list(match_by)
-
-            for col in match_by:
-                if col not in existing.column_names:
-                    raise ValueError(
-                        f"UPSERT match_by column {col!r} not in existing table "
-                        f"(columns: {existing.column_names})"
-                    )
-                if col not in incoming.column_names:
-                    raise ValueError(
-                        f"UPSERT match_by column {col!r} not in incoming table "
-                        f"(columns: {incoming.column_names})"
-                    )
-
-            incoming_keys: set[tuple] = set()
-            incoming_key_arrays = [
-                incoming.column(c).to_pylist() for c in match_by
-            ]
-            for row_idx in range(incoming.num_rows):
-                key = tuple(arr[row_idx] for arr in incoming_key_arrays)
-                incoming_keys.add(key)
-
-            existing_key_arrays = [
-                existing.column(c).to_pylist() for c in match_by
-            ]
-            keep_mask: list[bool] = []
-            for row_idx in range(existing.num_rows):
-                key = tuple(arr[row_idx] for arr in existing_key_arrays)
-                keep_mask.append(key not in incoming_keys)
-
-            surviving = existing.filter(pa.array(keep_mask, type=pa.bool_()))
-
-            return pa.concat_tables(
-                [surviving, incoming],
-                promote_options="default",
-            )
-
-        return incoming
-
-    # ------------------------------------------------------------------
-    # Batching helpers (private)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _iter_arrow_batches(
-        table: "pyarrow.Table",
-        batch_size: int,
-    ) -> Iterator["pyarrow.Table"]:
-        """Yield successive :class:`pyarrow.Table` slices of *batch_size* rows."""
-        total = table.num_rows
-        for offset in range(0, total, batch_size):
-            yield table.slice(offset, min(batch_size, total - offset))
-
-    # ------------------------------------------------------------------
-    # Arrow (primary public API)
-    # ------------------------------------------------------------------
-
-    def read_arrow_table(
-        self,
-        *,
-        options: O | None = None,
-        columns: "Sequence[str] | None | Any" = ...,
-        cast: "CastOptionsArg | Any" = ...,
-        use_threads: "bool | Any" = ...,
-        ignore_empty: "bool | Any" = ...,
-        raise_error: "bool | Any" = ...,
-        batch_size: "int | None | Any" = ...,
-        **option_kwargs,
-    ) -> Union["pyarrow.Table", Iterator["pyarrow.Table"]]:
-        """Read the buffer into a :class:`pyarrow.Table`.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance for this format, or ``None`` for
-            defaults. Explicit keyword arguments below override fields on
-            *options*.
-        columns:
-            Optional column projection — only these columns are
-            materialized when the format supports pushdown.
-        cast:
-            Arrow cast configuration applied to each batch after decode.
-        use_threads:
-            Enable parallel Arrow decode where supported.
-        ignore_empty:
-            Suppress zero-row batches.
-        raise_error:
-            Control whether cast failures propagate.
-        batch_size:
-            When ``> 0``, returns an iterator of :class:`pyarrow.Table`
-            chunks of at most *batch_size* rows instead of a single table.
-        **option_kwargs:
-            Format-specific read knobs forwarded to :meth:`check_options`.
-
-        Returns
-        -------
-        pyarrow.Table | Iterator[pyarrow.Table]
-            A single table, or an iterator of row-sliced tables when
-            *batch_size* is set.
-        """
-        resolved = self.check_options(
-            options=options,
-            columns=columns,
-            cast=cast,
-            use_threads=use_threads,
-            ignore_empty=ignore_empty,
-            raise_error=raise_error,
-            batch_size=batch_size,
-            **option_kwargs,
-        )
-        table = self._read_table_from_batches(options=resolved)
-
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            return self._iter_arrow_batches(table, bs)
-        return table
-
-    def write_arrow_table(
-        self,
-        table: "pyarrow.Table",
-        *,
-        options: O | None = None,
-        mode: "SaveMode | str | None | Any" = ...,
-        match_by: "Sequence[str] | str | None | Any" = ...,
-        cast: "CastOptionsArg | Any" = ...,
-        use_threads: "bool | Any" = ...,
-        raise_error: "bool | Any" = ...,
-        **option_kwargs,
-    ) -> None:
-        """Write a :class:`pyarrow.Table` to the buffer.
-
-        Parameters
-        ----------
-        table:
-            The :class:`pyarrow.Table` to encode.
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        mode:
-            Write disposition when the buffer is non-empty (``auto``,
-            ``overwrite``, ``append``, ``upsert``, ``ignore``,
-            ``error_if_exists``, ``truncate``).
-        match_by:
-            Column(s) used as the identity key for
-            :attr:`SaveMode.UPSERT`.
-        cast:
-            Arrow cast configuration applied before encode.
-        use_threads:
-            Enable parallel encode where supported.
-        raise_error:
-            Control whether cast failures propagate.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`.
-        """
-        resolved = self.check_options(
-            options=options,
-            mode=mode,
-            match_by=match_by,
-            cast=cast,
-            use_threads=use_threads,
-            raise_error=raise_error,
-            **option_kwargs,
-        )
-        if self.skip_write(mode=resolved.mode):
-            return
-
-        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
-            existing = self._read_existing_table()
-            table = self._apply_save_mode(
-                existing,
-                table,
-                mode=resolved.mode,
-                match_by=resolved.match_by,
-            )
-
-        self._write_single_table(table, resolved)
-
-    def _write_single_table(
-        self,
-        table: "pyarrow.Table",
-        options: O,
-    ) -> None:
-        """Write one table handling codec compression."""
-        codec = self.codec
-        if codec is not None:
-            plain = BytesIO(config=self.buffer.config)
-            orig_buffer = self.buffer
-            self.buffer = plain
-            try:
-                self._write_table_as_batches(table=table, options=options)
-            finally:
-                self.buffer = orig_buffer
-            self._compress_into_buffer(plain)
-            plain.close()
-        else:
-            self._write_table_as_batches(table=table, options=options)
-
-    # ------------------------------------------------------------------
-    # Python dict / list convenience wrappers
+    # Python list[dict]
     # ------------------------------------------------------------------
 
     def read_pylist(
@@ -1023,29 +652,7 @@ class MediaIO(ABC, Generic[O]):
         batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union[list[dict], Iterator[list[dict]]]:
-        """Read the buffer as a list of row dicts.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        columns:
-            Optional column projection applied before row materialization.
-        cast:
-            Arrow cast configuration applied before conversion to Python
-            objects.
-        use_threads:
-            Enable parallel Arrow decode where supported.
-        ignore_empty:
-            Suppress zero-row batches.
-        raise_error:
-            Control whether cast failures propagate.
-        batch_size:
-            When ``> 0``, returns a generator yielding successive
-            ``list[dict]`` chunks of at most *batch_size* rows.
-        **option_kwargs:
-            Format-specific read knobs forwarded to :meth:`check_options`.
-        """
+        """Read the buffer as a list of row dicts (or an iterator of chunks)."""
         resolved = self.check_options(
             options=options,
             columns=columns,
@@ -1056,13 +663,21 @@ class MediaIO(ABC, Generic[O]):
             batch_size=batch_size,
             **option_kwargs,
         )
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            return (
-                chunk.to_pylist()
-                for chunk in self.read_arrow_table(options=resolved)
-            )
-        return self.read_arrow_table(options=resolved).to_pylist()
+        return self._read_pylist(resolved)
+
+    def _read_pylist(
+        self,
+        options: O,
+    ) -> Union[list[dict], Iterator[list[dict]]]:
+        table_or_iter = self._read_arrow_table(options)
+
+        if isinstance(table_or_iter, pa.Table):
+            return table_or_iter.to_pylist(maps_as_pydicts=True)
+
+        def iter_pylists() -> Iterator[list[dict]]:
+            for tb in table_or_iter:
+                yield tb.to_pylist(maps_as_pydicts=True)
+        return iter_pylists()
 
     def write_pylist(
         self,
@@ -1076,35 +691,12 @@ class MediaIO(ABC, Generic[O]):
         raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
-        """Write a list (or iterable/generator) of row dicts to the buffer.
+        """Write a list (or iterable) of row dicts to the buffer.
 
-        Accepts unstructured records: missing keys are filled with ``None``
-        using the union of keys across rows, and all-``None`` columns are
-        written with Arrow ``null`` type.
-
-        Parameters
-        ----------
-        data:
-            An iterable of row dicts. Sparse/heterogeneous keys are
-            normalized against the union of keys seen across rows.
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        mode:
-            Write disposition when the buffer is non-empty.
-        match_by:
-            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
-        cast:
-            Arrow cast configuration applied before encode.
-        use_threads:
-            Enable parallel encode where supported.
-        raise_error:
-            Control whether cast failures propagate.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`.
+        Sparse/heterogeneous keys are normalized against the union of keys
+        seen across rows; missing entries are backfilled with ``None``.
         """
-        tb = self._safe_table_from_pylist(data)
-        self.write_arrow_table(
-            table=tb,
+        resolved = self.check_options(
             options=options,
             mode=mode,
             match_by=match_by,
@@ -1113,6 +705,70 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
+        return self._write_pylist(data, resolved)
+
+    @staticmethod
+    def _normalize_records(data: Iterable[dict]) -> list[dict]:
+        """Return *data* with every row backfilled to the union of keys.
+
+        :meth:`pyarrow.Table.from_pylist` infers the schema from the first row
+        only, silently dropping columns that appear later and producing wrong
+        results for sparse / heterogeneous inputs. This helper walks every row
+        once, collects the union of keys in first-seen order, then produces a
+        new list where each row has every key (missing entries filled with
+        ``None``). All-``None`` columns end up with Arrow ``null`` type on
+        conversion.
+        """
+        rows = list(data) if not isinstance(data, list) else data
+        if not rows:
+            return []
+
+        # Preserve first-seen key order for stable column ordering.
+        all_keys: dict[str, None] = {}
+        needs_backfill = False
+        reference_keys: tuple[str, ...] | None = None
+
+        for row in rows:
+            if row is None:
+                needs_backfill = True
+                continue
+            row_keys = tuple(row.keys())
+            if reference_keys is None:
+                reference_keys = row_keys
+            elif row_keys != reference_keys:
+                needs_backfill = True
+            for key in row_keys:
+                if key not in all_keys:
+                    all_keys[key] = None
+
+        if not needs_backfill:
+            return rows
+
+        keys = tuple(all_keys.keys())
+        return [
+            {key: (row.get(key) if row is not None else None) for key in keys}
+            for row in rows
+        ]
+
+    def _write_pylist(
+        self,
+        data: Iterable[dict],
+        options: O,
+    ) -> None:
+        rows = self._normalize_records(data)
+        try:
+            tb = pa.Table.from_pylist(rows)
+        except pa.ArrowInvalid:
+            # Genuinely unrepresentable mixed types — fall back to batch streaming.
+            return self._write_arrow_batches(
+                self.iter_arrow_batches(rows),
+                options,
+            )
+        return self._write_arrow_table(tb, options)
+
+    # ------------------------------------------------------------------
+    # Python dict[str, list]
+    # ------------------------------------------------------------------
 
     def read_pydict(
         self,
@@ -1126,28 +782,7 @@ class MediaIO(ABC, Generic[O]):
         batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union[dict[str, list], Iterator[dict[str, list]]]:
-        """Read the buffer as a column-oriented dict.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        columns:
-            Optional column projection.
-        cast:
-            Arrow cast configuration applied before conversion.
-        use_threads:
-            Enable parallel Arrow decode where supported.
-        ignore_empty:
-            Suppress zero-row batches.
-        raise_error:
-            Control whether cast failures propagate.
-        batch_size:
-            When ``> 0``, returns a generator yielding successive
-            ``dict[str, list]`` chunks of at most *batch_size* rows.
-        **option_kwargs:
-            Format-specific read knobs forwarded to :meth:`check_options`.
-        """
+        """Read the buffer as a column-oriented dict."""
         resolved = self.check_options(
             options=options,
             columns=columns,
@@ -1158,13 +793,21 @@ class MediaIO(ABC, Generic[O]):
             batch_size=batch_size,
             **option_kwargs,
         )
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            return (
-                chunk.to_pydict()
-                for chunk in self.read_arrow_table(options=resolved)
-            )
-        return self.read_arrow_table(options=resolved).to_pydict()
+        return self._read_pydict(resolved)
+
+    def _read_pydict(
+        self,
+        options: O,
+    ) -> Union[dict[str, list], Iterator[dict[str, list]]]:
+        table_or_iter = self._read_arrow_table(options)
+
+        if isinstance(table_or_iter, pa.Table):
+            return table_or_iter.to_pydict(maps_as_pydicts=True)
+
+        def iter_pydicts() -> Iterator[dict[str, list]]:
+            for tb in table_or_iter:
+                yield tb.to_pydict(maps_as_pydicts=True)
+        return iter_pydicts()
 
     def write_pydict(
         self,
@@ -1178,30 +821,8 @@ class MediaIO(ABC, Generic[O]):
         raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
-        """Write a column-oriented dict to the buffer.
-
-        Parameters
-        ----------
-        data:
-            A ``dict[str, list]`` where every value is a column-length list.
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        mode:
-            Write disposition when the buffer is non-empty.
-        match_by:
-            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
-        cast:
-            Arrow cast configuration applied before encode.
-        use_threads:
-            Enable parallel encode where supported.
-        raise_error:
-            Control whether cast failures propagate.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`.
-        """
-        tb = pa.Table.from_pydict(data) # noqa
-        self.write_arrow_table(
-            table=tb,
+        """Write a column-oriented dict to the buffer."""
+        resolved = self.check_options(
             options=options,
             mode=mode,
             match_by=match_by,
@@ -1210,9 +831,18 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
+        return self._write_pydict(data, resolved)
+
+    def _write_pydict(
+        self,
+        data: dict[str, list],
+        options: O,
+    ) -> None:
+        tb = pa.Table.from_pydict(data)  # noqa
+        return self._write_arrow_table(tb, options)
 
     # ------------------------------------------------------------------
-    # Pandas / Polars convenience wrappers
+    # Pandas
     # ------------------------------------------------------------------
 
     def read_pandas_frame(
@@ -1227,28 +857,7 @@ class MediaIO(ABC, Generic[O]):
         batch_size: "int | None | Any" = ...,
         **option_kwargs,
     ) -> Union["pandas.DataFrame", Iterator["pandas.DataFrame"]]:
-        """Read the buffer as a :class:`pandas.DataFrame`.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        columns:
-            Optional column projection.
-        cast:
-            Arrow cast configuration applied before pandas conversion.
-        use_threads:
-            Enable parallel Arrow decode where supported.
-        ignore_empty:
-            Suppress zero-row batches.
-        raise_error:
-            Control whether cast failures propagate.
-        batch_size:
-            When ``> 0``, returns a generator yielding
-            :class:`pandas.DataFrame` chunks of at most *batch_size* rows.
-        **option_kwargs:
-            Format-specific read knobs forwarded to :meth:`check_options`.
-        """
+        """Read the buffer as a :class:`pandas.DataFrame`."""
         resolved = self.check_options(
             options=options,
             columns=columns,
@@ -1259,13 +868,21 @@ class MediaIO(ABC, Generic[O]):
             batch_size=batch_size,
             **option_kwargs,
         )
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            return (
-                chunk.to_pandas()
-                for chunk in self.read_arrow_table(options=resolved)
-            )
-        return self.read_arrow_table(options=resolved).to_pandas()
+        return self._read_pandas_frame(resolved)
+
+    def _read_pandas_frame(
+        self,
+        options: O,
+    ) -> Union["pandas.DataFrame", Iterator["pandas.DataFrame"]]:
+        table_or_iter = self._read_arrow_table(options)
+
+        if isinstance(table_or_iter, pa.Table):
+            return table_or_iter.to_pandas()
+
+        def iter_frames() -> Iterator["pandas.DataFrame"]:
+            for tb in table_or_iter:
+                yield tb.to_pandas()
+        return iter_frames()
 
     def write_pandas_frame(
         self,
@@ -1281,36 +898,9 @@ class MediaIO(ABC, Generic[O]):
     ) -> None:
         """Write a :class:`pandas.DataFrame` to the buffer.
 
-        The index is preserved only when it has a non-empty ``name``; an
-        unnamed ``RangeIndex`` is dropped to stay consistent with typical
-        tabular outputs.
-
-        Parameters
-        ----------
-        frame:
-            The :class:`pandas.DataFrame` to encode.
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        mode:
-            Write disposition when the buffer is non-empty.
-        match_by:
-            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
-        cast:
-            Arrow cast configuration applied before encode.
-        use_threads:
-            Enable parallel encode where supported.
-        raise_error:
-            Control whether cast failures propagate.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`.
+        An unnamed ``RangeIndex`` is dropped; a named index is preserved.
         """
-        tb = pa.Table.from_pandas(
-            frame,
-            preserve_index=bool(frame.index.name),
-        ) # noqa
-
-        self.write_arrow_table(
-            table=tb,
+        resolved = self.check_options(
             options=options,
             mode=mode,
             match_by=match_by,
@@ -1319,6 +909,22 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
+        return self._write_pandas_frame(frame, resolved)
+
+    def _write_pandas_frame(
+        self,
+        frame: "pandas.DataFrame",
+        options: O,
+    ) -> None:
+        tb = pa.Table.from_pandas(
+            frame,
+            preserve_index=bool(frame.index.name),
+        )  # noqa
+        return self._write_arrow_table(tb, options)
+
+    # ------------------------------------------------------------------
+    # Polars
+    # ------------------------------------------------------------------
 
     def read_polars_frame(
         self,
@@ -1332,39 +938,8 @@ class MediaIO(ABC, Generic[O]):
         raise_error: "bool | Any" = ...,
         batch_size: "int | None | Any" = ...,
         **option_kwargs,
-    ) -> Union[
-        "polars.DataFrame",
-        "polars.LazyFrame",
-        Iterator["polars.DataFrame"],
-    ]:
-        """Read the buffer as a Polars frame.
-
-        Parameters
-        ----------
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        columns:
-            Optional column projection.
-        cast:
-            Arrow cast configuration applied before Polars conversion.
-        use_threads:
-            Enable parallel Arrow decode where supported.
-        ignore_empty:
-            Suppress zero-row batches.
-        lazy:
-            When ``True`` the returned frame is a
-            :class:`polars.LazyFrame` instead of a
-            :class:`polars.DataFrame`. Ignored when *batch_size* is set.
-        raise_error:
-            Control whether cast failures propagate.
-        batch_size:
-            When ``> 0``, returns a generator yielding
-            :class:`polars.DataFrame` chunks of at most *batch_size* rows.
-        **option_kwargs:
-            Format-specific read knobs forwarded to :meth:`check_options`.
-        """
-        from yggdrasil.polars.lib import polars as _pl
-
+    ) -> "pl.DataFrame | pl.LazyFrame | Iterator[pl.DataFrame | pl.LazyFrame]":
+        """Read the buffer as a Polars frame (or iterator of chunks)."""
         resolved = self.check_options(
             options=options,
             columns=columns,
@@ -1376,20 +951,59 @@ class MediaIO(ABC, Generic[O]):
             batch_size=batch_size,
             **option_kwargs,
         )
-        bs = resolved.batch_size
-        if bs and bs > 0:
-            return (
-                _pl.from_arrow(chunk, rechunk=False)
-                for chunk in self.read_arrow_table(options=resolved)
-            )
+        return self._read_polars_frame(resolved)
 
-        tb = self.read_arrow_table(options=resolved)
-        df = _pl.from_arrow(tb, rechunk=False)
-        return df.lazy() if resolved.lazy else df
+    def _read_polars_frame(
+        self,
+        options: O,
+    ) -> "pl.DataFrame | pl.LazyFrame | Iterator[pl.DataFrame | pl.LazyFrame]":
+        # Chunked: yield one frame per record batch.
+        if getattr(options, "batch_size", 0) and options.batch_size > 0:
+            return self._read_polars_frames(options)
+
+        # Single frame: materialize the whole table once.
+        arrow_table = self._read_arrow_table(options)
+        # _read_arrow_table returns a pa.Table when batch_size<=0.
+        df = pl.from_arrow(arrow_table)
+        return df.lazy() if getattr(options, "lazy", False) else df
+
+    def read_polars_frames(
+        self,
+        *,
+        options: Optional[O] = None,
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        ignore_empty: "bool | Any" = ...,
+        lazy: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        **option_kwargs,
+    ) -> Iterator["pl.DataFrame | pl.LazyFrame"]:
+        """Yield one Polars frame per Arrow record batch."""
+        resolved = self.check_options(
+            options=options,
+            columns=columns,
+            cast=cast,
+            use_threads=use_threads,
+            ignore_empty=ignore_empty,
+            lazy=lazy,
+            raise_error=raise_error,
+            **option_kwargs,
+        )
+        yield from self._read_polars_frames(resolved)
+
+    def _read_polars_frames(
+        self,
+        options: O,
+    ) -> Iterator["pl.DataFrame | pl.LazyFrame"]:
+        want_lazy = bool(getattr(options, "lazy", False))
+        for arrow_batch in self._read_arrow_batches(options):
+            df = pl.from_arrow(arrow_batch, rechunk=False)
+            yield df.lazy() if want_lazy else df
 
     def write_polars_frame(
         self,
-        frame: "polars.DataFrame | polars.LazyFrame",
+        frame: "pl.DataFrame | pl.LazyFrame",
         *,
         options: O | None = None,
         mode: "SaveMode | str | None | Any" = ...,
@@ -1399,41 +1013,7 @@ class MediaIO(ABC, Generic[O]):
         raise_error: "bool | Any" = ...,
         **option_kwargs,
     ) -> None:
-        """Write a Polars DataFrame or LazyFrame to the buffer.
-
-        For formats with a native Polars writer (Parquet, Arrow IPC,
-        CSV/TSV, JSON) the frame is serialized directly via
-        :meth:`polars.DataFrame.write_parquet` / ``write_ipc`` /
-        ``write_csv`` / ``write_json`` — the buffer never round-trips
-        through a :class:`pyarrow.Table`. Other formats fall back to the
-        Arrow-table write path.
-
-        A :class:`polars.LazyFrame` is collected before encode. Save-mode
-        merging (:attr:`SaveMode.APPEND`, :attr:`SaveMode.UPSERT`) is applied
-        using Polars-native ``concat`` / anti-join when the format supports
-        a native writer, and defers to the Arrow path otherwise.
-
-        Parameters
-        ----------
-        frame:
-            The Polars frame to encode.
-        options:
-            Pre-built options instance, or ``None`` for defaults.
-        mode:
-            Write disposition when the buffer is non-empty.
-        match_by:
-            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
-        cast:
-            Arrow cast configuration applied before encode.
-        use_threads:
-            Enable parallel encode where supported.
-        raise_error:
-            Control whether cast failures propagate.
-        **option_kwargs:
-            Format-specific write knobs forwarded to :meth:`check_options`.
-        """
-        from yggdrasil.polars.lib import polars as _pl
-
+        """Write a Polars DataFrame or LazyFrame to the buffer."""
         resolved = self.check_options(
             options=options,
             mode=mode,
@@ -1443,202 +1023,50 @@ class MediaIO(ABC, Generic[O]):
             raise_error=raise_error,
             **option_kwargs,
         )
+        return self._write_polars_frame(frame, resolved)
 
-        mime = self.media_type.mime_type if self.media_type is not None else None
+    def _write_polars_frame(
+        self,
+        frame: "pl.DataFrame | pl.LazyFrame",
+        options: O,
+    ) -> None:
+        # Collect lazy frames up-front so height / sizing work.
+        if isinstance(frame, pl.LazyFrame):
+            frame = frame.collect()
 
-        # Formats without a native Polars writer fall back to the Arrow path
-        # (which also owns save-mode merging + codec wrapping for them).
-        if mime not in _POLARS_NATIVE_MIMES:
-            casted = resolved.cast.cast_polars_tabular(frame)
-            if isinstance(casted, _pl.LazyFrame):
-                casted = casted.collect()
-            self.write_arrow_table(
-                table=casted.rechunk().to_arrow(),
-                options=resolved,
-            )
-            return
+        if frame.height == 0:
+            return None
 
-        if self.skip_write(mode=resolved.mode):
-            return
+        batch_size = getattr(options, "batch_size", 0) or 0
+        byte_size = getattr(options, "byte_size", 0) or 0
 
-        df = self._prepare_polars_frame(frame, options=resolved)
+        if batch_size > 0:
+            def iter_chunks() -> Iterator["pl.DataFrame"]:
+                yield from frame.iter_slices(n_rows=batch_size)
 
-        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
-            existing = self._read_existing_polars_frame()
-            df = self._apply_polars_save_mode(
-                existing,
-                df,
-                mode=resolved.mode,
-                match_by=resolved.match_by,
-            )
+        elif byte_size > 0:
+            total_size = frame.estimated_size(unit="b")
+            if total_size == 0:
+                def iter_chunks() -> Iterator["pl.DataFrame"]:
+                    yield frame
+            else:
+                rows_per_chunk = max(1, int(frame.height * byte_size / total_size))
 
-        payload = self._encode_polars_frame(df, mime=mime, options=resolved)
+                def iter_chunks() -> Iterator["pl.DataFrame"]:
+                    yield from frame.iter_slices(n_rows=rows_per_chunk)
 
-        codec = self.codec
-        if codec is not None:
-            plain = BytesIO(payload, config=self.buffer.config)
-            try:
-                self._compress_into_buffer(plain)
-            finally:
-                plain.close()
         else:
-            self.buffer.replace_with_payload(payload)
+            def iter_chunks() -> Iterator["pl.DataFrame"]:
+                yield frame
 
-    # ------------------------------------------------------------------
-    # Polars-native write helpers (private)
-    # ------------------------------------------------------------------
+        return self._write_polars_frames(iter_chunks(), options)
 
-    @staticmethod
-    def _prepare_polars_frame(
-        frame: "polars.DataFrame | polars.LazyFrame",
-        *,
+    def _write_polars_frames(
+        self,
+        frames: Iterator["pl.DataFrame | pl.LazyFrame"],
         options: O,
-    ) -> "polars.DataFrame":
-        """Collect a LazyFrame, apply the configured cast, rechunk."""
-        from yggdrasil.polars.lib import polars as _pl
-
-        casted = options.cast.cast_polars_tabular(frame)
-        if isinstance(casted, _pl.LazyFrame):
-            casted = casted.collect()
-
-        if options.columns is not None:
-            keep = [c for c in options.columns if c in casted.columns]
-            casted = casted.select(keep)
-
-        return casted.rechunk()
-
-    def _read_existing_polars_frame(self) -> "polars.DataFrame | None":
-        """Read current buffer contents as a Polars DataFrame, or ``None``."""
-        if self.buffer.size <= 0:
-            return None
-        try:
-            from yggdrasil.polars.lib import polars as _pl
-
-            table = self.read_arrow_table()
-            if not isinstance(table, pa.Table):
-                return None
-            frame = _pl.from_arrow(table, rechunk=False)
-            if isinstance(frame, _pl.Series):
-                frame = frame.to_frame()
-            return frame
-        except Exception:
-            return None
-
-    @staticmethod
-    def _apply_polars_save_mode(
-        existing: "polars.DataFrame | None",
-        incoming: "polars.DataFrame",
-        *,
-        mode: SaveMode,
-        match_by: "Sequence[str] | None",
-    ) -> "polars.DataFrame":
-        """Combine *existing* and *incoming* Polars frames according to *mode*."""
-        from yggdrasil.polars.lib import polars as _pl
-
-        if existing is None or existing.height == 0:
-            return incoming
-
-        if mode in (SaveMode.AUTO, SaveMode.OVERWRITE, SaveMode.TRUNCATE):
-            return incoming
-
-        if mode == SaveMode.APPEND:
-            return _pl.concat([existing, incoming], how="diagonal_relaxed")
-
-        if mode == SaveMode.UPSERT:
-            if not match_by:
-                raise ValueError(
-                    "SaveMode.UPSERT requires match_by columns, got None/empty"
-                )
-            keys = list(match_by)
-            for col in keys:
-                if col not in existing.columns:
-                    raise ValueError(
-                        f"UPSERT match_by column {col!r} not in existing frame "
-                        f"(columns: {existing.columns})"
-                    )
-                if col not in incoming.columns:
-                    raise ValueError(
-                        f"UPSERT match_by column {col!r} not in incoming frame "
-                        f"(columns: {incoming.columns})"
-                    )
-
-            surviving = existing.join(incoming.select(keys), on=keys, how="anti")
-            return _pl.concat([surviving, incoming], how="diagonal_relaxed")
-
-        return incoming
-
-    @classmethod
-    def _encode_polars_frame(
-        cls,
-        df: "polars.DataFrame",
-        *,
-        mime: "MimeType",
-        options: O,
-    ) -> bytes:
-        """Serialize *df* through the Polars native writer for *mime*."""
-        buf = _stdlib_io.BytesIO()
-
-        if mime is MimeTypes.PARQUET:
-            df.write_parquet(
-                buf,
-                compression=cls._pl_parquet_compression(
-                    getattr(options, "compression", None)
-                ),
-                compression_level=getattr(options, "compression_level", None),
-                statistics=getattr(options, "use_statistics", True),
-                use_pyarrow=True,
-            )
-            return buf.getvalue()
-
-        if mime is MimeTypes.ARROW_IPC or mime is MimeTypes.ARROW_IPC_STREAM:
-            df.write_ipc(
-                buf,
-                compression=cls._pl_ipc_compression(
-                    getattr(options, "compression", None)
-                ),
-            )
-            return buf.getvalue()
-
-        if mime is MimeTypes.JSON:
-            # Polars 1.x writes a JSON array of row dicts, matching JsonIO.
-            df.write_json(buf)
-            return buf.getvalue()
-
-        if mime is MimeTypes.CSV or mime is MimeTypes.TSV:
-            separator = getattr(options, "delimiter", None)
-            if not separator:
-                separator = "\t" if mime is MimeTypes.TSV else ","
-            df.write_csv(
-                buf,
-                separator=separator,
-                include_header=getattr(options, "include_header", True),
-            )
-            return buf.getvalue()
-
-        raise NotImplementedError(
-            f"No native Polars writer registered for mime type {mime!r}"
-        )
-
-    @staticmethod
-    def _pl_parquet_compression(value: Any) -> str:
-        """Map ygg's compression sentinels to Polars Parquet codec names."""
-        if value in (None, "", "none", "off", "auto"):
-            return "zstd"
-        if value in _POLARS_PARQUET_COMPRESSIONS:
-            return value
-        raise ValueError(
-            f"Polars Parquet writer rejects compression={value!r}; "
-            f"valid values: {sorted(_POLARS_PARQUET_COMPRESSIONS)}"
-        )
-
-    @staticmethod
-    def _pl_ipc_compression(value: Any) -> str:
-        """Map ygg's compression sentinels to Polars IPC codec names."""
-        if value in (None, "", "none", "off", "auto"):
-            return "uncompressed"
-        if value in _POLARS_IPC_COMPRESSIONS:
-            return value
-        raise ValueError(
-            f"Polars IPC writer rejects compression={value!r}; "
-            f"valid values: {sorted(_POLARS_IPC_COMPRESSIONS)}"
+    ) -> None:
+        return self._write_arrow_batches(
+            self.iter_arrow_batches(frames),
+            options,
         )

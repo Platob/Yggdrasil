@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin, Iterator, Generator
 
 import pyarrow as pa
 
@@ -23,6 +25,7 @@ from yggdrasil.io import SaveMode
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter
 from .data_utils import get_cast_options_class
+from .types import NullType
 from .types.base import DataType
 from .types.nested import StructType
 from .types.support import get_pandas, get_polars, get_spark_sql
@@ -275,6 +278,24 @@ class Field(BaseMetadata, BaseChildrenFields):
         if self.has_default:
             return f"Field({self.name!r}: {self.dtype!r}{suffix})"
         return f"Field({self.name!r}: {self.dtype!r}{suffix})"
+
+    @classmethod
+    def peek_from(cls, obj: Any) -> tuple[Any, "Field"]:
+        if isinstance(obj, (Iterator, Generator)):
+            first = next(obj, None)
+
+            if first is None:
+                return None, cls(name="", dtype=NullType())
+
+            obj = itertools.chain((first,), obj)
+
+            return obj, cls.from_(first)
+        elif isinstance(obj, list):
+            if not obj:
+                return obj, cls(name="", dtype=NullType())
+            return obj, cls.from_(obj[0])
+        else:
+            return obj, cls.from_(obj)
 
     def equals(
         self,
@@ -604,16 +625,20 @@ class Field(BaseMetadata, BaseChildrenFields):
         if isinstance(obj, cls):
             return obj
 
+        if isinstance(obj, DataType):
+            return cls(name="", dtype=obj)
+
+        if isinstance(obj, (str, Path)):
+            p = Path(obj)
+
+            if p.exists():
+                from yggdrasil.io.buffer.local_path_io import LocalPathIO
+
+                return LocalPathIO.make(p).collect_schema().to_field()
+
         ns, _ = ObjectSerde.module_and_name(obj)
 
         if ns.startswith("yggdrasil"):
-            if isinstance(obj, DataType):
-                return cls(
-                    name=DEFAULT_FIELD_NAME,
-                    dtype=obj,
-                    nullable=True,
-                )
-
             from .schema import Schema
 
             if isinstance(obj, Schema):
@@ -646,6 +671,9 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if hasattr(obj, "value"):
             return cls.from_any(obj.value)
+
+        if hasattr(obj, "collect_schema"):
+            return cls.from_any(obj.collect_schema())
 
         raise TypeError(f"Cannot build Field from {type(obj).__name__}")
 

@@ -21,7 +21,6 @@ import pyarrow as pa
 import pyarrow.csv as csv_pa
 
 from yggdrasil.io.enums import MimeTypes
-
 from .media_io import MediaIO
 from .media_options import MediaOptions
 
@@ -187,6 +186,10 @@ class CsvIO(MediaIO[CsvOptions]):
         """Validate and merge caller-supplied options."""
         return CsvOptions.check_parameters(options=options, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
+
     def _sample_text(
         self,
         *,
@@ -222,7 +225,8 @@ class CsvIO(MediaIO[CsvOptions]):
             if not positive:
                 continue
 
-            score = (len(positive), max(positive) - min(positive))
+            # More lines where the delimiter appears, then lowest variance.
+            score = (len(positive), -(max(positive) - min(positive)))
             if score > best_score:
                 best_delimiter = delimiter
                 best_score = score
@@ -240,14 +244,16 @@ class CsvIO(MediaIO[CsvOptions]):
             return options.has_header
 
         sample = self._sample_text(options=options)
+        reader_kwargs: dict[str, Any] = {
+            "delimiter": delimiter,
+            "quotechar": options.quote_char or '"',
+        }
+        if options.escape_char is not None:
+            reader_kwargs["escapechar"] = options.escape_char
+
         rows = [
             row
-            for row in csv.reader(
-                sample.splitlines(),
-                delimiter=delimiter,
-                quotechar=options.quote_char or '"',
-                escapechar=options.escape_char,
-            )
+            for row in csv.reader(sample.splitlines(), **reader_kwargs)
             if row and any(cell.strip() for cell in row)
         ]
 
@@ -267,11 +273,14 @@ class CsvIO(MediaIO[CsvOptions]):
 
         second_has_typed_values = any(kind in {"number", "bool", "date"} for kind in second_types)
         first_is_stringy = all(kind in {"string", "null"} for kind in first_types)
-        first_is_unique = len({value.strip() for value in first if value.strip()}) == len(
-            [value for value in first if value.strip()]
-        )
+        non_empty_first = [value for value in first if value.strip()]
+        first_is_unique = len({value.strip() for value in non_empty_first}) == len(non_empty_first)
 
         return first_is_stringy and first_is_unique and second_has_typed_values
+
+    # ------------------------------------------------------------------
+    # pyarrow.csv option builders
+    # ------------------------------------------------------------------
 
     def _read_options(self, *, options: CsvOptions, has_header: bool):
         """Build :mod:`pyarrow.csv` read options."""
@@ -305,52 +314,54 @@ class CsvIO(MediaIO[CsvOptions]):
             timestamp_parsers=list(options.timestamp_parsers),
         )
 
+    # ------------------------------------------------------------------
+    # Core read/write protocol
+    # ------------------------------------------------------------------
+
     def _read_arrow_batches(
         self,
-        *,
         options: CsvOptions,
     ) -> Iterator["pyarrow.RecordBatch"]:
         """Yield record batches from the CSV / TSV buffer."""
-        if self.buffer.size <= 0:
-            return
+        with self.open() as b:
+            if b.buffer.size <= 0:
+                return
 
-        delimiter = self._infer_delimiter(options=options)
-        has_header = self._infer_has_header(options=options, delimiter=delimiter)
-        arrow_io = self.buffer.to_arrow_io("r")
-        try:
-            table = csv_pa.read_csv(
-                arrow_io,
-                read_options=self._read_options(options=options, has_header=has_header),
-                parse_options=self._parse_options(options=options, delimiter=delimiter),
-                convert_options=self._convert_options(options=options),
-            )
-        finally:
-            arrow_io.close()
+            delimiter = self._infer_delimiter(options=options)
+            has_header = self._infer_has_header(options=options, delimiter=delimiter)
 
-        if options.columns is not None:
-            table = table.select(options.columns)
+            arrow_io = b.buffer.to_arrow_io("r")
+            try:
+                table = csv_pa.read_csv(
+                    arrow_io,
+                    read_options=self._read_options(options=options, has_header=has_header),
+                    parse_options=self._parse_options(options=options, delimiter=delimiter),
+                    convert_options=self._convert_options(options=options),
+                )
+            finally:
+                arrow_io.close()
 
-        if table.num_rows == 0 and options.ignore_empty:
-            return
+            if options.columns is not None:
+                table = table.select(options.columns)
 
-        yield from pa.Table.from_batches(table.to_batches()).to_batches()
+            if table.num_rows == 0 and options.ignore_empty:
+                return
+
+            yield from options.cast.cast_iterator(self.iter_arrow_batches(table))
 
     def _collect_arrow_schema(self, full: bool = False) -> "pyarrow.Schema":
         """Return the CSV schema by opening a streaming reader (header only)."""
         del full
-        if self.buffer.size <= 0:
-            return pa.schema([])
 
-        options = self.check_options(options=None)
-        delimiter = self._infer_delimiter(options=options)
-        has_header = self._infer_has_header(options=options, delimiter=delimiter)
+        with self.open() as b:
+            if b.buffer.size <= 0:
+                return pa.schema([])
 
-        buf, decompressed = self._decompressed_buffer()
-        orig_buffer = self.buffer
-        try:
-            if decompressed:
-                self.buffer = buf
-            arrow_io = self.buffer.to_arrow_io("r")
+            options = self.check_options(options=None)
+            delimiter = self._infer_delimiter(options=options)
+            has_header = self._infer_has_header(options=options, delimiter=delimiter)
+
+            arrow_io = b.buffer.to_arrow_io("r")
             try:
                 reader = csv_pa.open_csv(
                     arrow_io,
@@ -369,31 +380,34 @@ class CsvIO(MediaIO[CsvOptions]):
                 return schema
             finally:
                 arrow_io.close()
-        finally:
-            if decompressed:
-                self.buffer = orig_buffer
-                buf.close()
 
     def _write_arrow_batches(
         self,
-        *,
         batches: Iterator["pyarrow.RecordBatch"],
-        schema: "pyarrow.Schema",
         options: CsvOptions,
     ) -> None:
-        """Write record batches as CSV / TSV into the buffer."""
-        delimiter = self._infer_delimiter(options=options)
-        table = pa.Table.from_batches(list(batches), schema=schema)
+        """Encode record batches to CSV/TSV and write into the buffer."""
+        with self.open() as b:
+            delimiter = self._infer_delimiter(options=options)
 
-        arrow_io = self.buffer.to_arrow_io("w")
-        try:
-            csv_pa.write_csv(
-                table,
-                arrow_io,
-                write_options=csv_pa.WriteOptions(
-                    include_header=options.include_header,
-                    delimiter=delimiter,
-                ),
+            # peek_source returns the (possibly-reconstructed) iterator plus
+            # the inferred source schema; use the returned iterator, not
+            # the original one we just consumed.
+            peeked, cast_options = options.cast.peek_source(batches)
+
+            table = pa.Table.from_batches(
+                list(peeked),
+                schema=cast_options.source_schema.to_arrow_schema(),
             )
-        finally:
-            arrow_io.close()
+
+            write_options = csv_pa.WriteOptions(
+                include_header=options.include_header,
+                delimiter=delimiter,
+            )
+
+            arrow_io = b.buffer.to_arrow_io("w")
+            try:
+                csv_pa.write_csv(table, arrow_io, write_options=write_options)
+                b.mark_dirty()
+            finally:
+                arrow_io.close()

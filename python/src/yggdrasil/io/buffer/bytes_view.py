@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .bytes_io import BytesIO
@@ -10,12 +10,18 @@ if TYPE_CHECKING:
 __all__ = ["BytesIOView"]
 
 
+# Accepted types for write / pwrite. We intentionally reject anything
+# that would fall through to ``bytes(obj)``: ``bytes(5)`` silently
+# produces 5 null bytes, which is a classic typo-to-corruption hazard.
+_ACCEPTED_WRITE_TYPES = (bytes, bytearray, memoryview)
+
+
 class BytesIOView(io.RawIOBase):
     """
     Binary file-like window over a parent ``BytesIO``.
 
-    The view exposes a bounded, view-relative interface over a parent buffer
-    that supports cursorless random-access operations.
+    The view exposes a bounded, view-relative interface over a parent
+    buffer that supports cursorless random-access operations.
 
     Semantics
     ---------
@@ -36,6 +42,16 @@ class BytesIOView(io.RawIOBase):
     - ``pwrite()`` does not modify ``pos``.
     - ``write()`` advances ``pos``.
     - Writes may grow ``size`` up to ``max_size`` if set.
+    - ``write(b)`` where the view is full (``max_size`` reached) returns
+      0 — callers looping on short-write semantics must check for
+      no-progress to avoid infinite loops.
+
+    Close semantics
+    ---------------
+    ``close()`` sets ``closed`` but does not enforce the state on
+    subsequent operations — reads/writes after close still succeed
+    against the parent. This matches the parent's own convention and
+    keeps the view safe to use as a cheap shared fixture.
 
     Parent contract
     ---------------
@@ -45,10 +61,17 @@ class BytesIOView(io.RawIOBase):
     - ``flush()``
 
     The implementation also opportunistically uses:
-    - ``buffer()``
-    - ``_buf``
-    - ``_size``
-    - ``_invalidate_mmap()``
+    - ``buffer()`` — to obtain a file handle for truncation on spill mode
+    - ``_buf`` — in-memory-vs-spilled discriminator
+    - ``_size`` — parent's authoritative size (in-memory mode only)
+    - ``_invalidate_mmap()`` — invalidate cached mmap after truncate/write
+
+    Thread safety
+    -------------
+    Views share a parent. Concurrent writes or truncates on the same
+    parent (via multiple views or a view plus the parent directly) are
+    not serialized here. Callers must provide external synchronization
+    if that pattern is used.
     """
 
     __slots__ = (
@@ -122,14 +145,26 @@ class BytesIOView(io.RawIOBase):
         """Bytes remaining from the current cursor to the view end."""
         return max(0, self.size - self.pos)
 
-    def _coerce_bytes_like(self, b) -> memoryview:
-        if b is None:
-            return memoryview(b"")
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_bytes_like(b: Any) -> memoryview:
+        """Strict coercion to memoryview — rejects duck-typed fallbacks.
+
+        Silently accepting anything ``bytes()`` can digest lets bugs
+        like ``view.write(5)`` write five null bytes. We accept only
+        bytes / bytearray / memoryview.
+        """
         if isinstance(b, memoryview):
             return b
         if isinstance(b, (bytes, bytearray)):
             return memoryview(b)
-        return memoryview(bytes(b))
+        raise TypeError(
+            f"write requires bytes, bytearray, or memoryview; "
+            f"got {type(b).__name__}"
+        )
 
     def _invalidate_parent_mmap_if_needed(self) -> None:
         """
@@ -180,10 +215,12 @@ class BytesIOView(io.RawIOBase):
         return True
 
     def flush(self) -> None:
-        try:
-            self.parent.flush()
-        except Exception:
-            pass
+        """Flush the parent.
+
+        Does NOT swallow exceptions — flush is the write barrier, and
+        silent failure here means silent data loss. Let errors propagate.
+        """
+        self.parent.flush()
 
     def tell(self) -> int:
         return self.pos
@@ -218,11 +255,22 @@ class BytesIOView(io.RawIOBase):
         return n
 
     def readinto1(self, b) -> int:
+        # RawIOBase's readinto is a single underlying read already, so
+        # readinto1 — which is defined as "at most one underlying read"
+        # — can safely delegate.
         return self.readinto(b)
 
     def readall(self) -> bytes:
-        """Read the full view contents without modifying ``pos``."""
-        return self.pread(self.size, pos=0)
+        """Read from the current cursor to EOF and advance the cursor.
+
+        Matches :meth:`io.RawIOBase.readall` semantics. For a cursorless
+        full-view dump that does not move ``pos``, use :meth:`to_bytes`.
+        """
+        if self.remaining <= 0:
+            return b""
+        out = self.pread(self.remaining, pos=self.pos)
+        self.pos += len(out)
+        return out
 
     def write(self, b) -> int:
         n = self.pwrite(b, pos=self.pos)
@@ -233,13 +281,21 @@ class BytesIOView(io.RawIOBase):
         """
         Truncate the view and underlying parent to ``start + size``.
 
+        Behavior mirrors POSIX ``ftruncate`` across both backend modes:
+        - Shrinking below current size drops trailing bytes.
+        - Growing past current size extends with zero bytes.
+
         Notes
         -----
-        This truncates the underlying parent storage, not just the logical view.
-
-        - ``size=None`` truncates to the current cursor.
+        - ``size=None`` truncates to the current cursor (matching
+          :meth:`io.IOBase.truncate`).
         - If ``max_size`` is set, truncation is capped at that limit.
-        - Returns the new absolute size in the parent.
+        - Returns the new absolute parent size (``start + new_size``),
+          matching :meth:`io.IOBase.truncate` which returns the new
+          file size from the underlying storage's perspective.
+        - After truncation, ``self.size`` and ``self.pos`` are updated
+          consistently: ``self.size`` tracks the new view length and
+          ``self.pos`` is clamped into the new valid range.
         """
         new_size = self.pos if size is None else int(size)
         if new_size < 0:
@@ -251,29 +307,56 @@ class BytesIOView(io.RawIOBase):
         abs_end = self.start + new_size
 
         if getattr(self.parent, "_buf", None) is not None:
-            # in-memory mode
+            # ---- In-memory mode -----------------------------------------
+            # Shrink the parent's logical size when truncating below its
+            # current end. We do NOT touch the underlying bytearray — the
+            # parent will reuse the backing storage on subsequent writes,
+            # which is more efficient than allocating a new buffer here.
+            # Growth is handled by zero-extending on write (pwrite covers
+            # the gap), and the parent's _size is updated to the new
+            # logical extent so reads past old _size see zeros/EOF
+            # consistently.
             if hasattr(self.parent, "_size"):
-                self.parent._size = min(self.parent._size, abs_end)
+                if abs_end < self.parent._size:
+                    # Shrink: clamp parent's visible size.
+                    self.parent._size = abs_end
+                elif abs_end > self.parent._size:
+                    # Grow: zero-extend via a pwrite of the gap. This
+                    # is the only way to reliably expand the parent's
+                    # in-memory representation without coupling to its
+                    # internal growth semantics.
+                    gap = abs_end - self.parent._size
+                    zero_off = self.parent._size
+                    self.parent.pwrite(b"\x00" * gap, zero_off)
         else:
-            # spilled/file-backed mode
+            # ---- Spilled / file-backed mode -----------------------------
+            # Per design constraint: do NOT close the parent's handle
+            # in the finally block. The parent owns the lifecycle of
+            # any file descriptors it hands out via buffer(); closing
+            # them here would invalidate the parent's cached read
+            # handles (_read_fh) and any active memory maps.
+            #
+            # The trade-off: `fh` remains open until its reference is
+            # dropped by GC. For a typical workflow that's acceptable;
+            # high-frequency truncation on spilled buffers may warrant
+            # a parent-side truncate API that owns the fh.
             fh = self.parent.buffer()
             try:
                 fh.truncate(abs_end)
                 fh.flush()
             except Exception:
+                # Fallback: try the file-descriptor-level truncate,
+                # which works even if the high-level handle's truncate
+                # failed (e.g., buffered writer over a pipe-like).
                 try:
                     os.ftruncate(fh.fileno(), abs_end)
                 except Exception:
                     raise
-            finally:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
 
             self._invalidate_parent_mmap_if_needed()
 
-        self.size = min(self.size, new_size)
+        # Update view-local state to reflect the new parent extent.
+        self.size = new_size
         self.pos = min(self.pos, self.size)
         return abs_end
 
@@ -317,19 +400,23 @@ class BytesIOView(io.RawIOBase):
         Parameters
         ----------
         b:
-            Bytes-like object to write.
+            Bytes-like object to write. Must be one of ``bytes``,
+            ``bytearray``, or ``memoryview``. Arbitrary objects are
+            rejected — in particular, ``pwrite(5)`` does NOT silently
+            write five null bytes.
         pos:
             View-relative offset. Must be >= 0.
 
         Returns
         -------
         int
-            Number of bytes written.
+            Number of bytes written. Returns 0 when the view is full
+            (``pos >= max_size``).
 
         Notes
         -----
-        Writes may extend the visible size of the view. If ``max_size`` is set,
-        writes are clipped to fit the configured cap.
+        Writes may extend the visible size of the view. If ``max_size``
+        is set, writes are clipped to fit the configured cap.
         """
         pos = int(pos)
         if pos < 0:
@@ -343,7 +430,8 @@ class BytesIOView(io.RawIOBase):
             allowed = self.max_size - pos
             if allowed <= 0:
                 return 0
-            mv = mv[:allowed]
+            if len(mv) > allowed:
+                mv = mv[:allowed]
 
         n = int(self.parent.pwrite(mv, self.start + pos))
 
@@ -359,5 +447,11 @@ class BytesIOView(io.RawIOBase):
     # ------------------------------------------------------------------
 
     def to_bytes(self) -> bytes:
-        """Return the full contents of the view without modifying ``pos``."""
-        return self.readall()
+        """Return the full contents of the view without modifying ``pos``.
+
+        Unlike :meth:`readall` (which advances the cursor), this is a
+        cursorless full-view dump.
+        """
+        if self.size <= 0:
+            return b""
+        return self.parent.pread(self.size, self.start)

@@ -265,9 +265,21 @@ class Session(ABC):
             spark_session=spark_session,
             **options,
         )
+        return self._send(request, cfg)
 
-        remote_cfg = cfg.remote_cache
-        local_cfg = cfg.local_cache
+    def _send(
+        self,
+        request: PreparedRequest,
+        config: SendConfig,
+    ) -> Response:
+        """Core send pipeline: local cache → remote cache → network → writeback.
+
+        Assumes `config` is already a fully-resolved `SendConfig` (no kwargs
+        merging, no `check_arg`). Intended to be called by `send`, `_send_many`,
+        and any other path that has already built its effective config.
+        """
+        remote_cfg = config.remote_cache
+        local_cfg = config.local_cache
 
         # Per-request configs take precedence over the session-level ones.
         effective_local_cfg = request.local_cache_config or local_cfg
@@ -293,7 +305,7 @@ class Session(ABC):
                     request, effective_local_cfg
                 )
                 if local_response is not None:
-                    if cfg.raise_error:
+                    if config.raise_error:
                         local_response.raise_for_status()
                     return local_response
 
@@ -306,7 +318,7 @@ class Session(ABC):
             remote_response = self._load_remote_cached_response(
                 request,
                 effective_remote_cfg,
-                spark_session=cfg.spark_session,
+                spark_session=config.spark_session,
             )
             if remote_response is not None:
                 # Backfill local cache with the remote hit
@@ -316,13 +328,13 @@ class Session(ABC):
                         effective_local_cfg,
                         filepath=local_filepath,
                     )
-                if cfg.raise_error:
+                if config.raise_error:
                     remote_response.raise_for_status()
                 return remote_response
 
         # --- 3. No cache hit — perform actual request ---
         LOGGER.debug("Sending %s %s", request.method, request.url)
-        response = self._local_send(request, config=cfg)
+        response = self._local_send(request, config=config)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if effective_local_cfg.local_cache_enabled:
@@ -338,10 +350,10 @@ class Session(ABC):
             self._store_remote_cached_response(
                 response,
                 effective_remote_cfg,
-                spark_session=cfg.spark_session,
+                spark_session=config.spark_session,
             )
 
-        if cfg.raise_error:
+        if config.raise_error:
             response.raise_for_status()
 
         return response
@@ -543,7 +555,11 @@ class Session(ABC):
                 (
                     # Disable request-level remote cache while sending misses;
                     # remote writes are mutualized in the bulk insert block below.
-                    Job.make(self.send, r.copy(remote_cache_config=None), miss_send_config)
+                    Job.make(
+                        self._send,
+                        r.copy(remote_cache_config=None),
+                        miss_send_config
+                    )
                     for r in remote_misses
                 ),
                 ordered=config.ordered,

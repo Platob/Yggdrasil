@@ -34,6 +34,7 @@ class MediaOptions:
 
     # global read / write properties
     batch_size: int = 0
+    byte_size: int = 128 * 1024 * 1024
 
     # global write properties
     mode: SaveMode = SaveMode.AUTO
@@ -47,7 +48,8 @@ class MediaOptions:
         self.ignore_empty = self._validate_bool("ignore_empty", self.ignore_empty)
         self.lazy = self._validate_bool("lazy", self.lazy)
         self.raise_error = self._validate_bool("raise_error", self.raise_error)
-        self.batch_size = self._normalize_batch_size(self.batch_size)
+        self.batch_size = self._normalize_batch_or_byte_size(self.batch_size)
+        self.byte_size = self._normalize_batch_or_byte_size(self.byte_size)
         self.mode = SaveMode.parse(self.mode, default=SaveMode.AUTO)
         self.match_by = self._normalize_match_by(self.match_by)
 
@@ -70,6 +72,7 @@ class MediaOptions:
         lazy: bool | Any = ...,
         raise_error: bool | Any = ...,
         batch_size: int | None | Any = ...,
+        byte_size: int | None | Any = ...,
         **kwargs: Any,
     ) -> MediaOptions:
         base = cls._coerce_options(options)
@@ -83,6 +86,7 @@ class MediaOptions:
             lazy=lazy,
             raise_error=raise_error,
             batch_size=batch_size,
+            byte_size=byte_size,
             **kwargs,
         )
 
@@ -148,7 +152,7 @@ class MediaOptions:
         return items
 
     @staticmethod
-    def _normalize_batch_size(value: int | None) -> int:
+    def _normalize_batch_or_byte_size(value: int | None) -> int:
         if value is None:
             return 0
         if not isinstance(value, int):

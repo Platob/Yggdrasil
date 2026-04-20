@@ -77,13 +77,12 @@ def test_csvio_write_and_read_roundtrip():
 
 
 def test_csvio_gzip_roundtrip():
-    buf = BytesIO()
-    io_ = MediaIO.make(buf, MediaType(MimeTypes.CSV, codec=GZIP))
+    io_ = MediaIO.make(media=MediaType(MimeTypes.CSV, codec=GZIP))
     table = pa.table({"id": [1, 2], "score": [10.5, 11.5]})
 
     io_.write_arrow_table(table)
 
-    raw = buf.to_bytes()
+    raw = io_.holder.to_bytes()
     assert raw[:2] == b"\x1f\x8b"
     assert io_.read_arrow_table().to_pylist() == table.to_pylist()
 

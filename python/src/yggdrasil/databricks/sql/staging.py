@@ -8,9 +8,12 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
+from yggdrasil.databricks.fs.path import DatabricksPath, VolumePath
 from yggdrasil.environ import shutdown as yg_shutdown
-
-from ..fs.path import DatabricksPath, VolumePath
+from yggdrasil.io import BytesIO
+from yggdrasil.io.buffer.media_io import MediaIO
+from yggdrasil.io.buffer.parquet_io import ParquetOptions
+from yggdrasil.io.enums.media_type import MediaTypes
 
 if TYPE_CHECKING:
     from yggdrasil.data.cast import CastOptions
@@ -165,11 +168,6 @@ class StagingPath:
         Returns:
             ``self`` so calls can be chained.
         """
-        from yggdrasil.io import BytesIO
-        from yggdrasil.io.buffer.media_io import MediaIO
-        from yggdrasil.io.buffer.parquet_io import ParquetOptions
-        from yggdrasil.io.enums.media_type import MediaTypes
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         options = ParquetOptions(cast=cast_options) if cast_options else ParquetOptions()
@@ -180,13 +178,8 @@ class StagingPath:
         with BytesIO() as buffer:
             mio = MediaIO.make(buffer=buffer, media=MediaTypes.PARQUET)
             mio.write_table(data, options=options)
-            mio.buffer.seek(0)
-            self.path.write_bytes(mio.buffer.memoryview())
-
-            if read_columns:
-                mio.buffer.seek(0)
-                frame = mio.read_polars_frame(columns=list(read_columns))
-                object.__setattr__(self, "last_read_frame", frame)
+            mio.holder.seek(0)
+            self.path.write_bytes(mio.holder.memoryview())
 
         return self
 

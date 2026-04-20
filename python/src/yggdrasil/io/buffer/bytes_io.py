@@ -7,6 +7,7 @@ Design
 - Spilled backing is a path-like object (local ``Path`` or ``DatabricksPath``)
 - Uses os.pread/os.pwrite for cursorless file IO
 - Keeps optional readonly mmap for zero-copy reads when spilled
+- A cached read file-handle avoids open()/close() per pread() call
 
 Semantics
 ---------
@@ -16,6 +17,14 @@ Semantics
 - ``BytesIO(path, copy=True)`` copies file content into owned backing
 - ``BytesIO(path, copy=False)`` aliases the original path and mutates it
 - ``BytesIO(io.BytesIO(...))`` and other file-like sources read from the current cursor onward
+
+Compression
+-----------
+- ``compress`` and ``decompress`` delegate to :class:`~yggdrasil.io.enums.codec.Codec`,
+  which streams chunk-by-chunk when the codec supports it (gzip, zstd,
+  lz4, bz2, xz, lzma) and falls back to a bytes roundtrip otherwise
+  (snappy, brotli). Peak memory on streaming codecs is bounded by the
+  codec's internal chunk size, not by the full payload size.
 """
 
 from __future__ import annotations
@@ -28,6 +37,8 @@ import shutil
 import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, IO, Literal, Optional, Union
+
+import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.io.config import DEFAULT_CONFIG, BufferConfig
@@ -59,8 +70,18 @@ SpillPath = "Path | DatabricksPath"
 
 _HEAD_DEFAULT = 128
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
+_PICKLE_COMPRESS_THRESHOLD_DEFAULT = 1 * 1024 * 1024
 _HAS_PREAD = hasattr(os, "pread")
 _HAS_PWRITE = hasattr(os, "pwrite")
+
+
+def _as_contiguous_memoryview(mv: memoryview) -> memoryview:
+    """Return a C-contiguous view over *mv*.
+
+    ``memoryview.contiguous`` only exists from Python 3.12 on; use
+    ``c_contiguous`` for portability.
+    """
+    return mv if mv.c_contiguous else memoryview(mv.tobytes())
 
 
 class BytesIO(io.RawIOBase):
@@ -71,6 +92,7 @@ class BytesIO(io.RawIOBase):
         "_pos",
         "_path",
         "_mmap",
+        "_read_fh",
         "_closed",
         "_owns_path",
         "_media_type",
@@ -93,11 +115,16 @@ class BytesIO(io.RawIOBase):
 
         self._path: SpillPath | None = None
         self._mmap: mmap.mmap | None = None
+        self._read_fh: IO[bytes] | None = None
         self._owns_path: bool = False
         self._media_type: MediaType | None = media_type
 
         self._closed: bool = False
         self._init_from(data, copy=copy)
+
+    # ------------------------------------------------------------------
+    # Dunder protocol
+    # ------------------------------------------------------------------
 
     def __bool__(self) -> bool:
         return self.size > 0
@@ -124,9 +151,18 @@ class BytesIO(io.RawIOBase):
         self.close()
 
     def __getstate__(self):
-        if self.size > 1024 * 1024:
+        threshold = getattr(
+            self._cfg,
+            "pickle_compress_threshold",
+            _PICKLE_COMPRESS_THRESHOLD_DEFAULT,
+        )
+        if self.size > threshold:
             from yggdrasil.io import ZSTD
 
+            # compress(copy=True) now streams via Codec.compress() — the
+            # resulting BytesIO may be spilled if large enough. We still
+            # have to materialize to bytes for the pickle payload, but
+            # at least the *compressed* size is bounded, not the input.
             blob = self.compress(codec=ZSTD, copy=True).to_bytes()
             codec = ZSTD.name
         else:
@@ -194,26 +230,57 @@ class BytesIO(io.RawIOBase):
         if n > self._cfg.spill_bytes:
             self._spill_from_bytes(mv)
         else:
-            self._buf = bytearray(mv.tobytes() if not mv.contiguous else mv)
+            src = _as_contiguous_memoryview(mv)
+            self._buf = bytearray(src)
             self._size = n
             self._path = None
             self._owns_path = False
         self._pos = 0
 
     def _init_from_stdlib_bytesio(self, src: io.BytesIO) -> None:
-        self.pos = src.tell()
+        """Read from *src*'s current cursor to its end."""
+        start_pos = src.tell()
+        # getbuffer() avoids copying the whole payload just to probe size.
+        total = len(src.getbuffer())
+        remaining = max(0, total - start_pos)
 
-        self._buf = bytearray(src.getvalue())
-        self._size = len(self._buf)
-        self._path = None
+        if remaining > self._cfg.spill_bytes:
+            # Stream directly to disk — never materialize the full
+            # remainder as a bytearray first.
+            path = self._cfg.create_spill_path()
+            with path.open("w+b") as fh:
+                # Use readinto loop against getbuffer() slices instead of
+                # copying via src.read() to avoid the interpreter-level
+                # bytes copy.
+                view = memoryview(src.getbuffer())[start_pos:]
+                offset = 0
+                chunk = _COPY_CHUNK_SIZE
+                while offset < remaining:
+                    end = min(offset + chunk, remaining)
+                    fh.write(view[offset:end])
+                    offset = end
+                fh.flush()
+            self._buf = None
+            self._size = 0
+            self._path = path
+            self._owns_path = True
+        else:
+            # Small enough to hold in memory — slice from the current cursor.
+            self._buf = bytearray(memoryview(src.getbuffer())[start_pos:])
+            self._size = len(self._buf)
+            self._path = None
+            self._owns_path = False
 
-        if self._size > self._cfg.spill_bytes:
-            self.spill_to_file()
+        self._pos = 0
 
     def _init_from_bytesio(self, src: BytesIO, *, copy: bool) -> None:
         if copy:
             self._init_from_bytes(memoryview(src.to_bytes()))
             self._pos = 0
+            # Propagate media_type on copy — caller expected a faithful
+            # duplicate, not a media-stripped one.
+            if self._media_type is None:
+                self._media_type = src._media_type
             return
 
         # Aliasing memory-backed instances is unsafe because metadata
@@ -221,6 +288,8 @@ class BytesIO(io.RawIOBase):
         if src._buf is not None:
             self._init_from_bytes(memoryview(src.to_bytes()))
             self._pos = src._pos
+            if self._media_type is None:
+                self._media_type = src._media_type
             return
 
         self._buf = None
@@ -228,7 +297,8 @@ class BytesIO(io.RawIOBase):
         self._path = src._path
         self._owns_path = False
         self._pos = src._pos
-        self._media_type = src._media_type
+        if self._media_type is None:
+            self._media_type = src._media_type
 
     @staticmethod
     def _is_pathish(value: Any) -> bool:
@@ -280,12 +350,13 @@ class BytesIO(io.RawIOBase):
         self._pos = 0
 
     def _init_from_filelike(self, src: Any) -> None:
+        """Read from *src*'s current cursor to its end."""
         if hasattr(src, "seek") and hasattr(src, "tell"):
-            self.pos = src.tell()
+            start_pos = src.tell()
             src.seek(0, io.SEEK_END)
             end = src.tell()
-            src.seek(self.pos)
-            remaining = max(0, end - self.pos)
+            src.seek(start_pos)
+            remaining = max(0, end - start_pos)
 
             if remaining > self._cfg.spill_bytes:
                 path = self._cfg.create_spill_path()
@@ -296,17 +367,18 @@ class BytesIO(io.RawIOBase):
                 self._size = 0
                 self._path = path
                 self._owns_path = True
-            else:
-                payload = src.read()
-                self._buf = bytearray(payload)
-                self._size = len(payload)
-                self._path = None
-                self._owns_path = False
-        else:
+                self._pos = 0
+                return
+
             payload = src.read()
             self._init_from_bytes(memoryview(payload))
             self._pos = 0
             return
+
+        # Non-seekable: have to drain and decide after.
+        payload = src.read()
+        self._init_from_bytes(memoryview(payload))
+        self._pos = 0
 
     # ------------------------------------------------------------------
     # Backing helpers
@@ -325,10 +397,30 @@ class BytesIO(io.RawIOBase):
                 pass
             self._mmap = None
 
+    def _close_read_fh(self) -> None:
+        if self._read_fh is not None:
+            try:
+                self._read_fh.close()
+            except Exception:
+                pass
+            self._read_fh = None
+
+    def _get_read_fh(self) -> IO[bytes] | None:
+        """Return a cached read-only file handle for the spilled path.
+
+        Reopens lazily if the cached handle was invalidated. Returns
+        ``None`` when there is no spilled path.
+        """
+        if self._path is None:
+            return None
+        if self._read_fh is None:
+            self._read_fh = self._path.open("rb")
+        return self._read_fh
+
     def _spill_from_bytes(self, mv: memoryview) -> None:
         path = self._cfg.create_spill_path()
         with path.open("w+b") as fh:
-            fh.write(mv.tobytes() if not mv.contiguous else mv)
+            fh.write(_as_contiguous_memoryview(mv))
             fh.flush()
 
         self._buf = None
@@ -336,6 +428,7 @@ class BytesIO(io.RawIOBase):
         self._path = path
         self._owns_path = True
         self._invalidate_mmap()
+        self._close_read_fh()
 
     def spill_to_file(self) -> None:
         if self._buf is None:
@@ -343,8 +436,8 @@ class BytesIO(io.RawIOBase):
         path = self._cfg.create_spill_path()
         with path.open("w+b") as fh:
             if self._size:
-                payload = memoryview(self._buf)[: self._size]
-                fh.write(payload.tobytes() if not payload.contiguous else payload)
+                payload = _as_contiguous_memoryview(memoryview(self._buf)[: self._size])
+                fh.write(payload)
             fh.flush()
 
         self._buf = None
@@ -352,9 +445,11 @@ class BytesIO(io.RawIOBase):
         self._path = path
         self._owns_path = True
         self._invalidate_mmap()
+        self._close_read_fh()
 
     def _reset_backing_keep_open(self) -> None:
         self._invalidate_mmap()
+        self._close_read_fh()
 
         old_path = self._path
         old_owns_path = self._owns_path
@@ -373,21 +468,65 @@ class BytesIO(io.RawIOBase):
         self._pos = 0
         self._media_type = None
 
-    def replace_with_payload(self, payload: bytes) -> None:
+    def replace_with_payload(self, payload: Any) -> None:
+        """Replace this buffer's backing with *payload*, consuming payload.
+
+        Ownership semantics
+        -------------------
+        When *payload* is a path-backed :class:`BytesIO` that owns its
+        spill file, ownership is TRANSFERRED to ``self``. The source's
+        ``_owns_path`` is cleared so its ``close()`` will not unlink
+        the file that ``self`` now depends on. Callers should treat
+        *payload* as consumed — do not read from or close it after
+        this call.
+        """
         self._reset_backing_keep_open()
         self._init_from(payload, copy=False)
 
-    def buffer(self) -> IO[bytes]:
-        """
-        Return a file object for spilled backing.
+        # Transfer path ownership when we aliased a path-backed payload.
+        # Without this, both self and payload claim no ownership (the
+        # alias path in _init_from_bytesio sets self._owns_path=False)
+        # or — worse — payload retains ownership and self becomes a
+        # zombie when payload is GC'd. See also _init_from_bytesio's
+        # alias path, which is used for read-only aliasing where
+        # transfer is NOT desired.
+        if (
+            isinstance(payload, BytesIO)
+            and payload._path is not None
+            and payload._path is self._path
+            and payload._owns_path
+            and not self._owns_path
+        ):
+            self._owns_path = True
+            payload._owns_path = False
+            # Best-effort: also release payload's handles so its
+            # eventual close() is a no-op. We don't null out payload._path
+            # because inspection (repr, path property) remains valid.
+            payload._invalidate_mmap()
+            payload._close_read_fh()
 
-        This is primarily for internal helpers that need truncate/flush/fd access.
+    def open_file(self) -> IO[bytes]:
+        """Return a writable file object for the current backing.
+
+        For in-memory buffers this returns a stdlib ``io.BytesIO``
+        **snapshot** — a copy of the current bytes. Writes to the
+        snapshot do NOT propagate back to this BytesIO.
+
+        For spilled buffers this returns ``self._path.open("r+b")`` —
+        writes DO go to the backing file.
+
+        This asymmetry is load-bearing for some callers; prefer
+        :meth:`pread` / :meth:`pwrite` when you need consistent
+        behavior across backing modes.
         """
         if self._buf is not None:
             return io.BytesIO(bytes(memoryview(self._buf)[: self._size]))
         if self._path is None:
             raise RuntimeError("No backing store available")
         return self._path.open("r+b")
+
+    # Backwards-compatible alias.
+    buffer = open_file
 
     # ------------------------------------------------------------------
     # Cursorless IO primitives
@@ -409,12 +548,18 @@ class BytesIO(io.RawIOBase):
         if self._path is None:
             return b""
 
-        with self._path.open("rb") as fh:
-            if self._is_local_path(self._path) and _HAS_PREAD:
-                return os.pread(fh.fileno(), n, pos)
+        fh = self._get_read_fh()
+        if fh is None:
+            return b""
 
-            fh.seek(pos)
-            return fh.read(n)
+        if self._is_local_path(self._path) and _HAS_PREAD:
+            return os.pread(fh.fileno(), n, pos)
+
+        # Non-local path or no os.pread: synchronize via seek/read on the
+        # cached handle. Not thread-safe — if you need concurrent reads,
+        # open separate handles per reader.
+        fh.seek(pos)
+        return fh.read(n)
 
     def pwrite(self, mv: memoryview, pos: int) -> int:
         if len(mv) == 0:
@@ -435,6 +580,12 @@ class BytesIO(io.RawIOBase):
         if self._path is None:
             raise RuntimeError("No backing store available for write")
 
+        # Writes invalidate both the mmap view and the cached read handle
+        # so subsequent reads see fresh bytes (Windows mmap over a written
+        # file is undefined; re-open is the portable answer).
+        self._invalidate_mmap()
+        self._close_read_fh()
+
         with self._path.open("r+b") as fh:
             if self._is_local_path(self._path) and _HAS_PWRITE:
                 written = int(os.pwrite(fh.fileno(), mv, pos))
@@ -449,7 +600,9 @@ class BytesIO(io.RawIOBase):
     def _ensure_spill_for_growth(self, extra: int) -> None:
         if self._buf is None:
             return
-        projected = max(self._size, self._pos) + extra
+        # Conservative projection: the write lands at _pos, so worst-case
+        # size after the write is max(current size, _pos + extra).
+        projected = max(self._size, self._pos + extra)
         if projected > self._cfg.spill_bytes:
             self.spill_to_file()
 
@@ -572,14 +725,19 @@ class BytesIO(io.RawIOBase):
     def flush(self) -> None:
         return None
 
-    def head(self, n: int = _HEAD_DEFAULT):
+    def head(self, n: int = _HEAD_DEFAULT) -> bytes:
+        """Return the first *n* bytes without mmapping the whole file."""
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
         if n <= 0 or self.size == 0:
-            return memoryview(b"")
+            return b""
 
-        mv = self.memoryview()
-        return mv[: min(n, len(mv))]
+        # In-memory: zero-copy slice.
+        if self._buf is not None:
+            return bytes(memoryview(self._buf)[: min(n, self._size)])
+
+        # Spilled: pread avoids creating a full-file mmap for a small peek.
+        return self.pread(min(n, self.size), 0)
 
     def tell(self) -> int:
         if self._closed:
@@ -617,17 +775,35 @@ class BytesIO(io.RawIOBase):
         return out
 
     def readinto(self, b) -> int:
+        """Read into a pre-allocated buffer without allocating an intermediate bytes.
+
+        For in-memory backing we copy straight from the bytearray slice.
+        For spilled local paths we prefer ``os.pread`` into a temporary
+        then memcpy; the extra copy is unavoidable without ctypes.
+        """
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
 
         mv = memoryview(b)
-        if len(mv) == 0:
+        n = len(mv)
+        if n == 0:
             return 0
 
-        chunk = self.pread(len(mv), self._pos)
-        mv[: len(chunk)] = chunk
-        self._pos += len(chunk)
-        return len(chunk)
+        if self._buf is not None:
+            end = min(self._pos + n, self._size)
+            if self._pos >= end:
+                return 0
+            chunk_len = end - self._pos
+            mv[:chunk_len] = memoryview(self._buf)[self._pos : end]
+            self._pos += chunk_len
+            return chunk_len
+
+        chunk = self.pread(n, self._pos)
+        got = len(chunk)
+        if got:
+            mv[:got] = chunk
+            self._pos += got
+        return got
 
     def readinto1(self, b) -> int:
         return self.readinto(b)
@@ -686,60 +862,57 @@ class BytesIO(io.RawIOBase):
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
 
-        if self._is_pathish(dst) and not isinstance(dst, str):
-            path = self._coerce_path(dst)
+        # --------------------------------------------------------------
+        # Path-like destinations: one unified branch.
+        # --------------------------------------------------------------
+        if isinstance(dst, str) or isinstance(dst, os.PathLike) or self._is_pathish(dst):
+            dst_path = self._coerce_path(dst)
 
-            if path.exists() and not overwrite:
-                raise FileExistsError(f"Destination already exists: {path}")
+            if dst_path.exists() and not overwrite:
+                raise FileExistsError(f"Destination already exists: {dst_path}")
 
-            path.parent.mkdir(parents=True, exist_ok=True)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # In-memory → just write out.
             if self._buf is not None:
-                payload = memoryview(self._buf)[: self._size]
-                path.write_bytes(payload.tobytes() if not payload.contiguous else payload)
+                payload = _as_contiguous_memoryview(
+                    memoryview(self._buf)[: self._size]
+                )
+                dst_path.write_bytes(payload)
                 return self._size
 
+            # No backing or empty spill → write zero bytes.
             if self._path is None or self.size == 0:
-                path.write_bytes(b"")
+                dst_path.write_bytes(b"")
                 return 0
 
-            if self._path == path:
+            # No-op if source and destination are the same path.
+            if self._path == dst_path:
                 return self.size
 
-            if hasattr(self._path, "copy_to"):
-                self._path.copy_to(path)
-            else:
-                with self._path.open("rb") as src:
-                    with path.open("wb") as out:
-                        shutil.copyfileobj(src, out, length=batch_size)
-            return self.size
-
-        if isinstance(dst, (str, os.PathLike)):
-            path = Path(dst)
-
-            if path.exists() and not overwrite:
-                raise FileExistsError(f"Destination already exists: {path}")
-
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-            if self._buf is not None:
-                payload = memoryview(self._buf)[: self._size]
-                path.write_bytes(payload.tobytes() if not payload.contiguous else payload)
-                return self._size
-
-            if self._path is None or self.size == 0:
-                path.write_bytes(b"")
-                return 0
-
-            if self._path == path:
+            # Custom (e.g. Databricks) → use its copy_to if available.
+            if hasattr(self._path, "copy_to") and not isinstance(self._path, Path):
+                self._path.copy_to(dst_path)
                 return self.size
 
-            shutil.copyfile(self._path, path)
+            # Local-to-local fast path.
+            if self._is_local_path(self._path) and isinstance(dst_path, Path):
+                shutil.copyfile(self._path, dst_path)
+                return self.size
+
+            # Cross-type fallback: stream.
+            with self._path.open("rb") as src:
+                with dst_path.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=batch_size)
             return self.size
 
+        # --------------------------------------------------------------
+        # File-like destinations.
+        # --------------------------------------------------------------
         if not hasattr(dst, "write"):
             raise TypeError(
-                f"write_into() expected a writable binary IO or path-like destination, got {type(dst)!r}"
+                f"write_into() expected a writable binary IO or path-like destination, "
+                f"got {type(dst)!r}"
             )
 
         writable = getattr(dst, "writable", None)
@@ -749,12 +922,15 @@ class BytesIO(io.RawIOBase):
         total = 0
 
         if self._buf is not None:
-            payload = memoryview(self._buf)[: self._size]
+            payload = _as_contiguous_memoryview(
+                memoryview(self._buf)[: self._size]
+            )
             out = dst.write(payload)
             written = self._size if out is None else int(out)
             if written != self._size:
                 raise io.BlockingIOError(
-                    f"Short write while writing in-memory payload: expected {self._size}, got {written}"
+                    f"Short write while writing in-memory payload: "
+                    f"expected {self._size}, got {written}"
                 )
             total = written
         elif self._path is not None and self.size:
@@ -767,7 +943,8 @@ class BytesIO(io.RawIOBase):
                     written = len(chunk) if out is None else int(out)
                     if written != len(chunk):
                         raise io.BlockingIOError(
-                            f"Short write while streaming spilled payload: expected {len(chunk)}, got {written}"
+                            f"Short write while streaming spilled payload: "
+                            f"expected {len(chunk)}, got {written}"
                         )
                     total += written
         else:
@@ -794,10 +971,6 @@ class BytesIO(io.RawIOBase):
         self._ensure_spill_for_growth(len(mv))
         n = self.pwrite(mv, self._pos)
         self._pos += n
-
-        if self._buf is None:
-            self._invalidate_mmap()
-
         return n
 
     def write_str(self, s: str, encoding: str = "utf-8") -> int:
@@ -831,12 +1004,19 @@ class BytesIO(io.RawIOBase):
         if self._path is None:
             raise RuntimeError("No backing store available for truncate")
 
+        # truncate(0) on a spilled buffer drops back to in-memory empty —
+        # otherwise we'd leak a zero-byte file until close().
+        if size == 0:
+            self._reset_backing_keep_open()
+            return 0
+
+        self._invalidate_mmap()
+        self._close_read_fh()
         with self._path.open("r+b") as fh:
             fh.truncate(size)
 
         if self._pos > size:
             self._pos = size
-        self._invalidate_mmap()
         return size
 
     # ------------------------------------------------------------------
@@ -987,8 +1167,10 @@ class BytesIO(io.RawIOBase):
             raise ValueError("I/O operation on closed BytesIO")
 
         if pos is None:
+            # Default: start the view at the current parent cursor,
+            # except when the cursor is at EOF — treat that as "rewind"
+            # so ``for line in view:`` on a just-written buffer works.
             pos = self._pos
-
             if pos == self.size:
                 pos = 0
 
@@ -1057,8 +1239,6 @@ class BytesIO(io.RawIOBase):
         return self._path.open("rb")
 
     def to_arrow_io(self, mode: str = "r"):
-        from yggdrasil.arrow.lib import pyarrow as pa
-
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
 
@@ -1080,7 +1260,11 @@ class BytesIO(io.RawIOBase):
                 raise RuntimeError("Failed to materialize spill file for Arrow IO")
 
             if not self._is_local_path(self._path):
-                return pa.PythonFile(self.buffer(), mode=mode)
+                return pa.PythonFile(self.open_file(), mode=mode)
+
+            # Writes invalidate any existing read-side state.
+            self._invalidate_mmap()
+            self._close_read_fh()
 
             if "w" in mode:
                 return pa.OSFile(str(self._path), mode="w")
@@ -1089,61 +1273,134 @@ class BytesIO(io.RawIOBase):
         raise ValueError(f"Unsupported mode for to_arrow_io: {mode!r}")
 
     # ------------------------------------------------------------------
-    # Compression helpers
+    # Compression
     # ------------------------------------------------------------------
+    #
+    # Both methods delegate to the Codec class, which now streams
+    # chunk-by-chunk for codecs that support it (gzip, zstd, lz4, bz2,
+    # xz, lzma) and falls back to a bytes roundtrip for codecs that
+    # don't (snappy, brotli). Peak memory is bounded by the codec's
+    # internal chunk size for streaming codecs, regardless of input
+    # size.
 
     def compress(
         self,
         codec: "Codec | str",
         *,
-        copy: bool = False
+        copy: bool = False,
     ) -> "BytesIO":
+        """Compress this buffer with *codec*.
+
+        Delegates to :meth:`Codec.compress`, which streams when the
+        codec supports it. The resulting BytesIO is re-wrapped through
+        this instance's config so a large compressed output will spill
+        if it exceeds the spill threshold.
+
+        When ``copy=True`` returns a new instance; when ``copy=False``
+        replaces this instance's backing with the compressed payload
+        and returns ``self``.
+        """
         from ..enums.codec import Codec as _Codec
+
+        if self._closed:
+            raise ValueError("I/O operation on closed BytesIO")
 
         c = _Codec.parse(codec)
         if c is None:
             raise ValueError(f"Unknown codec: {codec!r}")
 
-        mt = self.media_type.with_codec(c) if self._media_type else None
+        target_mt = self.media_type.with_codec(c) if self._media_type else None
+
         payload = c.compress(self)
-        payload._media_type = mt
+        owned = self._own_payload(payload)
+        owned._media_type = target_mt
 
         if copy:
-            return payload
+            return owned
 
-        self.replace_with_payload(payload)
+        # Replace-in-place. _reset_backing_keep_open clears _media_type
+        # so we re-set it explicitly after.
+        self.replace_with_payload(owned)
+        self._media_type = target_mt
         return self
 
     def decompress(
         self,
         codec: "Codec | str | None" = "infer",
         *,
-        copy: bool = False
+        copy: bool = False,
     ) -> "BytesIO":
+        """Decompress this buffer with *codec*.
+
+        ``codec="infer"`` reads the codec from the current media type;
+        any other value is parsed via :meth:`Codec.parse`. An explicitly
+        named but unparseable codec raises ``ValueError`` — parity with
+        :meth:`compress`.
+
+        Delegates to :meth:`Codec.decompress`, which streams when the
+        codec supports it.
+        """
         from ..enums.codec import Codec as _Codec
 
         if self._closed:
             raise ValueError("I/O operation on closed BytesIO")
 
         if codec == "infer":
-            mt = self.media_type.without_codec()
-            codec = self.media_type.codec
+            target_mt = self.media_type.without_codec()
+            resolved = self.media_type.codec
         else:
-            mt = self._media_type.without_codec() if self._media_type else None
-            codec = _Codec.parse(codec)
+            target_mt = (
+                self._media_type.without_codec()
+                if self._media_type else None
+            )
+            resolved = _Codec.parse(codec)
+            # Parity with compress(): an unknown codec name is a user
+            # error, not a silent no-op. None stays permitted (means
+            # "no codec needed").
+            if resolved is None and codec is not None:
+                raise ValueError(f"Unknown codec: {codec!r}")
 
-        if codec is None:
+        if resolved is None:
+            if copy:
+                return self.__class__(self, copy=True, config=self._cfg)
             return self
 
-        raw = codec.decompress_bytes(self.to_bytes())
+        payload = resolved.decompress(self)
+        owned = self._own_payload(payload)
+        owned._media_type = target_mt
 
         if copy:
-            payload = self.__class__(raw, copy=False, media_type=mt)
+            return owned
+
+        self.replace_with_payload(owned)
+        self._media_type = target_mt
+        return self
+
+    def _own_payload(self, payload: "BytesIO") -> "BytesIO":
+        """Re-wrap a codec-produced payload under this instance's config.
+
+        :meth:`Codec.compress` / :meth:`Codec.decompress` build their
+        output via ``BytesIO()`` without our config, so the result
+        uses the default spill threshold. If the caller configured a
+        custom threshold (e.g. ``spill_bytes=1`` for a test, or a
+        larger value for production), we need the payload to honor it.
+
+        Reuses the payload as-is if it already shares our config,
+        otherwise reconstructs through our constructor.
+        """
+        if type(payload) is BytesIO and payload._cfg is self._cfg:
             return payload
 
-        self.replace_with_payload(raw)
-        self._media_type = mt
-        return self
+        # Feed the payload through our config-aware constructor. For
+        # large outputs this goes through _init_from_bytesio which
+        # either aliases the spilled path (zero-copy) or copies the
+        # memory-backed bytes — both honor our spill_bytes setting.
+        rewrapped = self.__class__(payload, copy=True, config=self._cfg)
+        try:
+            payload.close()
+        except Exception:
+            pass
+        return rewrapped
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1157,6 +1414,7 @@ class BytesIO(io.RawIOBase):
             return
 
         self._invalidate_mmap()
+        self._close_read_fh()
 
         old_path = self._path
         old_owns_path = self._owns_path

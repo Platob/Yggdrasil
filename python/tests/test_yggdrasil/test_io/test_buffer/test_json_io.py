@@ -77,7 +77,7 @@ def test_jsonio_gzip_write_arrow_table_and_read_pylist_roundtrip():
     io_.write_arrow_table(table)
 
     # Buffer payload should be compressed, not plain JSON text
-    raw = buf.to_bytes()
+    raw = io_.holder.to_bytes()
     assert raw
     assert not raw.startswith(b"[{")
     assert not raw.startswith(b'{"')
@@ -192,7 +192,7 @@ def test_jsonio_gzip_write_arrow_table_and_read_pylist_roundtrip_nested_types():
 
     io_.write_arrow_table(table)
 
-    raw = buf.to_bytes()
+    raw = io_.holder.to_bytes()
     assert raw
     assert not raw.startswith(b"[{")
     assert not raw.startswith(b'{"')

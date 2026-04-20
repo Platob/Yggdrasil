@@ -1,14 +1,16 @@
 """Casting options for Arrow- and engine-aware conversions."""
 from dataclasses import dataclass
-from typing import Any, Optional, Union, TypeVar, TYPE_CHECKING
+from typing import Any, Optional, Union, TypeVar, TYPE_CHECKING, Iterator, Iterable
 
 import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.types.support import get_polars, get_spark_sql
+from yggdrasil.pickle.serde import ObjectSerde
 
 if TYPE_CHECKING:
     import polars
+    import pandas as pd
     import pyspark.sql as ps
 
 __all__ = [
@@ -128,6 +130,13 @@ class CastOptions:
             allow_add_columns=self.allow_add_columns if allow_add_columns is None else allow_add_columns,
         )
 
+    def peek_source(self, src: Any, inplace: bool = True) -> tuple[Any, "CastOptions"]:
+        if self.source_field is None and src is not None:
+            src, dfield = Field.peek_from(src)
+
+            return src, self.with_source(dfield, inplace=inplace)
+        return self
+
     def check_source(self, obj: Any) -> "CastOptions":
         if self.source_field is None and obj is not None:
             return self.with_source(obj, inplace=True)
@@ -141,6 +150,13 @@ class CastOptions:
             return self
         return self.copy(source_field=f)
 
+    def peek_target(self, tgt: Any, inplace: bool = True) -> tuple[Any, "CastOptions"]:
+        if self.target_field is None and tgt is not None:
+            tgt, dfield = Field.peek_from(tgt)
+
+            return tgt, self.with_target(dfield, inplace=inplace)
+        return self
+
     def check_target(self, obj: Any) -> "CastOptions":
         if self.target_field is None and obj is not None:
             return self.with_target(obj, inplace=True)
@@ -153,6 +169,33 @@ class CastOptions:
             object.__setattr__(self, "target_field", f)
             return self
         return self.copy(target_field=f)
+
+    def cast_(self, obj: Any) -> Any:
+        ns, _ = ObjectSerde.module_and_name(obj)
+
+        if ns.startswith("pyarrow"):
+            return self.cast_arrow(obj)
+        elif ns.startswith("polars"):
+            return self.cast_polars(obj)
+        elif ns.startswith("pyspark"):
+            return self.cast_spark(obj)
+        elif ns.startswith("pandas"):
+            return self.cast_pandas(obj)
+        elif isinstance(obj, (Iterator, Iterable)):
+            def casted(items=obj):
+                for item in items:
+                    yield self.cast_(item)
+
+            return casted(obj)
+        else:
+            raise TypeError(f"Cannot cast {type(obj)}")
+
+    def cast_iterator(
+        self,
+        items: Iterator[Any]
+    ):
+        for item in items:
+            yield self.cast_(item)
 
     def cast_arrow(
         self,
@@ -247,6 +290,19 @@ class CastOptions:
         if self.target_field is None:
             return table
         return self.target_field.cast_spark_tabular(table, options=self)
+
+    def cast_pandas(self, obj: "pd.DataFrame | pd.Series"):
+        if self.target_field is None:
+            return obj
+
+        import pandas as pd
+
+        if isinstance(obj, pd.Series):
+            return self.target_field.cast_pandas_series(obj, options=self)
+        elif isinstance(obj, pd.DataFrame):
+            return self.target_field.cast_pandas_tabular(obj, options=self)
+        else:
+            raise TypeError(f"Cannot cast {type(obj)} to pandas")
 
     def fill_arrow_nulls(
         self,

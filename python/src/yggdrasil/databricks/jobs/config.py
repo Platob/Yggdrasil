@@ -10,7 +10,7 @@ from enum import Enum
 from inspect import isclass
 from typing import Any, Dict, List, get_type_hints, get_origin
 
-from ...types.cast.registry import convert
+from yggdrasil.data.cast.registry import convert
 
 __all__ = [
     "WidgetType",
@@ -116,7 +116,10 @@ class NotebookConfig:
         key_values: Dict[str, Any] = {}
 
         # Get all field names and types for this dataclass
-        class_fields = {field.name: field for field in fields(cls)}
+        class_fields = {
+            f.name: f for f in fields(cls)
+            if f.init and not f.name.startswith("_")
+        }
         type_hints = get_type_hints(cls)
 
         for field_name, field in class_fields.items():
@@ -320,7 +323,7 @@ class NotebookConfig:
         Returns:
             An instance of the dataclass populated from widgets or environment.
         """
-        from ...spark import pyspark_sql
+        import pyspark.sql as pyspark_sql
         cls.init_widgets()
 
         if pyspark_sql.SparkSession is not None:

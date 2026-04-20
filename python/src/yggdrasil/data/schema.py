@@ -7,10 +7,10 @@ from dataclasses import dataclass, field as dc_field, field
 from typing import TYPE_CHECKING, Any, AnyStr, Mapping, overload
 
 import pyarrow as pa
+
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 from yggdrasil.io import SaveMode
-
 from .base_meta import BaseMetadata, _normalize_metadata, _to_bytes, BaseChildrenFields
 from .data_field import Field
 from .types.nested import StructType
@@ -61,6 +61,9 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     inner_fields: OrderedDict[str, Field] = dc_field(default_factory=OrderedDict)
     metadata: dict[bytes, bytes] | None = field(default=None)
 
+    def __bool__(self):
+        return bool(self.inner_fields)
+
     def __post_init__(self) -> None:
         if not isinstance(self.inner_fields, OrderedDict):
             normalized_fields: OrderedDict[str, Field] = OrderedDict()
@@ -77,7 +80,13 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
                     normalized_fields[f.name] = f
 
             self.inner_fields = normalized_fields
-    
+
+    @classmethod
+    def peek_from(cls, obj: Any) -> tuple[Any, "Schema"]:
+        obj, dfield = Field.peek_from(obj)
+
+        return obj, cls.from_field(dfield)
+
     def equals(
         self,
         other: Any,
