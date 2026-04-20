@@ -77,7 +77,7 @@ class MediaOptions:
         lazy: bool | Any = ...,
         raise_error: bool | Any = ...,
         batch_size: int | None | Any = ...,
-        statistics: "Iterable[DataStatisticsConfig | dict | str] | None | Any" = ...,
+        statistics: "Iterable[DataStatisticsConfig | dict | str | tuple[str, ...]] | None | Any" = ...,
         **kwargs: Any,
     ) -> MediaOptions:
         base = cls._coerce_options(options)
@@ -191,15 +191,16 @@ class MediaOptions:
 
     @staticmethod
     def _normalize_statistics(
-        value: "Iterable[DataStatisticsConfig | dict | str] | None",
+        value: "Iterable[DataStatisticsConfig | dict | str | tuple[str, ...]] | None",
     ) -> list[DataStatisticsConfig] | None:
         """Delegate to :meth:`DataStatisticsConfig.coerce_many`.
 
         Accepts ``None`` (no stats), a list of
-        :class:`DataStatisticsConfig`, plain field-name strings, or dict
-        payloads. Returns a deduped list; raises on a single
-        non-iterable input or duplicate ``field`` names so the caller
-        notices bad config early.
+        :class:`DataStatisticsConfig`, plain field-name strings, dict
+        payloads, or column-name tuples for compound-key entries.
+        Returns a deduped list; raises on a single non-iterable input
+        or duplicate ``field`` keys so the caller notices bad config
+        early.
         """
         return DataStatisticsConfig.coerce_many(value)
 
