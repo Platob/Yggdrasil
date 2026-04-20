@@ -627,37 +627,6 @@ class DataType(BaseChildrenFields, ABC):
             return self._cast_chunked_array(array, opts)
         return self._cast_arrow_array(array, opts)
 
-    @staticmethod
-    def _nullify_empty_arrow_strings(
-        array: pa.Array | pa.ChunkedArray,
-    ) -> pa.Array | pa.ChunkedArray:
-        dtype = array.type
-        if (
-            pa.types.is_string(dtype)
-            or pa.types.is_large_string(dtype)
-            or pa.types.is_string_view(dtype)
-        ):
-            empty = pa.scalar("", type=dtype)
-        elif (
-            pa.types.is_binary(dtype)
-            or pa.types.is_large_binary(dtype)
-            or pa.types.is_binary_view(dtype)
-        ):
-            empty = pa.scalar(b"", type=dtype)
-        else:
-            return array
-
-        null_scalar = pa.scalar(None, type=dtype)
-
-        if isinstance(array, pa.ChunkedArray):
-            chunks = [
-                pc.if_else(pc.equal(chunk, empty), null_scalar, chunk)
-                for chunk in array.chunks
-            ]
-            return pa.chunked_array(chunks, type=dtype)
-
-        return pc.if_else(pc.equal(array, empty), null_scalar, array)
-
     def _outgoing_cast_arrow_array(
         self,
         array: pa.Array | pa.ChunkedArray,
@@ -680,7 +649,6 @@ class DataType(BaseChildrenFields, ABC):
     ) -> pa.Array:
         options = options.check_source(array)
 
-        array = self._nullify_empty_arrow_strings(array)
         target_type = self.to_arrow()
 
         try:
@@ -766,8 +734,7 @@ class DataType(BaseChildrenFields, ABC):
         if series.dtype != pl.String and series.dtype != pl.Binary:
             return series
 
-        arr = DataType._nullify_empty_arrow_strings(series.to_arrow())
-        return pl.Series(name=series.name, values=arr, dtype=series.dtype)
+        return series
 
     def cast_polars_expr(
         self,

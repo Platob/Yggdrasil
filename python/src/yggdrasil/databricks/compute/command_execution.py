@@ -57,6 +57,25 @@ ALREADY_LIBS = {
 LOGGER = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Live-command keepalive
+#
+# The shutdown registry holds bound methods via weakref.WeakMethod, so it does
+# NOT extend the lifetime of a CommandExecution. That's correct for the path
+# abstraction (no cleanup needed if the caller forgot about it) but WRONG for
+# commands: if the user fires a command with .start() and drops their
+# reference, we still want to cancel the command on the cluster at process
+# exit — otherwise the cluster keeps running a paid workload.
+#
+# _LIVE_COMMANDS is a strong-reference set keyed by CommandExecution identity.
+# We add on register, remove on unregister. Membership is cheap (set of object
+# refs) and the set is bounded by the number of simultaneously-active commands.
+# ---------------------------------------------------------------------------
+
+_LIVE_COMMANDS: set["CommandExecution"] = set()
+_LIVE_COMMANDS_LOCK = RLock()
+
+
 @dataclass(frozen=True, slots=True)
 class _ModuleUploadCacheKey:
     cluster_id: str
@@ -90,7 +109,13 @@ class CommandExecution:
     _ser_pyfunc: Optional[Serialized] = field(default=None, repr=False, compare=False, hash=False)
     _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _remote_payload_path: Optional[str] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _shutdown_hook: Any = field(default=None, init=False, repr=False, compare=False, hash=False)
+
+    # True iff this instance is currently registered with yg_shutdown. We do
+    # NOT store the registered callback — the registry keys bound methods by
+    # (func, id(instance)) internally, so a bare flag suffices.
+    _shutdown_registered: bool = field(
+        default=False, init=False, repr=False, compare=False, hash=False,
+    )
 
     def __post_init__(self):
         if self.environ and not isinstance(self.environ, Mapping):
@@ -225,35 +250,54 @@ class CommandExecution:
         self._ser_pyfunc = serialize(self.pyfunc)
         return self._ser_pyfunc
 
+    # ------------------------------------------------------------------ #
+    # Shutdown-hook integration                                          #
+    # ------------------------------------------------------------------ #
+
     def _register_shutdown_cancel(self) -> None:
-        if self._shutdown_hook is not None or not self.command_id:
+        """Register a process-exit hook that cancels this running command.
+
+        Idempotent. The `_LIVE_COMMANDS` set holds a strong reference to self
+        so the WeakMethod-backed registry entry does not die if the caller
+        drops their reference to this CommandExecution.
+        """
+        if self._shutdown_registered or not self.command_id:
             return
         try:
-            self._shutdown_hook = yg_shutdown.register(self._unsafe_cancel)
+            yg_shutdown.register(self._unsafe_cancel)
         except Exception:
             LOGGER.debug(
                 "Failed to register shutdown handler for command %s",
                 self.command_id,
                 exc_info=True,
             )
-
-    def _unregister_shutdown_cancel(self) -> None:
-        hook = self._shutdown_hook
-        self._shutdown_hook = None
-        if hook is None:
             return
 
+        with _LIVE_COMMANDS_LOCK:
+            _LIVE_COMMANDS.add(self)
+        self._shutdown_registered = True
+
+    def _unregister_shutdown_cancel(self) -> None:
+        """Remove the process-exit hook. Idempotent."""
+        if not self._shutdown_registered:
+            # Still defensively try to drop from _LIVE_COMMANDS in case of a
+            # prior mid-register crash — cheap.
+            with _LIVE_COMMANDS_LOCK:
+                _LIVE_COMMANDS.discard(self)
+            return
+
+        self._shutdown_registered = False
         try:
-            try:
-                yg_shutdown.unregister(hook)
-            except Exception:
-                yg_shutdown.unregister(self._unsafe_cancel)
+            yg_shutdown.unregister(self._unsafe_cancel)
         except Exception:
             LOGGER.debug(
                 "Failed to unregister shutdown handler for command %s",
                 self.command_id,
                 exc_info=True,
             )
+        finally:
+            with _LIVE_COMMANDS_LOCK:
+                _LIVE_COMMANDS.discard(self)
 
     def _clear_active_command(self) -> None:
         self._details = None
@@ -263,6 +307,10 @@ class CommandExecution:
     def _mark_done_if_terminal(self) -> None:
         if self._details is not None and self._details.status in DONE_STATES:
             self._unregister_shutdown_cancel()
+
+    # ------------------------------------------------------------------ #
+    # Command lifecycle                                                  #
+    # ------------------------------------------------------------------ #
 
     def start(self, reset: bool = False):
         if self.command_id:
@@ -361,7 +409,24 @@ class CommandExecution:
         return self
 
     def _unsafe_cancel(self):
-        return self.cancel(wait=False, raise_error=False)
+        """Best-effort cancel used as the atexit / signal shutdown callback.
+
+        Swallows all exceptions (including BaseException) so shutdown hooks
+        cannot cascade-fail. Logging is defensively guarded because logging
+        handlers may already be torn down by the time atexit runs.
+        """
+        try:
+            return self.cancel(wait=False, raise_error=False)
+        except BaseException:  # noqa: BLE001 — shutdown hook must not raise
+            try:
+                LOGGER.debug(
+                    "Shutdown cancel of command %s failed",
+                    self.command_id,
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return None
 
     def _command_status(self) -> CommandStatusResponse | None:
         if not self.command_id or not self.context.context_id:
@@ -476,8 +541,15 @@ class CommandExecution:
             return
         try:
             self.client.dbfs_path(path).remove()
-        except Exception:
-            LOGGER.debug("Failed to clean up remote payload path %s (non-fatal)", path, exc_info=True)
+        except BaseException:  # noqa: BLE001 — cleanup must never raise
+            try:
+                LOGGER.debug(
+                    "Failed to clean up remote payload path %s (non-fatal)",
+                    path,
+                    exc_info=True,
+                )
+            except Exception:
+                pass
         finally:
             self._remote_payload_path = None
 

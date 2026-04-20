@@ -104,8 +104,6 @@ def cast_arrow_json_string_array(
     if len(normalized) == 0:
         return pa.array([], type=target_arrow_type)
 
-    normalized = DataType._nullify_empty_arrow_strings(normalized)
-
     null_literal = pa.scalar("null", type=pa.string())
     filled = pc.fill_null(normalized, null_literal)
 

@@ -10,8 +10,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Optional, TypeVar
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
@@ -109,22 +108,6 @@ def exclude_env_key(key: str) -> bool:
     """
     Return ``True`` when an environment-variable key should not be forwarded to
     remote execution payloads.
-
-    The filter intentionally excludes:
-    - host-specific process/runtime variables
-    - Databricks / Spark / Python launcher internals
-    - credentials or deployment-specific configuration
-    - IDE / debugger / test-runner state
-
-    Parameters
-    ----------
-    key:
-        Environment-variable key to evaluate.
-
-    Returns
-    -------
-    bool
-        Whether the variable should be excluded from remote propagation.
     """
     normalized = str(key).upper()
     return (
@@ -134,19 +117,22 @@ def exclude_env_key(key: str) -> bool:
 
 
 def _build_forwarded_environ(
-    environ: Optional[Mapping | list | tuple | set] = None,
+    environ: Optional[Mapping[str, Any] | Iterable[str]] = None,
 ) -> dict[str, str]:
     """
     Build the environment mapping forwarded to remote commands.
 
-    The default baseline is the current process environment with excluded keys
-    removed. Additional values may be supplied either as:
+    The baseline is the current process environment with excluded keys
+    filtered out. Additional values may be supplied as:
 
-    - a mapping of explicit key/value pairs
+    - a :class:`Mapping` of explicit key/value pairs (values override baseline)
     - an iterable of key names to copy from ``os.environ``
 
-    ``None`` values are normalized to empty strings so the remote side can
-    still receive an explicit key assignment.
+    ``None`` values become empty strings so the remote side still sees an
+    explicit assignment.
+
+    Note: iterable inputs are interpreted as *key names*. If you want to
+    pass literal ``KEY=VALUE`` overrides, use a Mapping.
     """
     forwarded: dict[str, str] = {
         str(k): str(v)
@@ -165,6 +151,7 @@ def _build_forwarded_environ(
         })
         return forwarded
 
+    # Iterable of key names to copy from the local environment.
     forwarded.update({
         key: os.getenv(key, "")
         for key in (str(item) for item in environ if item)
@@ -179,13 +166,7 @@ def _build_forwarded_environ(
 
 @dc.dataclass(frozen=True, slots=True)
 class ContextPoolKey:
-    """
-    Stable key for process-global pooled execution contexts.
-
-    A context is uniquely identified by the Databricks cluster, the execution
-    language, and the logical ``context_key`` used to isolate remote state.
-    """
-
+    """Stable key for process-global pooled execution contexts."""
     cluster_id: str
     language: str
     context_key: str
@@ -193,6 +174,17 @@ class ContextPoolKey:
 
 _CONTEXT_POOL: dict[ContextPoolKey, "ExecutionContext"] = {}
 _CONTEXT_POOL_LOCK = threading.RLock()
+
+# Strong-reference keepalive for non-pooled temporary contexts.
+#
+# The shutdown registry holds bound methods via weakref.WeakMethod, which
+# means a temporary context that nobody keeps a reference to would see its
+# shutdown hook silently pruned before atexit fires — leaking a live remote
+# context on the cluster. Pooled contexts are already pinned by _CONTEXT_POOL,
+# but directly-constructed temporary contexts are not. This set closes that
+# gap.
+_LIVE_TEMP_CONTEXTS: set["ExecutionContext"] = set()
+_LIVE_TEMP_CONTEXTS_LOCK = threading.RLock()
 
 
 # ============================================================================
@@ -210,8 +202,7 @@ def _evict_idle_contexts() -> None:
     Close and remove pooled contexts that have exceeded their idle timeout.
 
     Only contexts with a non-``None`` ``close_after`` value are eligible for
-    automatic eviction. Contexts without an active ``context_id`` are skipped,
-    since they are already effectively closed.
+    automatic eviction. Contexts without an active ``context_id`` are skipped.
     """
     now = time.time()
     evicted: list[tuple[ContextPoolKey, "ExecutionContext"]] = []
@@ -233,8 +224,6 @@ def _evict_idle_contexts() -> None:
             _CONTEXT_POOL.pop(key, None)
 
     for _key, ctx in evicted:
-        prev_raise = logging.raiseExceptions
-        logging.raiseExceptions = False
         try:
             LOGGER.info(
                 "Auto-closing idle context %s (idle=%.0fs, close_after=%.0fs)",
@@ -243,27 +232,29 @@ def _evict_idle_contexts() -> None:
                 ctx.close_after,
             )
             ctx.close(wait=False, raise_error=False)
-        except Exception:
-            LOGGER.debug("Error auto-closing idle context %s", ctx, exc_info=True)
-        finally:
-            logging.raiseExceptions = prev_raise
+        except BaseException:  # noqa: BLE001 — reaper must never escape
+            try:
+                LOGGER.debug(
+                    "Error auto-closing idle context %s", ctx, exc_info=True,
+                )
+            except Exception:
+                pass
 
 
 def _reaper_loop() -> None:
-    """
-    Background loop that periodically scans the global pool for idle contexts.
-    """
+    """Background loop that periodically scans the pool for idle contexts."""
     while not _REAPER_STOP.wait(timeout=_REAPER_INTERVAL):
         try:
             _evict_idle_contexts()
-        except Exception:
-            LOGGER.debug("Unexpected error in context reaper loop", exc_info=True)
+        except BaseException:  # noqa: BLE001 — never kill the reaper
+            try:
+                LOGGER.debug("Unexpected error in context reaper loop", exc_info=True)
+            except Exception:
+                pass
 
 
 def _ensure_reaper_running() -> None:
-    """
-    Start the idle-context reaper thread if it is not already alive.
-    """
+    """Start the idle-context reaper thread if it is not already alive."""
     global _REAPER_THREAD
 
     with _REAPER_LOCK:
@@ -278,9 +269,22 @@ def _ensure_reaper_running() -> None:
         )
         _REAPER_THREAD.start()
         LOGGER.debug(
-            "Context reaper thread started (interval=%.0fs)",
-            _REAPER_INTERVAL,
+            "Context reaper thread started (interval=%.0fs)", _REAPER_INTERVAL,
         )
+
+
+def _stop_reaper(join_timeout: float = 2.0) -> None:
+    """Signal the reaper to exit and optionally wait for it."""
+    with _REAPER_LOCK:
+        _REAPER_STOP.set()
+        thread = _REAPER_THREAD
+
+    if thread is not None and thread.is_alive():
+        try:
+            thread.join(timeout=join_timeout)
+        except RuntimeError:
+            # Can happen if called from inside the reaper thread itself.
+            pass
 
 
 # ============================================================================
@@ -289,22 +293,51 @@ def _ensure_reaper_running() -> None:
 
 @dc.dataclass
 class RemoteMetadata:
-    """
-    Resolved filesystem paths associated with a remote execution context.
-
-    Attributes
-    ----------
-    context_path:
-        Root working directory for the logical context.
-    tmp_path:
-        Temporary-file directory within the context root.
-    libs_path:
-        Site-packages directory used to inject custom Python dependencies.
-    """
-
+    """Resolved filesystem paths associated with a remote execution context."""
     context_path: str
     tmp_path: str
     libs_path: str
+
+
+# ============================================================================
+# Timed single-call helper (replaces per-call ThreadPoolExecutor)
+# ============================================================================
+
+def _call_with_timeout(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout: float,
+    **kwargs: Any,
+) -> Any:
+    """
+    Run ``fn(*args, **kwargs)`` with a soft timeout.
+
+    On timeout, raises :class:`TimeoutError`. The worker thread is daemon, so
+    if the underlying call hangs forever it will not block interpreter exit.
+    We do NOT wait for the worker to finish after a timeout — the caller is
+    expected to either retry on a fresh path or give up.
+    """
+    result: list[Any] = []
+    error: list[BaseException] = []
+    done = threading.Event()
+
+    def _target() -> None:
+        try:
+            result.append(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 — re-raised on main thread
+            error.append(exc)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_target, name="ygg-ctx-create", daemon=True)
+    t.start()
+
+    if not done.wait(timeout=timeout):
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)!r} timed out after {timeout}s")
+
+    if error:
+        raise error[0]
+    return result[0]
 
 
 # ============================================================================
@@ -317,19 +350,15 @@ class ExecutionContext:
     Databricks command-execution context bound to a specific cluster.
 
     An ``ExecutionContext`` represents a live remote REPL/session created via
-    the Databricks command execution API. It owns enough metadata to:
-
-    - lazily connect or reconnect to a remote context
-    - participate in a global in-process pool
-    - build command payloads with controlled environment propagation
-    - serialize Python callables and arguments for remote execution
+    the Databricks command execution API.
 
     Notes
     -----
     - Instances are thread-safe at the object level via an internal ``RLock``.
     - Pooled contexts are shared per ``(cluster, language, context_key)``.
-    - Temporary contexts register a shutdown hook so they are closed on process
-      teardown when possible.
+    - Temporary contexts register a shutdown hook and strong-ref themselves
+      into ``_LIVE_TEMP_CONTEXTS`` so cleanup fires even if the caller drops
+      the instance.
     """
 
     cluster: "Cluster"
@@ -340,38 +369,31 @@ class ExecutionContext:
     close_after: float | None = dc.field(default=1800.0, repr=False, compare=False, hash=False)
 
     _remote_metadata: Optional[RemoteMetadata] = dc.field(
-        default=None,
-        init=False,
-        repr=False,
-        compare=False,
-        hash=False,
+        default=None, init=False, repr=False, compare=False, hash=False,
     )
     _lock: threading.RLock = dc.field(
         default_factory=threading.RLock,
-        init=False,
-        repr=False,
-        compare=False,
-        hash=False,
+        init=False, repr=False, compare=False, hash=False,
     )
     _created_at: float = dc.field(default=0.0, init=False, repr=False, compare=False, hash=False)
     _last_used_at: float = dc.field(default=0.0, init=False, repr=False, compare=False, hash=False)
+
+    # True iff this instance is currently registered with yg_shutdown.
+    _shutdown_registered: bool = dc.field(
+        default=False, init=False, repr=False, compare=False, hash=False,
+    )
 
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "ExecutionContext":
-        """
-        Open the context on entry, defaulting to Python when no language is set.
-        """
         return self.connect(language=self.language or Language.PYTHON)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """
-        Automatically close temporary contexts when leaving a ``with`` block.
-        """
         if self.temporary:
-            self.close(wait=False, raise_error=False)
+            # On exception, close synchronously so the caller observes errors.
+            self.close(wait=exc_type is not None, raise_error=False)
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -384,9 +406,7 @@ class ExecutionContext:
         return self.__repr__()
 
     def url(self) -> URL:
-        """
-        Return a context-scoped URL for diagnostics and logging.
-        """
+        """Return a context-scoped URL for diagnostics and logging."""
         return self.cluster.url().with_query_items({
             "context": self.context_id or "unknown",
         })
@@ -397,26 +417,15 @@ class ExecutionContext:
 
     @property
     def client(self):
-        """
-        Convenience proxy to the cluster client.
-        """
         return self.cluster.client
 
     @property
     def cluster_id(self):
-        """
-        Convenience proxy to the underlying Databricks cluster id.
-        """
         return self.cluster.cluster_id
 
     @property
     def remote_metadata(self) -> RemoteMetadata:
-        """
-        Lazily resolve remote filesystem paths for this context.
-
-        The path layout is derived from ``context_key``. If no explicit
-        ``context_key`` is set, the default hostname-based key is used.
-        """
+        """Lazily resolve remote filesystem paths for this context."""
         if self._remote_metadata is not None:
             return self._remote_metadata
 
@@ -433,29 +442,18 @@ class ExecutionContext:
 
     @property
     def created_at(self) -> dt.datetime:
-        return dt.datetime.fromtimestamp(
-            self._created_at,
-            tz=dt.timezone.utc,
-        )
+        return dt.datetime.fromtimestamp(self._created_at, tz=dt.timezone.utc)
 
     @property
     def last_used_at(self) -> dt.datetime:
-        return dt.datetime.fromtimestamp(
-            self._last_used_at,
-            tz=dt.timezone.utc,
-        )
+        return dt.datetime.fromtimestamp(self._last_used_at, tz=dt.timezone.utc)
 
     # ------------------------------------------------------------------
     # Pool helpers
     # ------------------------------------------------------------------
 
     def touch(self) -> None:
-        """
-        Record recent use of this context.
-
-        This timestamp is used by the idle-context reaper to determine when a
-        pooled context should be evicted and closed.
-        """
+        """Record recent use of this context."""
         self._last_used_at = time.time()
 
     @classmethod
@@ -466,9 +464,6 @@ class ExecutionContext:
         language: Language,
         context_key: Optional[str],
     ) -> ContextPoolKey:
-        """
-        Build the canonical pool key for a cluster/language/context tuple.
-        """
         return ContextPoolKey(
             cluster_id=str(cluster_id),
             language=language.value,
@@ -486,34 +481,7 @@ class ExecutionContext:
         reset: bool = False,
         close_after: float | None = 1800.0,
     ) -> "ExecutionContext":
-        """
-        Return a pooled execution context, creating it if needed.
-
-        The pool is process-global and keyed by ``(cluster, language,
-        context_key)``. Concurrent callers targeting the same key will share
-        the same ``ExecutionContext`` instance.
-
-        Parameters
-        ----------
-        cluster:
-            Cluster that owns the remote command-execution context.
-        language:
-            Execution language for the remote context.
-        context_key:
-            Logical identifier used to isolate remote filesystem state.
-        temporary:
-            Whether the created context should register shutdown cleanup.
-        reset:
-            Whether to force-close the existing pooled context before reuse.
-        close_after:
-            Idle timeout in seconds used by the background reaper. Set to
-            ``None`` to disable automatic eviction for this pooled context.
-
-        Returns
-        -------
-        ExecutionContext
-            Connected context instance from the global pool.
-        """
+        """Return a pooled execution context, creating it if needed."""
         key = cls._pool_key(
             cluster_id=cluster.cluster_id,
             language=language,
@@ -543,6 +511,48 @@ class ExecutionContext:
             return ctx
 
     # ------------------------------------------------------------------
+    # Shutdown-hook integration
+    # ------------------------------------------------------------------
+
+    def _register_shutdown_close(self) -> None:
+        """Register a process-exit hook that closes this temporary context."""
+        if self._shutdown_registered or not self.temporary:
+            return
+        try:
+            yg_shutdown.register(self._unsafe_close)
+        except Exception:
+            LOGGER.debug(
+                "Failed to register shutdown handler for context %s",
+                self.context_id,
+                exc_info=True,
+            )
+            return
+
+        with _LIVE_TEMP_CONTEXTS_LOCK:
+            _LIVE_TEMP_CONTEXTS.add(self)
+        self._shutdown_registered = True
+
+    def _unregister_shutdown_close(self) -> None:
+        """Remove the process-exit hook. Idempotent."""
+        if not self._shutdown_registered:
+            with _LIVE_TEMP_CONTEXTS_LOCK:
+                _LIVE_TEMP_CONTEXTS.discard(self)
+            return
+
+        self._shutdown_registered = False
+        try:
+            yg_shutdown.unregister(self._unsafe_close)
+        except Exception:
+            LOGGER.debug(
+                "Failed to unregister shutdown handler for context %s",
+                self.context_id,
+                exc_info=True,
+            )
+        finally:
+            with _LIVE_TEMP_CONTEXTS_LOCK:
+                _LIVE_TEMP_CONTEXTS.discard(self)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -554,29 +564,7 @@ class ExecutionContext:
         wait: WaitingConfigArg = True,
         temporary: bool = False,
     ) -> "ExecutionContext":
-        """
-        Create a new remote execution context.
-
-        If the current instance already owns a live context with the requested
-        language, it is reused and only the last-used timestamp is refreshed.
-
-        Parameters
-        ----------
-        language:
-            Databricks command-execution language for the remote context.
-        context_key:
-            Optional logical key used to derive remote filesystem paths.
-        wait:
-            Reserved lifecycle option for API consistency.
-        temporary:
-            Whether this context should be treated as short-lived and cleaned
-            up automatically during shutdown.
-
-        Returns
-        -------
-        ExecutionContext
-            The current instance for fluent chaining.
-        """
+        """Create a new remote execution context."""
         del wait  # kept for API compatibility
 
         with self._lock:
@@ -593,24 +581,22 @@ class ExecutionContext:
             )
 
             try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        client.create,
-                        cluster_id=self.cluster_id,
-                        language=language,
-                    )
-                    try:
-                        created = future.result(timeout=10).response
-                    except FuturesTimeoutError:
-                        LOGGER.warning(
-                            "Context creation timed out for %s — ensuring cluster running and retrying",
-                            self.cluster,
-                        )
-                        self.cluster.ensure_running(wait=True)
-                        created = client.create(
-                            cluster_id=self.cluster_id,
-                            language=language,
-                        ).response
+                created = _call_with_timeout(
+                    client.create,
+                    cluster_id=self.cluster_id,
+                    language=language,
+                    timeout=10.0,
+                ).response
+            except TimeoutError:
+                LOGGER.warning(
+                    "Context creation timed out for %s — ensuring cluster running and retrying",
+                    self.cluster,
+                )
+                self.cluster.ensure_running(wait=True)
+                created = client.create(
+                    cluster_id=self.cluster_id,
+                    language=language,
+                ).response
             except Exception as exc:
                 LOGGER.warning(
                     "Context creation failed for %s — ensuring cluster running and retrying: %s",
@@ -633,14 +619,7 @@ class ExecutionContext:
             LOGGER.info("Context created: id=%s on %s", self.context_id, self.cluster)
 
             if self.temporary:
-                try:
-                    yg_shutdown.register(self._unsafe_close)
-                except Exception:
-                    LOGGER.debug(
-                        "Failed to register shutdown handler for context %s",
-                        self.context_id,
-                        exc_info=True,
-                    )
+                self._register_shutdown_close()
 
             return self
 
@@ -651,37 +630,18 @@ class ExecutionContext:
         wait: WaitingConfigArg = True,
         reset: bool = False,
     ) -> "ExecutionContext":
-        """
-        Ensure this instance has an open remote execution context.
-
-        Parameters
-        ----------
-        language:
-            Desired execution language. Falls back to the existing instance
-            language, then Python.
-        wait:
-            Reserved lifecycle option for API consistency.
-        reset:
-            When ``True``, force-close the current remote context before
-            creating a replacement.
-
-        Returns
-        -------
-        ExecutionContext
-            The current instance for fluent chaining.
-        """
+        """Ensure this instance has an open remote execution context."""
         with self._lock:
             if self.context_id and not reset:
                 LOGGER.debug(
                     "%s already connected (context=%s), reusing",
-                    self,
-                    self.context_id,
+                    self, self.context_id,
                 )
                 self.touch()
                 return self
 
             if self.context_id and reset:
-                LOGGER.info("%s resetting connection", self)
+                LOGGER.debug("%s resetting connection", self)
                 self.close(wait=False, raise_error=False)
 
             resolved_language = language or self.language or Language.PYTHON
@@ -695,30 +655,37 @@ class ExecutionContext:
             )
 
     def close(self, wait: bool = True, raise_error: bool = True) -> None:
-        """
-        Destroy the remote execution context associated with this instance.
+        """Destroy the remote execution context associated with this instance.
 
         Parameters
         ----------
         wait:
             When ``True``, block until Databricks confirms destruction.
-            Otherwise, dispatch the destroy call asynchronously.
+            Otherwise, dispatch the destroy call asynchronously (daemon).
         raise_error:
             Whether ``DatabricksError`` exceptions should be propagated.
         """
         with self._lock:
             if not self.context_id:
+                # Still drop any stale shutdown registration.
+                self._unregister_shutdown_close()
                 return
 
             closing_id = self.context_id
+            # Unregister the shutdown hook BEFORE dispatching the destroy, so
+            # atexit can't race with a fire-and-forget destroy thread.
+            self._unregister_shutdown_close()
+
             LOGGER.info(
                 "Closing context %s on %s (wait=%s)",
-                closing_id,
-                self.cluster,
-                wait,
+                closing_id, self.cluster, wait,
             )
 
             client = self.client.workspace_client()
+            # Null out local state up front so other threads that see this
+            # object during close dispatch don't think it's still alive.
+            self.context_id = ""
+
             try:
                 if wait:
                     client.command_execution.destroy(
@@ -735,52 +702,36 @@ class ExecutionContext:
                 if raise_error:
                     raise
                 LOGGER.debug(
-                    "Suppressed DatabricksError while closing context %s",
-                    closing_id,
+                    "Suppressed DatabricksError while closing context %s", closing_id,
                 )
             finally:
                 LOGGER.debug("Context %s closed", closing_id)
-                self.context_id = ""
-                if self.temporary:
-                    try:
-                        yg_shutdown.unregister(self._unsafe_close)
-                    except Exception:
-                        pass
 
     def _unsafe_close(self) -> None:
-        """
-        Shutdown-safe close helper used by process-exit hooks.
+        """Shutdown-safe close helper used by process-exit hooks.
 
-        This method always performs a blocking close so it does not spawn extra
-        threads during interpreter teardown. Logging exception banners are
-        suppressed because log streams may already be partially dismantled at
-        shutdown time.
+        Always performs a blocking close so it does not spawn extra threads
+        during interpreter teardown. Swallows BaseException and defensively
+        guards the logger because logging may itself be torn down at exit.
         """
-        prev_raise = logging.raiseExceptions
-        logging.raiseExceptions = False
         try:
             self.close(wait=True, raise_error=False)
-        except Exception:
-            pass
-        finally:
-            logging.raiseExceptions = prev_raise
+        except BaseException:  # noqa: BLE001 — shutdown hook must not raise
+            try:
+                LOGGER.debug(
+                    "Shutdown close of context %s failed",
+                    self.context_id or "<unknown>",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Command helpers
     # ------------------------------------------------------------------
 
     def syspath_lines(self, environ: Optional[Mapping[str, str]] = None) -> str:
-        """
-        Build the Python preamble injected into Python commands.
-
-        The preamble:
-        - prepends the remote context-specific site-packages directory to
-          ``sys.path``
-        - optionally injects environment variables into ``os.environ``
-
-        Environment values are compressed and base64-encoded so they can be
-        embedded safely into the generated command string.
-        """
+        """Build the Python preamble injected into Python commands."""
         lines = f"""\
 import base64, gzip, os, json, sys, pandas as pd, numpy as np
 _p = os.path.expanduser({self.remote_metadata.libs_path!r})
@@ -813,32 +764,7 @@ for _k, _v in _env.items():
         func: Optional[Callable] = None,
         environ: Optional[Mapping] = None,
     ) -> "CommandExecution":
-        """
-        Build a :class:`CommandExecution` for this context.
-
-        Parameters
-        ----------
-        command:
-            Either a command string or a Python callable.
-        command_str:
-            Explicit command string. Used when ``command`` is not a string.
-        language:
-            Execution language. The special value ``"shell"`` is translated into
-            a Python wrapper that executes a subprocess remotely.
-        context:
-            Alternate context to bind to the resulting command object.
-        command_id:
-            Optional command identifier.
-        func:
-            Explicit callable to execute remotely.
-        environ:
-            Additional environment overrides or environment keys to forward.
-
-        Returns
-        -------
-        CommandExecution
-            Configured command-execution wrapper.
-        """
+        """Build a :class:`CommandExecution` for this context."""
         from .command_execution import CommandExecution
 
         context = self if context is None else context
@@ -887,13 +813,7 @@ print(p.stdout, flush=True)
         args: Optional[tuple] = None,
         kwargs: Optional[dict] = None,
     ) -> tuple[tuple, dict]:
-        """
-        Normalize positional and keyword arguments against a callable signature.
-
-        This expands default values when possible so remote invocation more
-        closely mirrors local call behavior, especially for partially bound
-        methods and functions with mixed positional/keyword parameters.
-        """
+        """Normalize positional and keyword arguments against a callable signature."""
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
 
@@ -984,31 +904,7 @@ print(p.stdout, flush=True)
         environ: Optional[Mapping] = None,
         pyfunc: Optional[Callable] = None,
     ) -> tuple[str, Optional[str]]:
-        """
-        Build a Python command string that invokes a serialized callable remotely.
-
-        The serialized function and its arguments are inlined when the payload is
-        small enough. Large payloads are uploaded to temporary DBFS storage and
-        referenced by path instead.
-
-        Parameters
-        ----------
-        serfunc:
-            Serialized callable wrapper.
-        args, kwargs:
-            Positional and keyword arguments passed to the callable.
-        tag:
-            Prefix used to mark the printed serialized return value.
-        environ:
-            Optional environment additions for the generated preamble.
-        pyfunc:
-            Original callable used for argument normalization when available.
-
-        Returns
-        -------
-        tuple[str, Optional[str]]
-            Generated command string and optional remote DBFS payload path.
-        """
+        """Build a Python command string that invokes a serialized callable remotely."""
         func = pyfunc if pyfunc is not None else serfunc.as_cache_python()
         args, kwargs = self._normalize_call_args(func, args=args, kwargs=kwargs)
 
@@ -1058,10 +954,7 @@ print({tag!r} + _r, flush=True)
         return command, remote_payload_path
 
     def is_in_databricks_environment(self) -> bool:
-        """
-        Return whether the current client is running inside a Databricks
-        environment.
-        """
+        """Return whether the current client is running inside Databricks."""
         return self.cluster.client.is_in_databricks_environment()
 
 
@@ -1073,19 +966,46 @@ def close_all_pooled_contexts() -> None:
     """
     Close and remove every context currently registered in the global pool.
 
-    This helper uses ``wait=True`` for every context so shutdown is synchronous
-    and does not rely on background threads. That makes it safe for use in
-    interpreter shutdown and signal-handling paths.
+    Stops the reaper thread first so it cannot race with this function or
+    try to dispatch more closes against a half-torn-down client stack.
+
+    Uses ``wait=True`` for every context: synchronous closes so shutdown is
+    deterministic and does not rely on background threads that might be
+    killed by interpreter teardown.
     """
+    # 1) Stop the reaper first so it can't dispatch new closes concurrently.
+    _stop_reaper(join_timeout=2.0)
+
+    # 2) Drain the pool atomically.
     with _CONTEXT_POOL_LOCK:
         contexts = list(_CONTEXT_POOL.values())
         _CONTEXT_POOL.clear()
 
-    for ctx in contexts:
+    # 3) Also drain any non-pooled temporary contexts still alive. Some of
+    #    them may already be in `contexts` (if they were pooled); the set
+    #    difference handles the overlap cheaply.
+    with _LIVE_TEMP_CONTEXTS_LOCK:
+        temps = list(_LIVE_TEMP_CONTEXTS)
+        _LIVE_TEMP_CONTEXTS.clear()
+
+    seen: set[int] = set()
+    all_contexts = []
+    for c in contexts + temps:
+        if id(c) not in seen:
+            seen.add(id(c))
+            all_contexts.append(c)
+
+    for ctx in all_contexts:
         try:
             ctx.close(wait=True, raise_error=False)
-        except Exception:
-            LOGGER.debug("Failed closing pooled context %s", ctx, exc_info=True)
+        except BaseException:  # noqa: BLE001 — shutdown must never escape
+            try:
+                LOGGER.debug("Failed closing pooled context %s", ctx, exc_info=True)
+            except Exception:
+                pass
 
 
-yg_shutdown.register(close_all_pooled_contexts)
+# Register at high priority so contexts close before lower-priority hooks
+# (e.g. client-level HTTP session teardown) take effect. LIFO-by-import is
+# not a reliable ordering mechanism across a large codebase.
+yg_shutdown.register(close_all_pooled_contexts, priority=100)

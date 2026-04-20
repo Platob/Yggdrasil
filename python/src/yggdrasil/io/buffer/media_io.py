@@ -484,10 +484,13 @@ class MediaIO(ABC, Generic[O]):
                     yield pa.Table.from_batches([batch])
             return iter_tables()
 
-        all_batches = list(batches)
-        if not all_batches:
-            return pa.Table.from_batches(all_batches, schema=pa.schema([]))
-        return pa.Table.from_batches(all_batches)
+        tables = [pa.Table.from_batches([b]) for b in batches]
+        if not tables:
+            schema = options.cast.target_schema or options.cast.source_schema
+            schema = schema.to_arrow_schema() if schema is None else pa.schema([])
+            return schema.empty_table()
+
+        return pa.concat_tables(tables, promote_options="permissive")
 
     def write_arrow_table(
         self,

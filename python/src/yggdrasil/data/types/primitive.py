@@ -196,8 +196,10 @@ class _JsonEncodeTargetMixin:
                 casted = pa.compute.cast(casted, self.to_arrow())
             return options.fill_arrow_nulls(casted)
 
-        array = self._nullify_empty_arrow_strings(array)
         target_type = self.to_arrow()
+
+        if target_type == array.type:
+            return options.fill_arrow_nulls(casted)
 
         try:
             casted = pc.cast(
@@ -1907,8 +1909,6 @@ class TemporalType(PrimitiveType, ABC):
     ) -> pa.Array:
         options = options.check_source(array)
         tc = _temporal_cast_module()
-
-        array = self._nullify_empty_arrow_strings(array)
 
         # options.safe=True means strict parsing. Best-effort ingestion
         # (the default) keeps fractional seconds and reinterprets wall-clock

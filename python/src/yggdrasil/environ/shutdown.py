@@ -8,15 +8,24 @@ Callbacks are run on:
 - termination-related signals such as SIGINT / SIGTERM / SIGHUP / SIGBREAK
   when available on the current platform and installable from the current thread
 
-Features:
-- decorator or direct registration
-- unregister support
-- priority ordering
-- run-once guarantee
-- restores previous signal handlers on uninstall
-- one failing callback does not block the others
+Design notes
+------------
+- Signal handlers do NOT raise synthetic SystemExit into arbitrary stack
+  frames. Instead they run callbacks, restore the previous handler, and
+  re-raise the signal to the process so the OS / previous handler decides
+  what happens next. This avoids injecting exceptions into finally blocks
+  and C extensions.
+- run() is both run-once and re-entrancy safe: a signal arriving while
+  atexit callbacks are executing will NOT start a parallel run, and will
+  NOT truncate the in-flight run.
+- Bound methods are tracked via weakref.WeakMethod so registering an
+  instance method does not extend the instance's lifetime, and does not
+  suffer from id() reuse after GC.
+- atexit is registered eagerly at module import so ordering relative to
+  other libraries is predictable (LIFO at import time).
 
-Typical usage:
+Typical usage
+-------------
 
     from yggdrasil.environ.shutdown import on_shutdown, shutdown_registry
 
@@ -29,18 +38,17 @@ Typical usage:
         print("flush first")
 
     shutdown_registry.unregister(cleanup)
-
-For bound instance methods, unregistering only works reliably if you pass the
-same bound method object back, or you keep the handle returned by register().
 """
 
 from __future__ import annotations
 
 import atexit
 import logging
+import os
 import signal
 import threading
-from dataclasses import dataclass, field
+import weakref
+from dataclasses import dataclass
 from types import FrameType
 from typing import Any, Callable, Iterable, TypeVar, overload
 
@@ -50,39 +58,65 @@ F = TypeVar("F", bound=Callable[..., Any])
 Callback = Callable[..., Any]
 
 
+# ---------------------------------------------------------------------------
+# Callback identity / weak references
+# ---------------------------------------------------------------------------
+
+def _is_bound_method(callback: Callback) -> bool:
+    return (
+        getattr(callback, "__self__", None) is not None
+        and getattr(callback, "__func__", None) is not None
+    )
+
+
 def _callback_key(callback: Callback) -> tuple[Any, ...]:
     """
-    Produce a stable identity key for callables, including bound methods.
+    Produce a stable identity key for callables.
 
     Plain functions:
         (<function object>,)
 
     Bound methods:
-        ("bound_method", id(instance), function_object)
+        ("bound_method", <func>, id(instance))
 
-    This lets unregister(obj.method) work even though each attribute access
-    produces a new bound method object.
+    id(instance) is stable while the instance is alive. Since the registry
+    keeps a WeakMethod, dead entries are pruned at run time and their keys
+    become irrelevant even if id() is later reused.
     """
-    self_obj = getattr(callback, "__self__", None)
-    func_obj = getattr(callback, "__func__", None)
-    if self_obj is not None and func_obj is not None:
-        return ("bound_method", id(self_obj), func_obj)
+    if _is_bound_method(callback):
+        return ("bound_method", callback.__func__, id(callback.__self__))
     return (callback,)
 
 
-@dataclass(order=True, slots=True)
+# ---------------------------------------------------------------------------
+# Registry entry
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
 class _Entry:
-    sort_key: tuple[int, int] = field(init=False, repr=False)
     priority: int
     order: int
-    key: tuple[Any, ...] = field(compare=False)
-    callback: Callback = field(compare=False)
-    pass_reason: bool = field(default=False, compare=False)
+    key: tuple[Any, ...]
+    # Either a strong reference (plain callable) or a WeakMethod (bound method).
+    # Resolve via _resolve() to get the actual callable, or None if dead.
+    ref: Any
+    is_weak: bool
+    pass_reason: bool = False
 
-    def __post_init__(self) -> None:
+    def _resolve(self) -> Callback | None:
+        if self.is_weak:
+            return self.ref()  # WeakMethod() returns None if dead
+        return self.ref
+
+    @property
+    def sort_key(self) -> tuple[int, int]:
         # Higher priority first, earlier registration breaks ties.
-        self.sort_key = (-self.priority, self.order)
+        return (-self.priority, self.order)
 
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
 
 class ShutdownRegistry:
     """
@@ -98,14 +132,24 @@ class ShutdownRegistry:
         self._lock = threading.RLock()
         self._entries: dict[tuple[Any, ...], _Entry] = {}
         self._order = 0
+
+        # Run-once + re-entrancy guards.
         self._ran = False
+        self._running = False
+
         self._installed = False
         self._atexit_registered = False
-        self._raise_on_callback_error = raise_on_callback_error
+        self.raise_on_callback_error = raise_on_callback_error
 
-        requested = handled_signals if handled_signals is not None else self._default_signals()
-        self._handled_signals = tuple(sig for sig in requested if self._supports_signal(sig))
+        requested = (
+            handled_signals if handled_signals is not None else self._default_signals()
+        )
+        self._handled_signals: tuple[int, ...] = tuple(
+            sig for sig in requested if self._supports_signal(sig)
+        )
         self._previous_handlers: dict[int, Any] = {}
+
+    # --- platform helpers -------------------------------------------------
 
     @staticmethod
     def _default_signals() -> tuple[int, ...]:
@@ -130,12 +174,14 @@ class ShutdownRegistry:
         # CPython requires this from the main thread of the main interpreter.
         return threading.current_thread() is threading.main_thread()
 
+    # --- install / uninstall ---------------------------------------------
+
     def install(self) -> None:
         """
         Install the atexit hook and signal handlers.
 
-        Safe to call multiple times. If called outside the main thread, atexit is
-        still registered but signal handlers are skipped.
+        Safe to call multiple times. If called outside the main thread, atexit
+        is still registered but signal handlers are skipped.
         """
         with self._lock:
             if not self._atexit_registered:
@@ -157,7 +203,9 @@ class ShutdownRegistry:
                             exc_info=True,
                         )
             else:
-                logger.debug("Skipping shutdown signal handler install outside main thread")
+                logger.debug(
+                    "Skipping shutdown signal handler install outside main thread"
+                )
 
             self._installed = True
 
@@ -165,22 +213,25 @@ class ShutdownRegistry:
         """
         Restore previous signal handlers.
 
-        Note: atexit registration is intentionally left in place; stdlib support for
-        atexit.unregister exists in modern Python, but leaving the runner registered
-        is harmless because run() is idempotent.
+        atexit registration is intentionally left in place; run() is idempotent
+        so leaving the runner registered is harmless.
         """
         with self._lock:
             if not self._installed:
                 return
 
-            for sig, previous in self._previous_handlers.items():
+            for sig, previous in list(self._previous_handlers.items()):
                 try:
                     signal.signal(sig, previous)
                 except (OSError, RuntimeError, ValueError):
-                    logger.exception("Failed to restore previous handler for signal %s", sig)
+                    logger.exception(
+                        "Failed to restore previous handler for signal %s", sig
+                    )
 
             self._previous_handlers.clear()
             self._installed = False
+
+    # --- register / unregister -------------------------------------------
 
     @overload
     def register(
@@ -213,18 +264,11 @@ class ShutdownRegistry:
         """
         Register a callback.
 
-        Supports:
-            registry.register(func)
-            registry.register(func, priority=100)
-
-            @registry.register
-            def func(): ...
-
-            @registry.register(priority=100)
-            def func(): ...
-
         If pass_reason=True, the callback will receive one positional argument:
             reason: str
+
+        Bound methods are held via weakref so the registry does not extend
+        the instance's lifetime.
         """
         if callback is None:
             def decorator(fn: F) -> F:
@@ -243,13 +287,26 @@ class ShutdownRegistry:
 
         key = _callback_key(callback)
 
+        if _is_bound_method(callback):
+            # When the instance dies, drop the entry automatically.
+            def _on_dead(_ref: Any, _key: tuple[Any, ...] = key) -> None:
+                with self._lock:
+                    self._entries.pop(_key, None)
+
+            ref: Any = weakref.WeakMethod(callback, _on_dead)
+            is_weak = True
+        else:
+            ref = callback
+            is_weak = False
+
         with self._lock:
             self._order += 1
             self._entries[key] = _Entry(
                 priority=priority,
                 order=self._order,
                 key=key,
-                callback=callback,
+                ref=ref,
+                is_weak=is_weak,
                 pass_reason=pass_reason,
             )
 
@@ -280,42 +337,74 @@ class ShutdownRegistry:
 
     def callbacks(self) -> tuple[Callback, ...]:
         """
-        Return currently registered callbacks in execution order.
+        Return currently live callbacks in execution order.
+
+        Dead weak references are skipped (but not pruned here; pruning happens
+        in run() or via the WeakMethod finalizer).
         """
         with self._lock:
-            entries = sorted(self._entries.values())
-            return tuple(entry.callback for entry in entries)
+            entries = sorted(self._entries.values(), key=lambda e: e.sort_key)
+            resolved: list[Callback] = []
+            for entry in entries:
+                cb = entry._resolve()
+                if cb is not None:
+                    resolved.append(cb)
+            return tuple(resolved)
+
+    # --- execution --------------------------------------------------------
 
     def run(self, reason: str = "manual") -> None:
         """
         Run registered callbacks once.
 
-        Subsequent calls are no-ops until reset_run_state() is called.
+        Re-entrancy safe: if a signal arrives while this is already running,
+        the nested call is a no-op and does NOT truncate the in-flight run.
+
+        Subsequent top-level calls are also no-ops until reset_run_state() is
+        called.
         """
         with self._lock:
-            if self._ran:
+            if self._ran or self._running:
                 return
-            self._ran = True
-            entries = sorted(self._entries.values())
+            self._running = True
+            # Snapshot and resolve weakrefs under the lock.
+            entries = sorted(self._entries.values(), key=lambda e: e.sort_key)
+            resolved: list[tuple[_Entry, Callback]] = []
+            dead_keys: list[tuple[Any, ...]] = []
+            for entry in entries:
+                cb = entry._resolve()
+                if cb is None:
+                    dead_keys.append(entry.key)
+                else:
+                    resolved.append((entry, cb))
+            for k in dead_keys:
+                self._entries.pop(k, None)
 
         errors: list[BaseException] = []
 
-        for entry in entries:
-            try:
-                if entry.pass_reason:
-                    entry.callback(reason)
-                else:
-                    entry.callback()
-            except BaseException as exc:
-                errors.append(exc)
-                logger.exception(
-                    "Shutdown callback failed: %r (reason=%s)",
-                    entry.callback,
-                    reason,
-                )
+        try:
+            for entry, cb in resolved:
+                try:
+                    if entry.pass_reason:
+                        cb(reason)
+                    else:
+                        cb()
+                except BaseException as exc:
+                    errors.append(exc)
+                    logger.exception(
+                        "Shutdown callback failed: %r (reason=%s)",
+                        cb,
+                        reason,
+                    )
+        finally:
+            with self._lock:
+                self._ran = True
+                self._running = False
 
-        if errors and self._raise_on_callback_error:
-            raise RuntimeError(f"{len(errors)} shutdown callback(s) failed") from errors[0]
+        if errors and self.raise_on_callback_error:
+            raise RuntimeError(
+                f"{len(errors)} shutdown callback(s) failed"
+            ) from errors[0]
 
     def reset_run_state(self) -> None:
         """
@@ -323,49 +412,90 @@ class ShutdownRegistry:
         """
         with self._lock:
             self._ran = False
+            self._running = False
+
+    # --- atexit / signal plumbing ----------------------------------------
 
     def _atexit_runner(self) -> None:
-        self.run(reason="atexit")
+        # Swallow everything here: raising out of atexit produces noisy
+        # "Error in atexit._run_exitfuncs" output that obscures real errors.
+        try:
+            self.run(reason="atexit")
+        except BaseException:
+            logger.exception("Error running shutdown callbacks at interpreter exit")
 
-    def _make_signal_handler(self, sig: int) -> Callable[[int, FrameType | None], None]:
+    def _make_signal_handler(
+        self, sig: int
+    ) -> Callable[[int, FrameType | None], None]:
+        """
+        Build a signal handler that:
+          1. runs registered callbacks (once, re-entrancy safe)
+          2. restores the previous handler
+          3. re-raises the signal to the process so the OS / previous handler
+             decides the final fate
+
+        This avoids raising synthetic SystemExit into arbitrary stack frames,
+        which is the main cause of ugly "errors at end of process".
+        """
         def handler(signum: int, frame: FrameType | None) -> None:
             try:
                 signame = signal.Signals(signum).name
             except ValueError:
                 signame = str(signum)
 
-            self.run(reason=f"signal:{signame}")
+            try:
+                self.run(reason=f"signal:{signame}")
+            except BaseException:
+                logger.exception(
+                    "Error running shutdown callbacks for signal %s", signame
+                )
 
-            previous = self._previous_handlers.get(sig, signal.SIG_DFL)
-
-            if previous is signal.SIG_IGN:
-                raise SystemExit(128 + signum)
-
-            if previous in (signal.SIG_DFL, None):
-                if signum == getattr(signal, "SIGINT", None):
-                    raise KeyboardInterrupt
-                raise SystemExit(128 + signum)
-
-            if previous is handler:
-                raise SystemExit(128 + signum)
+            # Restore the previous handler and re-raise. On POSIX and Windows
+            # (Python 3.8+) signal.raise_signal exists and delivers the signal
+            # to the current process.
+            previous = self._previous_handlers.get(signum, signal.SIG_DFL)
 
             try:
-                previous(signum, frame)
-            except TypeError:
-                # Some odd handlers may not match the full signal signature.
-                try:
-                    previous(signum)
-                except Exception:
-                    raise SystemExit(128 + signum)
-            except BaseException:
-                raise
+                signal.signal(signum, previous)
+            except (OSError, RuntimeError, ValueError):
+                logger.debug(
+                    "Failed to restore previous handler for %s", signame,
+                    exc_info=True,
+                )
 
-            raise SystemExit(128 + signum)
+            # If the previous handler explicitly ignored the signal, we do
+            # the same: do not force a termination.
+            if previous is signal.SIG_IGN:
+                return
+
+            # Prefer re-raising via the OS so whatever handler is now installed
+            # (default or user's previous) decides what happens.
+            try:
+                signal.raise_signal(signum)
+                return
+            except (AttributeError, OSError, ValueError):
+                # Very old Python or exotic platform: fall through to a
+                # best-effort exit.
+                pass
+
+            # Last-resort fallback. os._exit skips atexit (we already ran
+            # callbacks above, so that's fine) and does not raise an exception
+            # into user code.
+            os._exit(128 + signum)
 
         return handler
 
 
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
 shutdown_registry = ShutdownRegistry()
+
+# Register atexit eagerly so ordering relative to other libraries is
+# predictable (LIFO at import time) instead of depending on when the first
+# callback happens to be registered.
+shutdown_registry.install()
 
 
 @overload

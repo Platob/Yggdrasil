@@ -12,9 +12,6 @@ Hierarchy
 
 All namespace-specific logic lives in the concrete subclasses; the base class
 provides shared fields, ``parse()`` factory, and the ``pathlib``-compatible API.
-
-The class does **not** inherit from ``AbstractDataPath`` (removed) — it is
-self-contained.
 """
 from __future__ import annotations
 
@@ -22,10 +19,10 @@ import datetime as dt
 import fnmatch
 import logging
 import stat as stat_mod
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, astuple, replace
-from threading import Thread
 from typing import (
     Any, ClassVar, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING,
 )
@@ -181,9 +178,12 @@ class DatabricksPath(ABC):
         repr=False, hash=False, compare=False, default=None,
     )
 
-    # Shutdown-hook handle — populated when temporary=True
-    _shutdown_hook: Any = field(
-        default=None, init=False, repr=False, hash=False, compare=False,
+    # True once the path has been registered with the shutdown registry.
+    # We do NOT store the callback object itself — the registry keys bound
+    # methods by (func, id(instance)) and uses WeakMethod internally, so a
+    # plain boolean flag is enough and avoids spurious strong references.
+    _shutdown_registered: bool = field(
+        default=False, init=False, repr=False, hash=False, compare=False,
     )
 
     def __post_init__(self) -> None:
@@ -227,7 +227,13 @@ class DatabricksPath(ABC):
         client: Optional["DatabricksClient"] = None,
         temporary: bool = False,
     ) -> "DatabricksPath":
-        """Build a concrete path from *obj*."""
+        """Build a concrete path from *obj*.
+
+        If *obj* is already a :class:`DatabricksPath` and ``temporary=True`` is
+        requested on a non-temporary instance, a *clone* is returned rather
+        than mutating the input — flipping ``temporary`` in place would
+        silently schedule someone else's path for deletion.
+        """
         if not obj:
             return _empty(client=client)
 
@@ -235,8 +241,10 @@ class DatabricksPath(ABC):
             if client is not None and obj._client is None:
                 obj._client = client
             if temporary and not obj.temporary:
-                obj.temporary = True
-                obj._register_shutdown_remove()
+                clone = obj.clone_instance()
+                clone.temporary = True
+                clone._register_shutdown_remove()
+                return clone
             return obj
 
         hostname: str | None = None
@@ -664,12 +672,26 @@ class DatabricksPath(ABC):
         self._client = self.workspace.connect()
         return self
 
+    # ------------------------------------------------------------------
+    # Shutdown-hook integration
+    #
+    # The shutdown registry holds bound methods via WeakMethod, so the
+    # registration does NOT extend the lifetime of this path. That means we
+    # must keep *some* strong reference to the path alive as long as we want
+    # the cleanup to fire — typically the caller does that by holding the
+    # path object in a variable. If the caller drops the path on the floor,
+    # the WeakMethod dies, the registry entry is pruned by its finalizer,
+    # and cleanup silently won't fire. This is deliberate: we don't want
+    # cleanup to resurrect otherwise-dead objects.
+    # ------------------------------------------------------------------
+
     def _register_shutdown_remove(self) -> None:
         """Register a process-exit hook that removes this temporary path."""
-        if self._shutdown_hook is not None or not self.temporary:
+        if self._shutdown_registered or not self.temporary:
             return
         try:
-            self._shutdown_hook = yg_shutdown.register(self._unsafe_remove)
+            yg_shutdown.register(self._unsafe_remove)
+            self._shutdown_registered = True
         except Exception:
             logger.debug(
                 "Failed to register shutdown handler for temporary path %s",
@@ -679,15 +701,11 @@ class DatabricksPath(ABC):
 
     def _unregister_shutdown_remove(self) -> None:
         """Remove the process-exit hook registered by :meth:`_register_shutdown_remove`."""
-        hook = self._shutdown_hook
-        self._shutdown_hook = None
-        if hook is None:
+        if not self._shutdown_registered:
             return
+        self._shutdown_registered = False
         try:
-            try:
-                yg_shutdown.unregister(hook)
-            except Exception:
-                yg_shutdown.unregister(self._unsafe_remove)
+            yg_shutdown.unregister(self._unsafe_remove)
         except Exception:
             logger.debug(
                 "Failed to unregister shutdown handler for path %s",
@@ -696,23 +714,55 @@ class DatabricksPath(ABC):
             )
 
     def _unsafe_remove(self) -> None:
-        """Best-effort removal used as the atexit / signal shutdown callback."""
+        """Best-effort removal used as the atexit / signal shutdown callback.
+
+        At shutdown, the SDK client, network stack, or logging may already be
+        torn down. We swallow *all* exceptions and log at DEBUG — a failed
+        cleanup at process exit must never prevent other shutdown hooks from
+        running, and must never produce noisy tracebacks on stderr.
+        """
         try:
             self.remove(recursive=True, allow_not_found=True)
-        except Exception:
-            logger.debug(
-                "Shutdown cleanup of temporary path %s failed",
-                self.full_path(),
-                exc_info=True,
-            )
+        except BaseException:  # noqa: BLE001 — shutdown hook must not raise
+            try:
+                logger.debug(
+                    "Shutdown cleanup of temporary path %s failed",
+                    self.full_path(),
+                    exc_info=True,
+                )
+            except Exception:
+                # Logging itself may have been torn down by another atexit hook.
+                pass
 
     def close(self, wait: bool = True) -> None:
-        if self.temporary:
-            if wait:
-                self.remove(recursive=True)
-            else:
-                self._unregister_shutdown_remove()
-                Thread(target=self.remove, kwargs={"recursive": True}).start()
+        """Close the path.
+
+        For a non-temporary path this is a no-op.
+
+        For a temporary path:
+        - ``wait=True``  (default, safe): synchronously remove the remote
+          resource. Raises on failure.
+        - ``wait=False``: spawn a **daemon** background thread to do the
+          removal. Daemon so it cannot block interpreter shutdown. The
+          shutdown hook is unregistered eagerly to avoid a double-remove
+          race with atexit.
+        """
+        if not self.temporary:
+            return
+
+        if wait:
+            self.remove(recursive=True)
+            return
+
+        # Unregister the atexit hook first so we don't race atexit → remove()
+        # against the background thread's remove().
+        self._unregister_shutdown_remove()
+        t = threading.Thread(
+            target=self._unsafe_remove,
+            name=f"databricks-path-close-{self.name or 'root'}",
+            daemon=True,
+        )
+        t.start()
 
     # ================================================================== #
     # UC helpers (stubs — overridden by VolumePath / TablePath)           #
@@ -746,9 +796,18 @@ class DatabricksPath(ABC):
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Tear down the client first, then clean up the temporary path.
+        # On exception, prefer a synchronous wait so the caller observes
+        # cleanup failure rather than losing it in a background thread.
         if self._client is not None:
-            self._client.__exit__(exc_type, exc_val, exc_tb)
-        self.close(wait=False)
+            try:
+                self._client.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                logger.debug(
+                    "Client __exit__ raised for %s", self.full_path(),
+                    exc_info=True,
+                )
+        self.close(wait=exc_type is not None)
 
     def __str__(self) -> str:
         return self.full_path()
@@ -762,7 +821,18 @@ class DatabricksPath(ABC):
     # ── Clone ─────────────────────────────────────────────────────────
 
     def _copy_with(self, **overrides) -> "DatabricksPath":
-        return replace(self, **overrides)
+        """Internal clone — forwards to :func:`dataclasses.replace`.
+
+        A cloned path is NOT automatically registered as temporary even if the
+        source was; callers that want shutdown cleanup must either pass
+        ``temporary=True`` explicitly or call ``_register_shutdown_remove``
+        themselves. This avoids unintentionally scheduling sibling/parent
+        paths for deletion when manipulating ``parts``.
+        """
+        clone = replace(self, **overrides)
+        # replace() runs __post_init__, which may have registered a hook if
+        # temporary=True was carried over. That's the intended behaviour.
+        return clone
 
     def clone_instance(self, **kwargs) -> "DatabricksPath":
         return replace(
@@ -1311,4 +1381,3 @@ _KIND_MAP: dict[str, type[DatabricksPath]] = {
     "volumes":   VolumePath,
     "tables":    TablePath,
 }
-
