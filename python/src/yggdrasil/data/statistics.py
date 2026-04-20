@@ -1,263 +1,369 @@
-"""Lightweight per-field statistics descriptors.
+"""Per-statistic descriptors: what to compute, on which field(s), labeled.
 
-:class:`DataStatisticsConfig` describes which column-level KPIs a caller
-wants computed while a table streams through a pipeline — typically the
-:class:`~yggdrasil.io.buffer.media_io.MediaIO` read/write path, or a
-SQL-engine insertion planner that picks between bulk-insert, upsert,
-partition-pruned append, or ``MERGE`` based on the resulting numbers.
+A :class:`DataStatistic` bundles three things:
 
-The config is deliberately flag-based and frozen so it can be shared
-across threads and cached by callers without defensive copies.
+- **fields**: one or more :class:`~yggdrasil.data.data_field.Field` targets
+  (a single column, or a compound key for partition-pruning).
+- **kpis**: a set of :class:`KPI` values to compute over those fields —
+  ``MIN``, ``MAX``, ``COUNT``, ``DISTINCT``, and the others.
+- **label**: a human-readable identifier for the result row. Auto-derived
+  from ``fields``/``kpis`` when the caller doesn't supply one.
+
+It is frozen, so callers can share instances across threads without
+defensive copies, and fully parseable from a string DSL::
+
+    "amount.min"                  # scalar min
+    "amount.min,max,count"        # three KPIs, one stat
+    "(year,month).distinct"       # distinct tuple values, for partition pruning
+    "name.null_count"
+
+Downstream SQL engines read the resulting KPIs to decide insertion
+strategy — bulk INSERT, MERGE, partition-pruned APPEND, COPY staging
+sizing.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field as _dc_field
+from enum import Enum
 from typing import Any, Iterable, Union
 
-__all__ = ["DataStatisticsConfig", "FieldKey"]
+import pyarrow as pa
+
+from yggdrasil.data.data_field import Field
+
+__all__ = ["DataStatistic", "KPI"]
 
 
-# A stats entry targets either a single column (str) or a tuple of
-# columns treated as one compound key (used to collect distinct value
-# tuples for partition pruning).
-FieldKey = Union[str, tuple[str, ...]]
+class KPI(str, Enum):
+    """Column-level KPI name. The string value doubles as the DSL token."""
+
+    COUNT = "count"
+    NULL_COUNT = "null_count"
+    DISTINCT_COUNT = "distinct_count"
+    DISTINCT = "distinct"
+    MIN = "min"
+    MAX = "max"
+    SUM = "sum"
+    MEAN = "mean"
+    BYTE_SIZE = "byte_size"
+
+    @classmethod
+    def parse(cls, value: "str | KPI") -> "KPI":
+        """Case-insensitive parse with a couple of tolerated aliases."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise TypeError(f"KPI must be str or KPI, got {type(value).__name__}")
+        key = value.strip().lower()
+        aliases = {
+            "distinct_values": cls.DISTINCT,
+            "avg": cls.MEAN,
+            "average": cls.MEAN,
+            "nulls": cls.NULL_COUNT,
+            "nunique": cls.DISTINCT_COUNT,
+            "size": cls.BYTE_SIZE,
+        }
+        if key in aliases:
+            return aliases[key]
+        try:
+            return cls(key)
+        except ValueError:
+            valid = sorted(m.value for m in cls)
+            raise ValueError(
+                f"Unknown KPI {value!r}. Valid KPIs: {valid}. "
+                "Aliases accepted: distinct_values→distinct, avg→mean, nulls→null_count."
+            )
 
 
-# Flags that only make sense on a single scalar column. When ``field``
-# is a tuple, we force these to ``False`` — there is no sensible scalar
-# ``min``/``max``/``sum`` for a tuple.
-_SINGLE_COLUMN_ONLY_FLAGS: tuple[str, ...] = (
-    "min",
-    "max",
-    "sum",
-    "mean",
-    "byte_size",
-)
+# KPIs that need a scalar column. Trying to compute MIN over a compound
+# ``(year, month)`` key makes no sense — the SQL planner wants per-column
+# ranges; caller should declare a second stat for that.
+_COMPOUND_UNSAFE_KPIS: frozenset[KPI] = frozenset({
+    KPI.MIN,
+    KPI.MAX,
+    KPI.SUM,
+    KPI.MEAN,
+    KPI.BYTE_SIZE,
+})
+
+
+FieldLike = Union[Field, str, pa.Field]
 
 
 @dataclass(frozen=True, slots=True)
-class DataStatisticsConfig:
-    """Declare which KPIs to collect for a column or a compound key.
-
-    Each flag toggles one statistic. Flags are conservative by default —
-    cheap counting/extrema statistics are on, anything that requires a
-    second pass or extra buffering is off. A caller passes a list of
-    these through
-    :class:`~yggdrasil.io.buffer.media_options.MediaOptions.statistics`
-    and downstream code (e.g. a SQL engine insertion planner) decides
-    the strategy from the resulting numbers.
-
-    A :attr:`field` may be either a single column name (``"country"``)
-    or a tuple of column names (``("year", "month")``) treated as one
-    compound key. Tuple keys are how you capture the set of distinct
-    ``(year, month)`` pairs seen in a batch so the target engine can
-    prune partitions and issue writes only against the partitions that
-    actually received rows.
+class DataStatistic:
+    """One labeled statistic: what to compute over which field(s).
 
     Parameters
     ----------
-    field:
-        Column name, or tuple of column names for a compound key.
-        A list is accepted and normalized to a tuple; a tuple of length
-        one collapses back to a plain string to keep the canonical form
-        unique.
-    count:
-        Total number of rows observed (including nulls). Useful to
-        decide bulk-load vs. row-by-row insertion.
-    null_count:
-        Number of null values (per-column, or per-component for tuple
-        keys — any-null counts as null). Helps validate ``NOT NULL``
-        targets and pick ``COALESCE`` / default-value behavior on write.
-    distinct_count:
-        Number of distinct values (or distinct tuples for a compound
-        key). Drives ``MERGE`` vs. plain ``INSERT`` decisions and
-        index/clustering hints. Off by default — typically requires
-        hashing or a second pass.
-    distinct_values:
-        Capture the **set of distinct values** (or distinct tuples for
-        a compound key) in addition to the count. This is the partition
-        pruning hook: pass ``field=("year", "month"), distinct_values=True``
-        and the insertion planner can target only the partitions that
-        actually received rows. Off by default — memory cost grows with
-        cardinality, so the caller opts in.
-    min, max:
-        Minimum / maximum value. Drives partition pruning, range checks,
-        and target-table stat refreshes. Ignored for tuple keys (use a
-        per-column config for per-component ranges).
-    sum, mean:
-        Numeric aggregates. Off by default — only meaningful for numeric
-        scalar columns. Ignored for tuple keys.
-    byte_size:
-        Total serialized byte size for the column. Useful to size COPY
-        staging files and pick chunking boundaries. Ignored for tuple
-        keys.
+    fields:
+        One or more :class:`Field` targets. At the door we accept a
+        :class:`Field`, a bare column name (``str``), a :class:`pa.Field`,
+        or a tuple/list mixing those — strings are promoted to
+        :class:`Field` with a placeholder ``null`` dtype so the config
+        stays lightweight; the compute layer can resolve real dtypes
+        against the batch schema.
+    kpis:
+        One or more :class:`KPI` values. Accepts a single KPI / string,
+        or an iterable. Stored as a sorted, frozen set.
+    label:
+        Human-readable identifier for the result. Defaults to
+        ``"{field_spec}.{kpi_spec}"`` — e.g. ``"amount.min"`` or
+        ``"(year,month).distinct"``.
     """
 
-    field: FieldKey
-    count: bool = True
-    null_count: bool = True
-    distinct_count: bool = False
-    distinct_values: bool = False
-    min: bool = True
-    max: bool = True
-    sum: bool = False
-    mean: bool = False
-    byte_size: bool = False
+    fields: tuple[Field, ...]
+    kpis: frozenset[KPI]
+    label: str = _dc_field(default="")
 
     def __post_init__(self) -> None:
-        normalized = self._normalize_field(self.field)
-        if normalized is not self.field:
-            object.__setattr__(self, "field", normalized)
+        normalized_fields = self._normalize_fields(self.fields)
+        object.__setattr__(self, "fields", normalized_fields)
 
-        for f in fields(self):
-            if f.name == "field":
-                continue
-            value = getattr(self, f.name)
-            if not isinstance(value, bool):
-                raise TypeError(
-                    f"DataStatisticsConfig.{f.name} must be bool, "
-                    f"got {type(value).__name__}"
+        normalized_kpis = self._normalize_kpis(self.kpis)
+        object.__setattr__(self, "kpis", normalized_kpis)
+
+        if self.is_compound:
+            bad = normalized_kpis & _COMPOUND_UNSAFE_KPIS
+            if bad:
+                names = ", ".join(sorted(k.value for k in bad))
+                raise ValueError(
+                    f"KPIs {{{names}}} need a scalar column but this stat targets "
+                    f"compound key ({', '.join(f.name for f in normalized_fields)}). "
+                    "Declare a separate DataStatistic per column for per-component "
+                    "ranges."
                 )
 
-        # Compound keys have no scalar min/max/sum/mean/byte_size — zero
-        # them out rather than silently computing something misleading.
-        # Caller can still declare a per-column config alongside if they
-        # want per-component ranges.
-        if isinstance(self.field, tuple):
-            for flag in _SINGLE_COLUMN_ONLY_FLAGS:
-                if getattr(self, flag):
-                    object.__setattr__(self, flag, False)
+        if not self.label:
+            object.__setattr__(self, "label", self._default_label())
+        elif not isinstance(self.label, str):
+            raise TypeError(
+                f"DataStatistic.label must be str, got {type(self.label).__name__}"
+            )
 
     # ------------------------------------------------------------------
-    # Views
+    # Properties
     # ------------------------------------------------------------------
 
     @property
     def is_compound(self) -> bool:
-        """``True`` when :attr:`field` targets more than one column."""
-        return isinstance(self.field, tuple)
+        """``True`` when this stat targets more than one column."""
+        return len(self.fields) > 1
 
     @property
     def field_names(self) -> tuple[str, ...]:
-        """Always-tuple view of :attr:`field`, handy for iteration."""
-        return self.field if isinstance(self.field, tuple) else (self.field,)
+        """Plain column names in declaration order."""
+        return tuple(f.name for f in self.fields)
 
     # ------------------------------------------------------------------
-    # Parsing / normalization
+    # Default label
+    # ------------------------------------------------------------------
+
+    def _field_spec(self) -> str:
+        names = self.field_names
+        if len(names) == 1:
+            return names[0]
+        return "(" + ",".join(names) + ")"
+
+    def _kpi_spec(self) -> str:
+        return ",".join(sorted(k.value for k in self.kpis))
+
+    def _default_label(self) -> str:
+        return f"{self._field_spec()}.{self._kpi_spec()}"
+
+    # ------------------------------------------------------------------
+    # Normalization
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalize_field(value: Any) -> FieldKey:
-        """Accept str / tuple / list for :attr:`field` and canonicalize."""
-        if isinstance(value, str):
-            if not value:
-                raise ValueError("DataStatisticsConfig.field must be a non-empty str")
+    def _field_from(value: FieldLike) -> Field:
+        if isinstance(value, Field):
             return value
-
-        if isinstance(value, (tuple, list)):
-            items = tuple(value)
-            if not items:
-                raise ValueError(
-                    "DataStatisticsConfig.field tuple must contain at least one column name"
-                )
-            for i, item in enumerate(items):
-                if not isinstance(item, str):
-                    raise TypeError(
-                        "DataStatisticsConfig.field tuple must contain only str, "
-                        f"got {type(item).__name__} at index {i}"
-                    )
-                if not item:
-                    raise ValueError(
-                        f"DataStatisticsConfig.field tuple has an empty string at index {i}"
-                    )
-            seen: set[str] = set()
-            for name in items:
-                if name in seen:
-                    raise ValueError(
-                        f"DataStatisticsConfig.field tuple contains duplicate column {name!r}"
-                    )
-                seen.add(name)
-
-            # Single-column tuple collapses to a plain str — one canonical
-            # form per semantic target.
-            return items[0] if len(items) == 1 else items
-
+        if isinstance(value, str):
+            name = value.strip()
+            if not name:
+                raise ValueError("DataStatistic: empty string is not a valid column name")
+            # Placeholder dtype — the compute layer re-resolves against the
+            # batch schema. Keeps the config cheap to write.
+            return Field(name=name, dtype=pa.null())
+        if isinstance(value, pa.Field):
+            return Field.from_arrow_field(value)
         raise TypeError(
-            "DataStatisticsConfig.field must be a str or a tuple/list of str, "
+            "DataStatistic.fields entries must be a Field, column name (str), or "
+            f"pa.Field — got {type(value).__name__}"
+        )
+
+    @classmethod
+    def _normalize_fields(cls, value: Any) -> tuple[Field, ...]:
+        if isinstance(value, (Field, str, pa.Field)):
+            return (cls._field_from(value),)
+        if isinstance(value, (tuple, list)):
+            if not value:
+                raise ValueError("DataStatistic.fields must contain at least one field")
+            out = tuple(cls._field_from(v) for v in value)
+            seen: set[str] = set()
+            for f in out:
+                if f.name in seen:
+                    raise ValueError(
+                        f"DataStatistic.fields contains duplicate column {f.name!r}"
+                    )
+                seen.add(f.name)
+            return out
+        raise TypeError(
+            "DataStatistic.fields must be a Field / str / pa.Field or a "
+            f"tuple/list of those, got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _normalize_kpis(value: Any) -> frozenset[KPI]:
+        if isinstance(value, KPI):
+            return frozenset({value})
+        if isinstance(value, str):
+            return frozenset({KPI.parse(value)})
+        if isinstance(value, (frozenset, set, tuple, list)):
+            items = [KPI.parse(v) for v in value]
+            if not items:
+                raise ValueError("DataStatistic.kpis must contain at least one KPI")
+            return frozenset(items)
+        raise TypeError(
+            "DataStatistic.kpis must be a KPI, str, or an iterable of those; "
             f"got {type(value).__name__}"
         )
 
+    # ------------------------------------------------------------------
+    # String DSL
+    # ------------------------------------------------------------------
+
     @classmethod
-    def coerce(cls, value: Any) -> "DataStatisticsConfig":
-        """Accept a config, a field name / tuple, or a dict payload.
+    def parse(cls, spec: "str | DataStatistic") -> "DataStatistic":
+        """Parse a single DSL spec into one :class:`DataStatistic`.
 
-        - A :class:`DataStatisticsConfig` is returned unchanged.
-        - ``"col"`` → ``DataStatisticsConfig(field="col")``.
-        - ``("a", "b")`` or ``["a", "b"]`` → compound-key config.
-        - A dict is forwarded to the constructor; requires a ``field``
-          key.
+        Grammar::
 
-        Anything else raises :class:`TypeError` with a message that
-        spells out what was passed.
+            spec        = field_spec '.' kpi_list
+            field_spec  = column_name | '(' column_name (',' column_name)* ')'
+            kpi_list    = kpi (',' kpi)*
+
+        The KPI list is the tail after the **last** top-level ``.``,
+        so dotted column names are still possible by wrapping them in
+        parentheses: ``"(ns.col).min"``. Whitespace around separators
+        is ignored.
+
+        Examples
+        --------
+        >>> DataStatistic.parse("amount.min")
+        >>> DataStatistic.parse("amount.min,max,count")
+        >>> DataStatistic.parse("(year,month).distinct")
         """
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, str):
-            return cls(field=value)
-        if isinstance(value, (tuple, list)):
-            return cls(field=value)
-        if isinstance(value, dict):
-            if "field" not in value:
-                raise ValueError(
-                    "DataStatisticsConfig dict payload requires a 'field' key; "
-                    f"got keys={sorted(value)}"
-                )
-            return cls(**value)
-        raise TypeError(
-            "DataStatisticsConfig entries must be a DataStatisticsConfig, "
-            "a column name (str), a tuple/list of column names, or a dict "
-            f"with a 'field' key — got {type(value).__name__}"
+        if isinstance(spec, cls):
+            return spec
+        if not isinstance(spec, str):
+            raise TypeError(
+                f"DataStatistic.parse expects a str, got {type(spec).__name__}"
+            )
+
+        text = spec.strip()
+        if not text:
+            raise ValueError("DataStatistic.parse: empty spec")
+
+        field_text, kpi_text = cls._split_field_and_kpis(text)
+        field_names = cls._parse_field_spec(field_text)
+        kpi_tokens = [tok.strip() for tok in kpi_text.split(",") if tok.strip()]
+        if not kpi_tokens:
+            raise ValueError(
+                f"DataStatistic.parse({spec!r}): no KPI after '.'. "
+                "Example: 'amount.min' or 'amount.min,max,count'."
+            )
+
+        return cls(
+            fields=tuple(field_names),
+            kpis=frozenset(KPI.parse(t) for t in kpi_tokens),
         )
 
     @classmethod
-    def coerce_many(
+    def parse_many(
         cls,
-        values: Iterable[Any] | None,
-    ) -> list["DataStatisticsConfig"] | None:
-        """Normalize an iterable of configs / field names / tuples / dicts.
-
-        Returns ``None`` when *values* is ``None`` (no stats requested).
-        Raises :class:`ValueError` when the same ``field`` key is
-        declared twice — silent last-wins merging would make
-        insertion-strategy bugs hard to trace back. A single-column
-        entry (``"a"``) and a compound-key entry (``("a", "b")``) are
-        considered different targets.
-        """
+        values: "Iterable[DataStatistic | str] | None",
+    ) -> list["DataStatistic"] | None:
+        """Normalize a list of stats (mixed DSL strings / instances)."""
         if values is None:
             return None
-        if isinstance(values, (str, bytes, dict, cls)):
+        if isinstance(values, (str, cls)):
             raise TypeError(
-                "statistics must be a list of DataStatisticsConfig (or dicts / field "
-                f"names / tuples), not a single {type(values).__name__}. Wrap it in a list."
+                "statistics must be a list of DataStatistic / DSL strings, not a "
+                f"single {type(values).__name__}. Wrap it in a list."
             )
 
         try:
             items = list(values)
         except TypeError as e:
-            raise TypeError(
-                "statistics must be an iterable of DataStatisticsConfig entries"
-            ) from e
+            raise TypeError("statistics must be an iterable") from e
 
-        out: list[DataStatisticsConfig] = []
-        seen: set[FieldKey] = set()
+        out: list[DataStatistic] = []
+        seen: set[str] = set()
         for entry in items:
-            cfg = cls.coerce(entry)
-            key = cfg.field
-            if key in seen:
-                raise ValueError(
-                    f"Duplicate statistics entry for field {key!r}. "
-                    "Merge the flags into a single DataStatisticsConfig instead."
+            stat = cls.parse(entry) if isinstance(entry, str) else entry
+            if not isinstance(stat, cls):
+                raise TypeError(
+                    "statistics entries must be DataStatistic or DSL strings, got "
+                    f"{type(entry).__name__}"
                 )
-            seen.add(key)
-            out.append(cfg)
+            if stat.label in seen:
+                raise ValueError(
+                    f"Duplicate statistics entry with label {stat.label!r}. "
+                    "Give the colliding stat a distinct label or merge them."
+                )
+            seen.add(stat.label)
+            out.append(stat)
         return out
+
+    # ------------------------------------------------------------------
+    # DSL helpers (private)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_field_and_kpis(text: str) -> tuple[str, str]:
+        """Split on the last top-level ``.`` (ignoring dots inside parens)."""
+        depth = 0
+        split_at = -1
+        for i, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    raise ValueError(
+                        f"DataStatistic.parse({text!r}): unbalanced ')'"
+                    )
+            elif ch == "." and depth == 0:
+                split_at = i
+        if depth != 0:
+            raise ValueError(
+                f"DataStatistic.parse({text!r}): unbalanced '(' — close it with ')'"
+            )
+        if split_at < 0:
+            raise ValueError(
+                f"DataStatistic.parse({text!r}): missing '.kpi' suffix. "
+                "Example: 'amount.min' or '(year,month).distinct'."
+            )
+        return text[:split_at].strip(), text[split_at + 1:].strip()
+
+    @staticmethod
+    def _parse_field_spec(text: str) -> list[str]:
+        """Parse ``"col"`` or ``"(a, b, c)"`` into a list of names."""
+        if not text:
+            raise ValueError("DataStatistic.parse: empty field spec before '.'")
+        if text.startswith("(") and text.endswith(")"):
+            inner = text[1:-1]
+            names = [n.strip() for n in inner.split(",") if n.strip()]
+            if not names:
+                raise ValueError(
+                    "DataStatistic.parse: empty '()' — name at least one column"
+                )
+            return names
+        if "(" in text or ")" in text or "," in text:
+            raise ValueError(
+                f"DataStatistic.parse({text!r}): mixed parens / commas outside a "
+                "compound-field group. Use '(a,b)' for multi-column specs."
+            )
+        return [text]
