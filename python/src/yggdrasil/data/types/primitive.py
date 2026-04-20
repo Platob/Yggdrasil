@@ -140,6 +140,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PrimitiveType",
     "NullType",
+    "ObjectType",
     "BinaryType",
     "StringType",
     "BooleanType",
@@ -401,6 +402,154 @@ class NullType(PrimitiveType):
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> None:
         return None
+
+
+@dataclass(frozen=True)
+class ObjectType(DataType):
+    """Variant type — opaque Python object with no fixed schema.
+
+    The catch-all for values that don't map cleanly to any structured or
+    primitive type. Cast operations against ObjectType are no-ops: the
+    input passes through untouched, which is what you want for a variant
+    column carrying heterogeneous data.
+
+    Engine mapping:
+    - Polars: ``pl.Object``
+    - pandas: ``object`` dtype
+    - Arrow: ``large_binary()`` (physical stand-in; Arrow has no variant type)
+    - Spark:  ``BinaryType()`` (physical stand-in)
+    """
+
+    @property
+    def type_id(self) -> DataTypeId:
+        return DataTypeId.OBJECT
+
+    @property
+    def children_fields(self) -> list["Field"]:
+        return []
+
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        return False
+
+    @classmethod
+    def from_arrow_type(cls, dtype: pa.DataType) -> "ObjectType":
+        raise TypeError(
+            f"Cannot infer ObjectType from Arrow type {dtype!r}. "
+            "Arrow has no native object type. Create ObjectType() explicitly, "
+            "or use DataType.from_arrow_type() for standard Arrow types."
+        )
+
+    def to_arrow(self) -> pa.DataType:
+        return pa.large_binary()
+
+    @classmethod
+    def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
+        pl = get_polars()
+        return dtype == pl.Object
+
+    @classmethod
+    def from_polars_type(cls, dtype: "polars.DataType") -> "ObjectType":
+        if not cls.handles_polars_type(dtype):
+            raise TypeError(
+                f"Expected Polars Object dtype, got {dtype!r}. "
+                "Use DataType.from_polars_type() for standard Polars types."
+            )
+        return cls()
+
+    def to_polars(self) -> "polars.DataType":
+        pl = get_polars()
+        return pl.Object
+
+    @classmethod
+    def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
+        return False
+
+    @classmethod
+    def from_spark_type(cls, dtype: "pst.DataType") -> "ObjectType":
+        raise TypeError(
+            f"Cannot infer ObjectType from Spark type {dtype!r}. "
+            "Spark has no native object type. Create ObjectType() explicitly."
+        )
+
+    def to_spark(self) -> Any:
+        spark = get_spark_sql()
+        return spark.types.BinaryType()
+
+    def to_databricks_ddl(self) -> str:
+        return "BINARY"
+
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        type_id = value.get("id")
+        if type_id == int(DataTypeId.OBJECT):
+            return True
+        name = str(value.get("name", "")).upper()
+        return name == "OBJECT"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ObjectType":
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": int(DataTypeId.OBJECT),
+            "name": DataTypeId.OBJECT.name,
+        }
+
+    def _merge_with_same_id(
+        self,
+        other: "DataType",
+        mode: SaveMode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ) -> "ObjectType":
+        return self
+
+    # Variant target: never touch the values.
+    def _cast_arrow_array(self, array: pa.Array, options: "CastOptions") -> pa.Array:
+        return array
+
+    def _cast_chunked_array(
+        self, array: pa.ChunkedArray, options: "CastOptions"
+    ) -> pa.ChunkedArray:
+        return array
+
+    def _cast_polars_series(self, series: "polars.Series", options: "CastOptions"):
+        return series
+
+    def _cast_polars_expr(self, expr: Any, options: "CastOptions"):
+        return expr
+
+    def _cast_pandas_series(self, series: Any, options: "CastOptions"):
+        return series
+
+    def _cast_spark_column(self, column: Any, options: "CastOptions"):
+        return column
+
+    def default_pyobj(self, nullable: bool) -> Any:
+        if nullable:
+            return None
+        raise NotImplementedError(
+            "ObjectType.default_pyobj(nullable=False) is not supported. "
+            "Object types represent opaque Python objects with no universal "
+            "non-null default. Use nullable=True or convert to a more "
+            "specific type first."
+        )
+
+    def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
+        if nullable:
+            return pa.scalar(None, type=pa.large_binary())
+        raise NotImplementedError(
+            "ObjectType.default_arrow_scalar(nullable=False) is not supported. "
+            "Convert to a more specific type first."
+        )
+
+    def __repr__(self) -> str:
+        return "ObjectType()"
+
+    def __str__(self) -> str:
+        return "object"
 
 
 @dataclass(frozen=True)

@@ -661,30 +661,18 @@ class _Parser:
                 )
             return ParsedDataType(type_id=DataTypeId.DICTIONARY)
 
-        if dtype is DataTypeId.GEOGRAPHY:
-            if self._peek_any_generic_open():
-                args = self._parse_geography_args()
-                return ParsedDataType(
-                    type_id=DataTypeId.GEOGRAPHY,
-                    metadata=DataTypeMetadata(args=tuple(args)),
-                )
-            return ParsedDataType(type_id=DataTypeId.GEOGRAPHY)
-
-        if dtype is DataTypeId.EXTENSION or dtype is None:
+        if dtype is None:
+            # Unknown identifier (e.g. a dataclass forward-ref string like
+            # "dt.datetime"). Treat as opaque OBJECT and keep the original
+            # name on the parsed metadata so callers can still see it.
             if self._peek_any_generic_open():
                 open_tok = self._advance()
                 close_char = _matching_close(open_tok.value)
-                args = tuple(self._parse_scalar_items(close_char))
-                return ParsedDataType(
-                    type_id=DataTypeId.EXTENSION,
-                    metadata=DataTypeMetadata(
-                        name=raw_name,
-                        args=args,
-                    ),
-                    name=raw_name,
-                )
+                # Drain the bracketed payload so the outer tokenstream stays
+                # balanced; we don't carry the args forward.
+                self._parse_scalar_items(close_char)
             return ParsedDataType(
-                type_id=DataTypeId.EXTENSION,
+                type_id=DataTypeId.OBJECT,
                 metadata=DataTypeMetadata(name=raw_name),
                 name=raw_name,
             )
@@ -874,73 +862,6 @@ class _Parser:
         open_tok = self._expect_any_generic_open()
         close_char = _matching_close(open_tok.value)
         return self._parse_scalar_items(close_char)
-
-    def _parse_geography_args(self) -> list[object]:
-        """Parse geography-specific args like ``(OGC:CRS84, SPHERICAL)``.
-
-        Handles compound identifiers joined by ``:`` (e.g. ``OGC:CRS84``)
-        that the generic scalar parser would choke on, since ``:`` is
-        normally a punctuation token.
-        """
-        open_tok = self._expect_any_generic_open()
-        close_char = _matching_close(open_tok.value)
-        items: list[object] = []
-
-        if self._peek_punct(close_char):
-            self._advance()
-            return items
-
-        while True:
-            items.append(self._parse_geography_arg())
-            if self._peek_punct(","):
-                self._advance()
-                continue
-            break
-
-        self._expect_punct(close_char)
-        return items
-
-    def _parse_geography_arg(self) -> object:
-        """Parse a single geography arg, joining ``ident:ident`` into one string."""
-        tok = self._current()
-        if tok is None:
-            return self._fail("Unexpected end of geography args")
-
-        if tok.kind == "number":
-            self._advance()
-            return _parse_number(tok.value)
-
-        if tok.kind == "string":
-            self._advance()
-            return tok.value
-
-        if tok.kind == "ident":
-            # Consume the identifier and any colon-separated continuations
-            # so OGC:CRS84 becomes the single string "OGC:CRS84".
-            self._advance()
-            parts = [tok.value]
-            while self._peek_punct(":"):
-                self._advance()  # consume ':'
-                nxt = self._current()
-                if nxt is not None and nxt.kind in ("ident", "number"):
-                    self._advance()
-                    parts.append(nxt.value)
-                else:
-                    # Trailing colon with nothing after — just keep what we have.
-                    parts.append("")
-                    break
-            compound = ":".join(parts) if len(parts) > 1 else parts[0]
-
-            low = compound.lower()
-            if low == "true":
-                return True
-            if low == "false":
-                return False
-            if low in {"none", "null", "nil"}:
-                return None
-            return compound
-
-        return self._fail(f"Unexpected token in geography args: {tok.value!r}")
 
     def _parse_metadata(self, close_char: str) -> DataTypeMetadata:
         items: list[tuple[str | None, object]] = []
@@ -1431,14 +1352,6 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
         "literal": ("literal", DataTypeId.ENUM),
         "dictionary": ("dictionary", DataTypeId.DICTIONARY),
         "categorical": ("dictionary", DataTypeId.DICTIONARY),
-        "geography": ("geography", DataTypeId.GEOGRAPHY),
-        "geo": ("geography", DataTypeId.GEOGRAPHY),
-        "geozone": ("geography", DataTypeId.GEOGRAPHY),
-        "geolocation": ("geography", DataTypeId.GEOGRAPHY),
-        "udd": ("udd", DataTypeId.EXTENSION),
-        "user_defined": ("udd", DataTypeId.EXTENSION),
-        "user_defined_datatype": ("udd", DataTypeId.EXTENSION),
-        "custom": ("udd", DataTypeId.EXTENSION),
         "optional": ("optional", None),
         "annotated": ("annotated", None),
     }
