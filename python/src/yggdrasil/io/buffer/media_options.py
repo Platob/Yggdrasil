@@ -8,9 +8,10 @@ fields defined here are shared across all formats.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 from yggdrasil.data.cast.options import CastOptions, CastOptionsArg
+from yggdrasil.data.statistics import DataStatisticsConfig
 
 from ..enums.save_mode import SaveMode
 
@@ -39,6 +40,11 @@ class MediaOptions:
     mode: SaveMode = SaveMode.AUTO
     match_by: Sequence[str] | None = None
 
+    # Per-field KPI capture plan, consumed by SQL-engine insertion planners
+    # (and anyone else who needs min/max/count/… while data is in flight).
+    # ``None`` means "don't bother" — cheap default for the hot read path.
+    statistics: list[DataStatisticsConfig] | None = None
+
     def __post_init__(self) -> None:
         """Normalize and validate all fields in-place."""
         self.columns = self._normalize_columns(self.columns)
@@ -50,6 +56,7 @@ class MediaOptions:
         self.batch_size = self._normalize_batch_size(self.batch_size)
         self.mode = SaveMode.parse(self.mode, default=SaveMode.AUTO)
         self.match_by = self._normalize_match_by(self.match_by)
+        self.statistics = self._normalize_statistics(self.statistics)
 
         self._validate_subclass_fields()
 
@@ -70,6 +77,7 @@ class MediaOptions:
         lazy: bool | Any = ...,
         raise_error: bool | Any = ...,
         batch_size: int | None | Any = ...,
+        statistics: "Iterable[DataStatisticsConfig | dict | str] | None | Any" = ...,
         **kwargs: Any,
     ) -> MediaOptions:
         base = cls._coerce_options(options)
@@ -83,6 +91,7 @@ class MediaOptions:
             lazy=lazy,
             raise_error=raise_error,
             batch_size=batch_size,
+            statistics=statistics,
             **kwargs,
         )
 
@@ -179,6 +188,20 @@ class MediaOptions:
             raise TypeError(f"match_by must contain only str, found: {bad[:3]}")
 
         return tuple(items)
+
+    @staticmethod
+    def _normalize_statistics(
+        value: "Iterable[DataStatisticsConfig | dict | str] | None",
+    ) -> list[DataStatisticsConfig] | None:
+        """Delegate to :meth:`DataStatisticsConfig.coerce_many`.
+
+        Accepts ``None`` (no stats), a list of
+        :class:`DataStatisticsConfig`, plain field-name strings, or dict
+        payloads. Returns a deduped list; raises on a single
+        non-iterable input or duplicate ``field`` names so the caller
+        notices bad config early.
+        """
+        return DataStatisticsConfig.coerce_many(value)
 
     def _validate_subclass_fields(self) -> None:
         """Validate optional subclass fields when present."""
