@@ -17,11 +17,17 @@ use pyo3::prelude::*;
 
 pub mod base;
 pub mod id;
+pub mod nested;
+pub mod object;
 pub mod primitive;
+pub mod temporal;
 
 pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     id::register(py, module)?;
     base::register(py, module)?;
     primitive::register(py, module)?;
+    object::register(py, module)?;
+    temporal::register(py, module)?;
+    nested::register(py, module)?;
     Ok(())
 }
