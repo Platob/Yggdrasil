@@ -1387,6 +1387,108 @@ class MediaIO(ABC, Generic[O]):
         df = _pl.from_arrow(tb, rechunk=False)
         return df.lazy() if resolved.lazy else df
 
+    def write_polars_frames(
+        self,
+        frames: Iterable["polars.DataFrame | polars.LazyFrame"],
+        *,
+        options: O | None = None,
+        mode: "SaveMode | str | None | Any" = ...,
+        match_by: "Sequence[str] | str | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        use_threads: "bool | Any" = ...,
+        raise_error: "bool | Any" = ...,
+        **option_kwargs,
+    ) -> None:
+        """Write an iterable of Polars frames to the buffer, streaming batches.
+
+        The frames are consumed one at a time and each is converted to
+        Arrow record batches that are fed directly into the format-specific
+        writer. Peak memory stays bounded by the largest single frame
+        rather than the concatenation of all of them, which makes this the
+        right entry point for pipelines that produce many Polars chunks
+        (e.g. a generator over database pages, a ``LazyFrame`` streamed
+        through ``collect`` per partition) and would OOM if collected
+        first.
+
+        ``LazyFrame`` inputs are collected lazily — one at a time as the
+        iterator advances — so an iterable of lazy frames never materializes
+        more than one partition at once.
+
+        :attr:`SaveMode.APPEND` and :attr:`SaveMode.UPSERT` require the
+        union with the existing buffer contents, so those modes fall back
+        to materializing the incoming stream before merging; all other
+        modes stream end-to-end.
+
+        Parameters
+        ----------
+        frames:
+            Any iterable (list, tuple, generator, …) whose items are
+            :class:`polars.DataFrame` or :class:`polars.LazyFrame`.
+        options:
+            Pre-built options instance, or ``None`` for defaults.
+        mode:
+            Write disposition when the buffer is non-empty.
+        match_by:
+            Identity columns used when *mode* is :attr:`SaveMode.UPSERT`.
+        cast:
+            Arrow cast configuration applied before encode (per batch).
+        use_threads:
+            Enable parallel encode where supported.
+        raise_error:
+            Control whether cast failures propagate.
+        **option_kwargs:
+            Format-specific write knobs forwarded to :meth:`check_options`.
+        """
+        from yggdrasil.polars.lib import polars as _pl
+
+        resolved = self.check_options(
+            options=options,
+            mode=mode,
+            match_by=match_by,
+            cast=cast,
+            use_threads=use_threads,
+            raise_error=raise_error,
+            **option_kwargs,
+        )
+
+        if self.skip_write(mode=resolved.mode):
+            return
+
+        columns = resolved.columns
+
+        def _frame_to_arrow(frame: Any) -> "pyarrow.Table":
+            if isinstance(frame, _pl.LazyFrame):
+                frame = frame.collect()
+            if columns is not None:
+                keep = [c for c in columns if c in frame.columns]
+                frame = frame.select(keep)
+            return frame.rechunk().to_arrow()
+
+        def arrow_tables() -> Iterator["pyarrow.Table"]:
+            for frame in frames:
+                yield _frame_to_arrow(frame)
+
+        if resolved.mode in (SaveMode.APPEND, SaveMode.UPSERT):
+            tables = list(arrow_tables())
+            if not tables:
+                incoming = pa.table({})
+            elif len(tables) == 1:
+                incoming = tables[0]
+            else:
+                incoming = pa.concat_tables(tables, promote_options="default")
+
+            existing = self._read_existing_table()
+            incoming = self._apply_save_mode(
+                existing,
+                incoming,
+                mode=resolved.mode,
+                match_by=resolved.match_by,
+            )
+            self._write_single_table(incoming, resolved)
+            return
+
+        self._write_batches_iterable(arrow_tables(), options=resolved)
+
     def write_polars_frame(
         self,
         frame: "polars.DataFrame | polars.LazyFrame",

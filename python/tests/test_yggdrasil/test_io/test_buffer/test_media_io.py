@@ -1741,3 +1741,164 @@ class TestWritePolarsNative:
         mio.write_polars_frame(df)
         table = mio.read_arrow_table()
         assert table.num_rows == 3
+
+
+# ===================================================================
+# write_polars_frames — iterator-based streaming writer
+# ===================================================================
+
+class TestWritePolarsFrames:
+    """Exercise ``MediaIO.write_polars_frames`` end-to-end.
+
+    Streams an iterable of Polars frames into the buffer as Arrow record
+    batches, avoiding materializing all frames at once. Covers native
+    Parquet/IPC/CSV/TSV/JSON writers, Arrow-path fallback formats, codec
+    wrapping, generator inputs, LazyFrame inputs, and save-mode merging.
+    """
+
+    @staticmethod
+    def _pl():
+        from yggdrasil.polars.lib import polars as _pl
+        return _pl
+
+    def _chunks(self):
+        pl = self._pl()
+        return [
+            pl.DataFrame({"a": [1, 2], "b": ["x", "y"]}),
+            pl.DataFrame({"a": [3, 4], "b": ["z", "w"]}),
+            pl.DataFrame({"a": [5], "b": ["q"]}),
+        ]
+
+    @pytest.mark.parametrize(
+        "mime",
+        [
+            MimeTypes.PARQUET,
+            MimeTypes.ARROW_IPC,
+            MimeTypes.CSV,
+            MimeTypes.TSV,
+            MimeTypes.JSON,
+            MimeTypes.NDJSON,
+            MimeTypes.XML,
+        ],
+    )
+    def test_roundtrip_across_formats(self, mime):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, mime)
+        mio.write_polars_frames(self._chunks())
+        table = mio.read_arrow_table()
+        assert table.num_rows == 5
+        assert set(table.column_names) == {"a", "b"}
+        assert table.column("a").to_pylist() == [1, 2, 3, 4, 5]
+        assert table.column("b").to_pylist() == ["x", "y", "z", "w", "q"]
+
+    def test_accepts_generator_and_consumes_lazily(self):
+        pl = self._pl()
+        call_count = {"n": 0}
+
+        def gen():
+            for i in range(3):
+                call_count["n"] += 1
+                yield pl.DataFrame({"a": [i], "b": [str(i)]})
+
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frames(gen())
+        assert call_count["n"] == 3
+        result = mio.read_pylist()
+        assert result == [{"a": 0, "b": "0"}, {"a": 1, "b": "1"}, {"a": 2, "b": "2"}]
+
+    def test_lazyframe_inputs_are_collected_per_chunk(self):
+        pl = self._pl()
+        frames = [
+            pl.DataFrame({"a": [1]}).lazy().with_columns((pl.col("a") * 10).alias("b")),
+            pl.DataFrame({"a": [2]}).lazy().with_columns((pl.col("a") * 10).alias("b")),
+        ]
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frames(frames)
+        assert mio.read_pylist() == [{"a": 1, "b": 10}, {"a": 2, "b": 20}]
+
+    def test_empty_iterable_writes_empty_payload(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frames(iter([]))
+        table = mio.read_arrow_table()
+        assert table.num_rows == 0
+
+    def test_single_frame_roundtrip(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frames([pl.DataFrame({"a": [7, 8]})])
+        assert mio.read_pylist() == [{"a": 7}, {"a": 8}]
+
+    def test_gzip_codec_roundtrip(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MediaType(MimeTypes.PARQUET, codec=GZIP))
+        mio.write_polars_frames(self._chunks())
+        assert buf.to_bytes()[:2] == b"\x1f\x8b"
+        table = mio.read_arrow_table()
+        assert table.num_rows == 5
+
+    def test_columns_projection_is_applied(self):
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frames(
+            self._chunks(),
+            options=ParquetOptions(columns=["a"]),
+        )
+        table = mio.read_arrow_table()
+        assert table.column_names == ["a"]
+        assert table.column("a").to_pylist() == [1, 2, 3, 4, 5]
+
+    def test_append_merges_with_existing_buffer(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        mio.write_polars_frames(
+            [pl.DataFrame({"x": [2]}), pl.DataFrame({"x": [3, 4]})],
+            options=ParquetOptions(mode="append"),
+        )
+        assert mio.read_pylist() == [{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}]
+
+    def test_upsert_across_chunked_incoming(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(
+            pl.DataFrame({"id": [1, 2, 3], "v": [10, 20, 30]})
+        )
+        mio.write_polars_frames(
+            [
+                pl.DataFrame({"id": [2], "v": [99]}),
+                pl.DataFrame({"id": [3, 4], "v": [100, 40]}),
+            ],
+            options=ParquetOptions(mode="upsert", match_by=["id"]),
+        )
+        rows = {r["id"]: r["v"] for r in mio.read_pylist()}
+        assert rows == {1: 10, 2: 99, 3: 100, 4: 40}
+
+    def test_ignore_mode_leaves_existing_buffer_untouched(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        original = buf.to_bytes()
+        mio.write_polars_frames(
+            [pl.DataFrame({"x": [2]})],
+            options=ParquetOptions(mode="ignore"),
+        )
+        assert buf.to_bytes() == original
+        assert mio.read_pylist() == [{"x": 1}]
+
+    def test_error_if_exists_raises_on_nonempty_buffer(self):
+        pl = self._pl()
+        buf = BytesIO()
+        mio = MediaIO.make(buf, MimeTypes.PARQUET)
+        mio.write_polars_frame(pl.DataFrame({"x": [1]}))
+        with pytest.raises(IOError):
+            mio.write_polars_frames(
+                [pl.DataFrame({"x": [2]})],
+                options=ParquetOptions(mode="error_if_exists"),
+            )
