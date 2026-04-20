@@ -279,9 +279,6 @@ class DatabricksClient(URLResource):
         if not self._was_connected:
             self.close()
 
-    def __del__(self):
-        self.close()
-
     # -------------------------------------------------------------------------
     # Connection lifecycle
     # -------------------------------------------------------------------------

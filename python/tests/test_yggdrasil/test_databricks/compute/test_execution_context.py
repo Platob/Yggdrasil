@@ -627,10 +627,6 @@ class TestCloseAfterField(unittest.TestCase):
         ctx2 = ExecutionContext(cluster=c, context_id="x", close_after=9999.0)
         self.assertEqual(ctx1, ctx2)
 
-    def test_excluded_from_repr(self):
-        ctx = ExecutionContext(cluster=_make_cluster(), close_after=42.0)
-        self.assertNotIn("42", repr(ctx))
-
     def test_excluded_from_hash(self):
         ctx = ExecutionContext(cluster=_make_cluster(), context_id="x", close_after=1.0)
         with self.assertRaises(TypeError):

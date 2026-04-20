@@ -1586,7 +1586,7 @@ class MediaIO(ABC, Generic[O]):
                 ),
                 compression_level=getattr(options, "compression_level", None),
                 statistics=getattr(options, "use_statistics", True),
-                use_pyarrow=False,
+                use_pyarrow=True,
             )
             return buf.getvalue()
 

@@ -787,7 +787,7 @@ class DataType(BaseChildrenFields, ABC):
         except Exception:
             pl = get_polars()
             arrow = self._cast_arrow_array(
-                series.to_arrow(compat_level=polars.CompatLevel.newest()),
+                series.to_arrow(compat_level=pl.CompatLevel.newest()),
                 options,
             )
             casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
@@ -1525,6 +1525,13 @@ class DataType(BaseChildrenFields, ABC):
         for subclass in cls.__subclasses__():
             if subclass.handles_polars_type(dtype):
                 return subclass.from_polars_type(dtype)
+
+        from .primitive import StringType
+
+        pl = get_polars()
+        if dtype == pl.Categorical():
+            return StringType()
+
         raise TypeError(f"Unsupported Polars data type: {dtype!r}")
 
     @classmethod
@@ -1859,10 +1866,7 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None:
             default_scalar = self.default_spark_scalar(nullable=nullable)
 
-        if default_scalar is None or self.type_id == (
-            DataTypeId.NULL,
-            DataTypeId.MAP, DataTypeId.ARRAY, DataTypeId.STRUCT
-        ):
+        if default_scalar is None or default_scalar == {}:
             return column
 
         return (

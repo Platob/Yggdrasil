@@ -123,12 +123,6 @@ class BytesIO(io.RawIOBase):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
     def __getstate__(self):
         if self.size > 1024 * 1024:
             from yggdrasil.io import ZSTD

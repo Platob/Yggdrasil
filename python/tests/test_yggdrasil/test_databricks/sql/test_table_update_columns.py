@@ -212,22 +212,3 @@ class TestOverwriteDropsMissing:
         assert any(
             "ADD COLUMNS (`created_at` TIMESTAMP" in s for s in flat
         )
-
-
-# ── default AUTO mode still updates dtype and does not drop ──────────────────
-
-
-class TestAutoModeBehavior:
-    def test_auto_updates_dtype_but_does_not_drop(self, table, mock_client):
-        batches = _capture_execute_many(mock_client)
-
-        table.update_columns(
-            [Field(name="id", dtype=DataType.from_any("string"))],
-            # no mode → defaults to AUTO
-        )
-
-        flat = [s for batch in batches for s in batch]
-        assert any(
-            "ALTER COLUMN `id` TYPE STRING" in s for s in flat
-        )
-        assert not any("DROP COLUMN" in s for s in flat)

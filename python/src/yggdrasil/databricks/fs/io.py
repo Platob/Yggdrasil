@@ -114,13 +114,6 @@ class DatabricksIO(ABC, IO):
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
-    def __del__(self):
-        if self._need_flush():
-            try:
-                Thread(target=self.close).start()
-            except BaseException:
-                pass
-
     # ── Dunder helpers ────────────────────────────────────────────────
 
     def __next__(self):

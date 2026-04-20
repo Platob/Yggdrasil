@@ -201,6 +201,7 @@ class StagingPath:
         max_lifetime: float | None = 3600,
         start_ts: int | None = None,
         token: str | None = None,
+        owned: bool = True
     ) -> "StagingPath":
         """Build an engine-owned staging path under the ``tmp/.sql`` tree."""
         catalog = cls._clean_part(catalog_name)
@@ -235,7 +236,7 @@ class StagingPath:
             start_ts=start,
             end_ts=end,
             token=rnd,
-            owned=True,
+            owned=owned,
         )
 
     @classmethod

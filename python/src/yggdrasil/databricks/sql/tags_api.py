@@ -11,13 +11,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from databricks.sdk.errors import NotFound
+from databricks.sdk.errors import NotFound, DatabricksError
 from databricks.sdk.service.catalog import EntityTagAssignment
 
 from .sql_utils import _safe_str
 
 if TYPE_CHECKING:
-    from .table import Table
+    pass
 
 __all__ = [
     "apply_tags",
@@ -90,15 +90,23 @@ def apply_tags(
     api = _tags_api(client)
     written: list[EntityTagAssignment] = []
     for key, val in _iter_tag_pairs(tags):
-        written.append(
-            api.create(
-                tag_assignment=EntityTagAssignment(
-                    entity_type=entity_type,
-                    entity_name=entity_name,
-                    tag_key=key,
-                    tag_value=val,
-                )
+        stmt = EntityTagAssignment(
+            entity_type=entity_type,
+            entity_name=entity_name,
+            tag_key=key,
+            tag_value=val,
+        )
+        try:
+            result = api.create(tag_assignment=stmt)
+        except DatabricksError:
+            logger.warning(
+                "Failed to apply tag %r=%r to %s %r",
+                key, val, entity_type, entity_name, exc_info=True,
             )
+            result = stmt  # best effort: return the intended assignment even on failure
+
+        written.append(
+            result
         )
     return written
 

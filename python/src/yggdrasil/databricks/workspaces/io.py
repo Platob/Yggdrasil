@@ -75,13 +75,6 @@ class DatabricksIO(ABC, IO):
         """Exit the context manager and close the buffer."""
         self.close()
 
-    def __del__(self):
-        if self._need_flush():
-            try:
-                Thread(target=self.close).start()
-            except BaseException:
-                pass
-
     def __next__(self):
         """Iterate over lines in the file."""
         line = self.readline()
