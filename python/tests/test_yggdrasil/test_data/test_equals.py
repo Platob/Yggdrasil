@@ -23,7 +23,6 @@ import unittest
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.types.extensions.obj import ObjectType
 from yggdrasil.data.types.nested import ArrayType, MapType, StructType
 from yggdrasil.data.types.primitive import (
     BinaryType,
@@ -34,6 +33,7 @@ from yggdrasil.data.types.primitive import (
     FloatingPointType,
     IntegerType,
     NullType,
+    ObjectType,
     StringType,
     TimestampType,
 )

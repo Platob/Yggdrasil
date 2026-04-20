@@ -566,33 +566,17 @@ class DataType(BaseChildrenFields, ABC):
             return StringType()
 
         if parsed.type_id == DataTypeId.OBJECT:
-            from .extensions.obj import ObjectType
+            # Unknown forward-ref names (e.g. dataclass annotations like
+            # "dt.datetime" under `from __future__ import annotations`) come
+            # through as OBJECT with the original token kept in `name`.
+            # String is the safer round-trip target; reserve ObjectType for
+            # the explicit `object` / `any` / `variant` aliases that arrive
+            # without a carried name.
+            if parsed.name:
+                return StringType()
+            from .primitive import ObjectType
 
             return ObjectType()
-
-        if parsed.type_id == DataTypeId.GEOGRAPHY:
-            from .extensions.geography import GeographyType, _normalize_srid
-
-            srid_arg = meta.args[0] if meta.args else None
-            model_arg = meta.args[1] if len(meta.args) >= 2 else None
-            model = str(model_arg).upper() if model_arg is not None else None
-            return GeographyType(
-                srid=_normalize_srid(srid_arg),
-                model=model,
-            )
-
-        if parsed.type_id == DataTypeId.EXTENSION:
-            # If extension metadata carries a name, try to resolve it from the
-            # registry.  Otherwise, fall through to StringType — we can't do
-            # much without knowing which extension is involved.
-            ext_name = getattr(meta, "extension_name", None) or ""
-            if ext_name:
-                from .extensions.base import _EXTENSION_REGISTRY
-
-                target_cls = _EXTENSION_REGISTRY.get(ext_name)
-                if target_cls is not None:
-                    return target_cls()
-            return StringType()
 
         raise TypeError(f"Unsupported parsed data type: {parsed!r}")
 
@@ -1159,7 +1143,7 @@ class DataType(BaseChildrenFields, ABC):
             return StringType()
 
         if hint is object:
-            from .extensions.obj import ObjectType
+            from .primitive import ObjectType
 
             return ObjectType()
 

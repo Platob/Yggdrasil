@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import schema
-from yggdrasil.data.types.extensions.geography import GeographyType
 from yggdrasil.data.types.nested import ArrayType, MapType, StructType
 from yggdrasil.data.types.primitive import (
     BinaryType,
@@ -80,13 +79,6 @@ def test_nested_autotag_is_just_kind():
     assert StructType(fields=[Field("a", IntegerType(byte_size=8))]).autotag() == {
         b"kind": b"struct",
     }
-
-
-def test_geography_autotag_carries_srid_and_model():
-    tags = GeographyType(srid=4326, model="SPHERICAL").autotag()
-    assert tags[b"kind"] == b"geography"
-    assert tags[b"srid"] == b"4326"
-    assert tags[b"model"] == b"SPHERICAL"
 
 
 def test_field_autotag_sets_nullable_and_returns_self():

@@ -26,9 +26,6 @@ class DataTypeId(IntEnum):
     STRUCT = 34
     UNION = 35
 
-    EXTENSION = 64
     DICTIONARY = 65
     JSON = 66
     ENUM = 67
-    GEOGRAPHY = 68
-

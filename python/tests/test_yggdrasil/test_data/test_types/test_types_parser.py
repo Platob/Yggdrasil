@@ -794,37 +794,28 @@ class TestParserEdgeCases(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unexpected trailing tokens"):
             ParsedDataType.parse("int garbage")
 
-    def test_unknown_type_becomes_udd(self):
+    def test_unknown_type_falls_back_to_object(self):
         self.assertEqual(
             ParsedDataType.parse("my_custom_type"),
             ParsedDataType(
-                DataTypeId.EXTENSION,
+                DataTypeId.OBJECT,
                 DataTypeMetadata(name="my_custom_type"),
                 name="my_custom_type",
             ),
         )
 
-    def test_unknown_type_recursive_becomes_udd(self):
-        # geography is now a first-class type with DataTypeId.GEOGRAPHY.
-        self.assertEqual(
-            ParsedDataType.parse("geography(point, 4326)"),
-            ParsedDataType(
-                DataTypeId.GEOGRAPHY,
-                DataTypeMetadata(args=("point", 4326)),
-            ),
-        )
-
     def test_unknown_nested_type_in_map(self):
         self.assertEqual(
-            ParsedDataType.parse("map<string, geography(point, 4326)>"),
+            ParsedDataType.parse("map<string, my_custom_type(point, 4326)>"),
             ParsedDataType(
                 DataTypeId.MAP,
                 DataTypeMetadata(),
                 children=(
                     ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
                     ParsedDataType(
-                        DataTypeId.GEOGRAPHY,
-                        DataTypeMetadata(args=("point", 4326)),
+                        DataTypeId.OBJECT,
+                        DataTypeMetadata(name="my_custom_type"),
+                        name="my_custom_type",
                     ),
                 ),
             ),
@@ -849,7 +840,7 @@ class TestParserTypeIdMatrix(unittest.TestCase):
             ("struct<a:int>", DataTypeId.STRUCT),
             ("json", DataTypeId.JSON),
             ("enum('a')", DataTypeId.ENUM),
-            ("custom_type", DataTypeId.EXTENSION),
+            ("object", DataTypeId.OBJECT),
         ]
         for expr, expected in cases:
             with self.subTest(expr=expr):

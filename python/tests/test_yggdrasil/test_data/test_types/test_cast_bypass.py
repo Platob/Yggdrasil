@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.data.data_field import Field
-from yggdrasil.data.types.extensions.obj import ObjectType
 from yggdrasil.data.types.nested import StructType
 from yggdrasil.data.types.primitive import (
     IntegerType,
     NullType,
+    ObjectType,
     StringType,
 )
 from yggdrasil.pandas.tests import PandasTestCase

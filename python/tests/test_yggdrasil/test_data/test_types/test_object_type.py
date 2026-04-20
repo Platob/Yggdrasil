@@ -25,9 +25,8 @@ import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.data.types.base import DataType
-from yggdrasil.data.types.extensions.obj import ObjectType
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.primitive import NullType, StringType
+from yggdrasil.data.types.primitive import NullType, ObjectType, StringType
 from yggdrasil.polars.tests import PolarsTestCase
 
 # ---------------------------------------------------------------------------
