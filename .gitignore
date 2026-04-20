@@ -212,3 +212,7 @@ __marimo__/
 /csharp/Yggdrasil/*/obj/
 /csharp/Yggdrasil/YGGXLAddin/.vs/
 /csharp/Yggdrasil/packages/
+
+# Rust
+/rust/Cargo.lock
+/rust/target/
