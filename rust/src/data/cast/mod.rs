@@ -14,6 +14,7 @@
 /// casts are the hot path, nested/engine dispatch stays in Python.
 use pyo3::prelude::*;
 
+pub mod arrow;
 pub mod options;
 pub mod primitive;
 pub mod registry;
@@ -21,6 +22,7 @@ pub mod registry;
 pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     options::register(py, module)?;
     registry::register(py, module)?;
+    arrow::register(py, module)?;
     primitive::install_defaults();
     Ok(())
 }

@@ -13,6 +13,7 @@ use pyo3::types::PyDict;
 
 use super::base::{self, DataTypeImpl, PyDataType};
 use super::id::{DataTypeId, PyDataTypeId};
+use crate::data::engine;
 
 fn validate_unit(unit: &str, allow_day: bool) -> PyResult<()> {
     match unit {
@@ -109,6 +110,12 @@ impl PyDateType {
     fn to_databricks_ddl(&self) -> &'static str {
         "DATE"
     }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::date_to_arrow(self))
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::date_to_polars(self))
+    }
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -166,6 +173,14 @@ impl PyTimeType {
     }
     fn to_databricks_ddl(&self) -> &'static str {
         "TIMESTAMP_NTZ"
+    }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::time_to_arrow(self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::time_to_polars(self)?;
+        engine::polars_type_to_py(py, &dt)
     }
     fn __repr__(&self) -> String {
         base::repr_str(self)
@@ -228,6 +243,14 @@ impl PyTimestampType {
             None => "TIMESTAMP_NTZ",
         }
     }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::timestamp_to_arrow(self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::timestamp_to_polars(self)?;
+        engine::polars_type_to_py(py, &dt)
+    }
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -283,6 +306,14 @@ impl PyDurationType {
     }
     fn to_databricks_ddl(&self) -> &'static str {
         "INTERVAL"
+    }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::duration_to_arrow(self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::duration_to_polars(self)?;
+        engine::polars_type_to_py(py, &dt)
     }
     fn __repr__(&self) -> String {
         base::repr_str(self)

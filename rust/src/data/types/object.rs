@@ -9,6 +9,7 @@ use pyo3::types::PyDict;
 
 use super::base::{self, DataTypeImpl, PyDataType};
 use super::id::{DataTypeId, PyDataTypeId};
+use crate::data::engine;
 
 #[pyclass(module = "yggdrasil.rust.data.types", extends = PyDataType, frozen, eq, hash, name = "ObjectType")]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -43,6 +44,12 @@ impl PyObjectType {
     }
     fn to_databricks_ddl(&self) -> &'static str {
         "BINARY"
+    }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::object_to_arrow(self))
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::object_to_polars(self))
     }
     fn __repr__(&self) -> String {
         base::repr_str(self)

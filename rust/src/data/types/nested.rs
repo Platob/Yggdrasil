@@ -8,6 +8,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use super::base::{self, DataTypeImpl, PyDataType};
 use super::id::{DataTypeId, PyDataTypeId};
+use crate::data::engine;
 use crate::data::field::PyDataField;
 
 /// Build a default item-field for nested types whose user doesn't care
@@ -122,6 +123,14 @@ impl PyArrayType {
         let inner = databricks_ddl_of(py, &self.item_field)?;
         Ok(format!("ARRAY<{inner}>"))
     }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::array_to_arrow(py, self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::array_to_polars(py, self)?;
+        engine::polars_type_to_py(py, &dt)
+    }
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -228,6 +237,14 @@ impl PyMapType {
         let v = databricks_ddl_of(py, &self.value_field)?;
         Ok(format!("MAP<{k}, {v}>"))
     }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::map_to_arrow(py, self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::map_to_polars(py, self)?;
+        engine::polars_type_to_py(py, &dt)
+    }
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -320,6 +337,14 @@ impl PyStructType {
             parts.push(format!("{name}: {inner}"));
         }
         Ok(format!("STRUCT<{}>", parts.join(", ")))
+    }
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::struct_to_arrow(py, self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dt = engine::struct_to_polars(py, self)?;
+        engine::polars_type_to_py(py, &dt)
     }
     fn __repr__(&self) -> String {
         base::repr_str(self)

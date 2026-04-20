@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 
 pub mod cast;
 pub mod constants;
+pub mod engine;
 pub mod field;
 pub mod schema;
 pub mod types;

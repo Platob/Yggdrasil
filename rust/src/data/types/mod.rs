@@ -22,6 +22,21 @@ pub mod object;
 pub mod primitive;
 pub mod temporal;
 
+use crate::data::engine;
+
+/// `from_arrow(pyarrow_dt)` — reverse bridge from PyArrow DataType to
+/// our PyDataType subclasses.
+#[pyfunction]
+fn from_arrow(py: Python<'_>, dtype: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    engine::from_pyarrow(py, &dtype)
+}
+
+/// `from_polars(polars_dt)` — reverse bridge from polars DataType.
+#[pyfunction]
+fn from_polars(py: Python<'_>, dtype: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    engine::from_polars(py, &dtype)
+}
+
 pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     id::register(py, module)?;
     base::register(py, module)?;
@@ -29,5 +44,7 @@ pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     object::register(py, module)?;
     temporal::register(py, module)?;
     nested::register(py, module)?;
+    module.add_function(wrap_pyfunction!(from_arrow, module)?)?;
+    module.add_function(wrap_pyfunction!(from_polars, module)?)?;
     Ok(())
 }

@@ -11,6 +11,7 @@ use pyo3::types::PyDict;
 
 use super::base::{self, DataTypeImpl, PyDataType};
 use super::id::{DataTypeId, PyDataTypeId};
+use crate::data::engine;
 
 // ---------------------------------------------------------------------------
 // NullType
@@ -51,6 +52,14 @@ impl PyNullType {
 
     fn to_databricks_ddl(&self) -> &'static str {
         "VOID"
+    }
+
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::null_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::null_to_polars(self))
     }
 
     fn __repr__(&self) -> String {
@@ -116,6 +125,14 @@ impl PyBooleanType {
 
     fn to_databricks_ddl(&self) -> &'static str {
         "BOOLEAN"
+    }
+
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::boolean_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::boolean_to_polars(self))
     }
 
     fn __repr__(&self) -> String {
@@ -197,6 +214,14 @@ impl PyIntegerType {
         }
     }
 
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::integer_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::integer_to_polars(self))
+    }
+
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -265,6 +290,14 @@ impl PyFloatingPointType {
             4 => "FLOAT",
             _ => "DOUBLE",
         }
+    }
+
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::float_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::float_to_polars(self))
     }
 
     fn __repr__(&self) -> String {
@@ -354,6 +387,15 @@ impl PyDecimalType {
         format!("DECIMAL({precision},{scale})")
     }
 
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        let dt = engine::decimal_to_arrow(self)?;
+        engine::arrow_to_py(py, &dt)
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::decimal_to_polars(self))
+    }
+
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -437,6 +479,14 @@ impl PyStringType {
         }
     }
 
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::string_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::string_to_polars(self))
+    }
+
     fn __repr__(&self) -> String {
         base::repr_str(self)
     }
@@ -518,6 +568,14 @@ impl PyBinaryType {
             Some(n) => format!("BINARY({n})"),
             None => "BINARY".to_string(),
         }
+    }
+
+    fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::arrow_to_py(py, &engine::binary_to_arrow(self))
+    }
+
+    fn to_polars(&self, py: Python<'_>) -> PyResult<Py<pyo3::PyAny>> {
+        engine::polars_type_to_py(py, &engine::binary_to_polars(self))
     }
 
     fn __repr__(&self) -> String {

@@ -10,4 +10,28 @@ crate-type = ["cdylib"]
 [dependencies]
 # abi3-py310: build a single stable-ABI wheel that works on Python 3.10+.
 # This means one wheel per OS/arch instead of one per Python version.
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+
+# Arrow — real Rust DataType/Schema + PyArrow FFI via the C Data Interface.
+# We use the umbrella `arrow` crate so `arrow::pyarrow` is available.
+arrow = { version = "55", default-features = false, features = ["pyarrow", "ffi"] }
+arrow-schema = { version = "55", default-features = false }
+arrow-array = { version = "55", default-features = false }
+
+# Polars — Rust DataType enum as the internal representation for
+# polars-flavored casts.  The Python `polars.*` classes are constructed
+# via pyo3 getattr because polars' Python wrapper crate is not public.
+polars = { version = "0.45", default-features = false, features = [
+  "dtype-array",
+  "dtype-categorical",
+  "dtype-date",
+  "dtype-datetime",
+  "dtype-decimal",
+  "dtype-duration",
+  "dtype-i8",
+  "dtype-i16",
+  "dtype-struct",
+  "dtype-time",
+  "dtype-u8",
+  "dtype-u16",
+] }
