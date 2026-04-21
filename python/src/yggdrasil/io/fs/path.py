@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import fnmatch
+import mmap
 import os
 import pathlib
 from abc import ABC, abstractmethod
@@ -817,6 +818,113 @@ class Path(ABC):
         encoded = data.encode(encoding, errors=errors)
         self.write_bytes(encoded)
         return len(encoded)
+
+    # ================================================================ #
+    # Optimized memory access                                           #
+    # ================================================================ #
+    #
+    # These default implementations make every backend usable as a
+    # transparent substitute for a local file — BytesIO and other code
+    # can call ``pread`` / ``pwrite`` / ``memoryview`` / ``open_mmap``
+    # without branching on backend type.
+    #
+    # Local paths override each method to route through ``os.pread`` /
+    # ``os.pwrite`` / real ``mmap``. Remote backends (DatabricksPath,
+    # S3Path, …) pick up the fallback automatically, and can override
+    # individual methods for zero-copy range GETs or server-side copies.
+
+    @property
+    def local_os_path(self) -> Optional[str]:
+        """Return a local-filesystem path usable with :mod:`os` / :mod:`mmap`.
+
+        ``None`` means the path does not map to a local file — callers
+        must go through :meth:`read_bytes` / :meth:`pread` /
+        :meth:`memoryview` for data access. Local paths return their
+        absolute string form; DBFS-mounted paths can override to expose
+        their FUSE mount point.
+        """
+        return None
+
+    @property
+    def is_local_fs(self) -> bool:
+        """True when this path sits on a local POSIX filesystem.
+
+        Equivalent to ``self.local_os_path is not None`` but cheaper to
+        probe from hot paths that only need the yes/no.
+        """
+        return self.local_os_path is not None
+
+    def pread(self, n: int, pos: int) -> bytes:
+        """Positional read. Default: materialize then slice.
+
+        Subclasses should override when the backend supports a cheaper
+        random-access read (``os.pread``, HTTP range requests, …).
+        """
+        if n <= 0:
+            return b""
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        data = self.read_bytes()
+        end = min(pos + n, len(data))
+        if pos >= end:
+            return b""
+        return bytes(data[pos:end])
+
+    def pwrite(self, data: Union[bytes, bytearray, memoryview], pos: int) -> int:
+        """Positional write. Default: read-modify-write.
+
+        The default is O(file size) per call — fine for small files and
+        remote stores, disastrous for a hot loop on a multi-GB local
+        file. :class:`LocalPath` overrides with ``os.pwrite`` for a true
+        positional write.
+        """
+        mv = memoryview(data)
+        if len(mv) == 0:
+            return 0
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+
+        existing = self.read_bytes() if self.exists() else b""
+        new_size = max(len(existing), pos + len(mv))
+        buf = bytearray(new_size)
+        buf[: len(existing)] = existing
+        buf[pos : pos + len(mv)] = mv
+        self.write_bytes(bytes(buf))
+        return len(mv)
+
+    def memoryview(
+        self,
+        *,
+        offset: int = 0,
+        size: Optional[int] = None,
+    ) -> "memoryview":
+        """Return a ``memoryview`` over this file's contents.
+
+        Default: materializes the full payload into bytes and returns a
+        view over it. :class:`LocalPath` overrides with a real mmap so
+        large files don't inflate process RSS. Remote backends can cache
+        the materialized payload on the instance (or a session cache) to
+        make repeated views cheap.
+        """
+        if offset < 0:
+            raise ValueError("memoryview offset must be >= 0")
+
+        data = self.read_bytes()
+        if offset == 0 and size is None:
+            return memoryview(data)
+        end = len(data) if size is None else offset + size
+        return memoryview(data)[offset:end]
+
+    def open_mmap(self, mode: str = "r") -> Optional["mmap.mmap"]:
+        """Return a :class:`mmap.mmap` over this file, or ``None`` when
+        the backend can't memory-map.
+
+        Default is ``None`` — remote backends can't hand the OS a real
+        file descriptor. Callers should fall through to :meth:`memoryview`
+        which always works (at the cost of bytes materialization).
+        """
+        del mode
+        return None
 
     # ── Copy ───────────────────────────────────────────────────────
 

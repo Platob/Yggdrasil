@@ -11,12 +11,13 @@ stays instantiable so downstream code can pass a fresh handle around.
 
 from __future__ import annotations
 
+import mmap
 import os
 import pathlib
 import shutil
 import stat as stat_mod
 from dataclasses import dataclass
-from typing import IO, Any, ClassVar, Iterator, Optional
+from typing import IO, Any, ClassVar, Iterator, Optional, Union
 
 from .filesystem import FileSystem
 from .path import Path, _split
@@ -279,6 +280,88 @@ class LocalPath(Path):
         return self._pl().open(
             mode=mode, encoding=encoding, errors=errors, newline=newline
         )
+
+    # ---- Optimized memory access -------------------------------------
+
+    @property
+    def local_os_path(self) -> str:
+        """Return this path as a local-filesystem string (always available)."""
+        return self.full_path() or "."
+
+    @property
+    def is_local_fs(self) -> bool:
+        return True
+
+    def pread(self, n: int, pos: int) -> bytes:
+        """Positional read via :func:`os.pread` when available."""
+        if n <= 0:
+            return b""
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        if not hasattr(os, "pread"):
+            return super().pread(n, pos)
+        with self.open("rb") as fh:
+            return os.pread(fh.fileno(), n, pos)
+
+    def pwrite(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+    ) -> int:
+        """Positional write via :func:`os.pwrite` when available."""
+        mv = memoryview(data)
+        if len(mv) == 0:
+            return 0
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+        if not hasattr(os, "pwrite"):
+            return super().pwrite(data, pos)
+
+        pl = self._pl()
+        if not pl.exists():
+            pl.parent.mkdir(parents=True, exist_ok=True)
+            pl.touch()
+        with self.open("r+b") as fh:
+            return int(os.pwrite(fh.fileno(), mv, pos))
+
+    def open_mmap(self, mode: str = "r") -> Optional["mmap.mmap"]:
+        """Return a real :class:`mmap.mmap` over this file.
+
+        Returns ``None`` for empty or missing files because ``mmap.mmap``
+        rejects length=0 on most platforms — cheaper and clearer than
+        letting the caller handle the OSError.
+        """
+        pl = self._pl()
+        if not pl.exists():
+            return None
+        try:
+            size = pl.stat().st_size
+        except OSError:
+            return None
+        if size == 0:
+            return None
+        access = mmap.ACCESS_READ if mode == "r" else mmap.ACCESS_WRITE
+        open_mode = "rb" if mode == "r" else "r+b"
+        with pl.open(open_mode) as fh:
+            return mmap.mmap(fh.fileno(), length=0, access=access)
+
+    def memoryview(
+        self,
+        *,
+        offset: int = 0,
+        size: Optional[int] = None,
+    ) -> "memoryview":
+        """Zero-copy memoryview backed by an OS mmap when possible."""
+        if offset < 0:
+            raise ValueError("memoryview offset must be >= 0")
+        mm = self.open_mmap("r")
+        if mm is None:
+            return memoryview(b"")
+        mv = memoryview(mm)
+        if offset == 0 and size is None:
+            return mv
+        end = len(mv) if size is None else offset + size
+        return mv[offset:end]
 
     # ---- pathlib-style convenience factories -------------------------
 

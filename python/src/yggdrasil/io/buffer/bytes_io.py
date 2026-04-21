@@ -31,11 +31,10 @@ from __future__ import annotations
 
 import base64
 import io
-import mmap
 import os
 import shutil
 import struct
-from pathlib import Path
+from pathlib import Path as _PathlibPath
 from typing import TYPE_CHECKING, Any, IO, Literal, Optional, Union
 
 import pyarrow as pa
@@ -43,9 +42,12 @@ import pyarrow as pa
 import yggdrasil.pickle.json as json_module
 from yggdrasil.io.config import DEFAULT_CONFIG, BufferConfig
 from yggdrasil.io.enums import MediaType, MimeTypes
+from yggdrasil.io.fs import Path
 from yggdrasil.io.types import BytesLike
 
 if TYPE_CHECKING:
+    import mmap as _mmap_module
+
     import blake3
     import xxhash
 
@@ -62,17 +64,19 @@ BufferLike = Union[
     "BytesIO",
     str,
     Path,
-    "DatabricksPath",
+    _PathlibPath,
     IO[bytes],
 ]
 
-SpillPath = "Path | DatabricksPath"
+# Type alias for spill-backing paths. Any :class:`yggdrasil.io.fs.Path`
+# subclass works transparently — local, Databricks, S3, etc. — because the
+# Path API provides uniform :meth:`pread` / :meth:`pwrite` / :meth:`memoryview`
+# / :meth:`open_mmap`.
+SpillPath = Path
 
 _HEAD_DEFAULT = 128
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
 _PICKLE_COMPRESS_THRESHOLD_DEFAULT = 1 * 1024 * 1024
-_HAS_PREAD = hasattr(os, "pread")
-_HAS_PWRITE = hasattr(os, "pwrite")
 
 
 def _as_contiguous_memoryview(mv: memoryview) -> memoryview:
@@ -100,7 +104,9 @@ class BytesIO(io.RawIOBase):
 
     def __init__(
         self,
-        data: IO[bytes] | bytes | bytearray | memoryview | str | SpillPath | None = None,
+        data: (
+            IO[bytes] | bytes | bytearray | memoryview | str | SpillPath | None
+        ) = None,
         *,
         media_type: Optional["MediaType"] = None,
         config: BufferConfig | None = None,
@@ -114,7 +120,7 @@ class BytesIO(io.RawIOBase):
         self._pos: int = 0
 
         self._path: SpillPath | None = None
-        self._mmap: mmap.mmap | None = None
+        self._mmap: "_mmap_module.mmap | None" = None
         self._read_fh: IO[bytes] | None = None
         self._owns_path: bool = False
         self._media_type: MediaType | None = media_type
@@ -182,6 +188,7 @@ class BytesIO(io.RawIOBase):
 
         if codec is not None:
             from yggdrasil.io import Codec
+
             codec = Codec.parse(codec)
             blob = codec.decompress_bytes(blob)
 
@@ -302,7 +309,7 @@ class BytesIO(io.RawIOBase):
 
     @staticmethod
     def _is_pathish(value: Any) -> bool:
-        return isinstance(value, (str, Path)) or (
+        return isinstance(value, (str, _PathlibPath, Path, os.PathLike)) or (
             hasattr(value, "open")
             and hasattr(value, "exists")
             and hasattr(value, "stat")
@@ -310,13 +317,30 @@ class BytesIO(io.RawIOBase):
 
     @staticmethod
     def _coerce_path(value: Any):
-        if isinstance(value, (str, Path)):
-            return Path(value)
-        return value
+        """Coerce any path-like input to a :class:`yggdrasil.io.fs.Path`.
+
+        Already-coerced ``Path`` instances pass through. Duck-typed
+        remote paths (:class:`DatabricksPath` and friends) that expose
+        ``read_bytes`` / ``is_file`` also pass through so we don't lose
+        their backend-specific semantics. Everything else (str,
+        ``pathlib.Path``, ``os.PathLike``) runs through
+        :meth:`Path.from_any`.
+        """
+        if isinstance(value, Path):
+            return value
+        if hasattr(value, "read_bytes") and hasattr(value, "is_file"):
+            return value
+        return Path.from_any(value)
 
     @staticmethod
     def _is_local_path(path: Any) -> bool:
-        return isinstance(path, Path)
+        """True when the backing path can use local-fs fast paths.
+
+        Reads ``is_local_fs`` from the :class:`Path` API so DBFS-mounted
+        overrides etc. work transparently. Non-Path inputs (duck-typed
+        remote paths) are treated as non-local.
+        """
+        return bool(getattr(path, "is_local_fs", False))
 
     def _init_from_path(self, path, *, copy: bool) -> None:
         if not path.exists():
@@ -548,16 +572,18 @@ class BytesIO(io.RawIOBase):
         if self._path is None:
             return b""
 
+        # Prefer the Path-level ``pread`` when the backend implements a
+        # native one (LocalPath uses ``os.pread``, DatabricksPath can do
+        # range GETs, …). Fall back to seek/read on a cached handle for
+        # generic ``file-like``.
+        path_pread = getattr(self._path, "pread", None)
+        if callable(path_pread):
+            return path_pread(n, pos)
+
         fh = self._get_read_fh()
         if fh is None:
             return b""
 
-        if self._is_local_path(self._path) and _HAS_PREAD:
-            return os.pread(fh.fileno(), n, pos)
-
-        # Non-local path or no os.pread: synchronize via seek/read on the
-        # cached handle. Not thread-safe — if you need concurrent reads,
-        # open separate handles per reader.
         fh.seek(pos)
         return fh.read(n)
 
@@ -586,16 +612,18 @@ class BytesIO(io.RawIOBase):
         self._invalidate_mmap()
         self._close_read_fh()
 
-        with self._path.open("r+b") as fh:
-            if self._is_local_path(self._path) and _HAS_PWRITE:
-                written = int(os.pwrite(fh.fileno(), mv, pos))
-            else:
-                fh.seek(pos)
-                out = fh.write(mv)
-                fh.flush()
-                written = len(mv) if out is None else int(out)
+        # Route through the Path's native positional write when one is
+        # available (LocalPath → os.pwrite). Fall back to seek/write on
+        # a short-lived handle for duck-typed path-likes.
+        path_pwrite = getattr(self._path, "pwrite", None)
+        if callable(path_pwrite):
+            return int(path_pwrite(mv, pos))
 
-        return written
+        with self._path.open("r+b") as fh:
+            fh.seek(pos)
+            out = fh.write(mv)
+            fh.flush()
+            return len(mv) if out is None else int(out)
 
     def _ensure_spill_for_growth(self, extra: int) -> None:
         if self._buf is None:
@@ -637,7 +665,11 @@ class BytesIO(io.RawIOBase):
         if self._buf is not None:
             return self._size
         if self._path is not None and self._path.exists():
-            return self._path.stat().st_size
+            stat = self._path.stat()
+            # DatabricksStatResult and LocalPath StatResult both expose
+            # ``st_size`` as an alias to ``size``; prefer the alias so
+            # raw ``os.stat_result`` consumers keep working.
+            return getattr(stat, "st_size", getattr(stat, "size", 0))
         return 0
 
     @property
@@ -648,10 +680,15 @@ class BytesIO(io.RawIOBase):
                 # ZIP-based container formats (XLSX, DOCX, …) that would
                 # otherwise be detected as generic ZIP.
                 from_path = MediaType.parse(str(self._path), default=None)
-                if from_path is not None and from_path.mime_type is not MimeTypes.OCTET_STREAM:
+                if (
+                    from_path is not None
+                    and from_path.mime_type is not MimeTypes.OCTET_STREAM
+                ):
                     self._media_type = from_path
                     return self._media_type
-            self._media_type = MediaType.parse(self, default=MediaType(MimeTypes.OCTET_STREAM))
+            self._media_type = MediaType.parse(
+                self, default=MediaType(MimeTypes.OCTET_STREAM)
+            )
         return self._media_type
 
     @media_type.setter
@@ -687,7 +724,9 @@ class BytesIO(io.RawIOBase):
 
     def json_load(
         self,
-        orient: Optional[Literal["records", "split", "index", "columns", "values"]] = None,
+        orient: Optional[
+            Literal["records", "split", "index", "columns", "values"]
+        ] = None,
         *,
         media_type: Optional[MediaType] = None,
     ):
@@ -865,7 +904,11 @@ class BytesIO(io.RawIOBase):
         # --------------------------------------------------------------
         # Path-like destinations: one unified branch.
         # --------------------------------------------------------------
-        if isinstance(dst, str) or isinstance(dst, os.PathLike) or self._is_pathish(dst):
+        if (
+            isinstance(dst, str)
+            or isinstance(dst, os.PathLike)
+            or self._is_pathish(dst)
+        ):
             dst_path = self._coerce_path(dst)
 
             if dst_path.exists() and not overwrite:
@@ -875,9 +918,7 @@ class BytesIO(io.RawIOBase):
 
             # In-memory → just write out.
             if self._buf is not None:
-                payload = _as_contiguous_memoryview(
-                    memoryview(self._buf)[: self._size]
-                )
+                payload = _as_contiguous_memoryview(memoryview(self._buf)[: self._size])
                 dst_path.write_bytes(payload)
                 return self._size
 
@@ -890,17 +931,24 @@ class BytesIO(io.RawIOBase):
             if self._path == dst_path:
                 return self.size
 
-            # Custom (e.g. Databricks) → use its copy_to if available.
-            if hasattr(self._path, "copy_to") and not isinstance(self._path, Path):
+            # Local-to-local fast path — both sides map to the OS FS.
+            src_local = (
+                self._path.local_os_path if isinstance(self._path, Path) else None
+            )
+            dst_local = dst_path.local_os_path if isinstance(dst_path, Path) else None
+            if src_local is not None and dst_local is not None:
+                shutil.copyfile(src_local, dst_local)
+                return self.size
+
+            # Remote or mixed: prefer the source's ``copy_to`` when it has
+            # one — Databricks and friends get a server-side copy that
+            # way. Our base :class:`Path.copy_to` also handles the mixed
+            # case via read_bytes + write_bytes.
+            if hasattr(self._path, "copy_to"):
                 self._path.copy_to(dst_path)
                 return self.size
 
-            # Local-to-local fast path.
-            if self._is_local_path(self._path) and isinstance(dst_path, Path):
-                shutil.copyfile(self._path, dst_path)
-                return self.size
-
-            # Cross-type fallback: stream.
+            # Last-ditch cross-type stream.
             with self._path.open("rb") as src:
                 with dst_path.open("wb") as out:
                     shutil.copyfileobj(src, out, length=batch_size)
@@ -922,9 +970,7 @@ class BytesIO(io.RawIOBase):
         total = 0
 
         if self._buf is not None:
-            payload = _as_contiguous_memoryview(
-                memoryview(self._buf)[: self._size]
-            )
+            payload = _as_contiguous_memoryview(memoryview(self._buf)[: self._size])
             out = dst.write(payload)
             written = self._size if out is None else int(out)
             if written != self._size:
@@ -1134,10 +1180,14 @@ class BytesIO(io.RawIOBase):
             return h
 
         if self._path is not None:
-            if not self._is_local_path(self._path):
-                h.update(self.to_bytes())
+            # blake3's mmap fast path needs a real OS file. Route through
+            # ``local_os_path`` so DBFS mounts (which look remote but point
+            # at /dbfs/…) can still take the fast path.
+            local_os_path = getattr(self._path, "local_os_path", None)
+            if local_os_path:
+                h.update_mmap(local_os_path)
                 return h
-            h.update_mmap(str(self._path))
+            h.update(self.to_bytes())
             return h
 
         return h
@@ -1200,18 +1250,22 @@ class BytesIO(io.RawIOBase):
         if self._path is None or not self._path.exists():
             return memoryview(b"")
 
-        if not self._is_local_path(self._path):
-            return memoryview(self.to_bytes())
+        # Cache an mmap-backed view when the Path can produce one so
+        # repeated reads stay zero-copy. ``open_mmap`` returns None for
+        # remote backends — fall back to the Path-level memoryview,
+        # which materializes bytes once per call.
+        open_mmap = getattr(self._path, "open_mmap", None)
+        if callable(open_mmap):
+            if self._mmap is None or getattr(self._mmap, "closed", False):
+                self._mmap = open_mmap("r")
+            if self._mmap is not None:
+                return memoryview(self._mmap)
 
-        size = self._path.stat().st_size
-        if size == 0:
-            return memoryview(b"")
-
-        if self._mmap is None or self._mmap.closed:
-            with self._path.open("rb") as fh:
-                self._mmap = mmap.mmap(fh.fileno(), length=0, access=mmap.ACCESS_READ)
-
-        return memoryview(self._mmap)
+        # Remote / duck-typed path: ask it for a memoryview directly so
+        # subclasses that cache their read_bytes payload get reused.
+        if hasattr(self._path, "memoryview"):
+            return self._path.memoryview()
+        return memoryview(self.to_bytes())
 
     def to_bytes(self) -> bytes:
         if self._buf is not None:
@@ -1220,10 +1274,7 @@ class BytesIO(io.RawIOBase):
             return b""
         return self.pread(self.size, 0)
 
-    def to_base64(
-        self,
-        urlsafe: bool = True
-    ) -> str:
+    def to_base64(self, urlsafe: bool = True) -> str:
         b = self.to_bytes()
 
         if urlsafe:
@@ -1244,9 +1295,13 @@ class BytesIO(io.RawIOBase):
 
         if "r" in mode:
             if self.spilled and self._path is not None:
-                if not self._is_local_path(self._path):
-                    return pa.PythonFile(self.open_reader(), mode="r")
-                return pa.memory_map(str(self._path), "r")
+                # ``local_os_path`` is the single signal for "can I hand
+                # this to Arrow's OS-fd fast path?" — works for LocalPath
+                # and DBFS mounts alike.
+                local_os_path = getattr(self._path, "local_os_path", None)
+                if local_os_path:
+                    return pa.memory_map(local_os_path, "r")
+                return pa.PythonFile(self.open_reader(), mode="r")
 
             mv = self.memoryview()
             buf = pa.py_buffer(mv) if len(mv) else pa.py_buffer(b"")
@@ -1259,7 +1314,8 @@ class BytesIO(io.RawIOBase):
             if self._path is None:
                 raise RuntimeError("Failed to materialize spill file for Arrow IO")
 
-            if not self._is_local_path(self._path):
+            local_os_path = getattr(self._path, "local_os_path", None)
+            if not local_os_path:
                 return pa.PythonFile(self.open_file(), mode=mode)
 
             # Writes invalidate any existing read-side state.
@@ -1267,8 +1323,8 @@ class BytesIO(io.RawIOBase):
             self._close_read_fh()
 
             if "w" in mode:
-                return pa.OSFile(str(self._path), mode="w")
-            return pa.OSFile(str(self._path), mode="a")
+                return pa.OSFile(local_os_path, mode="w")
+            return pa.OSFile(local_os_path, mode="a")
 
         raise ValueError(f"Unsupported mode for to_arrow_io: {mode!r}")
 
@@ -1349,10 +1405,7 @@ class BytesIO(io.RawIOBase):
             target_mt = self.media_type.without_codec()
             resolved = self.media_type.codec
         else:
-            target_mt = (
-                self._media_type.without_codec()
-                if self._media_type else None
-            )
+            target_mt = self._media_type.without_codec() if self._media_type else None
             resolved = _Codec.parse(codec)
             # Parity with compress(): an unknown codec name is a user
             # error, not a silent no-op. None stays permitted (means
@@ -1443,6 +1496,5 @@ class BytesIO(io.RawIOBase):
         **option_kwargs,
     ):
         return self.media_io(media=media).read_polars_frame(
-            options=options,
-            **option_kwargs
+            options=options, **option_kwargs
         )

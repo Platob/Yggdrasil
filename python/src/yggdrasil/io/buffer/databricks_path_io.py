@@ -36,27 +36,20 @@ __all__ = ["DatabricksPathIO"]
 class DatabricksPathIO(PathIO):
     """PathIO reading from a :class:`DatabricksPath`."""
 
-    # Required — no default. DatabricksPath lives outside the
-    # ``yggdrasil.io.fs`` hierarchy so we keep its own type here and
-    # skip the base class's ``Path.from_any`` coercion for inputs that
-    # already look like DatabricksPath.
-    path: DatabricksPath
-
-    def __post_init__(self) -> None:
-        # Coerce anything non-DatabricksPath into one — strings, pathlib
-        # Paths, etc. A DatabricksPath duck-type check (`read_bytes`) is
-        # kept for objects that already implement the protocol without
-        # being a subclass (e.g. fsspec paths wrapped in a custom type).
-        if not isinstance(self.path, DatabricksPath) and not hasattr(
-            self.path, "read_bytes"
+    def __post_init__(self, path: Any = None) -> None:
+        # Pre-coerce any non-DatabricksPath / non-duck-typed input into
+        # a :class:`DatabricksPath` before letting the base do its own
+        # ``_coerce_path`` pass (which leaves duck-typed remote paths
+        # untouched).
+        resolved = path if path is not None else self.holder.path
+        if (
+            resolved is not None
+            and not isinstance(resolved, DatabricksPath)
+            and not hasattr(resolved, "read_bytes")
         ):
-            self.path = DatabricksPath.parse(str(self.path))
+            resolved = DatabricksPath.parse(str(resolved))
 
-        # Let the parent handle media_type inference via iter_files when
-        # media_type is None. The base's ``_coerce_path`` leaves
-        # DatabricksPath alone (duck-typed pass-through) so this stays
-        # lossless.
-        PathIO.__post_init__(self)
+        PathIO.__post_init__(self, resolved)
 
     @classmethod
     def make(

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from pathlib import Path as _PathlibPath
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -185,13 +185,37 @@ class PathOptions(MediaOptions):
 
 @dataclass(slots=True)
 class PathIO(MediaIO[PathOptions], ABC):
-    # Required — no default. :class:`Path` is abstract, so every concrete
-    # subclass must hand in a usable path (and typically also pins a more
-    # specific annotation, e.g. ``LocalPath`` / ``DatabricksPath``).
-    path: Path
+    """PathIO backs reads/writes with a :class:`Path`, stored on the holder.
 
-    def __post_init__(self) -> None:
-        if self.path is None:
+    The filesystem path lives on :attr:`holder.path` (``self.holder._path``),
+    the same slot :class:`BytesIO` uses for a spilled backing file. That
+    keeps a single source of truth — anyone inspecting ``io.holder.path``
+    or ``io.path`` sees the same object — and lets the base :class:`MediaIO`
+    machinery manage buffer lifecycle alongside the path.
+
+    :attr:`path` is exposed as a property for backward compatibility.
+    Setting it rewrites the holder's backing path.
+    """
+
+    # ``path`` is declared as an :class:`InitVar` so the dataclass-generated
+    # ``__init__`` (on this class and on subclasses that use
+    # ``@dataclass``) accepts ``path=`` as a kwarg. The value is routed
+    # to :meth:`__post_init__` and stashed on ``self.holder._path`` —
+    # that's the single source of truth.
+    #
+    # An :class:`InitVar` default is read from the class attribute at
+    # decoration time; defining a ``@property path`` in this class body
+    # would overwrite that default with the property descriptor. To
+    # avoid the collision the ``path`` property is attached **after**
+    # the class is built, below.
+    path: InitVar[Any] = None
+
+    def __post_init__(self, path: Any = None) -> None:
+        # Prefer an explicit ``path=`` kwarg; fall back to whatever the
+        # holder is already carrying (some callers build a BytesIO from
+        # the path first and hand it in as the holder).
+        resolved = path if path is not None else self.holder.path
+        if resolved is None:
             raise ValueError(
                 f"{type(self).__name__} requires a non-None path. "
                 "Pass a str, pathlib.Path, yggdrasil.io.fs.Path, or any "
@@ -203,7 +227,7 @@ class PathIO(MediaIO[PathOptions], ABC):
         # gets picked. Anything that already looks like a Path — either
         # one of ours or a duck-typed remote (e.g. DatabricksPath) — is
         # left alone so subclasses can keep their own concrete types.
-        self.path = self._coerce_path(self.path)
+        self.holder._path = self._coerce_path(resolved)
 
         if self.media_type is None:
             self.media_type = MediaType.parse(
@@ -1093,3 +1117,28 @@ class PathIO(MediaIO[PathOptions], ABC):
             return ds.OrcFileFormat()
 
         raise NotImplementedError(f"Unsupported dataset format for {mime_type!r}")
+
+
+# --------------------------------------------------------------------------
+# ``PathIO.path`` — property assigned after the @dataclass decorator
+# --------------------------------------------------------------------------
+#
+# Attaching the property here (instead of in the class body) avoids the
+# dataclass trap where a class-level ``path`` descriptor shadows the
+# :class:`InitVar` default. Behaviorally this is a normal property:
+# ``io.path`` reads ``io.holder.path`` and ``io.path = X`` rewrites
+# the holder's backing after invalidating any cached mmap / read handle.
+
+
+def _pathio_get_path(self: PathIO) -> Any:
+    """Backing filesystem path. Stored on :attr:`PathIO.holder.path`."""
+    return self.holder.path
+
+
+def _pathio_set_path(self: PathIO, value: Any) -> None:
+    self.holder._invalidate_mmap()
+    self.holder._close_read_fh()
+    self.holder._path = PathIO._coerce_path(value)
+
+
+PathIO.path = property(_pathio_get_path, _pathio_set_path)  # type: ignore[assignment]

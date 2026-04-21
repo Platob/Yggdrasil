@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path as _PathlibPath
+from typing import Any
 
 from yggdrasil.io.enums import MediaType, MimeType
 from yggdrasil.io.fs import LocalPath
@@ -29,15 +30,11 @@ __all__ = ["LocalPathIO"]
 class LocalPathIO(PathIO):
     """PathIO reading from the local filesystem."""
 
-    # Narrow the base class's ``Path`` annotation down to the local flavor.
-    # Still required — no default — so mis-constructed instances fail fast.
-    path: LocalPath
-
-    def __post_init__(self) -> None:
-        # Let the base do the safe ``Path.from_any`` coercion, then narrow
-        # to :class:`LocalPath` so children / callers get a predictable
-        # concrete type.
-        PathIO.__post_init__(self)
+    def __post_init__(self, path: Any = None) -> None:
+        # Run the base coercion first (it routes str / pathlib / PathLike
+        # through ``Path.from_any``), then narrow to :class:`LocalPath`
+        # so children and callers get a predictable concrete type.
+        PathIO.__post_init__(self, path)
         if not isinstance(self.path, LocalPath):
             self.path = LocalPath.from_any(self.path)
 
