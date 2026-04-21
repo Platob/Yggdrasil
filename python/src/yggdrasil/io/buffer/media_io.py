@@ -1073,3 +1073,109 @@ class MediaIO(ABC, Generic[O]):
             self.iter_arrow_batches(frames),
             options,
         )
+
+    # ------------------------------------------------------------------
+    # SQL execution
+    # ------------------------------------------------------------------
+
+    _EXECUTE_ENGINES = frozenset({"polars", "arrow", "pandas"})
+
+    def execute(
+        self,
+        statement: str,
+        engine: str = "polars",
+        *,
+        name: str = "self",
+        columns: "Sequence[str] | None | Any" = ...,
+        cast: "CastOptionsArg | Any" = ...,
+        options: O | None = None,
+        **option_kwargs,
+    ) -> "pl.DataFrame | pyarrow.Table | pandas.DataFrame":
+        """Run a SQL ``statement`` against this buffer and return the result.
+
+        The buffer is registered as a lazy Polars table under ``name``
+        (default ``"self"``) and the statement is executed through Polars'
+        SQL engine. Because the frame is lazy, the Polars optimizer pushes
+        the post-SQL projection and filter plan back through the scanner,
+        so formats whose :meth:`read_polars_frame` supports real lazy
+        scanning (Parquet, Arrow IPC, CSV, NDJSON) only materialize the
+        slices the query actually needs.
+
+        Parameters
+        ----------
+        statement:
+            Non-empty SQL text. Reference the buffer by ``name``, e.g.
+            ``"SELECT id, amount FROM self WHERE amount > 0"``.
+        engine:
+            Result materialization engine — one of:
+
+            * ``"polars"`` (default) → :class:`polars.DataFrame`
+            * ``"arrow"``             → :class:`pyarrow.Table`
+            * ``"pandas"``            → :class:`pandas.DataFrame`
+        name:
+            Alias under which the buffer is visible inside ``statement``.
+            Defaults to ``"self"`` to match :meth:`polars.LazyFrame.sql`.
+        columns:
+            Optional column projection applied at read time. Useful for
+            formats whose readers cannot push the SQL projection down
+            (ad-hoc JSON, XML, ZIP members); Parquet / IPC / CSV typically
+            handle pushdown themselves once the lazy plan is built.
+        cast:
+            Arrow cast configuration forwarded to the read path.
+        options:
+            Pre-built format options to start from (merged with the
+            explicit keyword overrides).
+        **option_kwargs:
+            Extra format-specific knobs forwarded to the concrete
+            :meth:`check_options`.
+
+        Returns
+        -------
+        The SQL result in the format selected by *engine*.
+
+        Raises
+        ------
+        ValueError
+            When ``statement`` is empty or ``engine`` is unrecognized.
+        """
+        if not isinstance(statement, str) or not statement.strip():
+            raise ValueError(
+                "MediaIO.execute requires a non-empty SQL statement string, "
+                f"got {statement!r}"
+            )
+
+        engine_key = str(engine).lower()
+        if engine_key not in self._EXECUTE_ENGINES:
+            raise ValueError(
+                f"MediaIO.execute engine must be one of "
+                f"{sorted(self._EXECUTE_ENGINES)}, got {engine!r}"
+            )
+
+        # lazy=True gives Polars a LazyFrame to plan against; batch_size
+        # is forced off so we hand SQLContext a single frame rather than
+        # an iterator of chunks it cannot consume.
+        frame = self.read_polars_frame(
+            options=options,
+            columns=columns,
+            cast=cast,
+            lazy=True,
+            batch_size=0,
+            **option_kwargs,
+        )
+
+        # Defensive: a subclass may short-circuit and hand back an eager
+        # DataFrame even when lazy=True was requested (e.g. a cached
+        # single-chunk path). Promote to LazyFrame for SQLContext.
+        if not isinstance(frame, pl.LazyFrame):
+            frame = frame.lazy()
+
+        ctx = pl.SQLContext(frames={name: frame}, eager=False)
+        result = ctx.execute(statement).collect()
+
+        if engine_key == "polars":
+            return result
+        if engine_key == "arrow":
+            return self.polars_to_arrow_table(result)
+        # "pandas" — import lazily so base installs without pandas keep working.
+        from yggdrasil.pandas.lib import pandas  # noqa: F401
+        return result.to_pandas()

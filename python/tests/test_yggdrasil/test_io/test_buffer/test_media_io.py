@@ -703,6 +703,64 @@ class TestMarkDirtyFlushBack:
 
 
 # =====================================================================
+# SQL execute
+# =====================================================================
+
+class TestExecute:
+    def test_select_all_returns_polars_by_default(
+        self, mock_io: _MockMediaIO, sample_table
+    ):
+        mock_io.write_arrow_table(sample_table)
+        out = mock_io.execute("SELECT * FROM self ORDER BY id")
+        assert isinstance(out, pl.DataFrame)
+        assert out.height == sample_table.num_rows
+        assert out.columns == sample_table.column_names
+
+    def test_projection_and_filter(self, mock_io: _MockMediaIO, sample_table):
+        mock_io.write_arrow_table(sample_table)
+        out = mock_io.execute(
+            "SELECT name FROM self WHERE id > 1 ORDER BY id"
+        )
+        assert isinstance(out, pl.DataFrame)
+        assert out.columns == ["name"]
+        assert out["name"].to_list() == ["b", "c"]
+
+    def test_engine_arrow_returns_arrow_table(
+        self, mock_io: _MockMediaIO, sample_table
+    ):
+        mock_io.write_arrow_table(sample_table)
+        out = mock_io.execute("SELECT id FROM self", engine="arrow")
+        assert isinstance(out, pa.Table)
+        assert out.column_names == ["id"]
+
+    @pytest.mark.skipif(not HAS_PANDAS, reason="pandas required")
+    def test_engine_pandas_returns_pandas_frame(
+        self, mock_io: _MockMediaIO, sample_table
+    ):
+        mock_io.write_arrow_table(sample_table)
+        out = mock_io.execute("SELECT id FROM self", engine="pandas")
+        assert isinstance(out, pd.DataFrame)
+        assert list(out.columns) == ["id"]
+
+    def test_custom_table_name(self, mock_io: _MockMediaIO, sample_table):
+        mock_io.write_arrow_table(sample_table)
+        out = mock_io.execute("SELECT COUNT(*) AS n FROM t", name="t")
+        assert out["n"].to_list() == [sample_table.num_rows]
+
+    def test_empty_statement_raises(self, mock_io: _MockMediaIO, sample_table):
+        mock_io.write_arrow_table(sample_table)
+        with pytest.raises(ValueError, match="non-empty SQL statement"):
+            mock_io.execute("")
+        with pytest.raises(ValueError, match="non-empty SQL statement"):
+            mock_io.execute("   ")
+
+    def test_unknown_engine_raises(self, mock_io: _MockMediaIO, sample_table):
+        mock_io.write_arrow_table(sample_table)
+        with pytest.raises(ValueError, match="engine must be one of"):
+            mock_io.execute("SELECT * FROM self", engine="duckdb")
+
+
+# =====================================================================
 # Static helpers
 # =====================================================================
 
