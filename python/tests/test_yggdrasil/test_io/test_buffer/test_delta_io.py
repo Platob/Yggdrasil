@@ -413,41 +413,43 @@ class TestExecute(DeltaIOTestCase):
             configuration=config,
         )
 
-    def test_execute_returns_polars_by_default(self):
+    def test_execute_returns_statement_result(self):
         import polars as pl
+        from yggdrasil.data.statement import LocalStatementResult
 
         io = self.make_io()
         self._seed(io)
 
         result = io.execute("SELECT id, name FROM self WHERE id > 6 ORDER BY id")
-        self.assertIsInstance(result, pl.DataFrame)
-        self.assertEqual(result.columns, ["id", "name"])
-        self.assertEqual(result["id"].to_list(), [7, 8, 9])
+        self.assertIsInstance(result, LocalStatementResult)
+        self.assertTrue(result.done)
+        self.assertTrue(result.is_polars)
 
-    def test_execute_arrow_engine(self):
+        df = result.to_polars(stream=False)
+        self.assertIsInstance(df, pl.DataFrame)
+        self.assertEqual(df.columns, ["id", "name"])
+        self.assertEqual(df["id"].to_list(), [7, 8, 9])
+
+    def test_execute_to_arrow_table(self):
         import pyarrow as pa
 
         io = self.make_io()
         self._seed(io)
-        result = io.execute(
-            "SELECT COUNT(*) AS n FROM self",
-            engine="arrow",
-        )
-        self.assertIsInstance(result, pa.Table)
-        self.assertEqual(result.column("n").to_pylist(), [10])
+        result = io.execute("SELECT COUNT(*) AS n FROM self")
+        table = result.to_arrow_table()
+        self.assertIsInstance(table, pa.Table)
+        self.assertEqual(table.column("n").to_pylist(), [10])
 
     @unittest.skipUnless(HAS_PANDAS, "pandas required for pandas engine")
-    def test_execute_pandas_engine(self):
+    def test_execute_to_pandas(self):
         import pandas as pd
 
         io = self.make_io()
         self._seed(io)
-        result = io.execute(
-            "SELECT COUNT(*) AS n FROM self",
-            engine="pandas",
-        )
-        self.assertIsInstance(result, pd.DataFrame)
-        self.assertEqual(int(result["n"].iloc[0]), 10)
+        result = io.execute("SELECT COUNT(*) AS n FROM self")
+        frame = result.to_pandas()
+        self.assertIsInstance(frame, pd.DataFrame)
+        self.assertEqual(int(frame["n"].iloc[0]), 10)
 
     def test_execute_aggregation_and_group_by(self):
         io = self.make_io()
@@ -456,7 +458,7 @@ class TestExecute(DeltaIOTestCase):
         result = io.execute(
             "SELECT part, COUNT(*) AS n, SUM(score) AS total "
             "FROM self GROUP BY part ORDER BY part"
-        )
+        ).to_polars(stream=False)
         self.assertEqual(result["part"].to_list(), ["a", "b"])
         self.assertEqual(result["n"].to_list(), [5, 5])
         self.assertEqual(result["total"].to_list(), [10.0, 35.0])
@@ -467,7 +469,7 @@ class TestExecute(DeltaIOTestCase):
 
         result = io.execute(
             "SELECT name FROM self WHERE part = 'a' ORDER BY id"
-        )
+        ).to_polars(stream=False)
         self.assertEqual(
             result["name"].to_list(),
             ["u0", "u1", "u2", "u3", "u4"],
@@ -479,11 +481,18 @@ class TestExecute(DeltaIOTestCase):
         with self.assertRaisesRegex(ValueError, "non-empty SQL statement"):
             io.execute("")
 
-    def test_execute_bad_engine_raises(self):
+    def test_execute_prepared_statement_input(self):
+        from yggdrasil.data.statement import PreparedStatement
+
         io = self.make_io()
         self._seed(io)
-        with self.assertRaisesRegex(ValueError, "engine must be one of"):
-            io.execute("SELECT 1", engine="duckdb")
+        prepared = PreparedStatement(text="SELECT COUNT(*) AS n FROM self")
+        result = io.execute(prepared)
+        self.assertEqual(result.statement, prepared)
+        self.assertEqual(
+            result.to_polars(stream=False)["n"].to_list(),
+            [10],
+        )
 
     def test_execute_on_table_with_deletion_vectors(self):
         """Full SQL round-trip on a table that requires the DV fallback.
@@ -498,15 +507,12 @@ class TestExecute(DeltaIOTestCase):
         dt = self.dt_cls(str(io.path))
         dt.delete("id < 4")
 
-        result = io.execute(
-            "SELECT COUNT(*) AS n FROM self",
-            engine="arrow",
-        )
+        result = io.execute("SELECT COUNT(*) AS n FROM self").to_arrow_table()
         self.assertEqual(result.column("n").to_pylist(), [6])
 
         grouped = io.execute(
             "SELECT part, COUNT(*) AS n FROM self GROUP BY part ORDER BY part"
-        )
+        ).to_polars(stream=False)
         self.assertEqual(grouped["part"].to_list(), ["a", "b"])
         self.assertEqual(grouped["n"].to_list(), [1, 5])
 
@@ -516,7 +522,7 @@ class TestExecute(DeltaIOTestCase):
         result = io.execute(
             "SELECT COUNT(*) AS n FROM t",
             name="t",
-        )
+        ).to_polars(stream=False)
         self.assertEqual(result["n"].to_list(), [10])
 
 

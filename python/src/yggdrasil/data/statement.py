@@ -34,6 +34,7 @@ BatchConcatMode = Literal[
 
 __all__ = [
     "BatchConcatMode",
+    "LocalStatementResult",
     "PreparedStatement",
     "StatementBatch",
     "StatementResult",
@@ -187,6 +188,12 @@ class StatementResult(ABC):
 
     _data_schema: Optional[Schema] = field(init=False, default=None, repr=False, compare=False)
     _arrow_table: Optional[pa.Table] = field(init=False, default=None, repr=False, compare=False)
+    _polars_df: Optional["polars.DataFrame"] = field(
+        init=False,
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _spark_df: Optional["pyspark.sql.DataFrame"] = field(
         init=False,
         default=None,
@@ -218,7 +225,8 @@ class StatementResult(ABC):
         """Return pickle-safe instance state.
 
         Spark DataFrames are not pickleable. If a Spark DataFrame is attached, it is
-        converted to a local Arrow table before serializing state.
+        converted to a local Arrow table before serializing state. Polars DataFrames
+        pickle cleanly and are preserved as-is.
 
         Warning
         -------
@@ -228,10 +236,11 @@ class StatementResult(ABC):
         state = {
             "_data_schema": self._data_schema,
             "_arrow_table": self._arrow_table,
+            "_polars_df": self._polars_df,
             "_spark_df": None,
         }
 
-        if self._spark_df is not None:
+        if self._spark_df is not None and self._arrow_table is None and self._polars_df is None:
             from yggdrasil.arrow.cast import any_to_arrow_table
 
             state["_arrow_table"] = any_to_arrow_table(self._spark_df, None)
@@ -240,7 +249,7 @@ class StatementResult(ABC):
 
     def __setstate__(self, state: dict) -> None:
         """Restore pickle-safe instance state."""
-        for name in ("_data_schema", "_arrow_table", "_spark_df"):
+        for name in ("_data_schema", "_arrow_table", "_polars_df", "_spark_df"):
             object.__setattr__(self, name, state.get(name))
 
     # -------------------------------------------------------------------------
@@ -253,15 +262,24 @@ class StatementResult(ABC):
         return self._spark_df is not None
 
     @property
+    def is_polars(self) -> bool:
+        """Whether this result currently has a cached Polars DataFrame."""
+        return self._polars_df is not None
+
+    @property
     def persisted(self) -> bool:
         """Whether this result has a cached local representation."""
-        return self._arrow_table is not None or self._spark_df is not None
+        return (
+            self._arrow_table is not None
+            or self._polars_df is not None
+            or self._spark_df is not None
+        )
 
     def persist(
         self,
-        mode: Literal["arrow", "spark", "auto"] = "auto",
+        mode: Literal["arrow", "polars", "spark", "auto"] = "auto",
         *,
-        data: Optional[Union[pa.Table, "pyspark.sql.DataFrame"]] = None,
+        data: Optional[Union[pa.Table, "polars.DataFrame", "polars.LazyFrame", "pyspark.sql.DataFrame"]] = None,
     ) -> StatementResult:
         """Materialize and cache the result.
 
@@ -270,10 +288,12 @@ class StatementResult(ABC):
         mode:
             Cache target:
             - ``"arrow"``: materialize to a local ``pyarrow.Table``
+            - ``"polars"``: materialize to a local ``polars.DataFrame``
             - ``"spark"``: materialize to a Spark DataFrame
             - ``"auto"``: currently the same as ``"arrow"``
         data:
-            Optional precomputed representation to attach directly.
+            Optional precomputed representation to attach directly. Polars
+            ``LazyFrame`` inputs are collected eagerly before caching.
 
         Returns
         -------
@@ -287,21 +307,35 @@ class StatementResult(ABC):
         - Persisting as Arrow materializes all rows locally.
         """
         if data is not None:
-            object.__setattr__(self, "_data_schema", Schema.from_(data))
-
             if isinstance(data, pa.Table):
+                object.__setattr__(self, "_data_schema", Schema.from_(data))
                 object.__setattr__(self, "_arrow_table", data)
+                object.__setattr__(self, "_polars_df", None)
+                object.__setattr__(self, "_spark_df", None)
+                return self
+
+            if _is_polars_frame(data):
+                from ..polars.lib import polars
+
+                if isinstance(data, polars.LazyFrame):
+                    data = data.collect()
+                object.__setattr__(self, "_data_schema", Schema.from_(data))
+                object.__setattr__(self, "_polars_df", data)
+                object.__setattr__(self, "_arrow_table", None)
                 object.__setattr__(self, "_spark_df", None)
                 return self
 
             if _is_spark_dataframe(data):
+                object.__setattr__(self, "_data_schema", Schema.from_(data))
                 object.__setattr__(self, "_spark_df", data)
                 object.__setattr__(self, "_arrow_table", None)
+                object.__setattr__(self, "_polars_df", None)
                 return self
 
             raise TypeError(
                 f"Unsupported data type for persist(): {type(data)!r}. "
-                "Expected pyarrow.Table or pyspark.sql.DataFrame."
+                "Expected pyarrow.Table, polars.DataFrame / polars.LazyFrame, "
+                "or pyspark.sql.DataFrame."
             )
 
         if self.persisted:
@@ -310,11 +344,15 @@ class StatementResult(ABC):
         if mode in {"auto", "arrow"}:
             return self.persist(data=self.to_arrow_table())
 
+        if mode == "polars":
+            return self.persist(data=self.to_polars(stream=False))
+
         if mode == "spark":
             return self.persist(data=self.to_spark())
 
         raise ValueError(
-            f"Unknown persist mode: {mode!r}. Expected 'auto', 'arrow', or 'spark'."
+            f"Unknown persist mode: {mode!r}. Expected 'auto', 'arrow', "
+            "'polars', or 'spark'."
         )
 
     # -------------------------------------------------------------------------
@@ -555,6 +593,10 @@ class StatementResult(ABC):
         if self._arrow_table is not None:
             return pds.dataset(self._arrow_table, schema=resolved_schema)
 
+        if self._polars_df is not None:
+            table = _polars_to_arrow_table(self._polars_df)
+            return pds.dataset(table, schema=resolved_schema)
+
         if self._spark_df is not None:
             table = self._spark_df.toArrow()
             batches = table.to_batches(max_chunksize=batch_size) if batch_size else table.to_batches()
@@ -583,6 +625,9 @@ class StatementResult(ABC):
         """Materialize the full result as a local Arrow table."""
         if self._arrow_table is not None:
             return self._arrow_table
+
+        if self._polars_df is not None:
+            return _polars_to_arrow_table(self._polars_df)
 
         if self._spark_df is not None:
             return self._spark_df.toArrow()
@@ -633,6 +678,9 @@ class StatementResult(ABC):
     ) -> Union["polars.LazyFrame", "polars.DataFrame"]:
         """Convert the result to Polars."""
         from ..polars.lib import polars
+
+        if self._polars_df is not None:
+            return self._polars_df.lazy() if stream else self._polars_df
 
         dataset = self.to_arrow_dataset(
             max_workers=max_workers,
@@ -1450,3 +1498,109 @@ def _concat_arrow_tables(
 def _is_spark_dataframe(value: object) -> bool:
     """Return True when ``value`` looks like a PySpark DataFrame without importing Spark eagerly."""
     return type(value).__module__.startswith("pyspark.sql")
+
+
+def _is_polars_frame(value: object) -> bool:
+    """Return True when ``value`` looks like a Polars DataFrame/LazyFrame without importing Polars eagerly."""
+    return type(value).__module__.startswith("polars")
+
+
+def _polars_to_arrow_table(df: "polars.DataFrame") -> pa.Table:
+    """Convert a Polars DataFrame to an Arrow table using the newest compat level."""
+    from ..polars.lib import polars
+
+    return df.rechunk().to_arrow(compat_level=polars.CompatLevel.newest())
+
+
+@dataclass
+class LocalStatementResult(StatementResult):
+    """Concrete :class:`StatementResult` for an already-materialized local result.
+
+    Wraps a value that is computed synchronously by the caller — the common
+    case for in-process SQL engines (Polars, DuckDB, Arrow) that do not need
+    a backend lifecycle.  ``done`` is always ``True``; :meth:`start` and
+    :meth:`cancel` are no-ops; and :meth:`to_arrow_reader` streams from the
+    attached cache (Arrow, Polars, or Spark).
+
+    Instantiate via :meth:`from_data` so the attached value is normalized
+    through :meth:`persist` and a schema is derived up front.
+    """
+
+    _error: Optional[BaseException] = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+
+    @classmethod
+    def from_data(
+        cls,
+        data: Union[pa.Table, "polars.DataFrame", "polars.LazyFrame", "pyspark.sql.DataFrame"],
+        *,
+        statement: Optional["PreparedStatement | str"] = None,
+    ) -> "LocalStatementResult":
+        """Build a ready :class:`LocalStatementResult` from a materialized value."""
+        prepared = (
+            PreparedStatement()
+            if statement is None
+            else PreparedStatement.prepare(statement)
+        )
+        return cls(statement=prepared).persist(data=data)
+
+    @property
+    def done(self) -> bool:
+        return True
+
+    @property
+    def failed(self) -> bool:
+        return self._error is not None
+
+    def raise_for_status(self) -> "LocalStatementResult":
+        if self._error is not None:
+            raise self._error
+        return self
+
+    def refresh_status(self) -> "LocalStatementResult":
+        return self
+
+    def start(
+        self,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs: Any,
+    ) -> "LocalStatementResult":
+        del wait, kwargs
+        if raise_error:
+            self.raise_for_status()
+        return self
+
+    def cancel(self) -> "LocalStatementResult":
+        return self
+
+    def collect_schema(self, full: bool = False) -> Schema:
+        del full
+        if self._data_schema is not None:
+            return self._data_schema
+        if self._arrow_table is not None:
+            return Schema.from_(self._arrow_table)
+        if self._polars_df is not None:
+            return Schema.from_(self._polars_df)
+        if self._spark_df is not None:
+            return Schema.from_(self._spark_df)
+        return Schema.from_arrow(pa.schema([]))
+
+    def to_arrow_reader(
+        self,
+        *,
+        max_workers: int = 4,
+        max_in_flight: int | None = None,
+        batch_size: int | None = None,
+        schema: Optional[pa.Schema] = None,
+        maintain_order: bool = False,
+        stream: bool = True,
+    ) -> pa.RecordBatchReader:
+        del max_workers, max_in_flight, maintain_order, stream
+        resolved_schema = schema or self.arrow_schema
+        table = self.to_arrow_table(batch_size=batch_size, schema=resolved_schema)
+        if batch_size:
+            return table.to_reader(max_chunksize=batch_size)
+        return table.to_reader()

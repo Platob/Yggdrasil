@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import itertools
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator as AbcIterator, Generator as AbcGenerator
+from collections.abc import Iterable, Iterator as AbcIterator, Generator as AbcGenerator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Iterator, Optional, Sequence, TypeVar, Union, Generator
@@ -59,11 +59,36 @@ if TYPE_CHECKING:
 
     from yggdrasil.data.cast.options import CastOptionsArg
     from yggdrasil.data.schema import Schema
+    from yggdrasil.data.statement import LocalStatementResult, PreparedStatement
 
 
 O = TypeVar("O", bound=MediaOptions)
 
 __all__ = ["MediaIO", "MediaOptions"]
+
+
+def _coerce_lazy_frame(value: Any) -> "pl.LazyFrame":
+    """Coerce an arbitrary tabular value into a Polars ``LazyFrame``.
+
+    Used by :meth:`MediaIO.execute` to register user-supplied
+    ``external_tables`` aliases inside the local Polars SQL context.
+    """
+    if isinstance(value, pl.LazyFrame):
+        return value
+    if isinstance(value, pl.DataFrame):
+        return value.lazy()
+    if isinstance(value, MediaIO):
+        frame = value.read_polars_frame(lazy=True, batch_size=0)
+        return frame if isinstance(frame, pl.LazyFrame) else frame.lazy()
+    if isinstance(value, pa.Table):
+        return pl.from_arrow(value).lazy()
+    if isinstance(value, pa.RecordBatch):
+        return pl.from_arrow(pa.Table.from_batches([value])).lazy()
+    raise TypeError(
+        "external_tables values must be a polars DataFrame / LazyFrame, "
+        "a pyarrow Table / RecordBatch, or a MediaIO; "
+        f"got {type(value).__name__}"
+    )
 
 
 @dataclass(slots=True)
@@ -1078,20 +1103,19 @@ class MediaIO(ABC, Generic[O]):
     # SQL execution
     # ------------------------------------------------------------------
 
-    _EXECUTE_ENGINES = frozenset({"polars", "arrow", "pandas"})
-
     def execute(
         self,
-        statement: str,
-        engine: str = "polars",
+        statement: "PreparedStatement | str",
         *,
         name: str = "self",
+        parameters: "Mapping[str, Any] | None" = None,
+        external_tables: "Mapping[str, Any] | None" = None,
         columns: "Sequence[str] | None | Any" = ...,
         cast: "CastOptionsArg | Any" = ...,
         options: O | None = None,
         **option_kwargs,
-    ) -> "pl.DataFrame | pyarrow.Table | pandas.DataFrame":
-        """Run a SQL ``statement`` against this buffer and return the result.
+    ) -> "LocalStatementResult":
+        """Run a SQL ``statement`` against this buffer and return a :class:`StatementResult`.
 
         The buffer is registered as a lazy Polars table under ``name``
         (default ``"self"``) and the statement is executed through Polars'
@@ -1101,20 +1125,32 @@ class MediaIO(ABC, Generic[O]):
         scanning (Parquet, Arrow IPC, CSV, NDJSON) only materialize the
         slices the query actually needs.
 
+        The materialized Polars frame is attached to the returned
+        :class:`LocalStatementResult` via :meth:`StatementResult.persist`.
+        Callers pick their preferred representation through the result's
+        converters: :meth:`~StatementResult.to_polars`,
+        :meth:`~StatementResult.to_arrow_table`,
+        :meth:`~StatementResult.to_pandas`.
+
         Parameters
         ----------
         statement:
-            Non-empty SQL text. Reference the buffer by ``name``, e.g.
+            A :class:`PreparedStatement` or a non-empty SQL string.  Strings
+            are coerced via :meth:`PreparedStatement.prepare`.  Reference
+            the buffer by ``name``, e.g.
             ``"SELECT id, amount FROM self WHERE amount > 0"``.
-        engine:
-            Result materialization engine — one of:
-
-            * ``"polars"`` (default) → :class:`polars.DataFrame`
-            * ``"arrow"``             → :class:`pyarrow.Table`
-            * ``"pandas"``            → :class:`pandas.DataFrame`
         name:
             Alias under which the buffer is visible inside ``statement``.
             Defaults to ``"self"`` to match :meth:`polars.LazyFrame.sql`.
+        parameters:
+            Extra named parameters merged into the statement.  Currently
+            informational — carried on the returned
+            :class:`PreparedStatement` but not substituted by the local
+            Polars SQL path.
+        external_tables:
+            Extra external-table aliases merged into the statement.  Each
+            value is registered as an additional frame in the local
+            :class:`polars.SQLContext`.
         columns:
             Optional column projection applied at read time. Useful for
             formats whose readers cannot push the SQL projection down
@@ -1131,24 +1167,27 @@ class MediaIO(ABC, Generic[O]):
 
         Returns
         -------
-        The SQL result in the format selected by *engine*.
+        LocalStatementResult
+            A terminal :class:`StatementResult` with the computed frame
+            attached as a persisted Polars DataFrame.
 
         Raises
         ------
         ValueError
-            When ``statement`` is empty or ``engine`` is unrecognized.
+            When the prepared statement text is empty.
         """
-        if not isinstance(statement, str) or not statement.strip():
-            raise ValueError(
-                "MediaIO.execute requires a non-empty SQL statement string, "
-                f"got {statement!r}"
-            )
+        from yggdrasil.data.statement import LocalStatementResult, PreparedStatement
 
-        engine_key = str(engine).lower()
-        if engine_key not in self._EXECUTE_ENGINES:
+        prepared = PreparedStatement.prepare(
+            statement,
+            parameters=parameters,
+            external_tables=external_tables,
+        )
+
+        if not prepared.text or not prepared.text.strip():
             raise ValueError(
-                f"MediaIO.execute engine must be one of "
-                f"{sorted(self._EXECUTE_ENGINES)}, got {engine!r}"
+                "MediaIO.execute requires a non-empty SQL statement, "
+                f"got {prepared.text!r}"
             )
 
         # lazy=True gives Polars a LazyFrame to plan against; batch_size
@@ -1169,13 +1208,11 @@ class MediaIO(ABC, Generic[O]):
         if not isinstance(frame, pl.LazyFrame):
             frame = frame.lazy()
 
-        ctx = pl.SQLContext(frames={name: frame}, eager=False)
-        result = ctx.execute(statement).collect()
+        frames: dict[str, pl.LazyFrame] = {name: frame}
+        for alias, table in prepared.external_tables.items():
+            frames[alias] = _coerce_lazy_frame(table)
 
-        if engine_key == "polars":
-            return result
-        if engine_key == "arrow":
-            return self.polars_to_arrow_table(result)
-        # "pandas" — import lazily so base installs without pandas keep working.
-        from yggdrasil.pandas.lib import pandas  # noqa: F401
-        return result.to_pandas()
+        ctx = pl.SQLContext(frames=frames, eager=False)
+        result = ctx.execute(prepared.text).collect()
+
+        return LocalStatementResult.from_data(result, statement=prepared)
