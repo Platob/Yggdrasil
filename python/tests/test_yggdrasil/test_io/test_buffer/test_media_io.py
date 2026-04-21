@@ -707,45 +707,85 @@ class TestMarkDirtyFlushBack:
 # =====================================================================
 
 class TestExecute:
-    def test_select_all_returns_polars_by_default(
+    def test_select_all_returns_statement_result(
         self, mock_io: _MockMediaIO, sample_table
     ):
+        from yggdrasil.data.statement import LocalStatementResult
+
         mock_io.write_arrow_table(sample_table)
         out = mock_io.execute("SELECT * FROM self ORDER BY id")
-        assert isinstance(out, pl.DataFrame)
-        assert out.height == sample_table.num_rows
-        assert out.columns == sample_table.column_names
+        assert isinstance(out, LocalStatementResult)
+        assert out.done is True
+        assert out.failed is False
+        assert out.is_polars is True
+        assert out.persisted is True
+
+        df = out.to_polars(stream=False)
+        assert isinstance(df, pl.DataFrame)
+        assert df.height == sample_table.num_rows
+        assert df.columns == sample_table.column_names
 
     def test_projection_and_filter(self, mock_io: _MockMediaIO, sample_table):
         mock_io.write_arrow_table(sample_table)
         out = mock_io.execute(
             "SELECT name FROM self WHERE id > 1 ORDER BY id"
         )
-        assert isinstance(out, pl.DataFrame)
-        assert out.columns == ["name"]
-        assert out["name"].to_list() == ["b", "c"]
+        df = out.to_polars(stream=False)
+        assert df.columns == ["name"]
+        assert df["name"].to_list() == ["b", "c"]
 
-    def test_engine_arrow_returns_arrow_table(
+    def test_to_arrow_table_conversion(
         self, mock_io: _MockMediaIO, sample_table
     ):
         mock_io.write_arrow_table(sample_table)
-        out = mock_io.execute("SELECT id FROM self", engine="arrow")
-        assert isinstance(out, pa.Table)
-        assert out.column_names == ["id"]
+        out = mock_io.execute("SELECT id FROM self")
+        table = out.to_arrow_table()
+        assert isinstance(table, pa.Table)
+        assert table.column_names == ["id"]
 
     @pytest.mark.skipif(not HAS_PANDAS, reason="pandas required")
-    def test_engine_pandas_returns_pandas_frame(
+    def test_to_pandas_conversion(
         self, mock_io: _MockMediaIO, sample_table
     ):
         mock_io.write_arrow_table(sample_table)
-        out = mock_io.execute("SELECT id FROM self", engine="pandas")
-        assert isinstance(out, pd.DataFrame)
-        assert list(out.columns) == ["id"]
+        out = mock_io.execute("SELECT id FROM self")
+        frame = out.to_pandas()
+        assert isinstance(frame, pd.DataFrame)
+        assert list(frame.columns) == ["id"]
 
     def test_custom_table_name(self, mock_io: _MockMediaIO, sample_table):
         mock_io.write_arrow_table(sample_table)
         out = mock_io.execute("SELECT COUNT(*) AS n FROM t", name="t")
-        assert out["n"].to_list() == [sample_table.num_rows]
+        df = out.to_polars(stream=False)
+        assert df["n"].to_list() == [sample_table.num_rows]
+
+    def test_prepared_statement_input(
+        self, mock_io: _MockMediaIO, sample_table
+    ):
+        from yggdrasil.data.statement import PreparedStatement
+
+        mock_io.write_arrow_table(sample_table)
+        prepared = PreparedStatement(text="SELECT COUNT(*) AS n FROM self")
+        out = mock_io.execute(prepared)
+        assert out.statement is prepared or out.statement == prepared
+        assert out.to_polars(stream=False)["n"].to_list() == [
+            sample_table.num_rows
+        ]
+
+    def test_external_tables_registers_alias(
+        self, mock_io: _MockMediaIO, sample_table
+    ):
+        mock_io.write_arrow_table(sample_table)
+        extra = pl.DataFrame({"id": [1], "bonus": [100]})
+        out = mock_io.execute(
+            "SELECT self.id, extra.bonus FROM self "
+            "INNER JOIN extra ON self.id = extra.id",
+            external_tables={"extra": extra},
+        )
+        df = out.to_polars(stream=False)
+        assert df.columns == ["id", "bonus"]
+        assert df["id"].to_list() == [1]
+        assert df["bonus"].to_list() == [100]
 
     def test_empty_statement_raises(self, mock_io: _MockMediaIO, sample_table):
         mock_io.write_arrow_table(sample_table)
@@ -753,11 +793,6 @@ class TestExecute:
             mock_io.execute("")
         with pytest.raises(ValueError, match="non-empty SQL statement"):
             mock_io.execute("   ")
-
-    def test_unknown_engine_raises(self, mock_io: _MockMediaIO, sample_table):
-        mock_io.write_arrow_table(sample_table)
-        with pytest.raises(ValueError, match="engine must be one of"):
-            mock_io.execute("SELECT * FROM self", engine="duckdb")
 
 
 # =====================================================================
