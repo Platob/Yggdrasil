@@ -1,47 +1,41 @@
-"""Abstract filesystem path — ``pathlib.Path``-like API without inheritance.
+"""Abstract filesystem path — ``pathlib.Path``-like API, no inheritance.
 
-This module defines a backend-agnostic :class:`Path` abstraction. It mirrors
-the surface of :class:`pathlib.Path` (pure-path manipulation + concrete I/O)
-without inheriting from it, so the same call sites can transparently work on
-local files, Databricks paths, object stores, and anything else that plugs in.
+Modeled on :class:`yggdrasil.databricks.fs.path.DatabricksPath` so local,
+remote, and object-store paths share the same surface. Concrete subclasses
+fill in a small set of hooks; everything else (pure-path manipulation,
+``read_text`` / ``write_text``, ``touch``, ``glob`` / ``rglob``, ``copy_to``)
+comes from this base class for free.
 
-Layout
-------
-- :class:`PathKind`   — enum for file / directory / other / missing
-- :class:`StatResult` — minimal ``os.stat_result``-compatible dataclass
-- :class:`PurePath`   — name/parts manipulation, no I/O
-- :class:`Path`       — concrete I/O contract, abstract per backend
+Hierarchy
+---------
+::
 
-Design notes
+    Path (abstract, dataclass)
+    ├── LocalPath     — pathlib-backed, scheme ``"file"``
+    └── …             — other backends plug in separately
+
+Side classes
 ------------
-- Paths are POSIX-style (forward slash). Windows-drive parsing is intentionally
-  not baked in; a local-filesystem subclass can override ``_parse`` if it needs
-  Windows semantics.
-- ``parts`` carries the full split, including a leading ``"/"`` token when the
-  path is absolute. This matches ``pathlib.PurePosixPath.parts``.
-- Concrete subclasses override only the small set of abstract hooks; all
-  pure-path properties (``name``, ``stem``, ``suffix``…) and the bytes↔text
-  helpers (``read_text``, ``write_text``) come from the base class and stay
-  consistent across backends.
+- :class:`PathKind`   — file / directory / symlink / other / missing enum
+- :class:`StatResult` — dataclass mirroring the useful bits of ``os.stat_result``
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import fnmatch
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import (
     IO,
     TYPE_CHECKING,
     Any,
     ClassVar,
-    Iterable,
     Iterator,
     List,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -49,16 +43,10 @@ from typing import (
 if TYPE_CHECKING:
     from .filesystem import FileSystem
 
-__all__ = [
-    "PathKind",
-    "StatResult",
-    "PurePath",
-    "Path",
-]
+__all__ = ["PathKind", "StatResult", "Path"]
 
 
 _SEP = "/"
-_ROOT = "/"
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +55,8 @@ _ROOT = "/"
 
 
 class PathKind(str, Enum):
-    """What a path points at. Mirrors what ``os.stat`` would tell you.
-
-    ``MISSING`` is the explicit "nothing here" value — callers should not get
-    ``None`` when the path simply does not exist.
+    """What a path points at. ``MISSING`` is the explicit "nothing here" value
+    so callers don't have to handle ``None`` for non-existent paths.
     """
 
     FILE = "file"
@@ -96,9 +82,8 @@ class PathKind(str, Enum):
 class StatResult:
     """Minimal ``os.stat_result`` stand-in usable across backends.
 
-    Keeps the field set small and typed; backends that have more metadata
-    (ETag, content-type, owner…) should subclass and add fields rather than
-    cramming them into ``st_mode``.
+    Backends with richer metadata (ETag, content-type, owner…) should
+    subclass and extend rather than cram extras into ``mode``.
     """
 
     size: int = 0
@@ -106,11 +91,11 @@ class StatResult:
     kind: PathKind = PathKind.MISSING
     mode: int = 0
 
-    # os.stat_result is subscript-compatible — keep that convenience.
+    # os.stat_result is subscript-compatible — keep that affordance.
     def __getitem__(self, idx: int) -> Any:
         return (self.mode, 0, 0, 0, 0, 0, self.size, 0, self.mtime, 0)[idx]
 
-    # Aliases to match os.stat_result for drop-in use.
+    # Drop-in aliases for code that already reads os.stat_result.
     @property
     def st_size(self) -> int:
         return self.size
@@ -125,365 +110,167 @@ class StatResult:
 
 
 # ---------------------------------------------------------------------------
-# Parse helpers
+# Parsing helpers
 # ---------------------------------------------------------------------------
 
 
-def _split(raw: str) -> Tuple[bool, List[str]]:
-    """Split a posix-ish path string into ``(is_absolute, parts)``.
-
-    Backslashes are normalized to forward slashes so Windows-style inputs
-    don't trip callers. Empty segments are dropped.
-    """
+def _split(raw: str) -> List[str]:
+    """Split a path string into segments, normalizing backslashes."""
     if not raw:
-        return False, []
-    cleaned = raw.replace("\\", "/")
-    is_abs = cleaned.startswith(_SEP)
-    return is_abs, [p for p in cleaned.split(_SEP) if p]
+        return []
+    return [p for p in raw.replace("\\", _SEP).split(_SEP) if p]
 
 
-def _flatten(parts: Iterable[Any]) -> Tuple[bool, List[str]]:
-    """Flatten a heterogeneous input into ``(is_absolute, segments)``.
+def _flatten(parts: Any) -> List[str]:
+    """Flatten a path-ish input into a list of string segments.
 
-    Accepts strings, other PurePaths, ``pathlib.PurePath`` objects, and lists
-    of any of the above. Mirrors how ``pathlib`` handles the constructor.
+    Accepts :class:`Path`, ``pathlib.PurePath``, strings, bytes, or any
+    iterable of those. Mirrors how :class:`pathlib.PurePath` treats its
+    constructor arguments — permissive on input shape, strict on contents.
     """
-    is_abs = False
-    out: List[str] = []
-    first = True
-    for item in parts:
-        if item is None:
-            continue
-        if isinstance(item, PurePath):
-            if first and item._is_absolute:
-                is_abs = True
-            out.extend(item._parts)
-        elif hasattr(item, "parts") and not isinstance(item, (str, bytes)):
-            # pathlib.PurePath and anything else that exposes .parts.
-            raw = os.fspath(item) if hasattr(item, "__fspath__") else str(item)
-            abs_, segs = _split(raw)
-            if first and abs_:
-                is_abs = True
-            out.extend(segs)
-        else:
-            raw = os.fspath(item) if hasattr(item, "__fspath__") else str(item)
-            abs_, segs = _split(raw)
-            if first and abs_:
-                is_abs = True
-            out.extend(segs)
-        first = False
-    return is_abs, out
+    if parts is None:
+        return []
+    if isinstance(parts, Path):
+        return list(parts.parts)
+    if isinstance(parts, (str, bytes, os.PathLike)):
+        raw = os.fspath(parts) if isinstance(parts, os.PathLike) else parts
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return _split(raw)
+    if isinstance(parts, (list, tuple, set)):
+        out: List[str] = []
+        for item in parts:
+            out.extend(_flatten(item))
+        return out
+    # Last-ditch string coercion.
+    return _split(str(parts))
+
+
+def _coerce_mtime(value: Any) -> Optional[float]:
+    """Normalize an mtime-ish value to float seconds since epoch.
+
+    Handles Python datetime, ISO-8601 strings, and millisecond epoch ints
+    that backends sometimes hand back.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        return dt.datetime.fromisoformat(value).timestamp()
+    out = float(value)
+    # Anything past y2286 is almost certainly milliseconds, not seconds.
+    if out > 10_000_000_000:
+        out = out / 1000.0
+    return out
 
 
 # ---------------------------------------------------------------------------
-# PurePath — pure manipulation, no I/O
+# Path — abstract, pathlib.Path-like, dataclass-shaped like DatabricksPath
 # ---------------------------------------------------------------------------
 
 
 @dataclass(eq=False)
-class PurePath:
-    """Backend-agnostic pure path. All manipulation, zero I/O.
+class Path(ABC):
+    """Abstract filesystem path with ``pathlib.Path``-like behavior.
 
-    Subclass when you want different parsing rules (e.g. Windows drives, URL
-    schemes) but don't need I/O yet. Most concrete backends will subclass
-    :class:`Path` instead.
+    Shape is deliberately aligned with
+    :class:`yggdrasil.databricks.fs.path.DatabricksPath`:
+
+    - ``parts`` is a plain ``List[str]`` of segments, root-free.
+    - ``anchor`` is the absolute prefix (``""``, ``"/"``, ``"C:\\"``…).
+      Backends with a namespace rendering (``DBFS``, ``S3``) typically
+      leave this empty and override :meth:`full_path` instead.
+    - Cached metadata (``_is_file``, ``_is_dir``, ``_size``, ``_mtime``)
+      is filled in lazily by :meth:`_refresh_metadata`. Subclasses should
+      populate these in a single round-trip when possible.
+
+    Abstract hooks (minimal set a backend must provide)
+    ---------------------------------------------------
+    - :meth:`full_path`          — absolute string rendering
+    - :meth:`_refresh_metadata`  — fetch remote status into cache
+    - :meth:`_ls_impl`           — list children (recursive flag)
+    - :meth:`_mkdir_impl`        — create the directory
+    - :meth:`_remove_file_impl`  — delete this file
+    - :meth:`_remove_dir_impl`   — delete this directory
+    - :meth:`open`               — return a file-like handle
+
+    Everything else (``name``, ``stem``, ``parent``, ``parents``,
+    ``joinpath``, ``read_text`` / ``write_text``, ``touch``, ``glob``,
+    ``copy_to``, …) is derived here and stays consistent across backends.
     """
 
-    # The scheme is advisory — it lets ``__str__`` / ``url()`` produce a
-    # stable rendering for non-local backends (e.g. ``"dbfs"``, ``"s3"``).
-    # Local filesystems should leave it as ``""``.
+    #: URL-style scheme for this backend. Empty for local-style paths.
     scheme: ClassVar[str] = ""
 
-    _parts: List[str] = field(default_factory=list)
-    _is_absolute: bool = False
+    # ── Core fields ──────────────────────────────────────────────────
+    parts: List[str] = field(default_factory=list)
+    anchor: str = ""
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    # ── Cached metadata (excluded from eq/hash/repr) ─────────────────
+    _is_file: Optional[bool] = field(
+        repr=False, hash=False, compare=False, default=None
+    )
+    _is_dir: Optional[bool] = field(repr=False, hash=False, compare=False, default=None)
+    _size: Optional[int] = field(repr=False, hash=False, compare=False, default=None)
+    _mtime: Optional[float] = field(repr=False, hash=False, compare=False, default=None)
 
-    def __init__(self, *segments: Any) -> None:
-        abs_, parts = _flatten(segments)
-        self._parts = parts
-        self._is_absolute = abs_
+    # Optional filesystem handle. Set by :meth:`FileSystem.path`.
+    _fs: Optional["FileSystem"] = field(
+        repr=False, hash=False, compare=False, default=None
+    )
 
-    # Dataclass-like copy helper used by ``with_*`` and ``joinpath``.
-    def _replace(
-        self, parts: Sequence[str], is_absolute: Optional[bool] = None
-    ) -> "PurePath":
-        clone = object.__new__(type(self))
-        clone._parts = list(parts)
-        clone._is_absolute = self._is_absolute if is_absolute is None else is_absolute
-        return clone
+    # ================================================================ #
+    # Factory                                                           #
+    # ================================================================ #
 
-    # ------------------------------------------------------------------
-    # pathlib.PurePath read-only properties
-    # ------------------------------------------------------------------
+    @classmethod
+    def parse(cls, obj: Any) -> "Path":
+        """Build an instance from a string, list, or another :class:`Path`.
 
-    @property
-    def parts(self) -> Tuple[str, ...]:
-        """Path components, including the root sentinel for absolute paths.
-
-        Mirrors ``pathlib.PurePosixPath.parts``: absolute paths prepend
-        ``"/"`` so callers can distinguish ``/a/b`` from ``a/b``.
+        Subclasses override to handle namespace prefixes (``dbfs:/…``) or
+        URL schemes. The base implementation assumes a plain POSIX path.
         """
-        if self._is_absolute:
-            return (_ROOT, *self._parts)
-        return tuple(self._parts)
-
-    @property
-    def anchor(self) -> str:
-        """``"/"`` for absolute paths, ``""`` otherwise."""
-        return _ROOT if self._is_absolute else ""
-
-    @property
-    def root(self) -> str:
-        return self.anchor
-
-    @property
-    def drive(self) -> str:
-        # POSIX default; Windows-style subclasses can override.
-        return ""
-
-    @property
-    def name(self) -> str:
-        return self._parts[-1] if self._parts else ""
-
-    @property
-    def suffix(self) -> str:
-        name = self.name
-        idx = name.rfind(".")
-        return name[idx:] if idx > 0 else ""
-
-    @property
-    def suffixes(self) -> List[str]:
-        name = self.name
-        if not name or name.startswith("."):
-            return []
-        pieces = name.split(".")
-        return [f".{p}" for p in pieces[1:]] if len(pieces) > 1 else []
-
-    @property
-    def stem(self) -> str:
-        name = self.name
-        idx = name.rfind(".")
-        return name[:idx] if idx > 0 else name
-
-    @property
-    def parent(self) -> "PurePath":
-        if not self._parts:
-            return self
-        return self._replace(self._parts[:-1])
-
-    @property
-    def parents(self) -> Tuple["PurePath", ...]:
-        out: List[PurePath] = []
-        cur = self
-        while cur._parts:
-            cur = cur.parent
-            out.append(cur)
-        return tuple(out)
-
-    # ------------------------------------------------------------------
-    # pathlib.PurePath manipulation
-    # ------------------------------------------------------------------
-
-    def is_absolute(self) -> bool:
-        return self._is_absolute
-
-    def as_posix(self) -> str:
-        body = _SEP.join(self._parts)
-        return (_ROOT + body) if self._is_absolute else body
-
-    def joinpath(self, *others: Any) -> "PurePath":
-        cur = self
-        for other in others:
-            cur = cur / other
-        return cur
-
-    def with_name(self, name: str) -> "PurePath":
-        if not self._parts:
-            raise ValueError(
-                f"Cannot set name on empty path: {self!r}. "
-                "Build a non-empty path first, e.g. Path('dir') / name."
-            )
-        if not name or _SEP in name or "\\" in name:
-            raise ValueError(
-                f"Invalid name {name!r}. Names cannot be empty or contain "
-                "path separators — use joinpath() for nested paths."
-            )
-        return self._replace(self._parts[:-1] + [name])
-
-    def with_suffix(self, suffix: str) -> "PurePath":
-        if suffix and not suffix.startswith("."):
-            raise ValueError(
-                f"Invalid suffix {suffix!r}. Suffixes must start with '.' "
-                "(e.g. '.parquet'), or be '' to strip the existing suffix."
-            )
-        return self.with_name(self.stem + suffix)
-
-    def with_stem(self, stem: str) -> "PurePath":
-        return self.with_name(stem + self.suffix)
-
-    def match(self, pattern: str) -> bool:
-        """Glob-match against the name or full string.
-
-        Matches ``pathlib.PurePath.match`` loosely: tries the filename first,
-        then the full rendering. Backends with scheme-aware rendering stay
-        consistent because both forms go through ``as_posix``.
-        """
-        return fnmatch.fnmatch(self.name, pattern) or fnmatch.fnmatch(
-            self.as_posix(), pattern
-        )
-
-    def is_relative_to(self, other: Any) -> bool:
-        other = self._coerce(other)
-        if self._is_absolute != other._is_absolute:
-            return False
-        return self._parts[: len(other._parts)] == other._parts
-
-    def relative_to(self, other: Any) -> "PurePath":
-        other = self._coerce(other)
-        if not self.is_relative_to(other):
-            raise ValueError(
-                f"{self.as_posix()!r} is not relative to {other.as_posix()!r}. "
-                "Use is_relative_to() to test the relationship first."
-            )
-        return self._replace(self._parts[len(other._parts) :], is_absolute=False)
-
-    # ------------------------------------------------------------------
-    # Coercion / dunder
-    # ------------------------------------------------------------------
-
-    def _coerce(self, obj: Any) -> "PurePath":
-        """Coerce ``obj`` to a path of this class, preserving abs/rel."""
-        if isinstance(obj, PurePath):
+        if isinstance(obj, Path):
             return obj
-        abs_, parts = _flatten((obj,))
-        return self._replace(parts, is_absolute=abs_)
+        raw = os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
+        anchor = _SEP if raw.startswith(_SEP) or raw.startswith("\\") else ""
+        return cls(parts=_split(raw), anchor=anchor)
 
-    def __truediv__(self, other: Any) -> "PurePath":
-        if other is None or other == "":
-            return self
-        abs_, segs = _flatten((other,))
-        # Right-hand absolute paths replace the left-hand side, matching
-        # pathlib semantics for ``Path('/a') / '/b' == Path('/b')``.
-        if abs_:
-            return self._replace(segs, is_absolute=True)
-        return self._replace(self._parts + segs)
+    # ================================================================ #
+    # Abstract hooks — implement per backend                            #
+    # ================================================================ #
 
-    def __rtruediv__(self, other: Any) -> "PurePath":
-        abs_, segs = _flatten((other,))
-        return self._replace(segs + self._parts, is_absolute=abs_ or self._is_absolute)
+    @abstractmethod
+    def full_path(self) -> str:
+        """Absolute string rendering of this path."""
 
-    def __str__(self) -> str:
-        rendered = self.as_posix() or "."
-        if self.scheme:
-            return (
-                f"{self.scheme}://{rendered}"
-                if not rendered.startswith(_SEP)
-                else f"{self.scheme}:{rendered}"
-            )
-        return rendered
+    @abstractmethod
+    def _refresh_metadata(self) -> None:
+        """Fetch backend status into ``_is_file`` / ``_is_dir`` / ``_size`` / ``_mtime``."""
 
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.as_posix()!r})"
+    @abstractmethod
+    def _ls_impl(
+        self, recursive: bool = False, allow_not_found: bool = True
+    ) -> Iterator["Path"]:
+        """Yield children of this directory."""
 
-    def __fspath__(self) -> str:
-        return self.as_posix()
+    @abstractmethod
+    def _mkdir_impl(self, parents: bool = True, exist_ok: bool = True) -> None:
+        """Create the directory at this path."""
 
-    def __hash__(self) -> int:
-        return hash((type(self).__name__, self._is_absolute, tuple(self._parts)))
+    @abstractmethod
+    def _remove_file_impl(self, allow_not_found: bool = True) -> None:
+        """Delete the file at this path."""
 
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, PurePath):
-            return (
-                type(self) is type(other)
-                and self._is_absolute == other._is_absolute
-                and self._parts == other._parts
-            )
-        if isinstance(other, str):
-            return self.as_posix() == other
-        return NotImplemented
-
-
-# ---------------------------------------------------------------------------
-# Path — concrete I/O contract
-# ---------------------------------------------------------------------------
-
-
-@dataclass(eq=False)
-class Path(PurePath, ABC):
-    """Abstract filesystem path with ``pathlib.Path``-like I/O.
-
-    Subclasses must implement the small set of abstract hooks; everything
-    else (``read_text``, ``write_text``, ``touch``, ``parents``, ``name``,
-    ``match``…) comes from this class or :class:`PurePath`.
-
-    Subclasses typically hold a reference to a :class:`FileSystem` (set via
-    ``filesystem`` / ``_fs``) to route I/O. Backends without a separable FS
-    layer (pure pathlib-style local paths) can just implement the hooks.
-    """
-
-    # Concrete backends fill this in; it's optional so tests and lightweight
-    # implementations aren't forced to build a full FileSystem first.
-    _fs: Optional["FileSystem"] = field(default=None, repr=False, compare=False)
-
-    def __init__(
-        self, *segments: Any, filesystem: Optional["FileSystem"] = None
+    @abstractmethod
+    def _remove_dir_impl(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True,
     ) -> None:
-        PurePath.__init__(self, *segments)
-        self._fs = filesystem
-
-    # ------------------------------------------------------------------
-    # Filesystem binding
-    # ------------------------------------------------------------------
-
-    @property
-    def filesystem(self) -> Optional["FileSystem"]:
-        """The :class:`FileSystem` this path is bound to, if any."""
-        return self._fs
-
-    def _replace(
-        self, parts: Sequence[str], is_absolute: Optional[bool] = None
-    ) -> "Path":
-        clone = object.__new__(type(self))
-        clone._parts = list(parts)
-        clone._is_absolute = self._is_absolute if is_absolute is None else is_absolute
-        clone._fs = self._fs
-        return clone
-
-    # ------------------------------------------------------------------
-    # Abstract I/O hooks — the minimum a backend must provide
-    # ------------------------------------------------------------------
-
-    @abstractmethod
-    def stat(self) -> StatResult:
-        """Return filesystem metadata as a :class:`StatResult`.
-
-        Must return a ``StatResult`` with ``kind=MISSING`` for non-existent
-        paths rather than raising — callers rely on that to implement
-        ``exists()`` without a try/except.
-        """
-
-    @abstractmethod
-    def iterdir(self) -> Iterator["Path"]:
-        """Yield one level of children (no recursion).
-
-        Raises ``FileNotFoundError`` only when the directory truly does not
-        exist; empty directories yield nothing.
-        """
-
-    @abstractmethod
-    def mkdir(self, *, parents: bool = False, exist_ok: bool = False) -> None:
-        """Create a directory at this path."""
-
-    @abstractmethod
-    def unlink(self, *, missing_ok: bool = False) -> None:
-        """Remove this file. Directories should use :meth:`rmdir`."""
-
-    @abstractmethod
-    def rmdir(self, *, recursive: bool = False, missing_ok: bool = False) -> None:
-        """Remove this directory. ``recursive=True`` drops its contents too."""
+        """Delete the directory at this path."""
 
     @abstractmethod
     def open(
@@ -494,31 +281,272 @@ class Path(PurePath, ABC):
         errors: Optional[str] = None,
         newline: Optional[str] = None,
     ) -> IO:
-        """Open the file and return a file-like object."""
+        """Open the file and return a file-like object (pathlib.Path.open)."""
 
-    @abstractmethod
-    def rename(self, target: Any) -> "Path":
-        """Rename to ``target`` and return the resulting :class:`Path`."""
+    # ================================================================ #
+    # pathlib.PurePosixPath — pure-path manipulation                    #
+    # ================================================================ #
 
-    # ------------------------------------------------------------------
-    # Concrete helpers — derived from the abstract hooks
-    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        """Last component — ``pathlib.PurePath.name``."""
+        return self.parts[-1] if self.parts else ""
+
+    @property
+    def suffix(self) -> str:
+        """Last extension with the leading dot."""
+        name = self.name
+        idx = name.rfind(".")
+        return name[idx:] if idx > 0 else ""
+
+    @property
+    def suffixes(self) -> List[str]:
+        """All extensions, dotted."""
+        name = self.name
+        if not name or name.startswith("."):
+            return []
+        pieces = name.split(".")
+        return [f".{p}" for p in pieces[1:]] if len(pieces) > 1 else []
+
+    @property
+    def stem(self) -> str:
+        """Name minus the last suffix."""
+        name = self.name
+        idx = name.rfind(".")
+        return name[:idx] if idx > 0 else name
+
+    @property
+    def extension(self) -> str:
+        """Dot-less extension convenience (``'txt'``, not ``'.txt'``)."""
+        return self.suffix.lstrip(".")
+
+    @property
+    def parent(self) -> "Path":
+        """Parent path."""
+        if not self.parts:
+            return self
+        return self._copy_with(
+            parts=self.parts[:-1],
+            _is_file=False,
+            _is_dir=True,
+            _size=0,
+        )
+
+    @property
+    def parents(self) -> Tuple["Path", ...]:
+        """All ancestors, closest first."""
+        out: List[Path] = []
+        cur: Path = self
+        while cur.parts:
+            cur = cur.parent
+            out.append(cur)
+        return tuple(out)
+
+    def is_absolute(self) -> bool:
+        """True when the path has a root anchor.
+
+        Backends whose :meth:`full_path` always renders an absolute string
+        (e.g. ``dbfs:/…``) should override this to return ``True``.
+        """
+        return bool(self.anchor)
+
+    def as_posix(self) -> str:
+        """POSIX-style rendering without scheme decoration."""
+        body = _SEP.join(self.parts)
+        return self.anchor + body if self.anchor else body
+
+    def joinpath(self, *others: Any) -> "Path":
+        """Join one or more path components."""
+        cur: Path = self
+        for other in others:
+            cur = cur / other
+        return cur
+
+    def with_name(self, name: str) -> "Path":
+        if not self.parts:
+            raise ValueError(
+                f"Cannot set name on empty path {self!r}. "
+                "Build a non-empty path first, e.g. Path('dir') / name."
+            )
+        if not name or _SEP in name or "\\" in name:
+            raise ValueError(
+                f"Invalid name {name!r}. Names cannot be empty or contain "
+                "path separators — use joinpath() for nested paths."
+            )
+        return self._copy_with(parts=self.parts[:-1] + [name])
+
+    def with_suffix(self, suffix: str) -> "Path":
+        if suffix and not suffix.startswith("."):
+            raise ValueError(
+                f"Invalid suffix {suffix!r}. Suffixes must start with '.' "
+                "(e.g. '.parquet') or be '' to strip the existing suffix."
+            )
+        return self.with_name(self.stem + suffix)
+
+    def with_stem(self, stem: str) -> "Path":
+        return self.with_name(stem + self.suffix)
+
+    def match(self, pattern: str) -> bool:
+        """Glob match against the name, then the full rendering."""
+        return fnmatch.fnmatch(self.name, pattern) or fnmatch.fnmatch(
+            self.full_path(), pattern
+        )
+
+    def is_relative_to(self, other: Any) -> bool:
+        other = self._coerce(other)
+        if type(self) is not type(other):
+            return False
+        if self.anchor != other.anchor:
+            return False
+        return self.parts[: len(other.parts)] == other.parts
+
+    def relative_to(self, other: Any) -> "Path":
+        other = self._coerce(other)
+        if not self.is_relative_to(other):
+            raise ValueError(
+                f"{self.full_path()!r} is not relative to {other.full_path()!r}. "
+                "Use is_relative_to() to test the relationship first."
+            )
+        return self._copy_with(parts=self.parts[len(other.parts) :], anchor="")
+
+    # ================================================================ #
+    # pathlib.Path — concrete I/O                                       #
+    # ================================================================ #
 
     def exists(self, *, follow_symlinks: bool = True) -> bool:
-        del follow_symlinks  # Left in the signature for pathlib.Path parity.
-        return self.stat().kind.exists
+        del follow_symlinks  # signature parity with pathlib.Path
+        return bool(self.is_file() or self.is_dir())
 
-    def is_file(self) -> bool:
-        return self.stat().kind.is_file
+    def is_file(self) -> Optional[bool]:
+        if self._is_file is None:
+            self._refresh_metadata()
+        return self._is_file
 
-    def is_dir(self) -> bool:
-        return self.stat().kind.is_dir
+    def is_dir(self) -> Optional[bool]:
+        if self._is_dir is None:
+            self._refresh_metadata()
+        return self._is_dir
 
     def is_symlink(self) -> bool:
-        return self.stat().kind is PathKind.SYMLINK
+        return False
 
-    # ``resolve`` / ``absolute`` default to "I already am" — concrete
-    # backends override if they need to handle ``.``, ``..``, or symlinks.
+    def stat(self) -> StatResult:
+        """Refresh cached metadata and return a :class:`StatResult`."""
+        self._refresh_metadata()
+        if self._is_file:
+            kind = PathKind.FILE
+        elif self._is_dir:
+            kind = PathKind.DIRECTORY
+        else:
+            kind = PathKind.MISSING
+        return StatResult(
+            size=self._size or 0,
+            mtime=self._mtime or 0.0,
+            kind=kind,
+            mode=0,
+        )
+
+    def iterdir(self) -> Iterator["Path"]:
+        """One level of children."""
+        yield from self._ls_impl(recursive=False, allow_not_found=True)
+
+    def ls(
+        self,
+        recursive: bool = False,
+        allow_not_found: bool = True,
+    ) -> Iterator["Path"]:
+        """Flexible listing — matches the DatabricksPath legacy helper."""
+        yield from self._ls_impl(recursive=recursive, allow_not_found=allow_not_found)
+
+    def glob(self, pattern: str) -> Iterator["Path"]:
+        """Recursive glob filtered by *pattern* (matches DatabricksPath)."""
+        for child in self._ls_impl(recursive=True, allow_not_found=True):
+            if fnmatch.fnmatch(child.name, pattern):
+                yield child
+
+    def rglob(self, pattern: str) -> Iterator["Path"]:
+        """Alias for :meth:`glob` — always recursive."""
+        yield from self.glob(pattern)
+
+    def walk(self) -> Iterator[Tuple["Path", List["Path"], List["Path"]]]:
+        """``os.walk``-style traversal rooted at this path."""
+        dirs: List[Path] = []
+        files: List[Path] = []
+        for child in self.iterdir():
+            (dirs if child.is_dir() else files).append(child)
+        yield self, dirs, files
+        for sub in dirs:
+            yield from sub.walk()
+
+    def mkdir(
+        self,
+        mode: int = 0o777,
+        parents: bool = True,
+        exist_ok: bool = True,
+    ) -> "Path":
+        del mode  # Most remote backends ignore POSIX mode bits.
+        self._mkdir_impl(parents=parents, exist_ok=exist_ok)
+        return self
+
+    def rmdir(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+        with_root: bool = True,
+    ) -> "Path":
+        self._remove_dir_impl(
+            recursive=recursive,
+            allow_not_found=allow_not_found,
+            with_root=with_root,
+        )
+        return self
+
+    def unlink(self, missing_ok: bool = True) -> None:
+        """``pathlib.Path.unlink`` — delegates to :meth:`remove`."""
+        self.remove(recursive=True, allow_not_found=missing_ok)
+
+    def rmfile(self, allow_not_found: bool = True) -> "Path":
+        self._remove_file_impl(allow_not_found=allow_not_found)
+        return self
+
+    def remove(
+        self,
+        recursive: bool = True,
+        allow_not_found: bool = True,
+    ) -> "Path":
+        """File or directory, whichever this path happens to be."""
+        if self.is_file():
+            self._remove_file_impl(allow_not_found=allow_not_found)
+        elif self.is_dir():
+            self._remove_dir_impl(
+                recursive=recursive,
+                allow_not_found=allow_not_found,
+                with_root=True,
+            )
+        elif not allow_not_found:
+            raise FileNotFoundError(f"{self!r} does not exist")
+        return self
+
+    def rename(self, target: Any) -> "Path":
+        """``pathlib.Path.rename`` — copy + remove by default."""
+        target_path = self._coerce(target)
+        self.copy_to(target_path)
+        self.remove(recursive=True)
+        return target_path
+
+    def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
+        """``pathlib.Path.touch``.
+
+        Default write-empty-bytes implementation. Backends with native
+        touch semantics (e.g. S3 zero-byte PUT) should override.
+        """
+        del mode
+        if self.exists():
+            if not exist_ok:
+                raise FileExistsError(f"Path already exists: {self.full_path()!r}")
+            return
+        self.write_bytes(b"")
+
     def resolve(self, *, strict: bool = False) -> "Path":
         del strict
         return self
@@ -526,9 +554,7 @@ class Path(PurePath, ABC):
     def absolute(self) -> "Path":
         return self
 
-    # ------------------------------------------------------------------
-    # Read/write convenience — written in terms of ``open``
-    # ------------------------------------------------------------------
+    # ── Bytes / text helpers ───────────────────────────────────────
 
     def read_bytes(self) -> bytes:
         with self.open("rb") as fh:
@@ -553,47 +579,160 @@ class Path(PurePath, ABC):
         errors: str = "strict",
         newline: Optional[str] = None,
     ) -> int:
-        del newline  # Signature parity; encoding happens before write_bytes.
+        del newline  # Signature parity; encoding runs before write_bytes.
         encoded = data.encode(encoding, errors=errors)
         self.write_bytes(encoded)
         return len(encoded)
 
-    def touch(self, *, exist_ok: bool = True) -> None:
-        """Create an empty file, updating mtime when it already exists.
+    # ── Copy ───────────────────────────────────────────────────────
 
-        Backends with native ``touch`` should override — the default here
-        rewrites the file with empty bytes, which is correct but not cheap.
+    def copy_to(self, dest: Any, allow_not_found: bool = True) -> "Path":
+        """Copy this file or directory to ``dest``.
+
+        Default implementation streams bytes for files and recurses for
+        directories. Backends with a cheap server-side copy should override.
         """
-        if self.exists():
-            if not exist_ok:
-                raise FileExistsError(f"Path already exists: {self.as_posix()!r}")
-            return
-        self.write_bytes(b"")
+        dest_path = self._coerce(dest)
+        if self.is_file():
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(self.read_bytes())
+        elif self.is_dir():
+            dest_path.mkdir(parents=True, exist_ok=True)
+            skip = len(self.parts)
+            for child in self.ls(recursive=True, allow_not_found=True):
+                if child.is_file():
+                    target = dest_path._copy_with(
+                        parts=dest_path.parts + child.parts[skip:],
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(child.read_bytes())
+        elif not allow_not_found:
+            raise FileNotFoundError(f"{self!r} does not exist")
+        return dest_path
 
-    # ------------------------------------------------------------------
-    # Listing helpers
-    # ------------------------------------------------------------------
+    # ================================================================ #
+    # Metadata                                                          #
+    # ================================================================ #
 
-    def glob(self, pattern: str) -> Iterator["Path"]:
-        """Non-recursive glob of direct children by name."""
-        for child in self.iterdir():
-            if fnmatch.fnmatch(child.name, pattern):
-                yield child
+    @property
+    def content_length(self) -> int:
+        if self._size is None:
+            self._refresh_metadata()
+        return self._size or 0
 
-    def rglob(self, pattern: str) -> Iterator["Path"]:
-        """Recursive glob. Walks into directories depth-first."""
-        for child in self.iterdir():
-            if fnmatch.fnmatch(child.name, pattern):
-                yield child
-            if child.is_dir():
-                yield from child.rglob(pattern)
+    @content_length.setter
+    def content_length(self, value: Optional[int]) -> None:
+        self._size = value
 
-    def walk(self) -> Iterator[Tuple["Path", List["Path"], List["Path"]]]:
-        """Yield ``(root, dirs, files)`` tuples, like :func:`os.walk`."""
-        dirs: List[Path] = []
-        files: List[Path] = []
-        for child in self.iterdir():
-            (dirs if child.is_dir() else files).append(child)
-        yield self, dirs, files
-        for sub in dirs:
-            yield from sub.walk()
+    @property
+    def mtime(self) -> Optional[float]:
+        if self._mtime is None:
+            self._refresh_metadata()
+        return self._mtime
+
+    @mtime.setter
+    def mtime(self, value: Any) -> None:
+        self._mtime = _coerce_mtime(value)
+
+    def refresh_status(self) -> "Path":
+        self._refresh_metadata()
+        return self
+
+    def reset_metadata(
+        self,
+        is_file: Optional[bool] = None,
+        is_dir: Optional[bool] = None,
+        size: Optional[int] = None,
+        mtime: Any = None,
+    ) -> "Path":
+        self._is_file = is_file
+        self._is_dir = is_dir
+        self._size = None if size is None else int(size)
+        self._mtime = _coerce_mtime(mtime)
+        return self
+
+    # ================================================================ #
+    # FileSystem binding                                                #
+    # ================================================================ #
+
+    @property
+    def filesystem(self) -> Optional["FileSystem"]:
+        return self._fs
+
+    def bind(self, fs: "FileSystem") -> "Path":
+        self._fs = fs
+        return self
+
+    # ================================================================ #
+    # Clone / coerce                                                    #
+    # ================================================================ #
+
+    def _copy_with(self, **overrides: Any) -> "Path":
+        """Internal clone. Forwards to :func:`dataclasses.replace`.
+
+        Cached metadata is cleared unless the caller passes it explicitly,
+        so a cloned path doesn't inherit stale status from the original.
+        """
+        defaults = dict(
+            _is_file=None,
+            _is_dir=None,
+            _size=None,
+            _mtime=None,
+            _fs=self._fs,
+        )
+        defaults.update(overrides)
+        return replace(self, **defaults)
+
+    def _coerce(self, obj: Any) -> "Path":
+        """Coerce *obj* to a path of this class."""
+        if isinstance(obj, Path) and type(obj) is type(self):
+            return obj
+        parsed = type(self).parse(obj)
+        if self._fs is not None and parsed._fs is None:
+            parsed._fs = self._fs
+        return parsed
+
+    # ================================================================ #
+    # Dunder                                                            #
+    # ================================================================ #
+
+    def __hash__(self) -> int:
+        return hash((type(self).__name__, self.full_path()))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Path):
+            return (
+                type(self) is type(other)
+                and self.anchor == other.anchor
+                and self.parts == other.parts
+            )
+        if isinstance(other, str):
+            return self.full_path() == other
+        return NotImplemented
+
+    def __truediv__(self, other: Any) -> "Path":
+        if other is None or other == "":
+            return self
+        # An absolute RHS replaces the LHS — matches pathlib semantics for
+        # ``Path('/a') / '/b' == Path('/b')``.
+        if isinstance(other, Path):
+            if other.anchor:
+                return self._copy_with(parts=list(other.parts), anchor=other.anchor)
+            return self._copy_with(parts=self.parts + list(other.parts))
+        raw = os.fspath(other) if isinstance(other, os.PathLike) else str(other)
+        raw_norm = raw.replace("\\", _SEP)
+        if raw_norm.startswith(_SEP):
+            return self._copy_with(parts=_split(raw_norm), anchor=_SEP)
+        return self._copy_with(parts=self.parts + _split(raw_norm))
+
+    def __rtruediv__(self, other: Any) -> "Path":
+        return self._coerce(other) / self
+
+    def __str__(self) -> str:
+        return self.full_path()
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.full_path()!r})"
+
+    def __fspath__(self) -> str:
+        return self.full_path()

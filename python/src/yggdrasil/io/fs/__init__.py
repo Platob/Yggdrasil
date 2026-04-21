@@ -2,26 +2,30 @@
 
 Public surface
 --------------
-- :class:`Path`       — abstract ``pathlib.Path``-like path (no inheritance)
-- :class:`PurePath`   — pure manipulation (name/parts/suffix/…)
-- :class:`StatResult` — ``os.stat_result``-style dataclass
-- :class:`PathKind`   — file/dir/symlink/missing enum
-- :class:`FileSystem` — abstract backend (open/ls/stat/mkdir/rm/rename)
+- :class:`Path`             — abstract ``pathlib.Path``-like path (no inheritance)
+- :class:`PathKind`         — file/directory/symlink/other/missing enum
+- :class:`StatResult`       — ``os.stat_result``-style dataclass
+- :class:`FileSystem`       — abstract backend (path/stat/open/ls/mkdir/rm/…)
+- :class:`LocalPath`        — local :class:`Path` backed by :mod:`pathlib`
+- :class:`LocalFileSystem`  — local :class:`FileSystem` — scheme ``"file"``
 
-Backends plug in via :func:`register_filesystem` (auto-registered when the
-subclass declares a ``scheme``). Looked up with :func:`get_filesystem`.
+Backends plug in via :func:`register_filesystem` (auto-registered when a
+concrete subclass declares a ``scheme``). Look them up with
+:func:`get_filesystem`.
 """
 
 from __future__ import annotations
 
 from .filesystem import FileSystem, get_filesystem, register_filesystem
-from .path import Path, PathKind, PurePath, StatResult
+from .local import LocalFileSystem, LocalPath
+from .path import Path, PathKind, StatResult
 
 __all__ = [
     "FileSystem",
+    "LocalFileSystem",
+    "LocalPath",
     "Path",
     "PathKind",
-    "PurePath",
     "StatResult",
     "get_filesystem",
     "register_filesystem",
