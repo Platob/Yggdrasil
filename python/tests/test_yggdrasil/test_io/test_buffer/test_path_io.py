@@ -208,8 +208,13 @@ class TestPathOptions:
             PathOptions(recursive="yes")  # type: ignore[arg-type]
 
     def test_partition_base_dir_normalized_to_path(self, tmp_path: Path):
+        # ``partition_base_dir`` now coerces through ``Path.from_any`` so
+        # a string input becomes a :class:`yggdrasil.io.fs.Path` (LocalPath
+        # fallback). pathlib.Path inputs pass through the same coercion.
+        from yggdrasil.io.fs import Path as FsPath
+
         opt = PathOptions(partition_base_dir=str(tmp_path))
-        assert isinstance(opt.partition_base_dir, Path)
+        assert isinstance(opt.partition_base_dir, FsPath)
 
     def test_ignore_prefixes_must_be_sequence_not_string(self):
         with pytest.raises(TypeError, match="ignore_prefixes"):

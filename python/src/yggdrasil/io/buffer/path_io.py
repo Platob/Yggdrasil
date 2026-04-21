@@ -23,16 +23,18 @@ Cast is applied symmetrically at the batch iterator level
 (:meth:`options.cast.cast_iterator`), so ``read_arrow_table`` and
 ``read_arrow_batches`` produce identically-cast output.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import InitVar, dataclass
+from pathlib import Path as _PathlibPath
 from typing import TYPE_CHECKING, Any, Optional
 
 from yggdrasil.arrow.lib import pyarrow as pa
 from yggdrasil.io.enums import MediaType, MimeType, MimeTypes
+from yggdrasil.io.fs import Path
 from .bytes_io import BytesIO
 from .media_io import MediaIO
 from .media_options import MediaOptions
@@ -47,15 +49,17 @@ _DEFAULT_IGNORE_PREFIXES = (".", "_")
 
 # Formats that pyarrow.dataset can scan natively. For any other mime
 # type (XLSX, XML, ZIP, …) we fall back to per-file MediaIO delegation.
-_DATASET_CAPABLE_MIMES: frozenset[MimeType] = frozenset({
-    MimeTypes.PARQUET,
-    MimeTypes.ARROW_IPC,
-    MimeTypes.ORC,
-    MimeTypes.CSV,
-    MimeTypes.TSV,
-    MimeTypes.JSON,
-    MimeTypes.NDJSON,
-})
+_DATASET_CAPABLE_MIMES: frozenset[MimeType] = frozenset(
+    {
+        MimeTypes.PARQUET,
+        MimeTypes.ARROW_IPC,
+        MimeTypes.ORC,
+        MimeTypes.CSV,
+        MimeTypes.TSV,
+        MimeTypes.JSON,
+        MimeTypes.NDJSON,
+    }
+)
 
 # Everything PathIO is willing to consider, dataset or not. Used by
 # `iter_files(supported_only=True)`.
@@ -65,6 +69,7 @@ _SUPPORTED_MIME_TYPES: tuple[MimeType, ...] = tuple(_DATASET_CAPABLE_MIMES)
 # =====================================================================
 # Options
 # =====================================================================
+
 
 @dataclass
 class PathOptions(MediaOptions):
@@ -107,7 +112,7 @@ class PathOptions(MediaOptions):
     supported_only: bool = True
     format: Any = None
     partitioning: str | Sequence[str] | None = "hive"
-    partition_base_dir: str | Path | None = None
+    partition_base_dir: str | Path | _PathlibPath | None = None
     exclude_invalid_files: bool | None = None
     ignore_prefixes: Sequence[str] | None = _DEFAULT_IGNORE_PREFIXES
     batch_readahead: int = 16
@@ -117,7 +122,9 @@ class PathOptions(MediaOptions):
         super().__post_init__()
 
         if not isinstance(self.recursive, bool):
-            raise TypeError(f"recursive must be bool, got {type(self.recursive).__name__}")
+            raise TypeError(
+                f"recursive must be bool, got {type(self.recursive).__name__}"
+            )
         if not isinstance(self.include_hidden, bool):
             raise TypeError(
                 f"include_hidden must be bool, got {type(self.include_hidden).__name__}"
@@ -128,7 +135,14 @@ class PathOptions(MediaOptions):
             )
 
         if self.partition_base_dir is not None:
-            self.partition_base_dir = Path(self.partition_base_dir)
+            # ``partition_base_dir`` is compared to file paths via
+            # ``_path_parts`` which works on anything with ``.parts`` or a
+            # string rendering. Keep the value as-is when it's already a
+            # yggdrasil :class:`Path`; otherwise coerce through the safe
+            # entry point so str / pathlib.Path inputs land on the right
+            # backend.
+            if not isinstance(self.partition_base_dir, Path):
+                self.partition_base_dir = Path.from_any(self.partition_base_dir)
 
         if self.ignore_prefixes is not None:
             if isinstance(self.ignore_prefixes, (str, bytes)):
@@ -158,7 +172,9 @@ class PathOptions(MediaOptions):
         return value
 
     @classmethod
-    def resolve(cls, *, options: "PathOptions | None" = None, **overrides: Any) -> "PathOptions":
+    def resolve(
+        cls, *, options: "PathOptions | None" = None, **overrides: Any
+    ) -> "PathOptions":
         return cls.check_parameters(options=options, **overrides)
 
 
@@ -166,16 +182,76 @@ class PathOptions(MediaOptions):
 # PathIO
 # =====================================================================
 
+
 @dataclass(slots=True)
 class PathIO(MediaIO[PathOptions], ABC):
-    path: Any = field(default_factory=Path)
+    """PathIO backs reads/writes with a :class:`Path`, stored on the holder.
 
-    def __post_init__(self) -> None:
+    The filesystem path lives on :attr:`holder.path` (``self.holder._path``),
+    the same slot :class:`BytesIO` uses for a spilled backing file. That
+    keeps a single source of truth — anyone inspecting ``io.holder.path``
+    or ``io.path`` sees the same object — and lets the base :class:`MediaIO`
+    machinery manage buffer lifecycle alongside the path.
+
+    :attr:`path` is exposed as a property for backward compatibility.
+    Setting it rewrites the holder's backing path.
+    """
+
+    # ``path`` is declared as an :class:`InitVar` so the dataclass-generated
+    # ``__init__`` (on this class and on subclasses that use
+    # ``@dataclass``) accepts ``path=`` as a kwarg. The value is routed
+    # to :meth:`__post_init__` and stashed on ``self.holder._path`` —
+    # that's the single source of truth.
+    #
+    # An :class:`InitVar` default is read from the class attribute at
+    # decoration time; defining a ``@property path`` in this class body
+    # would overwrite that default with the property descriptor. To
+    # avoid the collision the ``path`` property is attached **after**
+    # the class is built, below.
+    path: InitVar[Any] = None
+
+    def __post_init__(self, path: Any = None) -> None:
+        # Prefer an explicit ``path=`` kwarg; fall back to whatever the
+        # holder is already carrying (some callers build a BytesIO from
+        # the path first and hand it in as the holder).
+        resolved = path if path is not None else self.holder.path
+        if resolved is None:
+            raise ValueError(
+                f"{type(self).__name__} requires a non-None path. "
+                "Pass a str, pathlib.Path, yggdrasil.io.fs.Path, or any "
+                "object with read_bytes/is_file/is_dir."
+            )
+
+        # Safe-parse stringy / pathlib / PathLike inputs via the typed
+        # entry point so the correct backend (LocalPath, DBFSPath, …)
+        # gets picked. Anything that already looks like a Path — either
+        # one of ours or a duck-typed remote (e.g. DatabricksPath) — is
+        # left alone so subclasses can keep their own concrete types.
+        self.holder._path = self._coerce_path(resolved)
+
         if self.media_type is None:
             self.media_type = MediaType.parse(
                 self.infer_mime_type(),
                 default=MediaType(MimeTypes.PARQUET),
             )
+
+    @staticmethod
+    def _coerce_path(value: Any) -> Any:
+        """Coerce *value* to a path-like object without forcing a backend.
+
+        Routes plain strings, ``pathlib.Path``, ``bytes``, and
+        ``os.PathLike`` through :meth:`Path.from_any` so the right
+        :class:`yggdrasil.io.fs.Path` subclass is picked. Anything
+        already implementing the path protocol (our :class:`Path`, or a
+        duck-typed external type such as :class:`DatabricksPath`) passes
+        through unchanged.
+        """
+        if isinstance(value, Path):
+            return value
+        # Duck-type: if it walks like a path, don't force a re-parse.
+        if hasattr(value, "read_bytes") and hasattr(value, "is_file"):
+            return value
+        return Path.from_any(value)
 
     # ------------------------------------------------------------------
     # Subclass hooks
@@ -195,10 +271,12 @@ class PathIO(MediaIO[PathOptions], ABC):
     @abstractmethod
     def make(
         cls,
-        path: str | Path,
+        path: str | Path | _PathlibPath,
         media: MediaType | MimeType | str | None = None,
     ) -> "PathIO":
-        raise TypeError(f"{cls.__name__} is abstract and cannot be instantiated directly")
+        raise TypeError(
+            f"{cls.__name__} is abstract and cannot be instantiated directly"
+        )
 
     @abstractmethod
     def iter_files(
@@ -427,9 +505,7 @@ class PathIO(MediaIO[PathOptions], ABC):
     ) -> None:
         """Write support is not implemented yet."""
         del batches, options
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support writes yet"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support writes yet")
 
     def _collect_arrow_schema(self, full: bool = False) -> "pa.Schema":
         """Return the Arrow schema of this path.
@@ -580,6 +656,7 @@ class PathIO(MediaIO[PathOptions], ABC):
 
                 if options.filter is not None:
                     import pyarrow.compute as pc
+
                     mask = self._build_filter_mask(
                         table_or_batch=batch, filter_spec=options.filter, pc=pc
                     )
@@ -693,10 +770,7 @@ class PathIO(MediaIO[PathOptions], ABC):
 
         if isinstance(filter, Sequence) and not isinstance(filter, (str, bytes)):
             # Single-tuple shorthand: (col, value) or (col, op, value).
-            if (
-                len(filter) in {2, 3}
-                and isinstance(filter[0], str)
-            ):
+            if len(filter) in {2, 3} and isinstance(filter[0], str):
                 return PathIO._expression_from_tuple(filter)
 
             expr = None
@@ -731,7 +805,9 @@ class PathIO(MediaIO[PathOptions], ABC):
         if isinstance(value, set):
             value = list(value)
 
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
             values = list(value)
             if not values:
                 # Empty IN — match nothing.
@@ -795,9 +871,8 @@ class PathIO(MediaIO[PathOptions], ABC):
                 mask = current if mask is None else pc.and_kleene(mask, current)
             return mask
 
-        if (
-            isinstance(filter_spec, (list, tuple))
-            and not isinstance(filter_spec, (str, bytes))
+        if isinstance(filter_spec, (list, tuple)) and not isinstance(
+            filter_spec, (str, bytes)
         ):
             if len(filter_spec) in {2, 3} and isinstance(filter_spec[0], str):
                 return cls._mask_from_tuple(
@@ -817,9 +892,7 @@ class PathIO(MediaIO[PathOptions], ABC):
                 mask = current if mask is None else pc.and_kleene(mask, current)
             return mask
 
-        raise TypeError(
-            "filter must be a mapping or a sequence of filter tuples"
-        )
+        raise TypeError("filter must be a mapping or a sequence of filter tuples")
 
     @staticmethod
     def _mask_from_value(*, table_or_batch, column: str, value: Any, pc):
@@ -831,9 +904,8 @@ class PathIO(MediaIO[PathOptions], ABC):
         if isinstance(value, set):
             value = list(value)
 
-        if (
-            isinstance(value, (list, tuple))
-            and not isinstance(value, (str, bytes, bytearray))
+        if isinstance(value, (list, tuple)) and not isinstance(
+            value, (str, bytes, bytearray)
         ):
             if not value:
                 # Empty IN → never matches. pa.BooleanArray doesn't
@@ -910,9 +982,8 @@ class PathIO(MediaIO[PathOptions], ABC):
             return []
         if isinstance(filter_spec, dict):
             return list(filter_spec.keys())
-        if (
-            isinstance(filter_spec, Sequence)
-            and not isinstance(filter_spec, (str, bytes))
+        if isinstance(filter_spec, Sequence) and not isinstance(
+            filter_spec, (str, bytes)
         ):
             if len(filter_spec) in {2, 3} and isinstance(filter_spec[0], str):
                 return [filter_spec[0]]
@@ -951,7 +1022,7 @@ class PathIO(MediaIO[PathOptions], ABC):
         file_parts = cls._path_parts(file_path)
         base_parts = cls._path_parts(partition_base_dir)
         if base_parts and file_parts[: len(base_parts)] == base_parts:
-            return file_parts[len(base_parts):]
+            return file_parts[len(base_parts) :]
         return file_parts
 
     @classmethod
@@ -987,11 +1058,7 @@ class PathIO(MediaIO[PathOptions], ABC):
             return out
 
         names = list(partitioning)
-        return {
-            name: value
-            for name, value in zip(names, directory_parts)
-            if name
-        }
+        return {name: value for name, value in zip(names, directory_parts) if name}
 
     # ------------------------------------------------------------------
     # Dataset format resolution
@@ -1043,12 +1110,35 @@ class PathIO(MediaIO[PathOptions], ABC):
         if mime_type is MimeTypes.CSV:
             return ds.CsvFileFormat()
         if mime_type is MimeTypes.TSV:
-            return ds.CsvFileFormat(
-                parse_options=pa_csv.ParseOptions(delimiter="\t")
-            )
+            return ds.CsvFileFormat(parse_options=pa_csv.ParseOptions(delimiter="\t"))
         if mime_type in {MimeTypes.JSON, MimeTypes.NDJSON}:
             return ds.JsonFileFormat()
         if mime_type is MimeTypes.ORC:
             return ds.OrcFileFormat()
 
         raise NotImplementedError(f"Unsupported dataset format for {mime_type!r}")
+
+
+# --------------------------------------------------------------------------
+# ``PathIO.path`` — property assigned after the @dataclass decorator
+# --------------------------------------------------------------------------
+#
+# Attaching the property here (instead of in the class body) avoids the
+# dataclass trap where a class-level ``path`` descriptor shadows the
+# :class:`InitVar` default. Behaviorally this is a normal property:
+# ``io.path`` reads ``io.holder.path`` and ``io.path = X`` rewrites
+# the holder's backing after invalidating any cached mmap / read handle.
+
+
+def _pathio_get_path(self: PathIO) -> Any:
+    """Backing filesystem path. Stored on :attr:`PathIO.holder.path`."""
+    return self.holder.path
+
+
+def _pathio_set_path(self: PathIO, value: Any) -> None:
+    self.holder._invalidate_mmap()
+    self.holder._close_read_fh()
+    self.holder._path = PathIO._coerce_path(value)
+
+
+PathIO.path = property(_pathio_get_path, _pathio_set_path)  # type: ignore[assignment]

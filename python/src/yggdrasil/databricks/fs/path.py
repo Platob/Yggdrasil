@@ -13,18 +13,27 @@ Hierarchy
 All namespace-specific logic lives in the concrete subclasses; the base class
 provides shared fields, ``parse()`` factory, and the ``pathlib``-compatible API.
 """
+
 from __future__ import annotations
 
 import datetime as dt
 import fnmatch
 import logging
+import os
 import stat as stat_mod
 import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, astuple, replace
 from typing import (
-    Any, ClassVar, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
 )
 from urllib.parse import urlparse
 
@@ -68,8 +77,13 @@ __all__ = [
 NOT_FOUND_ERRORS = (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied)
 ALREADY_EXISTS_ERRORS = (AlreadyExists, ResourceAlreadyExists, BadRequest)
 SDK_ERRORS = (
-    NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied,
-    AlreadyExists, ResourceAlreadyExists, InternalError,
+    NotFound,
+    ResourceDoesNotExist,
+    BadRequest,
+    PermissionDenied,
+    AlreadyExists,
+    ResourceAlreadyExists,
+    InternalError,
 )
 
 
@@ -77,20 +91,23 @@ SDK_ERRORS = (
 # stat_result stand-in
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, slots=True)
 class DatabricksStatResult:
     """Minimal ``os.stat_result``-compatible object for Databricks paths."""
+
     st_size: int = 0
     st_mtime: float = 0.0
     st_mode: int = 0
 
-    def __getitem__(self, idx):          # os.stat_result is subscript-able
+    def __getitem__(self, idx):  # os.stat_result is subscript-able
         return astuple(self)[idx]
 
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
+
 
 def _split(path: str) -> List[str]:
     return [p for p in path.split("/") if p]
@@ -124,7 +141,7 @@ def _parse_string(s: str) -> Tuple[Optional[str], List[str], Optional[str]]:
         return None, _split(u.path), host
 
     if s.startswith("dbfs:/"):
-        return "dbfs", _split(s[len("dbfs:/"):]), None
+        return "dbfs", _split(s[len("dbfs:/") :]), None
 
     parts = _split(s)
     if parts and parts[0].lower() in _NAMESPACES:
@@ -155,6 +172,7 @@ def _flatten(parts) -> List[str]:
 # Abstract base
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @dataclass(eq=False)
 class DatabricksPath(ABC):
     """``pathlib.PurePosixPath``-like API for Databricks remote paths.
@@ -170,12 +188,15 @@ class DatabricksPath(ABC):
     temporary: bool = field(default=False)
 
     # Cached metadata (excluded from eq/hash)
-    _is_file: bool | None  = field(repr=False, hash=False, compare=False, default=None)
-    _is_dir: bool | None  = field(repr=False, hash=False, compare=False, default=None)
-    _size: int | None   = field(repr=False, hash=False, compare=False, default=None)
+    _is_file: bool | None = field(repr=False, hash=False, compare=False, default=None)
+    _is_dir: bool | None = field(repr=False, hash=False, compare=False, default=None)
+    _size: int | None = field(repr=False, hash=False, compare=False, default=None)
     _mtime: float | None = field(repr=False, hash=False, compare=False, default=None)
-    _client:  Optional["DatabricksClient"] = field(
-        repr=False, hash=False, compare=False, default=None,
+    _client: Optional["DatabricksClient"] = field(
+        repr=False,
+        hash=False,
+        compare=False,
+        default=None,
     )
 
     # True once the path has been registered with the shutdown registry.
@@ -183,7 +204,11 @@ class DatabricksPath(ABC):
     # methods by (func, id(instance)) and uses WeakMethod internally, so a
     # plain boolean flag is enough and avoids spurious strong references.
     _shutdown_registered: bool = field(
-        default=False, init=False, repr=False, hash=False, compare=False,
+        default=False,
+        init=False,
+        repr=False,
+        hash=False,
+        compare=False,
     )
 
     def __post_init__(self) -> None:
@@ -203,8 +228,9 @@ class DatabricksPath(ABC):
         """Fetch remote status and cache in ``_is_file / _is_dir / _size / _mtime``."""
 
     @abstractmethod
-    def _ls_impl(self, recursive: bool, fetch_size: int | None,
-                 allow_not_found: bool) -> Iterator["DatabricksPath"]: ...
+    def _ls_impl(
+        self, recursive: bool, fetch_size: int | None, allow_not_found: bool
+    ) -> Iterator["DatabricksPath"]: ...
 
     @abstractmethod
     def _mkdir_impl(self, parents: bool, exist_ok: bool) -> None: ...
@@ -213,8 +239,9 @@ class DatabricksPath(ABC):
     def _remove_file_impl(self, allow_not_found: bool) -> None: ...
 
     @abstractmethod
-    def _remove_dir_impl(self, recursive: bool, allow_not_found: bool,
-                         with_root: bool) -> None: ...
+    def _remove_dir_impl(
+        self, recursive: bool, allow_not_found: bool, with_root: bool
+    ) -> None: ...
 
     # ================================================================== #
     # Factory                                                             #
@@ -272,6 +299,7 @@ class DatabricksPath(ABC):
 
         if hostname:
             from ..client import DatabricksClient
+
             client = DatabricksClient(host=hostname)
 
         return klass(parts=tail, temporary=temporary, _client=client)
@@ -314,8 +342,11 @@ class DatabricksPath(ABC):
         if not self.parts:
             return self
         return self._copy_with(
-            parts=self.parts[:-1], temporary=False,
-            _is_file=False, _is_dir=True, _size=0,
+            parts=self.parts[:-1],
+            temporary=False,
+            _is_file=False,
+            _is_dir=True,
+            _size=0,
         )
 
     @property
@@ -365,7 +396,7 @@ class DatabricksPath(ABC):
             other = self.parse(other, client=self._client)
         if type(self) is not type(other):
             return False
-        return self.parts[:len(other.parts)] == other.parts
+        return self.parts[: len(other.parts)] == other.parts
 
     def relative_to(self, other: Union["DatabricksPath", str]) -> "DatabricksPath":
         """Compute relative path — ``pathlib.PurePosixPath.relative_to``."""
@@ -373,7 +404,7 @@ class DatabricksPath(ABC):
             other = self.parse(other, client=self._client)
         if not self.is_relative_to(other):
             raise ValueError(f"{self} is not relative to {other}")
-        return self._copy_with(parts=self.parts[len(other.parts):])
+        return self._copy_with(parts=self.parts[len(other.parts) :])
 
     # ================================================================== #
     # pathlib.Path — concrete I/O operations                              #
@@ -398,7 +429,11 @@ class DatabricksPath(ABC):
     def stat(self) -> DatabricksStatResult:
         """``pathlib.Path.stat`` — returns :class:`DatabricksStatResult`."""
         self._refresh_metadata()
-        mode = stat_mod.S_IFREG if self._is_file else (stat_mod.S_IFDIR if self._is_dir else 0)
+        mode = (
+            stat_mod.S_IFREG
+            if self._is_file
+            else (stat_mod.S_IFDIR if self._is_dir else 0)
+        )
         return DatabricksStatResult(
             st_size=self._size or 0,
             st_mtime=self._mtime or 0.0,
@@ -411,7 +446,9 @@ class DatabricksPath(ABC):
 
     def glob(self, pattern: str) -> Iterator["DatabricksPath"]:
         """``pathlib.Path.glob`` — recursive listing filtered by *pattern*."""
-        for child in self._ls_impl(recursive=True, fetch_size=None, allow_not_found=True):
+        for child in self._ls_impl(
+            recursive=True, fetch_size=None, allow_not_found=True
+        ):
             if fnmatch.fnmatch(child.name, pattern):
                 yield child
 
@@ -438,7 +475,9 @@ class DatabricksPath(ABC):
     ) -> "DatabricksPath":
         """Remove directory (recursive by default)."""
         self._remove_dir_impl(
-            recursive=recursive, allow_not_found=allow_not_found, with_root=with_root,
+            recursive=recursive,
+            allow_not_found=allow_not_found,
+            with_root=with_root,
         )
         return self
 
@@ -456,7 +495,9 @@ class DatabricksPath(ABC):
             self._remove_file_impl(allow_not_found=allow_not_found)
         elif self.is_dir():
             self._remove_dir_impl(
-                recursive=recursive, allow_not_found=allow_not_found, with_root=True,
+                recursive=recursive,
+                allow_not_found=allow_not_found,
+                with_root=True,
             )
 
         if allow_not_found:
@@ -489,11 +530,9 @@ class DatabricksPath(ABC):
     ) -> DatabricksIO:
         """``pathlib.Path.open`` — returns a :class:`DatabricksIO` handle."""
         path = self.connect()
-        return (
-            DatabricksIO
-            .create_instance(path=path, mode=mode, encoding=encoding)
-            .connect(clone=False)
-        )
+        return DatabricksIO.create_instance(
+            path=path, mode=mode, encoding=encoding
+        ).connect(clone=False)
 
     def read_bytes(self, use_cache: bool = False) -> bytes:
         """``pathlib.Path.read_bytes``."""
@@ -504,6 +543,126 @@ class DatabricksPath(ABC):
         """``pathlib.Path.write_bytes``."""
         with self.open("wb") as f:
             f.write_all_bytes(data=data)
+
+    # ── Optimized memory access (yggdrasil.io.fs.Path-compatible) ─────
+    #
+    # Mirrors the API ``yggdrasil.io.fs.Path`` exposes so BytesIO and
+    # other callers can treat a DatabricksPath as if it were a local
+    # file: :meth:`pread` / :meth:`pwrite` / :meth:`memoryview` /
+    # :meth:`open_mmap` / :attr:`local_os_path` / :attr:`is_local_fs`.
+
+    @property
+    def local_os_path(self) -> Optional[str]:
+        """Return a FUSE-mounted local path for ``/dbfs/…`` files, else ``None``.
+
+        Databricks clusters expose DBFS under ``/dbfs/`` via FUSE, so
+        :class:`DBFSPath` is directly addressable by :mod:`os` and
+        :mod:`mmap`. Workspace / volumes / table paths have no such
+        mount and return ``None`` — callers fall back to read_bytes /
+        pread round-tripping.
+        """
+        if self.kind is DatabricksPathKind.DBFS:
+            full = self.full_path()
+            # /dbfs/ is the FUSE mount; anything else would be misleading.
+            if full.startswith("/dbfs/"):
+                return full
+        return None
+
+    @property
+    def is_local_fs(self) -> bool:
+        return self.local_os_path is not None
+
+    def pread(self, n: int, pos: int) -> bytes:
+        """Positional read. Uses ``os.pread`` on DBFS mounts, range read otherwise."""
+        if n <= 0:
+            return b""
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+
+        local = self.local_os_path
+        if local and hasattr(os, "pread"):
+            with open(local, "rb") as fh:
+                return os.pread(fh.fileno(), n, pos)
+
+        # Fallback: cached full-file read. DatabricksIO can support
+        # range GETs; opting into them here would duplicate code that
+        # already lives on DatabricksIO, so stick with the simple,
+        # correct fallback.
+        data = self.read_bytes(use_cache=True)
+        end = min(pos + n, len(data))
+        if pos >= end:
+            return b""
+        return bytes(data[pos:end])
+
+    def pwrite(self, data, pos: int) -> int:
+        """Positional write. Uses ``os.pwrite`` on DBFS mounts; read-modify-write otherwise."""
+        mv = memoryview(data)
+        if len(mv) == 0:
+            return 0
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+
+        local = self.local_os_path
+        if local and hasattr(os, "pwrite"):
+            if not self.exists():
+                self.parent.mkdir(parents=True, exist_ok=True)
+                self.write_bytes(b"")
+            with open(local, "r+b") as fh:
+                return int(os.pwrite(fh.fileno(), mv, pos))
+
+        existing = self.read_bytes() if self.exists() else b""
+        new_size = max(len(existing), pos + len(mv))
+        buf = bytearray(new_size)
+        buf[: len(existing)] = existing
+        buf[pos : pos + len(mv)] = mv
+        self.write_bytes(bytes(buf))
+        return len(mv)
+
+    def open_mmap(self, mode: str = "r"):
+        """Memory-map this file when it's exposed via the DBFS FUSE mount.
+
+        Returns ``None`` for non-mounted paths — callers fall back to
+        :meth:`memoryview` which materializes bytes once.
+        """
+        import mmap as _mmap
+
+        local = self.local_os_path
+        if not local:
+            return None
+        try:
+            size = os.stat(local).st_size
+        except OSError:
+            return None
+        if size == 0:
+            return None
+        access = _mmap.ACCESS_READ if mode == "r" else _mmap.ACCESS_WRITE
+        open_mode = "rb" if mode == "r" else "r+b"
+        with open(local, open_mode) as fh:
+            return _mmap.mmap(fh.fileno(), length=0, access=access)
+
+    def memoryview(
+        self,
+        *,
+        offset: int = 0,
+        size: Optional[int] = None,
+    ) -> "memoryview":
+        """Return a (possibly zero-copy) view of this file's bytes."""
+        if offset < 0:
+            raise ValueError("memoryview offset must be >= 0")
+
+        mm = self.open_mmap("r")
+        if mm is not None:
+            mv = memoryview(mm)
+            if offset == 0 and size is None:
+                return mv
+            end = len(mv) if size is None else offset + size
+            return mv[offset:end]
+
+        data = self.read_bytes()
+        if offset == 0 and size is None:
+            return memoryview(data)
+        end = len(data) if size is None else offset + size
+        return memoryview(data)[offset:end]
 
     def read_text(self, encoding: str = "utf-8", errors: str | None = None) -> str:
         """``pathlib.Path.read_text``."""
@@ -552,7 +711,9 @@ class DatabricksPath(ABC):
             skip = len(self.parts)
             for child in self.ls(recursive=True, allow_not_found=True):
                 child.copy_to(
-                    dest=dest_path._copy_with(parts=dest_path.parts + child.parts[skip:]),
+                    dest=dest_path._copy_with(
+                        parts=dest_path.parts + child.parts[skip:]
+                    ),
                     allow_not_found=allow_not_found,
                 )
         elif not allow_not_found:
@@ -569,7 +730,9 @@ class DatabricksPath(ABC):
         allow_not_found: bool = True,
     ) -> Iterator["DatabricksPath"]:
         yield from self._ls_impl(
-            recursive=recursive, fetch_size=fetch_size, allow_not_found=allow_not_found,
+            recursive=recursive,
+            fetch_size=fetch_size,
+            allow_not_found=allow_not_found,
         )
 
     def path_parts(self) -> List[str]:
@@ -620,8 +783,10 @@ class DatabricksPath(ABC):
     @property
     def file_info(self) -> FileInfo:
         return FileInfo(
-            path=self.full_path(), type=self.file_type,
-            mtime=self.mtime, size=self.content_length,
+            path=self.full_path(),
+            type=self.file_type,
+            mtime=self.mtime,
+            size=self.content_length,
         )
 
     def refresh_status(self) -> "DatabricksPath":
@@ -632,11 +797,11 @@ class DatabricksPath(ABC):
         self,
         is_file: bool | None = None,
         is_dir: bool | None = None,
-        size:    int | None  = None,
-        mtime: float | None= None,
+        size: int | None = None,
+        mtime: float | None = None,
     ) -> "DatabricksPath":
         self._is_file = is_file
-        self._is_dir  = is_dir
+        self._is_dir = is_dir
         self._size = None if size is None else int(size)
         self._mtime = _coerce_mtime_seconds(mtime)
         return self
@@ -653,6 +818,7 @@ class DatabricksPath(ABC):
     def client(self) -> "DatabricksClient":
         if self._client is None:
             from ..client import DatabricksClient
+
             self._client = DatabricksClient.current()
         return self._client
 
@@ -804,7 +970,8 @@ class DatabricksPath(ABC):
                 self._client.__exit__(exc_type, exc_val, exc_tb)
             except Exception:
                 logger.debug(
-                    "Client __exit__ raised for %s", self.full_path(),
+                    "Client __exit__ raised for %s",
+                    self.full_path(),
                     exc_info=True,
                 )
         self.close(wait=exc_type is not None)
@@ -837,12 +1004,12 @@ class DatabricksPath(ABC):
     def clone_instance(self, **kwargs) -> "DatabricksPath":
         return replace(
             self,
-            parts   =kwargs.get("parts",   self.parts),
-            _client =kwargs.get("client",  self._client),
+            parts=kwargs.get("parts", self.parts),
+            _client=kwargs.get("client", self._client),
             _is_file=kwargs.get("is_file", self._is_file),
-            _is_dir =kwargs.get("is_dir",  self._is_dir),
-            _size   =kwargs.get("size",    self._size),
-            _mtime  =kwargs.get("mtime",   self._mtime),
+            _is_dir=kwargs.get("is_dir", self._is_dir),
+            _size=kwargs.get("size", self._size),
+            _mtime=kwargs.get("mtime", self._mtime),
         )
 
     def url(self) -> str:
@@ -866,16 +1033,23 @@ class DatabricksPath(ABC):
 # Empty sentinel
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def _empty(client=None) -> "DBFSPath":
     return DBFSPath(
-        parts=[], temporary=False, _client=client,
-        _is_file=False, _is_dir=False, _size=0, _mtime=0.0,
+        parts=[],
+        temporary=False,
+        _client=client,
+        _is_file=False,
+        _is_dir=False,
+        _size=0,
+        _mtime=0.0,
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DBFSPath  (/dbfs/…)
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 @dataclass(eq=False)
 class DBFSPath(DatabricksPath):
@@ -888,9 +1062,12 @@ class DBFSPath(DatabricksPath):
         try:
             info = self._sdk().dbfs.get_status(self.full_path())
             self.reset_metadata(
-                is_file=not info.is_dir, is_dir=info.is_dir,
+                is_file=not info.is_dir,
+                is_dir=info.is_dir,
                 size=info.file_size,
-                mtime=info.modification_time / 1000.0 if info.modification_time else None,
+                mtime=(
+                    info.modification_time / 1000.0 if info.modification_time else None
+                ),
             )
             return
         except NOT_FOUND_ERRORS:
@@ -898,7 +1075,7 @@ class DBFSPath(DatabricksPath):
         found = next(self._ls_impl(False, 1, True), None)
         self.reset_metadata(
             is_file=None if found is None else False,
-            is_dir =None if found is None else True,
+            is_dir=None if found is None else True,
             size=None,
             mtime=found.mtime if found else None,
         )
@@ -909,12 +1086,17 @@ class DBFSPath(DatabricksPath):
                 child = DBFSPath(
                     parts=info.path.split("/")[2:],
                     _client=self.workspace,
-                    _is_file=not info.is_dir, _is_dir=info.is_dir,
+                    _is_file=not info.is_dir,
+                    _is_dir=info.is_dir,
                     _size=info.file_size,
-                    _mtime=_coerce_mtime_seconds(getattr(info, "modification_time", None)),
+                    _mtime=_coerce_mtime_seconds(
+                        getattr(info, "modification_time", None)
+                    ),
                 )
                 if recursive and info.is_dir:
-                    yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
+                    yield from child._ls_impl(
+                        recursive=True, allow_not_found=allow_not_found
+                    )
                 else:
                     yield child
         except NOT_FOUND_ERRORS:
@@ -955,6 +1137,7 @@ class DBFSPath(DatabricksPath):
 # WorkspacePath  (/Workspace/…)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @dataclass(eq=False)
 class WorkspacePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.WORKSPACE
@@ -967,7 +1150,8 @@ class WorkspacePath(DatabricksPath):
             info = self._sdk().workspace.get_status(self.full_path())
             is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
             self.reset_metadata(
-                is_file=not is_dir, is_dir=is_dir,
+                is_file=not is_dir,
+                is_dir=is_dir,
                 size=info.size,
                 mtime=float(info.modified_at) / 1000.0 if info.modified_at else None,
             )
@@ -977,19 +1161,22 @@ class WorkspacePath(DatabricksPath):
         found = next(self._ls_impl(False, 1, True), None)
         self.reset_metadata(
             is_file=None if found is None else False,
-            is_dir =None if found is None else True,
+            is_dir=None if found is None else True,
             size=None,
             mtime=found.mtime if found else None,
         )
 
     def _ls_impl(self, recursive=False, fetch_size=None, allow_not_found=True):
         try:
-            for info in self._sdk().workspace.list(self.full_path(), recursive=recursive):
+            for info in self._sdk().workspace.list(
+                self.full_path(), recursive=recursive
+            ):
                 is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
                 yield WorkspacePath(
                     parts=info.path.split("/")[2:],
                     _client=self.workspace,
-                    _is_file=not is_dir, _is_dir=is_dir,
+                    _is_file=not is_dir,
+                    _is_dir=is_dir,
                     _size=info.size,
                     _mtime=_coerce_mtime_seconds(getattr(info, "modified_at", None)),
                 )
@@ -1031,12 +1218,16 @@ class WorkspacePath(DatabricksPath):
 # VolumePath  (/Volumes/catalog/schema/volume/…)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @dataclass(eq=False)
 class VolumePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.VOLUME
 
     _volume_info: Optional[VolumeInfo] = field(
-        repr=False, hash=False, compare=False, default=None,
+        repr=False,
+        hash=False,
+        compare=False,
+        default=None,
     )
 
     def full_path(self) -> str:
@@ -1058,7 +1249,8 @@ class VolumePath(DatabricksPath):
             cat, sch, vol, _ = self.sql_volume_or_table_parts()
             if cat and sch and vol:
                 self._volume_info = get_volume_metadata(
-                    sdk=self._sdk(), full_name=f"{cat}.{sch}.{vol}",
+                    sdk=self._sdk(),
+                    full_name=f"{cat}.{sch}.{vol}",
                 )
         return self._volume_info
 
@@ -1071,9 +1263,11 @@ class VolumePath(DatabricksPath):
         return f"{base}/{'/'.join(rel)}" if rel else base
 
     def temporary_credentials(self, operation: Optional[PathOperation] = None):
-        return self._sdk().temporary_path_credentials.generate_temporary_path_credentials(
-            url=self.storage_location(),
-            operation=operation or PathOperation.PATH_READ,
+        return (
+            self._sdk().temporary_path_credentials.generate_temporary_path_credentials(
+                url=self.storage_location(),
+                operation=operation or PathOperation.PATH_READ,
+            )
         )
 
     # ── Metadata ──────────────────────────────────────────────────────
@@ -1089,7 +1283,10 @@ class VolumePath(DatabricksPath):
 
     def reset_metadata(
         self,
-        is_file=None, is_dir=None, size=None, mtime=None,
+        is_file=None,
+        is_dir=None,
+        size=None,
+        mtime=None,
         volume_info=None,
     ):
         super().reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
@@ -1108,17 +1305,24 @@ class VolumePath(DatabricksPath):
         cat, sch, vol, _ = self.sql_volume_or_table_parts()
         if not vol:
             yield from self._ls_uc_hierarchy(
-                self._sdk(), cat, sch, recursive, allow_not_found,
+                self._sdk(),
+                cat,
+                sch,
+                recursive,
+                allow_not_found,
             )
             return
         try:
             for info in self._sdk().files.list_directory_contents(
-                self.full_path(), page_size=fetch_size,
+                self.full_path(),
+                page_size=fetch_size,
             ):
                 child_parts = info.path.split("/")[2:]
                 child = VolumePath(
-                    parts=child_parts, _client=self.workspace,
-                    _is_file=not info.is_directory, _is_dir=info.is_directory,
+                    parts=child_parts,
+                    _client=self.workspace,
+                    _is_file=not info.is_directory,
+                    _is_dir=info.is_directory,
                     _size=info.file_size,
                     _mtime=_coerce_mtime_seconds(
                         getattr(info, "last_modified", None)
@@ -1127,7 +1331,9 @@ class VolumePath(DatabricksPath):
                     ),
                 )
                 if recursive and info.is_directory:
-                    yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
+                    yield from child._ls_impl(
+                        recursive=True, allow_not_found=allow_not_found
+                    )
                 else:
                     yield child
         except SDK_ERRORS:
@@ -1150,12 +1356,17 @@ class VolumePath(DatabricksPath):
                 ]
             for _, pts in items:
                 child = VolumePath(
-                    parts=pts, _client=self.workspace,
-                    _is_file=False, _is_dir=True, _size=0,
+                    parts=pts,
+                    _client=self.workspace,
+                    _is_file=False,
+                    _is_dir=True,
+                    _size=0,
                     _mtime=time.time(),
                 )
                 if recursive:
-                    yield from child._ls_impl(recursive=True, allow_not_found=allow_not_found)
+                    yield from child._ls_impl(
+                        recursive=True, allow_not_found=allow_not_found
+                    )
                 else:
                     yield child
         except SDK_ERRORS:
@@ -1186,21 +1397,31 @@ class VolumePath(DatabricksPath):
         tags = self.workspace.default_tags()
         if cat:
             try:
-                sdk.catalogs.create(name=cat, properties=tags, comment="Auto-created by yggdrasil")
+                sdk.catalogs.create(
+                    name=cat, properties=tags, comment="Auto-created by yggdrasil"
+                )
             except ALREADY_EXISTS_ERRORS + (PermissionDenied, InternalError):
                 if not exist_ok:
                     raise
         if sch:
             try:
-                sdk.schemas.create(catalog_name=cat, name=sch, properties=tags, comment="Auto-created by yggdrasil")
+                sdk.schemas.create(
+                    catalog_name=cat,
+                    name=sch,
+                    properties=tags,
+                    comment="Auto-created by yggdrasil",
+                )
             except ALREADY_EXISTS_ERRORS + (PermissionDenied, InternalError):
                 if not exist_ok:
                     raise
         if vol:
             try:
                 self._volume_info = sdk.volumes.create(
-                    catalog_name=cat, schema_name=sch, name=vol,
-                    volume_type=VolumeType.MANAGED, comment="Auto-created by yggdrasil",
+                    catalog_name=cat,
+                    schema_name=sch,
+                    name=vol,
+                    volume_type=VolumeType.MANAGED,
+                    comment="Auto-created by yggdrasil",
                 )
             except ALREADY_EXISTS_ERRORS:
                 if not exist_ok:
@@ -1221,11 +1442,13 @@ class VolumePath(DatabricksPath):
     def grants_service(self):
         """A :class:`Grants` service bound to this volume's client."""
         from yggdrasil.databricks.sql.grants import Grants
+
         return Grants(client=self.client)
 
     def grants(self, principal: Optional[str] = None, *, effective: bool = False):
         """Iterate grants on this volume, optionally filtered by ``principal``."""
         from databricks.sdk.service.catalog import SecurableType
+
         return self.grants_service.list(
             securable_type=SecurableType.VOLUME,
             full_name=self._grants_full_name(),
@@ -1236,6 +1459,7 @@ class VolumePath(DatabricksPath):
     def grant(self, principal: str, privileges):
         """Add ``privileges`` for ``principal`` on this volume."""
         from databricks.sdk.service.catalog import SecurableType
+
         return self.grants_service.create(
             securable_type=SecurableType.VOLUME,
             full_name=self._grants_full_name(),
@@ -1338,6 +1562,7 @@ class VolumePath(DatabricksPath):
 # TablePath  (/Tables/catalog/schema/table)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 @dataclass(eq=False)
 class TablePath(DatabricksPath):
     kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.TABLE
@@ -1376,8 +1601,8 @@ class TablePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 
 _KIND_MAP: dict[str, type[DatabricksPath]] = {
-    "dbfs":      DBFSPath,
+    "dbfs": DBFSPath,
     "workspace": WorkspacePath,
-    "volumes":   VolumePath,
-    "tables":    TablePath,
+    "volumes": VolumePath,
+    "tables": TablePath,
 }

@@ -15,6 +15,7 @@ The only responsibilities of this subclass are:
 Everything else — schema inference, batch iteration, filter pushdown —
 happens in the base class.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -35,25 +36,20 @@ __all__ = ["DatabricksPathIO"]
 class DatabricksPathIO(PathIO):
     """PathIO reading from a :class:`DatabricksPath`."""
 
-    path: DatabricksPath = None  # type: ignore[assignment]
+    def __post_init__(self, path: Any = None) -> None:
+        # Pre-coerce any non-DatabricksPath / non-duck-typed input into
+        # a :class:`DatabricksPath` before letting the base do its own
+        # ``_coerce_path`` pass (which leaves duck-typed remote paths
+        # untouched).
+        resolved = path if path is not None else self.holder.path
+        if (
+            resolved is not None
+            and not isinstance(resolved, DatabricksPath)
+            and not hasattr(resolved, "read_bytes")
+        ):
+            resolved = DatabricksPath.parse(str(resolved))
 
-    def __post_init__(self) -> None:
-        # Coerce anything non-DatabricksPath into one — strings, pathlib
-        # Paths, etc. A DatabricksPath duck-type check (`read_bytes`) is
-        # kept for objects that already implement the protocol without
-        # being a subclass (e.g. fsspec paths wrapped in a custom type).
-        if self.path is None:
-            raise ValueError("DatabricksPathIO requires a non-None path")
-
-        if not isinstance(self.path, DatabricksPath) and not hasattr(self.path, "read_bytes"):
-            self.path = DatabricksPath.parse(str(self.path))
-
-        # Let the parent handle media_type inference via iter_files when
-        # media_type is None. We explicitly do NOT preempt it by calling
-        # MediaType.parse(str(self.path)) here, which would wrongly
-        # resolve to OCTET_STREAM for directories and short-circuit
-        # the parent's file-based inference.
-        PathIO.__post_init__(self)
+        PathIO.__post_init__(self, resolved)
 
     @classmethod
     def make(
@@ -81,9 +77,7 @@ class DatabricksPathIO(PathIO):
         resolved_media: MediaType | None
         if media is None:
             is_file = (
-                resolved_path.is_file()
-                if hasattr(resolved_path, "is_file")
-                else False
+                resolved_path.is_file() if hasattr(resolved_path, "is_file") else False
             )
             if is_file:
                 resolved_media = MediaType.parse(str(resolved_path), default=None)

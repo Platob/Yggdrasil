@@ -38,7 +38,9 @@ def _safe_tmp_root() -> Path:
     return path
 
 
-def _cleanup_expired_tmp_files(tmp_dir: Path, *, now: int, max_age_seconds: int = 24 * 3600) -> None:
+def _cleanup_expired_tmp_files(
+    tmp_dir: Path, *, now: int, max_age_seconds: int = 24 * 3600
+) -> None:
     """
     Best-effort cleanup of expired files named like: tmp-{start}-{end}.*
     Never raises.
@@ -107,13 +109,39 @@ class BufferConfig:
         return DEFAULT_CONFIG
 
     def create_spill_path(self, lifetime_seconds: int | None = None):
+        """Return a fresh spill path — a :class:`LocalPath` by default.
+
+        When ``tmp_dir`` is set to any path-like object (``pathlib.Path``,
+        ``str``, or a :class:`yggdrasil.io.fs.Path` subclass like a
+        remote :class:`DatabricksPath`), the spill path is produced by
+        joining against that object. That lets callers spill to DBFS /
+        S3 / whatever, as long as the resulting :class:`Path` subclass
+        implements :meth:`open`. Local-fs callers get zero-copy
+        ``mmap`` / ``os.pread`` through :class:`LocalPath`.
+        """
+        from yggdrasil.io.fs import LocalPath, Path as FsPath
+
         tmp_dir = self.tmp_dir if self.tmp_dir is not None else get_tmp_dir()
-        if not hasattr(tmp_dir, "__truediv__"):
-            tmp_dir = Path(tmp_dir)
         now = int(time.time())
-        end = now + int(lifetime_seconds) if lifetime_seconds is not None else now + 24 * 3600
+        end = (
+            now + int(lifetime_seconds)
+            if lifetime_seconds is not None
+            else now + 24 * 3600
+        )
         name = f"{self.prefix}{now}-{end}-{os.urandom(8).hex()}{self.suffix}"
-        return tmp_dir / name
+
+        # A yggdrasil Path composes natively via ``/``.
+        if isinstance(tmp_dir, FsPath):
+            return tmp_dir / name
+        # Duck-typed path (custom remote types, test fakes, …) — anything
+        # that already knows how to join ``/`` goes through untouched so
+        # users can plug in their own backends without subclassing
+        # :class:`Path`.
+        if hasattr(tmp_dir, "__truediv__") and not isinstance(tmp_dir, (str, bytes)):
+            return tmp_dir / name
+        # str / pathlib.Path / os.PathLike → LocalPath so spilled files
+        # get the zero-copy ``mmap`` / ``os.pread`` fast paths.
+        return LocalPath.from_any(tmp_dir) / name
 
 
 DEFAULT_CONFIG = BufferConfig(
