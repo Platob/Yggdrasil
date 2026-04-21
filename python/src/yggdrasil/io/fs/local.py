@@ -29,18 +29,27 @@ __all__ = ["LocalPath", "LocalFileSystem"]
 # ---------------------------------------------------------------------------
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, init=False)
 class LocalPath(Path):
     """A local-filesystem path, backed by :class:`pathlib.Path`.
 
     Accepts strings, other :class:`Path`-likes, or :class:`pathlib.Path`
     objects through :meth:`parse`. Absolute vs. relative is carried via
-    the ``anchor`` field.
+    the ``anchor`` field. :class:`LocalPath` is also the fallback target
+    for :meth:`Path.__new__` dispatch — any input that no other backend
+    claims lands here.
     """
 
     scheme: ClassVar[str] = "file"
 
     # ---- Factory ------------------------------------------------------
+
+    @classmethod
+    def _match(cls, obj: Any) -> bool:
+        # LocalPath is the fallback — dispatch should never preferentially
+        # pick it. The explicit "file://…" form is handled by ``parse`` when
+        # the dispatcher ends up here anyway.
+        return False
 
     @classmethod
     def parse(cls, obj: Any) -> "LocalPath":
@@ -68,6 +77,11 @@ class LocalPath(Path):
         raw = os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
         if not raw:
             return cls(parts=[], anchor="")
+        # Strip a "file://" scheme if the caller passed one through dispatch.
+        if raw.startswith("file://"):
+            raw = raw[len("file://") :]
+        elif raw.startswith("file:/"):
+            raw = raw[len("file:") :]
         normalized = raw.replace("\\", "/")
         anchor = "/" if normalized.startswith("/") else ""
         return cls(parts=_split(normalized), anchor=anchor)

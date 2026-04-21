@@ -43,7 +43,56 @@ from typing import (
 if TYPE_CHECKING:
     from .filesystem import FileSystem
 
-__all__ = ["PathKind", "StatResult", "Path"]
+__all__ = ["PathKind", "StatResult", "Path", "register_path_class"]
+
+
+# ---------------------------------------------------------------------------
+# Path class registry — used by Path.__new__ to pick a concrete subclass
+# ---------------------------------------------------------------------------
+#
+# Registration is automatic via ``Path.__init_subclass__``. The order
+# matters: the first class whose :meth:`_match` returns True wins.
+# :class:`LocalPath` is explicitly the fallback and is skipped during
+# iteration so more specific backends (Databricks, S3, …) take priority.
+
+_PATH_REGISTRY: List[type] = []
+
+
+def register_path_class(cls: type) -> type:
+    """Register *cls* as a candidate for :meth:`Path.__new__` dispatch.
+
+    Subclasses are auto-registered via ``__init_subclass__``; call this
+    only for something unusual (e.g. a dynamically-created subclass).
+    """
+    if cls not in _PATH_REGISTRY:
+        _PATH_REGISTRY.append(cls)
+    return cls
+
+
+def _select_path_class(obj: Any) -> type:
+    """Pick the best :class:`Path` subclass for *obj*.
+
+    Exact-type match wins (``Path(some_path)`` stays the same type).
+    Then registered subclasses get a shot via their ``_match`` classmethod.
+    :class:`LocalPath` is the fallback when nothing else claims the input.
+    """
+    # Local import to avoid a circular import at module load time.
+    from .local import LocalPath
+
+    if isinstance(obj, Path):
+        return type(obj)
+
+    for candidate in _PATH_REGISTRY:
+        if candidate is LocalPath:
+            continue
+        try:
+            if candidate._match(obj):
+                return candidate
+        except Exception:
+            # A misbehaving _match must not break dispatch — we just try
+            # the next candidate and fall back to LocalPath if needed.
+            continue
+    return LocalPath
 
 
 _SEP = "/"
@@ -170,7 +219,7 @@ def _coerce_mtime(value: Any) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, init=False)
 class Path(ABC):
     """Abstract filesystem path with ``pathlib.Path``-like behavior.
 
@@ -184,6 +233,13 @@ class Path(ABC):
     - Cached metadata (``_is_file``, ``_is_dir``, ``_size``, ``_mtime``)
       is filled in lazily by :meth:`_refresh_metadata`. Subclasses should
       populate these in a single round-trip when possible.
+
+    Dispatching constructor
+    -----------------------
+    ``Path("dbfs:/x")``, ``Path("/tmp/y")``, ``Path(pathlib.Path(...))``
+    pick the right concrete subclass automatically. The first registered
+    class whose ``_match`` claims the input wins; :class:`LocalPath` is
+    the fallback.
 
     Abstract hooks (minimal set a backend must provide)
     ---------------------------------------------------
@@ -221,21 +277,111 @@ class Path(ABC):
     )
 
     # ================================================================ #
-    # Factory                                                           #
+    # Registry + dispatching constructor                                #
     # ================================================================ #
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Every concrete Path subclass is a dispatch candidate.
+        register_path_class(cls)
+
+    def __new__(cls, obj: Any = None, *args: Any, **kwargs: Any) -> "Path":
+        """Dispatch to the correct subclass when called on :class:`Path`.
+
+        ``Path("/tmp/foo")``       → :class:`LocalPath`
+        ``Path("dbfs:/x/y")``      → Databricks / DBFS path (if registered)
+        ``Path(existing_path)``    → same type as ``existing_path``
+
+        When called on a concrete subclass, returns a plain instance —
+        no dispatch — so internal ``cls(parts=…, anchor=…)`` calls work
+        as usual.
+        """
+        del args, kwargs  # consumed by __init__
+        if cls is Path:
+            target = _select_path_class(obj)
+            # target.__new__ won't recurse: target is a concrete subclass
+            # so the ``cls is Path`` branch above doesn't fire.
+            return target.__new__(target, obj)
+        return object.__new__(cls)
+
+    def __init__(
+        self,
+        obj: Any = None,
+        *,
+        parts: Optional[List[str]] = None,
+        anchor: str = "",
+        _is_file: Optional[bool] = None,
+        _is_dir: Optional[bool] = None,
+        _size: Optional[int] = None,
+        _mtime: Optional[float] = None,
+        _fs: Optional["FileSystem"] = None,
+    ) -> None:
+        """Construct a :class:`Path`.
+
+        Two usage shapes, detected by argument type:
+
+        * ``Path(obj)`` — parse a string / :class:`os.PathLike` /
+          :class:`pathlib.PurePath` / other :class:`Path`. The class
+          typically runs ``type(self).parse(obj)`` to get fields.
+        * ``Path(parts=[...], anchor="/")`` — build from explicit fields.
+          This is what :func:`dataclasses.replace` (used by
+          :meth:`_copy_with`) and the FS factory reach for.
+        """
+        if obj is not None and not isinstance(obj, list):
+            # String / PathLike / Path — delegate to the class's parser.
+            if isinstance(obj, Path):
+                parsed = obj
+            else:
+                parsed = type(self).parse(obj)
+            self.parts = list(parsed.parts)
+            self.anchor = parsed.anchor
+        else:
+            # Explicit field form — also handles ``obj=[...]`` for symmetry
+            # with how pathlib.PurePath accepts a list of segments.
+            if obj is not None and parts is None:
+                parts = obj  # type: ignore[assignment]
+            self.parts = list(parts) if parts is not None else []
+            self.anchor = anchor
+        self._is_file = _is_file
+        self._is_dir = _is_dir
+        self._size = _size
+        self._mtime = _mtime
+        self._fs = _fs
+
+    @classmethod
+    def _match(cls, obj: Any) -> bool:
+        """Return True if ``cls`` is the right Path type for *obj*.
+
+        Default rule: match the URL-style scheme (``scheme://`` or
+        ``scheme:/``) against the class's :attr:`scheme`. Backends with
+        namespace prefixes (``/Volumes/``, ``/Workspace/``, …) should
+        override to inspect the head of the input.
+        """
+        if not cls.scheme or not isinstance(obj, str):
+            return False
+        head = f"{cls.scheme}:"
+        return obj.startswith(f"{head}//") or obj.startswith(f"{head}/")
 
     @classmethod
     def parse(cls, obj: Any) -> "Path":
         """Build an instance from a string, list, or another :class:`Path`.
 
-        Subclasses override to handle namespace prefixes (``dbfs:/…``) or
-        URL schemes. The base implementation assumes a plain POSIX path.
+        Called on the abstract :class:`Path`, dispatches through the
+        registry (same rules as :meth:`__new__`). Subclasses override to
+        handle namespace prefixes (``dbfs:/…``) or URL schemes.
         """
+        if cls is Path:
+            target = _select_path_class(obj)
+            return target.parse(obj)
         if isinstance(obj, Path):
             return obj
         raw = os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
         anchor = _SEP if raw.startswith(_SEP) or raw.startswith("\\") else ""
-        return cls(parts=_split(raw), anchor=anchor)
+        # Construct via the dataclass field form so we don't recurse through
+        # __init__'s string-parsing branch.
+        inst: Path = object.__new__(cls)
+        Path.__init__(inst, parts=_split(raw), anchor=anchor)
+        return inst
 
     # ================================================================ #
     # Abstract hooks — implement per backend                            #
