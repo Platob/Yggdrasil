@@ -70,6 +70,10 @@ bigdata = [
   "delta-spark>=3.2",
 ]
 
+delta = [
+  "deltalake>=1.0",
+]
+
 databricks = [
   "databricks-sdk>=0.97",
 ]
