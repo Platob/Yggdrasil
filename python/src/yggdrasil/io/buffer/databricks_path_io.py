@@ -15,6 +15,7 @@ The only responsibilities of this subclass are:
 Everything else — schema inference, batch iteration, filter pushdown —
 happens in the base class.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -35,24 +36,26 @@ __all__ = ["DatabricksPathIO"]
 class DatabricksPathIO(PathIO):
     """PathIO reading from a :class:`DatabricksPath`."""
 
-    path: DatabricksPath = None  # type: ignore[assignment]
+    # Required — no default. DatabricksPath lives outside the
+    # ``yggdrasil.io.fs`` hierarchy so we keep its own type here and
+    # skip the base class's ``Path.from_any`` coercion for inputs that
+    # already look like DatabricksPath.
+    path: DatabricksPath
 
     def __post_init__(self) -> None:
         # Coerce anything non-DatabricksPath into one — strings, pathlib
         # Paths, etc. A DatabricksPath duck-type check (`read_bytes`) is
         # kept for objects that already implement the protocol without
         # being a subclass (e.g. fsspec paths wrapped in a custom type).
-        if self.path is None:
-            raise ValueError("DatabricksPathIO requires a non-None path")
-
-        if not isinstance(self.path, DatabricksPath) and not hasattr(self.path, "read_bytes"):
+        if not isinstance(self.path, DatabricksPath) and not hasattr(
+            self.path, "read_bytes"
+        ):
             self.path = DatabricksPath.parse(str(self.path))
 
         # Let the parent handle media_type inference via iter_files when
-        # media_type is None. We explicitly do NOT preempt it by calling
-        # MediaType.parse(str(self.path)) here, which would wrongly
-        # resolve to OCTET_STREAM for directories and short-circuit
-        # the parent's file-based inference.
+        # media_type is None. The base's ``_coerce_path`` leaves
+        # DatabricksPath alone (duck-typed pass-through) so this stays
+        # lossless.
         PathIO.__post_init__(self)
 
     @classmethod
@@ -81,9 +84,7 @@ class DatabricksPathIO(PathIO):
         resolved_media: MediaType | None
         if media is None:
             is_file = (
-                resolved_path.is_file()
-                if hasattr(resolved_path, "is_file")
-                else False
+                resolved_path.is_file() if hasattr(resolved_path, "is_file") else False
             )
             if is_file:
                 resolved_media = MediaType.parse(str(resolved_path), default=None)

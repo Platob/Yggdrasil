@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import fnmatch
 import os
+import pathlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -382,6 +383,93 @@ class Path(ABC):
         inst: Path = object.__new__(cls)
         Path.__init__(inst, parts=_split(raw), anchor=anchor)
         return inst
+
+    # ================================================================ #
+    # Safe parsing — type-checked entry points                          #
+    # ================================================================ #
+    #
+    # ``parse`` is permissive: anything coerces to str. ``from_any`` and
+    # its friends are strict — they reject input they can't reliably
+    # interpret, and the error message tells the caller what to pass
+    # instead. Use these whenever input provenance is untrusted (user
+    # config, framework dataclass fields, etc.).
+
+    @classmethod
+    def from_any(cls, obj: Any) -> "Path":
+        """Safe dispatch from any path-like input.
+
+        Accepts :class:`Path`, :class:`pathlib.PurePath`, ``str``,
+        ``bytes``, or any :class:`os.PathLike`. Raises a clear
+        :class:`TypeError` for anything else — including ``None``.
+
+        When called on the abstract :class:`Path`, routes through the
+        registry so ``"dbfs:/x"`` becomes a DBFSPath, ``/tmp/y`` a
+        LocalPath, etc. On a concrete subclass, always returns that
+        subclass.
+        """
+        if obj is None:
+            raise TypeError(
+                f"Cannot build a {cls.__name__} from None. "
+                "Pass a str, pathlib.Path, or yggdrasil.io.fs.Path."
+            )
+        if isinstance(obj, Path):
+            # Already one of ours — pass through untouched when the
+            # caller asked for the abstract base or a matching concrete
+            # class; otherwise re-parse through the target subclass.
+            if cls is Path or isinstance(obj, cls):
+                return obj
+            return cls.from_str(obj.full_path())
+        if isinstance(obj, pathlib.PurePath):
+            return cls.from_pathlib(obj)
+        if isinstance(obj, (str, bytes)):
+            raw = obj.decode() if isinstance(obj, bytes) else obj
+            return cls.from_str(raw)
+        if isinstance(obj, os.PathLike):
+            return cls.from_str(os.fspath(obj))
+        raise TypeError(
+            f"Cannot build a {cls.__name__} from {type(obj).__name__!r}. "
+            "Pass a str, bytes, pathlib.Path, os.PathLike, or "
+            "yggdrasil.io.fs.Path."
+        )
+
+    @classmethod
+    def from_str(cls, value: str) -> "Path":
+        """Parse a string into a :class:`Path`.
+
+        On the abstract base, dispatches via the scheme registry so URL
+        schemes (``dbfs:/...``, ``fake://...``) route to the right
+        subclass. On a concrete subclass, delegates to :meth:`parse`.
+        """
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{cls.__name__}.from_str expected str, got "
+                f"{type(value).__name__!r}. Use {cls.__name__}.from_any() for "
+                "permissive input."
+            )
+        if cls is Path:
+            target = _select_path_class(value)
+            return target.from_str(value)
+        return cls.parse(value)
+
+    @classmethod
+    def from_pathlib(cls, value: pathlib.PurePath) -> "Path":
+        """Parse a :class:`pathlib.PurePath` into a :class:`Path`.
+
+        Default implementation rejects anything but :class:`pathlib.PurePath`
+        and delegates to :meth:`parse` on concrete subclasses. On the
+        abstract base, always returns a :class:`LocalPath` — pathlib
+        paths carry no backend information.
+        """
+        if not isinstance(value, pathlib.PurePath):
+            raise TypeError(
+                f"{cls.__name__}.from_pathlib expected pathlib.PurePath, got "
+                f"{type(value).__name__!r}."
+            )
+        if cls is Path:
+            from .local import LocalPath
+
+            return LocalPath.from_pathlib(value)
+        return cls.parse(value)
 
     # ================================================================ #
     # Abstract hooks — implement per backend                            #

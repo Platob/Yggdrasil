@@ -62,29 +62,53 @@ class LocalPath(Path):
         if isinstance(obj, LocalPath):
             return obj
         if isinstance(obj, pathlib.PurePath):
-            anchor = obj.anchor or ""
-            # pathlib.PurePath.parts includes the anchor; drop it for our
-            # root-free parts list.
-            raw_parts = obj.parts
-            if anchor and raw_parts and raw_parts[0] == anchor:
-                raw_parts = raw_parts[1:]
-            return cls(parts=list(raw_parts), anchor=_normalize_anchor(anchor))
+            return cls.from_pathlib(obj)
         if isinstance(obj, Path):
             # Cross-backend conversion — copy the segments but re-anchor
             # against the local FS so the rendering stays correct.
             return cls(parts=list(obj.parts), anchor=obj.anchor or "")
+        return cls.from_str(
+            os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
+        )
 
-        raw = os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
-        if not raw:
+    @classmethod
+    def from_str(cls, value: str) -> "LocalPath":
+        """Parse a string (POSIX or Windows-style) into a :class:`LocalPath`."""
+        if not isinstance(value, str):
+            raise TypeError(
+                f"LocalPath.from_str expected str, got {type(value).__name__!r}. "
+                "Use LocalPath.from_any() for permissive input."
+            )
+        if not value:
             return cls(parts=[], anchor="")
         # Strip a "file://" scheme if the caller passed one through dispatch.
-        if raw.startswith("file://"):
-            raw = raw[len("file://") :]
-        elif raw.startswith("file:/"):
-            raw = raw[len("file:") :]
-        normalized = raw.replace("\\", "/")
+        if value.startswith("file://"):
+            value = value[len("file://") :]
+        elif value.startswith("file:/"):
+            value = value[len("file:") :]
+        normalized = value.replace("\\", "/")
         anchor = "/" if normalized.startswith("/") else ""
         return cls(parts=_split(normalized), anchor=anchor)
+
+    @classmethod
+    def from_pathlib(cls, value: pathlib.PurePath) -> "LocalPath":
+        """Convert a :class:`pathlib.PurePath` into a :class:`LocalPath`.
+
+        Preserves the anchor (posix ``/``, Windows ``C:\\`` → ``C:/``)
+        and the segments, no string round-trip.
+        """
+        if not isinstance(value, pathlib.PurePath):
+            raise TypeError(
+                f"LocalPath.from_pathlib expected pathlib.PurePath, got "
+                f"{type(value).__name__!r}."
+            )
+        anchor = value.anchor or ""
+        # pathlib.PurePath.parts includes the anchor at index 0; strip it
+        # so our ``parts`` stays root-free.
+        raw_parts = value.parts
+        if anchor and raw_parts and raw_parts[0] == anchor:
+            raw_parts = raw_parts[1:]
+        return cls(parts=list(raw_parts), anchor=_normalize_anchor(anchor))
 
     # ---- Backing pathlib.Path -----------------------------------------
 

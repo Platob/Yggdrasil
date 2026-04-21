@@ -1,6 +1,7 @@
 """Local-filesystem :class:`PathIO`.
 
-Walks :mod:`pathlib.Path` the same way :class:`DatabricksPathIO` walks
+Walks :class:`~yggdrasil.io.fs.LocalPath` the same way
+:class:`DatabricksPathIO` walks
 :class:`~yggdrasil.databricks.fs.path.DatabricksPath`. Delegates all
 read logic — dataset/fallback dispatch, filtering, cast, partition
 extraction — to the :class:`PathIO` base class.
@@ -8,13 +9,15 @@ extraction — to the :class:`PathIO` base class.
 Kept deliberately parallel to :class:`DatabricksPathIO` so changes to
 the walk/filter contract propagate symmetrically.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path as _PathlibPath
 
 from yggdrasil.io.enums import MediaType, MimeType
+from yggdrasil.io.fs import LocalPath
 
 from .bytes_io import BytesIO
 from .path_io import PathIO, _SUPPORTED_MIME_TYPES
@@ -26,24 +29,22 @@ __all__ = ["LocalPathIO"]
 class LocalPathIO(PathIO):
     """PathIO reading from the local filesystem."""
 
-    path: Path = None  # type: ignore[assignment]
+    # Narrow the base class's ``Path`` annotation down to the local flavor.
+    # Still required — no default — so mis-constructed instances fail fast.
+    path: LocalPath
 
     def __post_init__(self) -> None:
-        if self.path is None:
-            raise ValueError("LocalPathIO requires a non-None path")
-        self.path = Path(self.path)
-
-        # Let the parent handle media_type inference via iter_files when
-        # media_type is None. We explicitly do NOT preempt it by calling
-        # MediaType.parse(self.path) here, which would wrongly resolve
-        # to OCTET_STREAM for directories and short-circuit the
-        # parent's file-based inference.
+        # Let the base do the safe ``Path.from_any`` coercion, then narrow
+        # to :class:`LocalPath` so children / callers get a predictable
+        # concrete type.
         PathIO.__post_init__(self)
+        if not isinstance(self.path, LocalPath):
+            self.path = LocalPath.from_any(self.path)
 
     @classmethod
     def make(
         cls,
-        path: str | Path,
+        path: str | LocalPath | _PathlibPath,
         media: MediaType | MimeType | str | None = None,
     ) -> "LocalPathIO":
         """Build a :class:`LocalPathIO`.
@@ -52,7 +53,7 @@ class LocalPathIO(PathIO):
         directly from the filesystem and never uses it, but the base
         :class:`MediaIO` dataclass requires the field.
         """
-        resolved_path = Path(path)
+        resolved_path = LocalPath.from_any(path)
 
         # Coerce media. For a *file*, fall back to extension parsing.
         # For a *directory* with no explicit media, leave media_type as
@@ -118,7 +119,10 @@ class LocalPathIO(PathIO):
         if not self.path.is_dir():
             return
 
-        walker = self.path.rglob("*") if recursive else self.path.glob("*")
+        # LocalPath.rglob yields a Path iterator (files and dirs); ``_keep``
+        # filters out directories. For a non-recursive walk we stick to
+        # iterdir to avoid descending.
+        walker = self.path.rglob("*") if recursive else self.path.iterdir()
         for file_path in walker:
             if self._keep(
                 file_path,
@@ -134,7 +138,7 @@ class LocalPathIO(PathIO):
 
     @staticmethod
     def _keep(
-        file_path: Path,
+        file_path: LocalPath,
         *,
         resolved_mime: MimeType | None,
         include_hidden: bool,
@@ -149,7 +153,7 @@ class LocalPathIO(PathIO):
             if name.startswith(".") or name.startswith("_"):
                 return False
 
-        file_mime = MimeType.parse(file_path, default=None)
+        file_mime = MimeType.parse(file_path.full_path(), default=None)
 
         if resolved_mime is not None:
             return file_mime is resolved_mime
@@ -159,17 +163,17 @@ class LocalPathIO(PathIO):
 
         return file_mime in _SUPPORTED_MIME_TYPES
 
-    def _child(self, file_path: Path) -> "LocalPathIO":
+    def _child(self, file_path: LocalPath) -> "LocalPathIO":
         """Build a child IO for a discovered file.
 
         Constructs directly rather than going through :meth:`make` —
-        we already have a :class:`Path`, and the child's media type is
-        always file-based (not directory), so extension parsing is both
-        correct and cheaper than re-running the full ``make()`` flow
-        for every file in a directory walk.
+        we already have a :class:`LocalPath`, and the child's media type
+        is always file-based (not directory), so extension parsing is
+        both correct and cheaper than re-running the full ``make()``
+        flow for every file in a directory walk.
         """
         return type(self)(
-            media_type=MediaType.parse(file_path, default=None),
+            media_type=MediaType.parse(file_path.full_path(), default=None),
             holder=BytesIO(),
             path=file_path,
         )
