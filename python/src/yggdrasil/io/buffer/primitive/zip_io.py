@@ -59,7 +59,7 @@ import pyarrow.ipc as ipc
 
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.enums import MimeTypes, Mode
+from yggdrasil.io.enums import MimeTypes, Mode, MediaType, MediaTypes
 from yggdrasil.io.fragment import Fragment, FragmentInfos
 from .base import PrimitiveIO
 
@@ -125,14 +125,6 @@ class ZipIO(PrimitiveIO):
     def options_class(cls):
         return ZipOptions
 
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    _APPEND_REJECTED_HINT: ClassVar[str] = (
-        "Zip APPEND is supported — if you're seeing this hint the "
-        "save mode resolved to something other than OVERWRITE or APPEND."
-    )
-
-    _NATIVE_SCANNER_OK: ClassVar[bool] = False
-
     # ==================================================================
     # Schema
     # ==================================================================
@@ -154,23 +146,8 @@ class ZipIO(PrimitiveIO):
         options: ZipOptions,
     ) -> Iterator[pa.RecordBatch]:
         """Yield record batches by enumerating zip entries in name order."""
-        if self.is_empty():
-            return
-
-        with self._reading_context(options) as io:
-            with zipfile.ZipFile(io, mode="r") as zf:
-                names = sorted(
-                    n for n in zf.namelist() if n.startswith(_ENTRY_PREFIX)
-                )
-                for name in names:
-                    with zf.open(name, "r") as entry:
-                        payload = entry.read()
-                    reader = ipc.RecordBatchStreamReader(_io.BytesIO(payload))
-                    try:
-                        for batch in reader:
-                            yield options.cast_arrow_tabular(batch)
-                    finally:
-                        reader.close()
+        for fragment in self.read_fragments(open_io=True):
+            yield from fragment.io.read_arrow_batches(options)
 
     # ==================================================================
     # Write path
@@ -558,20 +535,7 @@ class ZipEntryIO(PrimitiveIO):
     :attr:`Fragment.ancestors`.
     """
 
-    __slots__ = ("_holder", "_entry_name", "_dirty")
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
-
-    # Native scanners can't reach inside a zip entry's bytes; the
-    # holder's path points at the archive, not the entry payload.
-    _NATIVE_SCANNER_OK: ClassVar[bool] = False
-
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    _APPEND_REJECTED_HINT: ClassVar[str] = (
-        "ZipEntryIO APPEND is supported (Arrow IPC stream concat into "
-        "the same entry). If you're seeing this hint the save mode "
-        "resolved to something other than OVERWRITE or APPEND."
-    )
 
     def __init__(
         self,
@@ -731,13 +695,14 @@ class ZipEntryIO(PrimitiveIO):
     ) -> Iterator[pa.RecordBatch]:
         if self.is_empty():
             return
-        with self._reading_context(options) as io:
-            reader = ipc.RecordBatchStreamReader(io)
-            try:
-                for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
-            finally:
-                reader.close()
+
+        mt = MediaType.from_(self.entry_name, default=MediaTypes.OCTET_STREAM)
+
+        if mt.is_octet:
+            return
+
+        with self.as_media(media_type=mt) as media:
+            yield from media.read_arrow_batches(options)
 
     def _write_arrow_batches(
         self,

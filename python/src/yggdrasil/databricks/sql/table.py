@@ -45,6 +45,7 @@ from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
+from yggdrasil.io.enums import MimeTypes, MimeType
 from yggdrasil.io.enums.mode import ModeLike, Mode
 from yggdrasil.io.tabular import TabularIO
 
@@ -112,6 +113,10 @@ class Table(DatabricksResource, TabularIO):
     # ------------------------------------
     # TabularIO
     # ------------------------------------
+
+    @classmethod
+    def default_mime_type(cls) -> MimeType:
+        return MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
 
     @property
     def cached(self) -> bool:

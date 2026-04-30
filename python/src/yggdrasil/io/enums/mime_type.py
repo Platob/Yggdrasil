@@ -773,6 +773,13 @@ class MimeTypes:
         )
     )
 
+    STATEMENT_RESULT = MimeType.define(
+        MimeType(
+            "STATEMENT_RESULT",
+            "application/vnd.statement.result",
+        )
+    )
+
     DATABRICKS_STATEMENT = MimeType.define(
         MimeType(
             "DATABRICKS_STATEMENT",
@@ -784,6 +791,14 @@ class MimeTypes:
         MimeType(
             "SPARK_SQL_STATEMENT",
             "application/vnd.databricks.spark.sql",
+        )
+    )
+
+    # Databricks
+    DATABRICKS_UNITY_CATALOG_TABLE = MimeType.define(
+        MimeType(
+            "DATABRICKS_TABLE",
+            "application/vnd.databricks.uc.table",
         )
     )
 

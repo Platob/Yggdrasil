@@ -43,6 +43,7 @@ from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.enums import MimeType, MimeTypes
 from yggdrasil.io.tabular import TabularIO
 
 if TYPE_CHECKING:
@@ -202,6 +203,10 @@ class StatementResult(TabularIO, Generic[PS]):
     """
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
+
+    @classmethod
+    def default_mime_type(cls) -> MimeType:
+        return MimeTypes.STATEMENT_RESULT
 
     def __init__(
         self,

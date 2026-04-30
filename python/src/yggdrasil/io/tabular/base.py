@@ -292,9 +292,57 @@ class TabularIO(Disposable, ABC, Generic[O]):
     # ==================================================================
 
     @classmethod
-    def from_path(cls, path: Path, media_type: MediaType | None = None) -> "TabularIO[O]":
-        path = path_class().from_(path)
+    def from_(
+        cls,
+        obj: Any,
+        media_type: MediaType | None = None,
+        default: Any = ...
+    ):
+        if cls._FINAL_TABULAR_IO and isinstance(obj, cls):
+            return obj
 
+        buffer = BytesIO.from_(obj, media_type=media_type, default=None)
+        
+        if buffer is None:
+            if default is ...:
+                raise RuntimeError(
+                    f"No tabular IO registered for media_type {media_type!r}"
+                )
+            return default
+
+        return cls.from_bytes_io(buffer, media_type=media_type, default=default)
+
+    @classmethod
+    def from_bytes_io(
+        cls,
+        buffer: BytesIO,
+        media_type: MediaType | None = None,
+        default: Any = ...
+    ):
+        buffer = BytesIO.from_(buffer)
+        if media_type is None:
+            media_type = buffer.media_type
+        else:
+            media_type = MediaType.from_(media_type)
+            
+        target = cls.media_type_class(media_type, default=cls)
+        
+        if target._FINAL_TABULAR_IO:
+            return cls(buffer, media_type=media_type)
+        
+        if default is ...:
+            raise RuntimeError(
+                f"No tabular IO registered for media_type {media_type!r}"
+            )
+        return default
+
+    @classmethod
+    def from_path(
+        cls,
+        path: Path,
+        media_type: MediaType | None = None
+    ) -> "TabularIO[O]":
+        path = path_class().from_(path)
         return cls(path=path, media_type=media_type)
 
     @classmethod

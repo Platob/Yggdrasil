@@ -215,8 +215,20 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
         ``with_media_type`` so the request still has effect.
         """
         if media_type is not None:
-            return self.with_media_type(media_type, copy=False)
-        return self
+            media_type = MediaType.from_(media_type)
+
+        if self._FINAL_TABULAR_IO:
+            if media_type is None:
+                return self
+
+            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
+                return self
+
+            target = self.media_type_class(media_type=media_type)
+            return target(self, media_type=media_type)
+
+        target = self.media_type_class(media_type=media_type)
+        return target(self)
 
     # ------------------------------------------------------------------
     # Fragment surface
