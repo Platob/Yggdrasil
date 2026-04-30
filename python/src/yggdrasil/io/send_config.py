@@ -625,6 +625,7 @@ class SendManyConfig(_ConfigBase):
     batch_size: int | None = None
     ordered: bool = False
     max_in_flight: int | None = None
+    max_batch_size: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
