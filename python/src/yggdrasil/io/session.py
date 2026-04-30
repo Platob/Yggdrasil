@@ -697,7 +697,7 @@ class Session(ABC):
         pool = self.job_pool
         session_remote_cfg = config.remote_cache
         session_local_cfg = config.local_cache
-        batch_size = config.batch_size or pool.max_workers * 2
+        batch_size = config.batch_size or min(256, pool.max_workers * 100)
 
         def _batched(it: Iterator[PreparedRequest], n: int) -> Iterator[list[PreparedRequest]]:
             iterator = iter(it)
