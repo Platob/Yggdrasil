@@ -9,19 +9,87 @@ import urllib3
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io import BytesIO
-from yggdrasil.io.enums import MediaType, MimeTypes, MediaTypes
+from yggdrasil.io.enums import MediaTypes
 
 from .response import HTTPResponse
 from ..buffer.primitive import ArrowIPCIO
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session
-from ..tabular import TabularIO
 
 if TYPE_CHECKING:
     from .browser import BrowserHTTPSession
 
 __all__ = ["HTTPSession"]
+
+
+# Backoff tuning. 429s get a longer, gentler schedule than 5xx because rate
+# limits often need real wall-clock time to clear; transient server errors
+# usually resolve faster.
+_RETRY_TOTAL = 6
+_RETRY_CONNECT = 3
+_RETRY_READ = 3
+
+# 5xx schedule: 1, 2, 4, 8, 16, 32 (capped at backoff_max)
+_BACKOFF_5XX_FACTOR = 1.0
+_BACKOFF_5XX_MAX = 60.0
+
+# 429 schedule: 4, 8, 16, 32, 64, 128 (capped at backoff_max)
+# Server-supplied Retry-After always wins over this when present.
+_BACKOFF_429_FACTOR = 4.0
+_BACKOFF_429_MAX = 300.0
+
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+class _TieredRetry(urllib3.Retry):
+    """``urllib3.Retry`` variant with status-aware backoff.
+
+    Standard ``Retry`` exposes a single ``backoff_factor`` shared by every
+    retry, so 429 (rate limit) and 503 (transient outage) get the same
+    schedule. This subclass branches on the most recent response status:
+
+    * **429** uses a longer, gentler exponential schedule, since rate-limit
+      windows are typically wall-clock bound and respond poorly to tight
+      retries.
+    * **Everything else** (5xx, transport errors) uses a shorter schedule.
+    * The server's ``Retry-After`` header — when present and respected via
+      ``respect_retry_after_header=True`` — always overrides this, because
+      ``urllib3`` checks ``get_retry_after`` before ``get_backoff_time``.
+    """
+
+    def get_backoff_time(self) -> float:  # type: ignore[override]
+        # Mirror urllib3's own short-circuit: no backoff before the second
+        # consecutive error. ``history`` is a tuple of RequestHistory entries.
+        consecutive_errors = list(
+            takewhile(lambda x: x.redirect_location is None, reversed(self.history))
+        )
+        if len(consecutive_errors) <= 1:
+            return 0.0
+
+        last_status = consecutive_errors[0].status
+
+        if last_status == 429:
+            # Count *consecutive* 429s only — if the last attempt was a 503,
+            # we want the 5xx schedule, not a 429 schedule inflated by older
+            # rate-limit hits.
+            n = 0
+            for h in consecutive_errors:
+                if h.status == 429:
+                    n += 1
+                else:
+                    break
+            backoff = _BACKOFF_429_FACTOR * (2 ** (n - 1))
+            return float(min(_BACKOFF_429_MAX, backoff))
+
+        # Default 5xx / transport-error schedule, mirroring urllib3's formula
+        # but with our own factor and cap.
+        backoff = _BACKOFF_5XX_FACTOR * (2 ** (len(consecutive_errors) - 1))
+        return float(min(_BACKOFF_5XX_MAX, backoff))
+
+
+# Imported lazily-style at module level to keep _TieredRetry readable above.
+from itertools import takewhile  # noqa: E402
 
 
 @dataclass
@@ -30,21 +98,37 @@ class HTTPSession(Session):
 
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
 
-    def _build_http_pool(self) -> urllib3.PoolManager:
-        retries = urllib3.Retry(
-            total=4,
-            connect=2,
-            read=2,
-            backoff_factor=2,
-            status_forcelist=(429, 500, 502, 503, 504),
+    def _build_retry(self) -> urllib3.Retry:
+        """Build the :class:`urllib3.Retry` policy used by the connection pool.
+
+        Subclasses can override to swap the policy entirely, or call
+        ``super()._build_retry().new(...)`` to tweak a single field.
+        """
+        return _TieredRetry(
+            total=_RETRY_TOTAL,
+            connect=_RETRY_CONNECT,
+            read=_RETRY_READ,
+            status=_RETRY_TOTAL,
+            other=2,
+            status_forcelist=_RETRY_STATUSES,
+            allowed_methods=None,  # retry every method, incl. POST/PATCH
+            respect_retry_after_header=True,
             raise_on_status=False,
+            raise_on_redirect=False,
+            # backoff_factor/backoff_max are unused — _TieredRetry overrides
+            # get_backoff_time entirely — but we set sane defaults so any
+            # fallback path (e.g. .new() that drops back to base behavior) is
+            # still well-behaved.
+            backoff_factor=_BACKOFF_5XX_FACTOR,
+            backoff_max=_BACKOFF_429_MAX,
         )
 
+    def _build_http_pool(self) -> urllib3.PoolManager:
         return urllib3.PoolManager(
             num_pools=self.pool_maxsize,
             maxsize=self.pool_maxsize,
             block=True,
-            retries=retries,
+            retries=self._build_retry(),
             cert_reqs="CERT_REQUIRED" if self.verify else "CERT_NONE",
             ca_certs=None,
         )

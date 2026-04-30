@@ -20,5 +20,7 @@ from .xlsx_io import XlsxIO
 from .zip_io import ZipIO
 
 __all__ = [
-    'PrimitiveIO', 'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO', 'ZipIO',
+    'PrimitiveIO',
+    'ArrowIPCIO',
+    'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO', 'ZipIO',
 ]
