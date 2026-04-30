@@ -4,12 +4,13 @@ import datetime as dt
 import decimal
 import enum
 import json
+import logging
 import types
 import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Mapping, MutableMapping, Sequence, Set as AbstractSet
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, dataclass
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -19,8 +20,7 @@ from typing import (
     Optional,
     Union,
     get_args,
-    get_origin,
-)
+    get_origin, )
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -32,8 +32,8 @@ from yggdrasil.data.types.parser import (
     ParsedDataType,
     parse_data_type,
 )
-from yggdrasil.environ.importlib import cached_from_import
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums.mode import Mode
+from yggdrasil.lazy_imports import field_class, polars_module, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
 from .support import get_pandas, get_polars, get_spark_sql
 from ..base_meta import BaseChildrenFields
@@ -72,17 +72,23 @@ __all__ = [
 ]
 
 
+# ======================================================================
+# Module-level constants & private helpers
+# ======================================================================
+
 _NONE_TYPE = type(None)
 
+# from_any dispatch table — module prefix → classmethod name. Order
+# matters: first prefix match wins. ``yggdrasil`` is last because
+# several non-yggdrasil objects carry a ``.dtype`` attribute that we'd
+# otherwise shadow.
 _FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
     ("pyarrow", "from_arrow"),
     ("polars", "from_polars"),
     ("pandas", "from_pandas"),
     ("pyspark", "from_spark"),
-    ("yggdrasil", "from_yggdrasil")
+    ("yggdrasil", "from_yggdrasil"),
 )
-
-
 
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
@@ -144,11 +150,19 @@ def _literal_values_to_hint(values: tuple[object, ...]) -> object:
     return Union[tuple(types_seen)]
 
 
+@dataclass(frozen=True, repr=False)
 class DataType(BaseChildrenFields, ABC):
     _singleton_instance: ClassVar["DataType | None"] = None
 
+    # ==================================================================
+    # Dunder / identity
+    # ==================================================================
+
     def __str__(self):
-        return self.to_arrow().__str__()
+        return self.pretty_format()
+
+    def __repr__(self):
+        return self.pretty_format()
 
     def __call__(self, *args, **kwargs):
         if not args and not kwargs:
@@ -168,18 +182,20 @@ class DataType(BaseChildrenFields, ABC):
     @abstractmethod
     def type_id(self) -> DataTypeId: ...
 
-    def convert_pyobj(self, value: Any, nullable: bool, safe: bool = False):
-        if value is None:
-            return self.default_pyobj(nullable=nullable)
-        return self._convert_pyobj(value, safe=safe)
+    @classmethod
+    def instance(cls) -> "DataType":
+        if cls is DataType:
+            raise TypeError("DataType.instance() must be called on a subclass")
 
-    def _convert_pyobj(self, value: Any, safe: bool = False):
-        return value
+        inst = cls._singleton_instance
+        if inst is None:
+            inst = cls()
+            cls._singleton_instance = inst
+        return inst
 
-    def convert_arrow_scalar(
-        self, value: pa.Scalar, nullable: bool, safe: bool = False
-    ) -> pa.Scalar:
-        return value.cast(self.to_arrow(), safe=safe)
+    # ==================================================================
+    # Lifting — dtype → Field / StructType wrappers
+    # ==================================================================
 
     def to_struct(self, name: str | None = None) -> "StructType":
         if self.type_id == DataTypeId.STRUCT:
@@ -195,26 +211,28 @@ class DataType(BaseChildrenFields, ABC):
         nullable: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> "Field":
-        return self.get_data_field_class()(
+        return field_class()(
             name=name or DEFAULT_FIELD_NAME,
             dtype=self,
             nullable=nullable,
             metadata=metadata,
         )
 
+    # ==================================================================
+    # Merge — schema reconciliation
+    # ==================================================================
+
     def merge_with(
         self,
         other: "DataType",
-        mode: SaveMode | None = None,
+        mode: Mode | None = None,
         downcast: bool = False,
         upcast: bool = False,
     ):
-        if self.type_id == DataTypeId.NULL:
-            return other
-        elif other.type_id == DataTypeId.NULL:
+        mode = Mode.from_(mode, Mode.UPSERT)
+
+        if mode is Mode.IGNORE:
             return self
-        elif mode == SaveMode.OVERWRITE:
-            return other
 
         if self.type_id == other.type_id:
             return self._merge_with_same_id(
@@ -235,7 +253,7 @@ class DataType(BaseChildrenFields, ABC):
     def _merge_with_same_id(
         self,
         other: "DataType",
-        mode: SaveMode | None = None,
+        mode: Mode,
         downcast: bool = False,
         upcast: bool = False,
     ):
@@ -244,10 +262,16 @@ class DataType(BaseChildrenFields, ABC):
     def _merge_with_different_id(
         self,
         other: "DataType",
-        mode: SaveMode | None = None,
+        mode: Mode,
         downcast: bool = False,
         upcast: bool = False,
     ):
+        if mode in (Mode.APPEND, Mode.UPSERT, Mode.AUTO):
+            if self.type_id.is_any_or_null:
+                return other
+            elif other.type_id.is_any_or_null:
+                return self
+
         if downcast == upcast:
             return self
 
@@ -256,20 +280,21 @@ class DataType(BaseChildrenFields, ABC):
         else:
             return self if self.type_id > other.type_id else other
 
-    @classmethod
-    def get_data_field_class(cls) -> type["Field"]:
-        return cached_from_import("yggdrasil.data.data_field", "Field")
+    @abstractmethod
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        """Pretty-print this dtype with one element per line.
 
-    @classmethod
-    def instance(cls) -> "DataType":
-        if cls is DataType:
-            raise TypeError("DataType.instance() must be called on a subclass")
+        ``indent`` is the per-level step in spaces. ``level`` is the
+        current depth — the line is prefixed with ``indent * level``
+        spaces. Flat dtypes render as a single line; nested dtypes
+        (struct / list / map) override this to lay each child out on its
+        own line at ``level + 1``.
+        """
+        ...
 
-        inst = cls._singleton_instance
-        if inst is None:
-            inst = cls()
-            cls._singleton_instance = inst
-        return inst
+    # ==================================================================
+    # Classmethod plumbing — subclass dispatch helpers
+    # ==================================================================
 
     @classmethod
     def _any_subclass_handles(cls, dtype: Any, handler: str, label: str) -> bool:
@@ -289,28 +314,53 @@ class DataType(BaseChildrenFields, ABC):
         name = str(value.get("name", "")).upper()
         return name == type_id.name or name in aliases
 
+    # ==================================================================
+    # Engine handlers — `handles_<engine>_type` subclass probes
+    # ==================================================================
+
     @classmethod
     def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
         return cls._any_subclass_handles(dtype, "handles_arrow_type", "Arrow")
-
-    @abstractmethod
-    def to_arrow(self) -> pa.DataType:
-        raise NotImplementedError
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
         return cls._any_subclass_handles(dtype, "handles_polars_type", "Polars")
 
-    @abstractmethod
-    def to_polars(self) -> "polars.DataType":
-        raise NotImplementedError
-
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
         return cls._any_subclass_handles(dtype, "handles_spark_type", "Spark")
 
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        for subclass in cls.__subclasses__():
+            if subclass.handles_dict(value):
+                return True
+        return False
+
+    # ==================================================================
+    # Exporters — dict / arrow / polars / spark / databricks DDL
+    # ==================================================================
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.type_id.value,
+            "name": self.type_id.name,
+        }
+
+    @abstractmethod
+    def to_arrow(self) -> pa.DataType:
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_polars(self) -> "polars.DataType":
+        raise NotImplementedError
+
     @abstractmethod
     def to_spark(self) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_databricks_ddl(self) -> str:
         raise NotImplementedError
 
     def to_polars_flavor(self) -> "polars.DataType":
@@ -330,15 +380,9 @@ class DataType(BaseChildrenFields, ABC):
         """
         return self.to_spark()
 
-    @abstractmethod
-    def to_databricks_ddl(self) -> str:
-        raise NotImplementedError
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.type_id.value,
-            "name": self.type_id.name,
-        }
+    # ==================================================================
+    # Autotag — Databricks-friendly shape tags
+    # ==================================================================
 
     def autotag(self) -> dict[bytes, bytes]:
         """Return a dict of Databricks-friendly tags derived from this type.
@@ -356,683 +400,30 @@ class DataType(BaseChildrenFields, ABC):
         """
         return {b"kind": self.type_id.name.lower().encode("utf-8")}
 
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.to_arrow()})"
+    # ==================================================================
+    # Scalar conversion — Python / Arrow value coercion
+    # ==================================================================
 
-    def default_pyobj(self, nullable: bool) -> Any:
-        if nullable:
-            return None
-        raise NotImplementedError(
-            f"{type(self).__name__}.default_pyobj(nullable=False) is not implemented"
-        )
+    def convert_pyobj(self, value: Any, nullable: bool, safe: bool = False):
+        if value is None:
+            return self.default_pyobj(nullable=nullable)
+        return self._convert_pyobj(value, safe=safe)
 
-    def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
-        return pa.scalar(self.default_pyobj(nullable=nullable), type=self.to_arrow())
+    def _convert_pyobj(self, value: Any, safe: bool = False):
+        return value
 
-    def default_polars_scalar(self, nullable: bool = True) -> Any:
-        return self.default_pyobj(nullable=nullable)
+    def convert_arrow_scalar(
+        self, value: pa.Scalar, nullable: bool, safe: bool = False
+    ) -> pa.Scalar:
+        return value.cast(self.to_arrow(), safe=safe)
 
-    def default_pandas_scalar(self, nullable: bool = True) -> Any:
-        return self.default_pyobj(nullable=nullable)
-
-    def default_spark_scalar(self, nullable: bool = True) -> Any:
-        return self.default_pyobj(nullable=nullable)
-
-    def default_polars_expr(
-        self,
-        value: Any = None,
-        *,
-        alias: str | None = None,
-        nullable: bool = True,
-    ):
-        pl = get_polars()
-        value = (
-            self.default_polars_scalar(nullable=nullable) if value is None else value
-        )
-        s = pl.lit(value, dtype=self.to_polars())
-
-        if alias and alias != DEFAULT_FIELD_NAME:
-            s = s.alias(alias)
-        return s
-
-    def default_polars_series(
-        self,
-        value: Any = None,
-        *,
-        nullable: bool = True,
-        size: int = 0,
-        name: str = "",
-    ):
-        pl = get_polars()
-        value = (
-            self.default_polars_scalar(nullable=nullable) if value is None else value
-        )
-        return pl.Series(
-            name=name or DEFAULT_FIELD_NAME,
-            values=[value] * size,
-            dtype=self.to_polars(),
-        )
-
-    def default_pandas_series(
-        self,
-        value: Any = None,
-        *,
-        nullable: bool = True,
-        size: int = 0,
-        name: str | None = None,
-        index: Any = None,
-    ):
-        pd = get_pandas()
-        value = (
-            self.default_pandas_scalar(nullable=nullable) if value is None else value
-        )
-        return pd.Series(
-            [value] * size,
-            index=index,
-            name=name,
-            dtype=None,
-        )
-
-    def default_spark_column(
-        self,
-        value: Any = None,
-        *,
-        nullable: bool = True,
-    ):
-        spark = get_spark_sql()
-        value = self.default_spark_scalar(nullable=nullable) if value is None else value
-        return spark.functions.lit(value).cast(self.to_spark())
+    # ==================================================================
+    # Constructors — generic dispatch
+    # ==================================================================
 
     @classmethod
-    def from_parsed(cls, parsed: ParsedDataType) -> "DataType":
-        from .nested import ArrayType, MapType, StructType
-        from .primitive import (
-            BinaryType,
-            BooleanType,
-            DateType,
-            DecimalType,
-            DurationType,
-            FloatingPointType,
-            IntegerType,
-            NullType,
-            StringType,
-            TimeType,
-            TimestampType,
-        )
-
-        field_cls = cls.get_data_field_class()
-        meta: DataTypeMetadata = parsed.metadata
-
-        if parsed.type_id == DataTypeId.NULL:
-            return NullType()
-
-        if parsed.type_id == DataTypeId.BOOL:
-            return BooleanType()
-
-        if parsed.type_id == DataTypeId.INTEGER:
-            return IntegerType(byte_size=parsed.byte_size or 8, signed=True)
-
-        if parsed.type_id == DataTypeId.FLOAT:
-            return FloatingPointType(byte_size=parsed.byte_size or 8)
-
-        if parsed.type_id == DataTypeId.DECIMAL:
-            precision = meta.precision if meta.precision is not None else 38
-            scale = meta.scale if meta.scale is not None else 18
-            return DecimalType(
-                byte_size=parsed.byte_size, precision=precision, scale=scale
-            )
-
-        if parsed.type_id == DataTypeId.DATE:
-            return DateType()
-
-        if parsed.type_id == DataTypeId.TIME:
-            return TimeType(unit=meta.unit or "us")
-
-        if parsed.type_id == DataTypeId.TIMESTAMP:
-            tz = meta.timezone
-            if tz in {"ntz", "without_time_zone"}:
-                tz = None
-            elif tz in {"ltz", "with_time_zone"}:
-                tz = "UTC"
-            return TimestampType(unit=meta.unit or "us", tz=tz)
-
-        if parsed.type_id == DataTypeId.DURATION:
-            return DurationType(unit=meta.unit or "us")
-
-        if parsed.type_id == DataTypeId.BINARY:
-            return BinaryType()
-
-        if parsed.type_id == DataTypeId.STRING:
-            return StringType()
-
-        if parsed.type_id == DataTypeId.ARRAY:
-            child = parsed.item or ParsedDataType(type_id=DataTypeId.OBJECT)
-            return ArrayType.from_item_field(field_cls.from_parsed(child), safe=False)
-
-        if parsed.type_id == DataTypeId.MAP:
-            key_child = parsed.key or ParsedDataType(
-                type_id=DataTypeId.STRING, name="key"
-            )
-            value_child = parsed.value or ParsedDataType(
-                type_id=DataTypeId.STRING, name="value"
-            )
-
-            key_dtype = field_cls.from_parsed(key_child, name="key")
-            value_dtype = field_cls.from_parsed(value_child, name="value")
-
-            return MapType.from_key_value(
-                key_field=key_dtype,
-                value_field=value_dtype,
-                keys_sorted=bool(meta.sorted),
-            )
-
-        if parsed.type_id == DataTypeId.STRUCT:
-            return StructType(
-                fields=[
-                    field_cls(
-                        name=child.name or f"f{i}",
-                        dtype=cls.from_parsed(child),
-                        nullable=child.nullable is not False,
-                    )
-                    for i, child in enumerate(parsed.children)
-                ]
-            )
-
-        if parsed.type_id == DataTypeId.ENUM:
-            if meta.literals:
-                return cls.from_pytype(_literal_values_to_hint(meta.literals))
-            return StringType()
-
-        if parsed.type_id == DataTypeId.UNION:
-            if not parsed.variants:
-                return StringType()
-
-            dtypes = [cls.from_parsed(child) for child in parsed.variants]
-            first = dtypes[0]
-            if all(
-                type(dtype) is type(first) and dtype.to_dict() == first.to_dict()
-                for dtype in dtypes[1:]
-            ):
-                return first
-
-            return StringType()
-
-        if parsed.type_id == DataTypeId.DICTIONARY:
-            if parsed.value_type is not None:
-                return cls.from_parsed(parsed.value_type)
-            return StringType()
-
-        if parsed.type_id == DataTypeId.JSON:
-            return StringType()
-
-        if parsed.type_id == DataTypeId.OBJECT:
-            # Unknown forward-ref names (e.g. dataclass annotations like
-            # "dt.datetime" under `from __future__ import annotations`) come
-            # through as OBJECT with the original token kept in `name`.
-            # String is the safer round-trip target; reserve ObjectType for
-            # the explicit `object` / `any` / `variant` aliases that arrive
-            # without a carried name.
-            if parsed.name:
-                return StringType()
-            from .primitive import ObjectType
-
-            return ObjectType()
-
-        raise TypeError(f"Unsupported parsed data type: {parsed!r}")
-
-    def cast_arrow_array(
-        self,
-        array: pa.Array | pa.ChunkedArray,
-        options: "CastOptions | None" = None,
-        **more_options,
-    ) -> pa.Array | pa.ChunkedArray:
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return array
-
-        opts = get_cast_options_class().check(options, **more_options)
-        opts = opts.check_source(array).check_target(self)
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return array
-
-        # Null-typed source carries no values; reinterpret as typed-null
-        # instead of routing through pc.cast / empty-string nullifying.
-        src_field = opts.source_field
-        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
-            length = array.length() if isinstance(array, pa.ChunkedArray) else len(array)
-            typed_nulls = pa.nulls(length, type=self.to_arrow())
-            if isinstance(array, pa.ChunkedArray):
-                typed_nulls = pa.chunked_array([typed_nulls], type=self.to_arrow())
-            return opts.fill_arrow_nulls(typed_nulls)
-
-        # Source-driven outgoing cast: categorical/ISO types can translate
-        # themselves into numeric / temporal / etc. representations using
-        # domain knowledge that the generic pc.cast can't recover.  The hook
-        # returns None when the source has no special handling for this
-        # target, and we fall through to the standard target-side pipeline.
-        if src_field is not None:
-            try:
-                forwarded = src_field.dtype._outgoing_cast_arrow_array(array, self, opts)
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
-                raise ValueError(
-                    f"Failed casting from {opts.source_field!r} to {opts.target_field!r}: {e}"
-                ) from e
-            if forwarded is not None:
-                return opts.fill_arrow_nulls(forwarded)
-
-        if isinstance(array, pa.ChunkedArray):
-            return self._cast_chunked_array(array, opts)
-        return self._cast_arrow_array(array, opts)
-
-    def _outgoing_cast_arrow_array(
-        self,
-        array: pa.Array | pa.ChunkedArray,
-        target: "DataType",
-        options: "CastOptions",
-    ) -> pa.Array | pa.ChunkedArray | None:
-        """Optional hook: cast *from* this type to *target* using source-specific knowledge.
-
-        Override on categorical source types (ISO codes, enums, dictionaries)
-        to translate into numeric / temporal / etc. representations that the
-        generic ``pc.cast`` pipeline can't recover.  Return ``None`` to defer
-        to the standard target-side pipeline.
-        """
-        return None
-
-    def _cast_arrow_array(
-        self,
-        array: pa.Array,
-        options: "CastOptions",
-    ) -> pa.Array:
-        options = options.check_source(array)
-
-        target_type = self.to_arrow()
-
-        try:
-            casted = pc.cast(
-                array,
-                target_type=target_type,
-                safe=options.safe,
-                memory_pool=options.arrow_memory_pool,
-            )
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-            pl = get_polars()
-            array = (
-                pl.from_arrow(array)
-                .cast(dtype=self.to_polars(), strict=options.safe)
-                .to_arrow()
-            )
-            casted = pc.cast(
-                array,
-                target_type=target_type,
-                safe=options.safe,
-                memory_pool=options.arrow_memory_pool,
-            )
-
-        return options.fill_arrow_nulls(casted)
-
-    def _cast_chunked_array(
-        self,
-        array: pa.ChunkedArray,
-        options: "CastOptions",
-    ) -> pa.ChunkedArray:
-        chunks = [self._cast_arrow_array(chunk, options) for chunk in array.chunks]
-        chunk_type = chunks[0].type if chunks else self.to_arrow()
-        return pa.chunked_array(chunks, type=chunk_type)
-
-    def cast_polars_series(
-        self,
-        series: "polars.Series | polars.Expr",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ) -> "polars.Series | polars.Expr":
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return series
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(series)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return series
-
-        pl = get_polars()
-
-        # Null-typed source: reinterpret with target dtype, skip empty-string
-        # nullify and value-level cast.
-        src_field = opts.source_field
-        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
-            casted = series.cast(self.to_polars(), strict=False)
-            return self.fill_polars_array_nulls(
-                casted, nullable=self._target_nullable(opts)
-            )
-
-        series = self._nullify_empty_polars_strings(series)
-
-        if isinstance(series, pl.Expr):
-            return self._cast_polars_expr(series, opts)
-        return self._cast_polars_series(series, opts)
-
-    @staticmethod
-    def _nullify_empty_polars_strings(
-        series: "polars.Series | polars.Expr",
-    ) -> "polars.Series | polars.Expr":
-        pl = get_polars()
-
-        if not isinstance(series, pl.Series):
-            return series
-
-        if series.dtype != pl.String and series.dtype != pl.Binary:
-            return series
-
-        return series
-
-    def cast_polars_expr(
-        self,
-        series: "polars.Series | polars.Expr",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ) -> "polars.Series | polars.Expr":
-        return self.cast_polars_series(series, options, **more_options)
-
-    def _cast_polars_series(
-        self,
-        series: "polars.Series",
-        options: "CastOptions",
-    ):
-        try:
-            casted = series.cast(dtype=self.to_polars(), strict=options.safe)
-        except Exception:
-            pl = get_polars()
-            arrow = self._cast_arrow_array(
-                series.to_arrow(compat_level=pl.CompatLevel.newest()),
-                options,
-            )
-            casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
-
-        return self.fill_polars_array_nulls(casted, nullable=self._target_nullable(options))
-
-    def _cast_polars_expr(
-        self,
-        expr: "polars.Expr",
-        options: "CastOptions",
-    ):
-        casted = expr.cast(dtype=self.to_polars(), strict=options.safe)
-        return self.fill_polars_array_nulls(casted, nullable=self._target_nullable(options))
-
-    def cast_polars_tabular(
-        self,
-        table: "polars.DataFrame | polars.LazyFrame",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return table
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(table)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return table
-
-        return self._cast_polars_tabular(table, opts)
-
-    def _cast_polars_tabular(
-        self,
-        table: "polars.DataFrame | polars.LazyFrame",
-        options: "CastOptions",
-    ):
-        if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError(
-                "Need struct implementation for cast_polars_tabular"
-            )
-        return self.to_struct()._cast_polars_tabular(table, options)
-
-    def cast_pandas_series(
-        self,
-        series: "pd.Series",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return series
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(series)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return series
-
-        # Null-typed source: build a typed null series directly, skip Arrow.
-        src_field = opts.source_field
-        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
-            pd = get_pandas()
-            nullable = self._target_nullable(opts)
-            value = self.default_pandas_scalar(nullable=nullable) if not nullable else None
-            out = pd.Series(
-                [value] * len(series),
-                index=series.index,
-                name=series.name,
-            )
-            return self.fill_pandas_series_nulls(out, nullable=nullable)
-
-        return self._cast_pandas_series(series, opts)
-
-    def _cast_pandas_series(
-        self,
-        series: "pd.Series",
-        options: "CastOptions",
-    ):
-        pd = get_pandas()
-        options.check_source(series)
-
-        try:
-            arrow = pa.Array.from_pandas(series)
-        except Exception:
-            arrow = pa.array(series.tolist(), from_pandas=True)
-
-        casted = self._cast_arrow_array(arrow, options)
-        out = casted.to_pandas(types_mapper=None)
-
-        if not isinstance(out, pd.Series):
-            out = pd.Series(out, index=series.index, name=series.name)
-        else:
-            out.index = series.index
-            out.name = series.name
-
-        return self.fill_pandas_series_nulls(out, nullable=self._target_nullable(options))
-
-    def cast_pandas_tabular(
-        self,
-        data: "pd.DataFrame",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return data
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(data)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return data
-
-        return self.to_struct()._cast_pandas_tabular(data, opts)
-
-    def _cast_pandas_tabular(
-        self,
-        data: "pd.DataFrame",
-        options: "CastOptions",
-    ):
-        if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError(
-                "Need struct implementation for cast_pandas_tabular"
-            )
-        return self.to_struct()._cast_pandas_tabular(data, options)
-
-    def cast_arrow_tabular(
-        self,
-        table: pa.Table | pa.RecordBatch,
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return table
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(table)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return table
-
-        return self._cast_arrow_tabular(table, opts)
-
-    def _cast_arrow_tabular(
-        self,
-        table: pa.Table | pa.RecordBatch,
-        options: "CastOptions",
-    ):
-        if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError(
-                "Need struct implementation for cast_arrow_tabular"
-            )
-        return self.to_struct()._cast_arrow_tabular(table, options)
-
-    def cast_spark_column(
-        self,
-        column: "ps.Column",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return column
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True,
-            check_dtypes=True,
-            check_metadata=False,
-        ):
-            return column
-
-        # Null-typed source: a plain .cast() is already a metadata-only op on
-        # a NullType column; skip the empty-string nullify pass.
-        src_field = opts.source_field
-        if src_field is not None and src_field.dtype.type_id == DataTypeId.NULL:
-            casted = column.cast(self.to_spark())
-            return self.fill_spark_column_nulls(
-                casted, nullable=self._target_nullable(opts)
-            )
-
-        return self._cast_spark_column(column, opts)
-
-    def _cast_spark_column(
-        self,
-        column: "ps.Column",
-        options: "CastOptions",
-    ):
-        options.check_source(column)
-
-        column = self._nullify_empty_spark_strings(column, options)
-
-        casted = column.cast(self.to_spark())
-        return self.fill_spark_column_nulls(casted, nullable=self._target_nullable(options))
-
-    @staticmethod
-    def _nullify_empty_spark_strings(
-        column: "ps.Column",
-        options: "CastOptions",
-    ) -> "ps.Column":
-        source_field = options.source_field
-        if source_field is None:
-            return column
-
-        source_type_id = source_field.dtype.type_id
-        if source_type_id not in (DataTypeId.STRING, DataTypeId.BINARY):
-            return column
-
-        spark = get_spark_sql()
-        F = spark.functions
-        empty = F.lit("") if source_type_id == DataTypeId.STRING else F.lit(b"")
-        return F.when(column == empty, F.lit(None)).otherwise(column)
-
-    def cast_spark_tabular(
-        self,
-        data: "ps.DataFrame",
-        options: "CastOptions | None" = None,
-        **more_options,
-    ):
-        # Object target is a variant — never touch the values.
-        if self.type_id == DataTypeId.OBJECT:
-            return data
-
-        opts = (
-            get_cast_options_class()
-            .check(options, **more_options)
-            .check_source(data)
-            .check_target(self)
-        )
-
-        if not opts.need_cast(
-            check_names=True, check_dtypes=True, check_metadata=False
-        ):
-            return data
-
-        return self._cast_spark_tabular(data, opts)
-
-    def _cast_spark_tabular(
-        self,
-        data: "ps.DataFrame",
-        options: "CastOptions",
-    ):
-        if self.type_id == DataTypeId.STRUCT:
-            raise NotImplementedError(
-                "Need struct implementation for cast_spark_tabular"
-            )
-        return self.to_struct()._cast_spark_tabular(data, options)
+    def from_(cls, value: Any) -> "DataType":
+        return cls.from_any(value)
 
     @classmethod
     def from_any(cls, value: Any) -> "DataType":
@@ -1076,6 +467,10 @@ class DataType(BaseChildrenFields, ABC):
             f"Cannot convert value of type {type(value).__name__} to DataType: {value!r}"
         )
 
+    # ==================================================================
+    # Constructors — strings, parsed tokens, dicts
+    # ==================================================================
+
     @classmethod
     def from_str(cls, value: str) -> "DataType":
         token = str(value).strip()
@@ -1089,6 +484,204 @@ class DataType(BaseChildrenFields, ABC):
             return cls.from_dict(payload)
 
         return cls.from_parsed(parse_data_type(token))
+
+    @classmethod
+    def from_parsed(cls, parsed: ParsedDataType) -> "DataType":
+        from .nested import ArrayType, MapType, StructType
+        from .primitive import (
+            BinaryType,
+            BooleanType,
+            DateType,
+            DecimalType,
+            DurationType,
+            FloatingPointType,
+            IntegerType,
+            NullType,
+            StringType,
+            TimeType,
+            TimestampType,
+        )
+
+        field_cls = field_class()
+        meta: DataTypeMetadata = parsed.metadata
+
+        if parsed.type_id == DataTypeId.NULL:
+            return NullType()
+
+        if parsed.type_id == DataTypeId.BOOL:
+            return BooleanType()
+
+        if parsed.type_id == DataTypeId.INTEGER:
+            return IntegerType(byte_size=parsed.byte_size or 8, signed=True)
+
+        if parsed.type_id == DataTypeId.FLOAT:
+            return FloatingPointType(byte_size=parsed.byte_size or 8)
+
+        if parsed.type_id == DataTypeId.DECIMAL:
+            precision = meta.precision if meta.precision is not None else 38
+            scale = meta.scale if meta.scale is not None else 18
+            return DecimalType(
+                byte_size=parsed.byte_size, precision=precision, scale=scale
+            )
+
+        if parsed.type_id == DataTypeId.DATE or parsed.name in {
+            "dt.date", "date"
+        }:
+            return DateType()
+
+        if parsed.type_id == DataTypeId.TIME or parsed.name in {
+            "dt.time", "time"
+        }:
+            return TimeType(unit=meta.unit or "us")
+
+        if parsed.type_id == DataTypeId.TIMESTAMP or parsed.name in {
+            "dt.datetime", "datetime"
+        }:
+            tz = meta.timezone
+            if tz in {"ntz", "without_time_zone"}:
+                tz = None
+            elif tz in {"ltz", "with_time_zone"}:
+                tz = "UTC"
+            else:
+                tz = tz or "UTC"
+            return TimestampType(unit=meta.unit or "us", tz=tz)
+
+        if parsed.type_id == DataTypeId.DURATION or parsed.name in {
+            "dt.timedelta", "timedelta"
+        }:
+            return DurationType(unit=meta.unit or "us")
+
+        if parsed.type_id == DataTypeId.BINARY:
+            return BinaryType()
+
+        if parsed.type_id == DataTypeId.STRING:
+            return StringType()
+
+        if parsed.type_id == DataTypeId.ARRAY:
+            child = parsed.item or ParsedDataType(type_id=DataTypeId.OBJECT)
+            return ArrayType.from_item(field_cls.from_parsed(child))
+
+        if parsed.type_id == DataTypeId.MAP:
+            key_child = parsed.key or ParsedDataType(
+                type_id=DataTypeId.STRING, name="key"
+            )
+            value_child = parsed.value or ParsedDataType(
+                type_id=DataTypeId.STRING, name="value"
+            )
+
+            key_dtype = field_cls.from_parsed(key_child, name="key")
+            value_dtype = field_cls.from_parsed(value_child, name="value")
+
+            return MapType.from_key_value(
+                key_field=key_dtype,
+                value_field=value_dtype,
+                keys_sorted=bool(meta.sorted),
+            )
+
+        if parsed.type_id == DataTypeId.STRUCT:
+            return StructType(
+                fields=[
+                    field_cls.from_parsed(
+                        child,
+                        name=child.name or f"f{i}"
+                    )
+                    for i, child in enumerate(parsed.children)
+                ]
+            )
+
+        if parsed.type_id == DataTypeId.ENUM:
+            if meta.literals:
+                return cls.from_pytype(_literal_values_to_hint(meta.literals))
+            return StringType()
+
+        if parsed.type_id == DataTypeId.UNION:
+            if not parsed.variants:
+                return StringType()
+
+            dtypes = [cls.from_parsed(child) for child in parsed.variants]
+            first = dtypes[0]
+            if all(
+                type(dtype) is type(first) and dtype.to_dict() == first.to_dict()
+                for dtype in dtypes[1:]
+            ):
+                return first
+
+            return StringType()
+
+        if parsed.type_id == DataTypeId.DICTIONARY:
+            if parsed.value_type is not None:
+                return cls.from_parsed(parsed.value_type)
+            return StringType()
+
+        if parsed.type_id == DataTypeId.JSON:
+            return StringType()
+
+        if parsed.type_id == DataTypeId.OBJECT:
+            from .primitive import ObjectType
+
+            return ObjectType()
+
+        raise TypeError(f"Unsupported parsed data type: {parsed!r}")
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "DataType":
+        if not value:
+            raise ValueError(
+                f"Cannot build {cls.__name__} from empty dictionary {value!r}"
+            )
+
+        if "id" in value.keys() or b"id" in value.keys():
+            if cls.__subclasses__():
+                for subclass in cls.__subclasses__():
+                    if subclass.handles_dict(value):
+                        return subclass.from_dict(value)
+            raise ValueError(f"Unknown DataType payload: {value!r}")
+
+        for key in ("dtype", "type_text", "type_json", "type"):
+            dtype_payload = value.get(key)
+            if dtype_payload:
+                break
+
+        if dtype_payload is None:
+            raise ValueError(
+                f"Cannot find a valid 'dtype' key in the provided dictionary: {value}"
+            )
+
+        base = cls.from_any(dtype_payload)
+
+        if base.type_id == DataTypeId.STRUCT:
+            inner_fields = value.get("fields", base.children_fields)
+            return base.to_struct().with_fields(inner_fields)
+        elif base.type_id == DataTypeId.ARRAY:
+            element_type = value.get("elementType")
+            if element_type is not None:
+                base.item_field.with_dtype(element_type, inplace=True)
+
+            contains_null = value.get("containsNull")
+            if contains_null is not None:
+                base.item_field.with_nullable(contains_null, inplace=True)
+        elif base.type_id == DataTypeId.MAP:
+            key_type = value.get("keyType")
+            if key_type is not None:
+                base.key_field.with_dtype(key_type, inplace=True).with_name(
+                    "key", inplace=True
+                )
+
+            value_type = value.get("valueType")
+            if value_type is not None:
+                base.value_field.with_dtype(value_type, inplace=True).with_name(
+                    "value", inplace=True
+                )
+
+            value_contains_null = value.get("valueContainsNull")
+            if value_contains_null is not None:
+                base.value_field.with_nullable(value_contains_null, inplace=True)
+
+        return base
+
+    # ==================================================================
+    # Constructors — Python types, dataclasses
+    # ==================================================================
 
     @classmethod
     def from_pytype(cls, hint: Any) -> "DataType":
@@ -1145,6 +738,9 @@ class DataType(BaseChildrenFields, ABC):
 
             return StringType()
 
+        # Scalar builtins — exact-identity checks run before the
+        # issubclass fallbacks below so we don't spuriously treat
+        # ``bool`` as ``int`` (bool <: int in Python).
         if hint is bool:
             return BooleanType()
 
@@ -1184,6 +780,8 @@ class DataType(BaseChildrenFields, ABC):
                 return StringType()
             return cls.from_pytype(type(members[0].value))
 
+        # Scalar subclass fallbacks — for user-defined types that
+        # inherit from builtins (e.g. `class Mass(float): ...`).
         if _safe_issubclass(hint, bool):
             return BooleanType()
 
@@ -1217,6 +815,7 @@ class DataType(BaseChildrenFields, ABC):
         if _safe_issubclass(hint, dt.timedelta):
             return DurationType(unit="us")
 
+        # Container generics — list / set / frozenset / Sequence / Set
         if origin in (list, Sequence, set, frozenset, AbstractSet):
             item_hint = args[0] if args else Any
             return ArrayType(
@@ -1234,8 +833,10 @@ class DataType(BaseChildrenFields, ABC):
                 )
             )
 
+        # Tuple — two flavors: ``tuple[T, ...]`` is a homogeneous array,
+        # ``tuple[T1, T2, T3]`` is a fixed-arity struct with ``_0/_1/_2``.
         if origin is tuple:
-            field_cls = cls.get_data_field_class()
+            field_cls = field_class()
 
             if not args:
                 return ArrayType(
@@ -1268,6 +869,7 @@ class DataType(BaseChildrenFields, ABC):
                 )
             )
 
+        # Dict / OrderedDict / Mapping generics
         if origin is dict:
             key_hint, value_hint = args if len(args) == 2 else (Any, Any)
             return MapType.from_key_value(
@@ -1316,8 +918,9 @@ class DataType(BaseChildrenFields, ABC):
                 value_field=cls.from_pytype(Any),
             )
 
+        # TypedDict / NamedTuple / annotated class → StructType
         if _is_typed_dict_type(hint):
-            field_cls = cls.get_data_field_class()
+            field_cls = field_class()
             annotations = getattr(hint, "__annotations__", {})
             required_keys = getattr(hint, "__required_keys__", frozenset())
             optional_keys = getattr(hint, "__optional_keys__", frozenset())
@@ -1341,7 +944,7 @@ class DataType(BaseChildrenFields, ABC):
             return StructType(fields=inner_fields)
 
         if _is_namedtuple_type(hint):
-            field_cls = cls.get_data_field_class()
+            field_cls = field_class()
             annotations = getattr(hint, "__annotations__", {})
             return StructType(
                 fields=[
@@ -1355,7 +958,7 @@ class DataType(BaseChildrenFields, ABC):
             )
 
         if isinstance(hint, type) and getattr(hint, "__annotations__", None):
-            field_cls = cls.get_data_field_class()
+            field_cls = field_class()
             return StructType(
                 fields=[
                     field_cls(
@@ -1374,7 +977,7 @@ class DataType(BaseChildrenFields, ABC):
         if not is_dataclass(hint):
             raise TypeError(f"Unsupported dataclass input: {hint!r}")
 
-        field_cls = cls.get_data_field_class()
+        field_cls = field_class()
         inner_fields = []
 
         for f in fields(hint):
@@ -1386,10 +989,16 @@ class DataType(BaseChildrenFields, ABC):
                     name=f.name,
                     dtype=cls.from_any(f.type),
                     nullable=True,
+                ).with_metadata(
+                    default=f.default
                 )
             )
 
         return StructType(fields=inner_fields)
+
+    # ==================================================================
+    # Constructors — arrow
+    # ==================================================================
 
     @classmethod
     def from_arrow(
@@ -1449,6 +1058,10 @@ class DataType(BaseChildrenFields, ABC):
                 return subclass.from_arrow_type(value)
         raise TypeError(f"Unsupported Arrow data type: {value!r}")
 
+    # ==================================================================
+    # Constructors — polars
+    # ==================================================================
+
     @classmethod
     def from_polars(cls, value: Any) -> "DataType":
         pl = get_polars()
@@ -1500,6 +1113,10 @@ class DataType(BaseChildrenFields, ABC):
             return StringType()
 
         raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+
+    # ==================================================================
+    # Constructors — pandas
+    # ==================================================================
 
     @classmethod
     def from_pandas(cls, obj: Any):
@@ -1580,6 +1197,10 @@ class DataType(BaseChildrenFields, ABC):
 
         raise TypeError(f"Unsupported Pandas data type: {obj!r}")
 
+    # ==================================================================
+    # Constructors — spark
+    # ==================================================================
+
     @classmethod
     def from_spark(cls, value: Any) -> "DataType":
         sp = get_spark_sql()
@@ -1592,6 +1213,11 @@ class DataType(BaseChildrenFields, ABC):
             return cls.from_spark_type(value.schema)
         if isinstance(value, sp.types.StructField):
             return cls.from_spark_type(value.dataType)
+        if isinstance(value, sp.Column):
+            try:
+                return cls.from_str(value._jc.expr().dataType().typeName())
+            except Exception:
+                pass
 
         raise TypeError(f"Unsupported Spark data type: {value!r}")
 
@@ -1601,6 +1227,10 @@ class DataType(BaseChildrenFields, ABC):
             if subclass.handles_spark_type(value):
                 return subclass.from_spark_type(value)
         raise ValueError(f"Unknown DataType payload: {value!r}")
+
+    # ==================================================================
+    # Constructors — yggdrasil (Field / Schema / dtype holders)
+    # ==================================================================
 
     @classmethod
     def from_yggdrasil(
@@ -1644,68 +1274,295 @@ class DataType(BaseChildrenFields, ABC):
             f"Unsupported Yggdrasil data type for {cls_name or 'DataType'}: {value!r}"
         )
 
-    @classmethod
-    def handles_dict(cls, value: dict[str, Any]) -> bool:
-        for subclass in cls.__subclasses__():
-            if subclass.handles_dict(value):
-                return True
-        return False
+    # ==================================================================
+    # Cast — public arrow dispatchers
+    # ==================================================================
 
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DataType":
-        if not value:
-            raise ValueError(
-                f"Cannot build {cls.__name__} from empty dictionary {value!r}"
+    def cast_arrow_array(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        options: "CastOptions | None" = None,
+        **more_options,
+    ) -> pa.Array | pa.ChunkedArray:
+        opts = get_cast_options_class().check(options, **more_options)
+
+        if isinstance(array, pa.ChunkedArray):
+            return self._cast_chunked_array(array, opts)
+        return self._cast_arrow_array(array, opts)
+
+    def cast_arrow_tabular(
+        self,
+        table: pa.Table | pa.RecordBatch,
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_arrow_tabular(table, opts)
+
+    # ==================================================================
+    # Cast — arrow internals
+    # ==================================================================
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.Array:
+        if options.need_cast(array, self):
+            target_type = self.to_arrow()
+
+            try:
+                casted = pc.cast(
+                    array,
+                    target_type=target_type,
+                    safe=options.safe,
+                    memory_pool=options.arrow_memory_pool,
+                )
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                # Polars fallback — for casts pyarrow rejects (e.g. string →
+                # decimal, nested-struct coercions). Round-trip through
+                # polars, then re-cast to pin down the exact target type.
+                pl = get_polars()
+                array = (
+                    pl.from_arrow(array)
+                    .cast(dtype=self.to_polars(), strict=options.safe)
+                    .to_arrow()
+                )
+                casted = pc.cast(
+                    array,
+                    target_type=target_type,
+                    safe=options.safe,
+                    memory_pool=options.arrow_memory_pool,
+                )
+            return casted
+        return array
+
+    def _cast_chunked_array(
+        self,
+        array: pa.ChunkedArray,
+        options: "CastOptions",
+    ) -> pa.ChunkedArray:
+        if options.need_cast(array, self):
+            chunks = [self._cast_arrow_array(chunk, options) for chunk in array.chunks]
+            chunk_type = chunks[0].type if chunks else self.to_arrow()
+            return pa.chunked_array(chunks, type=chunk_type)
+        return array
+
+    def _cast_arrow_tabular(
+        self,
+        table: pa.Table | pa.RecordBatch,
+        options: "CastOptions",
+    ):
+        if self.type_id == DataTypeId.STRUCT:
+            raise NotImplementedError(
+                "Need struct implementation for cast_arrow_tabular"
+            )
+        return self.to_struct()._cast_arrow_tabular(table, options)
+
+    # ==================================================================
+    # Cast — public polars dispatchers
+    # ==================================================================
+
+    def cast_polars_series(
+        self,
+        series: "polars.Series | polars.Expr",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ) -> "polars.Series | polars.Expr":
+        opts = get_cast_options_class().check(options, **more_options)
+
+        pl = polars_module()
+        if isinstance(series, pl.Expr):
+            return self._cast_polars_expr(series, opts)
+        return self._cast_polars_series(series, opts)
+
+    def cast_polars_expr(
+        self,
+        series: "polars.Series | polars.Expr",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ) -> "polars.Series | polars.Expr":
+        """Expr-shape passthrough to :meth:`cast_polars_series`.
+
+        :meth:`cast_polars_series` already dispatches by isinstance — this
+        method exists so callers that know they hold an Expr can name it.
+        """
+        return self.cast_polars_series(series, options, **more_options)
+
+    def cast_polars_tabular(
+        self,
+        table: "polars.DataFrame | polars.LazyFrame",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_polars_tabular(table, opts)
+
+    # ==================================================================
+    # Cast — polars internals
+    # ==================================================================
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ):
+        if options.need_cast(series, self):
+            try:
+                casted = series.cast(dtype=self.to_polars(), strict=options.safe)
+            except Exception:
+                # Polars→Arrow→Polars round-trip — used when the direct
+                # polars cast rejects (e.g. timezone-lossy timestamp
+                # casts). Arrow's cast engine has a wider acceptance set.
+                pl = polars_module()
+                arrow = self._cast_arrow_array(
+                    series.to_arrow(compat_level=pl.CompatLevel.newest()),
+                    options,
+                )
+                casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
+
+            return casted
+
+        return series
+
+    def _cast_polars_expr(
+        self,
+        expr: "polars.Expr",
+        options: "CastOptions",
+    ):
+        return expr.cast(dtype=self.to_polars(), strict=options.safe)
+
+    def _cast_polars_tabular(
+        self,
+        table: "polars.DataFrame | polars.LazyFrame",
+        options: "CastOptions",
+    ):
+        if self.type_id == DataTypeId.STRUCT:
+            raise NotImplementedError(
+                "Need struct implementation for cast_polars_tabular"
             )
 
-        if "id" in value.keys() or b"id" in value.keys():
-            if cls.__subclasses__():
-                for subclass in cls.__subclasses__():
-                    if subclass.handles_dict(value):
-                        return subclass.from_dict(value)
-            raise ValueError(f"Unknown DataType payload: {value!r}")
+        return self.to_struct()._cast_polars_tabular(table, options)
 
-        for key in ("dtype", "type_text", "type_json", "type"):
-            dtype_payload = value.get(key)
-            if dtype_payload:
-                break
+    # ==================================================================
+    # Cast — public pandas dispatchers
+    # ==================================================================
 
-        if dtype_payload is None:
-            raise ValueError(
-                f"Cannot find a valid 'dtype' key in the provided dictionary: {value}"
+    def cast_pandas_series(
+        self,
+        series: "pd.Series",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_pandas_series(series, opts)
+
+    def cast_pandas_tabular(
+        self,
+        data: "pd.DataFrame",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_pandas_tabular(data, opts)
+
+    # ==================================================================
+    # Cast — pandas internals
+    # ==================================================================
+
+    def _cast_pandas_series(
+        self,
+        series: "pd.Series",
+        options: "CastOptions",
+    ):
+        if options.need_cast(series, self):
+            pd = pandas_module()
+            try:
+                arrow = pa.Array.from_pandas(series)
+            except Exception:
+                arrow = pa.array(series.tolist(), from_pandas=True)
+
+            casted = self._cast_arrow_array(arrow, options).to_pandas(types_mapper=None)
+
+            if not isinstance(casted, pd.Series):
+                casted = pd.Series(casted, index=series.index, name=series.name)
+            else:
+                casted.index = series.index
+                casted.name = series.name
+
+            return casted
+        return series
+
+    def _cast_pandas_tabular(
+        self,
+        data: "pd.DataFrame",
+        options: "CastOptions",
+    ):
+        if self.type_id == DataTypeId.STRUCT:
+            preserve_index = bool(data.index.name)
+            arrow_table = pa.Table.from_pandas(
+                data,
+                preserve_index=preserve_index,
+            )
+            casted = self._cast_arrow_tabular(arrow_table, options).to_pandas()
+
+            if preserve_index:
+                casted = casted.set_index(data.index.name)
+
+            return casted
+
+        return self.to_struct()._cast_pandas_tabular(data, options)
+
+    # ==================================================================
+    # Cast — public spark dispatchers
+    # ==================================================================
+
+    def cast_spark_column(
+        self,
+        column: "ps.Column",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_spark_column(column, opts)
+
+    def cast_spark_tabular(
+        self,
+        data: "ps.DataFrame",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ):
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_spark_tabular(data, opts)
+
+    # ==================================================================
+    # Cast — spark internals
+    # ==================================================================
+
+    def _cast_spark_column(
+        self,
+        column: "ps.Column",
+        options: "CastOptions",
+    ):
+        if options.need_cast(column, self):
+            return column.cast(self.to_spark())
+        return column
+
+    def _cast_spark_tabular(
+        self,
+        data: "ps.DataFrame",
+        options: "CastOptions",
+    ):
+        if self.type_id == DataTypeId.STRUCT:
+            raise NotImplementedError(
+                "Need struct implementation for cast_polars_tabular"
             )
 
-        base = cls.from_any(dtype_payload)
+        return self.to_struct()._cast_spark_tabular(data, options)
 
-        if base.type_id == DataTypeId.STRUCT:
-            inner_fields = value.get("fields", base.children_fields)
-            return base.to_struct().with_fields(inner_fields)
-        elif base.type_id == DataTypeId.ARRAY:
-            element_type = value.get("elementType")
-            if element_type is not None:
-                base.item_field.with_dtype(element_type, inplace=True)
-
-            contains_null = value.get("containsNull")
-            if contains_null is not None:
-                base.item_field.with_nullable(contains_null, inplace=True)
-        elif base.type_id == DataTypeId.MAP:
-            key_type = value.get("keyType")
-            if key_type is not None:
-                base.key_field.with_dtype(key_type, inplace=True).with_name(
-                    "key", inplace=True
-                )
-
-            value_type = value.get("valueType")
-            if value_type is not None:
-                base.value_field.with_dtype(value_type, inplace=True).with_name(
-                    "value", inplace=True
-                )
-
-            value_contains_null = value.get("valueContainsNull")
-            if value_contains_null is not None:
-                base.value_field.with_nullable(value_contains_null, inplace=True)
-
-        return base
+    # ==================================================================
+    # Fill — per-engine null-fill primitives
+    # ==================================================================
 
     def fill_arrow_array_nulls(
         self,
@@ -1738,6 +1595,106 @@ class DataType(BaseChildrenFields, ABC):
             return pa.chunked_array(chunks, type=array.type)
 
         return pc.fill_null(array, default_scalar)
+
+    def fill_polars_array_nulls(
+        self,
+        series: "polars.Series | polars.Expr",
+        *,
+        nullable: bool = False,
+        default_scalar: Any = None,
+    ) -> "polars.Series | polars.Expr":
+        if nullable:
+            return series
+
+        if default_scalar is None:
+            default_scalar = self.default_polars_scalar(nullable=nullable)
+
+        if default_scalar is None:
+            return series
+
+        pl = polars_module()
+        if isinstance(series, pl.Series):
+            if series.null_count() == 0:
+                return series
+
+        return series.fill_null(default_scalar)
+
+    def fill_pandas_series_nulls(
+        self,
+        series: "pd.Series",
+        *,
+        nullable: bool = False,
+        default_scalar: Any = None,
+    ) -> "pd.Series":
+        if nullable:
+            return series
+
+        if not series.isna().any():
+            return series
+
+        if default_scalar is None:
+            default_scalar = self.default_pandas_scalar(nullable=nullable)
+
+        if default_scalar is None:
+            return series
+
+        return series.fillna(default_scalar)
+
+    def fill_spark_column_nulls(
+        self,
+        column: "ps.Column",
+        *,
+        nullable: bool = False,
+        default_scalar: Any = None,
+    ) -> "ps.Column":
+        spark = get_spark_sql()
+        F = spark.functions
+
+        if default_scalar is None:
+            default_scalar = self.default_spark_scalar(nullable=nullable)
+
+        if default_scalar is None or default_scalar in ({}, []):
+            return column
+
+        try:
+            defaults = F.lit(default_scalar)
+        except Exception as e:
+            logging.warning(e)
+            return column
+
+        return (
+            F.when(column.isNull(), defaults)
+            .otherwise(column)
+            .cast(self.to_spark())
+        )
+
+    # ==================================================================
+    # Defaults — scalar + column / array factories
+    # ==================================================================
+    #
+    # ``default_<engine>_scalar`` returns a single value; the
+    # ``default_<engine>_series`` / ``default_<engine>_column`` /
+    # ``default_arrow_array`` methods lift that scalar into a sized
+    # container for zero-row or N-row materialization.
+
+    def default_pyobj(self, nullable: bool) -> Any:
+        if nullable:
+            return None
+        raise NotImplementedError(
+            f"{type(self).__name__}.default_pyobj(nullable=False) is not implemented"
+        )
+
+    def default_arrow_scalar(self, nullable: bool = True) -> pa.Scalar:
+        return pa.scalar(self.default_pyobj(nullable=nullable), type=self.to_arrow())
+
+    def default_polars_scalar(self, nullable: bool = True) -> Any:
+        return self.default_pyobj(nullable=nullable)
+
+    def default_pandas_scalar(self, nullable: bool = True) -> Any:
+        return self.default_pyobj(nullable=nullable)
+
+    def default_spark_scalar(self, nullable: bool = True) -> Any:
+        return self.default_pyobj(nullable=nullable)
 
     def default_arrow_array(
         self,
@@ -1781,67 +1738,75 @@ class DataType(BaseChildrenFields, ABC):
             memory_pool=memory_pool,
         )
 
-    def fill_polars_array_nulls(
+    def default_polars_expr(
         self,
-        series: "polars.Series | polars.Expr",
+        value: Any = None,
         *,
-        nullable: bool = False,
-        default_scalar: Any = None,
-    ) -> "polars.Series | polars.Expr":
-        if nullable:
-            return series
+        alias: str | None = None,
+        nullable: bool = True,
+    ):
+        pl = get_polars()
+        value = (
+            self.default_polars_scalar(nullable=nullable) if value is None else value
+        )
+        s = pl.lit(value, dtype=self.to_polars())
 
-        if default_scalar is None:
-            default_scalar = self.default_polars_scalar(nullable=nullable)
+        if alias and alias != DEFAULT_FIELD_NAME:
+            s = s.alias(alias)
+        return s
 
-        if default_scalar is None:
-            return series
-
-        return series.fill_null(default_scalar)
-
-    def fill_pandas_series_nulls(
+    def default_polars_series(
         self,
-        series: "pd.Series",
+        value: Any = None,
         *,
-        nullable: bool = False,
-        default_scalar: Any = None,
-    ) -> "pd.Series":
-        if nullable:
-            return series
-
-        if not series.isna().any():
-            return series
-
-        if default_scalar is None:
-            default_scalar = self.default_pandas_scalar(nullable=nullable)
-
-        if default_scalar is None:
-            return series
-
-        return series.fillna(default_scalar)
-
-    def fill_spark_column_nulls(
-        self,
-        column: "ps.Column",
-        *,
-        nullable: bool = False,
-        default_scalar: Any = None,
-    ) -> "ps.Column":
-        spark = get_spark_sql()
-        F = spark.functions
-
-        if default_scalar is None:
-            default_scalar = self.default_spark_scalar(nullable=nullable)
-
-        if default_scalar is None or default_scalar == {}:
-            return column
-
-        return (
-            F.when(column.isNull(), F.lit(default_scalar))
-            .otherwise(column)
-            .cast(self.to_spark())
+        nullable: bool = True,
+        size: int = 0,
+        name: str = "",
+    ):
+        pl = get_polars()
+        value = (
+            self.default_polars_scalar(nullable=nullable) if value is None else value
+        )
+        return pl.Series(
+            name=name or DEFAULT_FIELD_NAME,
+            values=[value] * size,
+            dtype=self.to_polars(),
         )
 
+    def default_pandas_series(
+        self,
+        value: Any = None,
+        *,
+        nullable: bool = True,
+        size: int = 0,
+        name: str | None = None,
+        index: Any = None,
+    ):
+        pd = get_pandas()
+        value = (
+            self.default_pandas_scalar(nullable=nullable) if value is None else value
+        )
+        return pd.Series(
+            [value] * size,
+            index=index,
+            name=name,
+            dtype=None,
+        )
+
+    def default_spark_column(
+        self,
+        value: Any = None,
+        *,
+        nullable: bool = True,
+    ):
+        spark = get_spark_sql()
+        value = self.default_spark_scalar(nullable=nullable) if value is None else value
+        return spark.functions.lit(value).cast(self.to_spark())
+
+
+# ======================================================================
+# Subclass re-exports — resolve late so subclass registry is populated
+# ======================================================================
 
 from .nested import ArrayType, MapType, NestedType, StructType
 from .primitive import (

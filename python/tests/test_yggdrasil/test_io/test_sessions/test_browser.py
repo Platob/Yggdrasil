@@ -498,7 +498,7 @@ class TestResolveUrl:
 
     def test_url_object_absolute_returned_as_is(self):
         b = BrowserHTTPSession()
-        url = URL.parse("https://example.com/page")
+        url = URL.from_("https://example.com/page")
         result = b._resolve_url(url)
         # absolute URL objects pass through unchanged (same object or equal)
         assert result == url
@@ -577,29 +577,29 @@ class TestResolveUrl:
 
 class TestApplyParams:
     def test_scalar_params_added(self):
-        url = URL.parse("https://example.com/path")
+        url = URL.from_("https://example.com/path")
         result = BrowserHTTPSession._apply_params(url, {"a": "1", "b": "2"})
         assert "a=1" in (result.query or "")
         assert "b=2" in (result.query or "")
 
     def test_multi_value_params(self):
-        url = URL.parse("https://example.com/path")
+        url = URL.from_("https://example.com/path")
         result = BrowserHTTPSession._apply_params(url, {"tag": ["x", "y"]})
         assert (result.query or "").count("tag=") == 2
 
     def test_preserves_existing_query(self):
-        url = URL.parse("https://example.com/path?existing=1")
+        url = URL.from_("https://example.com/path?existing=1")
         result = BrowserHTTPSession._apply_params(url, {"new": "2"})
         assert "existing=1" in (result.query or "")
         assert "new=2" in (result.query or "")
 
     def test_empty_params_noop(self):
-        url = URL.parse("https://example.com/path?q=1")
+        url = URL.from_("https://example.com/path?q=1")
         result = BrowserHTTPSession._apply_params(url, {})
         assert result.query == "q=1"
 
     def test_numeric_value_coerced(self):
-        url = URL.parse("https://example.com/")
+        url = URL.from_("https://example.com/")
         result = BrowserHTTPSession._apply_params(url, {"page": 3, "size": 20})
         assert "page=3" in (result.query or "")
         assert "size=20" in (result.query or "")

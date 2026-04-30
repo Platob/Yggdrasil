@@ -197,7 +197,7 @@ class TestFromPytypeComplex(ArrowTestCase):
             dtype.to_arrow(),
             pa.struct(
                 [
-                    pa.field("ts", pa.string(), nullable=True),
+                    pa.field("ts", pa.timestamp("us", "UTC"), nullable=True),
                     pa.field("price", pa.float32(), nullable=True),
                     pa.field("volume", pa.int32(), nullable=True),
                 ]

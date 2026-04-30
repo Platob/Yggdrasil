@@ -7,7 +7,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 
-from yggdrasil.io import MimeTypes
+from yggdrasil.io.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
 
 from .buffer import BytesIO
@@ -151,7 +151,7 @@ def _parse_int_header(value: Optional[str]) -> Optional[int]:
         return None
 
 
-@dataclass(frozen=True)
+@dataclass
 class PromotedHeaders:
     """
     Common HTTP headers extracted into dedicated typed fields.
@@ -382,8 +382,8 @@ def normalize_headers(
             out.update(DEFAULT_HEADERS)
 
             if accept_value:
-                codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
-                media_type = MediaType.parse(accept_value, codec=codec) if accept_value else None
+                codec = Codec.from_(accept_encoding_value) if accept_encoding_value else None
+                media_type = MediaType.from_(accept_value, codec=codec) if accept_value else None
 
                 out["Accept"] = "*/*" if media_type.mime_type == MimeTypes.OCTET_STREAM else media_type.mime_type.value
 
@@ -393,7 +393,7 @@ def normalize_headers(
             elif accept_encoding_value:
                 out["Accept"] = "*/*"
 
-                codec = Codec.parse(accept_encoding_value) if accept_encoding_value else None
+                codec = Codec.from_(accept_encoding_value) if accept_encoding_value else None
 
                 if codec is None:
                     raise ValueError(f"Invalid Accept-Encoding value: {accept_encoding_value}")

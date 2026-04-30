@@ -16,7 +16,7 @@ Use these helpers to apply `CastOptions` to tabular data across Arrow and datafr
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "value": ["10.1", "20.5"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.float64())])
@@ -27,7 +27,7 @@ out = cast_arrow_tabular(raw, CastOptions(target_field=target))
 
 ```python
 import yggdrasil.arrow as pa
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
 from yggdrasil.polars.lib import polars
 

@@ -193,7 +193,7 @@ class Grant(DatabricksResource):
         )
 
 
-@dc.dataclass(frozen=True)
+@dc.dataclass
 class Grants(DatabricksService):
     catalog_name: str | None = None
     schema_name: str | None = None

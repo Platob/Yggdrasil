@@ -245,7 +245,7 @@ def _current_compute_url(*, hostname: str, cwd: str) -> URL | None:
     if not cwd:
         return None
     path = normalize_abs_path_for_url(cwd)
-    return URL.parse_dict({"scheme": "local", "host": hostname.lower(), "path": path})
+    return URL.from_dict({"scheme": "local", "host": hostname.lower(), "path": path})
 
 
 def _databricks_current_url(*, kind: DatabricksLinkKind = "auto") -> URL | None:
@@ -266,7 +266,7 @@ def _databricks_current_url(*, kind: DatabricksLinkKind = "auto") -> URL | None:
     if not host or not org_id:
         return None
 
-    base = URL.parse_dict({"scheme": "https", "host": host, "path": "/", "query": f"o={org_id}"})
+    base = URL.from_dict({"scheme": "https", "host": host, "path": "/", "query": f"o={org_id}"})
 
     job_id = _pick(tags.get("jobId"), tags.get("job_id"), os.getenv("DATABRICKS_JOB_ID"))
     run_id = _pick(tags.get("jobRunId"), tags.get("job_run_id"), tags.get("runId"), os.getenv("DATABRICKS_RUN_ID"))
@@ -453,7 +453,7 @@ def _git_url_from_info(git: dict[str, str] | None) -> URL | None:
     remote = git.get("git_remote")
     if not remote:
         return None
-    url = URL.parse_str(_normalize_git_remote(remote), normalize=True)
+    url = URL.from_str(_normalize_git_remote(remote), normalize=True)
     sha = git.get("git_sha")
     if sha:
         url = url.with_fragment(sha)

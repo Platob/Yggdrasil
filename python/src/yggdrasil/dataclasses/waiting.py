@@ -96,7 +96,7 @@ class WaitingConfig:
         return (deadline - now).total_seconds()
 
     @classmethod
-    def check_arg(
+    def from_(
         cls,
         arg: WaitingConfigArg = None,
         timeout: Optional[Union[int, float, dt.timedelta]] = None,

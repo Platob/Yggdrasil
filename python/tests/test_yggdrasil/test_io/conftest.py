@@ -19,7 +19,6 @@ import pytest
 pytest.importorskip("yggdrasil")
 
 from yggdrasil.io.buffer.bytes_io import BytesIO       # noqa: E402
-from yggdrasil.io.config import BufferConfig           # noqa: E402
 from yggdrasil.io.request import PreparedRequest       # noqa: E402
 from yggdrasil.io.response import Response             # noqa: E402
 
@@ -86,18 +85,6 @@ def small_buf() -> BytesIO:
 def empty_buf() -> BytesIO:
     """Freshly created empty BytesIO."""
     return BytesIO()
-
-
-@pytest.fixture
-def spill_config(tmp_path: Path) -> BufferConfig:
-    """BufferConfig with a 64-byte spill threshold backed by tmp_path."""
-    return BufferConfig(spill_bytes=64, tmp_dir=tmp_path)
-
-
-@pytest.fixture
-def spilled_buf(spill_config: BufferConfig) -> BytesIO:
-    """A BytesIO that has already migrated to disk."""
-    return BytesIO(PAYLOAD, config=spill_config)
 
 
 @pytest.fixture

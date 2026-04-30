@@ -1,19 +1,17 @@
 """Databricks integrations and helpers for Yggdrasil."""
 
-from .lib import WorkspaceClient # noqa: F401
-from .workspaces import Workspace
-from .client import DatabricksClient
-from .fs import DatabricksPath, DatabricksPathKind, DatabricksIO
-from .fs.service import FileSystem
 from .ai.genie import Genie, GenieAnswer, GenieSpace
-
+from .client import DatabricksClient
+from .fs import DatabricksPath, DatabricksPathKind
+from .fs.service import FileSystem
+from .lib import WorkspaceClient  # noqa: F401
+from .workspaces import Workspace
 
 __all__ = [
     "DatabricksClient",
     "Workspace",
     "DatabricksPath",
     "DatabricksPathKind",
-    "DatabricksIO",
     "FileSystem",
     "Genie",
     "GenieAnswer",

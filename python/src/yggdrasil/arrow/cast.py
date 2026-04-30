@@ -1,48 +1,75 @@
+"""Arrow conversion entry points with native fast-path preference.
+
+Design principles
+-----------------
+
+1. **Cast in the source engine, then serialize.** Polars/Spark/pandas
+   each have engine-native cast machinery exposed on
+   :class:`CastOptions` as :meth:`cast_polars` / :meth:`cast_spark` /
+   :meth:`cast_pandas`. We use those *before* the Arrow conversion —
+   it's faster (no round-trip rebuild), preserves engine-specific
+   dtypes (polars Categoricals, pandas ExtensionArrays), and lets
+   lazy engines push the cast into their query plan. Arrow-side
+   casting is reserved for sources that are already Arrow or have no
+   native cast path.
+
+2. **Bulk over iterate.** Vectorized native methods over per-row
+   iteration. The streaming entry point is reserved for sources that
+   are themselves streams, or for materialized tables that need
+   chunking via ``options.row_size`` / ``options.byte_size``.
+
+3. **Bind source schemas, don't peek.** When we infer a source
+   schema, we bind it onto ``options.source_field`` so it propagates
+   downstream and drives :meth:`CastOptions.need_cast` without
+   re-inference.
+
+4. **Emit the merged schema.** When both source and target are bound,
+   the output schema is :attr:`CastOptions.merged_schema` —
+   reconciled per ``schema_mode``. ``RecordBatchReader`` /
+   iterator declarations use this.
+
+5. **Honor every options knob.** ``column_names`` projects on the way
+   in; ``arrow_memory_pool`` threads through pyarrow allocators;
+   ``safe`` flows into engine cast methods; ``row_size``/``byte_size``
+   drive output chunking.
+"""
+
+from __future__ import annotations
+
 import dataclasses
 import enum
 import logging
+from collections.abc import Iterator
 from dataclasses import is_dataclass
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, Generator
 
 import pyarrow as pa
+
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
-from yggdrasil.dataclasses.dataclass import dataclass_to_arrow_field
-from yggdrasil.pickle.serde import ObjectSerde
-
-from .python_arrow import (
-    is_arrow_type_list_like,
-    is_arrow_type_string_like,
-    is_arrow_type_binary_like,
-    merge_arrow_fields,
-    merge_arrow_types,
+from yggdrasil.data.schema import Schema, Field
+from yggdrasil.lazy_imports import (
+    pandas_module,
+    spark_sql_module,
+    polars_module,
 )
+from yggdrasil.pickle.serde import ObjectSerde
 from .python_defaults import default_arrow_scalar
 
 __all__ = [
     "ArrowDataType",
-    "cast_arrow_array",
-    "cast_arrow_tabular",
-    "cast_arrow_record_batch_reader",
-    "to_spark_arrow_type",
-    "to_polars_arrow_type",
-    "arrow_type_to_field",
-    "is_arrow_type_binary_like",
-    "is_arrow_type_string_like",
-    "is_arrow_type_list_like",
-    "record_batch_to_table",
     "any_to_arrow_scalar",
     "any_to_arrow_field",
+    "any_to_arrow_schema",
     "any_to_arrow_table",
     "any_to_arrow_record_batch",
-    "any_to_arrow_schema",
-    "arrow_field_to_dict",
-    "arrow_type_to_dict",
-    "dict_to_arrow_type",
-    "dict_to_arrow_field",
+    "any_to_arrow_batch_iterator",
+    "any_to_arrow_record_batch_reader",
+    "cast_arrow_array",
+    "cast_arrow_scalar",
+    "cast_arrow_tabular",
+    "cast_arrow_record_batch_reader",
     "default_arrow_scalar",
-    "merge_arrow_fields",
-    "merge_arrow_types",
 ]
 
 logger = logging.getLogger(__name__)
@@ -60,56 +87,227 @@ ArrowDataType = Union[
 
 
 # ---------------------------------------------------------------------------
-# Any-to-Arrow table / record batch
+# Source-binding & projection helpers
 # ---------------------------------------------------------------------------
+
+
+def _bind_source(options: CastOptions, obj: Any) -> CastOptions:
+    """Bind an inferred source schema onto ``options.source_field``.
+
+    Idempotent. Coercion failures are swallowed — "couldn't infer"
+    is not a hard error here.
+    """
+    if options.source_field is not None:
+        return options
+    try:
+        return options.check_source(obj=obj, copy=False)
+    except Exception:
+        return options
+
+
+def _resolve_projection(options: CastOptions) -> Optional[list[str]]:
+    """Resolve the effective column projection.
+
+    ``column_names`` is auto-populated from ``target_field.names`` by
+    :meth:`CastOptions.__post_init__`, so explicit and implicit
+    projection collapse into one source.
+    """
+    return list(options.column_names) if options.column_names else None
+
+
+def _project(table: pa.Table, options: CastOptions) -> pa.Table:
+    """Apply the resolved projection to a ``pa.Table``. Zero-copy."""
+    cols = _resolve_projection(options)
+    if not cols:
+        return table
+    if list(table.column_names) == cols:
+        return table
+    present = [c for c in cols if c in table.column_names]
+    return table.select(present) if present else table
+
+
+def _resolve_chunksize(
+    options: CastOptions,
+    schema: Optional[pa.Schema] = None,
+) -> Optional[int]:
+    """Resolve ``row_size`` / ``byte_size`` to a single ``max_chunksize``.
+
+    Schema preference: ``merged_schema`` → ``target_schema`` →
+    runtime ``schema``.
+    """
+    row_cap = options.row_size if options.row_size and options.row_size > 0 else None
+    byte_cap = options.byte_size if options.byte_size and options.byte_size > 0 else None
+
+    if byte_cap:
+        merged = options.merged_schema
+        if merged is not None and not merged.is_empty():
+            arrow_schema = merged.to_arrow_schema()
+        else:
+            arrow_schema = schema
+
+        if arrow_schema is not None:
+            width = 0
+            for field in arrow_schema:
+                bw = getattr(field.type, "bit_width", None)
+                width += (bw // 8) if bw and bw > 0 else 32
+            if width > 0:
+                byte_rows = max(1, byte_cap // width)
+                row_cap = min(row_cap, byte_rows) if row_cap else byte_rows
+
+    return row_cap
+
+
+# ---------------------------------------------------------------------------
+# Engine-specific bulk converters — cast in-engine, then serialize
+# ---------------------------------------------------------------------------
+
+
+def _pandas_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptions]:
+    """Convert pandas DataFrame/Series to Arrow.
+
+    1. Bind source.
+    2. Project.
+    3. **Cast in-engine** via :meth:`CastOptions.cast_pandas` —
+       handles dtype conversions and ExtensionArrays before Arrow
+       sees them. Avoids the "convert via numpy → lose precision →
+       fail to cast" trap that hits when pandas extension dtypes
+       (Int64, Float64, string[pyarrow]) hit ``Table.from_pandas``.
+    4. Serialize via ``Table.from_pandas(memory_pool=, safe=)``.
+    """
+    pd = pandas_module()
+
+    if isinstance(obj, pd.Series):
+        obj = obj.to_frame()
+
+    if not isinstance(obj, pd.DataFrame):
+        raise TypeError("Unsupported pandas object: %s" % (obj,))
+
+    options = _bind_source(options, obj)
+
+    projection = _resolve_projection(options)
+    if projection:
+        keep = [c for c in projection if c in obj.columns]
+        if keep and list(obj.columns) != keep:
+            obj = obj.loc[:, keep]
+
+    if options.target_field is not None and options.need_cast():
+        obj = options.cast_pandas(obj)
+
+    table = pa.Table.from_pandas(
+        obj,
+        preserve_index=bool(obj.index.name),
+        memory_pool=options.arrow_memory_pool,
+        safe=options.safe,
+    )
+    return table, options.copy(target_field=None)
+
+
+def _spark_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptions]:
+    """Convert Spark DataFrame to Arrow.
+
+    1. Bind source from Spark's ``StructType`` (cheap, no materialization).
+    2. Project via ``DataFrame.select`` — pushed into the physical plan.
+    3. **Cast in-engine** via :meth:`CastOptions.cast_spark` — the
+       cast becomes part of the Spark plan, fused with projection
+       and any pushdown filters. Vastly preferable to Arrow-side
+       cast, which would materialize the whole frame before casting.
+    4. Trigger ``toArrow()``.
+    """
+    pyspark_sql = spark_sql_module()
+
+    if not isinstance(obj, pyspark_sql.DataFrame):
+        raise TypeError("Unsupported Spark object: %s" % (obj,))
+
+    options = _bind_source(options, obj)
+
+    projection = _resolve_projection(options)
+    if projection:
+        keep = [c for c in projection if c in obj.columns]
+        if keep and list(obj.columns) != keep:
+            obj = obj.select(*keep)
+
+    if options.target_field is not None and options.need_cast():
+        obj = options.cast_spark(obj)
+
+    return obj.toArrow(), options.copy(target_field=None)
+
+
+# ---------------------------------------------------------------------------
+# Any-to-Arrow table / batch — bulk path
+# ---------------------------------------------------------------------------
+
 
 @register_converter(Any, pa.Table)
 def any_to_arrow_table(
     obj: Any,
-    options: Optional["CastOptions"] = None,
+    options: Optional[CastOptions] = None,
 ) -> pa.Table:
-    """Convert *any* supported object to a ``pa.Table``, then cast to the target schema.
+    """Convert *any* supported object to a ``pa.Table``, with engine-native
+    casting applied upstream when possible.
 
-    Supported input types (detected via namespace inspection):
+    Casting strategy:
 
-    * ``pa.Table`` — passed through to :func:`cast_arrow_tabular`.
-    * ``pa.RecordBatch`` — wrapped in a single-batch table first.
-    * ``pandas.DataFrame`` — via
-      :func:`~.pandas.cast.pandas_dataframe_to_arrow_table`.
-    * ``pyspark.sql.DataFrame`` — converted via Spark's ``toArrow()`` method.
-    * Everything else (Polars, dicts, dataclasses, …) — routed through
-      :func:`~.polars.cast.any_to_polars_dataframe` then
-      :func:`~.polars.cast.polars_dataframe_to_arrow_table`.
-
-    Args:
-        obj: Any object that can be converted to an Arrow table.
-        options: Cast options including the target schema.
-
-    Returns:
-        A ``pa.Table`` cast to ``options.target_arrow_schema`` (if set).
+    * **Arrow inputs** (Table/RecordBatch/Array/Reader) — cast on the
+      Arrow side via :meth:`CastOptions.cast_arrow_tabular`, with the
+      ``need_cast`` skip optimization.
+    * **Pandas / Spark / Polars inputs** — cast in-engine first via
+      ``cast_pandas`` / ``cast_spark`` / ``cast_polars``, then
+      serialize to Arrow. The serialized table needs no further cast.
+    * **Generic Python inputs** — wrapped via ``pl.DataFrame(obj)``
+      to get a polars cast path.
     """
-    if not isinstance(obj, pa.Table):
-        if isinstance(obj, pa.RecordBatch):
-            obj = pa.Table.from_batches([obj])  # type: ignore
+    options = CastOptions.check(options)
+
+    if isinstance(obj, pa.Table):
+        options = _bind_source(options, obj)
+        table = _project(obj, options)
+
+    elif isinstance(obj, pa.RecordBatch):
+        options = _bind_source(options, obj)
+        table = _project(pa.Table.from_batches([obj]), options)
+
+    elif isinstance(obj, (pa.Array, pa.ChunkedArray)):
+        name = (
+            options.target_field.name
+            if options.target_field and options.target_field.name
+            else "value"
+        )
+        table = pa.table({name: obj})
+        options = _bind_source(options, table)
+
+    elif isinstance(obj, pa.RecordBatchReader):
+        options = _bind_source(options, obj.schema)
+        table = _project(obj.read_all(), options)
+
+    elif isinstance(obj, (Generator, Iterator)):
+        batches = list(_stream_from_iterator(iter(obj), options))
+        table = pa.Table.from_batches(batches)
+
+    elif isinstance(obj, (list, tuple)):
+        if not obj:
+            merged_schema = options.merged_schema or Schema.empty()
+            return pa.Table.from_batches([], schema=merged_schema.to_arrow_schema())
+
+        try:
+            table = pa.Table.from_pylist(obj)
+        except Exception:
+            batches = list(_stream_from_iterator(iter(obj), options))
+            table = pa.Table.from_batches(batches)
+
+    else:
+        namespace = ObjectSerde.full_namespace(obj)
+
+        if namespace.startswith("pandas."):
+            table, options = _pandas_to_arrow(obj, options)
+        elif namespace.startswith("pyspark."):
+            table, options = _spark_to_arrow(obj, options)
+        elif namespace.startswith("polars."):
+            table, options = _polars_to_arrow(obj, options)
         else:
-            namespace = ObjectSerde.full_namespace(obj)
+            pl = polars_module()
+            table, options = _polars_to_arrow(pl.DataFrame(obj), options)
 
-            if namespace.startswith("pandas."):
-                from yggdrasil.pandas.cast import pandas_dataframe_to_arrow_table
-                obj = pandas_dataframe_to_arrow_table(obj, options)
-
-            if namespace.startswith("pyspark."):
-                import pyspark.sql as pyspark_sql
-                from yggdrasil.spark.cast import any_to_spark_dataframe
-
-                obj: pyspark_sql.DataFrame = any_to_spark_dataframe(obj, options)
-                obj = obj.toArrow()
-            else:
-                from yggdrasil.polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
-                obj = any_to_polars_dataframe(obj, options)
-                obj = polars_dataframe_to_arrow_table(obj, options)
-
-    return cast_arrow_tabular(obj, options)
+    return options.cast_arrow_tabular(table)
 
 
 @register_converter(Any, pa.RecordBatch)
@@ -117,86 +315,259 @@ def any_to_arrow_record_batch(
     obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.RecordBatch:
-    """Convert *any* supported object to a single ``pa.RecordBatch``.
+    """Convert to a single ``pa.RecordBatch``."""
+    options = CastOptions.check(options)
 
-    Delegates to :func:`any_to_arrow_table` and then extracts the first batch.
+    if isinstance(obj, pa.RecordBatch):
+        options = _bind_source(options, obj)
+        return options.cast_arrow_tabular(obj)
 
-    Args:
-        obj: Any object convertible to an Arrow table.
-        options: Cast options.
+    table = any_to_arrow_table(obj, options)
+    batches = table.to_batches()
+    if not batches:
+        return pa.RecordBatch.from_pylist([], schema=table.schema)
+    if len(batches) == 1:
+        return batches[0]
+    return table.combine_chunks().to_batches()[0]
 
-    Returns:
-        The first ``pa.RecordBatch`` from the resulting table.
+
+# ---------------------------------------------------------------------------
+# Streaming entry points
+# ---------------------------------------------------------------------------
+
+
+@register_converter(Any, Iterator[pa.RecordBatch])
+def any_to_arrow_batch_iterator(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> Iterator[pa.RecordBatch]:
+    """Convert *any* supported object to a lazy iterator of ``pa.RecordBatch``.
+
+    For Polars LazyFrame and Spark DataFrame, the engine-native cast
+    is applied before the streaming serialization — the iterator
+    yields already-cast batches with no Arrow-side rework.
     """
-    if not isinstance(obj, pa.RecordBatch):
-        obj: pa.Table = any_to_arrow_table(obj, options)
-        return obj.to_batches()[0]
+    options = CastOptions.check(options)
 
-    return cast_arrow_tabular(obj, options)
+    if isinstance(obj, pa.RecordBatchReader):
+        options = _bind_source(options, obj.schema)
+        return _stream_from_reader(obj, options)
+
+    if isinstance(obj, Iterator):
+        return _stream_from_iterator(obj, options)
+
+    namespace = ObjectSerde.full_namespace(obj) if not isinstance(obj, pa.Table) else ""
+
+    if namespace.startswith("pyspark."):
+        pyspark_sql = spark_sql_module()
+        if isinstance(obj, pyspark_sql.DataFrame):
+            options = _bind_source(options, obj)
+            projection = _resolve_projection(options)
+            if projection:
+                keep = [c for c in projection if c in obj.columns]
+                if keep and list(obj.columns) != keep:
+                    obj = obj.select(*keep)
+
+            # In-engine cast before streaming — fuses into Spark plan.
+            if options.target_field is not None and options.need_cast():
+                obj = options.cast_spark(obj)
+                options = options.copy(target_field=None)
+
+            to_iter = getattr(obj, "toArrowBatchIterator", None)
+            if callable(to_iter):
+                return _stream_from_iterator(iter(to_iter()), options)
+            # Fall through to bulk via _spark_to_arrow.
+
+    if namespace.startswith("polars."):
+        pl = polars_module()
+        if isinstance(obj, pl.LazyFrame):
+            return _polars_lazy_to_batch_iterator(obj, options)
+        # Eager polars (DataFrame/Series) falls through to the bulk
+        # path — no streaming benefit since data is already materialized.
+
+    if isinstance(obj, pa.RecordBatch):
+        options = _bind_source(options, obj)
+        casted = options.cast_arrow_tabular(obj)
+        chunksize = _resolve_chunksize(options, casted.schema)
+        return _slice_batch(casted, chunksize)
+
+    if isinstance(obj, pa.Table):
+        options = _bind_source(options, obj)
+        return _stream_from_table(obj, options, already_cast=False)
+
+    if isinstance(obj, (Generator, Iterator)):
+        return _stream_from_iterator(obj, options)
+
+    if isinstance(obj, (list, tuple)):
+        if obj:
+            return _stream_from_iterator(iter(obj), options)
+        return iter(())
+
+    # Generic fallback — bulk-convert (cast applied), then slice.
+    table = any_to_arrow_table(obj, options)
+    return _stream_from_table(table, options, already_cast=True)
+
+
+def _stream_from_reader(
+    reader: pa.RecordBatchReader,
+    options: CastOptions,
+) -> Iterator[pa.RecordBatch]:
+    """Cast each upstream batch on the Arrow side and re-chunk.
+
+    Arrow-side cast here because a ``RecordBatchReader`` is already
+    Arrow — there's no upstream engine to push the cast into.
+    """
+    needs_cast = options.target_field is not None and options.need_cast()
+    chunksize = _resolve_chunksize(options, reader.schema)
+
+    for batch in reader:
+        casted = options.cast_arrow_tabular(batch) if needs_cast else batch
+        yield from _slice_batch(casted, chunksize)
+
+
+def _stream_from_iterator(
+    items: Iterator[Any],
+    options: CastOptions,
+) -> Iterator[pa.RecordBatch]:
+    """Lazily flatten + cast a stream of mixed tabular objects.
+
+    Per-item shape may be Arrow (cast Arrow-side) or engine-native
+    (route through ``any_to_arrow_table`` which dispatches in-engine).
+    """
+    chunksize = _resolve_chunksize(options)
+    bound = options.source_field is not None
+
+    for item in items:
+        if not bound and isinstance(item, (pa.RecordBatch, pa.Table)):
+            options = _bind_source(options, item)
+            bound = True
+
+        if isinstance(item, pa.RecordBatch):
+            casted = options.cast_arrow_tabular(item)
+            yield from _slice_batch(casted, chunksize)
+        elif isinstance(item, pa.Table):
+            casted_table = options.cast_arrow_tabular(item)
+            for batch in casted_table.to_batches(max_chunksize=chunksize):
+                yield batch
+        elif isinstance(item, (Generator, Iterator)):
+            yield from _stream_from_iterator(item, options)
+        elif isinstance(item, (list, tuple)):
+            yield from _stream_from_iterator(iter(item), options)
+        else:
+            # Engine-native item — any_to_arrow_table casts in-engine.
+            sub = any_to_arrow_table(item, options)
+            yield from sub.to_batches(max_chunksize=chunksize)
+
+
+def _stream_from_table(
+    table: pa.Table,
+    options: CastOptions,
+    *,
+    already_cast: bool,
+) -> Iterator[pa.RecordBatch]:
+    """Slice into batches; cast Arrow-side per-batch when needed.
+
+    ``already_cast=True`` means the cast was applied in-engine
+    upstream; just slice. ``already_cast=False`` means we have a raw
+    Arrow table and need the standard need_cast skip path.
+    """
+    chunksize = _resolve_chunksize(options, table.schema)
+
+    if already_cast or options.target_field is None:
+        yield from table.to_batches(max_chunksize=chunksize)
+        return
+
+    options = _bind_source(options, table)
+    if not options.need_cast():
+        yield from table.to_batches(max_chunksize=chunksize)
+        return
+
+    for batch in table.to_batches(max_chunksize=chunksize):
+        yield options.cast_arrow_tabular(batch)
+
+
+def _slice_batch(
+    batch: pa.RecordBatch,
+    chunksize: Optional[int],
+) -> Iterator[pa.RecordBatch]:
+    """Slice a batch to ``chunksize`` rows. Zero-copy."""
+    if chunksize is None or batch.num_rows <= chunksize:
+        yield batch
+        return
+    for offset in range(0, batch.num_rows, chunksize):
+        yield batch.slice(offset, chunksize)
+
+
+@register_converter(Any, pa.RecordBatchReader)
+def any_to_arrow_record_batch_reader(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> pa.RecordBatchReader:
+    """Wrap ``any_to_arrow_batch_iterator`` behind a ``RecordBatchReader``.
+
+    Output schema: ``merged_schema`` → ``target_schema`` →
+    first-batch peek.
+    """
+    options = CastOptions.check(options)
+
+    if isinstance(obj, pa.RecordBatchReader):
+        return cast_arrow_record_batch_reader(obj, options)
+
+    iterator = any_to_arrow_batch_iterator(obj, options)
+
+    merged_schema = options.merged_schema
+    if merged_schema is not None:
+        return pa.RecordBatchReader.from_batches(merged_schema.to_arrow_schema(), iterator)
+
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return pa.RecordBatchReader.from_batches(pa.schema([]), iter(()))
+
+    def _chained(head=first, tail=iterator):
+        yield head
+        yield from tail
+
+    return pa.RecordBatchReader.from_batches(first.schema, _chained())
 
 
 # ---------------------------------------------------------------------------
 # Scalar casting
 # ---------------------------------------------------------------------------
 
+
 @register_converter(Any, pa.Scalar)
 def any_to_arrow_scalar(
     scalar: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Scalar:
-    """Convert a Python value to an Arrow scalar, then cast to the target field type.
+    """Convert a Python value to an Arrow scalar, then cast to target type."""
+    options = CastOptions.check(options)
 
-    Conversion rules:
+    if isinstance(scalar, pa.Scalar):
+        return cast_arrow_scalar(scalar, options)
 
-    * ``None`` → type-appropriate default scalar (respects nullability).
-    * ``enum.Enum`` → the enum's ``.value`` attribute is used.
-    * dataclass → converted to a ``dict`` via ``dataclasses.asdict``, then to a
-      struct scalar.  If no target field is set, the field is inferred from the
-      dataclass definition via :func:`~.dataclasses.dataclass.dataclass_to_arrow_field`.
-    * All other values → ``pa.scalar(value, type=target_field.type)`` with a
-      fallback to untyped ``pa.scalar(value)`` on ``ArrowInvalid``.
+    target_field = options.target_field
 
-    Args:
-        scalar: Input Python value.
-        options: Cast options.  ``options.target_field`` determines the output type.
+    if scalar is None:
+        return default_arrow_scalar(
+            target_field,
+            nullable=True if target_field is None else target_field.nullable,
+        )
 
-    Returns:
-        An Arrow scalar cast to the target field type.
-    """
-    if not isinstance(scalar, pa.Scalar):
-        options = CastOptions.check(options)
-        target_field = options.target_field
+    if isinstance(scalar, enum.Enum):
+        scalar = scalar.value
 
-        if scalar is None:
-            return default_arrow_scalar(
-                target_field,
-                nullable=True if target_field is None else target_field.nullable,
-            )
+    if is_dataclass(scalar):
+        scalar = dataclasses.asdict(scalar)
 
-        if isinstance(scalar, enum.Enum):
-            scalar = scalar.value
+    if target_field is None:
+        return pa.scalar(scalar)
 
-        if is_dataclass(scalar):
-            if not target_field:
-                target_field = dataclass_to_arrow_field(scalar)
-                options = options.copy(target_field=target_field)
-            scalar = dataclasses.asdict(scalar)
-
-        if target_field is None:
-            if is_dataclass(scalar):
-                scalar = pa.scalar(
-                    dataclasses.asdict(scalar),
-                    type=dataclass_to_arrow_field(scalar).type,
-                )
-            else:
-                scalar = pa.scalar(scalar)
-            return scalar
-
-        try:
-            scalar = pa.scalar(scalar, type=target_field.type)
-        except pa.ArrowInvalid:
-            # Fall back to untyped scalar; cast_arrow_scalar will handle the type.
-            scalar = pa.scalar(scalar)
+    try:
+        scalar = pa.scalar(scalar, type=target_field.type)
+    except pa.ArrowInvalid:
+        scalar = pa.scalar(scalar)
 
     return cast_arrow_scalar(scalar, options)
 
@@ -206,34 +577,18 @@ def cast_arrow_scalar(
     scalar: pa.Scalar,
     options: Optional[CastOptions] = None,
 ) -> pa.Scalar:
-    """Cast an existing Arrow scalar to the type described in *options*.
-
-    Wraps the scalar in a single-element array, delegates to
-    :func:`cast_arrow_array`, and returns the first element.  This ensures
-    all casting logic is centralised in the array path.
-
-    Args:
-        scalar: Arrow scalar to cast.
-        options: Cast options.  If ``options.target_field`` is ``None`` the
-            scalar is returned unchanged.
-
-    Returns:
-        Cast Arrow scalar.
-    """
+    """Cast an Arrow scalar via the array path."""
     options = CastOptions.check(options)
-    target_field = options.target_field
-
-    if target_field is None:
+    if options.target_field is None:
         return scalar
-
     arr = pa.array([scalar])
-    casted = cast_arrow_array(arr, options)
-    return casted[0]
+    return cast_arrow_array(arr, options)[0]
 
 
 # ---------------------------------------------------------------------------
-# Main array cast dispatcher
+# Array / Tabular casting — thin wrappers
 # ---------------------------------------------------------------------------
+
 
 @register_converter(pa.Array, pa.Array)
 @register_converter(pa.ChunkedArray, pa.ChunkedArray)
@@ -241,13 +596,9 @@ def cast_arrow_array(
     array: Union[pa.ChunkedArray, pa.Array],
     options: Optional[CastOptions] = None,
 ) -> Union[pa.ChunkedArray, pa.Array]:
-    options = CastOptions.check(options)
-    return options.cast_arrow_array(array)
+    """Cast a pyarrow Array/ChunkedArray."""
+    return CastOptions.check(options).cast_arrow_array(array)
 
-
-# ---------------------------------------------------------------------------
-# Table / RecordBatch casting
-# ---------------------------------------------------------------------------
 
 @register_converter(pa.Table, pa.Table)
 @register_converter(pa.RecordBatch, pa.RecordBatch)
@@ -255,8 +606,8 @@ def cast_arrow_tabular(
     data: Union[pa.Table, pa.RecordBatch],
     options: Optional[CastOptions] = None,
 ) -> Union[pa.Table, pa.RecordBatch]:
-    options = CastOptions.check(options)
-    return options.cast_arrow_tabular(data)
+    """Cast pyarrow Table/RecordBatch with skip-cast on schema match."""
+    return CastOptions.check(options).cast_arrow_tabular(data)
 
 
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)
@@ -264,358 +615,31 @@ def cast_arrow_record_batch_reader(
     data: pa.RecordBatchReader,
     options: Optional[CastOptions] = None,
 ) -> pa.RecordBatchReader:
-    """Lazily wrap a ``RecordBatchReader`` so each emitted batch is cast on-the-fly.
+    """Lazily wrap a ``RecordBatchReader`` with on-the-fly cast.
 
-    No data is read or materialised until the returned reader is iterated.
-    This is the preferred entry point for streaming workloads (e.g. reading
-    Parquet files in Arrow IPC streams) where full materialisation is
-    undesirable.
-
-    Args:
-        data: Source reader.
-        options: Cast options including the target schema.  If
-            ``options.target_arrow_schema`` is ``None`` the original reader is
-            returned as-is.
-
-    Returns:
-        A ``pa.RecordBatchReader`` whose schema matches the target and whose
-        batches are lazily cast.
+    Pure passthrough when the source schema matches target and no
+    chunking is requested.
     """
     options = CastOptions.check(options)
+    options = _bind_source(options, data.schema)
 
-    if options.target_field is None:
+    needs_cast = options.target_field is not None and options.need_cast()
+    needs_chunk = bool(options.row_size or options.byte_size)
+
+    if not needs_cast and not needs_chunk:
         return data
 
+    merged_schema = options.check_target(data.schema).merged_schema
+
     def casted_batches(opt=options):
-        """Lazily yield cast batches from the upstream reader."""
-        for batch in data:
-            yield cast_arrow_tabular(batch, opt)
+        yield from _stream_from_reader(data, opt)
 
-    return pa.RecordBatchReader.from_batches(arrow_schema, casted_batches())  # type: ignore
-
-
-# ---------------------------------------------------------------------------
-# Type normalisation helpers
-# ---------------------------------------------------------------------------
-
-def to_spark_arrow_type(dtype: ArrowDataType) -> ArrowDataType:
-    """Normalise an Arrow ``DataType`` to a Spark-compatible equivalent.
-
-    Spark does not support several Arrow type variants.  This function
-    recursively replaces them:
-
-    * ``large_string`` / ``large_binary`` → ``string`` / ``binary``
-    * ``large_list<T>`` → ``list<T>`` (value type also normalised)
-    * ``dictionary<index, value>`` → ``value`` type (Spark resolves categories)
-    * ``ExtensionType`` → ``storage_type`` (unwrap custom extensions)
-    * ``struct`` → ``struct`` with each child field normalised
-    * ``map`` → ``map`` with key and item types normalised
-
-    Args:
-        dtype: Arrow data type to normalise.
-
-    Returns:
-        A Spark-compatible Arrow data type.
-    """
-    if is_arrow_type_string_like(dtype):
-        return pa.string()
-    if is_arrow_type_binary_like(dtype):
-        return pa.binary()
-    if is_arrow_type_list_like(dtype):
-        return pa.list_(to_spark_arrow_type(dtype.value_type))
-    if pa.types.is_dictionary(dtype):
-        return to_spark_arrow_type(dtype.value_type)
-    if isinstance(dtype, pa.ExtensionType):
-        return to_spark_arrow_type(dtype.storage_type)
-    if pa.types.is_struct(dtype):
-        new_fields = [
-            pa.field(
-                f.name,
-                to_spark_arrow_type(f.type),
-                nullable=f.nullable,
-                metadata=f.metadata,
-            )
-            for f in dtype
-        ]
-        return pa.struct(new_fields)
-    if pa.types.is_map(dtype):
-        key_field = dtype.key_field
-        item_field = dtype.item_field
-        new_key = pa.field(
-            key_field.name,
-            to_spark_arrow_type(key_field.type),
-            nullable=key_field.nullable,
-            metadata=key_field.metadata,
-        )
-        new_item = pa.field(
-            item_field.name,
-            to_spark_arrow_type(item_field.type),
-            nullable=item_field.nullable,
-            metadata=item_field.metadata,
-        )
-        return pa.map_(new_key, new_item)
-
-    return dtype
-
-
-def to_polars_arrow_type(dtype: ArrowDataType) -> ArrowDataType:
-    """Normalise an Arrow ``DataType`` to a Polars-compatible equivalent.
-
-    Extends :func:`to_spark_arrow_type` with one additional rule required by
-    Polars: ``map<k,v>`` is not a first-class type in Polars' data model and
-    must be represented as ``list<struct<key: K, value: V>>``.
-
-    Transformation summary:
-
-    * All Spark normalisation rules apply first.
-    * ``map<K, V>`` → ``list<struct<key: K, value: V>>``
-    * ``struct`` children are recursively normalised.
-    * ``list`` element types are recursively normalised.
-
-    Args:
-        dtype: Arrow data type to normalise.
-
-    Returns:
-        A Polars-compatible Arrow data type.
-    """
-    # Apply Spark normalisation first (handles large_*, dictionary, extensions).
-    dtype = to_spark_arrow_type(dtype)
-
-    if pa.types.is_map(dtype):
-        key_field = dtype.key_field
-        item_field = dtype.item_field
-
-        key_type = to_polars_arrow_type(key_field.type)
-        value_type = to_polars_arrow_type(item_field.type)
-
-        # Represent as list<struct<key, value>> — Polars' canonical map form.
-        struct_type = pa.field(
-            "entries",
-            pa.struct(
-                [
-                    pa.field(
-                        key_field.name,
-                        key_type,
-                        nullable=key_field.nullable,
-                        metadata=key_field.metadata,
-                    ),
-                    pa.field(
-                        item_field.name,
-                        value_type,
-                        nullable=item_field.nullable,
-                        metadata=item_field.metadata,
-                    ),
-                ]
-            ),
-            nullable=True,
-        )
-        return pa.list_(struct_type)
-
-    if pa.types.is_struct(dtype):
-        new_fields = [
-            pa.field(
-                f.name,
-                to_polars_arrow_type(f.type),
-                nullable=f.nullable,
-                metadata=f.metadata,
-            )
-            for f in dtype
-        ]
-        return pa.struct(new_fields)
-
-    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
-        return pa.list_(to_polars_arrow_type(dtype.value_type))
-
-    return dtype
-
-
-# ---------------------------------------------------------------------------
-# Cross-container casting helpers
-# ---------------------------------------------------------------------------
-
-@register_converter(pa.Table, pa.RecordBatch)
-def table_to_record_batch(
-    data: pa.Table,
-    options: Optional[CastOptions] = None,
-) -> pa.RecordBatch:
-    """Cast a ``Table`` and return a single ``RecordBatch``.
-
-    All ``ChunkedArray`` columns are merged via
-    :meth:`~pyarrow.ChunkedArray.combine_chunks` before constructing the batch.
-    For empty tables an empty batch with the correct schema is returned.
-
-    Args:
-        data: Source table.
-        options: Cast options.
-
-    Returns:
-        A single ``pa.RecordBatch``.
-    """
-    casted: pa.Table = cast_arrow_tabular(data, options)
-
-    if casted.num_rows == 0:
-        arrays = [pa.array([], type=f.type) for f in casted.schema]
-        return pa.RecordBatch.from_arrays(arrays, schema=casted.schema)  # type: ignore
-
-    arrays = [chunked_array.combine_chunks() for chunked_array in casted.columns]
-    return pa.RecordBatch.from_arrays(arrays, schema=casted.schema)  # type: ignore
-
-
-@register_converter(pa.RecordBatch, pa.Table)
-def record_batch_to_table(
-    data: pa.RecordBatch,
-    options: Optional[CastOptions] = None,
-) -> pa.Table:
-    """Cast a ``RecordBatch`` and wrap the result as a single-batch ``Table``.
-
-    Args:
-        data: Source record batch.
-        options: Cast options.
-
-    Returns:
-        A ``pa.Table`` containing one batch.
-    """
-    casted = cast_arrow_tabular(data, options)
-    return pa.Table.from_batches(batches=[casted], schema=casted.schema)  # type: ignore
-
-
-@register_converter(pa.Table, pa.RecordBatchReader)
-def table_to_record_batch_reader(
-    data: pa.Table,
-    options: Optional[CastOptions] = None,
-) -> pa.RecordBatchReader:
-    """Cast a ``Table`` and expose the result as a ``RecordBatchReader``.
-
-    Args:
-        data: Source table.
-        options: Cast options.
-
-    Returns:
-        A ``pa.RecordBatchReader`` iterating over the cast table's batches.
-    """
-    casted = cast_arrow_tabular(data, options)
-    return pa.RecordBatchReader.from_batches(casted.schema, casted.to_batches())  # type: ignore
-
-
-@register_converter(pa.RecordBatchReader, pa.Table)
-def record_batch_reader_to_table(
-    data: pa.RecordBatchReader,
-    options: Optional[CastOptions] = None,
-) -> pa.Table:
-    """Cast each batch in a ``RecordBatchReader`` and collect into a ``Table``.
-
-    Args:
-        data: Source reader.  All batches are materialised.
-        options: Cast options.
-
-    Returns:
-        A ``pa.Table`` containing all cast batches.
-    """
-    casted_reader: pa.RecordBatchReader = cast_arrow_record_batch_reader(data, options)
-    return pa.Table.from_batches(batches=list(casted_reader), schema=casted_reader.schema)  # type: ignore
-
-
-@register_converter(pa.RecordBatch, pa.RecordBatchReader)
-def record_batch_to_record_batch_reader(
-    data: pa.RecordBatch,
-    options: Optional[CastOptions] = None,
-) -> pa.RecordBatchReader:
-    """Cast a ``RecordBatch`` and wrap it in a single-batch ``RecordBatchReader``.
-
-    Args:
-        data: Source record batch.
-        options: Cast options.
-
-    Returns:
-        A ``pa.RecordBatchReader`` with one batch.
-    """
-    casted = cast_arrow_tabular(data, options)
-    return pa.RecordBatchReader.from_batches(schema=casted.schema, batches=[casted])  # type: ignore
-
-
-@register_converter(pa.RecordBatchReader, pa.RecordBatch)
-def record_batch_reader_to_record_batch(
-    data: pa.RecordBatchReader,
-    options: Optional[CastOptions] = None,
-) -> pa.RecordBatch:
-    """Materialise a ``RecordBatchReader`` into a single ``RecordBatch``.
-
-    .. warning::
-        All batches are read into memory before merging.  Use
-        :func:`cast_arrow_record_batch_reader` for streaming workloads.
-
-    Args:
-        data: Source reader.
-        options: Cast options.
-
-    Returns:
-        A single merged ``pa.RecordBatch``.
-    """
-    table = record_batch_reader_to_table(data, options)
-    return table_to_record_batch(table, options)
+    return pa.RecordBatchReader.from_batches(merged_schema.to_arrow_schema(), casted_batches())
 
 
 # ---------------------------------------------------------------------------
 # Field / Schema converters
 # ---------------------------------------------------------------------------
-
-@register_converter(pa.Array, pa.Field)
-@register_converter(pa.ChunkedArray, pa.Field)
-def arrow_array_to_field(
-    array: Union[pa.Array, pa.ChunkedArray],
-    options: Optional[CastOptions] = None,
-) -> pa.Field:
-    """Derive a ``pa.Field`` descriptor from an Arrow array.
-
-    The field name is taken from ``options.source_field.to_arrow_field().name`` (or
-    ``"root"`` as fallback).  Nullability is set to ``True`` if the array type
-    is ``null`` or the array contains any nulls.
-
-    Args:
-        array: Array to introspect.
-        options: Cast options.
-
-    Returns:
-        A ``pa.Field`` describing the array's type and nullability.
-    """
-    options = CastOptions.check(options=options)
-    name = options.source_field.to_arrow_field().name if options.source_field.to_arrow_field() else "root"
-    metadata = options.source_field.to_arrow_field().metadata if options.source_field.to_arrow_field() else None
-
-    arrow_field = pa.field(
-        name,
-        array.type,
-        nullable=array.type == pa.null() or array.null_count > 0,
-        metadata=metadata,
-    )
-    return arrow_field
-
-
-@register_converter(pa.DataType, pa.Field)
-def arrow_type_to_field(
-    arrow_type: ArrowDataType,
-    options: Optional[CastOptions] = None,
-) -> pa.Field:
-    """Wrap an Arrow ``DataType`` into a ``pa.Field``.
-
-    Args:
-        arrow_type: Arrow type to wrap.
-        options: Cast options.  Used to derive the field name and nullability.
-
-    Returns:
-        A ``pa.Field`` with the given type.
-    """
-    options = CastOptions.check(options=options)
-    name = options.source_field.to_arrow_field().name if options.source_field.to_arrow_field() else "root"
-    nullable = (
-        options.source_field.to_arrow_field().nullable if options.source_field.to_arrow_field() else True
-    )
-    metadata = (
-        options.source_field.to_arrow_field().metadata if options.source_field.to_arrow_field() else None
-    )
-
-    arrow_field = pa.field(name, arrow_type, nullable=nullable, metadata=metadata)
-    return arrow_field
 
 
 @register_converter(Any, pa.Field)
@@ -623,10 +647,11 @@ def any_to_arrow_field(
     obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Field:
-    if not isinstance(obj, pa.Field):
-        from yggdrasil.data.data_field import Field
-        return Field.from_any(obj).to_arrow_field()
-    return obj
+    if isinstance(obj, pa.Field):
+        return obj
+    if isinstance(obj, Field):
+        return obj.to_arrow_field()
+    return Field.from_any(obj).to_arrow_field()
 
 
 @register_converter(Any, pa.Schema)
@@ -634,73 +659,155 @@ def any_to_arrow_schema(
     obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pa.Schema:
-    """Derive a ``pa.Schema`` from *any* supported object.
+    if isinstance(obj, pa.Schema):
+        return obj
+    if isinstance(obj, Schema):
+        return obj.to_arrow_schema()
+    return Schema.from_any(obj).to_arrow_schema()
 
-    Converts *obj* to an Arrow field via :func:`any_to_arrow_field`, then
-    expands the field to a schema via :func:`arrow_field_to_schema`.
 
-    For objects that are already ``pa.Schema``, delegates to
-    :func:`arrow_schema_to_schema` (which can optionally merge with a target).
+def _polars_lazyframe_prep(
+    lf: Any,
+    options: CastOptions,
+) -> tuple[Any, CastOptions]:
+    """Prepare a LazyFrame: bind source, project, and apply in-engine cast.
 
-    Args:
-        obj: Object to introspect.
-        options: Cast options.
-
-    Returns:
-        Arrow schema description of the object.
+    Returns the LazyFrame *unmaterialized* — caller decides when to
+    collect. The cast is folded into the plan via :meth:`cast_polars`,
+    so it executes as part of streaming collection, fused with
+    projection pushdown and any upstream scan filters.
     """
-    if not isinstance(obj, pa.Schema):
-        from yggdrasil.data.schema import Schema
-        return Schema.from_any(obj).to_arrow_schema()
-    return obj
+    pl = polars_module()
+    projection = _resolve_projection(options)
+
+    # Bind source from the lazy plan schema — cheap, no materialization.
+    if options.source_field is None:
+        try:
+            options = options.check_source(obj=lf.collect_schema(), copy=False)
+        except Exception:
+            pass
+
+    if projection:
+        available = set(lf.collect_schema().names())
+        keep = [c for c in projection if c in available]
+        if keep:
+            lf = lf.select(keep)
+
+    # Plan-level cast — fuses into streaming execution.
+    if options.target_field is not None and options.need_cast():
+        lf = options.cast_polars(lf)
+        options = options.copy(target_field=None)
+
+    return lf, options
 
 
-# ---------------------------------------------------------------------------
-# Dict serialization helpers
-# ---------------------------------------------------------------------------
+def _polars_eager_to_arrow(
+    df: Any,
+    options: CastOptions,
+) -> tuple[pa.Table, CastOptions]:
+    """Convert an *already eager* polars DataFrame/Series to Arrow.
+
+    Applies projection + in-engine cast, then serializes. Used by both
+    the bulk path (after collecting a LazyFrame) and the direct
+    DataFrame/Series entry point.
+    """
+    pl = polars_module()
+    projection = _resolve_projection(options)
+
+    if isinstance(df, pl.Series):
+        options = _bind_source(options, df)
+        if options.target_field is not None and options.need_cast():
+            df = options.cast_polars(df)
+            options = options.copy(target_field=None)
+        df = df.to_frame()
+
+    elif isinstance(df, pl.DataFrame):
+        options = _bind_source(options, df)
+        if projection:
+            keep = [c for c in projection if c in df.columns]
+            if keep and list(df.columns) != keep:
+                df = df.select(keep)
+        if options.target_field is not None and options.need_cast():
+            df = options.cast_polars(df)
+            options = options.copy(target_field=None)
+
+    else:
+        raise TypeError("Unsupported eager Polars object: %s" % (df,))
+
+    try:
+        table = df.to_arrow(compat_level=pl.CompatLevel.newest())
+    except Exception:
+        table = df.rechunk().to_arrow(compat_level=pl.CompatLevel.newest())
+
+    return table, options
 
 
-@register_converter(pa.Field, dict)
-def arrow_field_to_dict(field: pa.Field, options=None) -> dict[str, Any]:
-    """Convert a pyarrow.Field to a JSON-serializable dict."""
-    return {
-        "name": field.name,
-        "type": arrow_type_to_dict(field.type),
-        "nullable": field.nullable,
-        "metadata": (
-            {k.decode(): v.decode() for k, v in field.metadata.items()}
-            if field.metadata
-            else None
-        ),
-    }
+def _polars_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptions]:
+    """Bulk-convert any polars object to a ``pa.Table``.
 
-@register_converter(dict, pa.Field)
-def dict_to_arrow_field(d: dict[str, Any], options=None) -> pa.Field:
-    """Reconstruct a pyarrow.Field from a dict produced by field_to_dict."""
-    metadata = d.get("metadata")
-    if metadata:
-        metadata = {k.encode(): v.encode() for k, v in metadata.items()}
+    Used only by the bulk entry points. LazyFrames *must* materialize
+    here — caller asked for a Table — so we use the streaming engine
+    to keep memory bounded. For lazy-preserving iteration, callers
+    should reach for :func:`_polars_lazy_to_batch_iterator` instead.
+    """
+    pl = polars_module()
 
-    return pa.field(
-        name=d["name"],
-        type=dict_to_arrow_type(d["type"]),
-        nullable=d.get("nullable", True),
-        metadata=metadata,
-    )
+    if isinstance(obj, pl.LazyFrame):
+        lf, options = _polars_lazyframe_prep(obj, options)
+        try:
+            df = lf.collect(engine="streaming")
+        except TypeError:
+            df = lf.collect(streaming=True)
+        return _polars_eager_to_arrow(df, options)
+
+    return _polars_eager_to_arrow(obj, options)
 
 
-# ── Type serialization ────────────────────────────────────────────────────────
-@register_converter(pa.DataType, dict)
-def arrow_type_to_dict(t: ArrowDataType, options=None) -> dict[str, Any]:
-    """Recursively serialize a pyarrow DataType."""
-    from yggdrasil.data.types.base import DataType
+def _polars_lazy_to_batch_iterator(
+    lf: Any,
+    options: CastOptions,
+) -> Iterator[pa.RecordBatch]:
+    """Stream a LazyFrame as Arrow batches without eager materialization.
 
-    return DataType.from_arrow_type(t).to_dict()
+    Strategy: prep the plan (bind source, project, cast in-plan), then
+    drive it through ``collect(engine="streaming").iter_slices()``.
+    The streaming engine processes the plan in chunks bounded by the
+    polars streaming chunk size, and ``iter_slices`` yields each chunk
+    as a polars DataFrame which we serialize to Arrow per-slice.
 
+    The LazyFrame is not collected until the consumer pulls from this
+    iterator — the ``collect()`` call itself is a generator-driving
+    point, not pre-iteration work.
 
-@register_converter(dict, pa.DataType)
-def dict_to_arrow_type(d: dict[str, Any], options=None) -> ArrowDataType:
-    """Recursively deserialize a pyarrow DataType from a dict."""
-    from yggdrasil.data.types.base import DataType
+    Slice size: ``options.row_size`` (when set) determines slice
+    width; falls back to polars' default streaming chunk size
+    otherwise. We never materialize more than one slice at a time.
+    """
+    pl = polars_module()
+    lf, options = _polars_lazyframe_prep(lf, options)
 
-    return DataType.from_dict(d).to_arrow()
+    chunksize = _resolve_chunksize(options)
+
+    # Streaming collect — returns a DataFrame, but the plan executed
+    # in streaming mode so peak memory is bounded by the streaming
+    # engine's internal chunk size, not by the result size.
+    try:
+        df = lf.collect(engine="streaming")
+    except TypeError:
+        df = lf.collect(streaming=True)
+
+    # iter_slices yields the DataFrame in row-bounded chunks without
+    # copying — each slice shares buffers with the parent.
+    slice_n = chunksize or 65_536  # polars default-ish
+
+    for slice_df in df.iter_slices(n_rows=slice_n):
+        try:
+            slice_table = slice_df.to_arrow(compat_level=pl.CompatLevel.newest())
+        except Exception:
+            slice_table = slice_df.rechunk().to_arrow(
+                compat_level=pl.CompatLevel.newest()
+            )
+        # Slice may produce multiple Arrow batches if polars' internal
+        # chunking doesn't match our slice boundary; emit them all.
+        for batch in slice_table.to_batches():
+            yield batch

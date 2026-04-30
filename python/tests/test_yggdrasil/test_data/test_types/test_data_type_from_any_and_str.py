@@ -111,3 +111,13 @@ class TestFromStr(ArrowTestCase):
 
         self.assertIsInstance(parsed, MapType)
         self.assertEqual(parsed.to_arrow(), pa.map_(pa.string(), pa.string()))
+
+    def test_from_databricks_string_array(self):
+        pa = self.pa
+        parsed = DataType.from_str('STRUCT<q: TIMESTAMP, v: DOUBLE>')
+
+        self.assertIsInstance(parsed, StructType)
+        self.assertEqual(parsed.to_arrow(), pa.struct([
+            pa.field('q', pa.timestamp('us', "UTC")),
+            pa.field('v', pa.float64()),
+        ]))

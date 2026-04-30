@@ -1,244 +1,242 @@
-"""Type utilities for Databricks SQL metadata and Arrow."""
-
-from __future__ import annotations
-
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+import json
 from typing import Any
 
-import pyarrow as pa
-from yggdrasil.data import Schema
+from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo, ColumnTypeName
+from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo, ColumnInfoTypeName
+
+from yggdrasil.data import Field, DataType, field
+from yggdrasil.data.types import ObjectType, NullType, BinaryType, BooleanType, StringType, TimestampType, ArrayType, \
+    IntegerType, DateType, DecimalType, FloatingPointType, DurationType, MapType, StructType
+
+__all__ = [
+    "parse_databricks_field",
+]
 
 
-@dataclass(frozen=True, slots=True)
-class PrimaryKeySpec:
-    columns: list[str]
-    constraint_name: str | None = None
-    rely: bool = True
-    timeseries: str | None = None
+COLUMN_TYPE_MAP = {
+    ColumnTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
+    ColumnTypeName.BINARY: BinaryType(),
+    ColumnTypeName.BOOLEAN: BooleanType(),
+    ColumnTypeName.BYTE: IntegerType(byte_size=1),
+    ColumnTypeName.CHAR: StringType(byte_size=1),
+    ColumnTypeName.DATE: DateType(),
+    ColumnTypeName.DECIMAL: DecimalType(),
+    ColumnTypeName.DOUBLE: FloatingPointType(byte_size=8),
+    ColumnTypeName.FLOAT: FloatingPointType(byte_size=4),
+    ColumnTypeName.GEOGRAPHY: ObjectType(),
+    ColumnTypeName.GEOMETRY: ObjectType(),
+    ColumnTypeName.INT: IntegerType(byte_size=4),
+    ColumnTypeName.INTERVAL: DurationType(),
+    ColumnTypeName.LONG: IntegerType(byte_size=8),
+    ColumnTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
+    ColumnTypeName.NULL: NullType(),
+    ColumnTypeName.SHORT: FloatingPointType(byte_size=2),
+    ColumnTypeName.STRING: StringType(),
+    ColumnTypeName.STRUCT: StructType.empty(),
+    ColumnTypeName.TABLE_TYPE: StructType.empty(),
+    ColumnTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
+    ColumnTypeName.TIMESTAMP_NTZ: TimestampType(unit="us"),
+    ColumnTypeName.USER_DEFINED_TYPE: ObjectType(),
+    ColumnTypeName.VARIANT: ObjectType(),
+}
 
-    @classmethod
-    def from_schema(
-        cls,
-        schema: Schema,
-        *,
-        constraint_name: str | None = None,
-        rely: bool | None = None,
-        timeseries: str | None = None
-    ) -> PrimaryKeySpec | None:
-        rely = True if rely is None else bool(rely)
-        info = Schema.from_any(schema)
-        fields = [f for f in info.fields if f.name in info.primary_key_names]
 
-        if not fields:
-            return None
+COLUMN_INFO_TYPE_MAP = {
+    ColumnInfoTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
+    ColumnInfoTypeName.BINARY: BinaryType(),
+    ColumnInfoTypeName.BOOLEAN: BooleanType(),
+    ColumnInfoTypeName.BYTE: IntegerType(byte_size=1),
+    ColumnInfoTypeName.CHAR: StringType(byte_size=1),
+    ColumnInfoTypeName.DATE: DateType(),
+    ColumnInfoTypeName.DECIMAL: DecimalType(),
+    ColumnInfoTypeName.DOUBLE: FloatingPointType(byte_size=8),
+    ColumnInfoTypeName.FLOAT: FloatingPointType(byte_size=4),
+    ColumnInfoTypeName.INT: IntegerType(byte_size=4),
+    ColumnInfoTypeName.INTERVAL: DurationType(),
+    ColumnInfoTypeName.LONG: IntegerType(byte_size=8),
+    ColumnInfoTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
+    ColumnInfoTypeName.NULL: NullType(),
+    ColumnInfoTypeName.SHORT: FloatingPointType(byte_size=2),
+    ColumnInfoTypeName.STRING: StringType(),
+    ColumnInfoTypeName.STRUCT: StructType.empty(),
+    ColumnInfoTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
+    ColumnInfoTypeName.USER_DEFINED_TYPE: ObjectType(),
+}
 
-        if timeseries is None:
-            for f in fields:
-                arrow_type = getattr(f, "type", None)
-                if arrow_type is None and hasattr(f, "dtype"):
-                    to_arrow = getattr(f.dtype, "to_arrow", None)
-                    arrow_type = to_arrow() if callable(to_arrow) else None
-                if arrow_type is not None and pa.types.is_timestamp(arrow_type):
-                    timeseries = f.name
-                    break
 
-        return cls(
-            columns=[f.name for f in fields],
-            constraint_name=constraint_name,
-            rely=rely,
-            timeseries=timeseries,
+REPLACE_TIMEZONES = {
+    "Etc/UTC": "UTC",
+    "CET": "Europe/Zurich",
+    "EST": "America/New_York",
+    "MST": "America/Denver",
+    "PST": "America/Los_Angeles",
+    "GMT": "UTC",
+}
+
+
+def parse_databricks_field(obj: Any) -> Field:
+    if isinstance(obj, Field):
+        return obj
+    if isinstance(obj, dict):
+        return parse_field_dict(obj)
+    if isinstance(obj, CatalogColumnInfo):
+        return parse_catalog_column_info_field(obj)
+    if isinstance(obj, SQLColumnInfo):
+        return parse_sql_column_info(obj)
+
+    if isinstance(obj, str):
+        if obj.startswith("{") and obj.endswith("}"):
+            return parse_field_dict(json.loads(obj))
+
+        try:
+            dtype = ColumnTypeName[obj.upper()]
+            mapping = COLUMN_TYPE_MAP
+        except KeyError:
+            dtype = ColumnInfoTypeName[obj.upper()]
+            mapping = COLUMN_INFO_TYPE_MAP
+
+        return Field(
+            name="",
+            dtype=mapping.get(dtype, ObjectType.instance()),
         )
 
-    @classmethod
-    def from_str(
-        cls,
-        value: str,
-        *,
-        constraint_name: str | None = None,
-        rely: bool | None = None,
-        timeseries: str | None = None,
-    ) -> PrimaryKeySpec:
-        rely = True if rely is None else bool(rely)
-        value = str(value).strip()
-        if not value:
-            raise ValueError("Primary key column string cannot be empty")
-
-        return cls(
-            columns=[value],
-            constraint_name=constraint_name,
-            rely=rely,
-            timeseries=timeseries,
-        )
-
-    @classmethod
-    def from_any(
-        cls,
-        value: Any = None,
-        *,
-        schema: Any | None = None,
-        constraint_name: str | None = None,
-        rely: bool | None = None,
-        timeseries: str | None = None,
-    ) -> PrimaryKeySpec | None:
-        rely = True if rely is None else bool(rely)
-
-        if isinstance(value, cls):
-            return value
-
-        if isinstance(value, pa.Schema) or hasattr(value, "to_arrow_schema"):
-            return cls.from_schema(
-                value,
-                constraint_name=constraint_name,
-                rely=rely,
-                timeseries=timeseries,
-            )
-
-        if value is None:
-            return (
-                cls.from_schema(
-                    schema,
-                    constraint_name=constraint_name,
-                    rely=rely,
-                    timeseries=timeseries,
-                )
-                if schema is not None
-                else None
-            )
-
-        if isinstance(value, str):
-            return cls.from_str(
-                value,
-                constraint_name=constraint_name,
-                rely=bool(rely),
-                timeseries=timeseries,
-            )
-
-        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
-            columns = [str(item).strip() for item in value if str(item).strip()]
-            if not columns:
-                return None
-            return cls(
-                columns=columns,
-                constraint_name=constraint_name,
-                rely=bool(rely),
-                timeseries=timeseries,
-            )
-
-        raise TypeError(f"Cannot build {cls.__name__} from {type(value).__name__}")
-
-    @classmethod
-    def from_(
-        cls,
-        value: Any = None,
-        **kwargs: Any,
-    ) -> PrimaryKeySpec | None:
-        return cls.from_any(value, **kwargs)
+    raise TypeError(f"Cannot parse field from {obj!r}")
 
 
-@dataclass(frozen=True, slots=True)
-class ForeignKeySpec:
-    column: str
-    ref: str
-    constraint_name: str | None = None
-    rely: bool = False
-    match_full: bool = False
-    on_update_no_action: bool = False
-    on_delete_no_action: bool = False
+def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
+    name = obj.name or ""
+    dtype = COLUMN_INFO_TYPE_MAP.get(obj.type_name, ObjectType.instance())
 
-    @classmethod
-    def from_schema(cls, schema: Schema) -> list[ForeignKeySpec]:
-        info = Schema.from_any(schema)
-        return [
-            cls(column=column, ref=ref)
-            for column, ref in info.foreign_key_refs.items()
-        ]
+    if isinstance(dtype, DecimalType):
+        precision = 38 if obj.type_precision is None else obj.type_precision
+        scale = 18 if obj.type_scale is None else obj.type_scale
+        if precision is not None and scale is not None:
+            dtype = DecimalType(precision=precision, scale=scale)
 
-    @classmethod
-    def from_str(
-        cls,
-        value: str,
-        *,
-        constraint_name: str | None = None,
-        rely: bool = False,
-        match_full: bool = False,
-        on_update_no_action: bool = False,
-        on_delete_no_action: bool = False,
-    ) -> ForeignKeySpec:
-        raw = str(value).strip()
-        if not raw:
-            raise ValueError("Foreign key spec string cannot be empty")
+    if isinstance(dtype, TimestampType):
+        if dtype.tz:
+            if dtype.tz in REPLACE_TIMEZONES.keys():
+                tz = REPLACE_TIMEZONES.get(dtype.tz, dtype.tz)
+                dtype = TimestampType(unit=dtype.unit, tz=tz)
 
-        for delimiter in ("->", "=", ":"):
-            if delimiter in raw:
-                column, ref = raw.split(delimiter, 1)
-                column = column.strip()
-                ref = ref.strip()
-                if not column or not ref:
-                    break
-                return cls(
-                    column=column,
-                    ref=ref,
-                    constraint_name=constraint_name,
-                    rely=rely,
-                    match_full=match_full,
-                    on_update_no_action=on_update_no_action,
-                    on_delete_no_action=on_delete_no_action,
-                )
+    if dtype.type_id.is_nested:
+        dtype = dtype.merge_with(DataType.from_str(obj.type_text))
 
-        raise ValueError(
-            "Foreign key spec string must look like 'column=ref', "
-            "'column:ref', or 'column->ref'"
-        )
+    metadata = {}
+    if obj.position:
+        metadata[b"position"] = str(obj.position).encode()
 
-    @classmethod
-    def from_any(
-        cls,
-        value: Any = None,
-        *,
-        schema: Any | None = None,
-    ) -> list[ForeignKeySpec]:
-        if isinstance(value, cls):
-            return [value]
+    return Field(name=name, dtype=dtype, metadata=metadata)
 
-        if isinstance(value, pa.Schema) or hasattr(value, "to_arrow_schema"):
-            return cls.from_schema(value)
 
-        if value is None:
-            return cls.from_schema(schema) if schema is not None else []
+def parse_catalog_column_info_field(obj: CatalogColumnInfo) -> Field:
+    name = obj.name or ""
+    nullable = bool(obj.nullable) if obj.nullable is not None else True
+    dtype = ObjectType()
 
-        if isinstance(value, str):
-            return [cls.from_str(value)]
+    if isinstance(dtype, DecimalType):
+        precision = 38 if obj.type_precision is None else obj.type_precision
+        scale = 18 if obj.type_scale is None else obj.type_scale
+        if precision is not None and scale is not None:
+            dtype = DecimalType(precision=precision, scale=scale)
 
-        if isinstance(value, Mapping):
-            return [
-                cls(column=str(column), ref=str(ref))
-                for column, ref in value.items()
-                if str(column).strip() and str(ref).strip()
-            ]
+    metadata = {}
+    partition_by = False
 
-        if isinstance(value, tuple) and len(value) == 2:
-            column, ref = value
-            if str(column).strip() and str(ref).strip():
-                return [cls(column=str(column).strip(), ref=str(ref).strip())]
-            return []
+    if obj.comment:
+        metadata[b"comment"] = obj.comment.encode()
 
-        if isinstance(value, list) and all(isinstance(item, cls) for item in value):
-            return value
+    if obj.partition_index is not None:
+        partition_by = True
+        metadata[b"partition_index"] = str(obj.partition_index).encode()
 
-        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
-            specs: list[ForeignKeySpec] = []
-            for item in value:
-                specs.extend(cls.from_any(item))
-            return specs
+    if obj.position is not None:
+        metadata[b"position"] = str(obj.position).encode()
 
-        raise TypeError(f"Cannot build {cls.__name__} from {type(value).__name__}")
+    if obj.type_name:
+        dtype = dtype.merge_with(COLUMN_TYPE_MAP.get(obj.type_name, ObjectType.instance()))
 
-    @classmethod
-    def from_(
-        cls,
-        value: Any = None,
-        **kwargs: Any,
-    ) -> list[ForeignKeySpec]:
-        return cls.from_any(value, **kwargs)
+    if obj.type_json:
+        parsed = parse_field_dict(obj.type_json)
+        name = parsed.name or name
+        dtype = dtype.merge_with(parsed.dtype)
+        metadata.update(parsed.metadata or {})
+        partition_by = partition_by or parsed.partition_by
 
+    if obj.type_text and dtype.type_id.is_any_or_null:
+        dtype = dtype.merge_with(DataType.from_str(obj.type_text))
+
+    if isinstance(dtype, TimestampType):
+        if dtype.tz:
+            if dtype.tz in REPLACE_TIMEZONES.keys():
+                tz = REPLACE_TIMEZONES.get(dtype.tz, dtype.tz)
+                dtype = TimestampType(unit=dtype.unit, tz=tz)
+
+    return Field(
+        name=name,
+        dtype=dtype,
+        nullable=nullable,
+        metadata=metadata
+    ).with_partition_by(partition_by)
+
+
+def parse_field_dict(obj: Any) -> Field:
+    obj = _safe_dict(obj)
+    name = obj.get("name", None) or ""
+    nullable = obj.get("nullable", None)
+    metadata = _safe_dict(obj.get("metadata", None))
+    comment = metadata.get("comment", None)
+    if comment:
+        metadata[b"comment"] = comment
+
+    dtype = obj.get("type", None)
+    if dtype:
+        dtype = parse_databricks_field(dtype).dtype
+    else:
+        dtype = ObjectType()
+
+    fields = obj.get("fields", None)
+    if fields:
+        fields = [parse_databricks_field(_) for _ in fields]
+
+        if isinstance(dtype, StructType):
+            dtype = StructType(fields)
+
+    contains_null = obj.get("containsNull", True)
+    element_type = obj.get("elementType", None)
+    if element_type:
+        element_field = parse_databricks_field(element_type).with_nullable(contains_null)
+        if not element_field.name:
+            element_field = element_field.with_name("item")
+
+        if isinstance(dtype, ArrayType):
+            dtype = ArrayType.from_item(element_field)
+
+    if isinstance(dtype, MapType):
+        value_contains_null = obj.get("valueContainsNull", True)
+        key_type = obj.get("keyType", None)
+        key_field = parse_databricks_field(key_type).with_nullable(False) if key_type else dtype.key_field
+        value_type = obj.get("valueType", None)
+        value_field = parse_databricks_field(value_type).with_nullable(value_contains_null) if value_type else dtype.value_field
+
+        dtype = MapType.from_key_value(key_field, value_field)
+
+    return field(
+        name=name,
+        dtype=dtype,
+        nullable=bool(nullable) if nullable is not None else True,
+        metadata=metadata,
+    )
+
+
+def _safe_dict(obj: Any) -> dict:
+    if obj is None:
+        return {}
+
+    if isinstance(obj, dict):
+        return obj
+
+    if isinstance(obj, (str, bytes)):
+        return _safe_dict(json.loads(obj))
+
+    raise TypeError(f"Cannot parse dict from {type(obj)}")

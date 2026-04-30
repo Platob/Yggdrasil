@@ -4,7 +4,7 @@ import logging
 
 from databricks.sdk.errors import NotFound
 
-from yggdrasil.data import any_to_datetime
+from yggdrasil.data.cast import any_to_datetime
 
 import yggdrasil.pickle.json as json_module
 from dataclasses import dataclass, field

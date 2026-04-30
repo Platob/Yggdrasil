@@ -187,7 +187,7 @@ class Cluster(DatabricksResource):
 
     def url(self) -> URL:
         """Return the Databricks workspace URL for this cluster."""
-        return URL.parse_str(
+        return URL.from_str(
             f"{self.client.base_url.to_string().rstrip('/')}/compute/clusters/{self.cluster_id or 'unknown'}"
         )
 
@@ -312,7 +312,7 @@ class Cluster(DatabricksResource):
         Also waits for library installation completion after the cluster becomes
         stable.
         """
-        wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.from_(wait)
         if not wait:
             return self
 
@@ -517,7 +517,7 @@ class Cluster(DatabricksResource):
             return self
 
         client = self.clusters_client()
-        wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.from_(wait)
 
         LOGGER.debug("Starting %s", self)
 
@@ -771,7 +771,7 @@ class Cluster(DatabricksResource):
         if not self.is_running:
             return self
 
-        wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.from_(wait)
         if not wait:
             return self
 

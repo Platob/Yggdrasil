@@ -6,6 +6,6 @@ __all__ = [
     "Accounts"
 ]
 
-@dataclass(frozen=True)
+@dataclass
 class Accounts(DatabricksService):
     pass

@@ -8,7 +8,7 @@ from yggdrasil.data.data_field import Field
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import MapType
 from yggdrasil.data.types.nested.struct import StructType
-from yggdrasil.io import SaveMode  # noqa: F401 — kept for future merge-mode tests
+from yggdrasil.io.enums import Mode  # noqa: F401 — kept for future merge-mode tests
 
 
 # ---------------------------------------------------------------------------

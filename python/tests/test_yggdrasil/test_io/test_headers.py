@@ -150,7 +150,7 @@ def test_normalize_headers_redacts_jwt_like_values():
 def test_normalize_headers_backfills_body_headers():
     body = _DummyBody(
         size=99,
-        media_type=MediaType.parse("application/json"),
+        media_type=MediaType.from_("application/json"),
     )
 
     out = normalize_headers({}, body=body, is_request=True)
@@ -161,7 +161,7 @@ def test_normalize_headers_backfills_body_headers():
 
 
 def test_normalize_headers_backfills_content_encoding_when_codec_exists():
-    media_type = MediaType.parse("application/json")
+    media_type = MediaType.from_("application/json")
     media_type = MediaType(mime_type=media_type.mime_type, codec=GZIP)
 
     body = _DummyBody(
@@ -177,7 +177,7 @@ def test_normalize_headers_backfills_content_encoding_when_codec_exists():
 
 
 def test_normalize_headers_does_not_override_existing_body_headers():
-    media_type = MediaType.parse("application/json")
+    media_type = MediaType.from_("application/json")
     media_type = MediaType(mime_type=media_type.mime_type, codec=GZIP)
 
     body = _DummyBody(

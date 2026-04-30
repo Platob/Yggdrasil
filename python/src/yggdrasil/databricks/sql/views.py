@@ -34,7 +34,7 @@ from databricks.sdk.service.catalog import TableInfo, TableType
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.io.enums.save_mode import SaveMode, SaveModeArg
+from yggdrasil.io.enums.mode import Mode, ModeLike
 
 from .view import View
 
@@ -61,7 +61,7 @@ def _is_view_info(info: TableInfo) -> bool:
     return info.table_type in _VIEW_TABLE_TYPES
 
 
-@dataclass(frozen=True)
+@dataclass
 class Views(DatabricksService):
     """Collection-level service for Unity Catalog views.
 
@@ -554,7 +554,7 @@ class Views(DatabricksService):
         schema_name: str | None = None,
         by_name: bool = True,
         comment: str | None = None,
-        mode: SaveModeArg = SaveMode.OVERWRITE,
+        mode: ModeLike = Mode.OVERWRITE,
     ) -> View:
         """Create or update a view that concatenates *tables* with ``UNION ALL``.
 
@@ -581,7 +581,7 @@ class Views(DatabricksService):
                 Optional ``COMMENT`` on the view.
             mode:
                 Passed through to :meth:`View.create`.  Defaults to
-                :attr:`SaveMode.OVERWRITE` so the view is created or
+                :attr:`Mode.OVERWRITE` so the view is created or
                 replaced atomically.
 
         Returns:

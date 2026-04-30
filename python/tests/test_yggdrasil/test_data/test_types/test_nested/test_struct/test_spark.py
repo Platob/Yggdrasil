@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data import CastOptions, Field
+from yggdrasil.data import Field
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.types.nested.struct import (
     cast_spark_list_column,
     cast_spark_map_column,
     cast_spark_struct_column,
 )
-
 from ._helpers import normalize_nested
 
 pytest.importorskip("pyspark")

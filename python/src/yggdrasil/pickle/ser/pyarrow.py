@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Generic, Mapping, TypeVar, cast
 
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 import pyarrow.dataset as ds
 
 from yggdrasil.pickle.ser.constants import CODEC_NONE

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import threading
 import zlib
 from typing import Final
 
@@ -37,8 +38,31 @@ _GZIP_COMPRESSLEVEL: Final[int] = 1
 _ZLIB_LEVEL: Final[int] = 1
 _ZSTD_LEVEL: Final[int] = 1
 
-_ZSTD_COMPRESSOR = _zstd.ZstdCompressor(level=_ZSTD_LEVEL) if _zstd is not None else None
-_ZSTD_DECOMPRESSOR = _zstd.ZstdDecompressor() if _zstd is not None else None
+# zstandard's ZstdCompressor / ZstdDecompressor wrap mutable native contexts
+# (ZSTD_CCtx / ZSTD_DCtx) that are NOT safe to share across threads. Concurrent
+# .compress() / .decompress() calls on the same instance corrupt the context
+# and produce native access violations on Windows.
+#
+# We keep one compressor and one decompressor per thread via threading.local,
+# so each thread reuses its own contexts (cheap, avoids per-call allocation)
+# without ever sharing them.
+_tls = threading.local()
+
+
+def _zstd_compressor() -> "_zstd.ZstdCompressor":
+    c = getattr(_tls, "zstd_c", None)
+    if c is None:
+        c = _zstd.ZstdCompressor(level=_ZSTD_LEVEL)
+        _tls.zstd_c = c
+    return c
+
+
+def _zstd_decompressor() -> "_zstd.ZstdDecompressor":
+    d = getattr(_tls, "zstd_d", None)
+    if d is None:
+        d = _zstd.ZstdDecompressor()
+        _tls.zstd_d = d
+    return d
 
 
 def codec_name(codec: int) -> str:
@@ -56,9 +80,8 @@ def default_codec() -> int:
     Preference order:
     1. zstd, if installed
     2. zlib, always available in stdlib
-    3. gzip, compatibility fallback
     """
-    if _ZSTD_COMPRESSOR is not None:
+    if _zstd is not None:
         return CODEC_ZSTD
     return CODEC_ZLIB
 
@@ -78,11 +101,11 @@ def compress_bytes(data: bytes, codec: int) -> bytes:
         return zlib.compress(data, level=_ZLIB_LEVEL)
 
     if codec == CODEC_ZSTD:
-        if _ZSTD_COMPRESSOR is None:
+        if _zstd is None:
             raise InvalidCodecError(
                 "CODEC_ZSTD requested but zstandard is not installed"
             )
-        return _ZSTD_COMPRESSOR.compress(data)
+        return _zstd_compressor().compress(data)
 
     raise InvalidCodecError(f"Unknown codec id: {codec}")
 
@@ -99,10 +122,10 @@ def decompress_bytes(data: bytes, codec: int) -> bytes:
         return zlib.decompress(data)
 
     if codec == CODEC_ZSTD:
-        if _ZSTD_DECOMPRESSOR is None:
+        if _zstd is None:
             raise InvalidCodecError(
                 "CODEC_ZSTD encountered but zstandard is not installed"
             )
-        return _ZSTD_DECOMPRESSOR.decompress(data)
+        return _zstd_decompressor().decompress(data)
 
     raise InvalidCodecError(f"Unknown codec id: {codec}")

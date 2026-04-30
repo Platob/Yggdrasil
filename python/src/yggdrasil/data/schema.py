@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, MutableMapping
-from dataclasses import dataclass, field as dc_field, field
 from typing import TYPE_CHECKING, Any, AnyStr, Mapping, overload
 
 import pyarrow as pa
 
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from .base_meta import BaseMetadata, _normalize_metadata, _to_bytes, BaseChildrenFields
-from .data_field import Field
+from .data_field import Field, field
 from .types.nested import StructType
 from .types.support import get_polars, get_spark_sql
+from ..lazy_imports import path_class
 
 if TYPE_CHECKING:
     import polars
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 __all__ = [
     "Schema",
     "schema",
+    "Field",
+    "field"
 ]
 
 
@@ -56,10 +59,16 @@ def schema(
     )
 
 
-@dataclass
+@dataclasses.dataclass(repr=False, eq=False, frozen=True)
 class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
-    inner_fields: OrderedDict[str, Field] = dc_field(default_factory=OrderedDict)
-    metadata: dict[bytes, bytes] | None = field(default=None)
+    inner_fields: OrderedDict[str, Field] = dataclasses.field(default_factory=OrderedDict)
+    metadata: dict[bytes, bytes] | None = dataclasses.field(default=None)
+
+    def __repr__(self):
+        fields = ""
+        for f in self.inner_fields.values():
+            fields += f"\n    {f.name!r} -> {f.dtype!r} nullable={f.nullable!r} metadata={f.metadata!r}"
+        return f"Schema: {self.name!r} metadata={self.metadata!r}{fields}"
 
     def __bool__(self):
         return bool(self.inner_fields)
@@ -79,13 +88,24 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
                     f = Field.from_any(value)
                     normalized_fields[f.name] = f
 
-            self.inner_fields = normalized_fields
+            object.__setattr__(self, "inner_fields", normalized_fields)
 
     @classmethod
     def peek_from(cls, obj: Any) -> tuple[Any, "Schema"]:
         obj, dfield = Field.peek_from(obj)
 
         return obj, cls.from_field(dfield)
+
+    @classmethod
+    def empty(
+        cls,
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+    ):
+        return cls([], metadata=_normalize_metadata(metadata, tags=tags))
+
+    def is_empty(self):
+        return len(self.inner_fields) == 0
 
     def equals(
         self,
@@ -168,12 +188,15 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         return getattr(type(value), "__name__", DEFAULT_FIELD_NAME)
 
     @property
-    def children_fields(self) -> tuple[Field, ...]:
-        return tuple(self.inner_fields.values())
+    def children_fields(self) -> list[Field]:
+        return list(self.inner_fields.values())
 
     @property
-    def fields(self) -> tuple[Field, ...]:
-        return tuple(self.inner_fields.values())
+    def fields(self) -> list[Field]:
+        return [
+            f for f in self.inner_fields.values()
+            if not f.constraint_key
+        ]
 
     @property
     def name(self) -> str:
@@ -185,7 +208,7 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     def name(self, value: str) -> None:
         if value and value != DEFAULT_FIELD_NAME:
             if not self.metadata:
-                self.metadata = {}
+                object.__setattr__(self, "metadata", {})
             self.metadata[b"name"] = _to_bytes(value)
 
     @property
@@ -202,7 +225,7 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     def nullable(self, value: bool) -> None:
         if value:
             if not self.metadata:
-                self.metadata = {}
+                object.__setattr__(self, "metadata", {})
             self.metadata[b"nullable"] = b"t" if value else b"f"
 
     @property
@@ -211,36 +234,23 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
 
     @property
     def partition_by(self):
-        return [_ for _ in self.inner_fields.values() if _.partition_by]
+        return [f for f in self.fields if f.partition_by]
 
     @property
     def cluster_by(self):
-        return [_ for _ in self.inner_fields.values() if _.cluster_by]
+        return [f for f in self.fields if f.cluster_by]
 
     @property
-    def primary_keys(self) -> list[Field]:
-        return [f for f in self.inner_fields.values() if f.primary_key]
+    def primary_keys(self):
+        return [f for f in self.fields if f.primary_key]
 
     @property
-    def primary_key_names(self) -> list[str]:
-        return [f.name for f in self.inner_fields.values() if f.primary_key]
+    def foreign_keys(self):
+        return [f for f in self.fields if f.foreign_key]
 
     @property
-    def foreign_keys(self) -> list[Field]:
-        return [f for f in self.inner_fields.values() if f.foreign_key]
-
-    @property
-    def foreign_key_names(self) -> list[str]:
-        return [f.name for f in self.inner_fields.values() if f.foreign_key]
-
-    @property
-    def foreign_key_refs(self) -> dict[str, str]:
-        """Map each foreign-key column to its ``foreign_key`` tag value."""
-        return {
-            f.name: f.foreign_key
-            for f in self.inner_fields.values()
-            if f.foreign_key
-        }
+    def constraints(self):
+        return [_ for _ in self.inner_fields.values() if _.constraint_key]
 
     @property
     def comment(self):
@@ -421,7 +431,7 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         for name, f in other.inner_fields.items():
             self.inner_fields[name] = f.copy()
 
-        self.metadata = self._merge_metadata(self.metadata, other.metadata)
+        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
         return self
 
     def __sub__(self, other: Any) -> "Schema":
@@ -462,12 +472,12 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         other = self._coerce_other(other)
         keep_names = set(other.inner_fields)
 
-        self.inner_fields = OrderedDict(
+        object.__setattr__(self, "inner_fields", OrderedDict(
             (name, f)
             for name, f in self.inner_fields.items()
             if name in keep_names
-        )
-        self.metadata = self._merge_metadata(self.metadata, other.metadata)
+        ))
+        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
         return self
 
     def __or__(self, other: Any) -> "Schema":
@@ -594,23 +604,8 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     def from_path(
         cls,
         path: Any,
-        *,
-        media: Any = None,
-        path_io: Any = None,
     ) -> "Schema":
-        from yggdrasil.io.buffer.path_io import PathIO
-
-        if isinstance(path, PathIO):
-            resolved = path
-        elif isinstance(path_io, PathIO):
-            resolved = path_io
-        else:
-            factory = path_io
-            if factory is None:
-                from yggdrasil.io.buffer.local_path_io import LocalPathIO
-                factory = LocalPathIO
-            resolved = factory.make(path, media=media)
-        return resolved.collect_schema()
+        return path_class().from_(path).as_media().collect_schema()
 
     def to_field(self) -> Field:
         return Field(
@@ -624,7 +619,7 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         self,
         other: "Schema",
         inplace: bool = False,
-        mode: SaveMode | None = None,
+        mode: Mode | None = None,
         downcast: bool = False,
         upcast: bool = False,
         merge_dtype: bool = True,
@@ -645,6 +640,36 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
             )
             .to_schema()
         )
+
+    def with_metadata(
+        self,
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+        inplace: bool = False,
+        update: bool = True,
+    ) -> "Schema":
+        new_metadata = _normalize_metadata(metadata, tags)
+
+        if not new_metadata:
+            return self if update else self.copy(metadata=None)
+
+        if inplace:
+            if update:
+                self.metadata.update(new_metadata)
+            else:
+                object.__setattr__(self, "metadata", new_metadata)
+            return self
+
+        if update and self.metadata:
+            new_metadata = {
+                **self.metadata,
+                **(new_metadata or {})
+            }
+
+        return self.copy(metadata=new_metadata)
+
+    def with_name(self, name: str, inplace: bool = False) -> "Schema":
+        return self.with_metadata(metadata={b"name": _to_bytes(name)}, update=True, inplace=inplace)
 
 
 @register_converter(Any, Schema)

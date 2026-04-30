@@ -28,6 +28,6 @@ print(field)
 ```python
 from yggdrasil.dataclasses import WaitingConfig
 
-wait = WaitingConfig.check_arg(True)
+wait = WaitingConfig.from_(True)
 print(wait)
 ```

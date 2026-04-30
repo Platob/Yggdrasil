@@ -67,7 +67,7 @@ print(field)
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "score": ["3.14", "2.71"]})
 
@@ -97,7 +97,7 @@ Polars cast example:
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.polars.cast import cast_polars_dataframe
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.polars.lib import polars
 
 source_df = polars.DataFrame({"id": ["1"], "value": ["4.2"]})
@@ -156,7 +156,7 @@ print(stmt.to_arrow_table())
 ## 9) Advanced: reuse `CastOptions.check_arg` in custom helpers
 
 ```python
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 
 def normalize_options(options=None, target_field=None) -> CastOptions:

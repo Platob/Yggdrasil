@@ -1,10 +1,42 @@
+"""URL with canonical equality.
+
+Three design notes that drive the changes vs. the previous version:
+
+1. **Single port representation.** The internal sentinel ``_NO_PORT = 0``
+   was leaking past ``with_scheme(inplace=True)`` and ``with_host`` while
+   ``from_str`` / ``from_dict`` were normalizing absent ports to ``None``.
+   The dataclass auto-eq then reported ``port=0 != port=None`` for two
+   URLs that render to the exact same string. ``__post_init__`` now
+   normalizes ``0`` to ``None`` once, centrally — every constructor and
+   ``replace`` flows through it.
+
+2. **Windows drive letters in ``from_str``.** ``urlsplit("C:\\Users\\x")``
+   returns ``scheme='c', path='\\Users\\x'``. The previous fix-up only
+   stripped the bogus single-letter scheme, leaving the path mangled
+   and the drive letter dropped. We now reattach the drive and convert
+   backslashes to forward slashes inside this branch only — so
+   ``URL.from_str("C:\\Users\\x")`` and ``URL.from_(Path("C:\\Users\\x"))``
+   produce equal URLs on Windows, and the rest of the URL parser stays
+   untouched for non-Windows inputs.
+
+3. **In-process object handles via ``mem://``.** :meth:`URL.from_memory_address`
+   encodes ``id(obj)`` as a URL path so a Python object can round-trip
+   through code paths that expect a URL string (cache keys, MediaIO
+   dispatch, pipeline configs). Same-process, same-interpreter only;
+   the URL is a raw id() handle and the caller is responsible for
+   keeping a strong reference to the referent. See the method's
+   docstring for the full lifetime contract.
+"""
+
 from __future__ import annotations
 
+import ctypes
+import fnmatch
 import os
-from abc import ABC, abstractmethod
+import sys
 from dataclasses import dataclass, field, replace
-from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Mapping, Sequence, Type, TypeVar, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable, Literal, Mapping, Sequence
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -16,16 +48,13 @@ from urllib.parse import (
 )
 
 from yggdrasil.io.parameters import anonymize_parameters
+from yggdrasil.lazy_imports import (
+    bytes_io_class,
+    media_type_class,
+    mime_type_class,
+)
 
-__all__ = [
-    "URL",
-    "URLResource",
-    "get_registered_url_resource",
-    "register_url_resource",
-    "registered_url_schemes",
-    "url_resource_class",
-]
-T = TypeVar("T", bound="URLResource")
+__all__ = ["URL", "resolve_memory_address"]
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
@@ -35,7 +64,14 @@ _SAFE_FRAGMENT = "-._~!$&'()*+,;=:@/?"
 
 _NO_PORT = 0
 
-_REGISTRY: Dict[str, Type["URLResource"]] = {}
+# Scheme used for in-process object handles. ``mem://<hex_addr>``.
+# Same-process, same-interpreter only — see URL.from_memory_address.
+_MEMORY_SCHEME: str = "mem"
+
+# Pointer width in hex digits — 16 on 64-bit, 8 on 32-bit. Used so that
+# every emitted memory URL has the same visual length on a given host;
+# the parser accepts unpadded hex too, so this is purely cosmetic.
+_MEMORY_HEX_WIDTH: int = (sys.maxsize.bit_length() + 1 + 3) // 4
 
 
 def _lower_if(value: str) -> str:
@@ -56,8 +92,30 @@ def _normalize_path(
     elif path == "/":
         return path
 
-    elif os_find:
-        path = "/" + os.path.realpath(path).replace("\\", "/")
+    elif os_find and not path.startswith("/"):
+        # Pre-process the input for os.path.realpath so it behaves on both
+        # POSIX and Windows. Two cases matter:
+        #
+        # 1. POSIX absolute path like "/tmp/x". realpath("/tmp/x") == "/tmp/x",
+        #    so feed it through as-is. Do NOT lstrip("/") — that would make
+        #    the path cwd-relative and realpath would re-anchor it to $PWD.
+        #
+        # 2. Windows drive path, which arrives in file-URL form "/C:/Users/x".
+        #    Windows' realpath chokes on the leading slash and emits a broken
+        #    "/C:Users\x" (the slash AFTER the colon gets dropped as realpath
+        #    tries to normalize the odd mixed form). Strip the leading slash
+        #    only in this specific shape so realpath sees "C:/Users/x" and
+        #    does the right thing.
+        #
+        # The drive-letter pattern is "/X:" (colon at index 2, where X is a
+        # single letter). That's unambiguous: no real POSIX path has a colon
+        # at index 2 of a top-level absolute path.
+        to_resolve = path
+        if len(path) >= 3 and path[0] == "/" and path[2] == ":" and path[1].isalpha():
+            to_resolve = path[1:]
+
+        resolved = os.path.realpath(to_resolve).replace("\\", "/")
+        return resolved if resolved.startswith("/") else "/" + resolved
 
     return path
 
@@ -66,6 +124,91 @@ def _remove_default_port(scheme: str, host: str, port: int) -> int:
     if not scheme or not host or port <= 0:
         return _NO_PORT
     return _NO_PORT if _DEFAULT_PORTS.get(scheme) == port else port
+
+
+def _strip_windows_drive_slash(path: str) -> str:
+    """Inverse of the ``from_pathlib`` Windows fix-up.
+
+    Transforms ``/C:/Users/x`` → ``C:/Users/x`` for any leading
+    ``/X:`` pattern. Used by both :meth:`URL.to_pathlib` and
+    :meth:`URL.__fspath__` so the two agree on the drive-letter
+    handling without duplicating the rule.
+    """
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        return path[1:]
+    return path
+
+
+def _format_memory_address(address: int) -> str:
+    """Render a non-negative ``id()`` as ``0x``-prefixed lowercase hex,
+    zero-padded to the platform pointer width.
+
+    Emitted with a leading ``/`` by :meth:`URL.from_memory_address` so
+    the resulting URL path is already rooted and bypasses
+    :func:`_normalize_path`'s empty-path → ``"/"`` coercion.
+    """
+    if address < 0:
+        raise ValueError(f"memory address must be non-negative, got {address}")
+    return f"0x{address:0{_MEMORY_HEX_WIDTH}x}"
+
+
+def _parse_memory_address(text: str) -> int:
+    """Parse the path portion of a ``mem://`` URL back into an integer.
+
+    Accepts with or without ``0x`` prefix, with or without a leading
+    ``/`` (URL paths are rooted). Rejects empty strings, signed values,
+    and non-hex input.
+    """
+    if not text:
+        raise ValueError("memory address is empty")
+    s = text.lstrip("/").lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if not s:
+        raise ValueError(f"memory address is empty after stripping prefix: {text!r}")
+    try:
+        value = int(s, 16)
+    except ValueError as exc:
+        raise ValueError(f"not a valid hex memory address: {text!r}") from exc
+    if value < 0:
+        raise ValueError(f"memory address must be non-negative, got {value}")
+    return value
+
+
+def resolve_memory_address(address: int) -> object:
+    """Dereference an integer address back to the Python object.
+
+    Uses ``ctypes.cast(addr, py_object).value`` — the standard CPython
+    trick. O(1), but a *raw* dereference: the caller MUST hold a strong
+    reference to the object for the URL's entire lifetime. If the object
+    has been garbage-collected, the slot will be reused and this
+    function returns a different object (or, if the slot was freed and
+    not yet reused, may segfault).
+
+    Module-level so non-URL callers (tests, MediaIO dispatch sites) can
+    use it without constructing a URL instance.
+    """
+    return ctypes.cast(address, ctypes.py_object).value
+
+
+def _join_segment(seg: Any) -> str:
+    """Coerce a :meth:`URL.joinpath` argument to a path string.
+
+    URL-valued arguments contribute only their :attr:`path` component
+    — the scheme/host/query of the RHS is dropped. Use :meth:`URL.join`
+    instead when full URL-reference joining (per RFC 3986) is needed.
+    :class:`os.PathLike` and ``str`` pass through ``os.fspath``. All
+    other types raise :class:`TypeError` rather than coerce silently,
+    because ``url / 42`` is almost certainly a bug.
+    """
+    if isinstance(seg, URL):
+        return seg.path
+    if isinstance(seg, (str, os.PathLike)):
+        return os.fspath(seg)
+    raise TypeError(
+        f"joinpath/truediv segment must be str, URL, or os.PathLike, "
+        f"got {type(seg).__name__}"
+    )
 
 
 def _encode_userinfo(userinfo: str) -> str:
@@ -150,27 +293,6 @@ def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
     return userinfo, hostport, _NO_PORT
 
 
-def _looks_like_local_path(raw: str) -> bool:
-    if not raw:
-        return False
-
-    stripped = raw.strip()
-    split = urlsplit(stripped)
-
-    if split.scheme:
-        if len(split.scheme) == 1 and len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in ("\\", "/"):
-            return True
-        return False
-
-    return stripped.startswith(("/", "~", "./", "../")) or "/" in stripped or "\\" in stripped
-
-
-def _pathlike_to_file_parts(raw: str | Path) -> tuple[str, str]:
-    path = raw if isinstance(raw, Path) else Path(raw)
-    path = path.expanduser().resolve(strict=False)
-    return "file", path.as_posix()
-
-
 def _normalize_components(
     *,
     scheme: str,
@@ -195,7 +317,7 @@ def _normalize_components(
 
 
 @dataclass(frozen=True, slots=True)
-class URL:
+class URL(os.PathLike):
     scheme: str = ""
     userinfo: str | None = None
     host: str = ""
@@ -208,8 +330,228 @@ class URL:
     _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
     _anonymized: bool | None = field(default=None, init=False, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # Centrally normalize the port=0 sentinel to None. Without this,
+        # two URLs that render identically can compare unequal because
+        # one constructor flowed port through `port or None` and another
+        # left the int `_NO_PORT` (0) in place. Frozen dataclass — must
+        # use object.__setattr__.
+        if self.port == 0:
+            object.__setattr__(self, "port", None)
+
+    @property
+    def parts(self):
+        if not self.path or self.path == "/":
+            return []
+        return self.path.lstrip("/").split("/")
+
+    @property
+    def extensions(self) -> list[str]:
+        """Return the path's extensions, lowercased, leading dot stripped.
+
+        Examples::
+
+            URL.from_("/data/file.csv").extensions           == ["csv"]
+            URL.from_("/data/file.tar.gz").extensions        == ["tar", "gz"]
+            URL.from_("/data/archive.csv.zst").extensions    == ["csv", "zst"]
+            URL.from_("/data/README").extensions             == []
+            URL.from_("/data/.hidden").extensions            == []   # dotfile
+            URL.from_("/data/.env.local").extensions         == ["local"]
+
+        The list ordering is outer-to-inner: for ``archive.csv.zst`` you
+        get ``["csv", "zst"]``, matching the codec/media-type refactor
+        convention (outer format first, compression codec last). Leading
+        dotfile marker isn't treated as an extension.
+        """
+        if not self.path or self.path == "/":
+            return []
+        return [s.lstrip(".").lower() for s in PurePosixPath(self.path).suffixes]
+
+    @property
+    def name(self) -> str:
+        """Last segment of the path, trailing slash stripped.
+
+        Examples::
+
+            URL.from_("/a/b/c").name   == "c"
+            URL.from_("/a/b/c/").name  == "c"   # trailing slash ignored
+            URL.from_("/a/b/").name    == "b"
+            URL.from_("/").name        == ""
+            URL.from_("").name         == ""
+
+        ``PurePosixPath`` normalizes the trailing slash, so directory-style
+        URLs still return their last non-empty segment.
+        """
+        if not self.path or self.path == "/":
+            return ""
+        elif self.path.endswith("/"):
+            return self.parts[-2]
+        return self.parts[-1]
+
+    @property
+    def stem(self) -> str:
+        """The :attr:`name` with its final extension removed.
+
+        Matches :attr:`pathlib.PurePosixPath.stem` semantics — only the
+        last suffix is stripped, not all of them:
+
+            URL.from_("/a/file.csv").stem          == "file"
+            URL.from_("/a/archive.csv.zst").stem   == "archive.csv"
+            URL.from_("/a/README").stem            == "README"
+            URL.from_("/a/.hidden").stem           == ".hidden"  # dotfile
+            URL.from_("/a/.env.local").stem        == ".env"
+            URL.from_("/").stem                    == ""
+            URL.from_("").stem                     == ""
+
+        Use :attr:`extensions` if you need every suffix, or call
+        ``.stem`` repeatedly to peel layers.
+        """
+        if not self.path or self.path == "/":
+            return ""
+        return PurePosixPath(self.path).stem
+
+    @property
+    def parent(self) -> URL:
+        """The URL one path segment up, with query/fragment/authority preserved.
+
+        Matches :attr:`pathlib.PurePosixPath.parent` semantics at the
+        path level — trailing slashes are ignored and the root is its
+        own parent:
+
+            URL.from_("https://e.com/a/b/c").parent      # https://e.com/a/b
+            URL.from_("https://e.com/a/b/c/").parent     # https://e.com/a/b
+            URL.from_("https://e.com/a").parent          # https://e.com/
+            URL.from_("https://e.com/").parent           # https://e.com/
+            URL.from_("/a/b?x=1#frag").parent            # /a?x=1#frag
+
+        Query, fragment, scheme, host, userinfo, and port are carried
+        over unchanged. If the inherited query/fragment don't make
+        sense for the parent URL, strip them yourself via
+        :meth:`with_query` / :meth:`with_fragment`.
+        """
+        if not self.path or self.path == "/":
+            # Root is its own parent (pathlib semantics) and also the
+            # sensible answer when path is empty (the dataclass default
+            # is "/", so "" shouldn't occur in practice but guard anyway).
+            return self._replace(path="/")
+        parent_path = str(PurePosixPath(self.path).parent)
+        # PurePosixPath("").parent is ".", not "/" — coerce to "/" for
+        # URL semantics. Can't reach this branch given the guard above,
+        # but belt-and-braces.
+        if parent_path == ".":
+            parent_path = "/"
+        return self._replace(path=parent_path)
+
+    @property
+    def parents(self) -> tuple[URL, ...]:
+        """The full ancestry chain, closest first.
+
+        A tuple of URLs walking up from :attr:`parent` to the root.
+        Empty when the URL has no meaningful path:
+
+            URL.from_("https://e.com/a/b/c").parents
+                # (https://e.com/a/b, https://e.com/a, https://e.com/)
+            URL.from_("https://e.com/a").parents
+                # (https://e.com/,)
+            URL.from_("https://e.com/").parents
+                # ()
+
+        Like :attr:`parent`, every URL in the chain carries the same
+        query, fragment, and authority as ``self``.
+        """
+        if not self.path or self.path == "/":
+            return ()
+        return tuple(
+            self._replace(path=str(p))
+            for p in PurePosixPath(self.path).parents
+        )
+
+    @property
+    def media_type(self):
+        return self.infer_media_type(default=None)
+
+    @property
+    def mime_types(self):
+        mc = mime_type_class()
+        ext = self.extensions
+
+        if not ext:
+            return []
+
+        return [mc.from_str(_) for _ in ext]
+
+    def infer_media_type(self, default: "MediaType" = ...):
+        return media_type_class().from_url(self, default=default)
+
+    @property
+    def mime_type(self):
+        """The inner :class:`MimeType` of this URL's :attr:`media_type`.
+
+        For ``/data/archive.csv.zst`` this is ``CSV`` — the codec
+        wrapper is reported separately via :attr:`codec`. Returns
+        ``None`` when :attr:`media_type` is ``None``.
+        """
+        mt = self.media_type
+        return mt.mime_type if mt is not None else None
+
+    @property
+    def codec(self):
+        """The :class:`Codec` peeled from :attr:`media_type`, if any.
+
+        ``None`` for uncompressed URLs (``/data/file.csv``) and for
+        URLs with no filename. For ``/data/archive.csv.zst`` this is
+        the ZSTD codec.
+        """
+        mt = self.media_type
+        return mt.codec if mt is not None else None
+
+    # ------------------------------------------------------------------
+    # Memory-address handles
+    # ------------------------------------------------------------------
+
+    @property
+    def is_memory_address(self) -> bool:
+        """True iff this URL is a ``mem://`` in-process handle.
+
+        Cheap predicate for dispatch sites that need to branch between
+        real I/O (``file``, ``http``, ``s3``, ...) and direct object
+        pickup. Pairs with :attr:`memory_address` and
+        :meth:`resolve_memory_address` for the actual retrieval.
+        """
+        return self.scheme == _MEMORY_SCHEME
+
+    @property
+    def memory_address(self) -> int:
+        """Integer ``id()`` encoded in this ``mem://`` URL.
+
+        Raises :class:`ValueError` if this is not a memory URL or if the
+        path is malformed. Use :attr:`is_memory_address` to guard the
+        lookup if the scheme is unknown.
+        """
+        if not self.is_memory_address:
+            raise ValueError(
+                f"not a memory-address URL (scheme={self.scheme!r}); "
+                f"use is_memory_address to guard access"
+            )
+        return _parse_memory_address(self.path)
+
+    def resolve_memory_address(self) -> object:
+        """Dereference this ``mem://`` URL back to the original Python object.
+
+        Wraps the module-level :func:`resolve_memory_address` for
+        ergonomics. The lifetime caveats apply: the caller must have
+        kept a strong reference to the object since the URL was built.
+        See :meth:`from_memory_address` for the full contract.
+        """
+        return resolve_memory_address(self.memory_address)
+
     @classmethod
-    def empty(cls) -> "URL":
+    def empty(
+        cls,
+        new_instance: bool = False
+    ) -> "URL":
+        if new_instance:
+            return cls()
         return _EMPTY_URL
 
     @staticmethod
@@ -224,25 +566,54 @@ class URL:
         default_scheme: str | None = None,
         decode: bool = False,
         normalize: bool = True,
+    ):
+        return cls.from_(obj, default_scheme=default_scheme, decode=decode, normalize=normalize)
+
+    @classmethod
+    def from_(
+        cls,
+        obj: Any,
+        *,
+        default_scheme: str | None = None,
+        decode: bool = False,
+        normalize: bool = True,
+        default: Any = ...
     ) -> URL:
         if isinstance(obj, cls):
             return obj
 
-        if isinstance(obj, Mapping):
-            return cls.parse_dict(obj, decode=decode, normalize=normalize)
+        if isinstance(obj, str):
+            return cls.from_str(
+                str(obj),
+                default_scheme=default_scheme,
+                decode=decode,
+                normalize=normalize
+            )
 
         if isinstance(obj, Path):
-            scheme, path = _pathlike_to_file_parts(obj)
-            return cls.parse_dict(
-                {"scheme": default_scheme or scheme, "path": path},
+            return cls.from_pathlib(
+                obj,
+                default_scheme=default_scheme,
                 decode=decode,
                 normalize=normalize,
             )
 
-        if obj is None:
-            raise ValueError("Cannot parse URL from None")
+        if isinstance(obj, Mapping):
+            return cls.from_dict(obj, decode=decode, normalize=normalize)
 
-        return cls.parse_str(
+        if obj is None:
+            if default is ...:
+                raise ValueError("Cannot parse URL from None")
+            return default
+
+        bio = bytes_io_class()
+        if isinstance(obj, bio):
+            return cls.from_(
+                obj.url,
+                default_scheme=default_scheme, decode=decode, normalize=normalize
+            )
+
+        return cls.from_str(
             str(obj),
             default_scheme=default_scheme,
             decode=decode,
@@ -250,7 +621,73 @@ class URL:
         )
 
     @classmethod
-    def parse_str(
+    def from_memory_address(cls, obj: object) -> "URL":
+        """Build a ``mem://<hex_addr>`` URL pointing at ``obj``.
+
+        Encodes ``id(obj)`` so the URL can round-trip through code
+        paths that expect a string or :class:`URL` (cache keys,
+        MediaIO dispatch, pipeline configs). The returned URL is a
+        *handle*, not a persistent reference: it is valid only within
+        this process and only while the caller holds a strong
+        reference to ``obj``.
+
+        Lifetime contract:
+
+        - **Same-process, same-interpreter only.** No pickling, no
+          cross-process transport, no persistence across restarts.
+        - **Caller owns the reference.** This constructor does NOT
+          take a reference to ``obj``. If ``obj`` is garbage-collected
+          before :meth:`resolve_memory_address` runs, the address will
+          be reused and resolution returns a different object — or
+          crashes the interpreter if the slot was freed.
+
+        See :meth:`resolve_memory_address` for round-trip retrieval and
+        :attr:`is_memory_address` for dispatch-site predicates.
+
+        Implementation: the rendered path has a leading ``/`` so it is
+        a well-formed rooted URL path and bypasses
+        :func:`_normalize_path`'s empty-path coercion. Constructed
+        directly through ``cls(...)`` rather than :meth:`from_dict`
+        because there is nothing to normalize on a hex address — the
+        full :func:`_normalize_components` pipeline would be wasted
+        work and is in fact unsafe (we don't want anyone deciding to
+        ``realpath`` a hex string later).
+        """
+        address = id(obj)
+        return cls(
+            scheme=_MEMORY_SCHEME,
+            path="/" + _format_memory_address(address),
+        )
+
+    @classmethod
+    def is_pathish(cls, obj: Any) -> bool:
+        """Return True when *obj* is something :meth:`from_` can resolve
+        without resorting to the ``str(obj)`` fallback.
+
+        Accepts: :class:`URL` instances, :class:`str`, :class:`pathlib.Path`
+        (and any :class:`os.PathLike`), :class:`Mapping` (handled by
+        :meth:`from_dict`), and objects that expose a ``.url`` attribute
+        (the duck-typed fallback in :meth:`from_`).
+
+        Rejects ``None`` — :meth:`from_` raises on ``None``, so it is
+        not pathish. Arbitrary objects without any of the above shapes
+        also return False: :meth:`from_` would coerce them via
+        ``str(obj)`` and produce nonsense, so calling ``is_pathish``
+        first is the right guard.
+
+        This mirrors the ``is_pathish`` protocol used elsewhere in the
+        codebase (``path_class().is_pathish`` in ``MimeType.from_``,
+        ``MediaType.from_``), so ``URL`` can participate in the same
+        dispatch shape.
+        """
+        if obj is None:
+            return False
+        if isinstance(obj, (cls, str, Path, os.PathLike, Mapping)):
+            return True
+        return hasattr(obj, "url")
+
+    @classmethod
+    def from_str(
         cls,
         raw: str,
         *,
@@ -263,14 +700,22 @@ class URL:
 
         scheme = split.scheme
 
-        # A single-letter "scheme" is a Windows drive letter (e.g. C:/path).
-        # Treat it as no scheme and let the caller's default_scheme take over.
+        path = _decode_maybe(split.path, decode)
+
+        # A single-letter "scheme" is a Windows drive letter (e.g. C:/path
+        # or C:\path). Reattach the drive to the path, normalize backslash
+        # separators inside this branch, and force the file scheme so
+        # ``URL.from_str("C:\\foo")`` matches ``URL.from_(Path("C:\\foo"))``.
         if scheme and len(scheme) == 1 and scheme.isalpha():
-            scheme = ""
+            drive = scheme.upper()
+            rest = path.replace("\\", "/")
+            if not rest.startswith("/"):
+                rest = "/" + rest
+            path = f"/{drive}:{rest}"
+            scheme = "file"
 
         scheme = default_scheme or scheme
 
-        path = _decode_maybe(split.path, decode)
         query = _decode_maybe(split.query, decode)
         fragment = _decode_maybe(split.fragment, decode)
 
@@ -307,7 +752,46 @@ class URL:
         )
 
     @classmethod
-    def parse_dict(
+    def from_pathlib(
+        cls,
+        path: Path | str,
+        *,
+        default_scheme: str | None = None,
+        decode: bool = False,
+        normalize: bool = True,
+    ) -> URL:
+        """Build a URL from a ``pathlib.Path`` (or a string path).
+
+        Expands ``~``, resolves to an absolute posix path, and prepends a
+        leading slash to Windows drive-letter paths so ``C:/Users/x``
+        becomes ``/C:/Users/x`` — the form file URLs use. Passing a
+        string goes through ``Path`` first, so ``from_pathlib("~/data.csv")``
+        and ``from_pathlib(Path("~/data.csv"))`` produce equal URLs.
+
+        Use ``from_str`` instead if the input is already a URL string
+        (``file:///...``) — this method treats its input as a filesystem
+        path, not a URL.
+        """
+        if not isinstance(path, Path):
+            path = Path(path)
+
+        resolved = path.expanduser().resolve(strict=False).as_posix()
+
+        # Windows drive path must be /C:/... in file URLs. `as_posix()`
+        # yields "C:/Users/x" on Windows; we need "/C:/Users/x".
+        if len(resolved) >= 2 and resolved[1] == ":":
+            resolved = "/" + resolved
+
+        scheme = default_scheme or "file"
+
+        return cls.from_dict(
+            {"scheme": scheme, "path": resolved},
+            decode=decode,
+            normalize=normalize,
+        )
+
+    @classmethod
+    def from_dict(
         cls,
         data: Mapping[str, Any],
         *,
@@ -319,7 +803,7 @@ class URL:
 
         raw = data.get("url") or data.get("raw")
         if raw is not None:
-            return cls.parse_str(str(raw), decode=decode, normalize=normalize)
+            return cls.from_str(str(raw), decode=decode, normalize=normalize)
 
         scheme = str(data.get("scheme") or "")
         path = str(data.get("path") or "")
@@ -380,10 +864,203 @@ class URL:
     def __repr__(self):
         return f"URL({self.to_string()!r})"
 
+    def __fspath__(self) -> str:
+        """Return a filesystem-style string so :class:`URL` satisfies
+        :class:`os.PathLike`.
+
+        Rule: when the scheme is ``file`` or empty (bare path), return
+        the path component with the Windows drive-letter fix-up applied
+        (``/C:/Users/x`` → ``C:/Users/x``) so ``open(url)`` works the
+        same as ``open(url.to_pathlib())``. For any other scheme return
+        the raw :attr:`path`.
+
+        Callers that want the whole URL as a string — including scheme,
+        host, query, fragment — should use :func:`str` or
+        :meth:`to_string` explicitly. ``os.fspath`` is about filesystem
+        paths, and a full ``https://…`` string is not one.
+
+        Unlike :meth:`to_pathlib`, this method does not raise on an
+        empty path or on extra URL components; the ``os.fspath`` contract
+        is that it should return a string for anything registered as
+        ``PathLike``. An empty path yields an empty string.
+        """
+        if self.scheme in ("", "file"):
+            return _strip_windows_drive_slash(self.path)
+        return self.path
+
     def __truediv__(self, other: object) -> URL:
-        if not isinstance(other, str):
-            raise ValueError(f"Cannot join {self} with {type(other)}")
-        return self.with_path(other)
+        """``url / seg`` is shorthand for :meth:`joinpath`.
+
+        Semantics changed from earlier versions: previously this
+        *replaced* the path (``URL("/a") / "b"`` → ``/b``), which
+        contradicted the method name and every other URL/path
+        library. It now *joins*, matching :class:`pathlib.PurePath`:
+        ``URL("/a") / "b"`` → ``/a/b``.
+        """
+        return self.joinpath(other)
+
+    def joinpath(self, *segments: Any) -> URL:
+        """Append one or more path segments, pathlib-style.
+
+        ``URL("https://e.com/a").joinpath("b", "c")`` → ``https://e.com/a/b/c``.
+        Scheme, host, userinfo, port, query, and fragment are carried
+        over from ``self`` — only the path changes.
+
+        Semantics match :class:`pathlib.PurePosixPath.joinpath`:
+
+        - A segment starting with ``/`` is treated as absolute and
+          resets the accumulated path::
+
+                URL("/a/b").joinpath("/c")  →  URL("/c")
+
+        - ``..`` is NOT resolved implicitly. ``URL("/a/b").joinpath("..")``
+          yields ``/a/b/..``. If you want lexical resolution, run the
+          result through :meth:`with_path(..., os_find=True)` or handle
+          it at the call site — URL stays syntactic by default.
+
+        - URL-valued segments contribute only their :attr:`path`. Use
+          :meth:`join` instead for RFC 3986 reference resolution (which
+          honours scheme/host on the RHS).
+
+        - Accepts :class:`str`, :class:`URL`, or any :class:`os.PathLike`.
+          Anything else raises :class:`TypeError` — ``url / 42`` is
+          almost certainly a bug.
+
+        Trailing slashes on ``self.path`` are preserved by
+        :class:`PurePosixPath` semantics: ``/a/b/`` joined with ``c``
+        gives ``/a/b/c``.
+        """
+        if not segments:
+            return self
+
+        base = PurePosixPath(self.path) if self.path else PurePosixPath("/")
+        joined = base.joinpath(*(_join_segment(s) for s in segments))
+        return self._replace(path=str(joined))
+
+    # ------------------------------------------------------------------
+    # Pattern matching and relative-path queries
+    # ------------------------------------------------------------------
+
+    def match_pattern(self, pattern: str) -> bool:
+        """Glob-match against :attr:`name`, then against the full URL.
+
+        Returns ``True`` on either hit. The basename is checked first
+        because ``*.csv``-style filters are the common case and the
+        full URL rendering can be expensive on remote backends (forces
+        :meth:`to_string`). Uses :func:`fnmatch.fnmatch`, so the
+        pattern syntax is shell-style: ``*``, ``?``, ``[abc]``,
+        ``[!abc]``.
+
+        The full rendering is the encoded URL string (scheme + host +
+        path + query + fragment), so patterns like
+        ``"https://*.com/data/*"`` work.
+        """
+        if fnmatch.fnmatch(self.name, pattern):
+            return True
+        return fnmatch.fnmatch(self.to_string(), pattern)
+
+    def matches_patterns(self, patterns: Iterable[str] | None) -> bool:
+        """Glob-match against any pattern in *patterns*.
+
+        ``None`` or an empty iterable returns ``False`` — "no patterns"
+        means "no matches", not "everything matches". Callers that want
+        the "include everything when no filter" behaviour should guard
+        at the call site (``if not patterns or url.matches_patterns(patterns)``).
+
+        Basename is checked against every pattern first before the
+        full URL rendering is considered, since :attr:`name` is cheap
+        and ``*.ext``-style filters are the common case.
+        """
+        if patterns is None:
+            return False
+
+        # Materialize once — a generator would be exhausted by the
+        # first loop and silently skip the full-URL pass.
+        pats = patterns if isinstance(patterns, (tuple, list)) else tuple(patterns)
+        if not pats:
+            return False
+
+        name = self.name
+        for pat in pats:
+            if fnmatch.fnmatch(name, pat):
+                return True
+
+        full = self.to_string()
+        for pat in pats:
+            if fnmatch.fnmatch(full, pat):
+                return True
+
+        return False
+
+    def is_relative_to(self, other: Any) -> bool:
+        """True when ``self.path`` is equal to or below ``other.path``.
+
+        Semantics follow :meth:`pathlib.PurePath.is_relative_to` at
+        the path level, with an extra URL-aware constraint: when
+        ``other`` is a fully-qualified URL (has scheme or host), its
+        scheme and host must match ``self``'s. A file under one
+        authority is never "relative to" a file under a different
+        authority.
+
+        ``other`` is coerced via :meth:`from_` so strings, dicts,
+        :class:`Path` instances, and bare URLs all work::
+
+            URL("https://e.com/a/b").is_relative_to("/a")          # True
+            URL("https://e.com/a/b").is_relative_to("https://e.com/a")  # True
+            URL("https://e.com/a/b").is_relative_to("https://other.com/a")  # False
+            URL("https://e.com/a").is_relative_to("https://e.com/a/b")  # False
+        """
+        try:
+            other_url = self.from_(other)
+        except (ValueError, TypeError):
+            return False
+
+        # Authority check: if `other` carries a scheme or host, they
+        # must match `self`'s. A bare path ``/a`` relative check
+        # ignores authority.
+        if other_url.scheme and other_url.scheme != self.scheme:
+            return False
+        if other_url.host and other_url.host != self.host:
+            return False
+
+        # Lean on PurePosixPath for the path-level check so trailing
+        # slashes, roots, and normalization behave correctly.
+        self_path = PurePosixPath(self.path or "/")
+        other_path = PurePosixPath(other_url.path or "/")
+        return self_path.is_relative_to(other_path)
+
+    def relative_to(self, other: Any) -> URL:
+        """Return a URL whose path is ``self.path`` re-rooted under ``other``.
+
+        Raises :class:`ValueError` when ``self`` is not under ``other``
+        (check with :meth:`is_relative_to` first if the relationship
+        is unknown).
+
+        The returned URL keeps ``self``'s scheme/host/userinfo/port/
+        query/fragment — only the path changes. The new path is the
+        relative tail, with a leading ``/`` so it remains a well-formed
+        URL path (a URL path without a leading slash is ambiguous with
+        ``urllib.parse``). An exact match ``self == other`` yields a
+        path of ``"/"``.
+        """
+        other_url = self.from_(other)
+
+        if not self.is_relative_to(other_url):
+            raise ValueError(
+                f"{self.to_string()!r} is not relative to {other_url.to_string()!r}. "
+                "Use is_relative_to() to test the relationship first."
+            )
+
+        self_path = PurePosixPath(self.path or "/")
+        other_path = PurePosixPath(other_url.path or "/")
+        tail = self_path.relative_to(other_path)
+
+        # PurePosixPath.relative_to returns a relative path (no leading
+        # slash); URL paths should be rooted, so prepend "/". A pure
+        # "." (same directory) collapses to "/".
+        tail_str = str(tail)
+        new_path = "/" if tail_str in (".", "") else "/" + tail_str
+        return self._replace(path=new_path)
 
     def _replace(self, **changes: Any) -> URL:
         return replace(self, **changes)
@@ -487,15 +1164,87 @@ class URL:
 
         return authority
 
+    def to_pathlib(self, *, strict: bool = True) -> Path:
+        """Convert this URL to a ``pathlib.Path``.
+
+        The inverse of ``from_pathlib``: strips the leading slash from
+        Windows drive-letter paths so ``/C:/Users/x`` → ``C:/Users/x``,
+        then hands the result to ``Path``. Does **not** re-resolve or
+        expand ``~`` — the round-trip ``URL.from_pathlib(p).to_pathlib()``
+        gives an already-absolute ``Path``, and calling ``.resolve()`` on
+        an already-resolved path would force unwanted filesystem I/O
+        (e.g. following symlinks). Callers who want the resolved form
+        can call ``.resolve()`` on the returned ``Path`` themselves.
+
+        By default only the ``file`` scheme is accepted and the URL must
+        not carry a query, fragment, host, userinfo, or port — converting
+        those to a ``Path`` would silently drop data. Pass ``strict=False``
+        to relax both checks: any scheme is accepted and extra URL
+        components are ignored. Use that mode only when you've already
+        validated the URL shape elsewhere.
+
+        Raises:
+            ValueError: if the URL's path is empty, or (when ``strict``)
+                if the scheme is not ``file`` or extra components are
+                present.
+
+        Platform note: on Linux, ``Path("C:/x")`` yields a ``PosixPath``
+        that treats ``C:`` as a directory name — a ``file:///C:/x`` URL
+        can only round-trip correctly on Windows. This matches how
+        ``from_pathlib`` was specified.
+        """
+        if strict:
+            if self.scheme and self.scheme != "file":
+                raise ValueError(
+                    f"to_pathlib requires scheme='file' (got {self.scheme!r}); "
+                    f"pass strict=False to coerce any scheme"
+                )
+            extras = [
+                name
+                for name, value in (
+                    ("query", self.query),
+                    ("fragment", self.fragment),
+                    ("host", self.host or None),
+                    ("userinfo", self.userinfo),
+                    ("port", self.port),
+                )
+                if value
+            ]
+            if extras:
+                raise ValueError(
+                    f"to_pathlib cannot represent URL components "
+                    f"{extras} as a filesystem path; pass strict=False to drop them"
+                )
+
+        raw = self.path
+        if not raw or raw == "/":
+            raise ValueError(
+                f"Cannot convert URL with empty path to Path: {self.to_string(encode=False)!r}"
+            )
+
+        return Path(_strip_windows_drive_slash(raw))
+
     def join(self, ref: str | URL) -> URL:
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
-        return URL.parse_str(urljoin(base, target), normalize=True)
+        return URL.from_str(urljoin(base, target), normalize=True)
 
-    def with_scheme(self, scheme: str | None) -> URL:
+    def with_scheme(self, scheme: str | None, inplace: bool = False) -> URL:
         scheme_text = _lower_if(_s(scheme))
         port = _remove_default_port(scheme_text, _strip_trailing_dot(_lower_if(self.host)), _p(self.port))
-        return self._replace(scheme=scheme_text, port=port or None)
+        # ``port`` is the int sentinel (0 for "no port"); normalize to None
+        # so equality with constructor-built URLs holds.
+        port_attr = port or None
+
+        if inplace:
+            object.__setattr__(self, "scheme", scheme_text)
+            object.__setattr__(self, "port", port_attr)
+            # Invalidate cached renderings — the scheme just changed.
+            object.__setattr__(self, "_str_enc", None)
+            object.__setattr__(self, "_str_raw", None)
+            return self
+        else:
+            return self._replace(scheme=scheme_text, port=port_attr)
 
     def with_userinfo(self, userinfo: str | None) -> URL:
         return self._replace(userinfo=userinfo or None)
@@ -595,137 +1344,10 @@ class URL:
 
         return self
 
-
-class URLResource(ABC):
-    @classmethod
-    @abstractmethod
-    def url_scheme(cls) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    def to_url(self, scheme: str | None = None) -> URL:
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def from_parsed_url(cls: Type[T], url: URL) -> T:
-        raise NotImplementedError
-
-    @classmethod
-    def from_url(cls: Type[T], url: URL | str | Any) -> T:
-        default_scheme = None if cls is URLResource else cls.url_scheme()
-        parsed = URL.parse(url, default_scheme=default_scheme)
-        scheme = parsed.scheme.strip().lower()
-
-        if cls is URLResource:
-            if not scheme:
-                raise ValueError(
-                    "Cannot dispatch URLResource.from_url() without a scheme. "
-                    f"Got url={parsed.to_string(encode=False)!r}"
-                )
-
-            impl = _REGISTRY.get(scheme)
-            if impl is None:
-                registered = ", ".join(registered_url_schemes()) or "(none)"
-                raise ValueError(
-                    f"No URLResource registered for scheme {scheme!r}. "
-                    f"Registered schemes: {registered}"
-                )
-
-            return impl.from_parsed_url(parsed)  # type: ignore[return-value]
-
-        return cls.from_parsed_url(parsed)
-
-
-def get_registered_url_resource(scheme: str) -> Type["URLResource"] | None:
-    return _REGISTRY.get((scheme or "").strip().lower())
-
-
-def registered_url_schemes() -> tuple[str, ...]:
-    return tuple(sorted(_REGISTRY))
-
-
-def url_resource_class(cls: Type[T] | None = None):
-    def decorator(resource_cls: Type[T]) -> Type[T]:
-        return register_url_resource(resource_cls)
-
-    return decorator if cls is None else decorator(cls)
-
-
-def register_url_resource(resource_cls: Type[T]) -> Type[T]:
-    if not issubclass(resource_cls, URLResource):
-        raise TypeError(f"Can only register URLResource subclasses, got {resource_cls!r}")
-
-    scheme = resource_cls.url_scheme().strip().lower()
-    if not scheme:
-        raise ValueError(f"{resource_cls.__name__}.url_scheme() must return a non-empty scheme")
-
-    _REGISTRY[scheme] = resource_cls
-    return resource_cls
-
-
-@url_resource_class
-@dataclass(frozen=True, slots=True)
-class FileResource(URLResource):
-    path: Path
-
-    @classmethod
-    def url_scheme(cls) -> str:
-        return "file"
-
-    def to_url(self, scheme: str | None = None) -> URL:
-        target_scheme = (scheme or self.url_scheme()).strip().lower()
-        if target_scheme != "file":
-            raise ValueError(f"{self.__class__.__name__} only supports the 'file' scheme, got {target_scheme!r}")
-
-        normalized = self.path.expanduser().resolve(strict=False).as_posix()
-
-        # Windows drive path must be /C:/... in file URLs
-        if len(normalized) >= 2 and normalized[1] == ":":
-            normalized = "/" + normalized
-
-        return URL(
-            scheme="file",
-            path=normalized,
-        )
-
-    @classmethod
-    def from_parsed_url(cls: Type["FileResource"], url: URL) -> "FileResource":
-        raw_path = url.path or ""
-        if not raw_path:
-            raise ValueError("File URL is missing a path")
-
-        path_str = raw_path
-
-        # file:///C:/x -> Path("C:/x") on Windows-style input
-        if len(path_str) >= 3 and path_str[0] == "/" and path_str[2] == ":":
-            path_str = path_str[1:]
-
-        return cls(path=Path(path_str).expanduser().resolve(strict=False))
-
-    @classmethod
-    def from_path(cls, value: str | Path) -> "FileResource":
-        return cls(path=Path(value).expanduser().resolve(strict=False))
-
-    @property
-    def name(self) -> str:
-        return self.path.name
-
-    @property
-    def suffix(self) -> str:
-        return self.path.suffix
-
-    @property
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def joinpath(self, *parts: str) -> "FileResource":
-        return FileResource(self.path.joinpath(*parts).resolve(strict=False))
-
-    def __truediv__(self, other: str) -> "FileResource":
-        if not isinstance(other, str):
-            raise ValueError(f"Cannot join {self} with {type(other)}")
-        return self.joinpath(other)
+    def endswith(self, value: str):
+        if value and self.path:
+            return self.path.endswith(value)
+        return False
 
 
 _EMPTY_URL = URL()

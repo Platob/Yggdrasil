@@ -100,7 +100,7 @@ def _py_filter_tuple(python_version: Union[str, tuple[int, ...]]) -> tuple[int, 
     return int(python_version[0]), int(python_version[1])
 
 
-@dataclass(frozen=True)
+@dataclass
 class Compute(DatabricksService):
 
     @property
@@ -113,7 +113,7 @@ class Compute(DatabricksService):
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class Clusters(DatabricksService):
 
     # ------------------------------------------------------------------ #

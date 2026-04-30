@@ -2,11 +2,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, ClassVar, IO, Mapping, Union
+from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterator
 
 __all__ = ["MimeType", "MimeTypes"]
 
+from yggdrasil.lazy_imports import path_class, bytes_io_class
+
 MagicMatcher = Callable[[bytes], bool]
+
+
+# ----------------------------
+# Default-handling sentinel
+# ----------------------------
+# ``...`` (Ellipsis) as the module-level sentinel for "no default was
+# supplied; raise on miss." Mirrors :meth:`dict.pop` semantics — a
+# passed ``None`` is a valid fallback (caller wants a soft miss), but
+# omitting the argument altogether signals "I want to know about
+# resolution failures."
+#
+# Exposed as :data:`_RAISE` so callers who want to make the raise
+# explicit can pass it literally: ``MimeType.from_(x, default=_RAISE)``
+# is equivalent to leaving it out.
+_RAISE = ...
+
+
+def _miss(default: Any, reason: str) -> Any:
+    """Central miss handler — either returns *default* or raises.
+
+    Every ``from_*`` failure path routes through here so the sentinel
+    check lives in one place. When *default* is the ``...`` sentinel,
+    raises :class:`ValueError` with *reason*. Otherwise returns the
+    default as-is (including ``None``, an explicit MimeType, or any
+    other value the caller chose).
+    """
+    if default is _RAISE:
+        raise ValueError(f"MimeType resolution failed: {reason}")
+    return default
 
 
 # ----------------------------
@@ -65,6 +96,10 @@ class MimeType:
 
         return mt
 
+    @property
+    def is_any_bytes(self):
+        return self.value == MimeTypes.OCTET_STREAM.value
+
     def __str__(self) -> str:
         return self.value
 
@@ -73,6 +108,12 @@ class MimeType:
 
     @classmethod
     def get(cls, value: object) -> "MimeType | None":
+        """Pure lookup — never raises. Returns ``None`` on miss.
+
+        Kept as the low-level "resolve by name/value" entry point:
+        :meth:`from_` / :meth:`from_str` / :meth:`from_magic` layer
+        the default-handling contract on top.
+        """
         if not isinstance(value, str):
             return None
 
@@ -86,36 +127,205 @@ class MimeType:
         if hit is not None:
             return hit
 
-        for prefix in ("application/", "text/", "image/", "audio/", "video/"):
+        for prefix in (
+            "application/", "text/", "image/", "audio/", "video/",
+            "inode/"
+        ):
             if s.startswith(prefix):
                 return cls._BY_NAME.get(s[len(prefix):])
 
         return None
 
+    # ------------------------------------------------------------------
+    # Default-handling contract (shared by from_, from_magic, from_str)
+    # ------------------------------------------------------------------
+    # All three public parse entry points use the same sentinel:
+    #
+    # - ``default`` **omitted** → raise :class:`ValueError` on miss.
+    # - ``default=None`` → return ``None`` on miss.
+    # - ``default=<MimeType>`` → return that on miss.
+    #
+    # Mirrors :meth:`dict.pop`: the absent / present distinction gives
+    # callers a way to opt into strict mode without the awkwardness of
+    # ``MaybeNone | MimeType`` return types at every call site.
+    # ------------------------------------------------------------------
+
     @classmethod
-    def parse(cls, obj: Any, default: "MimeType | None" = None) -> "MimeType | None":
+    def parse_many(cls, obj: Any) -> list["MimeType"]:
+        """Resolve *obj* to a flat, deduped list of :class:`MimeType`.
+
+        Accepts anything :meth:`from_` accepts, plus:
+
+        - iterables (list, tuple, set, generator) of any supported input
+        - Accept-header strings: ``"application/json, text/csv;q=0.8"``
+        - composite ``format+codec`` strings: ``"application/csv+gzip"``,
+          ``"parquet+zstd"``, ``"trades.parquet.zst"``
+        - wildcard strings: ``"*/*"``, ``"text/*"``, ``"image/*"``
+        - ``None`` → ``[]``
+
+        Order: first-seen wins, deduped by identity. For composites, the
+        base format is emitted first, then the codec (codec wraps format).
+
+        Never raises on an unresolvable element — unknowns are dropped
+        silently. For strict per-element resolution, call :meth:`from_`.
+        """
+        seen: dict[int, "MimeType"] = {}
+
+        def emit(mt: "MimeType | None") -> None:
+            if mt is None:
+                return
+            seen.setdefault(id(mt), mt)
+
+        def resolve_scalar(token: str) -> "MimeType | None":
+            token = token.strip()
+            if not token:
+                return None
+            return cls.get(token) or cls.from_str(token, default=None)
+
+        def walk_str(s: str) -> None:
+            candidate = s.strip()
+            if not candidate:
+                return
+
+            # Accept-header split: "application/json, text/csv;q=0.8"
+            if "," in candidate:
+                for part in candidate.split(","):
+                    walk_str(part)
+                return
+
+            # Strip parameters: "text/csv; charset=utf-8; q=0.8"
+            if ";" in candidate:
+                candidate = candidate.split(";", 1)[0].strip()
+                if not candidate:
+                    return
+
+            lower = candidate.lower()
+
+            # Wildcards.
+            if lower in ("*/*", "*"):
+                emit(cls._BY_NAME.get("octet_stream"))
+                return
+            if lower.endswith("/*"):
+                prefix = lower[:-1]  # keep trailing '/'
+                for value, mt in cls._BY_VALUE.items():
+                    if value.startswith(prefix):
+                        emit(mt)
+                return
+
+            # Try full string first — keeps registered composites intact
+            # (PARQUET_DELTA = "application/vnd.apache.parquet+delta",
+            #  NDJSON = "application/ld+json").
+            mt = cls.get(candidate)
+            if mt is not None:
+                emit(mt)
+                return
+
+            # "format+codec" composite. Only accept the split if the tail
+            # actually names a codec — otherwise "application/ld+json"
+            # would split on '+' before _BY_VALUE caught it above.
+            if "+" in candidate:
+                base, _, codec = candidate.rpartition("+")
+                base_mt = resolve_scalar(base)
+                codec_mt = resolve_scalar(codec)
+                if codec_mt is not None and codec_mt.is_codec:
+                    if base_mt is not None:
+                        emit(base_mt)
+                    emit(codec_mt)
+                    return
+
+            # Dotted extension chain: "data.csv.gz", "trades.parquet.zst".
+            # If the last suffix is a codec and the penultimate is a known
+            # non-codec format, emit both in wrapping order.
+            if "." in candidate:
+                suffixes = [p.lstrip(".").lower() for p in Path(candidate).suffixes]
+                if len(suffixes) >= 2:
+                    tail = cls._EXT_MAP.get(suffixes[-1])
+                    base = cls._EXT_MAP.get(suffixes[-2])
+                    if (tail is not None and tail.is_codec
+                        and base is not None and not base.is_codec):
+                        emit(base)
+                        emit(tail)
+                        return
+
+            # Fallback: single-value resolution.
+            emit(cls.from_str(candidate, default=None))
+
+        def walk(x: Any) -> None:
+            if x is None:
+                return
+            if isinstance(x, cls):
+                emit(x)
+                return
+
+            # Iterables — but not scalars that happen to be iterable
+            # (str, bytes/bytearray/memoryview magic buffers, Path, IO).
+            if not isinstance(x, (str, bytes, bytearray, memoryview)):
+                _Path = path_class()
+                is_path = _Path.is_pathish(x)
+                is_io = hasattr(x, "read") and hasattr(x, "seek")
+                if not is_path and not is_io and isinstance(x, (list, tuple, set, frozenset, Iterable, Iterator)):
+                    try:
+                        for item in x:
+                            walk(item)
+                    except TypeError:
+                        pass
+                    else:
+                        return
+
+            if isinstance(x, str):
+                walk_str(x)
+                return
+
+            # bytes / IO / Path / PathLike — soft miss.
+            emit(cls.from_(x, default=None))
+
+        walk(obj)
+        return list(seen.values())
+
+    @classmethod
+    def from_(cls, obj: Any, default: "MimeType | None" = _RAISE) -> "MimeType | None":
         if isinstance(obj, cls):
             return obj
 
+        _Path = path_class()
+        if _Path.is_pathish(obj):
+            # ``Path.infer_media_type`` returns a MediaType (never None
+            # — it has its own default-handling), but its ``default``
+            # kwarg expects a MediaType or None, not our sentinel. Map
+            # the sentinel to None for the forwarded call, then check
+            # the result and route through _miss when it falls back to
+            # a default-ish value.
+            mt = _Path.from_(obj).infer_media_type(default=None)
+
+            if mt is not None:
+                return mt.mime_type
+
         if isinstance(obj, str):
-            return cls.parse_str(obj, default=default)
+            return cls.from_str(obj, default=default)
 
-        if isinstance(obj, Path):
-            return cls.parse_str(str(obj), default=default)
-
-        return cls.parse_magic(obj, default=default)
+        return cls.from_magic(obj, default=default)
 
     @classmethod
-    def parse_magic(
+    def from_magic(
         cls,
         magic: Union[bytes, bytearray, memoryview, IO[bytes], str, Path],
-        default: "MimeType | None" = None,
+        default: "MimeType | None" = _RAISE,
     ) -> "MimeType | None":
+        """Resolve by sniffing magic bytes from *magic*.
+
+        Accepts raw bytes/memoryview, a BytesIO, or anything the
+        buffer class can wrap. Reads the first 64 bytes and walks
+        the registered magic matchers in definition order.
+
+        :param default: see :class:`MimeType` class docstring for the
+            shared default-handling contract.
+        :raises ValueError: on a miss when *default* was not supplied.
+        """
         if not magic:
-            return default
+            return _miss(default, "empty magic buffer")
 
         if not isinstance(magic, (bytes, bytearray)):
-            from yggdrasil.io.buffer import BytesIO
+            BytesIO = bytes_io_class()
 
             if isinstance(magic, BytesIO):
                 magic = bytes(magic.head(64))
@@ -131,15 +341,30 @@ class MimeType:
                 except Exception:
                     continue
 
+        # Structural text-format sniffers for common non-magic formats.
         if magic.startswith(b"{") or magic.startswith(b"["):
             return MimeTypes.NDJSON if b"}\n{" in magic else MimeTypes.JSON
         if magic.startswith(b"<"):
             return MimeTypes.XML
 
-        return default
+        return _miss(default, f"no magic match for {magic[:16]!r}")
 
     @classmethod
-    def parse_str(cls, value: str, default: "MimeType | None" = None) -> "MimeType | None":
+    def from_str(cls, value: str, default: "MimeType | None" = _RAISE) -> "MimeType | None":
+        """Resolve a :class:`str` — path-like, bare extension, or mime value.
+
+        Tries, in order:
+
+        - If the string looks path-like (contains ``.``, ``/``, or
+          ``\\``), take its suffix as an extension key.
+        - Strip leading dots and try the bare form as an extension key.
+        - Fall back to :meth:`get` (name / mime-value lookup).
+        - Structural sniff on leading ``{`` / ``[``.
+
+        :param default: see :class:`MimeType` class docstring for the
+            shared default-handling contract.
+        :raises ValueError: on a miss when *default* was not supplied.
+        """
         candidate = value.strip()
 
         if "." in candidate or "/" in candidate or "\\" in candidate:
@@ -162,7 +387,18 @@ class MimeType:
         if candidate.startswith("{") or candidate.startswith("["):
             return MimeTypes.NDJSON if "\n{" in candidate else MimeTypes.JSON
 
-        return default
+        return _miss(default, f"no match for {value!r}")
+
+    # ------------------------------------------------------------------
+    # Extension-map mutators
+    # ------------------------------------------------------------------
+    # These call :meth:`from_str` internally to resolve string inputs
+    # to a MimeType. We pass ``default=None`` explicitly so the old
+    # None-on-miss cascade (``cls.get(mime) or cls.from_str(mime)``)
+    # keeps working — these mutators want to raise their OWN error
+    # messages ("did not resolve to a known MimeType"), not inherit
+    # the generic one from _miss.
+    # ------------------------------------------------------------------
 
     @classmethod
     def register_extension(
@@ -177,7 +413,7 @@ class MimeType:
         if isinstance(mime, MimeType):
             resolved = mime
         else:
-            resolved = cls.get(mime) or cls.parse_str(mime)
+            resolved = cls.get(mime) or cls.from_str(mime, default=None)
 
         if resolved is None:
             raise ValueError(f"register_extension: {mime!r} does not resolve to a known MimeType")
@@ -205,7 +441,7 @@ class MimeType:
             if isinstance(mime, MimeType):
                 mt = mime
             else:
-                mt = cls.get(mime) or cls.parse_str(mime)
+                mt = cls.get(mime) or cls.from_str(mime, default=None)
 
             if mt is None:
                 raise ValueError(
@@ -228,7 +464,7 @@ class MimeType:
         if isinstance(mime, MimeType):
             target = mime
         else:
-            target = cls.get(mime) or cls.parse_str(mime)
+            target = cls.get(mime) or cls.from_str(mime, default=None)
 
         if target is None:
             return []
@@ -327,6 +563,16 @@ class MimeTypes:
             magics=(magic_prefix(b"PK\x03\x04"),),
         )
     )
+
+    ZIP_ENTRY = MimeType.define(
+        MimeType(
+            "ZIP_ENTRY",
+            "application/zip-entry",
+            extensions=("zipentry",),
+            magics=(magic_prefix(b"PK\x01\x02"),),
+        )
+    )
+
     PDF = MimeType.define(
         MimeType(
             "PDF",
@@ -390,15 +636,8 @@ class MimeTypes:
         MimeType(
             "ARROW_IPC",
             "application/vnd.apache.arrow.file",
-            extensions=("ipc", "feather"),
+            extensions=("ipc", "feather", "arrow", "arrows"),
             magics=(magic_prefix(b"ARROW1"),),
-        )
-    )
-    ARROW_IPC_STREAM = MimeType.define(
-        MimeType(
-            "ARROW_IPC_STREAM",
-            "application/vnd.apache.arrow.stream",
-            extensions=("arrow", "arrows"),
         )
     )
     ORC = MimeType.define(
@@ -518,6 +757,33 @@ class MimeTypes:
             "image/bmp",
             extensions=("bmp",),
             magics=(magic_prefix(b"BM"),),
+        )
+    )
+
+    # --- Filesystem containers ---
+    FOLDER = MimeType.define(
+        MimeType(
+            "FOLDER",
+            # `inode/directory` is what `file --mime-type` returns on
+            # Unix. Not IANA-registered but the de facto convention.
+            # No extensions (directories don't have them) and no magic
+            # (not a byte stream) — resolution goes through the
+            # path-class via is_dir_sink.
+            "inode/directory",
+        )
+    )
+
+    DATABRICKS_STATEMENT = MimeType.define(
+        MimeType(
+            "DATABRICKS_STATEMENT",
+            "application/vnd.databricks.statement",
+        )
+    )
+
+    SPARK_SQL_STATEMENT = MimeType.define(
+        MimeType(
+            "SPARK_SQL_STATEMENT",
+            "application/vnd.databricks.spark.sql",
         )
     )
 

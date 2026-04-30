@@ -28,7 +28,7 @@ def test_timeout_timedelta():
     ],
 )
 def test_check_arg_scalar_sets_timeout(arg, expected_timeout):
-    wc = WaitingConfig.check_arg(arg)
+    wc = WaitingConfig.from_(arg)
     assert isinstance(wc, WaitingConfig)
     assert wc.timeout == expected_timeout
     # other defaults in your check_arg() fallback path
@@ -39,14 +39,14 @@ def test_check_arg_scalar_sets_timeout(arg, expected_timeout):
 
 def test_check_arg_instance_returns_equivalent_config():
     wc0 = WaitingConfig(timeout=1.0, interval=3.0, backoff=2.0, max_interval=9.0)
-    wc = WaitingConfig.check_arg(wc0)
+    wc = WaitingConfig.from_(wc0)
     # your implementation returns a new instance; equality is what matters
     assert wc == wc0
     assert wc is wc0
 
 
 def test_check_arg_dict_timeout():
-    wc = WaitingConfig.check_arg({"timeout": 11, "interval": 0.5, "backoff": 2, "max_interval": 4})
+    wc = WaitingConfig.from_({"timeout": 11, "interval": 0.5, "backoff": 2, "max_interval": 4})
     assert wc.timeout == 11.0
     assert wc.interval == 0.5
     assert wc.backoff == 2.0
@@ -69,13 +69,13 @@ def test_check_arg_dict_deadline(monkeypatch):
     # IMPORTANT: create deadline as _FixedDT (since mod.dt.datetime is now _FixedDT)
     deadline = _FixedDT(2026, 1, 26, 12, 0, 10)
 
-    wc = WaitingConfig.check_arg({"deadline": deadline})
+    wc = WaitingConfig.from_({"deadline": deadline})
     assert wc.timeout == 10.0
 
 
 def test_check_arg_dict_deadline_and_timeout_raises():
     with pytest.raises(ValueError):
-        WaitingConfig.check_arg({"deadline": dt.datetime.now(), "timeout": 1})
+        WaitingConfig.from_({"deadline": dt.datetime.now(), "timeout": 1})
 
 
 @pytest.mark.parametrize(
@@ -89,7 +89,7 @@ def test_check_arg_dict_deadline_and_timeout_raises():
     ],
 )
 def test_check_arg_bool_is_treated_as_int_due_to_type_order(arg, expected_timeout):
-    wc = WaitingConfig.check_arg(arg)
+    wc = WaitingConfig.from_(arg)
     assert wc.timeout == expected_timeout
     assert wc.interval == 0.5
     assert wc.backoff == 1.5
@@ -97,14 +97,14 @@ def test_check_arg_bool_is_treated_as_int_due_to_type_order(arg, expected_timeou
 
 
 def test_check_arg_kwargs_override_arg():
-    wc = WaitingConfig.check_arg({"timeout": 10, "interval": 1}, timeout=3, max_interval=8)
+    wc = WaitingConfig.from_({"timeout": 10, "interval": 1}, timeout=3, max_interval=8)
     assert wc.timeout == 3.0
     assert wc.interval == 1.0
     assert wc.max_interval == 8.0
 
 
 def test_check_arg_negative_timeout_clamped():
-    wc = WaitingConfig.check_arg(timeout=-5)
+    wc = WaitingConfig.from_(timeout=-5)
     assert wc.timeout == 0.0
 
 

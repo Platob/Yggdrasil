@@ -6,13 +6,12 @@ import pyarrow as pa
 import pytest
 from databricks.sdk.service.catalog import (
     ColumnInfo as CatalogColumnInfo,
-    ForeignKeyConstraint,
     PrimaryKeyConstraint,
     TableConstraint,
 )
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
-from yggdrasil.data import Field
 
+from yggdrasil.data import Field
 from yggdrasil.databricks.sql.column import Column
 from yggdrasil.databricks.sql.sql_utils import _safe_constraint_name
 
@@ -327,132 +326,10 @@ def test_unset_primary_key_executes(column, table_constraints_api):
     ]
 
 
-def test_add_foreign_key_ddl(column, ref_table):
-    cname = _safe_constraint_name("trades", "trade_id", "books", "book_id", "fk")
-    query = column.add_foreign_key_ddl(
-        ref_table=ref_table,
-        ref_column="book_id",
-    )
-    assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        f"ADD CONSTRAINT `{cname}` "
-        "FOREIGN KEY (`trade_id`) "
-        "REFERENCES `main`.`refined`.`books` (`book_id`)"
-    )
-
-
-def test_add_foreign_key_ddl_with_options(column, ref_table, ref_column):
-    query = column.add_foreign_key_ddl(
-        ref_table=ref_table,
-        ref_column=ref_column,
-        constraint_name="fk trades book",
-        rely=True,
-        match_full=True,
-        on_update_no_action=True,
-        on_delete_no_action=True,
-    )
-    assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        f"ADD CONSTRAINT `{_safe_constraint_name('fk trades book')}` "
-        "FOREIGN KEY (`trade_id`) "
-        "REFERENCES `main`.`refined`.`books` (`book_id`) "
-        "RELY MATCH FULL ON UPDATE NO ACTION ON DELETE NO ACTION"
-    )
-
-
-def test_set_foreign_key_executes(column, ref_table, table_constraints_api):
-    cname = _safe_constraint_name(
-        "trades", "trade_id", "main.refined.books", "book_id", "fk",
-    )
-    result = column.set_foreign_key(
-        ref_table=ref_table,
-        ref_column="book_id",
-        rely=True,
-    )
-    assert result is column
-    assert len(table_constraints_api.created) == 1
-    full_name, constraint = table_constraints_api.created[0]
-    assert full_name == "main.analytics.trades"
-    fk = constraint.foreign_key_constraint
-    assert fk is not None
-    assert fk.name == cname
-    assert fk.child_columns == ["trade_id"]
-    assert fk.parent_table == "main.refined.books"
-    assert fk.parent_columns == ["book_id"]
-    assert fk.rely is True
-
-
-def test_drop_foreign_key_ddl_default(column):
-    query = column.drop_foreign_key_ddl()
-    assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` "
-        "DROP FOREIGN KEY IF EXISTS (`trade_id`)"
-    )
-
-
-def test_drop_foreign_key_ddl_variation(column):
-    query = column.drop_foreign_key_ddl(if_exists=False)
-    assert query == (
-        "ALTER TABLE `main`.`analytics`.`trades` " "DROP FOREIGN KEY (`trade_id`)"
-    )
-
-
-def test_unset_foreign_key_executes(column, table_constraints_api):
-    column.table.infos.table_constraints = [
-        TableConstraint(
-            foreign_key_constraint=ForeignKeyConstraint(
-                name="trades_trade_id_books_book_id_fk",
-                child_columns=["trade_id"],
-                parent_table="main.refined.books",
-                parent_columns=["book_id"],
-            ),
-        ),
-    ]
-    result = column.unset_foreign_key(if_exists=False)
-    assert result is column
-    assert table_constraints_api.deleted == [
-        ("main.analytics.trades", "trades_trade_id_books_book_id_fk", False),
-    ]
-
-
-def test_resolve_ref_args_with_column_object(column, ref_column, ref_table):
-    resolved_table, resolved_column = column._resolve_ref_args(ref_column, None, None)
-
-    assert resolved_table is ref_table
-    assert resolved_column is ref_column
-
-
-def test_resolve_ref_args_with_ref_table_string(column):
-    resolved_ref_table = SimpleNamespace(name="books")
-    column.table.client.tables.find_table = lambda **kwargs: resolved_ref_table
-
-    resolved_table, resolved_column = column._resolve_ref_args(
-        None,
-        "main.refined.books",
-        "book_id",
-    )
-
-    assert resolved_table is resolved_ref_table
-    assert resolved_column == "book_id"
-
-
 def test_resolve_ref_args_defaults_to_self_table(column):
     resolved_table, resolved_column = column._resolve_ref_args(None, None, "trade_id")
     assert resolved_table is column.table
     assert resolved_column == "trade_id"
-
-
-def test_resolve_ref_args_with_string_column(column, ref_table):
-    column.table.client.tables.find_table = lambda **kwargs: ref_table
-
-    resolved_table, resolved_column = column._resolve_ref_args(
-        "main.refined.books.book_id",
-        None,
-        None,
-    )
-
-    assert resolved_table is ref_table
-    assert resolved_column == "book_id"
 
 
 def test_from_api_sql_column_info(table):

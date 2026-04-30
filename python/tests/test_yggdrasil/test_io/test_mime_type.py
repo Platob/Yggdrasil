@@ -78,17 +78,17 @@ def test_get_non_string_returns_none():
     ],
 )
 def test_parse_str_extension_and_paths(inp: str, expected: MimeType):
-    assert MimeType.parse_str(inp) is expected
+    assert MimeType.from_str(inp) is expected
 
 
 def test_parse_str_json_literal_heuristic():
-    assert MimeType.parse_str('{"a":1}') is MimeTypes.JSON
-    assert MimeType.parse_str("   [1,2,3]") is MimeTypes.JSON
+    assert MimeType.from_str('{"a":1}') is MimeTypes.JSON
+    assert MimeType.from_str("   [1,2,3]") is MimeTypes.JSON
 
 
 def test_parse_str_default_when_unknown():
-    assert MimeType.parse_str("nope/nope", default=None) is None
-    assert MimeType.parse_str("nope/nope", default=MimeTypes.OCTET_STREAM) is MimeTypes.OCTET_STREAM
+    assert MimeType.from_str("nope/nope", default=None) is None
+    assert MimeType.from_str("nope/nope", default=MimeTypes.OCTET_STREAM) is MimeTypes.OCTET_STREAM
 
 
 # ----------------------------
@@ -126,12 +126,12 @@ def test_parse_str_default_when_unknown():
     ],
 )
 def test_parse_magic_strong(payload: bytes, expected: MimeType):
-    assert MimeType.parse_magic(payload) is expected
+    assert MimeType.from_magic(payload) is expected
 
 
 def test_parse_magic_default_when_unknown():
-    assert MimeType.parse_magic(b"\x00\x01\x02", default=None) is None
-    assert MimeType.parse_magic(b"\x00\x01\x02", default=MimeTypes.OCTET_STREAM) is MimeTypes.OCTET_STREAM
+    assert MimeType.from_magic(b"\x00\x01\x02", default=None) is None
+    assert MimeType.from_magic(b"\x00\x01\x02", default=MimeTypes.OCTET_STREAM) is MimeTypes.OCTET_STREAM
 
 
 # ----------------------------
@@ -139,13 +139,13 @@ def test_parse_magic_default_when_unknown():
 # ----------------------------
 
 def test_parse_dispatch_str_bytes_path_io():
-    assert MimeType.parse(".parquet") is MimeTypes.PARQUET
-    assert MimeType.parse(Path("/tmp/x.csv")) is MimeTypes.CSV
-    assert MimeType.parse(b"\x1f\x8b\x08\x00xxxx") is MimeTypes.GZIP
+    assert MimeType.from_(".parquet") is MimeTypes.PARQUET
+    assert MimeType.from_(Path("/tmp/x.csv")) is MimeTypes.CSV
+    assert MimeType.from_(b"\x1f\x8b\x08\x00xxxx") is MimeTypes.GZIP
 
     fh = io.BytesIO(b"PAR1" + b"x" * 100)
     pos = fh.tell()
-    mt = MimeType.parse(fh)
+    mt = MimeType.from_(fh)
     assert mt is MimeTypes.PARQUET
     assert fh.tell() == pos
 
@@ -182,7 +182,7 @@ def test_register_extension_overwrite_rules():
 
     # register
     MimeType.register_extension(ext, MimeTypes.JSON, overwrite=True)
-    assert MimeType.parse_str("." + ext) is MimeTypes.JSON
+    assert MimeType.from_str("." + ext) is MimeTypes.JSON
 
     # without overwrite should error
     with pytest.raises(KeyError):
@@ -190,7 +190,7 @@ def test_register_extension_overwrite_rules():
 
     # with overwrite should replace
     MimeType.register_extension(ext, MimeTypes.CSV, overwrite=True)
-    assert MimeType.parse_str(ext) is MimeTypes.CSV
+    assert MimeType.from_str(ext) is MimeTypes.CSV
 
 
 def test_register_extensions_atomicity_fail_fast():

@@ -20,7 +20,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
@@ -55,7 +55,7 @@ class Session(ABC):
 
     def __post_init__(self) -> None:
         if self.base_url:
-            self.base_url = URL.parse(self.base_url)
+            self.base_url = URL.from_(self.base_url)
         if self._lock is None:
             self._lock = threading.RLock()
         if self.pool_maxsize <= 0:
@@ -205,7 +205,7 @@ class Session(ABC):
         cache_cfg: CacheConfig,
         *,
         spark_session: Optional["SparkSession"] = None,
-        mode: Optional[SaveMode] = None,
+        mode: Optional[Mode] = None,
     ) -> None:
         if not response.ok:
             return
@@ -229,7 +229,7 @@ class Session(ABC):
         normalize: bool = True,
         waiting: WaitingConfigArg = True,
     ) -> "Session":
-        parsed = URL.parse(url, normalize=normalize)
+        parsed = URL.from_(url, normalize=normalize)
 
         if parsed.scheme.startswith("http"):
             from .http_ import HTTPSession
@@ -237,7 +237,7 @@ class Session(ABC):
             return HTTPSession(
                 base_url=parsed,
                 verify=verify,
-                waiting=WaitingConfig.check_arg(waiting) if waiting is not None else None,
+                waiting=WaitingConfig.from_(waiting) if waiting is not None else None,
             )
 
         raise ValueError(f"Cannot build session from scheme: {parsed.scheme!r}")
@@ -288,7 +288,7 @@ class Session(ABC):
         # --- 1. Check local cache first (fast, disk-based) ---
         local_filepath = None
         if effective_local_cfg.local_cache_enabled:
-            if effective_local_cfg.mode == SaveMode.UPSERT:
+            if effective_local_cfg.mode == Mode.UPSERT:
                 # Force-evict any stale local entry so the fresh response
                 # can be written in its place after the actual fetch.
                 local_filepath = effective_local_cfg.local_cache_file(
@@ -313,7 +313,7 @@ class Session(ABC):
         # Skip when the effective config demands a forced refresh (UPSERT).
         if (
             effective_remote_cfg.remote_cache_enabled
-            and effective_remote_cfg.mode == SaveMode.APPEND
+            and effective_remote_cfg.mode == Mode.APPEND
         ):
             remote_response = self._load_remote_cached_response(
                 request,
@@ -424,7 +424,7 @@ class Session(ABC):
             if local_cfg.local_cache_enabled:
                 for req in batch:
                     effective_local = req.local_cache_config or local_cfg
-                    if effective_local.mode == SaveMode.UPSERT:
+                    if effective_local.mode == Mode.UPSERT:
                         # Evict any stale local entry; the fresh response will
                         # be stored after the fetch.
                         evict_path = effective_local.local_cache_file(
@@ -460,11 +460,11 @@ class Session(ABC):
             # split them out before building any SQL lookup.
             upsert_reqs = [
                 r for r in after_local
-                if (r.remote_cache_config or remote_cfg).mode == SaveMode.UPSERT
+                if (r.remote_cache_config or remote_cfg).mode == Mode.UPSERT
             ]
             lookup_reqs = [
                 r for r in after_local
-                if (r.remote_cache_config or remote_cfg).mode != SaveMode.UPSERT
+                if (r.remote_cache_config or remote_cfg).mode != Mode.UPSERT
             ]
 
             # Group non-UPSERT requests by their effective remote cache table so
@@ -477,7 +477,7 @@ class Session(ABC):
 
             for req in lookup_reqs:
                 t_cfg = req.remote_cache_config or remote_cfg
-                if not t_cfg.remote_cache_enabled or t_cfg.mode != SaveMode.APPEND:
+                if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                     remote_misses.append(req)
                     continue
                 tkey = t_cfg.table.full_name(safe=True)
@@ -581,7 +581,7 @@ class Session(ABC):
                 # Use the pre-snapshotted URL → cfg map to recover the correct
                 # per-request config now that the copies no longer carry it.
                 table_write_groups: dict[
-                    tuple[str, SaveMode], tuple[CacheConfig, list[Response]]
+                    tuple[str, Mode], tuple[CacheConfig, list[Response]]
                 ] = {}
                 for r in to_insert:
                     req = r.request
@@ -600,7 +600,7 @@ class Session(ABC):
                 for (_, mode), (t_cfg, t_responses) in table_write_groups.items():
                     LOGGER.debug(
                         "%s %s responses in remote cache %s",
-                        "Upserting" if mode == SaveMode.UPSERT else "Persisting",
+                        "Upserting" if mode == Mode.UPSERT else "Persisting",
                         len(t_responses),
                         t_cfg.table,
                     )
@@ -735,7 +735,7 @@ class Session(ABC):
         # ------------------------------------------------------------------ #
         # Remote cache prefetch — only when a remote cache table is present.  #
         # ------------------------------------------------------------------ #
-        if remote_cfg.remote_cache_enabled and remote_cfg.mode == SaveMode.APPEND:
+        if remote_cfg.remote_cache_enabled and remote_cfg.mode == Mode.APPEND:
             # Materialise the full request list so we can run one SQL batch lookup
             # and compare request keys on the driver side.
             all_requests: list[PreparedRequest] = list(requests)
@@ -751,7 +751,7 @@ class Session(ABC):
             # UPSERT requests bypass the cache read entirely — split them up
             # front so they never enter any SQL lookup.
             def _is_remote_upsert(req: PreparedRequest) -> bool:
-                return (req.remote_cache_config or remote_cfg).mode == SaveMode.UPSERT
+                return (req.remote_cache_config or remote_cfg).mode == Mode.UPSERT
 
             upsert_requests = [r for r in all_requests if _is_remote_upsert(r)]
             lookup_pairs = [
@@ -770,7 +770,7 @@ class Session(ABC):
             table_to_pairs: dict[str, list[tuple[PreparedRequest, PreparedRequest]]] = {}
             for orig, anon in lookup_pairs:
                 t_cfg = orig.remote_cache_config or remote_cfg
-                if not t_cfg.remote_cache_enabled or t_cfg.mode != SaveMode.APPEND:
+                if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                     miss_requests.append(orig)
                     continue
                 tkey = t_cfg.table.full_name(safe=True)
@@ -1242,7 +1242,7 @@ class Session(ABC):
             raise ValueError("url is required when base_url is not set on the session.")
 
         if params:
-            parsed = URL.parse(full_url, normalize=normalize)
+            parsed = URL.from_(full_url, normalize=normalize)
             items = list(parsed.query_items(keep_blank_values=True))
             items.extend((key, value) for key, value in params.items())
             full_url = parsed.with_query_items(tuple(items))

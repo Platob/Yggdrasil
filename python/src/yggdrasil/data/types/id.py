@@ -21,11 +21,33 @@ class DataTypeId(IntEnum):
     BINARY = 10
     STRING = 11
 
-    ARRAY = 32
-    MAP = 33
-    STRUCT = 34
-    UNION = 35
+    DICTIONARY = 64
+    JSON = 65
+    ENUM = 66
+    UNION = 67
 
-    DICTIONARY = 65
-    JSON = 66
-    ENUM = 67
+    ARRAY = 100
+    MAP = 101
+    STRUCT = 102
+
+
+    @property
+    def is_primitive(self) -> bool:
+        return 0 < self.value < 32
+
+    @property
+    def is_extension(self) -> bool:
+        return 32 <= self.value < 100
+
+    @property
+    def is_any_or_null(self) -> bool:
+        return self.value <= 1
+
+    @property
+    def is_nested(self) -> bool:
+        return self.value >= 100
+
+    @property
+    def is_temporal(self) -> bool:
+        return self.value in (6, 7, 8, 9)
+

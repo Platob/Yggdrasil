@@ -229,7 +229,7 @@ def _restore_media_type(buf: BytesIO, metadata: Mapping[bytes, bytes] | None) ->
 
     c = None
     if codec_name:
-        c = Codec.parse(codec_name)
+        c = Codec.from_(codec_name)
         if c is None:
             return
 

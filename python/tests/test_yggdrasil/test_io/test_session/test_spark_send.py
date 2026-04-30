@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pyarrow as pa
 import pytest
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 from yggdrasil.io.send_config import CacheConfig
@@ -138,7 +138,7 @@ class TestSparkStructural:
     def test_upsert_requests_bypass_sql_lookup(self, spark, mock_session):
         req = make_request("https://example.com/upsert")
         table = make_table_mock()
-        req.remote_cache_config = make_cache_config(table, mode=SaveMode.UPSERT)
+        req.remote_cache_config = make_cache_config(table, mode=Mode.UPSERT)
 
         session_table = make_table_mock()
         result = mock_session.spark_send(

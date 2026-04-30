@@ -424,7 +424,7 @@ class TestDurationType:
 
 class TestArrayType:
     def _int_array(self) -> ArrayType:
-        return ArrayType.from_item_field(IntegerType().to_field(name="item"))
+        return ArrayType.from_item(IntegerType().to_field(name="item"))
 
     def test_json_str(self) -> None:
         assert self._int_array().convert_pyobj("[1, 2, 3]", nullable=True) == [1, 2, 3]

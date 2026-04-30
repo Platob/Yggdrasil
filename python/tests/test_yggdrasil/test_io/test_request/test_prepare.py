@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from yggdrasil.io import MimeTypes
+from yggdrasil.io.enums import MimeTypes
 from yggdrasil.io.request import PreparedRequest
 
 

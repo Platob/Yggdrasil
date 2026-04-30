@@ -34,7 +34,7 @@ print(dataclass_to_arrow_field(Event))
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "ts": ["2024-01-01", "2024-01-02"]})
 

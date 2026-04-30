@@ -33,7 +33,7 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
+from yggdrasil.io.enums.mode import ModeLike, Mode
 from .column import Column
 from .grants import GrantsMixin
 from .sql_utils import (
@@ -373,7 +373,7 @@ class View(GrantsMixin):
         self,
         query: str,
         *,
-        mode: SaveModeArg = None,
+        mode: ModeLike = None,
         or_replace: bool | None = None,
         if_not_exists: bool | None = None,
         columns: Iterable[str] | None = None,
@@ -387,18 +387,18 @@ class View(GrantsMixin):
         When neither ``or_replace`` nor ``if_not_exists`` is provided, they are
         derived from ``mode``:
 
-            * :data:`SaveMode.OVERWRITE` → ``or_replace=True``
-            * :data:`SaveMode.AUTO` / :data:`SaveMode.APPEND` / :data:`SaveMode.UPSERT`
-              / :data:`SaveMode.IGNORE` → ``if_not_exists=True``
-            * :data:`SaveMode.ERROR_IF_EXISTS` → plain ``CREATE VIEW``
+            * :data:`Mode.OVERWRITE` → ``or_replace=True``
+            * :data:`Mode.AUTO` / :data:`Mode.APPEND` / :data:`Mode.UPSERT`
+              / :data:`Mode.IGNORE` → ``if_not_exists=True``
+            * :data:`Mode.ERROR_IF_EXISTS` → plain ``CREATE VIEW``
         """
-        parsed_mode = SaveMode.parse(mode, SaveMode.AUTO)
+        parsed_mode = Mode.from_(mode, default=Mode.AUTO)
 
         if or_replace is None and if_not_exists is None:
-            if parsed_mode == SaveMode.OVERWRITE:
+            if parsed_mode == Mode.OVERWRITE:
                 or_replace = True
                 if_not_exists = False
-            elif parsed_mode == SaveMode.ERROR_IF_EXISTS:
+            elif parsed_mode == Mode.ERROR_IF_EXISTS:
                 or_replace = False
                 if_not_exists = False
             else:
@@ -445,7 +445,7 @@ class View(GrantsMixin):
     ) -> "View":
         return self.create(
             query,
-            mode=SaveMode.AUTO,
+            mode=Mode.AUTO,
             comment=comment,
             properties=properties,
             columns=columns,

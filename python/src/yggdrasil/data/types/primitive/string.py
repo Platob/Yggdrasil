@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import datetime as dt
+import decimal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import pyarrow as pa
+
+from ._helpers import _bytes_to_str
+from .base import PrimitiveType
+from ..id import DataTypeId
+from ..support import get_polars, get_spark_sql
+
+if TYPE_CHECKING:
+    import polars
+    import pyspark.sql.types as pst
+
+__all__ = ["StringType"]
+
+
+@dataclass(frozen=True, repr=False)
+class StringType(PrimitiveType):
+    large: bool = False
+    view: bool = False
+
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * (indent * level)
+        s = "large_string" if self.large else "string"
+        s = s + "_view" if self.view else s
+        return f"{pad}{s}"
+
+    @property
+    def type_id(self) -> DataTypeId:
+        return DataTypeId.STRING
+
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        return (
+            pa.types.is_string(dtype)
+            or pa.types.is_large_string(dtype)
+            or pa.types.is_string_view(dtype)
+        )
+
+    @classmethod
+    def from_arrow_type(cls, dtype: pa.DataType) -> "StringType":
+        if pa.types.is_string(dtype):
+            return cls(large=False, view=False)
+        if pa.types.is_large_string(dtype):
+            return cls(large=True, view=False)
+        if pa.types.is_string_view(dtype):
+            return cls(large=False, view=True)
+        raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+
+    @classmethod
+    def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
+        pl = get_polars()
+        return dtype == pl.String
+
+    @classmethod
+    def from_polars_type(cls, dtype: "polars.DataType") -> "StringType":
+        if not cls.handles_polars_type(dtype):
+            raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+        return cls()
+
+    @classmethod
+    def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
+        spark = get_spark_sql()
+        return isinstance(dtype, spark.types.StringType)
+
+    @classmethod
+    def from_spark_type(cls, dtype: "pst.DataType") -> "StringType":
+        if not cls.handles_spark_type(dtype):
+            raise TypeError(f"Unsupported Spark data type: {dtype!r}")
+        return cls()
+
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        return cls._matches_dict(value, DataTypeId.STRING)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "StringType":
+        return cls(
+            large=bool(value.get("large", False)),
+            view=bool(value.get("view", False)),
+            byte_size=value.get("byte_size"),
+        )
+
+    # ==================================================================
+    # Exporters
+    # ==================================================================
+
+    def to_arrow(self) -> pa.DataType:
+        if self.large:
+            return pa.large_string()
+        if self.view:
+            return pa.string_view()
+        return pa.string()
+
+    def to_polars(self) -> "polars.DataType":
+        pl = get_polars()
+        return pl.String
+
+    def to_spark(self) -> Any:
+        spark = get_spark_sql()
+        return spark.types.StringType()
+
+    def to_databricks_ddl(self) -> str:
+        return "STRING"
+
+    # ==================================================================
+    # Defaults / conversion
+    # ==================================================================
+
+    def default_pyobj(self, nullable: bool) -> Any:
+        if nullable:
+            return None
+
+        if self.byte_size is not None and self.byte_size > 0:
+            return "X" * self.byte_size
+        return ""
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            decoded = _bytes_to_str(value)
+            if decoded is None:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: {value!r}"
+                    )
+                return None
+            return decoded
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, decimal.Decimal)):
+            return str(value)
+        if isinstance(value, (dt.date, dt.time, dt.datetime, dt.timedelta)):
+            return value.isoformat()
+        try:
+            return str(value)
+        except Exception:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert value of type {type(value).__name__} to str "
+                    f"for {type(self).__name__}: {value!r}"
+                )
+            return None

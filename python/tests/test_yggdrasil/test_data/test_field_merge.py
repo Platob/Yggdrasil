@@ -4,7 +4,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data.data_field import Field, field
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 
 
 class TestFieldMergeWith:
@@ -57,42 +57,6 @@ class TestFieldMergeWith:
             b"shared": b"right",
         }
 
-    def test_merge_with_merge_metadata_false_drops_metadata_from_result(self) -> None:
-        left = field(
-            "qty",
-            pa.int64(),
-            nullable=False,
-            metadata={"comment": "lhs"},
-        )
-        right = field(
-            "qty",
-            pa.int64(),
-            nullable=True,
-            metadata={"unit": "mw"},
-        )
-
-        out = left.merge_with(right, merge_metadata=False)
-
-        assert out.metadata == {b"comment": b"lhs"}
-        assert out.nullable is True
-
-    def test_merge_with_merge_nullable_false_keeps_left_nullable(self) -> None:
-        left = field("qty", pa.int64(), nullable=False)
-        right = field("qty", pa.int64(), nullable=True)
-
-        out = left.merge_with(right, merge_nullable=False)
-
-        assert out.nullable is False
-
-    def test_merge_with_merge_dtype_false_uses_right_dtype(self) -> None:
-        left = field("value", pa.int32(), nullable=False)
-        right = field("value", pa.float64(), nullable=False)
-
-        out = left.merge_with(right, merge_dtype=False)
-
-        assert out.dtype.equals(right.dtype)
-        assert out.arrow_type == pa.float64()
-
     def test_merge_with_uses_left_name_when_present(self) -> None:
         left = field("left_name", pa.int32(), nullable=False)
         right = field("right_name", pa.int32(), nullable=False)
@@ -109,8 +73,8 @@ class TestFieldMergeWith:
 
         assert out.name == "fallback_name"
 
-    @pytest.mark.parametrize("mode", [SaveMode.APPEND, "append"])
-    def test_merge_with_accepts_save_mode_enum_and_string(self, mode: SaveMode | str) -> None:
+    @pytest.mark.parametrize("mode", [Mode.APPEND, "append"])
+    def test_merge_with_accepts_save_mode_enum_and_string(self, mode: Mode | str) -> None:
         left = field("value", pa.int32(), nullable=False)
         right = field("value", pa.int64(), nullable=False)
 

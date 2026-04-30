@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 import pyarrow as pa
 import pyarrow.compute as pc
+
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
-from yggdrasil.io import SaveMode
-
+from yggdrasil.io.enums import Mode
+from yggdrasil.lazy_imports import field_class, polars_module
 from ._cast_json import (
     cast_arrow_json_string_array,
     cast_polars_json_string_expr,
@@ -39,12 +40,47 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class StructType(NestedType):
     fields: tuple["Field"] = field(default_factory=tuple)
 
+    def __bool__(self):
+        return bool(self.fields)
+
     def __post_init__(self):
         object.__setattr__(self, "fields", tuple(self.fields))
+
+    def equals(
+        self,
+        other: "DataType",
+        check_names: bool = True,
+        check_dtypes: bool = True,
+        check_metadata: bool = True,
+    ) -> bool:
+        if not isinstance(other, StructType):
+            return False
+        if len(self.fields) != len(other.fields):
+            return False
+        for i, (f1, f2) in enumerate(zip(self.fields, other.fields)):
+            if not f1.name:
+                f1.with_name(f2.name, inplace=True)
+            elif not f2.name:
+                f2.with_name(f1.name, inplace=True)
+
+            if not f1.equals(f2, check_names=check_names, check_dtypes=check_dtypes, check_metadata=check_metadata):
+                return False
+        return True
+
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * (indent * level)
+
+        if not self.fields:
+            return f"{pad}struct<>"
+
+        body = ",\n".join(
+            child.pretty_format(indent=indent, level=level + 1) for child in self.fields
+        )
+        return f"{pad}struct<\n{body}\n{pad}>"
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else {
@@ -62,8 +98,8 @@ class StructType(NestedType):
 
     def _merge_with_same_id(
         self,
-        other: "NestedType",
-        mode: SaveMode | None = None,
+        other: "StructType",
+        mode: Mode,
         downcast: bool = False,
         upcast: bool = False,
     ) -> "StructType":
@@ -72,24 +108,32 @@ class StructType(NestedType):
                 f"Cannot merge {self.__class__.__name__} with {other.__class__.__name__}"
             )
 
+        if mode is Mode.IGNORE:
+            return self
+
         merged_fields: list[Field] = []
-        seen: set[str] = set()
+        missing_fields: list[Field] = []
 
-        for i, self_field in enumerate(self.fields):
-            other_field = other.field_by(name=self_field.name, index=i, raise_error=False)
+        if not self.fields:
+            source_type, target_type = self, other
+        elif not other.fields:
+            source_type, target_type = other, self
+        else:
+            source_type, target_type = (self, other) if mode is Mode.OVERWRITE else (other, self)
 
-            if other_field is None:
-                merged_fields.append(self_field)
+        for i, f in enumerate(target_type.fields):
+            found = source_type.field_by(name=f.name, index=i, raise_error=False)
+            if found is None:
+                if mode is Mode.APPEND:
+                    missing_fields.append(f)
+                elif mode is Mode.UPSERT:
+                    merged_fields.append(f)
             else:
-                merged_fields.append(
-                    self_field.merge_with(other_field, downcast=downcast, upcast=upcast)
-                )
-                seen.add(other_field.name)
+                mf = f.merge_with(found, mode=mode, downcast=downcast, upcast=upcast)
+                merged_fields.append(mf)
 
-        if mode is None or mode in (SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO):
-            for other_field in other.fields:
-                if other_field.name not in seen:
-                    merged_fields.append(other_field)
+        for miss in missing_fields:
+            merged_fields.append(miss)
 
         return self.__class__(fields=tuple(merged_fields))
 
@@ -101,7 +145,8 @@ class StructType(NestedType):
     def from_arrow_type(cls, dtype: pa.DataType) -> "StructType":
         if not pa.types.is_struct(dtype):
             raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
-        return cls(fields=[cls.get_data_field_class().from_arrow_field(f) for f in dtype])
+        _f = field_class()
+        return cls(fields=[_f.from_arrow_field(f) for f in dtype])
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
@@ -130,6 +175,16 @@ class StructType(NestedType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.STRUCT)
+
+    @classmethod
+    def empty(cls) -> "StructType":
+        return cls(fields=[])
+
+    @classmethod
+    def from_fields(cls, values: Iterable["Field"]):
+        if isinstance(values, Mapping):
+            return cls(fields=tuple(values.values()))
+        return cls(fields=tuple(values))
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StructType":
@@ -170,16 +225,13 @@ class StructType(NestedType):
         inplace: bool = True,
     ) -> "StructType":
         if not safe:
-            _f = self.get_data_field_class()
+            _f = field_class()
             fields = [_f.from_any(_) for _ in fields]
 
         if inplace:
             object.__setattr__(self, "fields", tuple(fields))
             return self
         return self.__class__(fields=tuple(fields))
-
-    def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else {f.name: f.default for f in self.fields}
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> dict | None:
         if isinstance(value, (bytes, bytearray, memoryview)):
@@ -253,8 +305,7 @@ class StructType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.StructArray | pa.ChunkedArray:
-        options.check_source(array)
-        options.check_target(self)
+        options = options.check_source(array).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -286,9 +337,7 @@ class StructType(NestedType):
         table: pa.Table | pa.RecordBatch,
         options: "CastOptions",
     ):
-        options.check_source(table)
-        options.check_target(self)
-        return cast_arrow_tabular(table, options)
+        return cast_arrow_tabular(table, options.check_source(table).check_target(self))
 
     def _cast_polars_series(
         self,
@@ -296,8 +345,7 @@ class StructType(NestedType):
         options: "CastOptions",
     ) -> "polars.Series":
         pl = get_polars()
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         if options.source_field.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
             return options.target_field.default_polars_series(size=len(series))
@@ -313,7 +361,7 @@ class StructType(NestedType):
         expr: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_target(self)
+        options = options.check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -352,8 +400,7 @@ class StructType(NestedType):
         series: "pd.Series",
         options: "CastOptions",
     ) -> "pd.Series":
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -388,8 +435,7 @@ class StructType(NestedType):
         column: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_source(column)
-        options.check_target(self)
+        options = options.check_source(column).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -425,11 +471,10 @@ def cast_arrow_struct_array(
     array: pa.StructArray,
     options: "CastOptions",
 ):
-    options.check_source(array)
-
-    if options.target_field is None:
+    if not options.need_cast(array):
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
+
+    if options.source_field.dtype.type_id != DataTypeId.STRUCT:
         raise pa.ArrowInvalid(
             f"Cannot cast {options.source_field} to {options.target_field}"
         )
@@ -470,11 +515,10 @@ def cast_arrow_map_array(
     array: pa.MapArray,
     options: "CastOptions",
 ):
-    options.check_source(array)
-
-    if options.target_field is None:
+    if not options.need_cast(array):
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
+
+    if options.source_field.dtype.type_id != DataTypeId.MAP:
         raise pa.ArrowInvalid(
             f"Cannot cast {options.source_field} to {options.target_field}"
         )
@@ -508,11 +552,10 @@ def cast_arrow_list_array(
     array: pa.Array | pa.ChunkedArray,
     options: "CastOptions",
 ):
-    options.check_source(array)
-
-    if options.target_field is None:
+    if not options.need_cast(array):
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+
+    if options.source_field.dtype.type_id != DataTypeId.ARRAY:
         raise pa.ArrowInvalid(
             f"Cannot cast {options.source_field} to {options.target_field}"
         )
@@ -558,13 +601,11 @@ def cast_arrow_tabular(
     if not isinstance(data, (pa.Table, pa.RecordBatch)):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
-    options.check_source(data)
-
-    if options.target_field is None:
+    if not options.need_cast(data, check_names=True):
         return data
 
     source_schema = options.source_schema
-    target_schema = options.target_schema
+    target_schema = options.merged_schema
 
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
@@ -611,9 +652,10 @@ def cast_polars_struct_expr(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if not options.need_cast(expr):
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
+
+    if options.source_field.dtype.type_id != DataTypeId.STRUCT:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -649,9 +691,10 @@ def cast_polars_map_expr(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if not options.need_cast(expr):
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
+
+    if options.source_field.dtype.type_id != DataTypeId.MAP:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -692,9 +735,10 @@ def cast_polars_list_expr(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if not options.need_cast(expr):
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+
+    if options.source_field.dtype.type_id != DataTypeId.ARRAY:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -724,6 +768,9 @@ def cast_polars_struct_series(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
+    if not options.need_cast(series):
+        return series
+
     pl = get_polars()
     expr = cast_polars_struct_expr(pl.col(series.name), options).alias(options.target_field.name)
     return pl.DataFrame({series.name: series}).select(expr).to_series()
@@ -733,6 +780,9 @@ def cast_polars_list_series(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
+    if not options.need_cast(series):
+        return series
+
     pl = get_polars()
     expr = cast_polars_list_expr(pl.col(series.name), options).alias(options.target_field.name)
     return pl.DataFrame({series.name: series}).select(expr).to_series()
@@ -742,18 +792,16 @@ def cast_polars_tabular(
     data: "polars.DataFrame | polars.LazyFrame",
     options: "CastOptions",
 ) -> "polars.DataFrame | polars.LazyFrame":
-    pl = get_polars()
+    pl = polars_module()
 
     if not isinstance(data, (pl.DataFrame, pl.LazyFrame)):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
-    options = options.check_source(data)
-
-    if options.target_schema is None:
+    if not options.need_cast(data, check_names=True):
         return data
 
     source_schema = options.source_schema
-    target_schema = options.target_schema
+    target_schema = options.merged_schema
 
     exprs: list[Any] = []
 
@@ -816,7 +864,8 @@ def cast_pandas_struct_series(
 ) -> "pd.Series":
     pd = get_pandas()
 
-    options.check_source(series)
+    if not options.need_cast(series):
+        return series
 
     if options.target_field is None:
         return series
@@ -887,7 +936,8 @@ def cast_pandas_list_series(
 ) -> "pd.Series":
     pd = get_pandas()
 
-    options.check_source(series)
+    if not options.need_cast(series):
+        return series
 
     if options.target_field is None:
         return series
@@ -954,13 +1004,11 @@ def cast_pandas_tabular(
     if not isinstance(data, pd.DataFrame):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
-    options.check_source(data)
-
-    if options.target_schema is None:
+    if not options.need_cast(data, check_names=True):
         return data
 
     source_schema = options.source_schema
-    target_schema = options.target_schema
+    target_schema = options.merged_schema
 
     out: dict[str, pd.Series] = {}
     num_rows = len(data)
@@ -997,11 +1045,10 @@ def cast_spark_struct_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
-
-    if options.target_field is None:
+    if not options.need_cast(column):
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
+
+    if options.source_field.dtype.type_id != DataTypeId.STRUCT:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -1042,11 +1089,10 @@ def cast_spark_map_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
-
-    if options.target_field is None:
+    if not options.need_cast(column):
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
+
+    if options.source_field.dtype.type_id != DataTypeId.MAP:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -1078,11 +1124,10 @@ def cast_spark_list_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
-
-    if options.target_field is None:
+    if not options.need_cast(column):
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+
+    if options.source_field.dtype.type_id != DataTypeId.ARRAY:
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: Field = options.source_field
@@ -1119,13 +1164,11 @@ def cast_spark_tabular(
     if not isinstance(data, spark.DataFrame):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
-    options.check_source(data)
-
-    if options.target_schema is None:
+    if not options.need_cast(data, check_names=True):
         return data
 
     source_schema = options.source_schema
-    target_schema = options.target_schema
+    target_schema = options.merged_schema
 
     cols: list[Any] = []
 

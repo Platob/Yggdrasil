@@ -21,14 +21,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Iterator, TYPE_CHECKING
+from typing import Optional, Iterator, TYPE_CHECKING, Any
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
+
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
-
 from .table import Table
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 _TABLE_CACHE: ExpiringDict[str, Table] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Tables(DatabricksService):
     """Collection-level service for Unity Catalog tables.
 
@@ -211,7 +211,7 @@ class Tables(DatabricksService):
     ) -> "Table":
         """Return a :class:`~yggdrasil.databricks.sql.table.Table` bound to this service."""
 
-        return Table.parse(
+        return Table.from_(
             obj=location,
             service=self,
             catalog_name=catalog_name or self.catalog_name,
@@ -326,12 +326,12 @@ class Tables(DatabricksService):
         table_name: str | None = None,
         *,
         table_id: str | None = None,
-        raise_error: bool = True,
+        default: Any = ...,
     ) -> Optional[TableInfo]:
         """Raw API lookup — three strategies in order, no cache.
 
         1. Search by ``table_id`` (full list scan, preferred when id is known).
-        2. GET by fully-qualified name (fast path for normal lookups).
+        2. GET by fully qualified name (fast path for normal lookups).
         3. Case-insensitive list scan (handles edge cases in naming / quoting).
 
         Returns ``None`` on miss when ``raise_error=False``.
@@ -349,18 +349,18 @@ class Tables(DatabricksService):
                     if info.table_id == table_id:
                         return info
             except DatabricksError as exc:
-                if raise_error:
+                if default is ...:
                     raise ResourceDoesNotExist(
                         f"Failed searching table_id={table_id} in"
                         f" {catalog_name}.{schema_name}"
                     ) from exc
-                return None
+                return default
 
-            if raise_error:
+            if default is ...:
                 raise ResourceDoesNotExist(
                     f"Table id={table_id} not found in {catalog_name}.{schema_name}"
                 )
-            return None
+            return default
 
         # --- Strategy 2: GET by full name (fast path) -----------------------
         full_name = (
@@ -374,9 +374,9 @@ class Tables(DatabricksService):
         except DatabricksError:
             pass  # fall through to list scan
         except Exception as exc:
-            if raise_error:
+            if default is ...:
                 raise ResourceDoesNotExist(f"Failed to GET table {full_name}") from exc
-            return None
+            return default
 
         # --- Strategy 3: case-insensitive list scan -------------------------
         logger.debug(
@@ -388,29 +388,49 @@ class Tables(DatabricksService):
                 if info.name == table_name or info.name.lower() == str(table_name).lower():
                     return info
         except DatabricksError as exc:
-            if raise_error:
+            if default is ...:
                 raise ResourceDoesNotExist(
                     f"Failed to list tables in {catalog_name}.{schema_name}"
                 ) from exc
-            return None
+            return default
 
-        if raise_error:
+        if default is ...:
             raise ResourceDoesNotExist(f"Table {full_name} not found")
         return None
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
-
-    def find_table(
+    def get(
         self,
-        location: str | None = None,
+        location: str | Table | None = None,
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
         table_name: str | None = None,
         table_id: str | None = None,
-        raise_error: bool = True,
+        default: Any = None,
+        cache_ttl: float | None = 300.0,
+    ) -> Optional["Table"]:
+        return self.find_table(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            table_id=table_id,
+            default=default,
+            cache_ttl=cache_ttl,
+        )
+
+    def find_table(
+        self,
+        location: str | Table | None = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        table_id: str | None = None,
+        default: Any = ...,
         cache_ttl: float | None = 300.0,
     ) -> Optional["Table"]:
         """Resolve a table by name or Unity Catalog ID.
@@ -424,9 +444,12 @@ class Tables(DatabricksService):
             catalog_name: Override catalog (falls back to service default).
             schema_name:  Override schema (falls back to service default).
             table_id:     Unity Catalog table UUID — triggers id-based search.
-            raise_error:  Raise :exc:`ResourceDoesNotExist` when not found.
+            default:  Raise :exc:`ResourceDoesNotExist` when not found.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
         """
+        if isinstance(location, Table):
+            return location
+
         _, catalog, schema, name = self.parse_check_location_params(
             location=location, catalog_name=catalog_name, schema_name=schema_name,
             table_name=table_name
@@ -450,10 +473,14 @@ class Tables(DatabricksService):
             schema_name=schema,
             table_name=name,
             table_id=table_id,
-            raise_error=raise_error,
+            default=None,
         )
         if info is None:
-            return None
+            if default is ...:
+                raise ResourceDoesNotExist(
+                    f"Table {catalog}.{schema}.{name} not found"
+                )
+            return default
 
         tb = Table(
             service=self,
@@ -544,4 +571,3 @@ class Tables(DatabricksService):
                 if _TABLE_CACHE.get(key) is None:
                     _TABLE_CACHE.set(key, tb, ttl=cache_ttl)
             yield tb
-

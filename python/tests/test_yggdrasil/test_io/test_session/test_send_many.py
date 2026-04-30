@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime as dt
 from unittest.mock import patch
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.send_config import CacheConfig
 
 from .._helpers import (
@@ -111,7 +111,7 @@ class TestBatchUpsertBypass:
             table=upsert_table,
             received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
             request_by=KEY_COLS,
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
         session_table = make_table_mock("cat.schema.tbl", hits=[cached_a])
         mock_session.queue(make_response(req_b))  # the UPSERT refetch
@@ -162,7 +162,7 @@ class TestBatchWriteBack:
             table=table,
             received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
             request_by=KEY_COLS,
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
         mock_session.queue(make_response(req))
         session_table = make_table_mock("cat.schema.session")
@@ -174,7 +174,7 @@ class TestBatchWriteBack:
         )
 
         assert table.insert.call_count == 1
-        assert table.insert.call_args[1]["mode"] == SaveMode.UPSERT
+        assert table.insert.call_args[1]["mode"] == Mode.UPSERT
 
 
 class TestBatchDisabledConfig:

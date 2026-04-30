@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from yggdrasil.io import MimeTypes
+from yggdrasil.io.enums import MimeTypes
 from yggdrasil.io.enums import MediaType
 
 from .._helpers import make_response

@@ -11,7 +11,7 @@ from .resources import GenieAnswer, GenieSpace
 __all__ = ["Genie"]
 
 
-@dataclass(frozen=True)
+@dataclass
 class Genie(DatabricksService):
     """High-level wrapper around Databricks Workspace Genie APIs."""
 

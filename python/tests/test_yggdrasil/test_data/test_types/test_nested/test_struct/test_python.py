@@ -13,7 +13,7 @@ from yggdrasil.data import DataType, Field
 from yggdrasil.data.types import IntegerType
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested.struct import StructType
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ def test_merge_same_id_keeps_left_only_fields(
 
 @pytest.mark.parametrize(
     "mode",
-    [None, SaveMode.APPEND, SaveMode.UPSERT, SaveMode.AUTO],
+    [None, Mode.APPEND, Mode.UPSERT, Mode.AUTO],
 )
 def test_merge_same_id_appends_right_only_fields_for_append_like_modes(
     int64_type: IntegerType,
@@ -333,7 +333,7 @@ def test_merge_same_id_overwrite_mode_drops_right_only_fields(
         ]
     )
 
-    result = left._merge_with_same_id(right, mode=SaveMode.OVERWRITE)
+    result = left._merge_with_same_id(right, mode=Mode.OVERWRITE)
 
     assert [f.name for f in result.fields] == ["a"]
 
@@ -356,7 +356,7 @@ def test_merge_same_id_preserves_left_order_and_appends_new_right_fields(
         ]
     )
 
-    result = left._merge_with_same_id(right, mode=SaveMode.APPEND, upcast=True)
+    result = left._merge_with_same_id(right, mode=Mode.APPEND, upcast=True)
 
     assert [f.name for f in result.fields] == ["b", "a", "c"]
     assert result.fields[1].arrow_type == pa.int64()

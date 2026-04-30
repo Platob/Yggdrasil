@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.send_config import CacheConfig
 
 from .._helpers import make_request, make_response, make_table_mock
@@ -48,7 +48,7 @@ class TestRemoteCacheUpsertBypassesRead:
         req = make_request()
         req.remote_cache_config = CacheConfig(
             table=make_table_mock(),
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
 
         with patch.object(mock_session, "_load_remote_cached_response") as load:
@@ -61,7 +61,7 @@ class TestRemoteCacheUpsertBypassesRead:
         req = make_request()
         req.remote_cache_config = CacheConfig(
             table=make_table_mock(),
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
         fresh = make_response(request=req)
         mock_session.queue(fresh)
@@ -72,7 +72,7 @@ class TestRemoteCacheUpsertBypassesRead:
         store.assert_called_once()
         # Second positional arg is cache_cfg — its mode must be UPSERT.
         stored_cfg: CacheConfig = store.call_args[0][1]
-        assert stored_cfg.mode == SaveMode.UPSERT
+        assert stored_cfg.mode == Mode.UPSERT
 
 
 class TestRemoteCachePerRequestOverride:

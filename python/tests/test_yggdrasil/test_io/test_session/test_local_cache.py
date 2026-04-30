@@ -13,7 +13,7 @@ from __future__ import annotations
 import datetime as dt
 from unittest.mock import patch
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.send_config import CacheConfig
 
 from .._helpers import make_request, make_response
@@ -62,7 +62,7 @@ class TestLocalCacheUpsert:
         cfg = CacheConfig(
             path=tmp_path,
             received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
         # Seed a stale file at the exact path the eviction code targets.
         stale = cfg.local_cache_file(req, suffix=".ypkl", force=True)
@@ -83,7 +83,7 @@ class TestLocalCacheUpsert:
         cfg = CacheConfig(
             path=tmp_path,
             received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
-            mode=SaveMode.UPSERT,
+            mode=Mode.UPSERT,
         )
         with patch.object(mock_session, "_store_local_cached_response"):
             result = mock_session.send(req, local_cache=cfg)

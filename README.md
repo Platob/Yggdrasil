@@ -75,7 +75,7 @@ Make Arrow schema explicit before data moves downstream:
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
 target = pa.schema([

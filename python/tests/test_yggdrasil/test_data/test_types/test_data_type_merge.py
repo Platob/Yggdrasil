@@ -11,7 +11,7 @@ from yggdrasil.data.types.primitive import (
     NullType,
     StringType,
 )
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 
 
 class TestPrimitiveTypeMerge(unittest.TestCase):
@@ -122,7 +122,7 @@ class TestPrimitiveTypeMerge(unittest.TestCase):
         a = IntegerType(byte_size=4, signed=True)
         b = IntegerType(byte_size=8, signed=True)
 
-        result = a.merge_with(b, mode=SaveMode.OVERWRITE)
+        result = a.merge_with(b, mode=Mode.OVERWRITE)
 
         self.assertEqual(result.byte_size, 8)
 

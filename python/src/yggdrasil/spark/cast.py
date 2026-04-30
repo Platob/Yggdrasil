@@ -42,10 +42,11 @@ from typing import Any, Optional
 import pyarrow as pa
 import pyspark.sql as pyspark_sql
 import pyspark.sql.types as T
-from yggdrasil.data import Field, Schema
-from yggdrasil.data.cast import CastOptions, register_converter
+
+from yggdrasil.arrow.cast import any_to_arrow_table
+from yggdrasil.data.cast import register_converter
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.environ import PyEnv
-from yggdrasil.pickle.serde import ObjectSerde
 
 __all__ = [
     "any_to_spark_field",
@@ -61,7 +62,7 @@ def any_to_spark_field(
     field: pa.Field,
     options: Optional[CastOptions] = None,
 ) -> T.StructField:
-    return Field.from_(field).to_pyspark_field()
+    return options.check_source(field).merged_field.to_pyspark_field()
 
 
 @register_converter(Any, T.StructType)
@@ -69,7 +70,7 @@ def any_to_spark_schema(
     schema: pa.Schema,
     options: Optional[CastOptions] = None,
 ) -> T.StructType:
-    return Schema.from_any(schema).to_spark_schema()
+    return options.check_source(schema).merged_schema.to_spark_schema()
 
 
 @register_converter(pyspark_sql.Column, pyspark_sql.Column)
@@ -93,54 +94,20 @@ def any_to_spark_dataframe(
     obj: Any,
     options: Optional[CastOptions] = None,
 ) -> pyspark_sql.DataFrame:
+    opts = CastOptions.check(options)
+
+    if isinstance(obj, pyspark_sql.DataFrame):
+        return opts.cast_spark_tabular(obj)
+
     spark = PyEnv.spark_session(
         create=True,
         import_error=True,
         install_spark=False,
     )
 
-    opts = CastOptions.check(options)
-
-    if isinstance(obj, pyspark_sql.DataFrame):
-        return opts.cast_spark_tabular(obj)
-
     if obj is None:
-        return spark.createDataFrame([], schema=opts.target_field.to_schema().to_spark_schema())
+        return spark.createDataFrame([], schema=opts.merged_schema.to_spark_schema())
 
-    namespace = ObjectSerde.full_namespace(obj)
-
-    if namespace.startswith("pyarrow"):
-        if isinstance(obj, pa.RecordBatch):
-            obj = pa.Table.from_batches([obj], schema=obj.schema) # type: ignore
-        elif hasattr(obj, "to_table"):
-            obj = obj.to_table()
-
-        if isinstance(obj, pa.Table):
-            spark_schema = any_to_spark_schema(obj.schema, None)
-            df = spark.createDataFrame(obj, schema=spark_schema)
-        else:
-            raise ValueError(
-                f"Cannot convert {type(obj)} to pyspark.sql.DataFrame"
-            )
-    elif namespace.startswith("yggdrasil."):
-        from yggdrasil.spark.frame import DynamicFrame
-
-        if isinstance(obj, DynamicFrame):
-            schema = opts.target_schema
-
-            df = obj.df if schema is None else obj.cast(schema=schema)
-        else:
-            raise ValueError(
-                f"Cannot create spark dataframe from {type(obj)}"
-            )
-    else:
-        # Route through Polars as the intermediate representation for arbitrary inputs.
-        from yggdrasil.polars.cast import any_to_polars_dataframe, polars_dataframe_to_arrow_table
-
-        arrow_table = polars_dataframe_to_arrow_table(
-            any_to_polars_dataframe(obj, opts), opts
-        )
-        spark_schema = any_to_spark_schema(arrow_table.schema, None)
-        df = spark.createDataFrame(arrow_table, schema=spark_schema)
-
-    return opts.cast_spark_tabular(df)
+    arrow_table = any_to_arrow_table(obj, options=opts)
+    df = spark.createDataFrame(arrow_table, schema=opts.merged_schema.to_spark_schema())
+    return opts.cast_spark(df)

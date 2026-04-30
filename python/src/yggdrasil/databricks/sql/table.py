@@ -44,21 +44,16 @@ from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
-from yggdrasil.io.enums.save_mode import SaveModeArg, SaveMode
+from yggdrasil.io.enums.mode import ModeLike, Mode
 from .column import Column
 from .grants import GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
-    _qualify_fk_ref,
-    _safe_constraint_name,
-    _safe_str,
-    databricks_tag_literal,
     quote_ident,
     quote_principal,
     quote_qualified_ident,
     sql_literal, escape_sql_string,
 )
-from .types import PrimaryKeySpec, ForeignKeySpec
 
 if TYPE_CHECKING:
     import delta
@@ -164,7 +159,7 @@ class Table(GrantsMixin):
         )
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,
@@ -456,7 +451,7 @@ class Table(GrantsMixin):
             raise ValueError(f"Column {name!r} not found in {self!r}")
         return None
 
-    def collect_schema(self, full: bool = False) -> DataSchema:
+    def collect_schema(self, safe: bool = True) -> DataSchema:
         """Return the field schema, optionally enriched with UC metadata.
 
         ``full=False`` (default) is the cheap, round-trip-free path: only
@@ -488,7 +483,7 @@ class Table(GrantsMixin):
             b"table_name": self.table_name.encode(),
         }
 
-        if not full:
+        if not safe:
             return DataSchema.from_any_fields(
                 [c.field for c in self.columns],
                 metadata=metadata,
@@ -543,9 +538,9 @@ class Table(GrantsMixin):
 
         return DataSchema.from_any_fields(fields, metadata=metadata)
 
-    def collect_data_field(self, full: bool = False) -> Field:
+    def collect_data_field(self, safe: bool = False) -> Field:
         """Return the struct :class:`Field` rollup of :meth:`collect_schema`."""
-        return self.collect_schema(full=full).to_field()
+        return self.collect_schema(safe=safe).to_field()
 
     def _constraint_summary(
         self,
@@ -596,201 +591,6 @@ class Table(GrantsMixin):
     @property
     def arrow_field(self) -> pa.Field:
         return self.collect_data_field().to_arrow_field()
-
-    # =========================================================================
-    # Constraint helpers — public ALTER TABLE DDL builders
-    # =========================================================================
-
-    def add_primary_key_ddl(
-        self,
-        columns: "list[str] | str",
-        *,
-        constraint_name: str | None = None,
-        rely: bool = False,
-        timeseries: str | None = None,
-    ) -> str:
-        if isinstance(columns, str):
-            columns = [columns]
-
-        col_exprs = [
-            f"`{c}` TIMESERIES" if timeseries == c else f"`{c}`"
-            for c in columns
-        ]
-        cname = _safe_constraint_name(
-            constraint_name or f"{self.table_name}_{'_'.join(columns)}_pk"
-        )
-        rely_clause = " RELY" if rely else ""
-        return (
-            f"ALTER TABLE {self.full_name(safe=True)} "
-            f"ADD CONSTRAINT `{cname}` "
-            f"PRIMARY KEY ({', '.join(col_exprs)}) NOT ENFORCED"
-            f"{rely_clause}"
-        )
-
-    def set_primary_key(
-        self,
-        columns: "list[str] | str",
-        *,
-        constraint_name: str | None = None,
-        rely: bool = False,
-        timeseries: str | None = None,
-    ) -> "Table":
-        """Create a PRIMARY KEY constraint via the Unity Catalog API.
-
-        See https://docs.databricks.com/api/gcp/workspace/tableconstraints
-        for the ``TableConstraintsAPI.create`` endpoint.
-        """
-        from .constraints_api import apply_primary_key
-
-        if isinstance(columns, str):
-            columns = [columns]
-
-        apply_primary_key(
-            self,
-            PrimaryKeySpec(
-                columns=list(columns),
-                constraint_name=constraint_name,
-                rely=rely,
-                timeseries=timeseries,
-            ),
-        )
-        self._reset_cache(invalidate_cache=True)
-        return self
-
-    def drop_primary_key_ddl(
-        self,
-        *,
-        if_exists: bool = True,
-        cascade: bool = False,
-    ) -> str:
-        if_exists_clause = " IF EXISTS" if if_exists else ""
-        cascade_clause = " CASCADE" if cascade else ""
-        return (
-            f"ALTER TABLE {self.full_name(safe=True)} "
-            f"DROP PRIMARY KEY{if_exists_clause}{cascade_clause}"
-        )
-
-    def drop_primary_key(
-        self,
-        *,
-        if_exists: bool = True,
-        cascade: bool = False,
-    ) -> "Table":
-        """Delete the table's PRIMARY KEY constraint via the UC API.
-
-        The API deletes by constraint name, so we resolve the current PK
-        constraint name from ``TableInfo.table_constraints`` and call
-        ``TableConstraintsAPI.delete``.
-        """
-        from .constraints_api import delete_constraint
-
-        name = self._primary_key_constraint_name()
-        if name is None:
-            if not if_exists:
-                raise ValueError(
-                    f"{self!r} has no PRIMARY KEY constraint to drop"
-                )
-            return self
-
-        delete_constraint(
-            self, name, cascade=cascade, if_exists=if_exists,
-        )
-        self._reset_cache(invalidate_cache=True)
-        return self
-
-    def _primary_key_constraint_name(self) -> str | None:
-        """Return the current PK constraint name from ``TableInfo``, if any."""
-        for constraint in (getattr(self.infos, "table_constraints", None) or ()):
-            pk = getattr(constraint, "primary_key_constraint", None)
-            if pk is not None and getattr(pk, "name", None):
-                return pk.name
-        return None
-
-    def _foreign_key_constraint_name(self, column: str) -> str | None:
-        """Return the current FK constraint name on *column*, if any."""
-        for constraint in (getattr(self.infos, "table_constraints", None) or ()):
-            fk = getattr(constraint, "foreign_key_constraint", None)
-            if fk is None:
-                continue
-            child_columns = getattr(fk, "child_columns", None) or ()
-            if column in child_columns:
-                return getattr(fk, "name", None)
-        return None
-
-    def set_foreign_keys(
-        self,
-        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | Any | None" = None,
-        *,
-        schema: Any = None,
-        raise_error: bool = False,
-    ) -> "Table":
-        """Apply foreign-key constraints via the UC ``table_constraints`` API.
-
-        ``foreign_keys`` accepts anything :meth:`ForeignKeySpec.from_any` handles
-        (a dict ``{column: ref}``, a list of specs, a single spec, a schema, …).
-        When ``foreign_keys`` is omitted, the constraints are read from
-        ``schema`` (each field's ``foreign_key`` tag).
-
-        Partial refs such as ``"ref_table.col"`` are resolved against this
-        table's catalog/schema. Failures are logged and skipped unless
-        ``raise_error`` is set.
-        """
-        from .constraints_api import apply_foreign_key
-
-        fk_specs = ForeignKeySpec.from_any(foreign_keys, schema=schema)
-
-        for fk in fk_specs:
-            ref = _qualify_fk_ref(
-                fk.ref,
-                default_catalog=self.catalog_name,
-                default_schema=self.schema_name,
-            )
-            fk_with_ref = ForeignKeySpec(
-                column=fk.column,
-                ref=ref,
-                constraint_name=fk.constraint_name,
-                rely=fk.rely,
-                match_full=fk.match_full,
-                on_update_no_action=fk.on_update_no_action,
-                on_delete_no_action=fk.on_delete_no_action,
-            )
-            try:
-                apply_foreign_key(self, fk_with_ref)
-                logger.debug(
-                    "Applied FOREIGN KEY %r → %r on %s",
-                    fk.column, ref, self.full_name(),
-                )
-            except Exception:
-                if raise_error:
-                    raise
-                logger.warning(
-                    "Failed to apply FOREIGN KEY %r → %r on %s",
-                    fk.column, ref, self.full_name(),
-                    exc_info=True,
-                )
-
-        return self
-
-    def set_tags_ddl(
-        self,
-        tags: Mapping[str, str] | None,
-        *,
-        tag_collation: str | None = DEFAULT_TAG_COLLATION,
-    ) -> str:
-        pairs: list[str] = []
-        for k, v in (tags or {}).items():
-            key = _safe_str(k).strip() if k is not None else ""
-            val = _safe_str(v).strip() if v is not None else ""
-            if key and val:
-                pairs.append(
-                    f"{databricks_tag_literal(key, collation=tag_collation)} = "
-                    f"{databricks_tag_literal(val, collation=tag_collation)}"
-                )
-
-        if not pairs:
-            raise ValueError(f"Cannot set empty tags on {self!r}")
-
-        return f"ALTER TABLE {self.full_name(safe=True)} SET TAGS ({', '.join(pairs)})"
 
     def set_tags(
         self,
@@ -854,7 +654,7 @@ class Table(GrantsMixin):
         self,
         definition: Union[pa.Schema, Any, None],
         *,
-        mode: SaveMode | str | None = None,
+        mode: Mode | str | None = None,
         **options
     ) -> "Table":
         return self.create(
@@ -874,95 +674,22 @@ class Table(GrantsMixin):
             table_name=self.table_name,
         )
 
-    def _resolve_fk_field(
-        self,
-        data_field: Field,
-    ) -> tuple[Field, "ForeignKeySpec | None"]:
-        """Detect the ``catalog.schema.table.column`` FK pattern on ``data_field.name``.
-
-        When ``data_field.name`` contains ``.``, it is parsed through the
-        :class:`Columns` service (scoped to this table's defaults) as a
-        foreign-key reference:
-
-        =============================================  =======================================
-        Input name                                     Resolved as
-        =============================================  =======================================
-        ``"ref_table.col"``                            ``<this catalog>.<this schema>.ref_table.col``
-        ``"ref_schema.ref_table.col"``                 ``<this catalog>.ref_schema.ref_table.col``
-        ``"catalog.schema.ref_table.col"``             fully qualified
-        =============================================  =======================================
-
-        The referenced column is looked up via the Columns service so the
-        local column inherits its dtype (keeping the FK type-compatible).
-        The returned field is renamed to the leaf column name and the
-        returned :class:`ForeignKeySpec` carries the fully-qualified ref
-        plus a stable, FK-specific constraint name.
-
-        Safe fall-back: if the pattern can't be fully resolved, or the
-        reference points at this same table, the field is simply renamed
-        to the leaf name (dotted names are never valid column names) and
-        ``None`` is returned for the FK spec.
-        """
-        name = data_field.name or ""
-        if "." not in name:
-            return data_field, None
-
-        columns_service = self._columns_service()
-        cat, sch, tbl, col = columns_service.parse_location(name)
-
-        if not (cat and sch and tbl and col):
-            return data_field, None
-
-        local_field = data_field.with_name(col, inplace=False)
-
-        if (
-            cat == self.catalog_name
-            and sch == self.schema_name
-            and tbl == self.table_name
-        ):
-            return local_field, None
-
-        try:
-            ref_column = columns_service.column(
-                catalog_name=cat,
-                schema_name=sch,
-                table_name=tbl,
-                column_name=col,
-            )
-        except Exception:
-            logger.warning(
-                "Foreign key reference %r could not be resolved; skipping constraint.",
-                name, exc_info=True,
-            )
-            return local_field, None
-
-        local_field = local_field.with_dtype(ref_column.field.dtype, inplace=False)
-
-        fk_spec = ForeignKeySpec(
-            column=col,
-            ref=f"{cat}.{sch}.{tbl}.{col}",
-            constraint_name=_safe_constraint_name(
-                self.table_name, col, tbl, col, "fk",
-            ),
-        )
-        return local_field, fk_spec
-
-    def update_column(
+    def with_column(
         self,
         column: Field,
         *,
-        mode: SaveMode | str | None = None,
+        mode: Mode | str | None = None,
     ):
-        return self.update_columns(
+        return self.with_columns(
             [column],
             mode=mode,
         )
 
-    def update_columns(
+    def with_columns(
         self,
         columns: Iterable[Field],
         *,
-        mode: SaveMode | str | None = None,
+        mode: Mode | str | None = None,
     ):
         """Evolve this table's schema to match *columns*.
 
@@ -982,20 +709,18 @@ class Table(GrantsMixin):
             Only adds new columns and renames case-insensitive matches, so
             the call remains non-destructive.
         """
-        mode = SaveMode.parse(mode, SaveMode.AUTO)
+        mode = Mode.from_(mode, default=Mode.AUTO)
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
-        update_dtype = mode in (SaveMode.UPSERT, SaveMode.OVERWRITE)
-        drop_missing = mode == SaveMode.OVERWRITE
+        update_dtype = mode in (Mode.UPSERT, Mode.OVERWRITE)
+        drop_missing = mode == Mode.OVERWRITE
 
         rename_statements: list[str] = []
         type_statements: list[str] = []
         add_columns: list[str] = []
-        pending_fks: list[ForeignKeySpec] = []
         matched_existing: set[str] = set()
 
         for column in columns:
             data_field = Field.from_any(column)
-            data_field, fk = self._resolve_fk_field(data_field)
 
             existing = self.column(name=data_field.name, safe=False, raise_error=False)
 
@@ -1003,8 +728,6 @@ class Table(GrantsMixin):
                 add_columns.append(
                     f"`{data_field.name}` {data_field.dtype.to_databricks_ddl()}"
                 )
-                if fk is not None:
-                    pending_fks.append(fk)
                 continue
 
             matched_existing.add(existing.name)
@@ -1068,12 +791,6 @@ class Table(GrantsMixin):
             self.sql.execute_many(second_phase, parallel=True)
             executed = True
 
-        if pending_fks:
-            # FKs are applied through the UC ``table_constraints`` API after
-            # any ADD COLUMN has materialized the referencing column.
-            self._apply_constraints(pk_spec=None, fk_specs=pending_fks)
-            executed = True
-
         if executed:
             self._reset_cache(invalidate_cache=True)
 
@@ -1083,7 +800,7 @@ class Table(GrantsMixin):
         self,
         definition: Union[pa.Schema, Any],
         *,
-        mode: SaveMode | str | None = None,
+        mode: Mode | str | None = None,
         partition_by: Optional[list[str]] = None,
         storage_location: str | None = None,
         comment: str | None = None,
@@ -1091,8 +808,6 @@ class Table(GrantsMixin):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True,
-        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
-        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
         """Create the table, routing to SQL DDL or the Unity Catalog REST API.
 
@@ -1103,15 +818,15 @@ class Table(GrantsMixin):
             - creates the table first
             - then applies PK/FK via ALTER TABLE fallback
         """
-        mode = SaveMode.parse(mode, SaveMode.AUTO)
+        mode = Mode.from_(mode, default=Mode.AUTO)
         schema = DataSchema.from_(definition)
 
         if self.exists:
-            if mode == SaveMode.ERROR_IF_EXISTS:
+            if mode == Mode.ERROR_IF_EXISTS:
                 raise ValueError(f"Table {self!r} already exists")
-            elif mode == SaveMode.IGNORE:
+            elif mode == Mode.IGNORE:
                 return self
-            return self.update_columns(
+            return self.with_columns(
                 schema.fields,
                 mode=mode,
             )
@@ -1125,8 +840,6 @@ class Table(GrantsMixin):
                 comment=comment,
                 partition_by=partition_by,
                 if_not_exists=if_not_exists,
-                primary_keys=primary_keys,
-                foreign_keys=foreign_keys,
             )
         else:
             if table_type == TableType.EXTERNAL and not storage_location:
@@ -1142,8 +855,6 @@ class Table(GrantsMixin):
                 table_type=table_type,
                 data_source_format=data_source_format,
                 if_not_exists=if_not_exists,
-                primary_keys=primary_keys,
-                foreign_keys=foreign_keys,
             )
 
         self._apply_grants_from_metadata(schema.metadata)
@@ -1205,8 +916,6 @@ class Table(GrantsMixin):
         column_mapping_mode: str | None = None,
         wait_result: bool = True,
         auto_tag: bool = True,
-        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
-        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
         """Generate and execute a CREATE TABLE DDL statement.
 
@@ -1217,22 +926,17 @@ class Table(GrantsMixin):
         https://docs.databricks.com/api/gcp/workspace/tableconstraints.
         """
         schema_info = DataSchema.from_any(description).autotag()
-        partition_by = partition_by or schema_info.partition_by
-        cluster_by = cluster_by or schema_info.cluster_by
-        primary_keys = primary_keys or schema_info.primary_key_names
         comment = comment or schema_info.comment
-
-        pk_spec = PrimaryKeySpec.from_any(primary_keys, schema=schema_info)
-        fk_specs = list(ForeignKeySpec.from_any(foreign_keys, schema=schema_info))
-
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
+        partition_by = schema_info.partition_by
+        cluster_by = schema_info.cluster_by
+        primary_keys = schema_info.primary_keys
+
         for f in schema_info.children_fields:
-            f, inferred_fk = self._resolve_fk_field(f)
-            if inferred_fk is not None:
-                fk_specs.append(inferred_fk)
             if f.primary_key and f.nullable:
-                f = f.with_nullable(False)
+                f = f.with_nullable(False, inplace=True)
+
             effective_fields.append(f)
             column_definitions.append(f.to_databricks_ddl())
 
@@ -1321,10 +1025,6 @@ class Table(GrantsMixin):
 
         self._reset_cache(invalidate_cache=True)
 
-        # Apply PK/FK via the UC table_constraints API — CREATE TABLE no
-        # longer carries inline constraint DDL.
-        self._apply_constraints(pk_spec, fk_specs)
-
         if schema_info.tags:
             self.set_tags(schema_info.tags)
 
@@ -1344,52 +1044,9 @@ class Table(GrantsMixin):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = False,
-        primary_keys: "list[str] | str | PrimaryKeySpec | None" = None,
-        foreign_keys: "list[ForeignKeySpec] | dict[str, str] | None" = None,
     ) -> "Table":
         # TODO: support for table_type=TableType.EXTERNAL
         raise NotImplementedError("API path not implemented for SQL tables.")
-
-    def _apply_constraints(
-        self,
-        pk_spec: "PrimaryKeySpec | None",
-        fk_specs: "list[ForeignKeySpec]",
-    ) -> None:
-        """Apply PK then FK constraints via the UC ``table_constraints`` API.
-
-        Failures are logged and do not abort the successful table create.
-        """
-        from .constraints_api import apply_foreign_key, apply_primary_key
-
-        if pk_spec and pk_spec.columns:
-            try:
-                apply_primary_key(self, pk_spec)
-                logger.debug(
-                    "Applied PRIMARY KEY %r on %s",
-                    pk_spec.columns, self.full_name(),
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to apply PRIMARY KEY %r on %s — "
-                    "the table was created; add the constraint manually.",
-                    pk_spec.columns, self.full_name(),
-                    exc_info=True,
-                )
-
-        for fk in fk_specs:
-            try:
-                apply_foreign_key(self, fk)
-                logger.debug(
-                    "Applied FOREIGN KEY %r → %r on %s",
-                    fk.column, fk.ref, self.full_name(),
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to apply FOREIGN KEY %r → %r on %s — "
-                    "add the constraint manually.",
-                    fk.column, fk.ref, self.full_name(),
-                    exc_info=True,
-                )
 
     def delete(
         self,
@@ -1484,11 +1141,12 @@ class Table(GrantsMixin):
         self,
         data: Any,
         *,
-        mode: SaveModeArg = None,
+        mode: ModeLike = None,
         match_by: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
+        **kwargs
     ) -> None:
         return self.sql.insert_into(
             data,
@@ -1501,6 +1159,7 @@ class Table(GrantsMixin):
             wait=wait,
             raise_error=raise_error,
             spark_session=spark_session,
+            **kwargs
         )
 
     # =========================================================================

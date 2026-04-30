@@ -36,6 +36,18 @@ class BytesIOView(io.RawIOBase):
     - ``pread()`` performs cursorless reads using a view-relative offset.
     - ``read()`` advances ``pos``.
 
+    Seek semantics
+    --------------
+    Matches :class:`io.BytesIO`, not a POSIX file:
+
+    * ``SEEK_SET`` with a negative offset raises ``ValueError`` — that's
+      a user bug, not a boundary condition.
+    * ``SEEK_CUR`` / ``SEEK_END`` with an offset that would land before
+      the start of the view **clamp to 0**. This matches the in-memory
+      file convention and is what libraries like :mod:`zipfile` rely on
+      when they speculatively seek past the archive start to probe for
+      ZIP64 markers (see ``zipfile._EndRecData``).
+
     Write semantics
     ---------------
     - Writes occur at a view-relative offset.
@@ -180,19 +192,39 @@ class BytesIOView(io.RawIOBase):
                 invalidate()
 
     def _resolve_seek_pos(self, offset: int, whence: int) -> int:
+        """Resolve a seek target, matching :class:`io.BytesIO` semantics.
+
+        * ``SEEK_SET`` with ``offset < 0`` raises ``ValueError`` — that's
+          a user-visible programmer error, and ``io.BytesIO`` raises too.
+        * ``SEEK_CUR`` / ``SEEK_END`` that would land before the start
+          **clamp to 0** rather than raising. This matches ``io.BytesIO``
+          and is required for compatibility with consumers that
+          speculatively seek past the start (notably :mod:`zipfile`,
+          which probes for ZIP64 markers with ``fpin.seek(-N, SEEK_END)``
+          on tiny archives and relies on the clamp behavior).
+
+        Invalid ``whence`` values raise ``ValueError``, also matching
+        :class:`io.BytesIO`.
+        """
         offset = int(offset)
 
         if whence == io.SEEK_SET:
+            if offset < 0:
+                # Match BytesIO exactly: absolute negative positions
+                # are always bugs.
+                raise ValueError(f"negative seek value {offset}")
             new_pos = offset
         elif whence == io.SEEK_CUR:
             new_pos = self.pos + offset
+            if new_pos < 0:
+                # Clamp, don't raise. io.BytesIO behavior.
+                new_pos = 0
         elif whence == io.SEEK_END:
             new_pos = self.size + offset
+            if new_pos < 0:
+                new_pos = 0
         else:
             raise ValueError(f"invalid whence: {whence!r}")
-
-        if new_pos < 0:
-            raise ValueError("negative seek position")
 
         return new_pos
 

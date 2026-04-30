@@ -29,7 +29,7 @@ sql = DatabricksClient(host="https://<workspace>", token="<token>").sql
 
 ```python
 from yggdrasil.databricks import DatabricksClient
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 from yggdrasil.pandas.lib import pandas as pd
 from yggdrasil.polars.lib import polars as pl
 
@@ -90,7 +90,7 @@ stmt = sql.execute(f"SELECT * FROM {table_name} ORDER BY id")
 as_arrow = stmt.to_arrow_table()
 as_pandas = stmt.to_pandas()
 as_polars_lazy = stmt.to_polars()         # LazyFrame
-as_polars_df = stmt.to_polars(stream=False)  # DataFrame
+as_polars_df = stmt.to_polars()  # DataFrame
 as_spark = stmt.to_spark(spark=spark)
 as_pylist = stmt.to_pylist()              # unstructured Python list[dict]
 

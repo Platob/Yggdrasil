@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
-from yggdrasil.data import any_to_datetime, any_to_timedelta
+from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 
@@ -139,7 +139,7 @@ class _ConfigBase:
 
         wait = values.get("wait")
         if wait is not None:
-            values["wait"] = WaitingConfig.check_arg(wait)
+            values["wait"] = WaitingConfig.from_(wait)
 
         remote_cache = values.get("remote_cache")
         if remote_cache is not None:
@@ -172,7 +172,7 @@ class CacheConfig(_ConfigBase):
     table: Optional["Table"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    mode: SaveMode = SaveMode.APPEND
+    mode: Mode = Mode.APPEND
     anonymize: Literal["remove", "redact"] = "remove"
     received_from: Optional[dt.datetime] = None
     received_to: Optional[dt.datetime] = None
@@ -183,7 +183,7 @@ class CacheConfig(_ConfigBase):
     def _check_mapping(values: MutableMapping[str, Any]):
         wait = values.get("wait")
         if wait is not None:
-            values["wait"] = WaitingConfig.check_arg(wait)
+            values["wait"] = WaitingConfig.from_(wait)
 
         received_ttl = values.get("received_ttl")
         if received_ttl is not None:
@@ -200,8 +200,8 @@ class CacheConfig(_ConfigBase):
         return values
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "mode", SaveMode.parse(self.mode, default=SaveMode.APPEND))
-        object.__setattr__(self, "wait",  WaitingConfig.check_arg(self.wait))
+        object.__setattr__(self, "mode", Mode.from_(self.mode, default=Mode.APPEND))
+        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
 
         object.__setattr__(self, "request_by", _validate_request_by(self.request_by))
         object.__setattr__(self, "response_by", _validate_response_by(self.response_by))
@@ -564,7 +564,7 @@ class SendConfig(_ConfigBase):
     )
 
     def __post_init__(self):
-        object.__setattr__(self, "wait", WaitingConfig.check_arg(self.wait))
+        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
 
@@ -608,7 +608,7 @@ class SendManyConfig(_ConfigBase):
     max_in_flight: int | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "wait", WaitingConfig.check_arg(self.wait))
+        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
 

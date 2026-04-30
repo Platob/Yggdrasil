@@ -77,7 +77,7 @@ def test_nested_equals_returns_false_when_compared_to_non_nested() -> None:
 
 def test_nested_equals_returns_false_across_different_nested_type_ids() -> None:
     struct = _struct(("x", IntegerType(byte_size=8, signed=True)))
-    arr = ArrayType.from_item_field(IntegerType(byte_size=8, signed=True).to_field())
+    arr = ArrayType.from_item(IntegerType(byte_size=8, signed=True).to_field())
 
     assert struct.equals(arr) is False
     assert arr.equals(struct) is False
@@ -119,15 +119,15 @@ def test_nested_equals_map_different_value_dtype_is_false() -> None:
 
 
 def test_nested_equals_array_to_array_by_item() -> None:
-    a = ArrayType.from_item_field(StringType().to_field())
-    b = ArrayType.from_item_field(StringType().to_field())
+    a = ArrayType.from_item(StringType().to_field())
+    b = ArrayType.from_item(StringType().to_field())
 
     assert a.equals(b) is True
 
 
 def test_nested_equals_array_different_item_dtype_is_false() -> None:
-    a = ArrayType.from_item_field(StringType().to_field())
-    b = ArrayType.from_item_field(IntegerType().to_field())
+    a = ArrayType.from_item(StringType().to_field())
+    b = ArrayType.from_item(IntegerType().to_field())
 
     assert a.equals(b) is False
 
@@ -143,5 +143,5 @@ def test_nested_equals_respects_check_metadata_flag() -> None:
 
 def test_nested_type_id_is_nested_variant() -> None:
     assert _struct().type_id == DataTypeId.STRUCT
-    assert ArrayType.from_item_field(StringType().to_field()).type_id == DataTypeId.ARRAY
+    assert ArrayType.from_item(StringType().to_field()).type_id == DataTypeId.ARRAY
     assert MapType.from_key_value(StringType(), StringType()).type_id == DataTypeId.MAP

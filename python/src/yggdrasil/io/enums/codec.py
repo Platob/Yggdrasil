@@ -19,14 +19,30 @@ Streaming support is advertised by the :attr:`is_streaming` flag so
 callers can decide whether to trust :meth:`compress` / :meth:`decompress`
 with a large input, or fall back to a different strategy for
 non-streaming codecs.
+
+Implementation note — context managers
+--------------------------------------
+All concrete streaming reader/writer adapters are driven through ``with``
+blocks in :meth:`_stream_roundtrip` and :meth:`read_start_end`. This
+matters specifically for ``zstandard.ZstdCompressionWriter``, which
+rejects ``write()`` calls when not inside an active context manager
+(raises ``ZstdError: write() must be called from an active context
+manager``). The ``with`` pattern also stops silently swallowing
+``close()``-time errors, which are meaningful for formats that write
+the final frame/footer on close (gzip, zstd, lz4): a swallowed error
+there produces a truncated output that decompresses cleanly right up to
+the point where the real data ends.
 """
 from __future__ import annotations
 
 import abc
 import importlib
 import io as _io
+import logging
 import zlib
 from typing import IO, Any, TYPE_CHECKING
+
+from ...lazy_imports import mime_type_class, bytes_io_class
 
 if TYPE_CHECKING:
     from ..buffer import BytesIO
@@ -34,6 +50,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Codec",
+    "Codecs",
     "GZIP",
     "ZSTD",
     "LZ4",
@@ -47,7 +64,7 @@ __all__ = [
 ]
 
 _CHUNK = 256 * 1024  # 256 KiB streaming chunk size
-
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -77,12 +94,6 @@ def _drain(fh: "IO[bytes]") -> bytes:
         return fh.read()
     finally:
         fh.seek(pos)
-
-
-def _codec_from_mime(mt: "MimeType | None") -> "Codec | None":
-    if mt is None or not mt.is_codec:
-        return None
-    return _CODEC_BY_MIME.get(mt)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +157,11 @@ class Codec(abc.ABC):
         Subclasses override when the underlying library exposes a
         streaming decoder. Returning ``None`` signals the base class
         to fall back to :meth:`decompress_bytes` on the full stream.
+
+        The returned object must support the context-manager protocol;
+        :meth:`_stream_roundtrip` and :meth:`read_start_end` drive it
+        with ``with`` so that any final buffered state is flushed and
+        errors from close surface to the caller.
         """
         return None
 
@@ -155,6 +171,12 @@ class Codec(abc.ABC):
         Subclasses override when the underlying library exposes a
         streaming encoder. Returning ``None`` signals the base class
         to fall back to :meth:`compress_bytes` on the full input.
+
+        The returned object must support the context-manager protocol;
+        :meth:`_stream_roundtrip` drives it with ``with`` so that the
+        final frame/footer is written and errors from close surface
+        to the caller. This is also how ``zstandard``'s writer is
+        satisfied — it rejects ``write()`` outside an active context.
         """
         return None
 
@@ -180,6 +202,7 @@ class Codec(abc.ABC):
     def decompress(
         self,
         src: "IO[bytes] | BytesIO",
+        copy: bool = True
     ) -> "BytesIO":
         """Decompress *src* into a new :class:`BytesIO`.
 
@@ -203,14 +226,22 @@ class Codec(abc.ABC):
         Both directions follow the same shape: wrap src, seek-0,
         stream-or-fallback, return a new BytesIO, restore cursor in
         the finally.
-        """
-        from ..buffer.bytes_io import BytesIO
 
-        fh = BytesIO.parse(src)
+        Streaming adapters are driven with ``with`` so that:
+
+        - ``zstandard.ZstdCompressionWriter`` accepts writes (it only
+          permits them inside an active context manager).
+        - ``close()``-time errors — which matter for formats whose
+          footer is only written on close — surface to the caller
+          instead of being swallowed silently.
+        """
+        bio = bytes_io_class()
+
+        fh = bio.from_(src)
         saved = fh.tell()
         try:
             fh.seek(0)
-            out = BytesIO()
+            out = bio()
 
             if _compress:
                 writer = self._open_compress_writer(out)
@@ -218,36 +249,30 @@ class Codec(abc.ABC):
                     # Non-streaming codec — fall back to full-in-memory.
                     out.write(self.compress_bytes(fh.read()))
                 else:
-                    try:
+                    with writer:
                         while True:
                             chunk = fh.read(_CHUNK)
                             if not chunk:
                                 break
                             writer.write(chunk)
-                    finally:
-                        try:
-                            writer.close()
-                        except Exception:
-                            pass
             else:
                 reader = self._open_decompress_reader(fh)
                 if reader is None:
                     # Non-streaming codec — fall back to full-in-memory.
                     out.write(self.decompress_bytes(fh.read()))
                 else:
-                    try:
+                    with reader:
                         while True:
                             chunk = reader.read(_CHUNK)
                             if not chunk:
                                 break
                             out.write(chunk)
-                    finally:
-                        try:
-                            reader.close()
-                        except Exception:
-                            pass
 
             out.seek(0)
+
+            if fh._media_type is not None:
+                out._media_type = fh._media_type.with_codec(self)
+
             return out
         finally:
             try:
@@ -292,8 +317,6 @@ class Codec(abc.ABC):
 
         fh = BytesIO(src, copy=False).view(pos=0)
         saved = fh.tell()
-
-        reader: IO[bytes] | None = None
         try:
             fh.seek(0)
 
@@ -302,13 +325,9 @@ class Codec(abc.ABC):
                 data = self.decompress_bytes(_drain(fh))
                 return data[:n_start], (data[-n_end:] if n_end else b"")
 
-            return self._collect_head_tail(reader, n_start, n_end, chunk_size)
+            with reader:
+                return self._collect_head_tail(reader, n_start, n_end, chunk_size)
         finally:
-            if reader is not None:
-                try:
-                    reader.close()
-                except Exception:
-                    pass
             try:
                 fh.seek(saved)
             except Exception:
@@ -350,7 +369,7 @@ class Codec(abc.ABC):
     # ------------------------------------------------------------------
 
     @classmethod
-    def parse(cls, obj: Any, default: "Codec | None" = None) -> "Codec | None":
+    def from_(cls, obj: Any, default: "Codec | None" = ...) -> "Codec | None":
         """Parse an arbitrary input into a Codec instance.
 
         Accepts:
@@ -371,19 +390,23 @@ class Codec(abc.ABC):
             if hit is not None:
                 return hit
 
-        from .mime_type import MimeType as _MimeType
-
-        mt = _MimeType.parse(obj, default=None)
-        if mt is None or not mt.is_codec:
+        mt = mime_type_class().from_(obj, default=None)
+        if mt is None:
+            if default is ...:
+                raise ValueError(f"Cannot resolve Codec from non-codec MIME type {obj!r}")
             return default
-
-        return cls.from_mime(mt) or default
+        return cls.from_mime(mt, default=default)
 
     @classmethod
-    def from_mime(cls, mime: "MimeType | str") -> "Codec | None":
-        from .mime_type import MimeType as _MimeType
-        mt = mime if isinstance(mime, _MimeType) else _MimeType.parse_str(mime)
-        return _codec_from_mime(mt)
+    def from_mime(cls, mime: "MimeType | str", default: Any = ...) -> "Codec | None":
+        mime = mime_type_class().from_(mime, default=None)
+
+        if mime is None or not mime.is_codec:
+            if default is ...:
+                raise ValueError(f"Cannot resolve Codec from non-codec MIME type {mime!r}")
+            return default
+
+        return _CODEC_BY_MIME.get(mime)
 
     @classmethod
     def all(cls) -> list["Codec"]:
@@ -440,14 +463,36 @@ class _ZstdCodec(Codec):
         return zstd.ZstdCompressor().compress(data)
 
     def decompress_bytes(self, data: bytes) -> bytes:
+        """Decompress *data*, tolerating frames with or without content size.
+
+        :meth:`compress` (streaming) produces frames WITHOUT a declared
+        content-size field, which breaks ``ZstdDecompressor.decompress()``
+        (the single-shot bytes API requires the size). Routing through
+        ``stream_reader`` sidesteps the requirement — it decompresses
+        whatever the frame actually contains, regardless of whether the
+        header declares a size.
+
+        Marginally slower than the bytes API for single-shot-produced
+        frames (one extra object construction per call) but the
+        compatibility win is worth it: any blob produced by any
+        :class:`_ZstdCodec` method now decompresses through every other
+        :class:`_ZstdCodec` method.
+        """
+        import io as _stdlib_io
         zstd = _runtime_import("zstandard", "zstandard")
-        return zstd.ZstdDecompressor().decompress(data)
+        with zstd.ZstdDecompressor().stream_reader(_stdlib_io.BytesIO(data)) as r:
+            return r.read()
 
     def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
         zstd = _runtime_import("zstandard", "zstandard")
         return zstd.ZstdDecompressor().stream_reader(fh, closefd=False)
 
     def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+        # IMPORTANT: ``ZstdCompressionWriter.write()`` raises ZstdError
+        # unless the writer is inside an active context manager. The
+        # base class's :meth:`_stream_roundtrip` enters it via
+        # ``with writer:`` so this just returns the writer — no need
+        # to enter manually here.
         zstd = _runtime_import("zstandard", "zstandard")
         return zstd.ZstdCompressor().stream_writer(fh, closefd=False)
 
@@ -690,12 +735,9 @@ class _ZlibStreamWriter(_io.RawIOBase):
     def close(self) -> None:
         if not self._closed_for_writes:
             self._closed_for_writes = True
-            try:
-                tail = self._comp.flush()
-                if tail:
-                    self._fh.write(tail)
-            finally:
-                pass
+            tail = self._comp.flush()
+            if tail:
+                self._fh.write(tail)
         # Do NOT close self._fh — it's owned by the caller.
         super().close()
 
@@ -760,3 +802,16 @@ def _build_codec_by_mime() -> dict["MimeType", Codec]:
 
 
 _CODEC_BY_MIME = _build_codec_by_mime()
+
+
+class Codecs:
+    """Singleton class for accessing all registered codecs."""
+    GZIP = GZIP
+    ZSTD = ZSTD
+    LZ4 = LZ4
+    BZIP2 = BZIP2
+    XZ = XZ
+    SNAPPY = SNAPPY
+    BROTLI = BROTLI
+    ZLIB = ZLIB
+    LZMA = LZMA

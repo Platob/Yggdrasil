@@ -17,7 +17,7 @@ __all__ = ["Secrets"]
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Secrets(DatabricksService):
 
     def __getitem__(self, item):

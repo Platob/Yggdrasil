@@ -21,7 +21,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class IAM(DatabricksService):
 
     @property
@@ -43,7 +43,7 @@ class IAM(DatabricksService):
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class IAMGroups(IAM):
 
     def create(
@@ -219,7 +219,7 @@ class IAMGroups(IAM):
                 raise
 
 
-@dataclass(frozen=True)
+@dataclass
 class IAMUsers(IAM):
 
     def create(

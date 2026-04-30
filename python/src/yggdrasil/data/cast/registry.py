@@ -302,7 +302,7 @@ def convert(
       - Raises TypeError if no conversion path exists.
     """
     from yggdrasil.arrow.python_defaults import default_scalar
-    from yggdrasil.data.cast import CastOptions
+    from yggdrasil.data.cast.options import CastOptions
 
     is_optional, target_hint = unwrap_optional(target_hint)
 
@@ -318,7 +318,7 @@ def convert(
             return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]
 
     # Normalize options (CastOptions, Arrow types, kwargs, etc.)
-    options = CastOptions.check(options=options, **kwargs)
+    options = CastOptions.check(options, **kwargs)
 
     if value is None:
         return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]

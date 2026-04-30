@@ -40,7 +40,7 @@ print(convert("19.95", Decimal))
 
 ```python
 import yggdrasil.arrow as pa
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 schema = pa.schema([pa.field("id", pa.int64())])
 opts = CastOptions.check(schema, strict_match_names=True)

@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 _SCHEMA_INFO_CACHE: ExpiringDict[str, SchemaInfo] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Schemas(DatabricksService):
     """Collection-level service for Unity Catalog schemas.
 

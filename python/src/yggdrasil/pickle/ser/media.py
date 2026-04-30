@@ -87,7 +87,7 @@ class CodecSerialized(Serialized[Codec]):
     @property
     def value(self) -> Codec:
         name = self.decode().decode("utf-8")
-        result = Codec.parse(name)
+        result = Codec.from_(name)
         if result is None:
             raise ValueError(f"Unknown Codec name: {name!r}")
         return result
@@ -146,7 +146,7 @@ class MediaTypeSerialized(Serialized[MediaType]):
 
         c = None
         if codec_name:
-            c = Codec.parse(codec_name)
+            c = Codec.from_(codec_name)
             if c is None:
                 raise ValueError(f"Unknown Codec name: {codec_name!r}")
 

@@ -1,308 +1,237 @@
-"""Abstract filesystem path — ``pathlib.Path``-like API, no inheritance.
+"""Abstract filesystem path — ``pathlib.Path``-like API over :class:`URL`.
 
-Modeled on :class:`yggdrasil.databricks.fs.path.DatabricksPath` so local,
-remote, and object-store paths share the same surface. Concrete subclasses
-fill in a small set of hooks; everything else (pure-path manipulation,
-``read_text`` / ``write_text``, ``touch``, ``glob`` / ``rglob``, ``copy_to``)
-comes from this base class for free.
+Design
+------
 
-Hierarchy
----------
-::
+* :class:`Path` is *not* a dataclass and has no metadata cache.
+  Pure-path manipulation (``parent``, ``joinpath``, ``name``, …)
+  delegates to :class:`URL`. Filesystem-flavoured calls (``stat``,
+  ``ls``, ``mkdir``, ``read_bytes``, ``copy_to``, …) live here on
+  top of a small abstract surface.
+* Subclasses implement seven hooks: :meth:`full_path`,
+  :meth:`_stat`, :meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_file`,
+  :meth:`_remove_dir`, :meth:`_open`. Everything else derives.
+* :class:`Path` participates in the :class:`Disposable` graph from
+  :mod:`yggdrasil.disposable` so temp-file lifecycle and PathIO
+  ownership compose with the rest of the codebase.
 
-    Path (abstract, dataclass)
-    ├── LocalPath     — pathlib-backed, scheme ``"file"``
-    └── …             — other backends plug in separately
+Lifecycle rules
+---------------
 
-Side classes
-------------
-- :class:`PathKind`   — file / directory / symlink / other / missing enum
-- :class:`StatResult` — dataclass mirroring the useful bits of ``os.stat_result``
+Every Path is constructed in the **open** state — :meth:`Disposable.open`
+runs from the constructor unless ``auto_open=False`` is passed —
+so naive callers never have to think about it. Acquire is a true
+no-op (Path doesn't materialize files just because someone built a
+reference to one). Release honors :attr:`temporary` and unlinks the
+backing file when set, dirty-bit-irrelevant.
+
+The lifecycle ``open()`` is intentionally separate from the I/O
+``open_io()``. ``Disposable.open()`` takes no arguments (it's the
+lifecycle "acquire") and returns ``self``; ``open_io(mode, …)`` takes
+a mode and returns a :class:`PathIO`. The earlier draft tried to
+overload ``open`` to mean both, which produced an infinite recursion
+inside the Path-level ``open(mode)`` shadow. The names are kept
+distinct here on purpose.
+
+Temporary paths
+---------------
+
+:attr:`temporary` is a settable flag. Default ``False``. When True,
+:meth:`_release` unlinks the underlying file (``missing_ok=True``,
+exceptions swallowed). :meth:`with_tmp_name` mints a unique sibling
+or child path with the flag set; :meth:`as_temporary` /
+:meth:`as_persistent` flip it on an existing instance.
+
+When a :class:`PathIO` is opened against a temporary path, the
+PathIO adds the path as an owned child of the IO via
+:meth:`Disposable.add_owned`. The graph's claim refcount keeps
+the path alive until every PathIO over it has closed AND the path
+itself has closed — only then does the unlink fire.
+
+Staging
+-------
+
+:meth:`make_staging` is the canonical entry point for "give me a
+fresh temporary file under this directory, and clean up any
+expired siblings while you're there." All backends share:
+
+- the TTL-encoded filename format (``…-<start_ts>-<end_ts>.<ext>``)
+  so external sweepers can age files lexically without coordinating
+  with the in-process rate limiter;
+- the per-parent rate-limited sweep (``ExpiringDict``-backed)
+  so a high-throughput caller doesn't flood the backend's listing
+  API on every staging call.
+
+Subclasses that need backend-specific bring-up (UC hierarchy for
+:class:`VolumePath`, prefix construction for an S3 bucket, …)
+provide their own factory that builds the parent path, then call
+:meth:`make_staging` on it.
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import fnmatch
-import mmap
+import logging
 import os
 import pathlib
+import re
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import (
     IO,
-    TYPE_CHECKING,
     Any,
     ClassVar,
+    Iterable,
     Iterator,
     List,
     Optional,
     Tuple,
-    Union,
+    Union, TYPE_CHECKING,
 )
 
-if TYPE_CHECKING:
-    from .filesystem import FileSystem
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.disposable import Disposable
+from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.enums import MediaType
+from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.url import URL
+from yggdrasil.lazy_imports import local_path_class, tabular_io_class, databricks_path_class
 
-__all__ = ["PathKind", "StatResult", "Path", "register_path_class"]
+
+__all__ = ["Path", "register_path_class"]
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Path class registry — used by Path.__new__ to pick a concrete subclass
+# Subclass registry
 # ---------------------------------------------------------------------------
-#
-# Registration is automatic via ``Path.__init_subclass__``. The order
-# matters: the first class whose :meth:`_match` returns True wins.
-# :class:`LocalPath` is explicitly the fallback and is skipped during
-# iteration so more specific backends (Databricks, S3, …) take priority.
 
 _PATH_REGISTRY: List[type] = []
 
 
 def register_path_class(cls: type) -> type:
-    """Register *cls* as a candidate for :meth:`Path.__new__` dispatch.
-
-    Subclasses are auto-registered via ``__init_subclass__``; call this
-    only for something unusual (e.g. a dynamically-created subclass).
-    """
+    """Register *cls* as a candidate for :meth:`Path.__new__` dispatch."""
     if cls not in _PATH_REGISTRY:
         _PATH_REGISTRY.append(cls)
     return cls
 
 
-def _select_path_class(obj: Any) -> type:
+def _select_path_class(obj: Any, default: type = ...) -> type:
     """Pick the best :class:`Path` subclass for *obj*.
 
-    Exact-type match wins (``Path(some_path)`` stays the same type).
-    Then registered subclasses get a shot via their ``_match`` classmethod.
-    :class:`LocalPath` is the fallback when nothing else claims the input.
+    Order: exact-type match, registered handles() match, LocalPath
+    fallback. Lazy-loaded to break import cycles.
     """
-    # Local import to avoid a circular import at module load time.
-    from .local import LocalPath
-
     if isinstance(obj, Path):
-        return type(obj)
+        target = type(obj)
+        if target is not Path:
+            return target
 
     for candidate in _PATH_REGISTRY:
-        if candidate is LocalPath:
-            continue
         try:
-            if candidate._match(obj):
+            if candidate.handles(obj):
                 return candidate
         except Exception:
-            # A misbehaving _match must not break dispatch — we just try
-            # the next candidate and fall back to LocalPath if needed.
             continue
-    return LocalPath
 
+    databricks_path_class()
 
-_SEP = "/"
+    for candidate in _PATH_REGISTRY:
+        try:
+            if candidate.handles(obj):
+                return candidate
+        except Exception:
+            continue
+
+    default = local_path_class() if default is ... else default
+    return default
 
 
 # ---------------------------------------------------------------------------
-# PathKind + StatResult side classes
+# Staging sweep rate-limit
+# ---------------------------------------------------------------------------
+#
+# Process-global TTL'd dict mapping ``parent.full_path()`` -> a sentinel
+# value.  An entry's *presence* signals "swept recently"; its absence
+# signals "due for a sweep."  ``ExpiringDict`` handles the expiry, the
+# size bound, and the thread-safety; we just use it as a "have we done
+# this in the last N seconds" oracle.
+
+_STAGING_SWEEP_INTERVAL_S: float = 300.0       # 5 minutes default
+_STAGING_SWEEP_MAX_KEYS: int = 256
+_STAGING_SWEPT: ExpiringDict[str, bool] = ExpiringDict(
+    default_ttl=_STAGING_SWEEP_INTERVAL_S,
+    max_size=_STAGING_SWEEP_MAX_KEYS,
+)
+
+
+# Match a TTL-encoded staging filename's trailing ``-<start>-<end>(.ext)*``.
+# Group 2 is the end_ts (epoch seconds).  Anchored at end of string so the
+# extension trail is part of the match; works for any prefix scheme that
+# precedes the timestamps with a dash.
+_STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)(?:\.[^./]+)*$")
+
+
+# ---------------------------------------------------------------------------
+# Path — abstract, URL-delegating
 # ---------------------------------------------------------------------------
 
 
-class PathKind(str, Enum):
-    """What a path points at. ``MISSING`` is the explicit "nothing here" value
-    so callers don't have to handle ``None`` for non-existent paths.
+class Path(Disposable, os.PathLike, ABC):
+    """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
+
+    See the module docstring for the design and lifecycle rules.
+
+    Abstract hooks
+    --------------
+    - :meth:`full_path`     — absolute string rendering.
+    - :meth:`_stat`         — backend stat → :class:`PathStats`.
+    - :meth:`_ls`           — list children.
+    - :meth:`_mkdir`        — create directory.
+    - :meth:`_remove_file`  — delete file.
+    - :meth:`_remove_dir`   — delete directory.
+    - :meth:`_open`         — open file, return :class:`PathIO`.
+    - :meth:`pread`         — positional read.
+    - :meth:`pwrite`        — positional write.
+
+    For backends without a native random-access primitive, the
+    :meth:`pread` / :meth:`pwrite` overrides can delegate to the
+    concrete helpers :meth:`_pread_via_io` (open + read) and
+    :meth:`_pwrite_via_rmw` (read-modify-write). Those helpers are
+    correct but slow; subclasses with a real positional API
+    (``os.pread``, HTTP range requests) should implement their
+    own. Making these abstract — rather than providing the slow
+    helpers as defaults — forces every backend to think about
+    whether it has a fast path, instead of silently inheriting an
+    O(file size) write.
     """
 
-    FILE = "file"
-    DIRECTORY = "directory"
-    SYMLINK = "symlink"
-    OTHER = "other"
-    MISSING = "missing"
-
-    @property
-    def exists(self) -> bool:
-        return self is not PathKind.MISSING
-
-    @property
-    def is_file(self) -> bool:
-        return self is PathKind.FILE
-
-    @property
-    def is_dir(self) -> bool:
-        return self is PathKind.DIRECTORY
-
-
-@dataclass(frozen=True, slots=True)
-class StatResult:
-    """Minimal ``os.stat_result`` stand-in usable across backends.
-
-    Backends with richer metadata (ETag, content-type, owner…) should
-    subclass and extend rather than cram extras into ``mode``.
-    """
-
-    size: int = 0
-    mtime: float = 0.0
-    kind: PathKind = PathKind.MISSING
-    mode: int = 0
-
-    # os.stat_result is subscript-compatible — keep that affordance.
-    def __getitem__(self, idx: int) -> Any:
-        return (self.mode, 0, 0, 0, 0, 0, self.size, 0, self.mtime, 0)[idx]
-
-    # Drop-in aliases for code that already reads os.stat_result.
-    @property
-    def st_size(self) -> int:
-        return self.size
-
-    @property
-    def st_mtime(self) -> float:
-        return self.mtime
-
-    @property
-    def st_mode(self) -> int:
-        return self.mode
-
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
-
-
-def _split(raw: str) -> List[str]:
-    """Split a path string into segments, normalizing backslashes."""
-    if not raw:
-        return []
-    return [p for p in raw.replace("\\", _SEP).split(_SEP) if p]
-
-
-def _flatten(parts: Any) -> List[str]:
-    """Flatten a path-ish input into a list of string segments.
-
-    Accepts :class:`Path`, ``pathlib.PurePath``, strings, bytes, or any
-    iterable of those. Mirrors how :class:`pathlib.PurePath` treats its
-    constructor arguments — permissive on input shape, strict on contents.
-    """
-    if parts is None:
-        return []
-    if isinstance(parts, Path):
-        return list(parts.parts)
-    if isinstance(parts, (str, bytes, os.PathLike)):
-        raw = os.fspath(parts) if isinstance(parts, os.PathLike) else parts
-        if isinstance(raw, bytes):
-            raw = raw.decode()
-        return _split(raw)
-    if isinstance(parts, (list, tuple, set)):
-        out: List[str] = []
-        for item in parts:
-            out.extend(_flatten(item))
-        return out
-    # Last-ditch string coercion.
-    return _split(str(parts))
-
-
-def _coerce_mtime(value: Any) -> Optional[float]:
-    """Normalize an mtime-ish value to float seconds since epoch.
-
-    Handles Python datetime, ISO-8601 strings, and millisecond epoch ints
-    that backends sometimes hand back.
-    """
-    if value is None:
-        return None
-    if isinstance(value, dt.datetime):
-        return value.timestamp()
-    if isinstance(value, str):
-        return dt.datetime.fromisoformat(value).timestamp()
-    out = float(value)
-    # Anything past y2286 is almost certainly milliseconds, not seconds.
-    if out > 10_000_000_000:
-        out = out / 1000.0
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Path — abstract, pathlib.Path-like, dataclass-shaped like DatabricksPath
-# ---------------------------------------------------------------------------
-
-
-@dataclass(eq=False, init=False)
-class Path(ABC):
-    """Abstract filesystem path with ``pathlib.Path``-like behavior.
-
-    Shape is deliberately aligned with
-    :class:`yggdrasil.databricks.fs.path.DatabricksPath`:
-
-    - ``parts`` is a plain ``List[str]`` of segments, root-free.
-    - ``anchor`` is the absolute prefix (``""``, ``"/"``, ``"C:\\"``…).
-      Backends with a namespace rendering (``DBFS``, ``S3``) typically
-      leave this empty and override :meth:`full_path` instead.
-    - Cached metadata (``_is_file``, ``_is_dir``, ``_size``, ``_mtime``)
-      is filled in lazily by :meth:`_refresh_metadata`. Subclasses should
-      populate these in a single round-trip when possible.
-
-    Dispatching constructor
-    -----------------------
-    ``Path("dbfs:/x")``, ``Path("/tmp/y")``, ``Path(pathlib.Path(...))``
-    pick the right concrete subclass automatically. The first registered
-    class whose ``_match`` claims the input wins; :class:`LocalPath` is
-    the fallback.
-
-    Abstract hooks (minimal set a backend must provide)
-    ---------------------------------------------------
-    - :meth:`full_path`          — absolute string rendering
-    - :meth:`_refresh_metadata`  — fetch remote status into cache
-    - :meth:`_ls_impl`           — list children (recursive flag)
-    - :meth:`_mkdir_impl`        — create the directory
-    - :meth:`_remove_file_impl`  — delete this file
-    - :meth:`_remove_dir_impl`   — delete this directory
-    - :meth:`open`               — return a file-like handle
-
-    Everything else (``name``, ``stem``, ``parent``, ``parents``,
-    ``joinpath``, ``read_text`` / ``write_text``, ``touch``, ``glob``,
-    ``copy_to``, …) is derived here and stays consistent across backends.
-    """
-
-    #: URL-style scheme for this backend. Empty for local-style paths.
     scheme: ClassVar[str] = ""
+    __slots__ = ("url", "temporary")
 
-    # ── Core fields ──────────────────────────────────────────────────
-    parts: List[str] = field(default_factory=list)
-    anchor: str = ""
+    # Override on a subclass to tighten/loosen the staging-sweep rate
+    # limit for that backend.  The module-level default applies to any
+    # backend that doesn't override.  Currently the rate limit is shared
+    # across backends via the module-level ExpiringDict — overriding here
+    # changes only the *check* threshold the override caller sees, not
+    # the dict TTL.  In practice 5 min is fine for every known backend.
+    _STAGING_SWEEP_INTERVAL: ClassVar[float] = _STAGING_SWEEP_INTERVAL_S
 
-    # ── Cached metadata (excluded from eq/hash/repr) ─────────────────
-    _is_file: Optional[bool] = field(
-        repr=False, hash=False, compare=False, default=None
-    )
-    _is_dir: Optional[bool] = field(repr=False, hash=False, compare=False, default=None)
-    _size: Optional[int] = field(repr=False, hash=False, compare=False, default=None)
-    _mtime: Optional[float] = field(repr=False, hash=False, compare=False, default=None)
-
-    # Optional filesystem handle. Set by :meth:`FileSystem.path`.
-    _fs: Optional["FileSystem"] = field(
-        repr=False, hash=False, compare=False, default=None
-    )
-
-    # ================================================================ #
-    # Registry + dispatching constructor                                #
-    # ================================================================ #
+    # ==================================================================
+    # Construction / dispatch
+    # ==================================================================
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        # Every concrete Path subclass is a dispatch candidate.
+        try:
+            super().__init_subclass__(**kwargs)
+        except TypeError:
+            pass
         register_path_class(cls)
 
     def __new__(cls, obj: Any = None, *args: Any, **kwargs: Any) -> "Path":
-        """Dispatch to the correct subclass when called on :class:`Path`.
-
-        ``Path("/tmp/foo")``       → :class:`LocalPath`
-        ``Path("dbfs:/x/y")``      → Databricks / DBFS path (if registered)
-        ``Path(existing_path)``    → same type as ``existing_path``
-
-        When called on a concrete subclass, returns a plain instance —
-        no dispatch — so internal ``cls(parts=…, anchor=…)`` calls work
-        as usual.
-        """
-        del args, kwargs  # consumed by __init__
+        del args, kwargs
         if cls is Path:
             target = _select_path_class(obj)
-            # target.__new__ won't recurse: target is a concrete subclass
-            # so the ``cls is Path`` branch above doesn't fire.
             return target.__new__(target, obj)
         return object.__new__(cls)
 
@@ -310,292 +239,473 @@ class Path(ABC):
         self,
         obj: Any = None,
         *,
-        parts: Optional[List[str]] = None,
-        anchor: str = "",
-        _is_file: Optional[bool] = None,
-        _is_dir: Optional[bool] = None,
-        _size: Optional[int] = None,
-        _mtime: Optional[float] = None,
-        _fs: Optional["FileSystem"] = None,
+        url: URL | None = None,
+        temporary: bool = False,
+        auto_open: bool = True,
     ) -> None:
-        """Construct a :class:`Path`.
+        Disposable.__init__(self)
 
-        Two usage shapes, detected by argument type:
-
-        * ``Path(obj)`` — parse a string / :class:`os.PathLike` /
-          :class:`pathlib.PurePath` / other :class:`Path`. The class
-          typically runs ``type(self).parse(obj)`` to get fields.
-        * ``Path(parts=[...], anchor="/")`` — build from explicit fields.
-          This is what :func:`dataclasses.replace` (used by
-          :meth:`_copy_with`) and the FS factory reach for.
-        """
-        if obj is not None and not isinstance(obj, list):
-            # String / PathLike / Path — delegate to the class's parser.
-            if isinstance(obj, Path):
-                parsed = obj
-            else:
-                parsed = type(self).parse(obj)
-            self.parts = list(parsed.parts)
-            self.anchor = parsed.anchor
+        if url is not None:
+            resolved = URL.from_(url)
+        elif obj is None:
+            resolved = URL.empty()
+        elif isinstance(obj, Path):
+            resolved = obj.url
         else:
-            # Explicit field form — also handles ``obj=[...]`` for symmetry
-            # with how pathlib.PurePath accepts a list of segments.
-            if obj is not None and parts is None:
-                parts = obj  # type: ignore[assignment]
-            self.parts = list(parts) if parts is not None else []
-            self.anchor = anchor
-        self._is_file = _is_file
-        self._is_dir = _is_dir
-        self._size = _size
-        self._mtime = _mtime
-        self._fs = _fs
+            resolved = URL.from_(obj)
 
-    @classmethod
-    def _match(cls, obj: Any) -> bool:
-        """Return True if ``cls`` is the right Path type for *obj*.
+        self.url = resolved
+        self.temporary = bool(temporary)
 
-        Default rule: match the URL-style scheme (``scheme://`` or
-        ``scheme:/``) against the class's :attr:`scheme`. Backends with
-        namespace prefixes (``/Volumes/``, ``/Workspace/``, …) should
-        override to inspect the head of the input.
+        if auto_open:
+            Disposable.open(self)
+
+    # ==================================================================
+    # Disposable hooks
+    # ==================================================================
+
+    def _acquire(self) -> None:
+        return
+
+    def _release(self, committed: bool) -> None:
+        del committed
+        if not self.temporary:
+            return
+        try:
+            self.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # ==================================================================
+    # Temporary-flag builders
+    # ==================================================================
+
+    def as_temporary(self) -> "Path":
+        self.temporary = True
+        return self
+
+    def as_persistent(self) -> "Path":
+        self.temporary = False
+        return self
+
+    def with_tmp_name(
+        self,
+        prefix: str = "tmp-",
+        suffix: str = "",
+        ttl: int | None = 86400,
+        append: bool = True,
+        *,
+        temporary: bool = True,
+    ) -> "Path":
+        """Mint a unique sibling/child path with a TTL-encoded name.
+
+        Filename layout: ``{prefix}{token}-{start}-{end}{suffix}`` so
+        :meth:`make_staging`'s sweep can recognize and age it.
         """
-        if not cls.scheme or not isinstance(obj, str):
-            return False
-        head = f"{cls.scheme}:"
-        return obj.startswith(f"{head}//") or obj.startswith(f"{head}/")
+        seed = os.urandom(8).hex()
+        prefix = prefix or ""
+        suffix = suffix or ""
 
-    @classmethod
-    def parse(cls, obj: Any) -> "Path":
-        """Build an instance from a string, list, or another :class:`Path`.
+        if ttl is None:
+            name = f"{prefix}{seed}{suffix}"
+        else:
+            start = int(time.time())
+            end = start + ttl
+            name = f"{prefix}{seed}-{start}-{end}{suffix}"
 
-        Called on the abstract :class:`Path`, dispatches through the
-        registry (same rules as :meth:`__new__`). Subclasses override to
-        handle namespace prefixes (``dbfs:/…``) or URL schemes.
+        out = (self if append else self.parent) / name
+        if temporary:
+            out.as_temporary()
+        return out
+
+    # ==================================================================
+    # Staging — generic, rate-limited, sweep-aware
+    # ==================================================================
+
+    def make_staging(
+        self,
+        path: Union[str, Iterable[str], None] = None,
+        *,
+        ttl: int = 3600,
+        media_type: Union["MediaType", str, None] = None,
+        sweep: bool = True,
+        force_sweep: bool = False,
+    ) -> "Path":
+        """Mint a fresh temporary staging file under this directory.
+
+        ``path`` (optional) joins onto ``self`` first — pass a string
+        like ``"sub/dir"`` or a list of segments ``["sub", "dir"]`` to
+        nest the staging area under a subpath.  ``None`` (default) uses
+        ``self`` as the parent directly.
+
+        Pre-cleans the parent directory of expired siblings with the
+        same TTL-encoded name format, rate-limited per-parent so
+        high-throughput callers don't flood the backend's listing API.
+        Default rate limit: one sweep per parent per
+        :data:`_STAGING_SWEEP_INTERVAL_S` seconds (process-global).
+
+        Returns a ``temporary=True`` :class:`Path` whose name encodes
+        the lifetime so external sweepers can age it lexically.
+
+        Subclass hook
+        -------------
+        Subclasses needing backend-specific bring-up (e.g. UC hierarchy
+        creation for :class:`VolumePath`) compute the parent path and
+        call ``super().make_staging(...)``.  See
+        :meth:`VolumePath.staging_path` for the canonical example.
         """
-        if cls is Path:
-            target = _select_path_class(obj)
-            return target.parse(obj)
-        if isinstance(obj, Path):
-            return obj
-        raw = os.fspath(obj) if isinstance(obj, os.PathLike) else str(obj or "")
-        anchor = _SEP if raw.startswith(_SEP) or raw.startswith("\\") else ""
-        # Construct via the dataclass field form so we don't recurse through
-        # __init__'s string-parsing branch.
-        inst: Path = object.__new__(cls)
-        Path.__init__(inst, parts=_split(raw), anchor=anchor)
-        return inst
+        parent = self if path is None else self._join_segments(path)
 
-    # ================================================================ #
-    # Safe parsing — type-checked entry points                          #
-    # ================================================================ #
-    #
-    # ``parse`` is permissive: anything coerces to str. ``from_any`` and
-    # its friends are strict — they reject input they can't reliably
-    # interpret, and the error message tells the caller what to pass
-    # instead. Use these whenever input provenance is untrusted (user
-    # config, framework dataclass fields, etc.).
+        if sweep:
+            try:
+                parent._sweep_expired_staging(force=force_sweep)
+            except Exception:
+                # Sweep is best-effort.  A failed listing on a
+                # not-yet-existing parent is fine — the staging write
+                # below will create it.
+                LOGGER.debug(
+                    "Staging sweep failed for %s; continuing",
+                    parent, exc_info=True,
+                )
 
-    @classmethod
-    def from_any(cls, obj: Any) -> "Path":
-        """Safe dispatch from any path-like input.
-
-        Accepts :class:`Path`, :class:`pathlib.PurePath`, ``str``,
-        ``bytes``, or any :class:`os.PathLike`. Raises a clear
-        :class:`TypeError` for anything else — including ``None``.
-
-        When called on the abstract :class:`Path`, routes through the
-        registry so ``"dbfs:/x"`` becomes a DBFSPath, ``/tmp/y`` a
-        LocalPath, etc. On a concrete subclass, always returns that
-        subclass.
-        """
-        if obj is None:
-            raise TypeError(
-                f"Cannot build a {cls.__name__} from None. "
-                "Pass a str, pathlib.Path, or yggdrasil.io.fs.Path."
-            )
-        if isinstance(obj, Path):
-            # Already one of ours — pass through untouched when the
-            # caller asked for the abstract base or a matching concrete
-            # class; otherwise re-parse through the target subclass.
-            if cls is Path or isinstance(obj, cls):
-                return obj
-            return cls.from_str(obj.full_path())
-        if isinstance(obj, pathlib.PurePath):
-            return cls.from_pathlib(obj)
-        if isinstance(obj, (str, bytes)):
-            raw = obj.decode() if isinstance(obj, bytes) else obj
-            return cls.from_str(raw)
-        if isinstance(obj, os.PathLike):
-            return cls.from_str(os.fspath(obj))
-        raise TypeError(
-            f"Cannot build a {cls.__name__} from {type(obj).__name__!r}. "
-            "Pass a str, bytes, pathlib.Path, os.PathLike, or "
-            "yggdrasil.io.fs.Path."
+        # Build the file: parent / "{tmp_prefix}{token}-{start}-{end}{ext}"
+        ext = self._staging_extension(media_type)
+        suffix = f".{ext}" if ext else ""
+        return parent.with_tmp_name(
+            prefix="tmp-",
+            suffix=suffix,
+            ttl=ttl,
+            append=True,
+            temporary=True,
         )
 
-    @classmethod
-    def from_str(cls, value: str) -> "Path":
-        """Parse a string into a :class:`Path`.
+    def _join_segments(self, path: Union[str, Iterable[str]]) -> "Path":
+        """Resolve ``path`` against ``self``, accepting str or segment list."""
+        if isinstance(path, str):
+            return self / path
+        # Iterable of segments — fall through joinpath.
+        return self.joinpath(*path)
 
-        On the abstract base, dispatches via the scheme registry so URL
-        schemes (``dbfs:/...``, ``fake://...``) route to the right
-        subclass. On a concrete subclass, delegates to :meth:`parse`.
+    @staticmethod
+    def _staging_extension(media_type: Union["MediaType", str, None]) -> str:
+        """Resolve the staging file extension from a media-type hint."""
+        if media_type is None:
+            return ""
+        try:
+            from yggdrasil.io.enums import MediaType, MediaTypes
+            mt = MediaType.from_(media_type, default=MediaTypes.PARQUET)
+            return mt.full_extension or ""
+        except Exception:
+            # If MediaType resolution fails (no enum match), treat the
+            # input as a literal extension string.
+            if isinstance(media_type, str):
+                return media_type.lstrip(".")
+            return ""
+
+    def _sweep_expired_staging(self, *, force: bool = False) -> bool:
+        """Best-effort sweep of expired staging files under this directory.
+
+        Returns ``True`` if a sweep ran, ``False`` if the rate limiter
+        skipped this call.
+
+        Rate-limited per parent ``full_path()`` via the module-level
+        :data:`_STAGING_SWEPT` :class:`ExpiringDict` — at most one
+        sweep per :data:`_STAGING_SWEEP_INTERVAL_S` per parent per
+        process.  The check-and-stamp is one ``ExpiringDict`` op so
+        concurrent callers in the same parent converge to one sweep
+        per interval.
         """
-        if not isinstance(value, str):
-            raise TypeError(
-                f"{cls.__name__}.from_str expected str, got "
-                f"{type(value).__name__!r}. Use {cls.__name__}.from_any() for "
-                "permissive input."
+        key = self.full_path()
+
+        if not force:
+            # `__contains__` on ExpiringDict drops stale entries; if the
+            # key is still alive we've already swept this interval.
+            if key in _STAGING_SWEPT:
+                return False
+
+        # Stamp BEFORE the walk so concurrent callers see "swept" and
+        # skip.  Even if the walk fails, the stamp gates retries to the
+        # next interval (failures are best-effort).
+        _STAGING_SWEPT[key] = True
+
+        now_ts = int(time.time())
+        try:
+            for candidate in self.ls(recursive=True, allow_not_found=True):
+                match = _STAGING_TMP_RE.search(candidate.name)
+                if match is None:
+                    continue
+                try:
+                    end_ts = int(match.group(2))
+                except (TypeError, ValueError):
+                    continue
+                if end_ts >= now_ts:
+                    continue
+                try:
+                    candidate.remove(recursive=False, allow_not_found=True)
+                except Exception:
+                    LOGGER.debug(
+                        "Failed to remove expired staging file %s",
+                        candidate, exc_info=True,
+                    )
+        except Exception:
+            LOGGER.debug(
+                "Failed to sweep expired staging files under %s",
+                self, exc_info=True,
             )
-        if cls is Path:
-            target = _select_path_class(value)
-            return target.from_str(value)
-        return cls.parse(value)
+        return True
 
     @classmethod
-    def from_pathlib(cls, value: pathlib.PurePath) -> "Path":
-        """Parse a :class:`pathlib.PurePath` into a :class:`Path`.
+    def reset_staging_sweep_state(cls, parent_full_path: Optional[str] = None) -> None:
+        """Test/maintenance hook: drop the rate-limit stamp.
 
-        Default implementation rejects anything but :class:`pathlib.PurePath`
-        and delegates to :meth:`parse` on concrete subclasses. On the
-        abstract base, always returns a :class:`LocalPath` — pathlib
-        paths carry no backend information.
+        ``None`` clears every tracked parent (next call to any parent
+        will sweep); a specific path clears just that parent.
         """
-        if not isinstance(value, pathlib.PurePath):
-            raise TypeError(
-                f"{cls.__name__}.from_pathlib expected pathlib.PurePath, got "
-                f"{type(value).__name__!r}."
-            )
-        if cls is Path:
-            from .local import LocalPath
+        if parent_full_path is None:
+            _STAGING_SWEPT.clear()
+        else:
+            try:
+                del _STAGING_SWEPT[parent_full_path]
+            except KeyError:
+                pass
 
-            return LocalPath.from_pathlib(value)
-        return cls.parse(value)
+    # ==================================================================
+    # Classification — for the dispatch registry
+    # ==================================================================
 
-    # ================================================================ #
-    # Abstract hooks — implement per backend                            #
-    # ================================================================ #
+    @classmethod
+    def handles(cls, obj: Any) -> bool:
+        if not cls.scheme:
+            return False
+        if isinstance(obj, URL):
+            return obj.scheme == cls.scheme
+        if isinstance(obj, str):
+            return obj.startswith(f"{cls.scheme}:/")
+        try:
+            return URL.from_(obj).scheme == cls.scheme
+        except (ValueError, TypeError):
+            return False
+
+    @classmethod
+    def is_pathish(cls, obj: Any) -> bool:
+        if isinstance(obj, str):
+            if not obj:
+                return True
+            if len(obj) > 256 * 1024:
+                return False
+            if any(c in obj for c in "\t\n\r\f\v{}[]*?"):
+                return False
+            return True
+        if isinstance(obj, (Path, pathlib.PurePath, os.PathLike)):
+            return True
+        try:
+            return URL.is_pathish(obj)
+        except Exception:
+            return False
+
+    @property
+    def is_local(self) -> bool:
+        return False
+
+    # ==================================================================
+    # Coercion entry points
+    # ==================================================================
+
+    @classmethod
+    def from_(
+        cls,
+        obj: Any,
+        default: Any = ...,
+        *,
+        temporary: bool = False,
+    ) -> "Path":
+        if isinstance(obj, Path):
+            same_type = type(obj) is cls or cls is Path
+            if same_type:
+                if temporary:
+                    obj.temporary = True
+                return obj
+            return cls.from_url(obj.url, default=default, temporary=temporary)
+
+        try:
+            url = URL.from_(obj)
+        except (ValueError, TypeError):
+            if default is ...:
+                raise
+            return default
+
+        return cls.from_url(url, default=default, temporary=temporary)
+
+    @classmethod
+    def from_url(
+        cls,
+        url: URL,
+        default: Any = ...,
+        *,
+        temporary: bool = False,
+    ) -> "Path":
+        try:
+            resolved = URL.from_(url)
+        except (ValueError, TypeError):
+            if default is ...:
+                raise
+            return default
+
+        target = _select_path_class(resolved) if cls is Path else cls
+        return target(url=resolved, temporary=temporary)
+
+    @classmethod
+    def from_pathlib(
+        cls,
+        path: pathlib.PurePath,
+        default: Any = ...,
+        *,
+        temporary: bool = False,
+    ) -> "Path":
+        try:
+            url = URL.from_(path)
+        except (ValueError, TypeError):
+            if default is ...:
+                raise
+            return default
+        return cls.from_url(url, default=default, temporary=temporary)
+
+    # ==================================================================
+    # Abstract hooks
+    # ==================================================================
 
     @abstractmethod
-    def full_path(self) -> str:
-        """Absolute string rendering of this path."""
+    def full_path(self) -> str: ...
 
     @abstractmethod
-    def _refresh_metadata(self) -> None:
-        """Fetch backend status into ``_is_file`` / ``_is_dir`` / ``_size`` / ``_mtime``."""
+    def _stat(self) -> PathStats: ...
 
     @abstractmethod
-    def _ls_impl(
-        self, recursive: bool = False, allow_not_found: bool = True
-    ) -> Iterator["Path"]:
-        """Yield children of this directory."""
+    def _ls(
+        self,
+        recursive: bool = False,
+        allow_not_found: bool = True,
+    ) -> Iterator["Path"]: ...
 
     @abstractmethod
-    def _mkdir_impl(self, parents: bool = True, exist_ok: bool = True) -> None:
-        """Create the directory at this path."""
+    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None: ...
 
     @abstractmethod
-    def _remove_file_impl(self, allow_not_found: bool = True) -> None:
-        """Delete the file at this path."""
+    def _remove_file(self, allow_not_found: bool = True) -> None: ...
 
     @abstractmethod
-    def _remove_dir_impl(
+    def _remove_dir(
         self,
         recursive: bool = True,
         allow_not_found: bool = True,
         with_root: bool = True,
-    ) -> None:
-        """Delete the directory at this path."""
+    ) -> None: ...
 
     @abstractmethod
-    def open(
+    def _open(
         self,
         mode: str = "rb",
         *,
         encoding: Optional[str] = None,
         errors: Optional[str] = None,
         newline: Optional[str] = None,
-    ) -> IO:
-        """Open the file and return a file-like object (pathlib.Path.open)."""
+        auto_open: bool = True,
+        touch: bool = False,
+    ) -> BytesIO:
+        """Open the underlying file, return a :class:`BytesIO` (or subclass)."""
 
-    # ================================================================ #
-    # pathlib.PurePosixPath — pure-path manipulation                    #
-    # ================================================================ #
+    # ==================================================================
+    # I/O entry point — distinct from the lifecycle Disposable.open()
+    # ==================================================================
+
+    def open_io(
+        self,
+        mode: str = "rb",
+        *,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        auto_open: bool = True,
+        touch: bool = False,
+    ) -> BytesIO:
+        if not self.opened:
+            Disposable.open(self)
+
+        io = self._open(
+            mode,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            auto_open=auto_open,
+            touch=touch,
+        )
+
+        if self.temporary:
+            self.manage_object(io)
+
+        return io
+
+    # ==================================================================
+    # URL-delegated pure-path API
+    # ==================================================================
+
+    @property
+    def parts(self) -> List[str]:
+        return self.url.parts
 
     @property
     def name(self) -> str:
-        """Last component — ``pathlib.PurePath.name``."""
-        return self.parts[-1] if self.parts else ""
-
-    @property
-    def suffix(self) -> str:
-        """Last extension with the leading dot."""
-        name = self.name
-        idx = name.rfind(".")
-        return name[idx:] if idx > 0 else ""
-
-    @property
-    def suffixes(self) -> List[str]:
-        """All extensions, dotted."""
-        name = self.name
-        if not name or name.startswith("."):
-            return []
-        pieces = name.split(".")
-        return [f".{p}" for p in pieces[1:]] if len(pieces) > 1 else []
+        return self.url.name
 
     @property
     def stem(self) -> str:
-        """Name minus the last suffix."""
-        name = self.name
-        idx = name.rfind(".")
-        return name[:idx] if idx > 0 else name
+        return self.url.stem
 
     @property
-    def extension(self) -> str:
-        """Dot-less extension convenience (``'txt'``, not ``'.txt'``)."""
-        return self.suffix.lstrip(".")
+    def suffix(self) -> str:
+        exts = self.url.extensions
+        return "." + exts[-1] if exts else ""
+
+    @property
+    def suffixes(self) -> List[str]:
+        return ["." + e for e in self.url.extensions]
+
+    @property
+    def extensions(self) -> List[str]:
+        return self.url.extensions
+
+    @property
+    def media_type(self):
+        return self.url.media_type
+
+    @property
+    def mime_type(self):
+        return self.url.mime_type
+
+    @property
+    def codec(self):
+        return self.url.codec
 
     @property
     def parent(self) -> "Path":
-        """Parent path."""
-        if not self.parts:
-            return self
-        return self._copy_with(
-            parts=self.parts[:-1],
-            _is_file=False,
-            _is_dir=True,
-            _size=0,
-        )
+        return self._from_url(self.url.parent)
 
     @property
     def parents(self) -> Tuple["Path", ...]:
-        """All ancestors, closest first."""
-        out: List[Path] = []
-        cur: Path = self
-        while cur.parts:
-            cur = cur.parent
-            out.append(cur)
-        return tuple(out)
+        return tuple(self._from_url(u) for u in self.url.parents)
 
+    @property
     def is_absolute(self) -> bool:
-        """True when the path has a root anchor.
+        return self.url.is_absolute
 
-        Backends whose :meth:`full_path` always renders an absolute string
-        (e.g. ``dbfs:/…``) should override this to return ``True``.
-        """
-        return bool(self.anchor)
+    def joinpath(self, *segments: Any) -> "Path":
+        return self._from_url(self.url.joinpath(*segments))
 
-    def as_posix(self) -> str:
-        """POSIX-style rendering without scheme decoration."""
-        body = _SEP.join(self.parts)
-        return self.anchor + body if self.anchor else body
+    def __truediv__(self, other: Any) -> "Path":
+        return self.joinpath(other)
 
-    def joinpath(self, *others: Any) -> "Path":
-        """Join one or more path components."""
-        cur: Path = self
-        for other in others:
-            cur = cur / other
-        return cur
+    def __rtruediv__(self, other: Any) -> "Path":
+        return Path.from_(other) / self
 
     def with_name(self, name: str) -> "Path":
         if not self.parts:
@@ -603,17 +713,19 @@ class Path(ABC):
                 f"Cannot set name on empty path {self!r}. "
                 "Build a non-empty path first, e.g. Path('dir') / name."
             )
-        if not name or _SEP in name or "\\" in name:
+        if not name:
+            raise ValueError("Name cannot be empty")
+        if "/" in name:
             raise ValueError(
-                f"Invalid name {name!r}. Names cannot be empty or contain "
-                "path separators — use joinpath() for nested paths."
+                f"Invalid name {name!r}: cannot contain '/'. "
+                "Use joinpath() for nested paths."
             )
-        return self._copy_with(parts=self.parts[:-1] + [name])
+        return self.parent / name
 
     def with_suffix(self, suffix: str) -> "Path":
         if suffix and not suffix.startswith("."):
             raise ValueError(
-                f"Invalid suffix {suffix!r}. Suffixes must start with '.' "
+                f"Invalid suffix {suffix!r}: must start with '.' "
                 "(e.g. '.parquet') or be '' to strip the existing suffix."
             )
         return self.with_name(self.stem + suffix)
@@ -621,90 +733,135 @@ class Path(ABC):
     def with_stem(self, stem: str) -> "Path":
         return self.with_name(stem + self.suffix)
 
-    def match(self, pattern: str) -> bool:
-        """Glob match against the name, then the full rendering."""
-        return fnmatch.fnmatch(self.name, pattern) or fnmatch.fnmatch(
-            self.full_path(), pattern
-        )
+    def match_pattern(self, pattern: str) -> bool:
+        return self.url.match_pattern(pattern)
+
+    def matches_patterns(self, patterns: Iterable[str] | None) -> bool:
+        return self.url.matches_patterns(patterns)
 
     def is_relative_to(self, other: Any) -> bool:
-        other = self._coerce(other)
-        if type(self) is not type(other):
+        if isinstance(other, Path):
+            if type(self) is not type(other):
+                return False
+            return self.url.is_relative_to(other.url)
+        try:
+            other_path = Path.from_(other)
+        except (ValueError, TypeError):
             return False
-        if self.anchor != other.anchor:
+        if type(self) is not type(other_path):
             return False
-        return self.parts[: len(other.parts)] == other.parts
+        return self.url.is_relative_to(other_path.url)
 
     def relative_to(self, other: Any) -> "Path":
-        other = self._coerce(other)
-        if not self.is_relative_to(other):
-            raise ValueError(
-                f"{self.full_path()!r} is not relative to {other.full_path()!r}. "
-                "Use is_relative_to() to test the relationship first."
-            )
-        return self._copy_with(parts=self.parts[len(other.parts) :], anchor="")
+        if isinstance(other, Path):
+            other_path = other
+        else:
+            other_path = Path.from_(other)
 
-    # ================================================================ #
-    # pathlib.Path — concrete I/O                                       #
-    # ================================================================ #
+        if not self.is_relative_to(other_path):
+            raise ValueError(
+                f"{self.full_path()!r} is not relative to "
+                f"{other_path.full_path()!r}. Use is_relative_to() to test "
+                "the relationship first."
+            )
+        return self._from_url(self.url.relative_to(other_path.url))
+
+    # ==================================================================
+    # Stat — uncached, every call hits the backend
+    # ==================================================================
+
+    def stat(self) -> PathStats:
+        return self._stat()
 
     def exists(self, *, follow_symlinks: bool = True) -> bool:
-        del follow_symlinks  # signature parity with pathlib.Path
-        return bool(self.is_file() or self.is_dir())
+        del follow_symlinks
+        return self._stat().kind != PathKind.MISSING
 
-    def is_file(self) -> Optional[bool]:
-        if self._is_file is None:
-            self._refresh_metadata()
-        return self._is_file
+    def is_file(self) -> bool:
+        return self._stat().kind == PathKind.FILE
 
-    def is_dir(self) -> Optional[bool]:
-        if self._is_dir is None:
-            self._refresh_metadata()
-        return self._is_dir
+    def is_dir(self) -> bool:
+        return self._stat().kind == PathKind.DIRECTORY
 
     def is_symlink(self) -> bool:
         return False
 
-    def stat(self) -> StatResult:
-        """Refresh cached metadata and return a :class:`StatResult`."""
-        self._refresh_metadata()
-        if self._is_file:
-            kind = PathKind.FILE
-        elif self._is_dir:
-            kind = PathKind.DIRECTORY
-        else:
-            kind = PathKind.MISSING
-        return StatResult(
-            size=self._size or 0,
-            mtime=self._mtime or 0.0,
-            kind=kind,
-            mode=0,
-        )
+    def is_dir_sink(self) -> bool:
+        if self.url.path.endswith("/"):
+            return True
+        return self.is_dir()
+
+    @property
+    def content_length(self) -> int:
+        return int(self._stat().size)
+
+    @property
+    def mtime(self) -> Optional[float]:
+        s = self._stat()
+        if s.kind == PathKind.MISSING:
+            return None
+        return s.mtime
+
+    # ==================================================================
+    # Listing / walking
+    # ==================================================================
 
     def iterdir(self) -> Iterator["Path"]:
-        """One level of children."""
-        yield from self._ls_impl(recursive=False, allow_not_found=True)
+        yield from self._ls(recursive=False, allow_not_found=True)
 
     def ls(
         self,
+        *,
         recursive: bool = False,
         allow_not_found: bool = True,
+        include_patterns: Iterable[str] | None = None,
+        exclude_patterns: Iterable[str] | None = None,
+        exclude_private: bool = False,
     ) -> Iterator["Path"]:
-        """Flexible listing — matches the DatabricksPath legacy helper."""
-        yield from self._ls_impl(recursive=recursive, allow_not_found=allow_not_found)
+        includes = _materialize(include_patterns)
+        excludes = _materialize(exclude_patterns)
+
+        if includes is None and excludes is None and not exclude_private:
+            yield from self._ls(recursive=recursive, allow_not_found=allow_not_found)
+            return
+
+        def _dropped(child: "Path") -> bool:
+            if exclude_private and child.name.startswith("."):
+                return True
+            if excludes and child.matches_patterns(excludes):
+                return True
+            return False
+
+        if not recursive:
+            for child in self._ls(recursive=False, allow_not_found=allow_not_found):
+                if _dropped(child):
+                    continue
+                if includes is None or child.matches_patterns(includes):
+                    yield child
+            return
+
+        stack: List[Path] = [self]
+        while stack:
+            current = stack.pop()
+            for child in current._ls(
+                recursive=False, allow_not_found=allow_not_found
+            ):
+                if _dropped(child):
+                    continue
+                if includes is None or child.matches_patterns(includes):
+                    yield child
+                if child.is_dir():
+                    stack.append(child)
 
     def glob(self, pattern: str) -> Iterator["Path"]:
-        """Recursive glob filtered by *pattern* (matches DatabricksPath)."""
-        for child in self._ls_impl(recursive=True, allow_not_found=True):
-            if fnmatch.fnmatch(child.name, pattern):
+        for child in self._ls(recursive=True, allow_not_found=True):
+            if child.match_pattern(pattern):
                 yield child
 
     def rglob(self, pattern: str) -> Iterator["Path"]:
-        """Alias for :meth:`glob` — always recursive."""
         yield from self.glob(pattern)
 
     def walk(self) -> Iterator[Tuple["Path", List["Path"], List["Path"]]]:
-        """``os.walk``-style traversal rooted at this path."""
         dirs: List[Path] = []
         files: List[Path] = []
         for child in self.iterdir():
@@ -713,14 +870,18 @@ class Path(ABC):
         for sub in dirs:
             yield from sub.walk()
 
+    # ==================================================================
+    # Filesystem mutators
+    # ==================================================================
+
     def mkdir(
         self,
         mode: int = 0o777,
         parents: bool = True,
         exist_ok: bool = True,
     ) -> "Path":
-        del mode  # Most remote backends ignore POSIX mode bits.
-        self._mkdir_impl(parents=parents, exist_ok=exist_ok)
+        del mode
+        self._mkdir(parents=parents, exist_ok=exist_ok)
         return self
 
     def rmdir(
@@ -729,58 +890,67 @@ class Path(ABC):
         allow_not_found: bool = True,
         with_root: bool = True,
     ) -> "Path":
-        self._remove_dir_impl(
+        self._remove_dir(
             recursive=recursive,
             allow_not_found=allow_not_found,
             with_root=with_root,
         )
         return self
 
-    def unlink(self, missing_ok: bool = True) -> None:
-        """``pathlib.Path.unlink`` — delegates to :meth:`remove`."""
-        self.remove(recursive=True, allow_not_found=missing_ok)
-
     def rmfile(self, allow_not_found: bool = True) -> "Path":
-        self._remove_file_impl(allow_not_found=allow_not_found)
+        self._remove_file(allow_not_found=allow_not_found)
         return self
+
+    def unlink(self, missing_ok: bool = True) -> None:
+        kind = self._stat().kind
+        if kind == PathKind.MISSING:
+            if missing_ok:
+                return
+            raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+        if kind == PathKind.DIRECTORY:
+            raise IsADirectoryError(
+                f"Cannot unlink directory {self.full_path()!r}; "
+                "use rmdir() or remove() for trees."
+            )
+        self._remove_file(allow_not_found=missing_ok)
 
     def remove(
         self,
         recursive: bool = True,
         allow_not_found: bool = True,
     ) -> "Path":
-        """File or directory, whichever this path happens to be."""
-        if self.is_file():
-            self._remove_file_impl(allow_not_found=allow_not_found)
-        elif self.is_dir():
-            self._remove_dir_impl(
+        kind = self._stat().kind
+        if kind == PathKind.FILE:
+            self._remove_file(allow_not_found=allow_not_found)
+        elif kind == PathKind.DIRECTORY:
+            self._remove_dir(
                 recursive=recursive,
                 allow_not_found=allow_not_found,
                 with_root=True,
             )
-        elif not allow_not_found:
-            raise FileNotFoundError(f"{self!r} does not exist")
+        elif kind == PathKind.MISSING:
+            if not allow_not_found:
+                raise FileNotFoundError(f"{self!r} does not exist")
         return self
 
     def rename(self, target: Any) -> "Path":
-        """``pathlib.Path.rename`` — copy + remove by default."""
-        target_path = self._coerce(target)
+        target_path = Path.from_(target)
         self.copy_to(target_path)
         self.remove(recursive=True)
         return target_path
 
-    def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
-        """``pathlib.Path.touch``.
-
-        Default write-empty-bytes implementation. Backends with native
-        touch semantics (e.g. S3 zero-byte PUT) should override.
-        """
+    def touch(
+        self,
+        mode: int = 0o666,
+        exist_ok: bool = True,
+        parents: bool = True,
+    ) -> None:
         del mode
         if self.exists():
             if not exist_ok:
                 raise FileExistsError(f"Path already exists: {self.full_path()!r}")
             return
-        self.write_bytes(b"")
+        self.write_bytes(b"", parents=parents)
 
     def resolve(self, *, strict: bool = False) -> "Path":
         del strict
@@ -789,23 +959,163 @@ class Path(ABC):
     def absolute(self) -> "Path":
         return self
 
-    # ── Bytes / text helpers ───────────────────────────────────────
+    # ==================================================================
+    # Bytes / text I/O
+    # ==================================================================
 
-    def read_bytes(self) -> bytes:
-        with self.open("rb") as fh:
-            return fh.read()
+    @abstractmethod
+    def pread(
+        self,
+        n: int,
+        pos: int,
+        *,
+        default: Any = ...,
+    ) -> bytes: ...
 
-    def write_bytes(self, data: Union[bytes, bytearray, memoryview]) -> int:
-        with self.open("wb") as fh:
-            fh.write(bytes(data))
-        return len(data)
+    @abstractmethod
+    def pwrite(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+        *,
+        parents: bool = True,
+    ) -> int: ...
+
+    def _pread_via_io(
+        self,
+        n: int,
+        pos: int,
+        *,
+        default: Any = ...,
+    ) -> bytes:
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        if n == 0:
+            return b""
+        try:
+            with self.open_io("rb") as src:
+                if n < 0:
+                    src.seek(pos)
+                    return src.read()
+                return src.pread(n=n, pos=pos)
+        except (OSError, ValueError):
+            if default is ...:
+                raise
+            return default
+
+    def _pwrite_via_rmw(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+        *,
+        parents: bool = True,
+    ) -> int:
+        mv = memoryview(data)
+        if not mv.c_contiguous:
+            mv = memoryview(bytes(mv))
+        n = len(mv)
+        if n == 0:
+            return 0
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+
+        existing = self.read_bytes(raise_error=False) if self.exists() else b""
+        end = pos + n
+
+        if end <= len(existing):
+            buf = bytearray(existing)
+            buf[pos:end] = mv
+            out = bytes(buf)
+        else:
+            buf = bytearray(end)
+            if existing:
+                buf[: len(existing)] = existing
+            buf[pos:end] = mv
+            out = bytes(buf)
+
+        self.write_bytes(out, parents=parents)
+        return n
+
+    def read_bytes(self, *, raise_error: bool = True) -> bytes:
+        try:
+            with self.open_io("rb") as fh:
+                return fh.read()
+        except (OSError, ValueError):
+            if raise_error:
+                raise
+            return b""
+
+    def write_bytes(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        *,
+        mode: str = "wb",
+        parents: bool = True,
+    ) -> int:
+        def _write() -> int:
+            with self.open_io(mode) as fh:
+                return fh.write(bytes(data))
+
+        try:
+            return _write()
+        except (OSError, ValueError):
+            if not parents:
+                raise
+            self.parent.mkdir(parents=True, exist_ok=True)
+            return _write()
+
+    def truncate(self, n: int, *, parents: bool = True) -> int:
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+
+        stat = self._stat()
+        if stat.kind == PathKind.MISSING:
+            raise FileNotFoundError(
+                f"Cannot truncate non-existent path {self.full_path()!r}. "
+                "Call touch() first if you want create-or-resize semantics."
+            )
+        if stat.kind == PathKind.DIRECTORY:
+            raise IsADirectoryError(
+                f"Cannot truncate directory {self.full_path()!r}"
+            )
+
+        current = int(stat.size)
+        if n == current:
+            return n
+        if n == 0:
+            self.write_bytes(b"", parents=parents)
+            return 0
+
+        if n < current:
+            prefix = self.pread(n=n, pos=0)
+            if len(prefix) != n:
+                raise OSError(
+                    f"Short pread during truncate: requested {n} bytes, "
+                    f"got {len(prefix)}"
+                )
+            self.write_bytes(prefix, parents=parents)
+            return n
+
+        existing = self.read_bytes()
+        if len(existing) != current:
+            raise OSError(
+                f"Stat/read mismatch during truncate: stat={current}, "
+                f"read={len(existing)}"
+            )
+        buf = bytearray(n)
+        buf[:current] = existing
+        self.write_bytes(bytes(buf), parents=parents)
+        return n
 
     def read_text(
         self,
         encoding: str = "utf-8",
         errors: str = "strict",
+        raise_error: bool = True,
     ) -> str:
-        return self.read_bytes().decode(encoding, errors=errors)
+        return self.read_bytes(raise_error=raise_error).decode(
+            encoding, errors=errors,
+        )
 
     def write_text(
         self,
@@ -813,268 +1123,147 @@ class Path(ABC):
         encoding: str = "utf-8",
         errors: str = "strict",
         newline: Optional[str] = None,
+        parents: bool = True,
     ) -> int:
-        del newline  # Signature parity; encoding runs before write_bytes.
+        del newline
         encoded = data.encode(encoding, errors=errors)
-        self.write_bytes(encoded)
+        self.write_bytes(encoded, parents=parents)
         return len(encoded)
 
-    # ================================================================ #
-    # Optimized memory access                                           #
-    # ================================================================ #
-    #
-    # These default implementations make every backend usable as a
-    # transparent substitute for a local file — BytesIO and other code
-    # can call ``pread`` / ``pwrite`` / ``memoryview`` / ``open_mmap``
-    # without branching on backend type.
-    #
-    # Local paths override each method to route through ``os.pread`` /
-    # ``os.pwrite`` / real ``mmap``. Remote backends (DatabricksPath,
-    # S3Path, …) pick up the fallback automatically, and can override
-    # individual methods for zero-copy range GETs or server-side copies.
+    # ==================================================================
+    # Streaming copy / write_from_stream
+    # ==================================================================
 
-    @property
-    def local_os_path(self) -> Optional[str]:
-        """Return a local-filesystem path usable with :mod:`os` / :mod:`mmap`.
+    def copy_to(
+        self,
+        dest: Any,
+        *,
+        batch_size: int = 4 * 1024 * 1024,
+        parents: bool = True,
+    ) -> int:
+        dest_path = Path.from_(dest)
+        if dest_path == self:
+            return self.content_length
 
-        ``None`` means the path does not map to a local file — callers
-        must go through :meth:`read_bytes` / :meth:`pread` /
-        :meth:`memoryview` for data access. Local paths return their
-        absolute string form; DBFS-mounted paths can override to expose
-        their FUSE mount point.
-        """
-        return None
+        if parents:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    @property
-    def is_local_fs(self) -> bool:
-        """True when this path sits on a local POSIX filesystem.
+        total = 0
+        with self.open_io("rb") as src, dest_path.open_io("wb") as dst:
+            while True:
+                chunk = src.read(batch_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                total += len(chunk)
+        return total
 
-        Equivalent to ``self.local_os_path is not None`` but cheaper to
-        probe from hot paths that only need the yes/no.
-        """
-        return self.local_os_path is not None
+    def write_stream(
+        self,
+        src: IO[bytes],
+        *,
+        batch_size: int = 4 * 1024 * 1024,
+        parents: bool = True,
+    ) -> int:
+        total = 0
+        with self.open_io("wb") as dst:
+            while True:
+                chunk = src.read(batch_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                total += len(chunk)
+        return total
 
-    def pread(self, n: int, pos: int) -> bytes:
-        """Positional read. Default: materialize then slice.
-
-        Subclasses should override when the backend supports a cheaper
-        random-access read (``os.pread``, HTTP range requests, …).
-        """
-        if n <= 0:
-            return b""
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        data = self.read_bytes()
-        end = min(pos + n, len(data))
-        if pos >= end:
-            return b""
-        return bytes(data[pos:end])
-
-    def pwrite(self, data: Union[bytes, bytearray, memoryview], pos: int) -> int:
-        """Positional write. Default: read-modify-write.
-
-        The default is O(file size) per call — fine for small files and
-        remote stores, disastrous for a hot loop on a multi-GB local
-        file. :class:`LocalPath` overrides with ``os.pwrite`` for a true
-        positional write.
-        """
-        mv = memoryview(data)
-        if len(mv) == 0:
-            return 0
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-
-        existing = self.read_bytes() if self.exists() else b""
-        new_size = max(len(existing), pos + len(mv))
-        buf = bytearray(new_size)
-        buf[: len(existing)] = existing
-        buf[pos : pos + len(mv)] = mv
-        self.write_bytes(bytes(buf))
-        return len(mv)
+    # ==================================================================
+    # memoryview / mmap — default fallbacks
+    # ==================================================================
 
     def memoryview(
         self,
         *,
         offset: int = 0,
         size: Optional[int] = None,
-    ) -> "memoryview":
-        """Return a ``memoryview`` over this file's contents.
-
-        Default: materializes the full payload into bytes and returns a
-        view over it. :class:`LocalPath` overrides with a real mmap so
-        large files don't inflate process RSS. Remote backends can cache
-        the materialized payload on the instance (or a session cache) to
-        make repeated views cheap.
-        """
+        raise_error: bool = True,
+    ) -> memoryview:
         if offset < 0:
             raise ValueError("memoryview offset must be >= 0")
+        n = -1 if size is None else int(size)
+        return memoryview(self.pread(n=n, pos=offset, default=raise_error))
 
-        data = self.read_bytes()
-        if offset == 0 and size is None:
-            return memoryview(data)
-        end = len(data) if size is None else offset + size
-        return memoryview(data)[offset:end]
-
-    def open_mmap(self, mode: str = "r") -> Optional["mmap.mmap"]:
-        """Return a :class:`mmap.mmap` over this file, or ``None`` when
-        the backend can't memory-map.
-
-        Default is ``None`` — remote backends can't hand the OS a real
-        file descriptor. Callers should fall through to :meth:`memoryview`
-        which always works (at the cost of bytes materialization).
-        """
+    def open_mmap(self, mode: str = "r"):
         del mode
         return None
 
-    # ── Copy ───────────────────────────────────────────────────────
+    # ==================================================================
+    # Media type
+    # ==================================================================
 
-    def copy_to(self, dest: Any, allow_not_found: bool = True) -> "Path":
-        """Copy this file or directory to ``dest``.
+    def infer_media_type(self, *, default: "MediaType" = ...) -> "MediaType":
+        return MediaType.from_path(self, default=default)
 
-        Default implementation streams bytes for files and recurses for
-        directories. Backends with a cheap server-side copy should override.
-        """
-        dest_path = self._coerce(dest)
-        if self.is_file():
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(self.read_bytes())
-        elif self.is_dir():
-            dest_path.mkdir(parents=True, exist_ok=True)
-            skip = len(self.parts)
-            for child in self.ls(recursive=True, allow_not_found=True):
-                if child.is_file():
-                    target = dest_path._copy_with(
-                        parts=dest_path.parts + child.parts[skip:],
-                    )
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(child.read_bytes())
-        elif not allow_not_found:
-            raise FileNotFoundError(f"{self!r} does not exist")
-        return dest_path
+    def as_media(self, media_type: MediaType | None = None):
+        return tabular_io_class().from_path(self, media_type=media_type)
 
-    # ================================================================ #
-    # Metadata                                                          #
-    # ================================================================ #
+    # ==================================================================
+    # Internal helpers
+    # ==================================================================
 
-    @property
-    def content_length(self) -> int:
-        if self._size is None:
-            self._refresh_metadata()
-        return self._size or 0
+    def _from_url(self, url: URL) -> "Path":
+        return type(self)(url=url)
 
-    @content_length.setter
-    def content_length(self, value: Optional[int]) -> None:
-        self._size = value
+    # ==================================================================
+    # Dunder
+    # ==================================================================
 
-    @property
-    def mtime(self) -> Optional[float]:
-        if self._mtime is None:
-            self._refresh_metadata()
-        return self._mtime
-
-    @mtime.setter
-    def mtime(self, value: Any) -> None:
-        self._mtime = _coerce_mtime(value)
-
-    def refresh_status(self) -> "Path":
-        self._refresh_metadata()
-        return self
-
-    def reset_metadata(
-        self,
-        is_file: Optional[bool] = None,
-        is_dir: Optional[bool] = None,
-        size: Optional[int] = None,
-        mtime: Any = None,
-    ) -> "Path":
-        self._is_file = is_file
-        self._is_dir = is_dir
-        self._size = None if size is None else int(size)
-        self._mtime = _coerce_mtime(mtime)
-        return self
-
-    # ================================================================ #
-    # FileSystem binding                                                #
-    # ================================================================ #
-
-    @property
-    def filesystem(self) -> Optional["FileSystem"]:
-        return self._fs
-
-    def bind(self, fs: "FileSystem") -> "Path":
-        self._fs = fs
-        return self
-
-    # ================================================================ #
-    # Clone / coerce                                                    #
-    # ================================================================ #
-
-    def _copy_with(self, **overrides: Any) -> "Path":
-        """Internal clone. Forwards to :func:`dataclasses.replace`.
-
-        Cached metadata is cleared unless the caller passes it explicitly,
-        so a cloned path doesn't inherit stale status from the original.
-        """
-        defaults = dict(
-            _is_file=None,
-            _is_dir=None,
-            _size=None,
-            _mtime=None,
-            _fs=self._fs,
-        )
-        defaults.update(overrides)
-        return replace(self, **defaults)
-
-    def _coerce(self, obj: Any) -> "Path":
-        """Coerce *obj* to a path of this class."""
-        if isinstance(obj, Path) and type(obj) is type(self):
-            return obj
-        parsed = type(self).parse(obj)
-        if self._fs is not None and parsed._fs is None:
-            parsed._fs = self._fs
-        return parsed
-
-    # ================================================================ #
-    # Dunder                                                            #
-    # ================================================================ #
+    def __fspath__(self) -> str:
+        return self.url.__fspath__()
 
     def __hash__(self) -> int:
-        return hash((type(self).__name__, self.full_path()))
+        return hash((type(self), self.url))
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Path):
-            return (
-                type(self) is type(other)
-                and self.anchor == other.anchor
-                and self.parts == other.parts
-            )
+            return type(self) is type(other) and self.url == other.url
         if isinstance(other, str):
             return self.full_path() == other
         return NotImplemented
-
-    def __truediv__(self, other: Any) -> "Path":
-        if other is None or other == "":
-            return self
-        # An absolute RHS replaces the LHS — matches pathlib semantics for
-        # ``Path('/a') / '/b' == Path('/b')``.
-        if isinstance(other, Path):
-            if other.anchor:
-                return self._copy_with(parts=list(other.parts), anchor=other.anchor)
-            return self._copy_with(parts=self.parts + list(other.parts))
-        raw = os.fspath(other) if isinstance(other, os.PathLike) else str(other)
-        raw_norm = raw.replace("\\", _SEP)
-        if raw_norm.startswith(_SEP):
-            return self._copy_with(parts=_split(raw_norm), anchor=_SEP)
-        return self._copy_with(parts=self.parts + _split(raw_norm))
-
-    def __rtruediv__(self, other: Any) -> "Path":
-        return self._coerce(other) / self
 
     def __str__(self) -> str:
         return self.full_path()
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.full_path()!r})"
+        if self.temporary:
+            return f"{type(self).__name__}({self.url!r}, temporary=True)"
+        return f"{type(self).__name__}({self.url!r})"
 
-    def __fspath__(self) -> str:
-        return self.full_path()
+    # ==================================================================
+    # Context manager — single-shot, file-like idiom
+    # ==================================================================
+
+    def __enter__(self) -> "Path":
+        if not self._acquired:
+            Disposable.open(self)
+        self._depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._depth > 0:
+            self._depth -= 1
+        if self._depth > 0:
+            return
+        if exc_type is not None:
+            self._dirty = False
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _materialize(patterns: Iterable[str] | None) -> Optional[Tuple[str, ...]]:
+    if patterns is None:
+        return None
+    out = patterns if isinstance(patterns, tuple) else tuple(patterns)
+    return out if out else None

@@ -1,1608 +1,752 @@
-"""Databricks path abstraction — ``pathlib.Path``-like API.
+"""Abstract :class:`DatabricksPath` — Databricks-aware :class:`Path` base.
 
-Hierarchy
----------
-::
+What this class adds on top of :class:`yggdrasil.io.fs.path.Path`
+---------------------------------------------------------------
 
-    DatabricksPath  (abstract base — mirrors ``pathlib.PurePosixPath`` + I/O)
-    ├── DBFSPath        — /dbfs/…
-    ├── WorkspacePath   — /Workspace/…
-    ├── VolumePath      — /Volumes/catalog/schema/volume/…  (Unity Catalog)
-    └── TablePath       — /Tables/catalog/schema/table
+- Legacy POSIX path parsing (``/dbfs/…``, ``/Workspace/…``,
+  ``/Volumes/…``, ``/Tables/…``) so ``Path("/Volumes/cat/sch/vol/x")``
+  routes to :class:`VolumePath` without the caller having to write
+  the URL form.
+- Client binding: :attr:`client`, :meth:`with_client`,
+  :meth:`connect`, :meth:`connected`. The client is set late and
+  doesn't participate in identity (two paths with the same URL but
+  different clients still compare equal).
+- A directory-aware :meth:`copy_to` override — the base streaming
+  copy opens both endpoints as files, which 400s on the SDK for
+  bare directory paths. We branch on :meth:`is_dir` and walk the
+  tree.
 
-All namespace-specific logic lives in the concrete subclasses; the base class
-provides shared fields, ``parse()`` factory, and the ``pathlib``-compatible API.
+Big design change vs. the legacy
+--------------------------------
+
+**No more ``DatabricksIO`` subclasses.** The previous architecture
+had four IO classes (``DatabricksIO`` abstract base, plus
+``DBFSIO``, ``WorkspaceIO``, ``VolumeIO``) each managing buffer
+plumbing, mode handling, fingerprint dedup, commit-on-close.
+
+All of that is now folded into :class:`yggdrasil.io.buffer.bytes_io.BytesIO`
+itself: when a ``BytesIO`` is constructed with a non-local path,
+it builds an internal *transaction buffer* (another ``BytesIO``,
+autonomous), fills it via ``path.pread`` on acquire, commits via
+``path.write_bytes`` on flush. Mode handling, fingerprint dedup,
+and commit semantics live there.
+
+What's left for Databricks paths to implement is the
+positional-IO contract that ``Path`` declares abstract:
+
+- :meth:`pread` — read N bytes at offset (range-read or
+  download-and-slice).
+- :meth:`pwrite` — write N bytes at offset (read-modify-write).
+- :meth:`read_bytes` — full download.
+- :meth:`write_bytes` — full upload.
+
+The last two override the base ``Path``'s default implementations
+(which go through ``open_io``) to call the SDK directly. Otherwise
+opening a path-bound BytesIO would recurse: BytesIO._acquire calls
+path.pread → which would call open_io → which would construct a
+new BytesIO bound to the path → which would try to acquire …
+
+So Databricks paths bypass ``open_io`` for their own bytes I/O,
+and ``_open`` returns a plain ``BytesIO(path=self, mode=mode)``
+with no special subclass — the BytesIO machinery handles
+everything.
+
+Per-subclass responsibilities
+-----------------------------
+
+Each concrete subclass (DBFSPath / WorkspacePath / VolumePath /
+TablePath) implements:
+
+- The abstract ``Path`` hooks: ``full_path``, ``_stat``, ``_ls``,
+  ``_mkdir``, ``_remove_file``, ``_remove_dir``, ``_open``.
+- Two new SDK transport hooks: ``_remote_download`` (whole-object
+  GET → bytes) and ``_remote_upload`` (whole-object PUT, takes
+  bytes).
+- Optionally fast paths for ``pread``/``pwrite`` if the SDK has
+  range-IO primitives (DBFS FUSE does; the others don't).
+
+The base class wires ``read_bytes`` → ``_remote_download``,
+``write_bytes`` → ``_remote_upload``, and provides default
+``pread``/``pwrite`` that go through download-and-slice /
+read-modify-write.
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import fnmatch
 import logging
-import os
-import stat as stat_mod
 import threading
-import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, astuple, replace
-from typing import (
-    Any,
-    ClassVar,
-    Iterator,
-    List,
-    Optional,
-    Tuple,
-    Union,
-    TYPE_CHECKING,
-)
-from urllib.parse import urlparse
+from abc import abstractmethod
+from dataclasses import replace as _dc_replace
+from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 
-from databricks.sdk.errors import InternalError
-from databricks.sdk.errors.platform import (
-    NotFound,
-    ResourceDoesNotExist,
-    BadRequest,
-    PermissionDenied,
-    AlreadyExists,
-    ResourceAlreadyExists,
-)
-from databricks.sdk.service.catalog import VolumeType, VolumeInfo, PathOperation
-from databricks.sdk.service.workspace import ObjectType
-from pyarrow.fs import FileInfo, FileType
-
-from yggdrasil.environ import shutdown as yg_shutdown
-from .io import DatabricksIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.fs.path import Path, _select_path_class
+from yggdrasil.io.url import URL
 from .path_kind import DatabricksPathKind
-from .volumes_path import get_volume_status, get_volume_metadata
+from ...lazy_imports import databricks_client_class
 
 if TYPE_CHECKING:
     from ..client import DatabricksClient
 
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "DatabricksPath",
-    "DBFSPath",
-    "WorkspacePath",
-    "VolumePath",
-    "TablePath",
     "DatabricksPathKind",
-    "DatabricksStatResult",
 ]
 
-# ---------------------------------------------------------------------------
-# Error groups
-# ---------------------------------------------------------------------------
 
-NOT_FOUND_ERRORS = (NotFound, ResourceDoesNotExist, BadRequest, PermissionDenied)
-ALREADY_EXISTS_ERRORS = (AlreadyExists, ResourceAlreadyExists, BadRequest)
-SDK_ERRORS = (
-    NotFound,
-    ResourceDoesNotExist,
-    BadRequest,
-    PermissionDenied,
-    AlreadyExists,
-    ResourceAlreadyExists,
-    InternalError,
-)
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# stat_result stand-in
+# Legacy POSIX path parsing
 # ---------------------------------------------------------------------------
 
-
-@dataclass(frozen=True, slots=True)
-class DatabricksStatResult:
-    """Minimal ``os.stat_result``-compatible object for Databricks paths."""
-
-    st_size: int = 0
-    st_mtime: float = 0.0
-    st_mode: int = 0
-
-    def __getitem__(self, idx):  # os.stat_result is subscript-able
-        return astuple(self)[idx]
+_NAMESPACES = {"dbfs+fuse", "dbfs+workspace", "dbfs+volumes", "dbfs+tables"}
 
 
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
+def _parse_legacy(raw: str) -> Tuple[str, str]:
+    """Parse a POSIX Databricks path → ``(scheme, url_path)``."""
+    raw = URL.from_(raw).path
+
+    if not raw.startswith("/"):
+        raise ValueError(f"Not a POSIX Databricks path: {raw!r}")
+    parts = raw.split("/", 2)
+    if len(parts) < 2:
+        raise ValueError(f"Not a POSIX Databricks path: {raw!r}")
+    namespace = parts[1].lower()
+    if namespace not in _NAMESPACES:
+        raise ValueError(
+            f"Not a POSIX Databricks path: {raw!r} "
+            f"(namespace {parts[1]!r} not in {sorted(_NAMESPACES)})"
+        )
+    rest = "/" + parts[2] if len(parts) == 3 else "/"
+    return namespace, rest
 
 
-def _split(path: str) -> List[str]:
-    return [p for p in path.split("/") if p]
+def _looks_like_legacy_databricks(s: str) -> bool:
+    if not isinstance(s, str) or not s.startswith("/"):
+        return False
+    parts = s.split("/", 2)
+    return len(parts) >= 2 and parts[1].lower() in _NAMESPACES
 
 
-def _coerce_mtime_seconds(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, dt.datetime):
-        return value.timestamp()
-    if isinstance(value, str):
-        return dt.datetime.fromisoformat(value).timestamp()
-    value = float(value)
-    if value > 10_000_000_000:
-        value = value / 1000.0
-    return value
+# ===========================================================================
+# DatabricksPath
+# ===========================================================================
 
 
-def _parse_string(s: str) -> Tuple[Optional[str], List[str], Optional[str]]:
-    """Return ``(namespace, tail_parts, hostname)``."""
-    s = s.strip()
-    if not s:
-        return None, [], None
+class DatabricksPath(Path):
+    """Abstract :class:`Path` for Databricks namespaces.
 
-    if s.startswith(("dbfs://", "http://", "https://")):
-        u = urlparse(s)
-        host = u.netloc or None
-        for parts in (_split(u.fragment), _split(u.path)):
-            if parts and parts[0].lower() in _NAMESPACES:
-                return parts[0].lower(), parts[1:], host
-        return None, _split(u.path), host
-
-    if s.startswith("dbfs:/"):
-        return "dbfs", _split(s[len("dbfs:/") :]), None
-
-    parts = _split(s)
-    if parts and parts[0].lower() in _NAMESPACES:
-        return parts[0].lower(), parts[1:], None
-
-    return None, parts, None
-
-
-_NAMESPACES = {"workspace", "volumes", "dbfs", "tables"}
-
-
-def _flatten(parts) -> List[str]:
-    if isinstance(parts, DatabricksPath):
-        return list(parts.parts)
-    if isinstance(parts, (set, tuple)):
-        parts = list(parts)
-    if not isinstance(parts, list):
-        parts = [str(parts).replace("\\", "/")]
-    if any("/" in p for p in parts):
-        flat: List[str] = []
-        for p in parts:
-            flat.extend(seg for seg in p.split("/") if seg)
-        return flat
-    return list(parts)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Abstract base
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(eq=False)
-class DatabricksPath(ABC):
-    """``pathlib.PurePosixPath``-like API for Databricks remote paths.
-
-    Concrete subclasses implement the abstract hooks for each namespace.
-    Use :meth:`parse` to build an instance from any string / list / path.
+    Concrete subclasses (DBFSPath / WorkspacePath / VolumePath /
+    TablePath) implement two SDK-transport hooks, plus the abstract
+    ``Path`` surface. The buffered-IO machinery is provided by
+    :class:`BytesIO` itself; this class no longer instantiates a
+    custom IO subclass.
     """
 
-    kind: ClassVar[DatabricksPathKind]
+    __slots__ = ("_client",)
 
-    # ── Shared fields ─────────────────────────────────────────────────
-    parts: List[str] = field(default_factory=list)
-    temporary: bool = field(default=False)
+    scheme: ClassVar[str] = "dbfs"
 
-    # Cached metadata (excluded from eq/hash)
-    _is_file: bool | None = field(repr=False, hash=False, compare=False, default=None)
-    _is_dir: bool | None = field(repr=False, hash=False, compare=False, default=None)
-    _size: int | None = field(repr=False, hash=False, compare=False, default=None)
-    _mtime: float | None = field(repr=False, hash=False, compare=False, default=None)
-    _client: Optional["DatabricksClient"] = field(
-        repr=False,
-        hash=False,
-        compare=False,
-        default=None,
-    )
+    #: Canonical POSIX prefix for the legacy string shape
+    #: (``/dbfs/``, ``/Workspace/``, …). Empty on the abstract base.
+    _NAMESPACE_PREFIX: ClassVar[Optional[str]] = None
 
-    # True once the path has been registered with the shutdown registry.
-    # We do NOT store the callback object itself — the registry keys bound
-    # methods by (func, id(instance)) and uses WeakMethod internally, so a
-    # plain boolean flag is enough and avoids spurious strong references.
-    _shutdown_registered: bool = field(
-        default=False,
-        init=False,
-        repr=False,
-        hash=False,
-        compare=False,
-    )
+    # ==================================================================
+    # Construction — chain through Path.__init__
+    # ==================================================================
 
-    def __post_init__(self) -> None:
-        if self.temporary:
-            self._register_shutdown_remove()
+    def __new__(cls, obj: Any = None, *args: Any, **kwargs: Any) -> "Path":
+        del args, kwargs
 
-    # ================================================================== #
-    # Abstract — implement per namespace                                  #
-    # ================================================================== #
+        if cls is DatabricksPath:
+            for sub in cls.__subclasses__():
+                if sub.handles(obj):
+                    return sub.__new__(obj, obj)
 
-    @abstractmethod
-    def full_path(self) -> str:
-        """Absolute path string (e.g. ``/Volumes/cat/schema/vol/file``)."""
+            target = _select_path_class(obj)
+            return target.__new__(target, obj)
+        return super().__new__(cls, obj)
 
-    @abstractmethod
-    def _refresh_metadata(self) -> None:
-        """Fetch remote status and cache in ``_is_file / _is_dir / _size / _mtime``."""
+    def __init__(
+        self,
+        obj: Any = None,
+        *,
+        url: Optional[URL] = None,
+        temporary: bool = False,
+        auto_open: bool = True,
+        client: Optional["DatabricksClient"] = None,
+    ) -> None:
+        coerced = self._coerce_legacy(obj)
 
-    @abstractmethod
-    def _ls_impl(
-        self, recursive: bool, fetch_size: int | None, allow_not_found: bool
-    ) -> Iterator["DatabricksPath"]: ...
+        super().__init__(
+            coerced,
+            url=url,
+            temporary=temporary,
+            auto_open=auto_open,
+        )
 
-    @abstractmethod
-    def _mkdir_impl(self, parents: bool, exist_ok: bool) -> None: ...
+        # Stamp the class scheme onto a URL that came in without one.
+        scheme = getattr(self, "scheme", "") or ""
+        if scheme and not self.url.scheme:
+            self.url = _dc_replace(self.url, scheme=scheme)
 
-    @abstractmethod
-    def _remove_file_impl(self, allow_not_found: bool) -> None: ...
+        # Strip our canonical namespace prefix if a URL-form input
+        # retained it.
+        prefix = self._NAMESPACE_PREFIX
+        if prefix:
+            stripped = self._strip_namespace_prefix(self.url.path)
+            if stripped != self.url.path:
+                self.url = _dc_replace(self.url, path=stripped)
 
-    @abstractmethod
-    def _remove_dir_impl(
-        self, recursive: bool, allow_not_found: bool, with_root: bool
-    ) -> None: ...
-
-    # ================================================================== #
-    # Factory                                                             #
-    # ================================================================== #
+        self._client = client
 
     @classmethod
-    def parse(
-        cls,
-        obj: Union["DatabricksPath", str, List[str]],
-        client: Optional["DatabricksClient"] = None,
-        temporary: bool = False,
-    ) -> "DatabricksPath":
-        """Build a concrete path from *obj*.
+    def _coerce_legacy(cls, obj: Any) -> Any:
+        """Pre-coerce inputs the new :class:`Path` base doesn't handle.
 
-        If *obj* is already a :class:`DatabricksPath` and ``temporary=True`` is
-        requested on a non-temporary instance, a *clone* is returned rather
-        than mutating the input — flipping ``temporary`` in place would
-        silently schedule someone else's path for deletion.
+        Only intervenes for strings that look like canonical
+        Databricks POSIX paths; everything else passes through.
         """
-        if not obj:
-            return _empty(client=client)
+        if isinstance(obj, str) and _looks_like_legacy_databricks(obj):
+            scheme, path = _parse_legacy(obj)
+            return f"{scheme}://{path}"
+        return obj
 
-        if isinstance(obj, DatabricksPath):
-            if client is not None and obj._client is None:
-                obj._client = client
-            if temporary and not obj.temporary:
-                clone = obj.clone_instance()
-                clone.temporary = True
-                clone._register_shutdown_remove()
-                return clone
-            return obj
+    # ==================================================================
+    # Classification — extend Path.handles for legacy POSIX
+    # ==================================================================
 
-        hostname: str | None = None
-        if isinstance(obj, str):
-            head, tail, hostname = _parse_string(obj)
-            if head is None:
-                raise ValueError(
-                    f"Unrecognized Databricks path {obj!r}.  "
-                    "Expected dbfs:/…, /Workspace/…, /Volumes/…, or an https://…/ URL."
-                )
-            raw = [head, *tail]
-        elif isinstance(obj, list):
-            raw = _flatten(obj)
-        else:
-            raise TypeError(f"Cannot parse {type(obj).__name__!r} as a DatabricksPath.")
-
-        flat = [p for p in _flatten(raw) if p]
-        if not flat:
-            return _empty(client=client)
-
-        ns, *tail = flat
-        klass = _KIND_MAP.get(ns.lower())
-        if klass is None:
-            raise ValueError(f"Unknown namespace {ns!r}.")
-
-        if hostname:
-            from ..client import DatabricksClient
-
-            client = DatabricksClient(host=hostname)
-
-        return klass(parts=tail, temporary=temporary, _client=client)
-
-    # ================================================================== #
-    # pathlib.PurePosixPath — pure path properties                        #
-    # ================================================================== #
-
-    @property
-    def name(self) -> str:
-        """Last component — ``pathlib.PurePosixPath.name``."""
-        return self.parts[-1] if self.parts else ""
-
-    @property
-    def suffix(self) -> str:
-        """Last extension with dot — ``pathlib.PurePosixPath.suffix``."""
-        name = self.name
-        i = name.rfind(".")
-        return name[i:] if i > 0 else ""
-
-    @property
-    def suffixes(self) -> List[str]:
-        """All extensions — ``pathlib.PurePosixPath.suffixes``."""
-        name = self.name
-        if not name or name.startswith("."):
-            return []
-        parts = name.split(".")
-        return [f".{s}" for s in parts[1:]] if len(parts) > 1 else []
-
-    @property
-    def stem(self) -> str:
-        """Name without the last suffix — ``pathlib.PurePosixPath.stem``."""
-        name = self.name
-        i = name.rfind(".")
-        return name[:i] if i > 0 else name
-
-    @property
-    def parent(self) -> "DatabricksPath":
-        """Parent path — ``pathlib.PurePosixPath.parent``."""
-        if not self.parts:
-            return self
-        return self._copy_with(
-            parts=self.parts[:-1],
-            temporary=False,
-            _is_file=False,
-            _is_dir=True,
-            _size=0,
-        )
-
-    @property
-    def parents(self) -> Tuple["DatabricksPath", ...]:
-        """All ancestors — ``pathlib.PurePosixPath.parents``."""
-        result = []
-        p = self
-        while p.parts:
-            p = p.parent
-            result.append(p)
-        return tuple(result)
-
-    def joinpath(self, *others: Union[str, "DatabricksPath"]) -> "DatabricksPath":
-        """Join one or more components — ``pathlib.PurePosixPath.joinpath``."""
-        result = self
-        for o in others:
-            result = result / o
-        return result
-
-    def with_name(self, name: str) -> "DatabricksPath":
-        """Return sibling with *name* — ``pathlib.PurePosixPath.with_name``."""
-        if not self.parts:
-            raise ValueError("Cannot replace name on an empty path.")
-        if not name or "/" in name:
-            raise ValueError(f"Invalid name: {name!r}")
-        return self._copy_with(parts=self.parts[:-1] + [name])
-
-    def with_suffix(self, suffix: str) -> "DatabricksPath":
-        """Return path with *suffix* — ``pathlib.PurePosixPath.with_suffix``."""
-        if suffix and not suffix.startswith("."):
-            raise ValueError(f"Invalid suffix: {suffix!r}")
-        return self.with_name(self.stem + suffix)
-
-    def with_stem(self, stem: str) -> "DatabricksPath":
-        """Return path with *stem* — ``pathlib.PurePosixPath.with_stem`` (3.12+)."""
-        return self.with_name(stem + self.suffix)
-
-    def match(self, pattern: str) -> bool:
-        """Glob-match against the path — ``pathlib.PurePosixPath.match``."""
-        return fnmatch.fnmatch(self.name, pattern) or fnmatch.fnmatch(
-            str(self), pattern
-        )
-
-    def is_relative_to(self, other: Union["DatabricksPath", str]) -> bool:
-        """Check prefix relationship — ``pathlib.PurePosixPath.is_relative_to``."""
-        if isinstance(other, str):
-            other = self.parse(other, client=self._client)
-        if type(self) is not type(other):
+    @classmethod
+    def handles(cls, obj: Any) -> bool:
+        if cls is DatabricksPath:
+            for sub in cls.__subclasses__():
+                if sub.handles(obj):
+                    return True
             return False
-        return self.parts[: len(other.parts)] == other.parts
 
-    def relative_to(self, other: Union["DatabricksPath", str]) -> "DatabricksPath":
-        """Compute relative path — ``pathlib.PurePosixPath.relative_to``."""
-        if isinstance(other, str):
-            other = self.parse(other, client=self._client)
-        if not self.is_relative_to(other):
-            raise ValueError(f"{self} is not relative to {other}")
-        return self._copy_with(parts=self.parts[len(other.parts) :])
+        if not cls.scheme:
+            return False
+        if not cls._NAMESPACE_PREFIX:
+            return False
 
-    # ================================================================== #
-    # pathlib.Path — concrete I/O operations                              #
-    # ================================================================== #
-
-    def exists(self, *, follow_symlinks: bool = True) -> bool:
-        """``pathlib.Path.exists``."""
-        return bool(self.is_file() or self.is_dir())
-
-    def is_file(self) -> Optional[bool]:
-        """``pathlib.Path.is_file``."""
-        if self._is_file is None:
-            self._refresh_metadata()
-        return self._is_file
-
-    def is_dir(self) -> Optional[bool]:
-        """``pathlib.Path.is_dir``."""
-        if self._is_dir is None:
-            self._refresh_metadata()
-        return self._is_dir
-
-    def stat(self) -> DatabricksStatResult:
-        """``pathlib.Path.stat`` — returns :class:`DatabricksStatResult`."""
-        self._refresh_metadata()
-        mode = (
-            stat_mod.S_IFREG
-            if self._is_file
-            else (stat_mod.S_IFDIR if self._is_dir else 0)
-        )
-        return DatabricksStatResult(
-            st_size=self._size or 0,
-            st_mtime=self._mtime or 0.0,
-            st_mode=mode | 0o755,
-        )
-
-    def iterdir(self) -> Iterator["DatabricksPath"]:
-        """``pathlib.Path.iterdir`` — non-recursive listing."""
-        yield from self._ls_impl(recursive=False, fetch_size=None, allow_not_found=True)
-
-    def glob(self, pattern: str) -> Iterator["DatabricksPath"]:
-        """``pathlib.Path.glob`` — recursive listing filtered by *pattern*."""
-        for child in self._ls_impl(
-            recursive=True, fetch_size=None, allow_not_found=True
-        ):
-            if fnmatch.fnmatch(child.name, pattern):
-                yield child
-
-    def rglob(self, pattern: str) -> Iterator["DatabricksPath"]:
-        """``pathlib.Path.rglob`` — alias for ``glob`` (always recursive)."""
-        yield from self.glob(pattern)
-
-    def mkdir(
-        self,
-        mode: int = 0o777,
-        parents: bool = True,
-        exist_ok: bool = True,
-    ) -> "DatabricksPath":
-        """``pathlib.Path.mkdir``."""
-        _ = mode  # Databricks doesn't support POSIX mode bits
-        self._mkdir_impl(parents=parents, exist_ok=exist_ok)
-        return self
-
-    def rmdir(
-        self,
-        recursive: bool = True,
-        allow_not_found: bool = True,
-        with_root: bool = True,
-    ) -> "DatabricksPath":
-        """Remove directory (recursive by default)."""
-        self._remove_dir_impl(
-            recursive=recursive,
-            allow_not_found=allow_not_found,
-            with_root=with_root,
-        )
-        return self
-
-    def unlink(self, missing_ok: bool = True) -> None:
-        """``pathlib.Path.unlink``."""
-        self.remove(recursive=True, allow_not_found=missing_ok)
-
-    def remove(
-        self,
-        recursive: bool = True,
-        allow_not_found: bool = True,
-    ) -> "DatabricksPath":
-        self._unregister_shutdown_remove()
-        if self.is_file():
-            self._remove_file_impl(allow_not_found=allow_not_found)
-        elif self.is_dir():
-            self._remove_dir_impl(
-                recursive=recursive,
-                allow_not_found=allow_not_found,
-                with_root=True,
+        if Path.is_pathish(obj):
+            url = URL.from_(
+                obj,
+                default_scheme=cls.scheme,
+                default=None
             )
 
-        if allow_not_found:
-            return self
+            if url is not None:
+                return url.scheme == cls.scheme or (
+                    url.path and url.path.startswith(cls._NAMESPACE_PREFIX)
+                )
 
-        raise FileNotFoundError(f"{self!r} does not exist")
+        ns, _ = _parse_legacy(obj)
+        return ns == cls.scheme
 
-    def rmfile(self, allow_not_found: bool = True) -> "DatabricksPath":
-        self._remove_file_impl(allow_not_found=allow_not_found)
+    @classmethod
+    def _strip_namespace_prefix(cls, raw: str) -> str:
+        if not raw.startswith("/"):
+            raw = "/" + raw
+        prefix = cls._NAMESPACE_PREFIX
+        if not prefix:
+            return raw
+        if raw.startswith(prefix):
+            tail = raw[len(prefix):].lstrip("/")
+            return "/" + tail if tail else "/"
+        if raw == prefix.rstrip("/"):
+            return "/"
+        return raw
+
+    # ==================================================================
+    # Coercion entry points
+    # ==================================================================
+
+    @classmethod
+    def from_(
+        cls,
+        obj: Any,
+        default: Any = ...,
+        *,
+        temporary: bool = False,
+        client: "DatabricksClient | None" = None,
+    ) -> "DatabricksPath":
+        if isinstance(obj, DatabricksPath):
+            same_type = type(obj) is cls or cls is DatabricksPath
+            if same_type:
+                if temporary:
+                    obj.temporary = True
+                if client is not None:
+                    obj._client = client
+                return obj
+            return cls.from_url(
+                obj.url,
+                default=default, temporary=temporary,
+                client=client
+            )
+
+        if Path.is_pathish(obj):
+            return cls.from_url(
+                URL.from_(obj),
+                default=default,
+                temporary=temporary,
+                client=client
+            )
+
+        return super().from_(obj, default=default, temporary=temporary)
+
+    @classmethod
+    def from_url(
+        cls,
+        url: URL,
+        default: Any = ...,
+        *,
+        temporary: bool = False,
+        client: "DatabricksClient | None" = None,
+    ) -> "Path":
+        """Build a :class:`Path` from a URL, dispatching by scheme.
+
+        Dead-branch removed vs. previous version: ``URL.from_``
+        either returns a :class:`URL` or raises, never ``None``,
+        so the ``if resolved is None`` check never fired.
+        """
+        try:
+            resolved = URL.from_(url)
+        except (ValueError, TypeError):
+            if default is ...:
+                raise
+            return default
+
+        if cls is DatabricksPath:
+            for sub in cls.__subclasses__():
+                if sub.handles(resolved):
+                    client = databricks_client_class().current() if client is None else client
+                    return sub(
+                        url=resolved, temporary=temporary,
+                        client=client
+                    )
+
+        return super().from_url(resolved, default=default, temporary=temporary)
+
+    @property
+    def is_local(self) -> bool:
+        # Default False — subclasses (notably DBFSPath) override
+        # when a local-FS view exists (FUSE mount).
+        return False
+
+    def to_sql_string_location(self, file_format: str):
+        return f"{file_format}.`{self.full_path()}`"
+
+    def _from_url(self, url: URL) -> "Path":
+        """Build a same-typed :class:`Path` from *url*.
+
+        Stays on ``type(self)`` so subclass overrides flow through.
+        Does NOT propagate :attr:`temporary` — navigation produces
+        a new identity, and the temp lifecycle is anchored to the
+        original Path that claimed it.
+        """
+        return type(self)(
+            url=url,
+            client=self.client,
+        )
+
+    # ==================================================================
+    # Client binding
+    # ==================================================================
+
+    @property
+    def client(self) -> "DatabricksClient":
+        if self._client is None:
+            raise RuntimeError(
+                f"{self!r} has no Databricks client bound. Use "
+                "with_client(...) or pass client= at construction."
+            )
+        return self._client
+
+    @property
+    def connected(self) -> bool:
+        return self._client is not None and getattr(
+            self._client, "connected", False,
+        )
+
+    @property
+    def workspace(self):
+        """SDK :class:`WorkspaceClient` shortcut."""
+        return self.client.workspace_client()
+
+    def _sdk(self):
+        return self.workspace
+
+    def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
+        self._client = client
         return self
 
-    def rename(self, target: Union["DatabricksPath", str]) -> "DatabricksPath":
-        """``pathlib.Path.rename`` — implemented as copy + remove."""
-        if isinstance(target, str):
-            target = self.parse(target, client=self._client)
-        self.copy_to(target)
-        self.remove(recursive=True)
-        return target
+    def connect(self) -> "DatabricksPath":
+        if self._client is None:
+            raise RuntimeError(
+                f"{self!r} has no Databricks client bound. Use "
+                "with_client(...) before calling connect()."
+            )
+        if not self.connected:
+            self._client.connect()
+        return self
 
-    # ── File I/O ──────────────────────────────────────────────────────
+    def _unsafe_remove(self) -> None:
+        try:
+            self.remove(recursive=True, allow_not_found=True)
+        except BaseException:
+            try:
+                LOGGER.debug(
+                    "Shutdown cleanup of %s failed",
+                    self.full_path(), exc_info=True,
+                )
+            except Exception:
+                pass
+
+    def close(self, wait: bool = True) -> None:
+        """Close the path. ``wait=False`` spawns a daemon thread so the
+        remote-remove can't block interpreter shutdown."""
+        if not self.temporary or wait:
+            super().close()
+            return
+
+        threading.Thread(
+            target=self._unsafe_remove,
+            name=f"databricks-path-close-{self.name or 'root'}",
+            daemon=True,
+        ).start()
+
+    # ==================================================================
+    # I/O — _open returns a plain BytesIO bound to this path
+    # ==================================================================
+    #
+    # The major change vs. the legacy: we no longer construct a
+    # custom DatabricksIO subclass. The base BytesIO already knows
+    # how to handle non-local paths via its transaction-buffer
+    # machinery — it'll call self.pread to fill on acquire and
+    # self.write_bytes to commit on flush. That's all we need.
+
+    def _open(
+        self,
+        mode: str = "rb",
+        *,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        auto_open: bool = True,
+        touch: bool = False,
+    ) -> BytesIO:
+        """Construct a path-bound :class:`BytesIO`.
+
+        Binary-mode only at this layer; text wrapping is the caller's
+        job (or use the ``open()`` shim below for builtin-open
+        ergonomics). The BytesIO machinery handles the buffer
+        lifecycle, mode-driven download/upload, and commit-on-close.
+        """
+        del errors, newline, encoding  # binary-only at this layer
+
+        # Bind the client lazily on first IO if it isn't connected.
+        if self._client is not None and not self.connected:
+            self.connect()
+
+        # Promote text mode to binary internally.
+        if "b" not in mode:
+            mode = mode.replace("t", "")
+            if "b" not in mode:
+                mode += "b"
+
+        del touch  # honored at the SDK layer per-subclass if useful
+
+        return BytesIO(
+            path=self,
+            mode=mode,
+            auto_open=auto_open,
+        )
 
     def open(
         self,
         mode: str = "rb",
         buffering: int = -1,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-        clone: bool = False,
-    ) -> DatabricksIO:
-        """``pathlib.Path.open`` — returns a :class:`DatabricksIO` handle."""
-        path = self.connect()
-        return DatabricksIO.create_instance(
-            path=path, mode=mode, encoding=encoding
-        ).connect(clone=False)
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        *,
+        auto_open: bool = True,
+        touch: bool = False,
+    ) -> IO[bytes]:
+        """``builtins.open``-shaped open. Binary or text handle.
 
-    def read_bytes(self, use_cache: bool = False) -> bytes:
-        """``pathlib.Path.read_bytes``."""
-        with self.open("rb") as f:
-            return f.read_all_bytes(use_cache=use_cache)
+        Provided for parity with the legacy ``FileSystem.open``
+        signature. ``buffering`` is forwarded for stdlib parity but
+        ignored — the underlying :class:`BytesIO` does its own
+        sizing.
 
-    def write_bytes(self, data) -> None:
-        """``pathlib.Path.write_bytes``."""
-        with self.open("wb") as f:
-            f.write_all_bytes(data=data)
+        Text-mode (``mode`` without ``b``) returns a
+        :class:`io.TextIOWrapper` over the binary handle.
+        """
+        del buffering
 
-    # ── Optimized memory access (yggdrasil.io.fs.Path-compatible) ─────
+        if "b" in mode:
+            return self.open_io(
+                mode=mode,
+                encoding=encoding,
+                auto_open=auto_open,
+                touch=touch,
+            )
+
+        binary_mode = mode.replace("t", "") + "b"
+        binary_mode = binary_mode.replace("bb", "b")
+        binary_handle = self.open_io(
+            mode=binary_mode,
+            encoding=None,
+            auto_open=auto_open,
+            touch=touch,
+        )
+
+        import io as _stdio
+        return _stdio.TextIOWrapper(
+            binary_handle,
+            encoding=encoding or "utf-8",
+            errors=errors or "strict",
+            newline=newline,
+            write_through=True,
+        )
+
+    # ==================================================================
+    # Bytes I/O — direct SDK calls, NOT through open_io
+    # ==================================================================
     #
-    # Mirrors the API ``yggdrasil.io.fs.Path`` exposes so BytesIO and
-    # other callers can treat a DatabricksPath as if it were a local
-    # file: :meth:`pread` / :meth:`pwrite` / :meth:`memoryview` /
-    # :meth:`open_mmap` / :attr:`local_os_path` / :attr:`is_local_fs`.
+    # Override the base's read_bytes/write_bytes (which go through
+    # open_io → BytesIO → path.pread → infinite recursion). The
+    # subclass-supplied _remote_download / _remote_upload are the
+    # SDK transport.
+
+    def read_bytes(self, *, raise_error: bool = True) -> bytes:
+        """Whole-file download via :meth:`_remote_download`."""
+        try:
+            return self._remote_download(allow_not_found=False).to_bytes()
+        except (OSError, ValueError):
+            if raise_error:
+                raise
+            return b""
+
+    def write_bytes(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        *,
+        mode: str = "wb",
+        parents: bool = True,
+    ) -> int:
+        """Whole-file upload via :meth:`_remote_upload`."""
+        del mode  # always overwrite at this layer
+        payload = bytes(data)
+
+        try:
+            self._remote_upload(payload)
+        except FileNotFoundError:
+            if not parents:
+                raise
+            self.parent.mkdir(parents=True, exist_ok=True)
+            self._remote_upload(payload)
+        return len(payload)
+
+    # ==================================================================
+    # Positional IO — required by the abstract Path
+    # ==================================================================
+
+    def pread(
+        self,
+        n: int,
+        pos: int,
+        *,
+        default: Any = ...,
+    ) -> bytes:
+        """Positional read via download-and-slice.
+
+        SDK Databricks paths don't generally expose range reads
+        (DBFS FUSE is the exception, handled by :class:`DBFSPath`'s
+        override). The naive implementation downloads the whole
+        object and slices locally — correct, single round-trip per
+        ``pread`` call, fine for occasional use; if pread becomes a
+        hot loop the caller should ``read_bytes`` once and slice
+        themselves.
+        """
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        if n == 0:
+            return b""
+
+        try:
+            data = self._remote_download(allow_not_found=False)
+        except FileNotFoundError:
+            if default is ...:
+                raise
+            return default
+        except OSError:
+            if default is ...:
+                raise
+            return default
+
+        if n < 0:
+            return data[pos:]
+        return data[pos:pos + n]
+
+    def pwrite(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+        *,
+        parents: bool = True,
+    ) -> int:
+        """Positional write via read-modify-write.
+
+        Most Databricks SDKs don't support partial writes — even
+        DBFS' streaming upload truncates the destination. This
+        implementation downloads the existing object (if any),
+        splices the new bytes at ``pos``, uploads the result.
+
+        Window-inside-existing patches in place; extending past EOF
+        zero-pads to match POSIX. Same shape as
+        :meth:`Path._pwrite_via_rmw` but using our SDK-direct
+        ``read_bytes`` / ``write_bytes`` to avoid the
+        ``open_io`` recursion.
+        """
+        mv = memoryview(data)
+        if not mv.c_contiguous:
+            mv = memoryview(bytes(mv))
+        n = len(mv)
+        if n == 0:
+            return 0
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+
+        existing = self.read_bytes(raise_error=False) if self.exists() else b""
+        end = pos + n
+
+        if end <= len(existing):
+            buf = bytearray(existing)
+            buf[pos:end] = mv
+            out = bytes(buf)
+        else:
+            buf = bytearray(end)
+            if existing:
+                buf[: len(existing)] = existing
+            buf[pos:end] = mv
+            out = bytes(buf)
+
+        self.write_bytes(out, parents=parents)
+        return n
+
+    # ==================================================================
+    # SDK transport — abstract, subclasses fill in
+    # ==================================================================
+
+    @abstractmethod
+    def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
+        """Whole-object GET. Returns ``bytes``.
+
+        Raises :class:`FileNotFoundError` on missing object when
+        ``allow_not_found=False``; returns ``b""`` when True.
+        Other backend errors propagate.
+        """
+
+    @abstractmethod
+    def _remote_upload(self, payload: BytesIO) -> None:
+        """Whole-object PUT. Takes ``bytes``.
+
+        Implementations should overwrite if the object already
+        exists. ``FileNotFoundError`` on a missing parent directory
+        is allowed to propagate; the caller (:meth:`write_bytes`)
+        will retry once after creating the parent.
+        """
+
+    # ==================================================================
+    # copy_to — directory-aware override
+    # ==================================================================
+
+    def copy_to(
+        self,
+        dest: Any,
+        *,
+        batch_size: int = 4 * 1024 * 1024,
+        parents: bool = True,
+    ) -> int:
+        """Copy this path to *dest*; recurses for directories.
+
+        The base streaming copy opens both endpoints as files —
+        fine when ``self`` is a leaf, but the SDK reads on a
+        directory path return ``BadRequest``. Branch on
+        :meth:`is_dir` and walk children for the directory case,
+        rebuilding the relative tree under ``dest``.
+        """
+        dest_path = Path.from_(dest)
+
+        if not self.is_dir():
+            return super().copy_to(
+                dest_path, batch_size=batch_size, parents=parents,
+            )
+
+        if parents:
+            dest_path.mkdir(parents=True, exist_ok=True)
+
+        total = 0
+        for child in self.ls(recursive=True, allow_not_found=True):
+            try:
+                rel = child.relative_to(self)
+            except ValueError:
+                continue
+            target = dest_path.joinpath(*rel.parts)
+            if child.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            total += Path.copy_to(
+                child, target,
+                batch_size=batch_size, parents=False,
+            )
+        return total
+
+    # ==================================================================
+    # Cross-scheme helpers
+    # ==================================================================
+
+    @property
+    @abstractmethod
+    def kind(self) -> DatabricksPathKind:
+        """The :class:`DatabricksPathKind` enum tag for this scheme."""
 
     @property
     def local_os_path(self) -> Optional[str]:
-        """Return a FUSE-mounted local path for ``/dbfs/…`` files, else ``None``.
+        """Local-FS path when this remote is OS-mounted, else ``None``.
 
-        Databricks clusters expose DBFS under ``/dbfs/`` via FUSE, so
-        :class:`DBFSPath` is directly addressable by :mod:`os` and
-        :mod:`mmap`. Workspace / volumes / table paths have no such
-        mount and return ``None`` — callers fall back to read_bytes /
-        pread round-tripping.
+        Default ``None``; :class:`DBFSPath` overrides for FUSE.
         """
-        if self.kind is DatabricksPathKind.DBFS:
-            full = self.full_path()
-            # /dbfs/ is the FUSE mount; anything else would be misleading.
-            if full.startswith("/dbfs/"):
-                return full
         return None
 
     @property
     def is_local_fs(self) -> bool:
         return self.local_os_path is not None
 
-    def pread(self, n: int, pos: int) -> bytes:
-        """Positional read. Uses ``os.pread`` on DBFS mounts, range read otherwise."""
-        if n <= 0:
-            return b""
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-
-        local = self.local_os_path
-        if local and hasattr(os, "pread"):
-            with open(local, "rb") as fh:
-                return os.pread(fh.fileno(), n, pos)
-
-        # Fallback: cached full-file read. DatabricksIO can support
-        # range GETs; opting into them here would duplicate code that
-        # already lives on DatabricksIO, so stick with the simple,
-        # correct fallback.
-        data = self.read_bytes(use_cache=True)
-        end = min(pos + n, len(data))
-        if pos >= end:
-            return b""
-        return bytes(data[pos:end])
-
-    def pwrite(self, data, pos: int) -> int:
-        """Positional write. Uses ``os.pwrite`` on DBFS mounts; read-modify-write otherwise."""
-        mv = memoryview(data)
-        if len(mv) == 0:
-            return 0
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-
-        local = self.local_os_path
-        if local and hasattr(os, "pwrite"):
-            if not self.exists():
-                self.parent.mkdir(parents=True, exist_ok=True)
-                self.write_bytes(b"")
-            with open(local, "r+b") as fh:
-                return int(os.pwrite(fh.fileno(), mv, pos))
-
-        existing = self.read_bytes() if self.exists() else b""
-        new_size = max(len(existing), pos + len(mv))
-        buf = bytearray(new_size)
-        buf[: len(existing)] = existing
-        buf[pos : pos + len(mv)] = mv
-        self.write_bytes(bytes(buf))
-        return len(mv)
-
-    def open_mmap(self, mode: str = "r"):
-        """Memory-map this file when it's exposed via the DBFS FUSE mount.
-
-        Returns ``None`` for non-mounted paths — callers fall back to
-        :meth:`memoryview` which materializes bytes once.
-        """
-        import mmap as _mmap
-
-        local = self.local_os_path
-        if not local:
-            return None
-        try:
-            size = os.stat(local).st_size
-        except OSError:
-            return None
-        if size == 0:
-            return None
-        access = _mmap.ACCESS_READ if mode == "r" else _mmap.ACCESS_WRITE
-        open_mode = "rb" if mode == "r" else "r+b"
-        with open(local, open_mode) as fh:
-            return _mmap.mmap(fh.fileno(), length=0, access=access)
-
-    def memoryview(
-        self,
-        *,
-        offset: int = 0,
-        size: Optional[int] = None,
-    ) -> "memoryview":
-        """Return a (possibly zero-copy) view of this file's bytes."""
-        if offset < 0:
-            raise ValueError("memoryview offset must be >= 0")
-
-        mm = self.open_mmap("r")
-        if mm is not None:
-            mv = memoryview(mm)
-            if offset == 0 and size is None:
-                return mv
-            end = len(mv) if size is None else offset + size
-            return mv[offset:end]
-
-        data = self.read_bytes()
-        if offset == 0 and size is None:
-            return memoryview(data)
-        end = len(data) if size is None else offset + size
-        return memoryview(data)[offset:end]
-
-    def read_text(self, encoding: str = "utf-8", errors: str | None = None) -> str:
-        """``pathlib.Path.read_text``."""
-        return self.read_bytes().decode(encoding, errors=errors or "strict")
-
-    def write_text(
-        self,
-        data: str,
-        encoding: str = "utf-8",
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        """``pathlib.Path.write_text``."""
-        encoded = data.encode(encoding, errors=errors or "strict")
-        self.write_bytes(encoded)
-        return len(encoded)
-
-    def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
-        """``pathlib.Path.touch``."""
-        if self.exists():
-            if not exist_ok:
-                raise FileExistsError(f"Path already exists: {self}")
-            return
-        self.write_bytes(b"")
-
-    # ── Copy ──────────────────────────────────────────────────────────
-
-    def copy_to(
-        self,
-        dest: Union["DatabricksIO", "DatabricksPath", str],
-        allow_not_found: bool = True,
-    ) -> None:
-        if self.is_file():
-            with self.open(mode="rb") as src:
-                src.copy_to(dest=dest)
-        elif self.is_dir():
-            dest_path = self.parse(
-                obj=dest,
-                client=(
-                    self.workspace
-                    if isinstance(dest, DatabricksPath) and dest._client is None
-                    else None
-                ),
-            )
-            dest_path.mkdir(parents=True, exist_ok=True)
-            skip = len(self.parts)
-            for child in self.ls(recursive=True, allow_not_found=True):
-                child.copy_to(
-                    dest=dest_path._copy_with(
-                        parts=dest_path.parts + child.parts[skip:]
-                    ),
-                    allow_not_found=allow_not_found,
-                )
-        elif not allow_not_found:
-            raise FileNotFoundError(f"Path {self} does not exist.")
-
-    # ================================================================== #
-    # Legacy-compatible helpers                                           #
-    # ================================================================== #
-
-    def ls(
-        self,
-        recursive: bool = False,
-        fetch_size: int | None = None,
-        allow_not_found: bool = True,
-    ) -> Iterator["DatabricksPath"]:
-        yield from self._ls_impl(
-            recursive=recursive,
-            fetch_size=fetch_size,
-            allow_not_found=allow_not_found,
-        )
-
-    def path_parts(self) -> List[str]:
-        return list(self.parts)
-
-    @property
-    def extension(self) -> str:
-        return self.suffix.lstrip(".")
-
-    @property
-    def file_type(self) -> FileType:
-        if self.is_file():
-            return FileType.File
-        if self.is_dir():
-            return FileType.Directory
-        return FileType.NotFound
-
-    # ================================================================== #
-    # Metadata                                                            #
-    # ================================================================== #
-
-    @property
-    def content_length(self) -> int:
-        if self._size is None:
-            self._refresh_metadata()
-        return self._size or 0
-
-    @content_length.setter
-    def content_length(self, value: int | None) -> None:
-        self._size = value
-
-    @property
-    def mtime(self) -> Optional[float]:
-        if self._mtime is None:
-            self._refresh_metadata()
-        return self._mtime
-
-    @mtime.setter
-    def mtime(self, value) -> None:
-        if isinstance(value, dt.datetime):
-            value = value.timestamp()
-        elif isinstance(value, str):
-            value = dt.datetime.fromisoformat(value).timestamp()
-        else:
-            value = float(value)
-        self._mtime = value
-
-    @property
-    def file_info(self) -> FileInfo:
-        return FileInfo(
-            path=self.full_path(),
-            type=self.file_type,
-            mtime=self.mtime,
-            size=self.content_length,
-        )
-
-    def refresh_status(self) -> "DatabricksPath":
-        self._refresh_metadata()
-        return self
-
-    def reset_metadata(
-        self,
-        is_file: bool | None = None,
-        is_dir: bool | None = None,
-        size: int | None = None,
-        mtime: float | None = None,
-    ) -> "DatabricksPath":
-        self._is_file = is_file
-        self._is_dir = is_dir
-        self._size = None if size is None else int(size)
-        self._mtime = _coerce_mtime_seconds(mtime)
-        return self
-
-    # ================================================================== #
-    # Client / workspace                                                  #
-    # ================================================================== #
-
-    @property
-    def connected(self) -> bool:
-        return self._client is not None and self._client.connected
-
-    @property
-    def client(self) -> "DatabricksClient":
-        if self._client is None:
-            from ..client import DatabricksClient
-
-            self._client = DatabricksClient.current()
-        return self._client
-
-    @property
-    def workspace(self):
-        return self.client.workspace
-
-    @workspace.setter
-    def workspace(self, value) -> None:
-        self._client = value
+    def sql_volume_or_table_parts(self) -> Tuple[
+        Optional[str], Optional[str], Optional[str], list,
+    ]:
+        return (None, None, None, [])
 
     def sql_engine(self):
-        catalog, schema, _, _ = self.sql_volume_or_table_parts()
-        return self.workspace.sql(catalog_name=catalog, schema_name=schema)
+        from yggdrasil.databricks.sql import SQLEngine
+        return SQLEngine(client=self.client)
 
-    def connect(self) -> "DatabricksPath":
-        self._client = self.workspace.connect()
-        return self
+    # ==================================================================
+    # Abstract — concrete subclasses must implement
+    # ==================================================================
 
-    # ------------------------------------------------------------------
-    # Shutdown-hook integration
-    #
-    # The shutdown registry holds bound methods via WeakMethod, so the
-    # registration does NOT extend the lifetime of this path. That means we
-    # must keep *some* strong reference to the path alive as long as we want
-    # the cleanup to fire — typically the caller does that by holding the
-    # path object in a variable. If the caller drops the path on the floor,
-    # the WeakMethod dies, the registry entry is pruned by its finalizer,
-    # and cleanup silently won't fire. This is deliberate: we don't want
-    # cleanup to resurrect otherwise-dead objects.
-    # ------------------------------------------------------------------
+    @abstractmethod
+    def full_path(self) -> str:
+        """POSIX rendering with the namespace prefix.
 
-    def _register_shutdown_remove(self) -> None:
-        """Register a process-exit hook that removes this temporary path."""
-        if self._shutdown_registered or not self.temporary:
-            return
-        try:
-            yg_shutdown.register(self._unsafe_remove)
-            self._shutdown_registered = True
-        except Exception:
-            logger.debug(
-                "Failed to register shutdown handler for temporary path %s",
-                self.full_path(),
-                exc_info=True,
-            )
-
-    def _unregister_shutdown_remove(self) -> None:
-        """Remove the process-exit hook registered by :meth:`_register_shutdown_remove`."""
-        if not self._shutdown_registered:
-            return
-        self._shutdown_registered = False
-        try:
-            yg_shutdown.unregister(self._unsafe_remove)
-        except Exception:
-            logger.debug(
-                "Failed to unregister shutdown handler for path %s",
-                self.full_path(),
-                exc_info=True,
-            )
-
-    def _unsafe_remove(self) -> None:
-        """Best-effort removal used as the atexit / signal shutdown callback.
-
-        At shutdown, the SDK client, network stack, or logging may already be
-        torn down. We swallow *all* exceptions and log at DEBUG — a failed
-        cleanup at process exit must never prevent other shutdown hooks from
-        running, and must never produce noisy tracebacks on stderr.
+        ``/dbfs/foo/bar``, ``/Workspace/x``, ``/Volumes/cat/sch/vol/x``,
+        ``/Tables/cat/sch/tbl``.
         """
-        try:
-            self.remove(recursive=True, allow_not_found=True)
-        except BaseException:  # noqa: BLE001 — shutdown hook must not raise
-            try:
-                logger.debug(
-                    "Shutdown cleanup of temporary path %s failed",
-                    self.full_path(),
-                    exc_info=True,
-                )
-            except Exception:
-                # Logging itself may have been torn down by another atexit hook.
-                pass
-
-    def close(self, wait: bool = True) -> None:
-        """Close the path.
-
-        For a non-temporary path this is a no-op.
-
-        For a temporary path:
-        - ``wait=True``  (default, safe): synchronously remove the remote
-          resource. Raises on failure.
-        - ``wait=False``: spawn a **daemon** background thread to do the
-          removal. Daemon so it cannot block interpreter shutdown. The
-          shutdown hook is unregistered eagerly to avoid a double-remove
-          race with atexit.
-        """
-        if not self.temporary:
-            return
-
-        if wait:
-            self.remove(recursive=True)
-            return
-
-        # Unregister the atexit hook first so we don't race atexit → remove()
-        # against the background thread's remove().
-        self._unregister_shutdown_remove()
-        t = threading.Thread(
-            target=self._unsafe_remove,
-            name=f"databricks-path-close-{self.name or 'root'}",
-            daemon=True,
-        )
-        t.start()
-
-    # ================================================================== #
-    # UC helpers (stubs — overridden by VolumePath / TablePath)           #
-    # ================================================================== #
-
-    def sql_volume_or_table_parts(
-        self,
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-        return None, None, None, []
-
-    # ================================================================== #
-    # Dunder protocol                                                     #
-    # ================================================================== #
-
-    def __hash__(self) -> int:
-        return hash(self.full_path())
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, DatabricksPath):
-            return type(self) is type(other) and self.parts == other.parts
-        if isinstance(other, str):
-            return self.full_path() == other
-        return NotImplemented
-
-    def __truediv__(self, other: Union[str, "DatabricksPath"]) -> "DatabricksPath":
-        if not other:
-            return self
-        return self._copy_with(parts=self.parts + _flatten(other))
-
-    def __enter__(self) -> "DatabricksPath":
-        return self.connect()
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        # Tear down the client first, then clean up the temporary path.
-        # On exception, prefer a synchronous wait so the caller observes
-        # cleanup failure rather than losing it in a background thread.
-        if self._client is not None:
-            try:
-                self._client.__exit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                logger.debug(
-                    "Client __exit__ raised for %s",
-                    self.full_path(),
-                    exc_info=True,
-                )
-        self.close(wait=exc_type is not None)
-
-    def __str__(self) -> str:
-        return self.full_path()
-
-    def __repr__(self) -> str:
-        return self.url()
-
-    def __fspath__(self) -> str:
-        return self.full_path()
-
-    # ── Clone ─────────────────────────────────────────────────────────
-
-    def _copy_with(self, **overrides) -> "DatabricksPath":
-        """Internal clone — forwards to :func:`dataclasses.replace`.
-
-        A cloned path is NOT automatically registered as temporary even if the
-        source was; callers that want shutdown cleanup must either pass
-        ``temporary=True`` explicitly or call ``_register_shutdown_remove``
-        themselves. This avoids unintentionally scheduling sibling/parent
-        paths for deletion when manipulating ``parts``.
-        """
-        clone = replace(self, **overrides)
-        # replace() runs __post_init__, which may have registered a hook if
-        # temporary=True was carried over. That's the intended behaviour.
-        return clone
-
-    def clone_instance(self, **kwargs) -> "DatabricksPath":
-        return replace(
-            self,
-            parts=kwargs.get("parts", self.parts),
-            _client=kwargs.get("client", self._client),
-            _is_file=kwargs.get("is_file", self._is_file),
-            _is_dir=kwargs.get("is_dir", self._is_dir),
-            _size=kwargs.get("size", self._size),
-            _mtime=kwargs.get("mtime", self._mtime),
-        )
-
-    def url(self) -> str:
-        base = (
-            self._client.base_url.to_string().rstrip("/")
-            if self._client is not None
-            else "dbfs://"
-        )
-        return base + self.full_path()
-
-    def _sdk(self):
-        return self.workspace.workspace_client()
-
-    def _full_parts(self) -> List[str]:
-        if self.parts and not self.parts[-1]:
-            return self.parts[:-1]
-        return self.parts
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Empty sentinel
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _empty(client=None) -> "DBFSPath":
-    return DBFSPath(
-        parts=[],
-        temporary=False,
-        _client=client,
-        _is_file=False,
-        _is_dir=False,
-        _size=0,
-        _mtime=0.0,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DBFSPath  (/dbfs/…)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(eq=False)
-class DBFSPath(DatabricksPath):
-    kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.DBFS
-
-    def full_path(self) -> str:
-        return "/dbfs/" + "/".join(self._full_parts())
-
-    def _refresh_metadata(self) -> None:
-        try:
-            info = self._sdk().dbfs.get_status(self.full_path())
-            self.reset_metadata(
-                is_file=not info.is_dir,
-                is_dir=info.is_dir,
-                size=info.file_size,
-                mtime=(
-                    info.modification_time / 1000.0 if info.modification_time else None
-                ),
-            )
-            return
-        except NOT_FOUND_ERRORS:
-            pass
-        found = next(self._ls_impl(False, 1, True), None)
-        self.reset_metadata(
-            is_file=None if found is None else False,
-            is_dir=None if found is None else True,
-            size=None,
-            mtime=found.mtime if found else None,
-        )
-
-    def _ls_impl(self, recursive=False, fetch_size=None, allow_not_found=True):
-        try:
-            for info in self._sdk().dbfs.list(self.full_path()):
-                child = DBFSPath(
-                    parts=info.path.split("/")[2:],
-                    _client=self.workspace,
-                    _is_file=not info.is_dir,
-                    _is_dir=info.is_dir,
-                    _size=info.file_size,
-                    _mtime=_coerce_mtime_seconds(
-                        getattr(info, "modification_time", None)
-                    ),
-                )
-                if recursive and info.is_dir:
-                    yield from child._ls_impl(
-                        recursive=True, allow_not_found=allow_not_found
-                    )
-                else:
-                    yield child
-        except NOT_FOUND_ERRORS:
-            if not allow_not_found:
-                raise
-
-    def _mkdir_impl(self, parents=True, exist_ok=True):
-        try:
-            self._sdk().dbfs.mkdirs(self.full_path())
-        except ALREADY_EXISTS_ERRORS:
-            if not exist_ok:
-                raise
-        self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
-
-    def _remove_file_impl(self, allow_not_found=True):
-        try:
-            self._sdk().dbfs.delete(self.full_path(), recursive=False)
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-        finally:
-            self.reset_metadata()
-
-    def _remove_dir_impl(self, recursive=True, allow_not_found=True, with_root=True):
-        path = self.full_path()
-        try:
-            self._sdk().dbfs.delete(path, recursive=recursive)
-            if not with_root:
-                self._sdk().dbfs.mkdirs(path)
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-        finally:
-            self.reset_metadata()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# WorkspacePath  (/Workspace/…)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(eq=False)
-class WorkspacePath(DatabricksPath):
-    kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.WORKSPACE
-
-    def full_path(self) -> str:
-        return "/Workspace/" + "/".join(self._full_parts())
-
-    def _refresh_metadata(self) -> None:
-        try:
-            info = self._sdk().workspace.get_status(self.full_path())
-            is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
-            self.reset_metadata(
-                is_file=not is_dir,
-                is_dir=is_dir,
-                size=info.size,
-                mtime=float(info.modified_at) / 1000.0 if info.modified_at else None,
-            )
-            return
-        except SDK_ERRORS:
-            pass
-        found = next(self._ls_impl(False, 1, True), None)
-        self.reset_metadata(
-            is_file=None if found is None else False,
-            is_dir=None if found is None else True,
-            size=None,
-            mtime=found.mtime if found else None,
-        )
-
-    def _ls_impl(self, recursive=False, fetch_size=None, allow_not_found=True):
-        try:
-            for info in self._sdk().workspace.list(
-                self.full_path(), recursive=recursive
-            ):
-                is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
-                yield WorkspacePath(
-                    parts=info.path.split("/")[2:],
-                    _client=self.workspace,
-                    _is_file=not is_dir,
-                    _is_dir=is_dir,
-                    _size=info.size,
-                    _mtime=_coerce_mtime_seconds(getattr(info, "modified_at", None)),
-                )
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-
-    def _mkdir_impl(self, parents=True, exist_ok=True):
-        try:
-            self._sdk().workspace.mkdirs(self.full_path())
-        except ALREADY_EXISTS_ERRORS:
-            if not exist_ok:
-                raise
-        self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
-
-    def _remove_file_impl(self, allow_not_found=True):
-        try:
-            self._sdk().workspace.delete(self.full_path(), recursive=True)
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-        finally:
-            self.reset_metadata()
-
-    def _remove_dir_impl(self, recursive=True, allow_not_found=True, with_root=True):
-        path = self.full_path()
-        try:
-            self._sdk().workspace.delete(path, recursive=recursive)
-            if not with_root:
-                self._sdk().workspace.mkdirs(path)
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-        finally:
-            self.reset_metadata()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# VolumePath  (/Volumes/catalog/schema/volume/…)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(eq=False)
-class VolumePath(DatabricksPath):
-    kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.VOLUME
-
-    _volume_info: Optional[VolumeInfo] = field(
-        repr=False,
-        hash=False,
-        compare=False,
-        default=None,
-    )
-
-    def full_path(self) -> str:
-        return "/Volumes/" + "/".join(self._full_parts())
-
-    # ── UC decomposition ──────────────────────────────────────────────
-
-    def sql_volume_or_table_parts(self):
-        p = self.parts
-        return (
-            p[0] if len(p) > 0 else None,
-            p[1] if len(p) > 1 else None,
-            p[2] if len(p) > 2 else None,
-            p[3:],
-        )
-
-    def volume_info(self) -> Optional[VolumeInfo]:
-        if self._volume_info is None:
-            cat, sch, vol, _ = self.sql_volume_or_table_parts()
-            if cat and sch and vol:
-                self._volume_info = get_volume_metadata(
-                    sdk=self._sdk(),
-                    full_name=f"{cat}.{sch}.{vol}",
-                )
-        return self._volume_info
-
-    def storage_location(self) -> str:
-        info = self.volume_info()
-        if info is None:
-            raise NotFound(f"Volume {self!r} not found.")
-        _, _, _, rel = self.sql_volume_or_table_parts()
-        base = info.storage_location.rstrip("/")
-        return f"{base}/{'/'.join(rel)}" if rel else base
-
-    def temporary_credentials(self, operation: Optional[PathOperation] = None):
-        return (
-            self._sdk().temporary_path_credentials.generate_temporary_path_credentials(
-                url=self.storage_location(),
-                operation=operation or PathOperation.PATH_READ,
-            )
-        )
-
-    # ── Metadata ──────────────────────────────────────────────────────
-
-    def _refresh_metadata(self) -> None:
-        is_file, is_dir, size, mtime = get_volume_status(
-            sdk=self._sdk(),
-            full_path=self.full_path(),
-            check_file_first="." in self.name,
-            raise_error=False,
-        )
-        self.reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
-
-    def reset_metadata(
-        self,
-        is_file=None,
-        is_dir=None,
-        size=None,
-        mtime=None,
-        volume_info=None,
-    ):
-        super().reset_metadata(is_file=is_file, is_dir=is_dir, size=size, mtime=mtime)
-        if volume_info is not None:
-            self._volume_info = volume_info
-        return self
-
-    def clone_instance(self, *, volume_info=..., **kwargs):
-        clone = super().clone_instance(**kwargs)
-        clone._volume_info = self._volume_info if volume_info is ... else volume_info
-        return clone
-
-    # ── Listing ───────────────────────────────────────────────────────
-
-    def _ls_impl(self, recursive=False, fetch_size=None, allow_not_found=True):
-        cat, sch, vol, _ = self.sql_volume_or_table_parts()
-        if not vol:
-            yield from self._ls_uc_hierarchy(
-                self._sdk(),
-                cat,
-                sch,
-                recursive,
-                allow_not_found,
-            )
-            return
-        try:
-            for info in self._sdk().files.list_directory_contents(
-                self.full_path(),
-                page_size=fetch_size,
-            ):
-                child_parts = info.path.split("/")[2:]
-                child = VolumePath(
-                    parts=child_parts,
-                    _client=self.workspace,
-                    _is_file=not info.is_directory,
-                    _is_dir=info.is_directory,
-                    _size=info.file_size,
-                    _mtime=_coerce_mtime_seconds(
-                        getattr(info, "last_modified", None)
-                        or getattr(info, "modified_at", None)
-                        or getattr(info, "modification_time", None)
-                    ),
-                )
-                if recursive and info.is_directory:
-                    yield from child._ls_impl(
-                        recursive=True, allow_not_found=allow_not_found
-                    )
-                else:
-                    yield child
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-
-    def _ls_uc_hierarchy(self, sdk, catalog, schema, recursive, allow_not_found):
-        try:
-            if not catalog:
-                items = [(i.name, [i.name]) for i in sdk.catalogs.list()]
-            elif not schema:
-                items = [
-                    (i.name, [catalog, i.name])
-                    for i in sdk.schemas.list(catalog_name=catalog)
-                ]
-            else:
-                items = [
-                    (i.name, [i.catalog_name, i.schema_name, i.name])
-                    for i in sdk.volumes.list(catalog_name=catalog, schema_name=schema)
-                ]
-            for _, pts in items:
-                child = VolumePath(
-                    parts=pts,
-                    _client=self.workspace,
-                    _is_file=False,
-                    _is_dir=True,
-                    _size=0,
-                    _mtime=time.time(),
-                )
-                if recursive:
-                    yield from child._ls_impl(
-                        recursive=True, allow_not_found=allow_not_found
-                    )
-                else:
-                    yield child
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-
-    # ── mkdir ─────────────────────────────────────────────────────────
-
-    def _mkdir_impl(self, parents=True, exist_ok=True):
-        sdk = self._sdk()
-        path = self.full_path()
-        try:
-            sdk.files.create_directory(path)
-        except (BadRequest, NotFound, ResourceDoesNotExist) as exc:
-            if not parents:
-                raise
-            if "not exist" in str(exc):
-                self._ensure_uc_hierarchy(sdk=sdk, exist_ok=exist_ok)
-            sdk.files.create_directory(path)
-        except ALREADY_EXISTS_ERRORS:
-            if not exist_ok:
-                raise
-        self.reset_metadata(is_file=False, is_dir=True, size=0, mtime=time.time())
-
-    def _ensure_uc_hierarchy(self, sdk=None, exist_ok=True):
-        cat, sch, vol, _ = self.sql_volume_or_table_parts()
-        sdk = self._sdk() if sdk is None else sdk
-        tags = self.workspace.default_tags()
-        if cat:
-            try:
-                sdk.catalogs.create(
-                    name=cat, properties=tags, comment="Auto-created by yggdrasil"
-                )
-            except ALREADY_EXISTS_ERRORS + (PermissionDenied, InternalError):
-                if not exist_ok:
-                    raise
-        if sch:
-            try:
-                sdk.schemas.create(
-                    catalog_name=cat,
-                    name=sch,
-                    properties=tags,
-                    comment="Auto-created by yggdrasil",
-                )
-            except ALREADY_EXISTS_ERRORS + (PermissionDenied, InternalError):
-                if not exist_ok:
-                    raise
-        if vol:
-            try:
-                self._volume_info = sdk.volumes.create(
-                    catalog_name=cat,
-                    schema_name=sch,
-                    name=vol,
-                    volume_type=VolumeType.MANAGED,
-                    comment="Auto-created by yggdrasil",
-                )
-            except ALREADY_EXISTS_ERRORS:
-                if not exist_ok:
-                    raise
-
-    # ── Grants ────────────────────────────────────────────────────────
-
-    def _grants_full_name(self) -> str:
-        cat, sch, vol, _ = self.sql_volume_or_table_parts()
-        if not (cat and sch and vol):
-            raise ValueError(
-                f"Cannot manage grants on {self!r}: a volume path must include "
-                f"catalog, schema, and volume parts"
-            )
-        return f"{cat}.{sch}.{vol}"
-
-    @property
-    def grants_service(self):
-        """A :class:`Grants` service bound to this volume's client."""
-        from yggdrasil.databricks.sql.grants import Grants
-
-        return Grants(client=self.client)
-
-    def grants(self, principal: Optional[str] = None, *, effective: bool = False):
-        """Iterate grants on this volume, optionally filtered by ``principal``."""
-        from databricks.sdk.service.catalog import SecurableType
-
-        return self.grants_service.list(
-            securable_type=SecurableType.VOLUME,
-            full_name=self._grants_full_name(),
-            principal=principal,
-            effective=effective,
-        )
-
-    def grant(self, principal: str, privileges):
-        """Add ``privileges`` for ``principal`` on this volume."""
-        from databricks.sdk.service.catalog import SecurableType
-
-        return self.grants_service.create(
-            securable_type=SecurableType.VOLUME,
-            full_name=self._grants_full_name(),
-            principal=principal,
-            privileges=privileges,
-        )
-
-    def revoke(self, principal: str, privileges):
-        """Remove ``privileges`` from ``principal`` on this volume."""
-        from databricks.sdk.service.catalog import SecurableType, PermissionsChange
-        from yggdrasil.databricks.sql.grants import _check_principal, _check_privileges
-
-        principal = _check_principal(principal)
-        svc = self.grants_service
-        full_name = self._grants_full_name()
-
-        svc.update(
-            securable_type=SecurableType.VOLUME,
-            full_name=full_name,
-            changes=[
-                PermissionsChange(
-                    principal=principal,
-                    remove=_check_privileges(privileges),
-                )
-            ],
-        )
-        return svc.get(
-            securable_type=SecurableType.VOLUME,
-            full_name=full_name,
-            principal=principal,
-            effective=False,
-            raise_error=False,
-        )
-
-    def set_grants(self, principal: str, privileges):
-        """Replace ``principal``'s privileges on this volume to match ``privileges``."""
-        from databricks.sdk.service.catalog import SecurableType
-        from yggdrasil.databricks.sql.grants import _check_principal
-
-        principal = _check_principal(principal)
-        svc = self.grants_service
-        full_name = self._grants_full_name()
-
-        existing = svc.get(
-            securable_type=SecurableType.VOLUME,
-            full_name=full_name,
-            principal=principal,
-            effective=False,
-            raise_error=False,
-        )
-
-        if existing is None:
-            return self.grant(principal=principal, privileges=privileges)
-        return existing.replace(privileges)
-
-    # ── Removal ───────────────────────────────────────────────────────
-
-    def _remove_file_impl(self, allow_not_found=True):
-        try:
-            self._sdk().files.delete(self.full_path())
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
-        finally:
-            self.reset_metadata()
-
-    def _remove_dir_impl(self, recursive=True, allow_not_found=True, with_root=True):
-        cat, sch, vol, rel = self.sql_volume_or_table_parts()
-        path = self.full_path()
-        if rel:
-            try:
-                self._sdk().files.delete_directory(path)
-            except SDK_ERRORS as exc:
-                if recursive and "directory is not empty" in str(exc):
-                    for child in self.ls():
-                        if child.is_file():
-                            child._remove_file_impl(True)
-                        else:
-                            child._remove_dir_impl(True, True, True)
-                    if with_root:
-                        self._sdk().files.delete_directory(path)
-                elif not allow_not_found:
-                    raise
-        elif vol:
-            try:
-                self._sdk().volumes.delete(f"{cat}.{sch}.{vol}")
-            except SDK_ERRORS:
-                if not allow_not_found:
-                    raise
-        elif sch:
-            try:
-                self._sdk().schemas.delete(f"{cat}.{sch}", force=True)
-            except SDK_ERRORS:
-                if not allow_not_found:
-                    raise
-        self.reset_metadata()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TablePath  (/Tables/catalog/schema/table)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-@dataclass(eq=False)
-class TablePath(DatabricksPath):
-    kind: ClassVar[DatabricksPathKind] = DatabricksPathKind.TABLE
-
-    def full_path(self) -> str:
-        return "/Tables/" + "/".join(self._full_parts())
-
-    def sql_volume_or_table_parts(self):
-        p = self.parts
-        return (
-            p[0] if len(p) > 0 else None,
-            p[1] if len(p) > 1 else None,
-            p[2] if len(p) > 2 else None,
-            p[3:],
-        )
-
-    # Stubs — tables have no file-system representation
-    def _refresh_metadata(self):
-        self.reset_metadata(is_file=False, is_dir=True)
-
-    def _ls_impl(self, recursive=False, fetch_size=None, allow_not_found=True):
-        return iter([])
-
-    def _mkdir_impl(self, parents=True, exist_ok=True):
-        pass
-
-    def _remove_file_impl(self, allow_not_found=True):
-        pass
-
-    def _remove_dir_impl(self, recursive=True, allow_not_found=True, with_root=True):
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Namespace → class dispatch  (must be after all class definitions)
-# ---------------------------------------------------------------------------
-
-_KIND_MAP: dict[str, type[DatabricksPath]] = {
-    "dbfs": DBFSPath,
-    "workspace": WorkspacePath,
-    "volumes": VolumePath,
-    "tables": TablePath,
-}

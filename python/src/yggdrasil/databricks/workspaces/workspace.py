@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 class Workspace(DatabricksClient):
     pass
 
+
 @dataclass
 class WorkspaceResource(DatabricksResource):
     service: Workspaces = field(
@@ -37,18 +38,3 @@ class WorkspaceResource(DatabricksResource):
     @property
     def details(self):
         return self.client.account_client().workspaces.get(workspace_id=self.id)
-
-    def set_details(self, details: SDKWorkspace) -> None:
-        self.id = details.workspace_id
-        self.name = details.workspace_name
-        self.url = URL.parse_str(details.workspace_id)
-
-        return self
-
-    def refresh(self):
-        details: SDKWorkspace = (
-            self.client.account_client()
-            .workspaces.get(workspace_id=self.id)
-        )
-
-        return self.set_details(details)

@@ -560,11 +560,11 @@ class BrowserHTTPSession(HTTPSession):
 
         # ── Already has explicit http/https ────────────────────────────────
         if s.startswith(("https://", "http://")):
-            return URL.parse(s)
+            return URL.from_(s)
 
         # ── Protocol-relative ──────────────────────────────────────────────
         if s.startswith("//"):
-            return URL.parse("https:" + s)
+            return URL.from_("https:" + s)
 
         # ── Explicit relative paths (/path, ./path, ../path) ──────────────
         if s.startswith(("/", "./", "../")):
@@ -592,7 +592,7 @@ class BrowserHTTPSession(HTTPSession):
         #   "v1/resource"           → first_seg="v1"  → no dot → relative path
         first_seg = s.split("/", 1)[0] if "/" in s else s
         if "." in first_seg and not first_seg.startswith("."):
-            return URL.parse("https://" + s)
+            return URL.from_("https://" + s)
 
         # ── Relative path segment (e.g. "api/resource", "page") ───────────
         if self.base_url:

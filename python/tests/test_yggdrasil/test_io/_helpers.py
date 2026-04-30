@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pyarrow as pa
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig
@@ -125,7 +125,7 @@ def make_table_mock(
 def make_cache_config(
     table: MagicMock | None = None,
     *,
-    mode: SaveMode = SaveMode.APPEND,
+    mode: Mode = Mode.APPEND,
     received_from: dt.datetime | str | None = "2020-01-01T00:00:00Z",
     request_by: list[str] | None = None,
 ) -> CacheConfig:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Generic, Mapping, TypeVar
 
 from yggdrasil.pandas.lib import pandas as pd
-from yggdrasil.arrow.lib import pyarrow as pa
+import pyarrow as pa
 
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser.serialized import Serialized

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data import CastOptions, Field, Schema
+from yggdrasil.data import Field, Schema
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.types.nested.struct import (
     cast_polars_list_expr,
     cast_polars_list_series,

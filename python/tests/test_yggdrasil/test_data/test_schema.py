@@ -178,13 +178,9 @@ def test_partition_cluster_primary_foreign_key_properties():
         ]
     )
 
-    assert [f.name for f in s.partition_by] == ["date_id"]
-    assert [f.name for f in s.cluster_by] == ["book_id"]
-    assert [f.name for f in s.primary_keys] == ["book_id", "trade_id"]
-    assert s.primary_key_names == ["book_id", "trade_id"]
-    assert [f.name for f in s.foreign_keys] == ["counterparty_id"]
-    assert s.foreign_key_names == ["counterparty_id"]
-    assert s.foreign_key_refs == {"counterparty_id": "dim_counterparty.id"}
+    assert s.partition_by.field_names() == ["date_id"]
+    assert s.cluster_by.field_names() == ["book_id"]
+    assert s.primary_keys.field_names() == ["book_id", "trade_id"]
 
 
 def test_copy_preserves_fields_and_metadata_but_deep_copies_field_objects():
@@ -697,24 +693,22 @@ def test_schema_from_path_discovers_fields_and_metadata(tmp_path):
 
 def test_schema_from_path_accepts_path_io_instance(tmp_path):
     import pyarrow.parquet as pq
-    from yggdrasil.io.buffer.local_path_io import LocalPathIO
 
     path = tmp_path / "data.parquet"
     pq.write_table(pa.table({"x": [1, 2]}), path)
 
-    out = Schema.from_path(LocalPathIO.make(path))
+    out = Schema.from_path(path)
 
     assert [f.name for f in out.fields] == ["x"]
 
 
 def test_schema_from_path_accepts_path_io_factory(tmp_path):
     import pyarrow.parquet as pq
-    from yggdrasil.io.buffer.local_path_io import LocalPathIO
 
     path = tmp_path / "data.parquet"
     pq.write_table(pa.table({"x": [1, 2]}), path)
 
-    out = Schema.from_path(path, path_io=LocalPathIO)
+    out = Schema.from_path(path)
 
     assert [f.name for f in out.fields] == ["x"]
 

@@ -6,7 +6,7 @@ import datetime as dt
 import pytest
 
 from yggdrasil.dataclasses.waiting import WaitingConfig
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig
@@ -58,11 +58,11 @@ def test_cache_config_defaults() -> None:
         "request_body_hash",
     ]
     assert cfg.response_by is None
-    assert cfg.mode == SaveMode.APPEND
+    assert cfg.mode == Mode.APPEND
     assert cfg.anonymize == "remove"
     assert cfg.received_from is None
     assert cfg.received_to is None
-    assert cfg.wait == WaitingConfig.check_arg(False)
+    assert cfg.wait == WaitingConfig.from_(False)
 
 
 def test_cache_config_coerces_received_datetimes_from_strings() -> None:

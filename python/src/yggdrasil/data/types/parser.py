@@ -13,53 +13,41 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------
+# Byte-size defaults for named integer / float aliases.
+#
+# Returns None for unknown names so callers can distinguish "explicitly
+# 8 bytes" from "no declared size". The earlier version fell back to 8
+# unconditionally, which caused plain `int` / `float` tokens to emit a
+# byte_size the user never specified — indistinguishable from `int64`.
+# ---------------------------------------------------------------------
+
+_INTEGER_BYTE_SIZES: dict[str, int] = {
+    "byte": 1, "tinyint": 1, "i8": 1, "u8": 1, "int8": 1, "uint8": 1, "utinyint": 1,
+    "short": 2, "smallint": 2, "i16": 2, "u16": 2, "int16": 2, "uint16": 2, "usmallint": 2,
+    "int": 4, "integer": 4, "i32": 4, "u32": 4, "int32": 4, "uint32": 4,
+    "long": 8, "bigint": 8, "i64": 8, "u64": 8, "int64": 8, "uint64": 8, "ubigint": 8,
+    "i128": 16, "u128": 16, "int128": 16, "uint128": 16,
+    "hugeint": 16, "uhugeint": 16,
+}
+
+
+_FLOAT_BYTE_SIZES: dict[str, int] = {
+    "f16": 2, "float16": 2, "half": 2,
+    "bfloat16": 2, "bf16": 2,
+    "f32": 4, "float32": 4, "float": 4, "real": 4,
+    "double": 8, "double_precision": 8, "f64": 8, "float64": 8,
+}
+
+
 def _default_integer_byte_size(name: str) -> int | None:
-    mapping = {
-        "byte": 1,
-        "tinyint": 1,
-        "i8": 1,
-        "u8": 1,
-        "int8": 1,
-        "uint8": 1,
-        "short": 2,
-        "smallint": 2,
-        "i16": 2,
-        "u16": 2,
-        "int16": 2,
-        "uint16": 2,
-        "int": 4,
-        "integer": 4,
-        "i32": 4,
-        "u32": 4,
-        "int32": 4,
-        "uint32": 4,
-        "long": 8,
-        "bigint": 8,
-        "i64": 8,
-        "u64": 8,
-        "int64": 8,
-        "uint64": 8,
-    }
-    return mapping.get(name, 8)
+    """Look up the byte size for a named integer alias, or None if unknown."""
+    return _INTEGER_BYTE_SIZES.get(name)
 
 
 def _default_float_byte_size(name: str) -> int | None:
-    mapping = {
-        "f16": 2,
-        "float16": 2,
-        "half": 2,
-        "bfloat16": 2,
-        "bf16": 2,
-        "f32": 4,
-        "float32": 4,
-        "float": 4,
-        "real": 4,
-        "double": 8,
-        "double_precision": 8,
-        "f64": 8,
-        "float64": 8,
-    }
-    return mapping.get(name, 8)
+    """Look up the byte size for a named float alias, or None if unknown."""
+    return _FLOAT_BYTE_SIZES.get(name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,15 +151,13 @@ class ParsedDataType:
         parser = _Parser(value, raise_error=raise_error, default=default)
 
         try:
-            result = parser.parse()
+            return parser.parse()
         except ValueError as e:
-            raise ValueError(
-                f"Failed to parse DataType string {value!r} as a DataType: {e}"
-            ) from e
-
-        if isinstance(result, ParsedDataType):
-            return result
-        return cls(type_id=default, metadata=DataTypeMetadata())
+            if raise_error:
+                raise ValueError(
+                    f"Failed to parse DataType string {value!r} as a DataType: {e}"
+                ) from e
+            return cls(type_id=default, metadata=DataTypeMetadata())
 
     @classmethod
     def parse_type_id(
@@ -217,65 +203,273 @@ _TYPE_METADATA_KEYS = {
 }
 
 
-def _fast_path_metadata() -> dict[str, tuple[DataTypeId, DataTypeMetadata]]:
-    """Single-token temporal/sized aliases that carry implicit metadata.
+# ---------------------------------------------------------------------
+# Fast-path metadata for single-token temporal / sized aliases.
+#
+# These spellings (Spark/Databricks/Polars/Arrow DDL: `date32`,
+# `timestamp_ms`, `interval_year_month`, ...) imply both a type_id and
+# partial metadata without taking a bracketed payload. They are
+# terminal — a user who needs to combine unit with `tz` or `nullable`
+# should use the canonical `timestamp[unit=..., tz=...]` form.
+# ---------------------------------------------------------------------
 
-    These cover Arrow sized temporal types (`date32`, `time64`) and the
-    unit-suffixed spellings (`timestamp_ms`, `duration_ns`, ...) that show up
-    in Spark/Databricks/Polars DDL. The aliases are terminal — users who need
-    combined metadata should fall back to the explicit `timestamp[...]` form.
-    """
-    return {
-        "timestamp_with_time_zone": (
-            DataTypeId.TIMESTAMP,
-            DataTypeMetadata(timezone="with_time_zone"),
-        ),
-        "timestamp_without_time_zone": (
-            DataTypeId.TIMESTAMP,
-            DataTypeMetadata(timezone="without_time_zone"),
-        ),
-        "timestamp_ntz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ntz")),
-        "timestamp_ltz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ltz")),
-        "timestamp_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
-        "timestamp_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
-        "timestamp_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
-        "timestamp_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
-        "datetime_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
-        "datetime_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
-        "datetime_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
-        "datetime_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
-        "duration_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
-        "duration_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
-        "duration_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
-        "duration_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
-        "interval_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
-        "interval_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
-        "interval_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
-        "interval_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
-        "interval_year_month": (
-            DataTypeId.DURATION,
-            DataTypeMetadata(unit="year_month"),
-        ),
-        "interval_day_time": (
-            DataTypeId.DURATION,
-            DataTypeMetadata(unit="day_time"),
-        ),
-        "interval_month_day_nano": (
-            DataTypeId.DURATION,
-            DataTypeMetadata(unit="month_day_nano"),
-        ),
-        "date32": (DataTypeId.DATE, DataTypeMetadata(byte_size=4, unit="day")),
-        "date64": (DataTypeId.DATE, DataTypeMetadata(byte_size=8, unit="ms")),
-        "time32": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
-        "time64": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
-        "time32_s": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="s")),
-        "time32_ms": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
-        "time64_us": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="us")),
-        "time64_ns": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
-    }
+_FAST_PATH_METADATA: dict[str, tuple[DataTypeId, DataTypeMetadata]] = {
+    "timestamp_with_time_zone": (
+        DataTypeId.TIMESTAMP,
+        DataTypeMetadata(timezone="with_time_zone"),
+    ),
+    "timestamp_without_time_zone": (
+        DataTypeId.TIMESTAMP,
+        DataTypeMetadata(timezone="without_time_zone"),
+    ),
+    "timestamp_ntz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ntz")),
+    "timestamp_ltz": (DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ltz")),
+    "timestamp_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
+    "timestamp_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
+    "timestamp_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
+    "timestamp_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
+    "datetime_s": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="s")),
+    "datetime_ms": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ms")),
+    "datetime_us": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="us")),
+    "datetime_ns": (DataTypeId.TIMESTAMP, DataTypeMetadata(unit="ns")),
+    "duration_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
+    "duration_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
+    "duration_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
+    "duration_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
+    "interval_s": (DataTypeId.DURATION, DataTypeMetadata(unit="s")),
+    "interval_ms": (DataTypeId.DURATION, DataTypeMetadata(unit="ms")),
+    "interval_us": (DataTypeId.DURATION, DataTypeMetadata(unit="us")),
+    "interval_ns": (DataTypeId.DURATION, DataTypeMetadata(unit="ns")),
+    "interval_year_month": (
+        DataTypeId.DURATION,
+        DataTypeMetadata(unit="year_month"),
+    ),
+    "interval_day_time": (
+        DataTypeId.DURATION,
+        DataTypeMetadata(unit="day_time"),
+    ),
+    "interval_month_day_nano": (
+        DataTypeId.DURATION,
+        DataTypeMetadata(unit="month_day_nano"),
+    ),
+    "date32": (DataTypeId.DATE, DataTypeMetadata(byte_size=4, unit="day")),
+    "date64": (DataTypeId.DATE, DataTypeMetadata(byte_size=8, unit="ms")),
+    "time32": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
+    "time64": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
+    "time32_s": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="s")),
+    "time32_ms": (DataTypeId.TIME, DataTypeMetadata(byte_size=4, unit="ms")),
+    "time64_us": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="us")),
+    "time64_ns": (DataTypeId.TIME, DataTypeMetadata(byte_size=8, unit="ns")),
+}
 
 
-_FAST_PATH_METADATA = _fast_path_metadata()
+# ---------------------------------------------------------------------
+# Canonical type-name alias table.
+#
+# Hoisted to module scope so it's allocated exactly once — the parser
+# is in a hot path during schema parsing / casting. Covers Arrow,
+# Spark, Polars, Databricks, PostgreSQL, DuckDB, BigQuery, Snowflake,
+# Rust, NumPy, and the internal spellings.
+# ---------------------------------------------------------------------
+
+_NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
+    # object / variant / null
+    "object":       ("object",  DataTypeId.OBJECT),
+    "any":          ("object",  DataTypeId.OBJECT),
+    "variant":      ("object",  DataTypeId.OBJECT),
+    "none":         ("none",    DataTypeId.NULL),
+    "null":         ("none",    DataTypeId.NULL),
+    "nil":          ("none",    DataTypeId.NULL),
+
+    # bool
+    "bool":         ("bool",    DataTypeId.BOOL),
+    "boolean":      ("bool",    DataTypeId.BOOL),
+    "bit":          ("bool",    DataTypeId.BOOL),
+
+    # integers — Python / Arrow / Spark / Databricks / SQL
+    "int":          ("int",     DataTypeId.INTEGER),
+    "integer":      ("integer", DataTypeId.INTEGER),
+    "bigint":       ("bigint",  DataTypeId.INTEGER),
+    "smallint":     ("smallint", DataTypeId.INTEGER),
+    "tinyint":      ("tinyint", DataTypeId.INTEGER),
+    "byte":         ("byte",    DataTypeId.INTEGER),
+    "short":        ("short",   DataTypeId.INTEGER),
+    "long":         ("long",    DataTypeId.INTEGER),
+    # Rust / Arrow shorthand
+    "i8":           ("i8",      DataTypeId.INTEGER),
+    "i16":          ("i16",     DataTypeId.INTEGER),
+    "i32":          ("i32",     DataTypeId.INTEGER),
+    "i64":          ("i64",     DataTypeId.INTEGER),
+    "i128":         ("i128",    DataTypeId.INTEGER),
+    "u8":           ("u8",      DataTypeId.INTEGER),
+    "u16":          ("u16",     DataTypeId.INTEGER),
+    "u32":          ("u32",     DataTypeId.INTEGER),
+    "u64":          ("u64",     DataTypeId.INTEGER),
+    "u128":         ("u128",    DataTypeId.INTEGER),
+    # Polars / NumPy spelling
+    "int8":         ("int8",    DataTypeId.INTEGER),
+    "int16":        ("int16",   DataTypeId.INTEGER),
+    "int32":        ("int32",   DataTypeId.INTEGER),
+    "int64":        ("int64",   DataTypeId.INTEGER),
+    "int128":       ("int128",  DataTypeId.INTEGER),
+    "uint8":        ("uint8",   DataTypeId.INTEGER),
+    "uint16":       ("uint16",  DataTypeId.INTEGER),
+    "uint32":       ("uint32",  DataTypeId.INTEGER),
+    "uint64":       ("uint64",  DataTypeId.INTEGER),
+    "uint128":      ("uint128", DataTypeId.INTEGER),
+    # DuckDB wide / unsigned
+    "utinyint":     ("utinyint", DataTypeId.INTEGER),
+    "usmallint":    ("usmallint", DataTypeId.INTEGER),
+    "uinteger":     ("uinteger", DataTypeId.INTEGER),
+    "ubigint":      ("ubigint", DataTypeId.INTEGER),
+    "hugeint":      ("hugeint", DataTypeId.INTEGER),
+    "uhugeint":     ("uhugeint", DataTypeId.INTEGER),
+
+    # floats
+    "float":        ("float",   DataTypeId.FLOAT),
+    "double":       ("double",  DataTypeId.FLOAT),
+    "double_precision": ("double_precision", DataTypeId.FLOAT),
+    "real":         ("real",    DataTypeId.FLOAT),
+    "f16":          ("f16",     DataTypeId.FLOAT),
+    "f32":          ("f32",     DataTypeId.FLOAT),
+    "f64":          ("f64",     DataTypeId.FLOAT),
+    "float16":      ("float16", DataTypeId.FLOAT),
+    "float32":      ("float32", DataTypeId.FLOAT),
+    "float64":      ("float64", DataTypeId.FLOAT),
+    "half":         ("half",    DataTypeId.FLOAT),
+    "bfloat16":     ("bfloat16", DataTypeId.FLOAT),
+    "bf16":         ("bfloat16", DataTypeId.FLOAT),
+
+    # decimals
+    "decimal":      ("decimal", DataTypeId.DECIMAL),
+    "decimal128":   ("decimal", DataTypeId.DECIMAL),
+    "decimal256":   ("decimal", DataTypeId.DECIMAL),
+    "numeric":      ("decimal", DataTypeId.DECIMAL),
+    "number":       ("decimal", DataTypeId.DECIMAL),
+    "bignumeric":   ("decimal", DataTypeId.DECIMAL),
+    "money":        ("decimal", DataTypeId.DECIMAL),
+
+    # date / time
+    "date":         ("date",    DataTypeId.DATE),
+    "date32":       ("date32",  DataTypeId.DATE),
+    "date64":       ("date64",  DataTypeId.DATE),
+    "time":         ("time",    DataTypeId.TIME),
+    "time32":       ("time32",  DataTypeId.TIME),
+    "time64":       ("time64",  DataTypeId.TIME),
+    "time32_s":     ("time32_s", DataTypeId.TIME),
+    "time32_ms":    ("time32_ms", DataTypeId.TIME),
+    "time64_us":    ("time64_us", DataTypeId.TIME),
+    "time64_ns":    ("time64_ns", DataTypeId.TIME),
+
+    # timestamps
+    "timestamp":    ("timestamp", DataTypeId.TIMESTAMP),
+    "datetime":     ("timestamp", DataTypeId.TIMESTAMP),
+    "timestamp_with_time_zone":    ("timestamp_with_time_zone", DataTypeId.TIMESTAMP),
+    "timestamp_without_time_zone": ("timestamp_without_time_zone", DataTypeId.TIMESTAMP),
+    "timestamp_ntz": ("timestamp_ntz", DataTypeId.TIMESTAMP),
+    "timestamp_ltz": ("timestamp_ltz", DataTypeId.TIMESTAMP),
+    "timestamp_s":  ("timestamp_s", DataTypeId.TIMESTAMP),
+    "timestamp_ms": ("timestamp_ms", DataTypeId.TIMESTAMP),
+    "timestamp_us": ("timestamp_us", DataTypeId.TIMESTAMP),
+    "timestamp_ns": ("timestamp_ns", DataTypeId.TIMESTAMP),
+    "datetime_s":   ("datetime_s", DataTypeId.TIMESTAMP),
+    "datetime_ms":  ("datetime_ms", DataTypeId.TIMESTAMP),
+    "datetime_us":  ("datetime_us", DataTypeId.TIMESTAMP),
+    "datetime_ns":  ("datetime_ns", DataTypeId.TIMESTAMP),
+
+    # durations / intervals
+    "duration":     ("duration", DataTypeId.DURATION),
+    "duration_s":   ("duration_s", DataTypeId.DURATION),
+    "duration_ms":  ("duration_ms", DataTypeId.DURATION),
+    "duration_us":  ("duration_us", DataTypeId.DURATION),
+    "duration_ns":  ("duration_ns", DataTypeId.DURATION),
+    "interval":     ("duration", DataTypeId.DURATION),
+    "interval_s":   ("interval_s", DataTypeId.DURATION),
+    "interval_ms":  ("interval_ms", DataTypeId.DURATION),
+    "interval_us":  ("interval_us", DataTypeId.DURATION),
+    "interval_ns":  ("interval_ns", DataTypeId.DURATION),
+    "interval_year_month": ("interval_year_month", DataTypeId.DURATION),
+    "interval_day_time":   ("interval_day_time",   DataTypeId.DURATION),
+    "interval_month_day_nano": ("interval_month_day_nano", DataTypeId.DURATION),
+    "timedelta":    ("duration", DataTypeId.DURATION),
+
+    # binary
+    "binary":       ("binary",  DataTypeId.BINARY),
+    "bytes":        ("binary",  DataTypeId.BINARY),
+    "bytea":        ("binary",  DataTypeId.BINARY),
+    "blob":         ("binary",  DataTypeId.BINARY),
+    "large_binary": ("binary",  DataTypeId.BINARY),
+    "fixed_size_binary": ("binary", DataTypeId.BINARY),
+
+    # strings
+    "string":       ("string",  DataTypeId.STRING),
+    "str":          ("string",  DataTypeId.STRING),
+    "text":         ("string",  DataTypeId.STRING),
+    "utf8":         ("string",  DataTypeId.STRING),
+    "large_utf8":   ("string",  DataTypeId.STRING),
+    "large_string": ("string",  DataTypeId.STRING),
+    "varchar":      ("varchar", DataTypeId.STRING),
+    "char":         ("char",    DataTypeId.STRING),
+    "character_varying": ("character_varying", DataTypeId.STRING),
+    "character":    ("character", DataTypeId.STRING),
+
+    # collections
+    "array":        ("array",   DataTypeId.ARRAY),
+    "list":         ("array",   DataTypeId.ARRAY),
+    "large_list":   ("array",   DataTypeId.ARRAY),
+    "fixed_size_list": ("array", DataTypeId.ARRAY),
+    "set":          ("set",     DataTypeId.ARRAY),
+    "frozenset":    ("frozenset", DataTypeId.ARRAY),
+
+    # map
+    "map":          ("map",     DataTypeId.MAP),
+    "dict":         ("map",     DataTypeId.MAP),
+    "mapping":      ("map",     DataTypeId.MAP),
+
+    # struct / record
+    "struct":       ("struct",  DataTypeId.STRUCT),
+    "row":          ("struct",  DataTypeId.STRUCT),
+    "record":       ("struct",  DataTypeId.STRUCT),
+    "tuple":        ("tuple",   DataTypeId.STRUCT),
+
+    # union / json / enum / dictionary
+    "union":        ("union",   DataTypeId.UNION),
+    "json":         ("json",    DataTypeId.JSON),
+    "jsonb":        ("json",    DataTypeId.JSON),
+    "enum":         ("enum",    DataTypeId.ENUM),
+    "literal":      ("literal", DataTypeId.ENUM),
+    "dictionary":   ("dictionary", DataTypeId.DICTIONARY),
+    "categorical":  ("dictionary", DataTypeId.DICTIONARY),
+
+    # wrappers handled specially in parse_primary (no direct DataTypeId)
+    "optional":     ("optional", None),
+    "annotated":    ("annotated", None),
+
+    # geospatial — not a native type_id, fall through to string
+    "geography":    ("string",  DataTypeId.STRING),
+    "geometry":     ("string",  DataTypeId.STRING),
+}
+
+
+# ---------------------------------------------------------------------
+# Set of type-ids whose single-token form accepts a bracketed payload.
+# Used by the "metadata-only" fallback in parse_primary so plain types
+# like `int32[nullable=false]` or `bool[encoding=thrift]` work instead
+# of leaving the bracket as trailing and failing outright.
+#
+# Compound/parameterized types (DECIMAL / VARCHAR / ARRAY / MAP / ...)
+# have dedicated branches earlier in parse_primary and don't need this.
+# ---------------------------------------------------------------------
+
+_BRACKET_METADATA_TYPE_IDS = frozenset({
+    DataTypeId.BOOL,
+    DataTypeId.INTEGER,
+    DataTypeId.FLOAT,
+    DataTypeId.DATE,
+    DataTypeId.NULL,
+    DataTypeId.OBJECT,
+    DataTypeId.JSON,
+})
 
 
 class _Lexer:
@@ -604,34 +798,19 @@ class _Parser:
             return ParsedDataType(type_id=DataTypeId.STRUCT)
 
         if canonical == "decimal":
+            # DECIMAL accepts three bracketed shapes:
+            #   decimal(10, 2)                — positional precision/scale
+            #   decimal[precision=10, scale=2] — keyword form
+            #   decimal(10, 2, "native")      — free-form args bucket
             if self._peek_any_generic_open():
-                args = self._parse_scalar_args()
-                if len(args) == 2 and all(isinstance(v, int) for v in args):
-                    return ParsedDataType(
-                        type_id=DataTypeId.DECIMAL,
-                        metadata=DataTypeMetadata(
-                            precision=int(args[0]),
-                            scale=int(args[1]),
-                        ),
-                    )
-                return ParsedDataType(
-                    type_id=DataTypeId.DECIMAL,
-                    metadata=DataTypeMetadata(args=tuple(args)),
-                )
+                return self._parse_parameterized_decimal()
             return ParsedDataType(type_id=DataTypeId.DECIMAL)
 
         if canonical in {"varchar", "char", "character_varying", "character"}:
+            # Length can come as `varchar(10)` (positional) or
+            # `varchar[length=10]` (keyword).
             if self._peek_any_generic_open():
-                args = self._parse_scalar_args()
-                length = (
-                    int(args[0])
-                    if len(args) == 1 and isinstance(args[0], int)
-                    else None
-                )
-                return ParsedDataType(
-                    type_id=DataTypeId.STRING,
-                    metadata=DataTypeMetadata(length=length, args=tuple(args)),
-                )
+                return self._parse_parameterized_string()
             return ParsedDataType(type_id=DataTypeId.STRING)
 
         if dtype in {
@@ -677,33 +856,122 @@ class _Parser:
                 name=raw_name,
             )
 
+        # Final fallback for simple types (INTEGER/FLOAT/BOOL/DATE/...).
+        # These have no compound syntax of their own, but we still accept
+        # a bracketed metadata payload so callers can always attach
+        # nullability / encoding / format without having to reach for the
+        # generic `[...]` form of a wider type.
+        base_metadata = self._default_metadata_for(dtype, canonical)
+
+        if dtype in _BRACKET_METADATA_TYPE_IDS and self._peek_any_generic_open():
+            open_tok = self._advance()
+            close_char = _matching_close(open_tok.value)
+            payload = self._parse_metadata(close_char)
+            # Preserve the byte_size default (not represented in the
+            # bracketed payload) unless the user explicitly overrode it.
+            if base_metadata.byte_size is not None and payload.byte_size is None:
+                payload = replace(payload, byte_size=base_metadata.byte_size)
+            return ParsedDataType(type_id=dtype, metadata=payload)
+
+        return ParsedDataType(type_id=dtype, metadata=base_metadata)
+
+    # ------------------------------------------------------------------
+    # Parameterized forms split out so parse_primary stays readable.
+    # ------------------------------------------------------------------
+
+    def _parse_parameterized_decimal(self) -> ParsedDataType:
+        """Handle decimal(p, s), decimal[precision=.., scale=..], and mixed."""
+        open_tok = self._advance()
+        close_char = _matching_close(open_tok.value)
+        items: list[tuple[str | None, object]] = []
+
+        if self._peek_punct(close_char):
+            self._advance()
+            return ParsedDataType(type_id=DataTypeId.DECIMAL)
+
+        while True:
+            items.append(self._parse_metadata_item())
+            if self._peek_punct(","):
+                self._advance()
+                continue
+            break
+        self._expect_punct(close_char)
+
+        # All-positional: classic decimal(p, s) [, extra...].
+        if all(key is None for key, _ in items):
+            values = [value for _, value in items]
+            if len(values) == 2 and all(isinstance(v, int) for v in values):
+                return ParsedDataType(
+                    type_id=DataTypeId.DECIMAL,
+                    metadata=DataTypeMetadata(
+                        precision=int(values[0]),
+                        scale=int(values[1]),
+                    ),
+                )
+            return ParsedDataType(
+                type_id=DataTypeId.DECIMAL,
+                metadata=DataTypeMetadata(args=tuple(values)),
+            )
+
+        # Mixed / keyword: route through the generic metadata builder.
+        metadata = _metadata_from_items(items)
+        return ParsedDataType(type_id=DataTypeId.DECIMAL, metadata=metadata)
+
+    def _parse_parameterized_string(self) -> ParsedDataType:
+        """Handle varchar(n), varchar[length=n], and friends."""
+        open_tok = self._advance()
+        close_char = _matching_close(open_tok.value)
+        items: list[tuple[str | None, object]] = []
+
+        if self._peek_punct(close_char):
+            self._advance()
+            return ParsedDataType(type_id=DataTypeId.STRING)
+
+        while True:
+            items.append(self._parse_metadata_item())
+            if self._peek_punct(","):
+                self._advance()
+                continue
+            break
+        self._expect_punct(close_char)
+
+        # All-positional: varchar(10) [, extra...].
+        if all(key is None for key, _ in items):
+            values = [value for _, value in items]
+            length = int(values[0]) if values and isinstance(values[0], int) else None
+            return ParsedDataType(
+                type_id=DataTypeId.STRING,
+                metadata=DataTypeMetadata(length=length, args=tuple(values)),
+            )
+
+        metadata = _metadata_from_items(items)
+        return ParsedDataType(type_id=DataTypeId.STRING, metadata=metadata)
+
+    def _default_metadata_for(
+        self,
+        dtype: DataTypeId,
+        canonical: str,
+    ) -> DataTypeMetadata:
+        """Default metadata for a plain-token type (no brackets seen yet)."""
         if dtype is DataTypeId.INTEGER:
-            return ParsedDataType(
-                type_id=dtype,
-                metadata=DataTypeMetadata(
-                    byte_size=_default_integer_byte_size(canonical)
-                ),
-            )
-
+            return DataTypeMetadata(byte_size=_default_integer_byte_size(canonical))
         if dtype is DataTypeId.FLOAT:
-            return ParsedDataType(
-                type_id=dtype,
-                metadata=DataTypeMetadata(
-                    byte_size=_default_float_byte_size(canonical)
-                ),
-            )
+            return DataTypeMetadata(byte_size=_default_float_byte_size(canonical))
+        return DataTypeMetadata()
 
-        return ParsedDataType(type_id=dtype)
+    # ------------------------------------------------------------------
 
     def _parse_type_head_name(self) -> str:
         tok = self._current()
         if tok is None or tok.kind not in {"ident", "string"}:
             return self._fail("Expected type name")
 
+        # Look ahead up to 3 tokens past the head for multi-token names like
+        # `double precision` or `timestamp with time zone`. Take the longest
+        # match found in `_MULTI_TOKEN_TYPE_NAMES`; if none match, just consume
+        # the head token.
         max_parts = 4
         best_len = 1
-
-        parts = [tok.value]
         lookahead_parts = [tok.value]
 
         for offset in range(1, max_parts):
@@ -715,7 +983,7 @@ class _Parser:
             if candidate in _MULTI_TOKEN_TYPE_NAMES:
                 best_len = len(lookahead_parts)
 
-        selected = []
+        selected: list[str] = []
         for _ in range(best_len):
             current = self._current()
             if current is None:
@@ -883,67 +1151,7 @@ class _Parser:
         if all(key is None for key, _ in items):
             return DataTypeMetadata(args=tuple(value for _, value in items))
 
-        extras: dict[str, object] = {}
-        flags: list[str] = []
-
-        nullable: bool | None = None
-        ordered: bool | None = None
-        sorted_: bool | None = None
-        timezone: str | None = None
-        unit: str | None = None
-        encoding: str | None = None
-        format_: str | None = None
-        length: int | None = None
-        precision: int | None = None
-        scale: int | None = None
-
-        for key, value in items:
-            if key is None:
-                if isinstance(value, str):
-                    flags.append(value)
-                else:
-                    extras[f"arg_{len(extras)}"] = value
-                continue
-
-            low = key.lower()
-
-            if low == "nullable" and isinstance(value, bool):
-                nullable = value
-            elif low == "ordered" and isinstance(value, bool):
-                ordered = value
-            elif low == "sorted" and isinstance(value, bool):
-                sorted_ = value
-            elif low in {"tz", "timezone"} and isinstance(value, str):
-                timezone = value
-            elif low == "unit" and isinstance(value, str):
-                unit = value
-            elif low in {"encoding", "codec"} and isinstance(value, str):
-                encoding = value
-            elif low == "format" and isinstance(value, str):
-                format_ = value
-            elif low == "length" and isinstance(value, int):
-                length = value
-            elif low == "precision" and isinstance(value, int):
-                precision = value
-            elif low == "scale" and isinstance(value, int):
-                scale = value
-            else:
-                extras[key] = value
-
-        return DataTypeMetadata(
-            nullable=nullable,
-            ordered=ordered,
-            sorted=sorted_,
-            timezone=timezone,
-            unit=unit,
-            encoding=encoding,
-            format=format_,
-            length=length,
-            precision=precision,
-            scale=scale,
-            flags=tuple(flags),
-            extras=extras,
-        )
+        return _metadata_from_items(items)
 
     def _parse_dictionary_payload(
         self,
@@ -1189,9 +1397,94 @@ class _Parser:
         return self.index >= len(self.tokens)
 
     def _fail(self, message: str) -> Any:
-        if self.raise_error:
-            raise ValueError(message)
-        return ParsedDataType(type_id=self.default, metadata=DataTypeMetadata())
+        """Signal a parse error by raising ``ValueError``.
+
+        Always raises — the outer :meth:`ParsedDataType.parse` owns the
+        recovery decision via its ``raise_error`` flag. Raising here
+        (rather than returning a sentinel) keeps mid-parse state
+        coherent: a sentinel return would cascade into
+        ``AttributeError``s further up (e.g. ``_canonical_name(raw_name)``
+        calling ``.strip()`` on a ``ParsedDataType``).
+        """
+        raise ValueError(message)
+
+
+def _metadata_from_items(
+    items: list[tuple[str | None, object]],
+) -> DataTypeMetadata:
+    """Build a DataTypeMetadata from mixed-key items.
+
+    Centralizes the key → field mapping used by both the generic
+    `type[key=value]` metadata form and the parameterized DECIMAL /
+    VARCHAR branches. Unrecognized keys land in ``extras``, positional
+    string values go to ``flags``, and positional non-string values go
+    into ``extras`` under ``arg_N``.
+    """
+    extras: dict[str, object] = {}
+    flags: list[str] = []
+
+    nullable: bool | None = None
+    ordered: bool | None = None
+    sorted_: bool | None = None
+    timezone: str | None = None
+    unit: str | None = None
+    encoding: str | None = None
+    format_: str | None = None
+    length: int | None = None
+    precision: int | None = None
+    scale: int | None = None
+    byte_size: int | None = None
+
+    for key, value in items:
+        if key is None:
+            if isinstance(value, str):
+                flags.append(value)
+            else:
+                extras[f"arg_{len(extras)}"] = value
+            continue
+
+        low = key.lower()
+
+        if low == "nullable" and isinstance(value, bool):
+            nullable = value
+        elif low == "ordered" and isinstance(value, bool):
+            ordered = value
+        elif low == "sorted" and isinstance(value, bool):
+            sorted_ = value
+        elif low in {"tz", "timezone"} and isinstance(value, str):
+            timezone = value
+        elif low == "unit" and isinstance(value, str):
+            unit = value
+        elif low in {"encoding", "codec"} and isinstance(value, str):
+            encoding = value
+        elif low == "format" and isinstance(value, str):
+            format_ = value
+        elif low == "length" and isinstance(value, int):
+            length = value
+        elif low == "precision" and isinstance(value, int):
+            precision = value
+        elif low == "scale" and isinstance(value, int):
+            scale = value
+        elif low in {"byte_size", "bytes", "size"} and isinstance(value, int):
+            byte_size = value
+        else:
+            extras[key] = value
+
+    return DataTypeMetadata(
+        nullable=nullable,
+        ordered=ordered,
+        sorted=sorted_,
+        timezone=timezone,
+        unit=unit,
+        encoding=encoding,
+        format=format_,
+        length=length,
+        precision=precision,
+        scale=scale,
+        byte_size=byte_size,
+        flags=tuple(flags),
+        extras=extras,
+    )
 
 
 def _matching_close(open_char: str) -> str:
@@ -1224,139 +1517,14 @@ def _set_nullable(parsed: ParsedDataType, nullable: bool | None) -> ParsedDataTy
 
 
 def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
+    """Normalize a raw type name to its canonical alias + DataTypeId.
+
+    Returns ``(canonical, None)`` for unknown names so ``parse_primary``
+    can route them to the OBJECT-forward-ref fallback with the raw name
+    preserved on metadata.
+    """
     low = name.strip().lower().replace(" ", "_").replace("-", "_")
-
-    aliases: dict[str, tuple[str, DataTypeId | None]] = {
-        "object": ("object", DataTypeId.OBJECT),
-        "any": ("object", DataTypeId.OBJECT),
-        "variant": ("object", DataTypeId.OBJECT),
-        "none": ("none", DataTypeId.NULL),
-        "null": ("none", DataTypeId.NULL),
-        "nil": ("none", DataTypeId.NULL),
-        "bool": ("bool", DataTypeId.BOOL),
-        "boolean": ("bool", DataTypeId.BOOL),
-        "int": ("int", DataTypeId.INTEGER),
-        "integer": ("integer", DataTypeId.INTEGER),
-        "bigint": ("bigint", DataTypeId.INTEGER),
-        "smallint": ("smallint", DataTypeId.INTEGER),
-        "tinyint": ("tinyint", DataTypeId.INTEGER),
-        "byte": ("byte", DataTypeId.INTEGER),
-        "short": ("short", DataTypeId.INTEGER),
-        "long": ("long", DataTypeId.INTEGER),
-        "i8": ("i8", DataTypeId.INTEGER),
-        "i16": ("i16", DataTypeId.INTEGER),
-        "i32": ("i32", DataTypeId.INTEGER),
-        "i64": ("i64", DataTypeId.INTEGER),
-        "u8": ("u8", DataTypeId.INTEGER),
-        "u16": ("u16", DataTypeId.INTEGER),
-        "u32": ("u32", DataTypeId.INTEGER),
-        "u64": ("u64", DataTypeId.INTEGER),
-        "int8": ("int8", DataTypeId.INTEGER),
-        "int16": ("int16", DataTypeId.INTEGER),
-        "int32": ("int32", DataTypeId.INTEGER),
-        "int64": ("int64", DataTypeId.INTEGER),
-        "uint8": ("uint8", DataTypeId.INTEGER),
-        "uint16": ("uint16", DataTypeId.INTEGER),
-        "uint32": ("uint32", DataTypeId.INTEGER),
-        "uint64": ("uint64", DataTypeId.INTEGER),
-        "float": ("float", DataTypeId.FLOAT),
-        "double": ("double", DataTypeId.FLOAT),
-        "double_precision": ("double_precision", DataTypeId.FLOAT),
-        "real": ("real", DataTypeId.FLOAT),
-        "f16": ("f16", DataTypeId.FLOAT),
-        "f32": ("f32", DataTypeId.FLOAT),
-        "f64": ("f64", DataTypeId.FLOAT),
-        "float16": ("float16", DataTypeId.FLOAT),
-        "float32": ("float32", DataTypeId.FLOAT),
-        "float64": ("float64", DataTypeId.FLOAT),
-        "half": ("half", DataTypeId.FLOAT),
-        "bfloat16": ("bfloat16", DataTypeId.FLOAT),
-        "bf16": ("bfloat16", DataTypeId.FLOAT),
-        "decimal": ("decimal", DataTypeId.DECIMAL),
-        "decimal128": ("decimal", DataTypeId.DECIMAL),
-        "decimal256": ("decimal", DataTypeId.DECIMAL),
-        "numeric": ("decimal", DataTypeId.DECIMAL),
-        "date": ("date", DataTypeId.DATE),
-        "date32": ("date32", DataTypeId.DATE),
-        "date64": ("date64", DataTypeId.DATE),
-        "time": ("time", DataTypeId.TIME),
-        "time32": ("time32", DataTypeId.TIME),
-        "time64": ("time64", DataTypeId.TIME),
-        "time32_s": ("time32_s", DataTypeId.TIME),
-        "time32_ms": ("time32_ms", DataTypeId.TIME),
-        "time64_us": ("time64_us", DataTypeId.TIME),
-        "time64_ns": ("time64_ns", DataTypeId.TIME),
-        "timestamp": ("timestamp", DataTypeId.TIMESTAMP),
-        "datetime": ("timestamp", DataTypeId.TIMESTAMP),
-        "timestamp_with_time_zone": ("timestamp_with_time_zone", DataTypeId.TIMESTAMP),
-        "timestamp_without_time_zone": (
-            "timestamp_without_time_zone",
-            DataTypeId.TIMESTAMP,
-        ),
-        "timestamp_ntz": ("timestamp_ntz", DataTypeId.TIMESTAMP),
-        "timestamp_ltz": ("timestamp_ltz", DataTypeId.TIMESTAMP),
-        "timestamp_s": ("timestamp_s", DataTypeId.TIMESTAMP),
-        "timestamp_ms": ("timestamp_ms", DataTypeId.TIMESTAMP),
-        "timestamp_us": ("timestamp_us", DataTypeId.TIMESTAMP),
-        "timestamp_ns": ("timestamp_ns", DataTypeId.TIMESTAMP),
-        "datetime_s": ("datetime_s", DataTypeId.TIMESTAMP),
-        "datetime_ms": ("datetime_ms", DataTypeId.TIMESTAMP),
-        "datetime_us": ("datetime_us", DataTypeId.TIMESTAMP),
-        "datetime_ns": ("datetime_ns", DataTypeId.TIMESTAMP),
-        "duration": ("duration", DataTypeId.DURATION),
-        "duration_s": ("duration_s", DataTypeId.DURATION),
-        "duration_ms": ("duration_ms", DataTypeId.DURATION),
-        "duration_us": ("duration_us", DataTypeId.DURATION),
-        "duration_ns": ("duration_ns", DataTypeId.DURATION),
-        "interval": ("duration", DataTypeId.DURATION),
-        "interval_s": ("interval_s", DataTypeId.DURATION),
-        "interval_ms": ("interval_ms", DataTypeId.DURATION),
-        "interval_us": ("interval_us", DataTypeId.DURATION),
-        "interval_ns": ("interval_ns", DataTypeId.DURATION),
-        "interval_year_month": ("interval_year_month", DataTypeId.DURATION),
-        "interval_day_time": ("interval_day_time", DataTypeId.DURATION),
-        "interval_month_day_nano": ("interval_month_day_nano", DataTypeId.DURATION),
-        "timedelta": ("duration", DataTypeId.DURATION),
-        "binary": ("binary", DataTypeId.BINARY),
-        "bytes": ("binary", DataTypeId.BINARY),
-        "bytea": ("binary", DataTypeId.BINARY),
-        "blob": ("binary", DataTypeId.BINARY),
-        "large_binary": ("binary", DataTypeId.BINARY),
-        "fixed_size_binary": ("binary", DataTypeId.BINARY),
-        "string": ("string", DataTypeId.STRING),
-        "str": ("string", DataTypeId.STRING),
-        "text": ("string", DataTypeId.STRING),
-        "utf8": ("string", DataTypeId.STRING),
-        "large_utf8": ("string", DataTypeId.STRING),
-        "large_string": ("string", DataTypeId.STRING),
-        "varchar": ("varchar", DataTypeId.STRING),
-        "char": ("char", DataTypeId.STRING),
-        "character_varying": ("character_varying", DataTypeId.STRING),
-        "character": ("character", DataTypeId.STRING),
-        "array": ("array", DataTypeId.ARRAY),
-        "list": ("array", DataTypeId.ARRAY),
-        "large_list": ("array", DataTypeId.ARRAY),
-        "fixed_size_list": ("array", DataTypeId.ARRAY),
-        "set": ("set", DataTypeId.ARRAY),
-        "frozenset": ("frozenset", DataTypeId.ARRAY),
-        "map": ("map", DataTypeId.MAP),
-        "dict": ("map", DataTypeId.MAP),
-        "mapping": ("map", DataTypeId.MAP),
-        "struct": ("struct", DataTypeId.STRUCT),
-        "row": ("struct", DataTypeId.STRUCT),
-        "record": ("struct", DataTypeId.STRUCT),
-        "tuple": ("tuple", DataTypeId.STRUCT),
-        "union": ("union", DataTypeId.UNION),
-        "json": ("json", DataTypeId.JSON),
-        "enum": ("enum", DataTypeId.ENUM),
-        "literal": ("literal", DataTypeId.ENUM),
-        "dictionary": ("dictionary", DataTypeId.DICTIONARY),
-        "categorical": ("dictionary", DataTypeId.DICTIONARY),
-        "optional": ("optional", None),
-        "annotated": ("annotated", None),
-    }
-
-    return aliases.get(low, (low, None))
+    return _NAME_ALIASES.get(low, (low, None))
 
 
 def parse_data_type(

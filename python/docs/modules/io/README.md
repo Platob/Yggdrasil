@@ -30,7 +30,7 @@ with BytesIO() as buf:
 ```python
 from yggdrasil.io import URL
 
-u = URL.parse_str("https://example.com/a/b?q=1")
+u = URL.from_str("https://example.com/a/b?q=1")
 print(u.host, u.path)
 print(u.with_query_items({"q": 2, "lang": "en"}).to_string())
 ```

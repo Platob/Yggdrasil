@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import MISSING
 from difflib import get_close_matches
-from typing import Any, AnyStr, Mapping, TYPE_CHECKING
+from typing import Any, AnyStr, Mapping, TYPE_CHECKING, Union, Iterable
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.constants import DBX_META_PREFIX, TAG_PREFIX, DEFAULT_VALUE_KEY
@@ -19,6 +20,9 @@ __all__ = [
     "_normalize_metadata",
     "_to_bytes",
 ]
+
+
+SelectType = Union[str, int, "Field"]
 
 
 def _to_bytes(value: Any) -> bytes:
@@ -63,10 +67,13 @@ def _normalize_metadata(
         )
 
     if default_value is not None and default_value is not MISSING and default_value is not ...:
-        normalized[DEFAULT_VALUE_KEY] = json_module.dumps(
-            default_value, safe=False, to_bytes=True,
-            ensure_ascii=False, separators=(",", ":")
-        )
+        try:
+            normalized[DEFAULT_VALUE_KEY] = json_module.dumps(
+                default_value, safe=False, to_bytes=True,
+                ensure_ascii=False, separators=(",", ":")
+            )
+        except Exception as e:
+            logging.error(f"Could not serialize default value {default_value!r}: {e}")
 
     return normalized or None
 
@@ -135,9 +142,16 @@ class BaseMetadata(ABC):
                 object.__setattr__(self, "metadata", {})
             self.metadata[TAG_PREFIX + _to_bytes(key)] = _to_bytes(value)
 
+    def _unset_tag_value(self, key: bytes | str) -> None:
+        if not self.metadata:
+            return
+        self.metadata.pop(TAG_PREFIX + _to_bytes(key), None)
+        if not self.metadata:
+            object.__setattr__(self, "metadata", None)
+
     def _tag_flag(self, key: bytes | str) -> bool:
         value = self._tag_value(key)
-        return bool(value and value.startswith(b"t"))
+        return bool(value)
 
     def _tag_text(self, key: bytes | str) -> str | None:
         value = self._tag_value(key)
@@ -183,6 +197,18 @@ class BaseChildrenFields(ABC):
     @abstractmethod
     def children_fields(self) -> list["Field"]:
         ...
+
+    @property
+    def primary_fields(self):
+        return [f for f in self.children_fields if f.primary_key]
+
+    @property
+    def partition_fields(self):
+        return [f for f in self.children_fields if f.partition_by]
+
+    @property
+    def cluster_fields(self):
+        return [f for f in self.children_fields if f.cluster_by]
 
     def field(
         self,
@@ -310,3 +336,166 @@ class BaseChildrenFields(ABC):
 
     def field_names(self) -> list[str]:
         return [f.name for f in self.children_fields]
+
+    def select(
+        self,
+        identifiers: "SelectType | Iterable[SelectType]" = (),
+        *others: SelectType,
+        raise_error: bool = True,
+    ) -> list["Field"]:
+        """Resolve one or more identifiers into the matching :class:`Field` objects.
+
+        Accepts strings (resolved by name), ints (resolved by index),
+        and existing :class:`Field` instances (resolved by ``.name``
+        against this container — so callers can copy a field set
+        between sibling schemas without first stringifying everything).
+
+        Calling shapes that all work the same way:
+
+        * ``schema.select("price")`` — single identifier.
+        * ``schema.select("price", "qty", 0)`` — multiple positionals.
+        * ``schema.select(["price", "qty"])`` — single iterable.
+        * ``schema.select(other_schema.children_fields)`` — copy
+          a sibling's fields by name into this schema.
+        * ``schema.select("price", ["qty", "ts"], 0)`` — mixed; each
+          positional is itself flattened so iterables and scalars
+          can be interleaved.
+
+        :param identifiers:
+            First identifier or iterable of identifiers.
+        :param others:
+            Additional identifiers. Each is flattened the same way
+            as the first.
+        :param raise_error:
+            ``True`` (default) — missing identifiers raise via
+            :meth:`field_by` with the same suggestion-rich error
+            message used elsewhere. ``False`` — missing identifiers
+            yield ``None`` in the returned list, preserving caller
+            order.
+
+        :returns:
+            A list of :class:`Field` (or ``Field | None`` when
+            ``raise_error=False``), one entry per resolved identifier
+            in caller order. Duplicates in the input produce
+            duplicates in the output — this is intentional, since
+            ``select`` is the natural place to express a projection
+            and projections sometimes repeat columns.
+
+        :raises KeyError:
+            With suggestions, when ``raise_error`` is True and an
+            identifier doesn't resolve.
+        :raises TypeError:
+            When an identifier is not a ``str`` / ``int`` / ``Field``.
+        """
+        # Flatten ``identifiers`` plus all positional ``others`` into
+        # a single ordered list. We accept both a scalar and an
+        # iterable in the first slot, plus any number of positional
+        # tail args, so the call sites listed in the docstring all
+        # converge on the same internal representation.
+        flat: list[SelectType] = []
+
+        # ``identifiers`` may itself be a single SelectType (str / int
+        # / Field) or an iterable of them. Strings are iterable as
+        # characters, so we have to special-case them — same for the
+        # imported Field class which we detect via duck-typing on
+        # ``.name`` to avoid the runtime import cycle.
+        self._extend_select_targets(flat, identifiers)
+        for other in others:
+            self._extend_select_targets(flat, other)
+
+        # Resolve each entry through ``field_by``. The strict branch
+        # propagates ``field_by``'s rich error path (with suggestions);
+        # the lenient branch yields ``None`` for misses so callers
+        # can post-process the gaps.
+        resolved: list["Field"] = []
+        for ident in flat:
+            field = self._resolve_select_target(ident, raise_error=raise_error)
+            resolved.append(field)
+        return resolved
+
+    @staticmethod
+    def _extend_select_targets(
+        out: list["SelectType"],
+        item: "SelectType | Iterable[SelectType]",
+    ) -> None:
+        """Append *item* to *out*, flattening one level of iterable.
+
+        Treats strings and :class:`Field` instances as scalars
+        (they're not "containers of identifiers" even though the
+        former is iterable). Anything else with ``__iter__`` is
+        flattened. Mappings are explicitly handled as scalars too —
+        iterating a dict yields its keys, which would silently change
+        the meaning of ``select(some_dict)`` in surprising ways.
+        """
+        # Scalar fast paths. Strings come first because every other
+        # branch would treat them as iterables of characters.
+        if isinstance(item, (str, int)):
+            out.append(item)
+            return
+        # Field detection by duck-typing on ``.name`` rather than
+        # isinstance — avoids the runtime import that the
+        # TYPE_CHECKING block above already pushed off to type-check
+        # time only.
+        if hasattr(item, "name") and not isinstance(item, (list, tuple, set, frozenset)):
+            # Anything carrying a ``.name`` and not obviously a
+            # collection: treat as a scalar Field-like.
+            out.append(item)  # type: ignore[arg-type]
+            return
+        if isinstance(item, Mapping):
+            # A mapping isn't a meaningful identifier shape — flag it
+            # explicitly rather than letting the iterable path silently
+            # walk its keys.
+            raise TypeError(
+                f"select() does not accept a mapping as an identifier; "
+                f"got {type(item).__name__}. Pass the keys or values "
+                "explicitly if that's what you meant."
+            )
+        # Generic iterable: flatten one level. We don't recurse —
+        # ``select(["a", ["b", "c"]])`` is rejected so the call shape
+        # stays predictable.
+        try:
+            iterator = iter(item)
+        except TypeError:
+            raise TypeError(
+                f"select() expected str / int / Field / Iterable of those, "
+                f"got {type(item).__name__}: {item!r}"
+            ) from None
+        for sub in iterator:
+            if isinstance(sub, (str, int)) or hasattr(sub, "name"):
+                out.append(sub)
+            else:
+                raise TypeError(
+                    f"select() identifiers must be str / int / Field; "
+                    f"got nested {type(sub).__name__}: {sub!r}. "
+                    "Flatten the input before passing it in — select() "
+                    "only flattens one level so the call shape stays "
+                    "predictable."
+                )
+
+    def _resolve_select_target(
+        self,
+        ident: "SelectType",
+        *,
+        raise_error: bool,
+    ) -> "Field | None":
+        """Resolve a single ``SelectType`` into a :class:`Field`.
+
+        Strings → ``field_by(name=ident)``. Ints → ``field_by(index=ident)``.
+        :class:`Field` instances → ``field_by(name=ident.name)`` so
+        the lookup happens against ``self`` (the right behaviour when
+        callers thread fields between sister schemas).
+        """
+        if isinstance(ident, str):
+            return self.field_by(name=ident, raise_error=raise_error)
+        if isinstance(ident, int):
+            return self.field_by(index=ident, raise_error=raise_error)
+        # Field-shaped — duck-type via ``.name``.
+        name = getattr(ident, "name", None)
+        if name is None:
+            if raise_error:
+                raise TypeError(
+                    f"select() identifier of type {type(ident).__name__} "
+                    "has no usable .name attribute."
+                )
+            return None
+        return self.field_by(name=name, raise_error=raise_error)

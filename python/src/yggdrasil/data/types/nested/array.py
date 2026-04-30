@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
+import pyarrow.types as pat
+
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
-from yggdrasil.io import SaveMode
-
+from yggdrasil.io.enums import Mode
+from yggdrasil.lazy_imports import field_class
 from ._cast_json import (
     cast_arrow_json_string_array,
     cast_polars_json_string_expr,
@@ -40,7 +42,7 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ArrayType(NestedType):
     item_field: "Field"
     list_size: int | None = None
@@ -50,6 +52,11 @@ class ArrayType(NestedType):
     @property
     def type_id(self) -> DataTypeId:
         return DataTypeId.ARRAY
+
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * (indent * level)
+        inner = self.item_field.pretty_format(indent=indent, level=level + 1)
+        return f"{pad}list<\n{inner}\n{pad}>"
 
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
@@ -62,10 +69,33 @@ class ArrayType(NestedType):
 
         return [self.item_field.default for _ in range(self.list_size)]
 
+    def equals(
+        self,
+        other: "DataType",
+        check_names: bool = True,
+        check_dtypes: bool = True,
+        check_metadata: bool = True,
+    ) -> bool:
+        if not isinstance(other, ArrayType):
+            return super().equals(
+                other, check_names=check_names, check_dtypes=check_dtypes,
+                check_metadata=check_metadata
+            )
+
+        if not self.item_field.name:
+            self.item_field.with_name(other.item_field.name, inplace=True)
+
+        return (
+            self.item_field.equals(other.item_field, check_metadata=check_metadata)
+            and self.list_size == other.list_size
+            and self.large == other.large
+            and self.view == other.view
+        )
+
     def _merge_with_same_id(
         self,
         other: "ArrayType",
-        mode: SaveMode | None = None,
+        mode: Mode,
         downcast: bool = False,
         upcast: bool = False,
     ):
@@ -74,11 +104,26 @@ class ArrayType(NestedType):
             mode=mode, downcast=downcast, upcast=upcast
         )
 
+        if self.list_size and other.list_size:
+            if downcast:
+                list_size = min(self.list_size, other.list_size)
+            else:
+                list_size = max(self.list_size, other.list_size)
+        else:
+            list_size = self.list_size
+
+        if self.large and other.large:
+            large = True
+        elif self.large or other.large:
+            large = True
+        else:
+            large = False
+
         return self.__class__(
             item_field=item_field,
-            list_size=self.list_size or other.list_size,
-            large=self.large,
-            view=self.view,
+            list_size=list_size,
+            large=large,
+            view=self.view or other.view,
         )
 
     @property
@@ -96,17 +141,15 @@ class ArrayType(NestedType):
         )
 
     @classmethod
-    def from_item_field(
+    def from_item(
         cls,
         item_field: "Field",
         list_size: int | None = None,
         large: bool = False,
         view: bool = False,
-        safe: bool = False,
     ):
-        if not safe:
-            _f = cls.get_data_field_class()
-            item_field = _f.from_any(item_field).with_name("item")
+        _f = field_class()
+        item_field = _f.from_any(item_field)
 
         # Arrow's fixed-size list requires list_size >= 0; treat any negative
         # value (including the -1 placeholder some serializers emit) as
@@ -129,7 +172,7 @@ class ArrayType(NestedType):
         if not cls.handles_arrow_type(dtype):
             raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
 
-        _f = cls.get_data_field_class()
+        _f = field_class()
         item_field = _f.from_arrow_field(dtype.value_field)
 
         if pa.types.is_list(dtype):
@@ -184,7 +227,7 @@ class ArrayType(NestedType):
         if not cls.handles_polars_type(dtype):
             raise TypeError(f"Unsupported Polars data type: {dtype!r}")
 
-        _f = cls.get_data_field_class()
+        _f = field_class()
 
         return cls(
             item_field=_f(
@@ -208,7 +251,7 @@ class ArrayType(NestedType):
         if not cls.handles_spark_type(dtype):
             raise TypeError(f"Unsupported Spark data type: {dtype!r}")
 
-        _f = cls.get_data_field_class()
+        _f = field_class()
 
         return cls(
             item_field=_f(
@@ -228,7 +271,7 @@ class ArrayType(NestedType):
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ArrayType":
-        _f = cls.get_data_field_class()
+        _f = field_class()
 
         return cls(
             item_field=_f.from_any(value["item_field"]),
@@ -258,36 +301,38 @@ class ArrayType(NestedType):
         array: pa.Array | pa.ChunkedArray,
         options: "CastOptions",
     ) -> pa.Array | pa.ChunkedArray:
-        options.check_source(array)
-        options.check_target(self)
+        options = options.check_source(array).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        if options.need_cast(source=array, target=self):
+            source_type_id = options.source_field.dtype.type_id
 
-        if source_type_id == DataTypeId.NULL or array.null_count == len(array):
-            return options.target_field.default_arrow_array(
-                size=len(array),
-                memory_pool=options.arrow_memory_pool,
-            )
+            if source_type_id == DataTypeId.NULL or array.null_count == len(array):
+                return options.target_field.default_arrow_array(
+                    size=len(array),
+                    memory_pool=options.arrow_memory_pool,
+                )
 
-        elif is_json_string_source(source_type_id):
-            return cast_arrow_json_string_array(array, options=options)
+            elif is_json_string_source(source_type_id):
+                return cast_arrow_json_string_array(array, options=options)
 
-        elif source_type_id == DataTypeId.ARRAY:
-            return cast_arrow_list_array(
-                array,
-                options=options,
-            )
+            elif source_type_id == DataTypeId.ARRAY:
+                return cast_arrow_list_array(
+                    array,
+                    options=options,
+                )
 
-        elif source_type_id == DataTypeId.MAP:
-            return cast_arrow_map_array_to_list(
-                array,
-                options=options,
-            )
+            elif source_type_id == DataTypeId.MAP:
+                return cast_arrow_map_array_to_list(
+                    array,
+                    options=options,
+                )
 
-        else:
-            raise pa.ArrowInvalid(
-                f"Cannot cast {options.source_field} to {options.target_field}"
-            )
+            else:
+                raise pa.ArrowInvalid(
+                    f"Cannot cast {options.source_field} to {options.target_field}"
+                )
+
+        return array
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()
@@ -316,9 +361,6 @@ class ArrayType(NestedType):
             base["view"] = True
 
         return base
-
-    def default_pyobj(self, nullable: bool) -> Any:
-        return None if nullable else []
 
     def _convert_pyobj(self, value: Any, safe: bool = False) -> list | None:
         # Priority path: str/bytes → JSON-decode, then fall through.
@@ -377,8 +419,7 @@ class ArrayType(NestedType):
         options: "CastOptions",
     ) -> "polars.Series":
         pl = get_polars()
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         if options.source_field.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
             return options.target_field.default_polars_series(size=len(series))
@@ -394,7 +435,7 @@ class ArrayType(NestedType):
         expr: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_target(self)
+        options = options.check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -418,8 +459,7 @@ class ArrayType(NestedType):
         options: "CastOptions",
     ) -> "pd.Series":
         pd = get_pandas()
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -445,8 +485,7 @@ class ArrayType(NestedType):
         column: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_source(column)
-        options.check_target(self)
+        options = options.check_source(column).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -469,7 +508,7 @@ def cast_arrow_list_array(
     array: pa.Array | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.Array | pa.ChunkedArray:
-    options.check_source(array)
+    options = options.check_source(array)
 
     if options.target_field is None:
         return array
@@ -477,6 +516,19 @@ def cast_arrow_list_array(
         raise pa.ArrowInvalid(
             f"Cannot cast {options.source_field} to {options.target_field}"
         )
+
+    source_field: Field = options.source_field
+    target_field: Field = options.target_field.with_name(options.target_field.name or source_field.name, inplace=True)
+
+    source_type: ArrayType = source_field.dtype
+    target_type: ArrayType = target_field.dtype
+    target_type.item_field.with_name(target_type.item_field.name or source_type.item_field.name, inplace=True)
+
+    source_arrow_type = source_type.to_arrow()
+    target_arrow_type = target_type.to_arrow()
+
+    if array.type == target_arrow_type:
+        return array
 
     if isinstance(array, pa.ChunkedArray):
         chunks = [
@@ -491,18 +543,13 @@ def cast_arrow_list_array(
             type=options.target_field.dtype.to_arrow(),
         )
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
-
-    source_type: ArrayType = source_field.dtype
-    target_type: ArrayType = target_field.dtype
-
-    values = array.values
-
-    target_values = target_type.item_field.cast_arrow_array(
-        values,
-        options=options.copy(source_field=source_type.item_field),
-    )
+    if source_arrow_type.value_type == target_arrow_type.value_type:
+        target_values = array.values
+    else:
+        target_values = target_type.item_field.cast_arrow_array(
+            array.values,
+            options=options.copy(source_field=source_type.item_field),
+        )
 
     if target_type.list_size is not None:
         return pa.FixedSizeListArray.from_arrays(
@@ -534,7 +581,7 @@ def cast_arrow_map_array_to_list(
     array: pa.MapArray | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.Array | pa.ChunkedArray:
-    options.check_source(array)
+    options = options.check_source(array)
 
     if options.target_field is None:
         return array

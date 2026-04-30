@@ -9,7 +9,7 @@ the anonymized copy is created.
 
 from __future__ import annotations
 
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.send_config import CacheConfig
 
 from .._helpers import make_request
@@ -24,7 +24,7 @@ def test_both_fields_default_to_none() -> None:
 
 def test_fields_can_be_assigned_after_construction() -> None:
     req = make_request()
-    cfg = CacheConfig(mode=SaveMode.UPSERT)
+    cfg = CacheConfig(mode=Mode.UPSERT)
 
     req.local_cache_config = cfg
     req.remote_cache_config = cfg
@@ -35,7 +35,7 @@ def test_fields_can_be_assigned_after_construction() -> None:
 
 def test_copy_preserves_both_fields() -> None:
     local_cfg = CacheConfig()
-    remote_cfg = CacheConfig(mode=SaveMode.UPSERT)
+    remote_cfg = CacheConfig(mode=Mode.UPSERT)
     req = make_request()
     req.local_cache_config = local_cfg
     req.remote_cache_config = remote_cfg
@@ -48,7 +48,7 @@ def test_copy_preserves_both_fields() -> None:
 
 def test_copy_local_cache_config_override_is_applied() -> None:
     original = CacheConfig()
-    new = CacheConfig(mode=SaveMode.UPSERT)
+    new = CacheConfig(mode=Mode.UPSERT)
     req = make_request()
     req.local_cache_config = original
 

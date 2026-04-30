@@ -1039,7 +1039,7 @@ class PyEnv:
         if not packages and requirements is None:
             return None
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
         pip_cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["install"]
         tmp_req: Path | None = None
 
@@ -1163,7 +1163,7 @@ class PyEnv:
             *extra_args,
         ]
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
 
         try:
             return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait_cfg, raise_error=True)

@@ -13,7 +13,7 @@ assert convert("false", bool) is False
 
 ```python
 import yggdrasil.arrow as pa
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.arrow.cast import cast_arrow_tabular
 
 source = pa.table({"id": ["1"], "price": ["9.99"]})

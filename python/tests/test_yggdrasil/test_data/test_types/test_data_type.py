@@ -80,7 +80,7 @@ class TestDataTypeArrow(_IntegerCastFillMixin, ArrowTestCase):
         out = StringType().cast_arrow_array(arr)
 
         self.assertEqual(out.type, pa.string())
-        self.assertEqual(out.to_pylist(), ["a", None, "b", None])
+        self.assertEqual(out.to_pylist(), ["a", "", "b", None])
 
     def test_cast_arrow_chunked_array_string_to_int_nullifies_empty(self):
         pa = self.pa

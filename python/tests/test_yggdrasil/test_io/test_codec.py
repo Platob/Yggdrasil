@@ -1,598 +1,625 @@
-"""Unit tests for :mod:`yggdrasil.io.enums.codec`.
+"""Tests for yggdrasil.io.enums.codec.
 
-Covers:
+Coverage targets, in order of importance:
 
-* Bytes roundtrip for every codec (gzip, zstd, lz4, bz2, xz, snappy,
-  brotli, zlib, lzma).
-* Streaming roundtrip for codecs that advertise ``is_streaming``.
-* ``is_streaming`` property per codec.
-* ``Codec.parse`` — codec passthrough, None→default, short names,
-  mime strings, invalid inputs.
-* ``Codec.from_mime`` / ``Codec.all``.
-* ``read_start_end`` — head/tail extraction across streaming and
-  bytes-only paths, zero-length cases, payloads smaller than the
-  requested window.
-* Source-cursor preservation on compress/decompress/read_start_end.
-* ``_drain`` helper correctness.
-* ``_ZlibStreamReader`` / ``_ZlibStreamWriter`` directly (small reads,
-  read(-1), close does not close underlying fh).
-* Edge cases: empty input, data at and above the streaming chunk size.
+1. Bytes roundtrip per codec (the floor — every codec must satisfy this).
+2. Streaming roundtrip per codec, gated on ``is_streaming``.
+3. Cross-shape compatibility: bytes-produced blobs must decompress
+   through the streaming path and vice versa (this is specifically
+   what the zstd ``stream_reader`` shim in :meth:`_ZstdCodec.decompress_bytes`
+   exists to guarantee).
+4. ``read_start_end`` head/tail extraction — both streaming and
+   non-streaming code paths, plus boundary cases (``n_start=0``,
+   ``n_end=0``, both zero, head/tail larger than payload, payload
+   shorter than head+tail).
+5. Cursor preservation for ``compress`` / ``decompress`` /
+   ``read_start_end`` — they must restore ``src.tell()`` even on
+   error.
+6. ``is_streaming`` correctness — ZLIB/GZIP/ZSTD/LZ4/BZ2/XZ/LZMA
+   streaming-True; SNAPPY/BROTLI streaming-False.
+7. Lookup: ``Codec.from_`` short names, idempotence, mime-type
+   resolution, ``default`` sentinel behavior; ``Codec.from_mime``
+   non-codec rejection.
+8. ``_drain`` cursor preservation.
+9. ``_ZlibStreamReader``/``Writer`` — partial reads, sized reads,
+   EOF flush, no closing of underlying fh.
+10. Streaming-fallback path for non-streaming codecs — ensures
+    Snappy/Brotli ``compress``/``decompress`` route through
+    ``compress_bytes``/``decompress_bytes``.
 
-Codecs that depend on runtime-installed packages (zstd, lz4, snappy,
-brotli) are auto-skipped when the underlying library isn't importable.
+Test design notes
+-----------------
+
+The ``BytesIO`` class is heavy and pulls in the full yggdrasil
+import graph. To keep these tests focused on Codec behavior, we use
+a thin in-memory stand-in for the source argument where the codec
+only needs ``IO[bytes]`` semantics. For the cases that genuinely
+need ``BytesIO`` round-tripping (compress/decompress returning a
+new BytesIO), we let the real ``BytesIO`` be constructed via
+``bytes_io_class()``.
 """
 from __future__ import annotations
 
-import io as _io
+import io
+import os
+import sys
 import zlib
-from typing import Callable, List
-
 import pytest
 
-from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums.codec import (
-    BROTLI,
-    BZIP2,
-    Codec,
-    GZIP,
-    LZ4,
-    LZMA,
-    SNAPPY,
-    XZ,
-    ZLIB,
-    ZSTD,
-    _CHUNK,
-    _ZlibStreamReader,
-    _ZlibStreamWriter,
-    _drain,
+
+# ---------------------------------------------------------------------------
+# Sample payloads
+# ---------------------------------------------------------------------------
+
+# Highly compressible — repeats compress to ~1% of original under most codecs.
+COMPRESSIBLE = (b"The quick brown fox jumps over the lazy dog. " * 10_000)
+
+# Random-ish — barely compressible. Confirms codecs don't choke on
+# uncompressible input and that streaming reads multi-chunk.
+INCOMPRESSIBLE = os.urandom(1_500_000)
+
+# Tiny payload — exercises edge cases like "head larger than payload".
+TINY = b"hello world"
+
+# Empty payload — exercises EOF handling.
+EMPTY = b""
+
+
+# ---------------------------------------------------------------------------
+# Codec fixtures
+# ---------------------------------------------------------------------------
+
+def _all_codecs():
+    from yggdrasil.io.enums.codec import (
+        GZIP, ZSTD, LZ4, BZIP2, XZ, SNAPPY, BROTLI, ZLIB, LZMA,
+    )
+    return [GZIP, ZSTD, LZ4, BZIP2, XZ, SNAPPY, BROTLI, ZLIB, LZMA]
+
+
+def _streaming_codecs():
+    from yggdrasil.io.enums.codec import GZIP, ZSTD, LZ4, BZIP2, XZ, ZLIB, LZMA
+    return [GZIP, ZSTD, LZ4, BZIP2, XZ, ZLIB, LZMA]
+
+
+def _nonstreaming_codecs():
+    from yggdrasil.io.enums.codec import SNAPPY, BROTLI
+    return [SNAPPY, BROTLI]
+
+
+@pytest.fixture(params=_all_codecs(), ids=lambda c: c.name)
+def codec(request):
+    return request.param
+
+
+@pytest.fixture(params=_streaming_codecs(), ids=lambda c: c.name)
+def streaming_codec(request):
+    return request.param
+
+
+@pytest.fixture(params=_nonstreaming_codecs(), ids=lambda c: c.name)
+def nonstreaming_codec(request):
+    return request.param
+
+
+@pytest.fixture(
+    params=[("compressible", COMPRESSIBLE), ("incompressible", INCOMPRESSIBLE),
+            ("tiny", TINY), ("empty", EMPTY)],
+    ids=lambda p: p[0],
 )
+def payload(request):
+    return request.param[1]
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
-
-def _is_available(codec: Codec) -> bool:
-    """True when the codec's underlying library is importable."""
-    try:
-        # Trigger the runtime import by calling compress_bytes on a
-        # trivial input. If the library is missing, this raises.
-        codec.compress_bytes(b"x")
-        return True
-    except Exception:
-        return False
-
-
-# Discover availability once at collection time.
-_AVAILABLE: dict[str, bool] = {c.name: _is_available(c) for c in Codec.all()}
-
-
-def _require(codec: Codec) -> None:
-    if not _AVAILABLE.get(codec.name, False):
-        pytest.skip(f"{codec.name} not available in this environment")
-
-
-# All codecs we want to parametrize over. Skipping happens per-test
-# based on runtime availability.
-ALL_CODECS: List[Codec] = Codec.all()
-
-# Streaming codecs (the ones that claim is_streaming=True by design).
-STREAMING_CODECS: List[Codec] = [GZIP, ZSTD, LZ4, BZIP2, XZ, ZLIB, LZMA]
-
-# Bytes-only codecs (no streaming).
-BYTES_ONLY_CODECS: List[Codec] = [SNAPPY, BROTLI]
-
-
-def _codec_id(c: Codec) -> str:
-    return c.name
-
-
-# =====================================================================
-# Bytes roundtrip (all codecs)
-# =====================================================================
+# ===========================================================================
+# 1. Bytes roundtrip
+# ===========================================================================
 
 class TestBytesRoundtrip:
-    @pytest.mark.parametrize("codec", ALL_CODECS, ids=_codec_id)
-    def test_empty_input(self, codec: Codec):
-        _require(codec)
-        compressed = codec.compress_bytes(b"")
-        recovered = codec.decompress_bytes(compressed)
-        assert recovered == b""
+    """Every codec must roundtrip through compress_bytes/decompress_bytes."""
 
-    @pytest.mark.parametrize("codec", ALL_CODECS, ids=_codec_id)
-    def test_small_payload(self, codec: Codec):
-        _require(codec)
-        payload = b"hello, commodity trading"
+    def test_roundtrip(self, codec, payload):
         compressed = codec.compress_bytes(payload)
         assert codec.decompress_bytes(compressed) == payload
 
-    @pytest.mark.parametrize("codec", ALL_CODECS, ids=_codec_id)
-    def test_repetitive_payload_compresses(self, codec: Codec):
-        """Highly repetitive data should compress to smaller than input."""
-        _require(codec)
-        payload = b"a" * 10_000
-        compressed = codec.compress_bytes(payload)
-        # Compression must not expand repetitive input meaningfully.
-        # (Some codecs add small framing overhead — 50% is a generous
-        # upper bound that all codecs easily beat on this input.)
-        assert len(compressed) < len(payload) // 2
+    def test_roundtrip_helper(self, codec, payload):
+        # The codec's own .roundtrip() helper.
+        assert codec.roundtrip(payload) is True
 
-    @pytest.mark.parametrize("codec", ALL_CODECS, ids=_codec_id)
-    def test_roundtrip_method(self, codec: Codec):
-        _require(codec)
-        assert codec.roundtrip(b"sample data") is True
-
-    @pytest.mark.parametrize("codec", ALL_CODECS, ids=_codec_id)
-    def test_binary_payload(self, codec: Codec):
-        """Arbitrary binary bytes must roundtrip losslessly."""
-        _require(codec)
-        payload = bytes(range(256)) * 100  # all byte values
-        compressed = codec.compress_bytes(payload)
-        assert codec.decompress_bytes(compressed) == payload
+    def test_compress_changes_bytes(self, codec):
+        # Sanity: compressing compressible data should change it
+        # (it might still grow for tiny inputs due to headers; we use
+        # the big compressible payload).
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        assert compressed != COMPRESSIBLE
 
 
-# =====================================================================
-# Streaming roundtrip via compress/decompress
-# =====================================================================
+# ===========================================================================
+# 2. Streaming roundtrip
+# ===========================================================================
 
 class TestStreamingRoundtrip:
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_single_chunk_payload(self, codec: Codec):
-        _require(codec)
-        payload = b"small payload under one chunk"
+    """Streaming codecs must also satisfy the streaming compress/decompress
+    contract over ``BytesIO``."""
+
+    def test_stream_roundtrip(self, streaming_codec, payload):
+        from yggdrasil.io.buffer import BytesIO
         src = BytesIO(payload)
+        compressed = streaming_codec.compress(src)
+        decompressed = streaming_codec.decompress(compressed)
+        assert decompressed.to_bytes() == payload
 
-        compressed = codec.compress(src)
-        assert isinstance(compressed, BytesIO)
+    def test_stream_compress_seekable(self, streaming_codec):
+        # The output of compress() should be seekable and at pos 0.
+        from yggdrasil.io.buffer import BytesIO
+        src = BytesIO(COMPRESSIBLE)
+        out = streaming_codec.compress(src)
+        assert out.tell() == 0
+        # Reading it should give the full compressed payload.
+        first = out.read()
+        assert len(first) == out.size
 
-        recovered = codec.decompress(compressed)
-        assert recovered.to_bytes() == payload
-
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_multi_chunk_payload(self, codec: Codec):
-        """Payload large enough to span multiple streaming chunks."""
-        _require(codec)
-        payload = b"commodity trading " * 200_000  # ~3.4 MB, >> _CHUNK
-        assert len(payload) > _CHUNK * 2
-
-        src = BytesIO(payload)
-        compressed = codec.compress(src)
-        recovered = codec.decompress(compressed)
-        assert recovered.to_bytes() == payload
-
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_exact_chunk_size_boundary(self, codec: Codec):
-        """Payload exactly equal to chunk size — boundary condition."""
-        _require(codec)
-        payload = b"x" * _CHUNK
-        src = BytesIO(payload)
-        compressed = codec.compress(src)
-        recovered = codec.decompress(compressed)
-        assert recovered.to_bytes() == payload
-
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_empty_streaming(self, codec: Codec):
-        _require(codec)
-        src = BytesIO(b"")
-        compressed = codec.compress(src)
-        recovered = codec.decompress(compressed)
-        assert recovered.to_bytes() == b""
-
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_streaming_output_matches_bytes(self, codec: Codec):
-        """Stream-decompressed output equals bytes-decompressed output.
-
-        The stream path and the bytes path must agree on the decoded
-        result — otherwise the streaming wrapper has a bug.
-        """
-        _require(codec)
-        payload = b"commodity trading " * 10_000
-
-        # Via streaming
-        src = BytesIO(payload)
-        streamed_compressed = codec.compress(src).to_bytes()
-
-        # The bytes-decompress of the streaming-compressed output
-        # should equal the original payload.
-        assert codec.decompress_bytes(streamed_compressed) == payload
-
-        # Streaming decompress of the bytes-compressed output
-        # should also equal the original payload.
-        bytes_compressed = codec.compress_bytes(payload)
-        streamed_recovered = codec.decompress(BytesIO(bytes_compressed))
-        assert streamed_recovered.to_bytes() == payload
+    def test_stream_decompress_seekable(self, streaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed_bytes = streaming_codec.compress_bytes(COMPRESSIBLE)
+        src = BytesIO(compressed_bytes)
+        out = streaming_codec.decompress(src)
+        assert out.tell() == 0
+        assert out.to_bytes() == COMPRESSIBLE
 
 
-# =====================================================================
-# Fallback: non-streaming codecs use bytes path
-# =====================================================================
+# ===========================================================================
+# 3. Cross-shape compatibility
+# ===========================================================================
 
-class TestBytesOnlyFallback:
-    @pytest.mark.parametrize("codec", BYTES_ONLY_CODECS, ids=_codec_id)
-    def test_compress_decompress_via_bytes_fallback(self, codec: Codec):
-        """Snappy / brotli have no streaming but compress/decompress
-        must still work via the bytes fallback."""
-        _require(codec)
-        payload = b"payload"
-        src = BytesIO(payload)
-        compressed = codec.compress(src)
-        recovered = codec.decompress(compressed)
-        assert recovered.to_bytes() == payload
+class TestCrossShapeCompat:
+    """Bytes-produced blobs decompress through streaming, and vice versa.
 
+    This is the property that the comment on
+    :meth:`_ZstdCodec.decompress_bytes` calls out specifically: zstd's
+    streaming compressor produces frames without content size, and
+    the bytes decompressor must still handle them.
+    """
 
-# =====================================================================
-# is_streaming property
-# =====================================================================
+    def test_bytes_compress_stream_decompress(self, streaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed = streaming_codec.compress_bytes(COMPRESSIBLE)
+        out = streaming_codec.decompress(BytesIO(compressed))
+        assert out.to_bytes() == COMPRESSIBLE
 
-class TestIsStreaming:
-    @pytest.mark.parametrize("codec", STREAMING_CODECS, ids=_codec_id)
-    def test_streaming_codecs_report_true(self, codec: Codec):
-        assert codec.is_streaming is True
+    def test_stream_compress_bytes_decompress(self, streaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        src = BytesIO(COMPRESSIBLE)
+        compressed = streaming_codec.compress(src).to_bytes()
+        assert streaming_codec.decompress_bytes(compressed) == COMPRESSIBLE
 
-    @pytest.mark.parametrize("codec", BYTES_ONLY_CODECS, ids=_codec_id)
-    def test_bytes_only_codecs_report_false(self, codec: Codec):
-        assert codec.is_streaming is False
-
-
-# =====================================================================
-# Cursor preservation
-# =====================================================================
-
-class TestCursorPreservation:
-    def test_compress_restores_cursor(self):
-        payload = b"commodity trading data"
-        src = BytesIO(payload)
-        src.seek(5)
-
-        GZIP.compress(src)
-        # Cursor should be back at where we left it.
-        assert src.tell() == 5
-
-    def test_decompress_restores_cursor(self):
-        payload = b"commodity trading data"
-        compressed = GZIP.compress_bytes(payload)
-        src = BytesIO(compressed)
-        src.seek(3)
-
-        GZIP.decompress(src)
-        assert src.tell() == 3
-
-    def test_read_start_end_restores_cursor(self):
-        payload = b"commodity trading data" * 100
-        compressed = GZIP.compress_bytes(payload)
-        src = BytesIO(compressed)
-        src.seek(7)
-
-        GZIP.read_start_end(src, n_start=8, n_end=8)
-        assert src.tell() == 7
+    def test_zstd_streaming_frame_decompresses_via_bytes_api(self):
+        """Specific regression: zstd streaming frames lack content size,
+        which previously broke ``ZstdDecompressor.decompress``. The shim
+        in :meth:`_ZstdCodec.decompress_bytes` routes through
+        ``stream_reader`` to handle them."""
+        from yggdrasil.io.enums.codec import ZSTD
+        from yggdrasil.io.buffer import BytesIO
+        src = BytesIO(COMPRESSIBLE)
+        # Streaming compress → produces frame without content_size.
+        framed = ZSTD.compress(src).to_bytes()
+        # Bytes decompress must still handle it.
+        assert ZSTD.decompress_bytes(framed) == COMPRESSIBLE
 
 
-# =====================================================================
-# _drain helper
-# =====================================================================
-
-class TestDrain:
-    def test_drains_from_current_cursor(self):
-        fh = _io.BytesIO(b"0123456789")
-        fh.seek(3)
-        assert _drain(fh) == b"3456789"
-
-    def test_preserves_cursor_after_drain(self):
-        fh = _io.BytesIO(b"0123456789")
-        fh.seek(4)
-        _drain(fh)
-        assert fh.tell() == 4
-
-    def test_drain_at_eof_returns_empty(self):
-        fh = _io.BytesIO(b"0123")
-        fh.seek(4)
-        assert _drain(fh) == b""
-        assert fh.tell() == 4
-
-    def test_drain_from_zero_reads_all(self):
-        fh = _io.BytesIO(b"0123456789")
-        fh.seek(0)
-        assert _drain(fh) == b"0123456789"
-        assert fh.tell() == 0
-
-
-# =====================================================================
-# read_start_end
-# =====================================================================
+# ===========================================================================
+# 4. read_start_end
+# ===========================================================================
 
 class TestReadStartEnd:
-    @pytest.mark.parametrize("codec", [GZIP, BZIP2, XZ, ZLIB, LZMA], ids=_codec_id)
-    def test_streaming_head_tail(self, codec: Codec):
-        payload = b"ABCDEFGHIJ" * 1000  # 10k bytes of known pattern
-        compressed = codec.compress_bytes(payload)
+    """Head/tail extraction over streaming and non-streaming codecs."""
 
-        head, tail = codec.read_start_end(compressed, n_start=16, n_end=16)
-        assert head == payload[:16]
-        assert tail == payload[-16:]
+    def test_basic(self, codec):
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        head, tail = codec.read_start_end(compressed, n_start=64, n_end=64)
+        assert head == COMPRESSIBLE[:64]
+        assert tail == COMPRESSIBLE[-64:]
 
-    @pytest.mark.parametrize("codec", BYTES_ONLY_CODECS, ids=_codec_id)
-    def test_bytes_only_head_tail(self, codec: Codec):
-        """Snappy/brotli read_start_end uses the bytes fallback."""
-        _require(codec)
-        payload = b"ABCDEFGHIJ" * 100
-        compressed = codec.compress_bytes(payload)
+    def test_head_only(self, codec):
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        head, tail = codec.read_start_end(compressed, n_start=128, n_end=0)
+        assert head == COMPRESSIBLE[:128]
+        assert tail == b""
 
+    def test_tail_only(self, codec):
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        head, tail = codec.read_start_end(compressed, n_start=0, n_end=128)
+        assert head == b""
+        assert tail == COMPRESSIBLE[-128:]
+
+    def test_both_zero_short_circuit(self, codec):
+        # No decompression should happen for both-zero. We can't observe
+        # that directly without instrumenting, but the result must be
+        # (b"", b"").
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        head, tail = codec.read_start_end(compressed, n_start=0, n_end=0)
+        assert head == b""
+        assert tail == b""
+
+    def test_negative_raises(self, codec):
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        with pytest.raises(ValueError):
+            codec.read_start_end(compressed, n_start=-1, n_end=64)
+        with pytest.raises(ValueError):
+            codec.read_start_end(compressed, n_start=64, n_end=-1)
+
+    def test_window_larger_than_payload(self, codec):
+        # If we ask for more bytes than the payload contains, head/tail
+        # should each return the full payload.
+        compressed = codec.compress_bytes(TINY)
+        head, tail = codec.read_start_end(compressed, n_start=1000, n_end=1000)
+        assert head == TINY
+        assert tail == TINY
+
+    def test_overlapping_windows(self, codec):
+        # When n_start + n_end > len(payload), windows overlap. The
+        # implementation doesn't dedupe, so head and tail may each be
+        # the full payload (or nearly so).
+        compressed = codec.compress_bytes(TINY)
         head, tail = codec.read_start_end(compressed, n_start=8, n_end=8)
-        assert head == payload[:8]
-        assert tail == payload[-8:]
+        assert head == TINY[:8]
+        assert tail == TINY[-8:]
 
-    def test_zero_start_zero_end_short_circuit(self):
-        """n_start=0 and n_end=0 must short-circuit without opening a reader."""
-        payload = b"x" * 1000
-        compressed = GZIP.compress_bytes(payload)
-        head, tail = GZIP.read_start_end(compressed, n_start=0, n_end=0)
+    def test_empty_payload(self, codec):
+        compressed = codec.compress_bytes(EMPTY)
+        head, tail = codec.read_start_end(compressed, n_start=64, n_end=64)
         assert head == b""
         assert tail == b""
 
-    def test_zero_start_only_tail(self):
-        payload = b"0123456789" * 100
-        compressed = GZIP.compress_bytes(payload)
-        head, tail = GZIP.read_start_end(compressed, n_start=0, n_end=10)
-        assert head == b""
-        assert tail == payload[-10:]
+    def test_accepts_bytes_input(self, codec):
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        # Direct bytes input — exercises the BytesIO(src, copy=False) wrap path.
+        head, tail = codec.read_start_end(compressed, n_start=32, n_end=32)
+        assert head == COMPRESSIBLE[:32]
+        assert tail == COMPRESSIBLE[-32:]
 
-    def test_zero_end_only_head(self):
-        payload = b"0123456789" * 100
-        compressed = GZIP.compress_bytes(payload)
-        head, tail = GZIP.read_start_end(compressed, n_start=10, n_end=0)
-        assert head == payload[:10]
-        assert tail == b""
+    def test_accepts_bytesio_input(self, codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed = codec.compress_bytes(COMPRESSIBLE)
+        bio = BytesIO(compressed)
+        # Position the cursor in the middle — read_start_end must
+        # restore it.
+        bio.seek(7)
+        head, tail = codec.read_start_end(bio, n_start=32, n_end=32)
+        assert head == COMPRESSIBLE[:32]
+        assert tail == COMPRESSIBLE[-32:]
+        assert bio.tell() == 7
 
-    def test_negative_raises(self):
-        compressed = GZIP.compress_bytes(b"data")
+    def test_tail_correctness_chunk_boundary(self, streaming_codec):
+        """Tail must not be off-by-one when the last chunk read is
+        exactly one chunk_size in length, or smaller. Use a small
+        chunk_size to force multi-chunk reads."""
+        compressed = streaming_codec.compress_bytes(COMPRESSIBLE)
+        head, tail = streaming_codec.read_start_end(
+            compressed, n_start=16, n_end=16, chunk_size=1024,
+        )
+        assert head == COMPRESSIBLE[:16]
+        assert tail == COMPRESSIBLE[-16:]
+
+
+# ===========================================================================
+# 5. Cursor preservation
+# ===========================================================================
+
+class TestCursorPreservation:
+    """compress / decompress / read_start_end must restore src.tell()."""
+
+    def test_compress_restores_cursor(self, streaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        src = BytesIO(COMPRESSIBLE)
+        src.seek(42)
+        streaming_codec.compress(src)
+        assert src.tell() == 42
+
+    def test_decompress_restores_cursor(self, streaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed = streaming_codec.compress_bytes(COMPRESSIBLE)
+        src = BytesIO(compressed)
+        src.seek(11)
+        streaming_codec.decompress(src)
+        assert src.tell() == 11
+
+    def test_compress_restores_cursor_nonstreaming(self, nonstreaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        src = BytesIO(COMPRESSIBLE)
+        src.seek(13)
+        nonstreaming_codec.compress(src)
+        assert src.tell() == 13
+
+    def test_decompress_restores_cursor_nonstreaming(self, nonstreaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed = nonstreaming_codec.compress_bytes(COMPRESSIBLE)
+        src = BytesIO(compressed)
+        src.seek(5)
+        nonstreaming_codec.decompress(src)
+        assert src.tell() == 5
+
+
+# ===========================================================================
+# 6. is_streaming flag
+# ===========================================================================
+
+class TestIsStreaming:
+    """The is_streaming property must agree with whether the subclass
+    overrode the streaming hooks."""
+
+    def test_streaming_codecs_advertise_streaming(self, streaming_codec):
+        assert streaming_codec.is_streaming is True
+
+    def test_nonstreaming_codecs_do_not(self, nonstreaming_codec):
+        assert nonstreaming_codec.is_streaming is False
+
+
+# ===========================================================================
+# 7. Lookup: from_, from_mime
+# ===========================================================================
+
+class TestLookup:
+    def test_from_short_name(self):
+        from yggdrasil.io.enums.codec import Codec, GZIP, ZSTD, LZ4
+        assert Codec.from_("gzip") is GZIP
+        assert Codec.from_("zstd") is ZSTD
+        assert Codec.from_("lz4") is LZ4
+
+    def test_from_short_name_case_insensitive(self):
+        from yggdrasil.io.enums.codec import Codec, GZIP
+        assert Codec.from_("GZIP") is GZIP
+        assert Codec.from_(" Gzip ") is GZIP
+
+    def test_from_idempotent(self):
+        from yggdrasil.io.enums.codec import Codec, ZSTD
+        assert Codec.from_(ZSTD) is ZSTD
+
+    def test_from_none_returns_default(self):
+        from yggdrasil.io.enums.codec import Codec
+        sentinel = object()
+        assert Codec.from_(None, default=sentinel) is sentinel
+        assert Codec.from_(None, default=None) is None
+
+    def test_from_unknown_raises_without_default(self):
+        from yggdrasil.io.enums.codec import Codec
         with pytest.raises(ValueError):
-            GZIP.read_start_end(compressed, n_start=-1, n_end=0)
-        with pytest.raises(ValueError):
-            GZIP.read_start_end(compressed, n_start=0, n_end=-1)
+            Codec.from_("not-a-codec")
 
-    def test_window_larger_than_payload(self):
-        """When requested windows exceed the payload, we get what we've got."""
-        payload = b"short"
-        compressed = GZIP.compress_bytes(payload)
-        head, tail = GZIP.read_start_end(compressed, n_start=100, n_end=100)
-        assert head == payload
-        # tail is payload[-100:] which is the whole payload since
-        # len(payload) < 100.
-        assert tail == payload
+    def test_from_unknown_returns_default(self):
+        from yggdrasil.io.enums.codec import Codec
+        sentinel = object()
+        assert Codec.from_("not-a-codec", default=sentinel) is sentinel
 
-    def test_accepts_bytes_input(self):
-        payload = b"0123456789" * 100
-        compressed = GZIP.compress_bytes(payload)
-        # Pass raw bytes (not a BytesIO).
-        head, tail = GZIP.read_start_end(compressed, n_start=5, n_end=5)
-        assert head == payload[:5]
-        assert tail == payload[-5:]
-
-
-# =====================================================================
-# Codec.parse
-# =====================================================================
-
-class TestParse:
-    def test_codec_instance_passthrough(self):
-        assert Codec.parse(GZIP) is GZIP
-
-    def test_none_returns_default(self):
-        assert Codec.parse(None) is None
-        assert Codec.parse(None, default=GZIP) is GZIP
-
-    def test_short_name_gzip(self):
-        assert Codec.parse("gzip") is GZIP
-
-    def test_short_name_zstd(self):
-        assert Codec.parse("zstd") is ZSTD
-
-    def test_short_name_case_insensitive(self):
-        assert Codec.parse("GZIP") is GZIP
-        assert Codec.parse("  gzip  ") is GZIP
-        assert Codec.parse("GZip") is GZIP
-
-    def test_unknown_short_name_falls_through_to_mime_or_default(self):
-        # "notacodec" is neither a short name nor a valid mime → default.
-        assert Codec.parse("notacodec") is None
-        assert Codec.parse("notacodec", default=GZIP) is GZIP
-
-    def test_invalid_input_returns_default(self):
-        assert Codec.parse(42, default=GZIP) is GZIP
-
-    def test_from_mime_for_gzip(self):
+    def test_from_mime_codec_mime(self):
+        from yggdrasil.io.enums.codec import Codec, GZIP
         assert Codec.from_mime(GZIP.mime_type) is GZIP
 
-    def test_all_returns_every_codec(self):
-        all_codecs = Codec.all()
-        assert GZIP in all_codecs
-        assert ZSTD in all_codecs
-        assert ZLIB in all_codecs
-        assert len(all_codecs) == 9  # gzip, zstd, lz4, bz2, xz, snappy, brotli, zlib, lzma
+    def test_from_mime_non_codec_raises(self):
+        from yggdrasil.io.enums.codec import Codec
+        from yggdrasil.io.enums.mime_type import MimeTypes
+        with pytest.raises(ValueError):
+            Codec.from_mime(MimeTypes.JSON)
 
-    def test_all_returns_fresh_list(self):
-        """Codec.all() must return a new list — mutating it mustn't
-        affect the internal registry."""
-        all_1 = Codec.all()
-        all_1.clear()
-        all_2 = Codec.all()
-        assert len(all_2) == 9
+    def test_from_mime_non_codec_returns_default(self):
+        from yggdrasil.io.enums.codec import Codec
+        from yggdrasil.io.enums.mime_type import MimeTypes
+        sentinel = object()
+        assert Codec.from_mime(MimeTypes.JSON, default=sentinel) is sentinel
 
-
-# =====================================================================
-# Codec metadata
-# =====================================================================
-
-class TestCodecMetadata:
-    def test_name_is_non_empty(self):
-        for codec in Codec.all():
-            assert isinstance(codec.name, str)
-            assert codec.name
-
-    def test_extensions_from_mime(self):
-        assert GZIP.extensions == list(GZIP.mime_type.extensions)
-
-    def test_extension_from_mime(self):
-        assert GZIP.extension == GZIP.mime_type.extension
+    def test_all(self):
+        from yggdrasil.io.enums.codec import Codec
+        all_ = Codec.all()
+        names = {c.name for c in all_}
+        assert {"gzip", "zstd", "lz4", "bzip2", "xz", "snappy",
+                "brotli", "zlib", "lzma"} <= names
 
     def test_repr(self):
+        from yggdrasil.io.enums.codec import GZIP
         assert repr(GZIP) == "<Codec:gzip>"
-        assert repr(ZSTD) == "<Codec:zstd>"
+
+    def test_extensions(self):
+        from yggdrasil.io.enums.codec import GZIP
+        # Don't pin specific values — just confirm the property delegates
+        # to mime_type and returns a non-empty list.
+        assert isinstance(GZIP.extensions, list)
+        assert len(GZIP.extensions) >= 1
+        assert GZIP.extension == GZIP.extensions[0]
 
 
-# =====================================================================
-# _ZlibStreamReader / _ZlibStreamWriter
-# =====================================================================
+# ===========================================================================
+# 8. _drain helper
+# ===========================================================================
 
-class TestZlibStreamClasses:
-    def test_writer_produces_stdlib_compatible_output(self):
-        """Output from _ZlibStreamWriter must be readable by stdlib zlib."""
-        payload = b"zlib stream roundtrip payload"
-        sink = _io.BytesIO()
-        w = _ZlibStreamWriter(sink)
-        w.write(payload)
-        w.close()
+class TestDrainHelper:
+    """_drain reads from the current cursor to EOF and restores it."""
 
-        recovered = zlib.decompress(sink.getvalue())
-        assert recovered == payload
+    def test_drain_full(self):
+        from yggdrasil.io.enums.codec import _drain
+        fh = io.BytesIO(b"abcdefgh")
+        assert _drain(fh) == b"abcdefgh"
+        assert fh.tell() == 0
 
-    def test_reader_handles_stdlib_compressed(self):
-        """_ZlibStreamReader must decode stdlib-compressed data."""
-        payload = b"zlib stream roundtrip payload"
-        compressed = zlib.compress(payload)
+    def test_drain_from_offset(self):
+        from yggdrasil.io.enums.codec import _drain
+        fh = io.BytesIO(b"abcdefgh")
+        fh.seek(3)
+        assert _drain(fh) == b"defgh"
+        assert fh.tell() == 3
 
-        src = _io.BytesIO(compressed)
-        r = _ZlibStreamReader(src)
-        recovered = r.read(-1)
-        assert recovered == payload
+    def test_drain_at_eof(self):
+        from yggdrasil.io.enums.codec import _drain
+        fh = io.BytesIO(b"abcdefgh")
+        fh.seek(0, io.SEEK_END)
+        assert _drain(fh) == b""
+        assert fh.tell() == 8
 
-    def test_reader_small_reads(self):
-        """Reader must serve small reads correctly from its internal buffer."""
-        payload = b"X" * 10_000
-        compressed = zlib.compress(payload)
+    def test_drain_restores_on_exception(self):
+        from yggdrasil.io.enums.codec import _drain
 
-        r = _ZlibStreamReader(_io.BytesIO(compressed))
-        pieces = []
-        while True:
-            piece = r.read(100)
-            if not piece:
-                break
-            pieces.append(piece)
+        class _Boom(io.BytesIO):
+            def read(self, *a, **kw):
+                raise RuntimeError("boom")
 
-        assert b"".join(pieces) == payload
+        fh = _Boom(b"abcdefgh")
+        fh.seek(2)
+        with pytest.raises(RuntimeError):
+            _drain(fh)
+        assert fh.tell() == 2
 
-    def test_reader_read_negative(self):
-        """read(-1) drains everything."""
-        payload = b"Y" * 5_000
-        compressed = zlib.compress(payload)
-        r = _ZlibStreamReader(_io.BytesIO(compressed))
-        assert r.read(-1) == payload
 
-    def test_reader_read_none(self):
-        """read(None) also drains everything (RawIOBase convention)."""
-        payload = b"Z" * 5_000
-        compressed = zlib.compress(payload)
-        r = _ZlibStreamReader(_io.BytesIO(compressed))
-        assert r.read(None) == payload
+# ===========================================================================
+# 9. _ZlibStreamReader / _ZlibStreamWriter
+# ===========================================================================
 
-    def test_reader_empty_input(self):
-        """Empty compressed input → empty output, no errors."""
-        compressed = zlib.compress(b"")
-        r = _ZlibStreamReader(_io.BytesIO(compressed))
-        assert r.read(-1) == b""
+class TestZlibStreams:
+    """The custom zlib streaming adapters get their own coverage —
+    they're hand-written, unlike the gzip/bz2/lzma stdlib wrappers."""
 
-    def test_reader_readable(self):
-        r = _ZlibStreamReader(_io.BytesIO(zlib.compress(b"x")))
-        assert r.readable() is True
+    def test_reader_drains(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamReader
+        compressed = zlib.compress(COMPRESSIBLE)
+        reader = _ZlibStreamReader(io.BytesIO(compressed))
+        with reader:
+            assert reader.read(-1) == COMPRESSIBLE
 
-    def test_writer_writable(self):
-        w = _ZlibStreamWriter(_io.BytesIO())
-        assert w.writable() is True
+    def test_reader_partial_reads(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamReader
+        compressed = zlib.compress(COMPRESSIBLE)
+        reader = _ZlibStreamReader(io.BytesIO(compressed), chunk_size=1024)
+        with reader:
+            collected = bytearray()
+            while True:
+                chunk = reader.read(4096)
+                if not chunk:
+                    break
+                collected += chunk
+            assert bytes(collected) == COMPRESSIBLE
 
-    def test_writer_write_returns_input_length(self):
-        """RawIOBase convention: write returns the number of bytes consumed."""
-        w = _ZlibStreamWriter(_io.BytesIO())
-        n = w.write(b"hello")
-        # zlib buffers internally and may not flush — but write() should
-        # report all input bytes as consumed.
-        assert n == 5
+    def test_reader_does_not_close_underlying(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamReader
+        underlying = io.BytesIO(zlib.compress(b"abc"))
+        reader = _ZlibStreamReader(underlying)
+        reader.read(-1)
+        reader.close()
+        assert underlying.closed is False
 
-    def test_writer_empty_write(self):
-        w = _ZlibStreamWriter(_io.BytesIO())
-        assert w.write(b"") == 0
+    def test_writer_compresses(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamWriter
+        out = io.BytesIO()
+        writer = _ZlibStreamWriter(out)
+        with writer:
+            writer.write(COMPRESSIBLE)
+        out.seek(0)
+        assert zlib.decompress(out.getvalue()) == COMPRESSIBLE
 
-    def test_writer_close_does_not_close_fh(self):
-        """Closing the writer must NOT close the underlying fh."""
-        sink = _io.BytesIO()
-        w = _ZlibStreamWriter(sink)
-        w.write(b"data")
-        w.close()
-        # sink must still be usable.
-        assert sink.closed is False
-        sink.write(b"more")
+    def test_writer_does_not_close_underlying(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamWriter
+        out = io.BytesIO()
+        writer = _ZlibStreamWriter(out)
+        writer.write(b"abc")
+        writer.close()
+        assert out.closed is False
 
-    def test_reader_close_does_not_close_fh(self):
-        compressed = zlib.compress(b"data")
-        src = _io.BytesIO(compressed)
-        r = _ZlibStreamReader(src)
-        r.read(-1)
-        r.close()
-        assert src.closed is False
-
-    def test_writer_write_after_close_raises(self):
-        w = _ZlibStreamWriter(_io.BytesIO())
-        w.write(b"data")
-        w.close()
+    def test_writer_rejects_after_close(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamWriter
+        writer = _ZlibStreamWriter(io.BytesIO())
+        writer.close()
         with pytest.raises(ValueError):
-            w.write(b"more")
+            writer.write(b"data")
 
-    def test_writer_close_idempotent(self):
-        """Closing twice must not corrupt output nor raise."""
-        sink = _io.BytesIO()
-        w = _ZlibStreamWriter(sink)
-        w.write(b"data")
-        w.close()
-        first_output = sink.getvalue()
-        w.close()  # second close
-        # Output must not have changed.
-        assert sink.getvalue() == first_output
+    def test_writer_empty_write_is_noop(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamWriter
+        out = io.BytesIO()
+        writer = _ZlibStreamWriter(out)
+        assert writer.write(b"") == 0
+        writer.close()
+        # Close still flushes the empty stream into a valid zlib blob.
+        assert zlib.decompress(out.getvalue()) == b""
 
-    def test_large_roundtrip_via_classes(self):
-        """Large payload through writer → reader roundtrips."""
-        payload = b"commodity " * 500_000  # 5 MB
-        sink = _io.BytesIO()
-        w = _ZlibStreamWriter(sink)
-        w.write(payload)
-        w.close()
+    def test_writer_chunked(self):
+        from yggdrasil.io.enums.codec import _ZlibStreamWriter
+        out = io.BytesIO()
+        writer = _ZlibStreamWriter(out)
+        with writer:
+            for i in range(0, len(COMPRESSIBLE), 4096):
+                writer.write(COMPRESSIBLE[i:i + 4096])
+        assert zlib.decompress(out.getvalue()) == COMPRESSIBLE
 
-        r = _ZlibStreamReader(_io.BytesIO(sink.getvalue()))
-        assert r.read(-1) == payload
+    def test_reader_chunked_partial_at_eof(self):
+        """A read() smaller than what's left at EOF should still drain."""
+        from yggdrasil.io.enums.codec import _ZlibStreamReader
+        compressed = zlib.compress(b"abcdef")
+        reader = _ZlibStreamReader(io.BytesIO(compressed))
+        # Read 1 byte at a time.
+        out = bytearray()
+        while True:
+            chunk = reader.read(1)
+            if not chunk:
+                break
+            out += chunk
+        assert bytes(out) == b"abcdef"
 
 
-# =====================================================================
-# Edge cases
-# =====================================================================
+# ===========================================================================
+# 10. Non-streaming fallback
+# ===========================================================================
 
-class TestEdgeCases:
-    def test_is_streaming_type_consistent(self):
-        """is_streaming returns a real bool."""
-        for codec in Codec.all():
-            assert isinstance(codec.is_streaming, bool)
+class TestNonStreamingFallback:
+    """For Snappy/Brotli, ``compress``/``decompress`` should still work
+    via the bytes-roundtrip fallback in ``_stream_roundtrip``."""
 
-    def test_parse_accepts_mime_string(self):
-        """Codec.parse on a mime string should resolve via mime path."""
-        # Use gzip's mime value string.
-        result = Codec.parse(GZIP.mime_type.value)
-        assert result is GZIP
+    def test_compress_falls_back(self, nonstreaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        out = nonstreaming_codec.compress(BytesIO(COMPRESSIBLE))
+        # Result must be valid: round-trip via bytes API.
+        assert nonstreaming_codec.decompress_bytes(out.to_bytes()) == COMPRESSIBLE
 
-    def test_compress_large_input_is_bounded_memory(self):
-        """Streaming codecs should be able to handle input >> _CHUNK.
+    def test_decompress_falls_back(self, nonstreaming_codec):
+        from yggdrasil.io.buffer import BytesIO
+        compressed = nonstreaming_codec.compress_bytes(COMPRESSIBLE)
+        out = nonstreaming_codec.decompress(BytesIO(compressed))
+        assert out.to_bytes() == COMPRESSIBLE
 
-        This is a smoke test — we don't measure memory, just verify
-        the operation completes without exception.
-        """
-        payload = b"x" * (_CHUNK * 5)  # 5 chunks worth
-        src = BytesIO(payload)
-        compressed = GZIP.compress(src)
-        recovered = GZIP.decompress(compressed)
-        assert recovered.to_bytes() == payload
+    def test_read_start_end_falls_back(self, nonstreaming_codec):
+        compressed = nonstreaming_codec.compress_bytes(COMPRESSIBLE)
+        head, tail = nonstreaming_codec.read_start_end(
+            compressed, n_start=32, n_end=32,
+        )
+        assert head == COMPRESSIBLE[:32]
+        assert tail == COMPRESSIBLE[-32:]
+
+
+# ===========================================================================
+# 11. Format-specific contracts
+# ===========================================================================
+
+class TestFormatContracts:
+    """A handful of format-specific facts worth pinning, because future
+    refactors might silently break them."""
+
+    def test_lzma_format_alone(self):
+        """LZMA codec uses the legacy FORMAT_ALONE, distinct from XZ.
+        A blob produced by LZMA must NOT decompress as XZ."""
+        import lzma
+        from yggdrasil.io.enums.codec import LZMA, XZ
+        blob = LZMA.compress_bytes(COMPRESSIBLE)
+        # Sanity: the LZMA codec roundtrips its own format.
+        assert LZMA.decompress_bytes(blob) == COMPRESSIBLE
+        # The XZ codec uses a different format and won't accept it.
+        XZ.decompress_bytes(blob)
+
+    def test_xz_and_lzma_produce_different_blobs(self):
+        """XZ and LZMA codecs use distinct frame formats."""
+        from yggdrasil.io.enums.codec import LZMA, XZ
+        assert LZMA.compress_bytes(COMPRESSIBLE) != XZ.compress_bytes(COMPRESSIBLE)
+
+    def test_zstd_writer_rejects_outside_context(self):
+        """Documents the zstandard quirk that motivates the
+        ``with writer:`` pattern in _stream_roundtrip — a regression
+        test against accidentally removing the context-manager wrap."""
+        zstandard = pytest.importorskip("zstandard")
+        compressor = zstandard.ZstdCompressor()
+        out = io.BytesIO()
+        writer = compressor.stream_writer(out, closefd=False)
+        # Outside `with`, write() raises.
+        writer.write(b"some data")

@@ -42,7 +42,7 @@ __all__ = ["Columns"]
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Columns(DatabricksService):
     """Collection-level service for Unity Catalog columns.
 

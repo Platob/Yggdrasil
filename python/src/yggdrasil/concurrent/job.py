@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generic, Optional, Tuple, TypeVar, TYPE_CHECKING
+from typing import Any, Callable, Dict, Generic, Tuple, TypeVar, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from yggdrasil.concurrent.threading import ThreadJob

@@ -8,13 +8,3 @@ from .service import Workspaces
 from .workspace import *
 
 # Re-exports from the new canonical location
-from ..fs.path_kind import DatabricksPathKind
-from ..fs.path import (
-    DatabricksPath,
-    DBFSPath,
-    WorkspacePath,
-    VolumePath,
-    TablePath,
-    DatabricksStatResult,
-)
-from ..fs.io import DatabricksIO

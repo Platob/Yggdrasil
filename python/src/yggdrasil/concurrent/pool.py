@@ -13,7 +13,9 @@ from typing import Any, Deque, Iterable, Iterator, Optional, Set
 from .job import Job
 from .job_result import JobResult
 
-__all__ = ["JobPoolExecutor"]
+__all__ = [
+    "JobPoolExecutor"
+]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -211,4 +213,3 @@ class JobPoolExecutor(ThreadPoolExecutor):
                     self._cancel_all(pending)
                 if shutdown_on_exit:
                     self.shutdown(wait=shutdown_wait, cancel_futures=True)
-

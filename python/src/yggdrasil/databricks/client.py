@@ -16,7 +16,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.enums import MimeTypes
-from yggdrasil.io.url import URL, URLResource, url_resource_class
+from yggdrasil.io.url import URL
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
@@ -27,8 +27,7 @@ if TYPE_CHECKING:
     from .sql.columns import Columns
     from .sql.catalogs import Catalogs
     from .sql.schemas import Schemas
-    from .sql.service import Warehouses
-    from .sql.statements import Statements
+    from yggdrasil.databricks.warehouse.service import Warehouses
     from .sql.grants import Grants
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -82,9 +81,8 @@ def env_field(
     )
 
 
-@url_resource_class
 @dataclass
-class DatabricksClient(URLResource):
+class DatabricksClient:
     """
     Thin wrapper around databricks.sdk.config.Config.
 
@@ -161,8 +159,8 @@ class DatabricksClient(URLResource):
     @property
     def base_url(self):
         if not self.host:
-            return URL.parse_str(self.make_config().host)
-        return URL.parse_str(self.host)
+            return URL.from_str(self.make_config().host)
+        return URL.from_str(self.host)
 
     def to_url(self, scheme: str | None = None) -> URL:
         query: dict[str, Any] = {}
@@ -203,7 +201,7 @@ class DatabricksClient(URLResource):
         elif isinstance(obj, URL):
             return cls.from_parsed_url(obj)
         elif isinstance(obj, str):
-            url = URL.parse_str(obj, default_scheme="https")
+            url = URL.from_str(obj, default_scheme="https")
             return cls.from_parsed_url(url)
         elif isinstance(obj, dict):
             return cls(**obj)
@@ -454,7 +452,8 @@ class DatabricksClient(URLResource):
         workspace_id = self.get_workspace_id()
 
         if local_cache.exists() and local_cache.stat().st_size > 0:
-            existing_data = buff.media_io(MimeTypes.PARQUET).read_polars_frame()
+            # TODO: fix
+            existing_data = buff.as_media(MimeTypes.PARQUET).read_polars_frame()
             filtered = existing_data.filter(pl.col("workspace_id") == workspace_id)
 
             for record in filtered.to_dicts():
@@ -467,14 +466,14 @@ class DatabricksClient(URLResource):
             "select distinct account_id, cast(workspace_id as bigint) as workspace_id, workspace_url"
             " from system.access.workspaces_latest"
             " where status = 'RUNNING'"
-        ).to_polars(stream=False)
+        ).to_polars()
 
         if existing_data is not None:
             new_data = pl.concat([existing_data, new_data]).unique()
 
         buff.truncate()
         buff.seek(0)
-        buff.media_io(MimeTypes.PARQUET).write_arrow_table(new_data.to_arrow())
+        buff.as_media(MimeTypes.PARQUET).write_arrow_table(new_data.to_arrow())
         buff.close()
 
         filtered = new_data.filter(pl.col("workspace_id") == workspace_id)
@@ -566,7 +565,7 @@ class DatabricksClient(URLResource):
         """
         from .fs.path import DatabricksPath
 
-        return DatabricksPath.parse(
+        return DatabricksPath.from_(
             obj=parts,
             client=self,
             temporary=temporary
@@ -648,7 +647,7 @@ class DatabricksClient(URLResource):
         volume_name: str | None = None,
         base_path: str | None = None,
     ):
-        wait = WaitingConfig.check_arg(wait)
+        wait = WaitingConfig.from_(wait)
 
         base_path = base_path or self._base_tmp_path(
             catalog_name=catalog_name,
@@ -750,24 +749,12 @@ class DatabricksClient(URLResource):
 
     @property
     def warehouses(self) -> "Warehouses":
-        from .sql.service import Warehouses
+        from yggdrasil.databricks.warehouse.service import Warehouses
 
         return self.lazy_property(
             self,
             cache_attr="_warehouses",
             factory=lambda: Warehouses(client=self),
-            use_cache=True,
-        )
-
-    @property
-    def statements(self) -> "Statements":
-        """Collection-level SQL statement service for this client."""
-        from .sql.statements import Statements
-
-        return self.lazy_property(
-            self,
-            cache_attr="_statements",
-            factory=lambda: Statements(client=self),
             use_cache=True,
         )
 
@@ -957,7 +944,7 @@ def is_checked_tmp_path(
 
     return False
 
-@dataclass(frozen=True)
+@dataclass
 class DatabricksService(ABC):
     client: DatabricksClient = field(
         default_factory=DatabricksClient.current,
@@ -1049,11 +1036,6 @@ class DatabricksService(ABC):
         return self.client.warehouses
 
     @property
-    def statements(self) -> "Statements":
-        """SQL statement service (shorthand for ``client.statements``)."""
-        return self.client.statements
-
-    @property
     def compute(self) -> "Compute":
         return self.client.compute
 
@@ -1104,7 +1086,10 @@ class DatabricksService(ABC):
 
 @dataclass
 class DatabricksResource(ABC):
-    service: DatabricksService
+    service: DatabricksService = field(
+        default_factory=DatabricksService.current,
+        repr=False, compare=False, hash=False
+    )
 
     def __post_init__(self):
         pass

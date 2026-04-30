@@ -371,7 +371,7 @@ class SystemCommand:
                 )
             return self
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
 
         if wait_cfg:
             try:

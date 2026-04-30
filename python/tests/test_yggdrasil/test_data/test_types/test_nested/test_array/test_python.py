@@ -24,21 +24,13 @@ from yggdrasil.data.types.primitive import IntegerType, StringType
 def test_from_item_field_safe_mode_preserves_original_field() -> None:
     original = Field(name="custom", dtype=StringType(), nullable=False)
 
-    result = ArrayType.from_item_field(item_field=original, safe=True)
+    result = ArrayType.from_item(item_field=original)
 
     assert result.item_field is original
 
 
-def test_from_item_field_non_safe_mode_renames_item_to_item() -> None:
-    original = Field(name="custom", dtype=StringType(), nullable=False)
-
-    result = ArrayType.from_item_field(item_field=original, safe=False)
-
-    assert result.item_field.name == "item"
-
-
 def test_from_item_field_sanitizes_negative_list_size_to_none() -> None:
-    result = ArrayType.from_item_field(
+    result = ArrayType.from_item(
         item_field=Field(name="item", dtype=StringType(), nullable=True),
         list_size=-1,
     )
@@ -47,7 +39,7 @@ def test_from_item_field_sanitizes_negative_list_size_to_none() -> None:
 
 
 def test_from_item_field_preserves_zero_list_size() -> None:
-    result = ArrayType.from_item_field(
+    result = ArrayType.from_item(
         item_field=Field(name="item", dtype=StringType(), nullable=True),
         list_size=0,
         safe=True,
@@ -62,7 +54,7 @@ def test_from_item_field_preserves_zero_list_size() -> None:
 
 
 def test_type_id_is_array() -> None:
-    dtype = ArrayType.from_item_field(StringType().to_field())
+    dtype = ArrayType.from_item(StringType().to_field())
     assert dtype.type_id == DataTypeId.ARRAY
 
 
@@ -78,7 +70,7 @@ def test_handles_dict_rejects_other_types_and_unknown_names() -> None:
 
 
 def test_children_fields_is_the_item_field() -> None:
-    dtype = ArrayType.from_item_field(StringType().to_field())
+    dtype = ArrayType.from_item(StringType().to_field())
     children = dtype.children_fields
     assert len(children) == 1
     assert children[0].name == "item"
@@ -140,12 +132,12 @@ def test_to_dict_from_dict_round_trip_preserves_all_fields() -> None:
 
 
 def test_default_pyobj_nullable_returns_none() -> None:
-    dtype = ArrayType.from_item_field(StringType().to_field())
+    dtype = ArrayType.from_item(StringType().to_field())
     assert dtype.default_pyobj(nullable=True) is None
 
 
 def test_default_pyobj_non_nullable_returns_empty_list() -> None:
-    dtype = ArrayType.from_item_field(StringType().to_field())
+    dtype = ArrayType.from_item(StringType().to_field())
     assert dtype.default_pyobj(nullable=False) == []
 
 
@@ -155,7 +147,7 @@ def test_default_pyobj_non_nullable_returns_empty_list() -> None:
 
 
 def test_to_databricks_ddl_wraps_item_type() -> None:
-    dtype = ArrayType.from_item_field(StringType().to_field())
+    dtype = ArrayType.from_item(StringType().to_field())
     ddl = dtype.to_databricks_ddl()
     assert ddl.upper().startswith("ARRAY<")
     assert ddl.endswith(">")

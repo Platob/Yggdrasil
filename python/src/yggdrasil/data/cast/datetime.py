@@ -294,7 +294,7 @@ def str_to_tzinfo(value: str, opts: Any = None) -> dt.tzinfo:
     s = value.strip()
     u = s.upper()
 
-    if u in {"UTC", "Z"}:
+    if u in {"Etc/UTC", "UTC", "Z"}:
         return _UTC
     if u in {"LOCAL", "CURRENT", "NOW"}:
         return CURRENT_TZINFO

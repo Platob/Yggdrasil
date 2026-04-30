@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from yggdrasil.io import MediaType, MimeTypes
+from yggdrasil.io.enums import MediaType, MimeTypes
 from yggdrasil.io.request import PreparedRequest
 
 

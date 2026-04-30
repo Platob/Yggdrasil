@@ -8,7 +8,8 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data import CastOptions, Field, Schema
+from yggdrasil.data import Field, Schema
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.types import IntegerType
 from yggdrasil.data.types.nested.array import ArrayType
 from yggdrasil.data.types.nested.struct import (
@@ -90,7 +91,7 @@ def test_cast_arrow_struct_array_rejects_non_struct_source() -> None:
 
     source_field = Field(
         name="src",
-        dtype=ArrayType.from_item_field(
+        dtype=ArrayType.from_item(
             IntegerType(byte_size=8, signed=True).to_field(name="item"),
             safe=True,
         ),

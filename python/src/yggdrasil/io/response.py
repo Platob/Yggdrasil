@@ -7,10 +7,11 @@ import warnings
 from dataclasses import MISSING, dataclass, replace, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
+import polars as pl
 import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
-from yggdrasil.data import any_to_datetime
+from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
@@ -21,7 +22,6 @@ from .request import PreparedRequest, REQUEST_SCHEMA
 
 if TYPE_CHECKING:
     import pandas as pd
-    import polars as pl
     from fastapi import Response as FastAPIResponse
     from pyspark.sql import DataFrame as SparkDataFrame, Row as SparkRow
     from starlette.responses import Response as StarletteResponse
@@ -121,21 +121,12 @@ def _sniff_media_from_body(
     content_type: str | None,
     content_encoding: str | None,
 ) -> MediaType:
-    content_codec = Codec.parse(content_encoding, default=None)
-
-    if content_type and not _is_probably_placeholder_content_type(content_type):
-        try:
-            return MediaType.parse(content_type, codec=content_codec)
-        except Exception:
-            pass
-
-    try:
-        sniffed = body.media_type
-    except Exception:
-        sniffed = MediaType(MimeTypes.OCTET_STREAM, content_codec)
-
-    return MediaType(sniffed.mime_type, codec=content_codec) if content_encoding else sniffed
-
+    if content_type or content_encoding:
+        return MediaType.from_many(
+            mime_types=[content_type, content_encoding],
+            default=MediaType.from_mime(MimeTypes.OCTET_STREAM)
+        )
+    return body.media_type
 
 def _ensure_media_headers(
     headers: MutableMapping[str, str],
@@ -223,7 +214,7 @@ def _parse_buffer(obj: Mapping[str, Any], *, prefix: str) -> BytesIO:
         body = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix="")
     if body is MISSING or body is None:
         return BytesIO()
-    return BytesIO.parse(obj=body)
+    return BytesIO.from_(obj=body)
 
 
 def _parse_status_code(obj: Mapping[str, Any], *, prefix: str) -> int:
@@ -673,7 +664,7 @@ class Response:
             self.headers = {}
 
         self.request.accept_media_type = value
-        self.buffer.set_media_type(value, safe=safe)
+        self.buffer.with_media_type(value, copy=False)
         self.headers["Content-Type"] = value.mime_type.value
 
         if value.codec is not None:
@@ -705,6 +696,9 @@ class Response:
     def body(self) -> BytesIO:
         return self.buffer
 
+    def dio(self, media_type: MediaType | None = None):
+        return self.buffer.as_media(media_type=self.media_type)
+
     @property
     def codec(self) -> Optional[Codec]:
         return self.media_type.codec
@@ -727,8 +721,8 @@ class Response:
         *,
         media_type: Optional[MediaType] = None,
     ) -> Any:
+        del orient # TODO: implement orient
         return self.buffer.json_load(
-            orient=orient,
             media_type=media_type or self.media_type,
         )
 
@@ -851,13 +845,11 @@ class Response:
     def to_arrow_batches(
         self,
         parse: bool = True,
-        *,
-        lazy: bool = False,
-        **media_options: Any,
+        **options: Any
     ) -> Iterator[pa.RecordBatch]:
         if parse:
-            mio = self.buffer.media_io(media=self.media_type)
-            yield from mio.read_arrow_batches(lazy=lazy, **media_options)
+            with self.dio() as b:
+                yield from b.read_arrow_batches(**options)
             return
 
         yield self._arrow_batch_from_values()
@@ -908,14 +900,9 @@ class Response:
         **media_options: Any,
     ):
         if parse:
-            mio = self.buffer.media_io(media=self.media_type)
-
-            for df in mio.read_polars_frames(lazy=lazy, **media_options):
-                yield df
+            yield from self.dio().read_polars_frames(lazy=lazy, **media_options)
         else:
-            from yggdrasil.polars.lib import polars as _pl
-
-            yield _pl.from_arrow(self.to_arrow_batch(parse=False))
+            yield pl.from_arrow(self.to_arrow_batch(parse=False))
 
     def to_polars(
         self,
@@ -927,7 +914,7 @@ class Response:
         from yggdrasil.polars.lib import polars as _pl
 
         if parse:
-            mio = self.buffer.media_io(media=self.media_type)
+            mio = self.buffer.as_media(media_type=self.media_type)
             return mio.read_polars_frame(lazy=lazy, **media_options)
 
         return _pl.from_arrow(self.to_arrow_batch(parse=False))
@@ -944,19 +931,6 @@ class Response:
             lazy=lazy,
             **media_options,
         ).to_pandas()
-
-    def to_spark(
-        self,
-        parse: bool = True,
-        *,
-        lazy: bool = False,
-        **media_options: Any,
-    ) -> "SparkDataFrame":
-        from yggdrasil.spark.cast import arrow_table_to_spark_dataframe
-
-        return arrow_table_to_spark_dataframe(
-            self.to_arrow_table(parse=parse, lazy=lazy, **media_options)
-        )
 
     # ------------------------------------------------------------------
     # Arrow / Spark deserialization

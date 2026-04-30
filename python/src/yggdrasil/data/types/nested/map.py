@@ -13,10 +13,10 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
-from yggdrasil.io import SaveMode
+from yggdrasil.io.enums import Mode
+from yggdrasil.lazy_imports import field_class, struct_type_class
 from ._cast_json import (
     cast_arrow_json_string_array,
-    cast_polars_json_string_expr,
     cast_spark_json_string_column,
     is_json_string_source,
 )
@@ -53,7 +53,7 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class MapType(NestedType):
     item_field: "Field"
     keys_sorted: bool = False
@@ -62,10 +62,18 @@ class MapType(NestedType):
     def type_id(self) -> DataTypeId:
         return DataTypeId.MAP
 
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * (indent * level)
+        body = ",\n".join(
+            child.pretty_format(indent=indent, level=level + 1)
+            for child in (self.key_field, self.value_field)
+        )
+        return f"{pad}map<\n{body}\n{pad}>"
+
     def _merge_with_same_id(
         self,
         other: "MapType",
-        mode: SaveMode | None = None,
+        mode: Mode | None = None,
         downcast: bool = False,
         upcast: bool = False,
     ) -> "MapType":
@@ -112,26 +120,25 @@ class MapType(NestedType):
         cls,
         key_field: "Field",
         value_field: "Field",
-        keys_sorted: bool = False,
+        keys_sorted: bool | None = None,
     ) -> "MapType":
-        _f = cls.get_data_field_class()
-        k = _f.from_any(key_field).with_name("key", inplace=True).with_nullable(
-            nullable=False,
-            inplace=True,
-        )
-        v = _f.from_any(value_field).with_name("value", inplace=True)
-        entry_struct = cached_from_import(
-            "yggdrasil.data.types.nested",
-            "StructType",
-        )(fields=[k, v])
+        _f = field_class()
+        k = _f.from_any(key_field).with_nullable(False)
+
+        if not k.name:
+            k.with_name("key", inplace=True)
+
+        v = _f.from_any(value_field)
+        if not v.name:
+            v.with_name("value", inplace=True)
 
         return cls(
             item_field=_f(
                 name="entries",
-                dtype=entry_struct,
+                dtype=struct_type_class()(fields=[k, v]),
                 nullable=False,
             ),
-            keys_sorted=keys_sorted,
+            keys_sorted=k.sorted if keys_sorted is None else bool(keys_sorted),
         )
 
     @classmethod
@@ -158,6 +165,28 @@ class MapType(NestedType):
             keys_sorted=getattr(dtype, "keys_sorted", False),
         )
 
+    def equals(
+        self,
+        other: "DataType",
+        check_names: bool = True,
+        check_dtypes: bool = True,
+        check_metadata: bool = True,
+    ) -> bool:
+        if not isinstance(other, MapType):
+            return False
+
+        if not self.key_field.name:
+            self.key_field.with_name(other.key_field.name, inplace=True)
+
+        if not self.value_field.name:
+            self.value_field.with_name(other.value_field.name, inplace=True)
+
+        return (
+            self.key_field.equals(other.key_field, check_names, check_dtypes, check_metadata)
+            and self.value_field.equals(other.value_field, check_names, check_dtypes, check_metadata)
+            and self.keys_sorted == other.keys_sorted
+        )
+
     @classmethod
     def handles_polars_type(cls, dtype: "polars.List") -> bool:
         pl = get_polars()
@@ -165,8 +194,7 @@ class MapType(NestedType):
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.List") -> "MapType":
-        _f = cached_from_import("yggdrasil.data.data_field", "Field")
-        StructType = cached_from_import("yggdrasil.data.types.nested", "StructType")
+        _f = field_class()
 
         if not cls.handles_polars_type(dtype):
             raise TypeError(f"Unsupported Polars data type: {dtype!r}")
@@ -179,7 +207,7 @@ class MapType(NestedType):
         return cls(
             item_field=_f(
                 name="entries",
-                dtype=StructType(fields=fields),
+                dtype=struct_type_class()(fields=fields),
                 nullable=False,
             ),
             keys_sorted=False,
@@ -245,42 +273,43 @@ class MapType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.MapArray | pa.ChunkedArray:
-        options.check_source(array)
-        options.check_target(self)
+        options = options.check_source(array).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        if options.need_cast(array, self):
+            source_type_id = options.source_field.dtype.type_id
 
-        if source_type_id == DataTypeId.NULL or array.null_count == len(array):
-            return options.target_field.default_arrow_array(
-                size=len(array),
-                memory_pool=options.arrow_memory_pool,
-            )
+            if source_type_id == DataTypeId.NULL or array.null_count == len(array):
+                return options.target_field.default_arrow_array(
+                    size=len(array),
+                    memory_pool=options.arrow_memory_pool,
+                )
 
-        elif is_json_string_source(source_type_id):
-            return cast_arrow_json_string_array(array, options=options)
+            elif is_json_string_source(source_type_id):
+                return cast_arrow_json_string_array(array, options=options)
 
-        elif source_type_id == DataTypeId.MAP:
-            return cast_arrow_map_array(
-                array,
-                options=options,
-            )
+            elif source_type_id == DataTypeId.MAP:
+                return cast_arrow_map_array(
+                    array,
+                    options=options,
+                )
 
-        elif source_type_id == DataTypeId.ARRAY:
-            return cast_arrow_list_array_to_map(
-                array,
-                options=options,
-            )
+            elif source_type_id == DataTypeId.ARRAY:
+                return cast_arrow_list_array_to_map(
+                    array,
+                    options=options,
+                )
 
-        elif source_type_id == DataTypeId.STRUCT:
-            return cast_arrow_struct_array_to_map(
-                array,
-                options=options,
-            )
+            elif source_type_id == DataTypeId.STRUCT:
+                return cast_arrow_struct_array_to_map(
+                    array,
+                    options=options,
+                )
 
-        else:
-            raise pa.ArrowInvalid(
-                f"Cannot cast {options.source_field} to {options.target_field}"
-            )
+            else:
+                raise pa.ArrowInvalid(
+                    f"Cannot cast {options.source_field} to {options.target_field}"
+                )
+        return array
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()
@@ -292,8 +321,7 @@ class MapType(NestedType):
         options: "CastOptions",
     ) -> "polars.Series":
         pl = get_polars()
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -325,7 +353,7 @@ class MapType(NestedType):
         expr: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_target(self)
+        options = options.check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -358,8 +386,7 @@ class MapType(NestedType):
         series: "pd.Series",
         options: "CastOptions",
     ) -> "pd.Series":
-        options.check_source(series)
-        options.check_target(self)
+        options = options.check_source(series).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -388,8 +415,7 @@ class MapType(NestedType):
         column: Any,
         options: "CastOptions",
     ) -> Any:
-        options.check_source(column)
-        options.check_target(self)
+        options = options.check_source(column).check_target(self)
 
         source_type_id = options.source_field.dtype.type_id
 
@@ -564,7 +590,7 @@ def cast_arrow_map_array(
     array: pa.MapArray | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.MapArray | pa.ChunkedArray:
-    options.check_source(array)
+    options = options.check_source(array)
 
     if options.target_field is None:
         return array
@@ -622,7 +648,7 @@ def cast_arrow_list_array_to_map(
     array: pa.ListArray | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.MapArray | pa.ChunkedArray:
-    options.check_source(array)
+    options = options.check_source(array)
 
     if options.target_field is None:
         return array
@@ -698,7 +724,7 @@ def cast_arrow_struct_array_to_map(
     array: pa.StructArray | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.MapArray | pa.ChunkedArray:
-    options.check_source(array)
+    options = options.check_source(array)
 
     if options.target_field is None:
         return array
@@ -999,7 +1025,7 @@ def cast_spark_map_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
+    options = options.check_source(column)
 
     if options.target_field is None:
         return column
@@ -1050,7 +1076,7 @@ def cast_spark_list_column_to_map(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
+    options = options.check_source(column)
 
     if options.target_field is None:
         return column
@@ -1107,7 +1133,7 @@ def cast_spark_struct_column_to_map(
     spark = get_spark_sql()
     F = spark.functions
 
-    options.check_source(column)
+    options = options.check_source(column)
 
     if options.target_field is None:
         return column

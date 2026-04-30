@@ -1,21 +1,47 @@
+"""OS-style filesystem façade backed by :class:`DatabricksPath`.
+
+This is the high-level convenience wrapper users reach for when they
+want pathlib/os.path ergonomics without holding onto :class:`Path`
+instances directly. Most methods accept anything Pathish (strings,
+:class:`URL`, existing :class:`DatabricksPath`) and resolve to a
+concrete subclass through :meth:`DatabricksPath.parse`.
+
+Notes on the rework
+-------------------
+
+The previous version had a few signature mismatches with the new
+:class:`yggdrasil.io.fs.path.Path` base that surfaced as ``TypeError``
+in the integration tests:
+
+* ``read_bytes`` forwarded ``use_cache=`` — the new ``Path.read_bytes``
+  only accepts ``raise_error=``. The cache concept lived on the old
+  ``DatabricksIO`` (now deleted entirely — buffered IO is handled by
+  :class:`BytesIO`'s transaction-buffer mechanism), so there's no
+  reason to keep the kwarg here.
+* ``read_text`` / ``write_text`` defaulted ``errors`` to ``None`` — but
+  ``bytes.decode`` and ``str.encode`` reject ``None``. The standard
+  default is ``"strict"``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from .path import DatabricksPath, DatabricksStatResult
+from .path import DatabricksPath
 from ..client import DatabricksService
 
-__all__ = [
-    "FileSystem",
-]
+__all__ = ["FileSystem"]
 
 
-@dataclass(frozen=True)
+@dataclass
 class FileSystem(DatabricksService):
-    """OS-style filesystem helpers backed by ``DatabricksPath``."""
+    """OS-style filesystem helpers backed by :class:`DatabricksPath`."""
 
     sep: str = "/"
+
+    # ------------------------------------------------------------------
+    # Path construction
+    # ------------------------------------------------------------------
 
     def path(
         self,
@@ -23,7 +49,9 @@ class FileSystem(DatabricksService):
         *,
         temporary: bool = False,
     ) -> DatabricksPath:
-        return DatabricksPath.parse(path, client=self.client, temporary=temporary)
+        return DatabricksPath.from_(
+            path, client=self.client, temporary=temporary,
+        )
 
     def join(self, *parts: Any, temporary: bool = False) -> DatabricksPath:
         if not parts:
@@ -31,6 +59,10 @@ class FileSystem(DatabricksService):
         head, *tail = parts
         path = self.path(head, temporary=temporary)
         return path.joinpath(*tail) if tail else path
+
+    # ------------------------------------------------------------------
+    # Open / stat / classification
+    # ------------------------------------------------------------------
 
     def open(
         self,
@@ -41,6 +73,12 @@ class FileSystem(DatabricksService):
         errors: str | None = None,
         newline: str | None = None,
     ):
+        # ``buffering`` is forwarded for ``builtins.open`` parity. The
+        # underlying :class:`DatabricksIO` ignores it (the buffered
+        # spill-to-disk layer has its own sizing) but downstream
+        # callers may rely on the call shape — see the unit test
+        # ``test_open_delegates_with_builtin_open_shape`` which asserts
+        # all six kwargs are forwarded.
         return self.path(path).open(
             mode=mode,
             buffering=buffering,
@@ -58,11 +96,15 @@ class FileSystem(DatabricksService):
     def isdir(self, path: Any) -> bool:
         return bool(self.path(path).is_dir())
 
-    def stat(self, path: Any) -> DatabricksStatResult:
+    def stat(self, path: Any):
         return self.path(path).stat()
 
     def abspath(self, path: Any) -> str:
         return self.path(path).full_path()
+
+    # ------------------------------------------------------------------
+    # Listing
+    # ------------------------------------------------------------------
 
     def iterdir(
         self,
@@ -80,14 +122,12 @@ class FileSystem(DatabricksService):
         self,
         path: Any,
         *,
-        fetch_size: int | None = None,
         recursive: bool = False,
         allow_not_found: bool = True,
-    ):
+    ) -> Iterator[DatabricksPath]:
         yield from self.path(path=path).ls(
-            fetch_size=fetch_size,
             recursive=recursive,
-            allow_not_found=allow_not_found
+            allow_not_found=allow_not_found,
         )
 
     def listdir(
@@ -112,8 +152,14 @@ class FileSystem(DatabricksService):
     def rglob(self, path: Any, pattern: str) -> list[DatabricksPath]:
         return list(self.path(path).rglob(pattern))
 
+    # ------------------------------------------------------------------
+    # Mutators
+    # ------------------------------------------------------------------
+
     def mkdir(self, path: Any, mode: int = 0o777) -> DatabricksPath:
-        return self.path(path).mkdir(mode=mode, parents=False, exist_ok=False)
+        return self.path(path).mkdir(
+            mode=mode, parents=False, exist_ok=False,
+        )
 
     def makedirs(
         self,
@@ -121,9 +167,16 @@ class FileSystem(DatabricksService):
         mode: int = 0o777,
         exist_ok: bool = False,
     ) -> DatabricksPath:
-        return self.path(path).mkdir(mode=mode, parents=True, exist_ok=exist_ok)
+        return self.path(path).mkdir(
+            mode=mode, parents=True, exist_ok=exist_ok,
+        )
 
-    def touch(self, path: Any, mode: int = 0o666, exist_ok: bool = True) -> DatabricksPath:
+    def touch(
+        self,
+        path: Any,
+        mode: int = 0o666,
+        exist_ok: bool = True,
+    ) -> DatabricksPath:
         target = self.path(path)
         target.touch(mode=mode, exist_ok=exist_ok)
         return target
@@ -170,8 +223,22 @@ class FileSystem(DatabricksService):
         source.copy_to(dest)
         return dest
 
-    def read_bytes(self, path: Any, *, use_cache: bool = False) -> bytes:
-        return self.path(path).read_bytes(use_cache=use_cache)
+    # ------------------------------------------------------------------
+    # Bytes / text I/O
+    # ------------------------------------------------------------------
+
+    def read_bytes(self, path: Any, *, raise_error: bool = True) -> bytes:
+        """Whole-object download.
+
+        ``raise_error`` matches :meth:`Path.read_bytes` — defaulting
+        to ``True`` so missing files surface as ``FileNotFoundError``
+        instead of empty bytes. The legacy ``use_cache`` kwarg is
+        gone: the BytesIO buffered IO layer handles its own scratch
+        backing automatically (transaction buffer for non-local
+        paths, fd for local), and the previous "cache flag" was a
+        knob on a layer that no longer exists.
+        """
+        return self.path(path).read_bytes(raise_error=raise_error)
 
     def write_bytes(self, path: Any, data: Any) -> DatabricksPath:
         target = self.path(path)
@@ -183,7 +250,7 @@ class FileSystem(DatabricksService):
         path: Any,
         *,
         encoding: str = "utf-8",
-        errors: str | None = None,
+        errors: str = "strict",
     ) -> str:
         return self.path(path).read_text(encoding=encoding, errors=errors)
 
@@ -193,12 +260,18 @@ class FileSystem(DatabricksService):
         data: str,
         *,
         encoding: str = "utf-8",
-        errors: str | None = None,
+        errors: str = "strict",
         newline: str | None = None,
     ) -> DatabricksPath:
         target = self.path(path)
-        target.write_text(data, encoding=encoding, errors=errors, newline=newline)
+        target.write_text(
+            data, encoding=encoding, errors=errors, newline=newline,
+        )
         return target
+
+    # ------------------------------------------------------------------
+    # Trees
+    # ------------------------------------------------------------------
 
     def copytree(
         self,
@@ -219,11 +292,16 @@ class FileSystem(DatabricksService):
         path: Any,
         *,
         allow_not_found: bool = True,
-    ) -> Iterator[tuple[DatabricksPath, list[DatabricksPath], list[DatabricksPath]]]:
+    ) -> Iterator[
+        tuple[DatabricksPath, list[DatabricksPath], list[DatabricksPath]]
+    ]:
         root = self.path(path)
-        by_parent: dict[str, tuple[DatabricksPath, list[DatabricksPath], list[DatabricksPath]]] = {}
+        by_parent: dict[
+            str,
+            tuple[DatabricksPath, list[DatabricksPath], list[DatabricksPath]],
+        ] = {}
 
-        def ensure(node: DatabricksPath) -> tuple[DatabricksPath, list[DatabricksPath], list[DatabricksPath]]:
+        def ensure(node: DatabricksPath):
             key = node.full_path()
             existing = by_parent.get(key)
             if existing is None:

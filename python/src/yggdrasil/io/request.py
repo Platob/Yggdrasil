@@ -7,12 +7,13 @@ import json as json_module
 from dataclasses import MISSING, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
-from yggdrasil.arrow.lib import pyarrow as pa
-from yggdrasil.data import any_to_datetime
+import pyarrow as pa
+
+from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
-from yggdrasil.io import MediaType, MimeTypes
+from yggdrasil.io.enums import MediaType, MimeTypes
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
@@ -427,7 +428,7 @@ class PreparedRequest:
 
     def __post_init__(self) -> None:
         self.method = self.method or "GET"
-        self.url = URL.parse(self.url)
+        self.url = URL.from_(self.url)
         self.headers = _string_dict(self.headers)
         self.tags = _string_dict(self.tags)
         self.sent_at = any_to_datetime(self.sent_at) if self.sent_at else dt.datetime.fromtimestamp(
@@ -435,7 +436,7 @@ class PreparedRequest:
         )
 
         if self.buffer is not None and not isinstance(self.buffer, BytesIO):
-            self.buffer = BytesIO.parse(self.buffer)
+            self.buffer = BytesIO.from_(self.buffer)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<{self.method} {self.url.to_string()!r}>"
@@ -453,7 +454,7 @@ class PreparedRequest:
     ) -> "PreparedRequest":
         if isinstance(obj, str):
             obj = {
-                "url": URL.parse_str(obj, normalize=normalize)
+                "url": URL.from_str(obj, normalize=normalize)
             }
 
         if isinstance(obj, Mapping):
@@ -515,10 +516,10 @@ class PreparedRequest:
         url_struct = get_from_dict(obj, keys=("url", "request_url"), prefix=prefix)
 
         if url_str is not MISSING and url_str not in (None, ""):
-            return URL.parse(url_str, normalize=normalize)
+            return URL.from_(url_str, normalize=normalize)
 
         if isinstance(url_struct, Mapping):
-            return URL.parse(
+            return URL.from_(
                 {
                     "scheme": url_struct.get("scheme") or "",
                     "userinfo": url_struct.get("userinfo") or "",
@@ -545,7 +546,7 @@ class PreparedRequest:
                 "PreparedRequest.parse_dict: missing url/url_str/request_url_str or exploded url fields"
             )
 
-        return URL.parse(
+        return URL.from_(
             {
                 "scheme": "" if scheme in (MISSING, None) else str(scheme),
                 "userinfo": "" if userinfo in (MISSING, None) else str(userinfo),
@@ -599,7 +600,7 @@ class PreparedRequest:
         buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=prefix)
         if buffer is MISSING or buffer is None:
             return None
-        return BytesIO.parse(buffer)
+        return BytesIO.from_(buffer)
 
     @staticmethod
     def _parse_sent_at_timestamp(obj: Mapping[str, Any], *, prefix: str) -> dt.datetime:
@@ -634,7 +635,7 @@ class PreparedRequest:
         compress_threshold: Optional[int] = 4 * 1024 * 1024,
         compress_codec: Optional[Codec] = GZIP,
     ) -> "PreparedRequest":
-        parsed_url = URL.parse(url, normalize=normalize)
+        parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
 
         request_body: Optional[BytesIO] = None
@@ -689,13 +690,13 @@ class PreparedRequest:
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
-        new_url = self.url if url is None else URL.parse(url, normalize=normalize)
+        new_url = self.url if url is None else URL.from_(url, normalize=normalize)
         new_headers = dict(self.headers) if headers is None else _string_dict(headers)
 
         if buffer is ...:
             new_buffer = self.buffer
             if copy_buffer and new_buffer is not None:
-                new_buffer = BytesIO.parse(new_buffer.to_bytes())
+                new_buffer = BytesIO.from_(new_buffer.to_bytes())
         else:
             new_buffer = buffer
 
@@ -772,8 +773,8 @@ class PreparedRequest:
         if not self.headers:
             return MediaType(MimeTypes.OCTET_STREAM, None)
 
-        accept = MimeType.parse(self.headers.get("Accept"), default=MimeTypes.OCTET_STREAM)
-        codec = Codec.parse(self.headers.get("Accept-Encoding"), default=None)
+        accept = MimeType.from_(self.headers.get("Accept"), default=MimeTypes.OCTET_STREAM)
+        codec = Codec.from_(self.headers.get("Accept-Encoding"), default=None)
         return MediaType(accept, codec)
 
     @accept_media_type.setter

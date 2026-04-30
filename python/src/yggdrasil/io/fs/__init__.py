@@ -16,17 +16,12 @@ concrete subclass declares a ``scheme``). Look them up with
 
 from __future__ import annotations
 
-from .filesystem import FileSystem, get_filesystem, register_filesystem
-from .local import LocalFileSystem, LocalPath
-from .path import Path, PathKind, StatResult
+from .path import Path
+from .local_path import LocalPath
+from .memory_io import MemoryPath
 
 __all__ = [
-    "FileSystem",
-    "LocalFileSystem",
-    "LocalPath",
     "Path",
-    "PathKind",
-    "StatResult",
-    "get_filesystem",
-    "register_filesystem",
+    "LocalPath",
+    "MemoryPath"
 ]

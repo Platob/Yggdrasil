@@ -47,7 +47,7 @@ print(convert({"id": "1", "email": "ada@example.com"}, User))
 ```python
 import yggdrasil.arrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast import CastOptions
+from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1"], "score": ["3.14"]})
 opts = CastOptions(target_field=pa.schema([

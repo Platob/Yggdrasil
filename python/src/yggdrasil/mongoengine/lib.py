@@ -151,8 +151,8 @@ def _same_host(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
 
-    left_url = URL.parse_str(left, default_scheme="mongodb")
-    right_url = URL.parse_str(right, default_scheme="mongodb")
+    left_url = URL.from_str(left, default_scheme="mongodb")
+    right_url = URL.from_str(right, default_scheme="mongodb")
     return str(left_url) == str(right_url)
 
 

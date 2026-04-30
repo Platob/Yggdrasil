@@ -157,7 +157,7 @@ def with_mongo_connection(
                         "No valid MongoDB connection configurations found for Databricks routing."
                     )
 
-                mongo_url = URL.parse_str(configs[0]["host"], default_scheme="https")
+                mongo_url = URL.from_str(configs[0]["host"], default_scheme="https")
                 key = mongo_url.host
 
                 if not key:

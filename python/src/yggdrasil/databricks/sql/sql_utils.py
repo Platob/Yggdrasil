@@ -6,19 +6,14 @@ import base64
 import re
 from fnmatch import fnmatchcase
 from typing import Any, Callable, Optional
-import hashlib
 
 __all__ = [
     "DEFAULT_TAG_COLLATION",
-    "_build_fk_constraint_sql",
-    "_build_pk_constraint_sql",
-    "_build_table_constraints_sql",
     "_qualify_fk_ref",
     "databricks_tag_literal",
     "is_glob_pattern",
     "name_matcher",
     "normalize_databricks_collation",
-    "_safe_constraint_name",
     "_safe_str",
     "_sql_str",
     "escape_sql_string",
@@ -53,43 +48,6 @@ def name_matcher(pattern: str | None) -> Optional[Callable[[str | None], bool]]:
 DEFAULT_TAG_COLLATION = None
 _COLLATION_SUFFIXES = ("CI", "AI", "RTRIM")
 _LOCALE_COLLATION_BASE_RE = re.compile(r"^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*$")
-
-
-def _safe_constraint_name(*parts: object, max_length: int = 255) -> str:
-    """Build a stable Databricks-safe constraint name.
-
-    The visible prefix is normalized for readability. A short hash derived from
-    the raw input parts guarantees stability and avoids collisions caused by
-    normalization.
-    """
-    raw_parts: tuple[str, ...] = tuple("" if part is None else str(part) for part in parts)
-
-    tokens: list[str] = []
-    for text in raw_parts:
-        text = text.strip()
-        if not text:
-            continue
-        text = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in text)
-        text = "_".join(piece for piece in text.split("_") if piece)
-        if text:
-            tokens.append(text)
-
-    prefix = "_".join(tokens) if tokens else "constraint"
-    digest = hashlib.sha256("\x1f".join(raw_parts).encode("utf-8")).hexdigest()[:12]
-
-    name = f"{prefix}_{digest}"
-    if len(name) <= max_length:
-        return name
-
-    prefix_max = max_length - len(digest) - 1
-    if prefix_max <= 0:
-        return digest[:max_length]
-
-    prefix = prefix[:prefix_max].rstrip("_")
-    if not prefix:
-        return digest[:max_length]
-
-    return f"{prefix}_{digest}"
 
 
 def _safe_str(value: Any) -> str:
@@ -234,95 +192,6 @@ def _qualify_fk_ref(
     return f"{ref_table}.{','.join(ref_cols)}"
 
 
-def _build_pk_constraint_sql(pk_spec: Any) -> str | None:
-    if not pk_spec or not getattr(pk_spec, "columns", None):
-        return None
-
-    cols: list[str] = []
-    for column in pk_spec.columns:
-        col_sql = quote_ident(column)
-        if getattr(pk_spec, "timeseries", None) == column:
-            col_sql += " TIMESERIES"
-        cols.append(col_sql)
-
-    parts: list[str] = []
-    if getattr(pk_spec, "constraint_name", None):
-        parts.append(f"CONSTRAINT {quote_ident(pk_spec.constraint_name)}")
-
-    parts.append(f"PRIMARY KEY ({', '.join(cols)})")
-
-    if getattr(pk_spec, "rely", False):
-        parts.append("RELY")
-
-    return " ".join(parts)
-
-
-def _build_fk_constraint_sql(
-    table_name: str,
-    fk: Any,
-    *,
-    default_catalog: str | None = None,
-    default_schema: str | None = None,
-) -> str:
-    ref_table, ref_columns = _parse_fk_ref(
-        fk.ref,
-        default_catalog=default_catalog,
-        default_schema=default_schema,
-    )
-
-    parts: list[str] = []
-    cname = _safe_constraint_name(
-        getattr(fk, "constraint_name", None)
-        or f"{table_name}_{fk.column}_{ref_table}_{'_'.join(ref_columns)}_fk"
-    )
-    parts.append(f"CONSTRAINT {quote_ident(cname)}")
-    parts.append(f"FOREIGN KEY ({quote_ident(fk.column)})")
-    parts.append(f"REFERENCES {quote_qualified_ident(ref_table)}")
-
-    if ref_columns:
-        parts.append("(" + ", ".join(quote_ident(column) for column in ref_columns) + ")")
-
-    parts.append("NOT ENFORCED")
-
-    if getattr(fk, "rely", False):
-        parts.append("RELY")
-    if getattr(fk, "match_full", False):
-        parts.append("MATCH FULL")
-    if getattr(fk, "on_update_no_action", False):
-        parts.append("ON UPDATE NO ACTION")
-    if getattr(fk, "on_delete_no_action", False):
-        parts.append("ON DELETE NO ACTION")
-
-    return " ".join(parts)
-
-
-def _build_table_constraints_sql(
-    table_name: str,
-    pk_spec: Any,
-    fk_specs: list[Any],
-    *,
-    default_catalog: str | None = None,
-    default_schema: str | None = None,
-) -> list[str]:
-    constraints: list[str] = []
-
-    pk_sql = _build_pk_constraint_sql(pk_spec)
-    if pk_sql:
-        constraints.append(pk_sql)
-
-    for fk in fk_specs:
-        constraints.append(
-            _build_fk_constraint_sql(
-                table_name,
-                fk,
-                default_catalog=default_catalog,
-                default_schema=default_schema,
-            )
-        )
-
-    return constraints
-
-
 def escape_sql_string(s: str) -> str:
     """Escape a Python string for safe embedding in a single-quoted SQL literal."""
     return s.replace("'", "''")
@@ -365,3 +234,37 @@ def sql_literal(value: Any) -> str:
     except ValueError:
         pass
     return "'" + escape_sql_string(text) + "'"
+
+
+def _render_sql_literal(value: Any) -> str:
+    """Render a Python value as a Databricks SQL literal.
+
+    Used to inline distinct partition keys into the merge ON clause so
+    Delta can prune files instead of acquiring a whole-table OCC read set.
+    Only the narrow set of types Delta actually allows as partition columns
+    is supported — strings, bools, ints/floats, dates, datetimes, decimals,
+    bytes.  Anything else falls back to a quoted string repr, which is
+    safe but may not match.
+    """
+    import datetime as _dt
+    import decimal as _dec
+
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, _dec.Decimal)):
+        return str(value)
+    if isinstance(value, float):
+        # NaN/Inf aren't valid partition values; let Delta reject if seen.
+        return repr(value)
+    if isinstance(value, _dt.datetime):
+        return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+    if isinstance(value, _dt.date):
+        return f"DATE '{value.isoformat()}'"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "X'" + bytes(value).hex() + "'"
+    # Strings and fallback: single-quote and escape embedded quotes.
+    return "'" + str(value).replace("'", "''") + "'"
+
+

@@ -118,22 +118,22 @@ class TestPrimitiveEquals(unittest.TestCase):
 class TestNestedEquals(unittest.TestCase):
 
     def test_array_of_same_inner_equal(self):
-        a = ArrayType.from_item_field(IntegerType().to_field(name="item"))
-        b = ArrayType.from_item_field(IntegerType().to_field(name="item"))
+        a = ArrayType.from_item(IntegerType().to_field(name="item"))
+        b = ArrayType.from_item(IntegerType().to_field(name="item"))
         self.assertTrue(a.equals(b))
 
     def test_array_different_inner_not_equal(self):
-        a = ArrayType.from_item_field(IntegerType().to_field(name="item"))
-        b = ArrayType.from_item_field(StringType().to_field(name="item"))
+        a = ArrayType.from_item(IntegerType().to_field(name="item"))
+        b = ArrayType.from_item(StringType().to_field(name="item"))
         self.assertFalse(a.equals(b))
 
     def test_array_not_equal_to_struct(self):
-        arr = ArrayType.from_item_field(IntegerType().to_field(name="item"))
+        arr = ArrayType.from_item(IntegerType().to_field(name="item"))
         st = StructType(fields=[IntegerType().to_field(name="x")])
         self.assertFalse(arr.equals(st))
 
     def test_array_not_equal_to_primitive(self):
-        arr = ArrayType.from_item_field(IntegerType().to_field(name="item"))
+        arr = ArrayType.from_item(IntegerType().to_field(name="item"))
         self.assertFalse(arr.equals(IntegerType()))
 
     def test_map_same_equal(self):
@@ -226,7 +226,7 @@ class TestNestedEquals(unittest.TestCase):
 class TestNestedRecurse(unittest.TestCase):
 
     def test_array_of_struct_equal(self):
-        a = ArrayType.from_item_field(
+        a = ArrayType.from_item(
             StructType(
                 fields=[
                     IntegerType().to_field(name="x"),
@@ -234,7 +234,7 @@ class TestNestedRecurse(unittest.TestCase):
                 ]
             ).to_field(name="item")
         )
-        b = ArrayType.from_item_field(
+        b = ArrayType.from_item(
             StructType(
                 fields=[
                     IntegerType().to_field(name="x"),
@@ -245,10 +245,10 @@ class TestNestedRecurse(unittest.TestCase):
         self.assertTrue(a.equals(b))
 
     def test_array_of_struct_diff_child(self):
-        a = ArrayType.from_item_field(
+        a = ArrayType.from_item(
             StructType(fields=[IntegerType().to_field(name="x")]).to_field(name="item")
         )
-        b = ArrayType.from_item_field(
+        b = ArrayType.from_item(
             StructType(fields=[StringType().to_field(name="x")]).to_field(name="item")
         )
         self.assertFalse(a.equals(b))
@@ -257,7 +257,7 @@ class TestNestedRecurse(unittest.TestCase):
         # Array<Map<String, Struct<a: Array<Int>, b: Struct<c: String>>>>
         deep_struct = StructType(
             fields=[
-                ArrayType.from_item_field(
+                ArrayType.from_item(
                     IntegerType().to_field(name="item")
                 ).to_field(name="a"),
                 StructType(
@@ -266,11 +266,11 @@ class TestNestedRecurse(unittest.TestCase):
             ]
         )
         map_type = MapType.from_key_value(StringType(), deep_struct)
-        outer = ArrayType.from_item_field(map_type.to_field(name="item"))
+        outer = ArrayType.from_item(map_type.to_field(name="item"))
 
         deep_struct_clone = StructType(
             fields=[
-                ArrayType.from_item_field(
+                ArrayType.from_item(
                     IntegerType().to_field(name="item")
                 ).to_field(name="a"),
                 StructType(
@@ -278,7 +278,7 @@ class TestNestedRecurse(unittest.TestCase):
                 ).to_field(name="b"),
             ]
         )
-        outer_clone = ArrayType.from_item_field(
+        outer_clone = ArrayType.from_item(
             MapType.from_key_value(StringType(), deep_struct_clone).to_field(
                 name="item"
             )
@@ -290,7 +290,7 @@ class TestNestedRecurse(unittest.TestCase):
         # Same structure but with IntegerType vs FloatingPointType at a leaf.
         left = StructType(
             fields=[
-                ArrayType.from_item_field(
+                ArrayType.from_item(
                     StructType(
                         fields=[IntegerType().to_field(name="leaf")]
                     ).to_field(name="item")
@@ -299,7 +299,7 @@ class TestNestedRecurse(unittest.TestCase):
         )
         right = StructType(
             fields=[
-                ArrayType.from_item_field(
+                ArrayType.from_item(
                     StructType(
                         fields=[FloatingPointType().to_field(name="leaf")]
                     ).to_field(name="item")
@@ -451,7 +451,7 @@ class TestFieldNestedEquals(unittest.TestCase):
                 name="root",
                 dtype=StructType(
                     fields=[
-                        ArrayType.from_item_field(
+                        ArrayType.from_item(
                             StructType(
                                 fields=[
                                     IntegerType().to_field(name="leaf"),
@@ -473,7 +473,7 @@ class TestFieldNestedEquals(unittest.TestCase):
             name="root",
             dtype=StructType(
                 fields=[
-                    ArrayType.from_item_field(
+                    ArrayType.from_item(
                         StructType(
                             fields=[IntegerType().to_field(name="leaf")]
                         ).to_field(name="item")
@@ -486,7 +486,7 @@ class TestFieldNestedEquals(unittest.TestCase):
             name="root",
             dtype=StructType(
                 fields=[
-                    ArrayType.from_item_field(
+                    ArrayType.from_item(
                         StructType(
                             fields=[StringType().to_field(name="leaf")]
                         ).to_field(name="item")
@@ -633,7 +633,7 @@ class TestSchemaNestedEquals(unittest.TestCase):
     def _build_nested_field(self) -> Field:
         return Field(
             name="events",
-            dtype=ArrayType.from_item_field(
+            dtype=ArrayType.from_item(
                 StructType(
                     fields=[
                         IntegerType().to_field(name="id"),
@@ -665,7 +665,7 @@ class TestSchemaNestedEquals(unittest.TestCase):
 
         mutated = Field(
             name="events",
-            dtype=ArrayType.from_item_field(
+            dtype=ArrayType.from_item(
                 StructType(
                     fields=[
                         IntegerType().to_field(name="id"),
@@ -697,7 +697,7 @@ class TestSchemaNestedEquals(unittest.TestCase):
         # Rename a deep leaf ("ok" -> "okay") but keep dtypes identical.
         renamed = Field(
             name="events",
-            dtype=ArrayType.from_item_field(
+            dtype=ArrayType.from_item(
                 StructType(
                     fields=[
                         IntegerType().to_field(name="id"),
@@ -734,7 +734,7 @@ class TestSchemaNestedEquals(unittest.TestCase):
         )
         reordered = Field(
             name="events",
-            dtype=ArrayType.from_item_field(
+            dtype=ArrayType.from_item(
                 StructType(
                     fields=[
                         IntegerType().to_field(name="id"),

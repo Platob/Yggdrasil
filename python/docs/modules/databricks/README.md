@@ -83,7 +83,7 @@ c.sql.insert_into("main.default.demo", [{"id": 1, "name": "alice"}, {"id": 2, "n
 stmt = c.sql.execute("SELECT * FROM main.default.demo ORDER BY id")
 print(stmt.to_arrow_table())
 print(stmt.to_pandas())
-print(stmt.to_polars(stream=False))
+print(stmt.to_polars())
 ```
 
 ### B. Files + secrets + SQL in one flow

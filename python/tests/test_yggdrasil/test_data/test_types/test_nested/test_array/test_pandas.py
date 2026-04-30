@@ -14,6 +14,7 @@ from yggdrasil.data.types.nested.array import (
     ArrayType,
     cast_pandas_list_series,
 )
+from yggdrasil.lazy_imports import field_class
 
 pd = pytest.importorskip("pandas")
 
@@ -81,7 +82,7 @@ def test_array_type_default_pandas_series_respects_nullable() -> None:
     dtype = ArrayType(
         item_field=Field(
             name="item",
-            dtype=ArrayType.get_data_field_class().from_any("string").dtype,
+            dtype=field_class().from_any("string").dtype,
             nullable=True,
         ),
     )

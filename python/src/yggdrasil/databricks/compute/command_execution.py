@@ -387,7 +387,7 @@ class CommandExecution:
             self._unregister_shutdown_cancel()
             return self
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
         client = self.client.workspace_client().command_execution
         command_id = self.command_id
 
@@ -487,7 +487,7 @@ class CommandExecution:
         if not self.command_id:
             return self.start().wait(wait=wait, raise_error=raise_error)
 
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
         iteration = 0
         start_time = time.time()
 
@@ -559,7 +559,7 @@ class CommandExecution:
         raise_error: bool = True,
         tag: str = "__CALL_RESULT__",
     ) -> Any:
-        wait_cfg = WaitingConfig.check_arg(wait)
+        wait_cfg = WaitingConfig.from_(wait)
         installed_modules: set[str] = set()
         last_exc = None
         logs = None

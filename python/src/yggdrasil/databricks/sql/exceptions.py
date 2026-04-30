@@ -15,7 +15,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclass
 class SQLError(DatabricksError):
     statement_id: str
     state: StatementState

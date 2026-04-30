@@ -22,7 +22,7 @@ class TestPolarsFlavor(PolarsTestCase):
         )
 
     def test_datatype_flavor_nested_array(self):
-        arr = ArrayType.from_item_field(Field("item", IntegerType()))
+        arr = ArrayType.from_item(Field("item", IntegerType()))
         self.assertEqual(arr.to_polars_flavor(), self.pl.List(self.pl.Int64))
 
     def test_field_flavor_returns_polars_field(self):
@@ -60,7 +60,7 @@ class TestSparkFlavor(SparkTestCase):
     def test_datatype_flavor_nested_array(self):
         from pyspark.sql.types import ArrayType as SparkArrayType, LongType
 
-        arr = ArrayType.from_item_field(Field("item", IntegerType()))
+        arr = ArrayType.from_item(Field("item", IntegerType()))
         out = arr.to_spark_flavor()
         self.assertIsInstance(out, SparkArrayType)
         self.assertIsInstance(out.elementType, LongType)
