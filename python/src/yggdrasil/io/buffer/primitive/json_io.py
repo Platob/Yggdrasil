@@ -18,13 +18,13 @@ a valid append. UPSERT goes through the generic rewrite helper.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
 import pyarrow.json as pa_json
-
+import yggdrasil.pickle.json as json_module
+from yggdrasil.arrow.cast import any_to_arrow_batch_iterator
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
@@ -32,6 +32,7 @@ from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module,
 )
+
 from .base import PrimitiveIO
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class JsonOptions(CastOptions):
     encoding: str = "utf-8"
     use_threads: bool = True
     line_ending: str = "\n"
+    indent: int | None = None
 
     def to_read_options(self) -> "pa_json.ReadOptions":
         return pa_json.ReadOptions(use_threads=self.use_threads)
@@ -81,10 +83,6 @@ class JsonIO(PrimitiveIO):
     @classmethod
     def options_class(cls):
         return JsonOptions
-
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    _SUPPORTED_UPSERT: ClassVar[bool] = True
-    _NATIVE_SCANNER_OK: ClassVar[bool] = True
 
     # ==================================================================
     # Schema
@@ -118,17 +116,39 @@ class JsonIO(PrimitiveIO):
             if io.remaining_bytes() == 0:
                 return
 
-            source = io.arrow_io(mode="rb")
-            reader = pa_json.open_json(
-                source,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
-            try:
-                for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
-            finally:
-                reader.close()
+            tail = io.tail(5)
+            line_defined = tail.endswith(b"\n")
+
+            if line_defined:
+                source = io.arrow_io(mode="rb")
+
+                try:
+                    reader = pa_json.open_json(
+                        source,
+                        read_options=options.to_read_options(),
+                        parse_options=options.to_parse_options(),
+                    )
+                except Exception as e:
+                    raise ValueError(
+                        f"Cannot parse JSON {io}:\n{io.synthetic_content()}"
+                    ) from e
+
+                try:
+                    for batch in reader:
+                        yield options.cast_arrow_tabular(batch)
+                finally:
+                    reader.close()
+            else:
+                parsed = json_module.load(io)
+
+                if isinstance(parsed, list):
+                    yield pa.RecordBatch.from_pylist(parsed)
+                elif isinstance(parsed, dict):
+                    yield pa.RecordBatch.from_pylist([parsed])
+                else:
+                    raise ValueError(
+                        f"Cannot parse JSON {io} as list or dict: {io.synthetic_content()}"
+                    )
 
     # ==================================================================
     # Write path
@@ -145,11 +165,11 @@ class JsonIO(PrimitiveIO):
         manually via ``Table.to_pylist`` plus ``json.dumps``. For
         large writes prefer Parquet or IPC.
         """
-        import json as _json
-
         action = self._resolve_save_mode(options.mode)
         if action is Mode.IGNORE:
             return
+        if action is Mode.APPEND:
+            return self._arrow_append_via_rewrite(batches, options)
         if action is Mode.UPSERT:
             return self._arrow_upsert_via_rewrite(batches, options)
         if action not in (Mode.OVERWRITE, Mode.APPEND):
@@ -164,40 +184,24 @@ class JsonIO(PrimitiveIO):
         if first is None:
             return
 
-        if options.target_field is not None:
-            first = options.cast_arrow_tabular(first)
+        all_batches = [first] + list(any_to_arrow_batch_iterator(iterator))
 
-        is_append = action is Mode.APPEND and not self.is_empty()
+        collected = pa.concat_tables(
+            [pa.Table.from_batches([batch]) for batch in all_batches],
+            promote_options="permissive",
+            memory_pool=options.arrow_memory_pool,
+        ).to_pylist(maps_as_pydicts=True)
 
-        lifecycle = options.copy(
-            truncate_before_write=not is_append,
-            write_seek=-1 if is_append else None,
-        )
-
-        line_sep = options.line_ending.encode(options.encoding)
-
-        def emit(batch: pa.RecordBatch, sink) -> None:
-            for row in batch.to_pylist(maps_as_pydicts=True):
-                sink.write(_json.dumps(row, ensure_ascii=False).encode(options.encoding))
-                sink.write(line_sep)
-
-        with self._writing_context(lifecycle) as io:
-            with contextlib.ExitStack() as stack:
-                sink = io.arrow_io(mode="ab" if is_append else "wb")
-                stack.callback(sink.close)
-
-                emit(first, sink)
-                for batch in iterator:
-                    batch = options.cast_arrow_tabular(batch)
-                    emit(batch, sink)
+        with self._writing_context(options) as io:
+            io.write_bytes(
+                json_module.dumps(collected, indent=options.indent)
+            )
 
     # ==================================================================
     # Native engine overrides
     # ==================================================================
 
     def _can_use_native_scanner(self, options: JsonOptions) -> bool:
-        if not type(self)._NATIVE_SCANNER_OK:
-            return False
         if self.is_empty():
             return False
         if options.target_field is not None:

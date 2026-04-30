@@ -14,25 +14,35 @@ Hierarchy navigation
     catalog.schema("sales")          # → Schema
     catalog.schemas()                # → Iterator[Schema]
     catalog.table("sales.orders")    # → Table
+
+Tag handling
+------------
+Tag reads / writes / deletes route through ``client.entity_tags`` (entity
+type ``"catalogs"``).  The host-scoped cache in that service is
+authoritative, so this class no longer carries its own tag cache. The
+legacy ``set_tags_ddl`` helper is retained for dry-run / logging only —
+``set_tags`` and ``unset_tags`` go through the REST API.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Optional, TYPE_CHECKING
+from dataclasses import field
+from typing import Any, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
-
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-from .grants import GrantsMixin
+from yggdrasil.io.enums.mode import ModeLike
+
 from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
+    from .catalogs import Catalogs
     from .schema import Schema
     from .table import Table
 
@@ -41,21 +51,28 @@ __all__ = ["Catalog"]
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Catalog(GrantsMixin):
+class Catalog(DatabricksResource):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags."""
-    catalog_name: str | None = None
+    
+    def __init__(
+        self,
+        service: "Catalogs | None" = None,
+        *,
+        catalog_name: str | None = None,
+        infos_ttl: float | None = None,
+        infos: CatalogInfo | None = None,
+        infos_fetched_at: float | None = None,
+    ):
+        if service is None:
+            from .catalogs import Catalogs
+            service = Catalogs.current()
 
-    # TTL for the _infos cache (seconds).  None disables expiry.
-    _infos_ttl: float | None = field(default=1800.0, repr=False, compare=False, hash=False)
-
-    _infos: Optional[CatalogInfo] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _infos_fetched_at: float | None = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-
+        super().__init__(service=service)
+        self.catalog_name = catalog_name
+        self._infos_ttl = infos_ttl or 1800.0
+        self._infos = infos
+        self._infos_fetched_at = infos_fetched_at
+    
     # ── identity ──────────────────────────────────────────────────────────────
 
     def full_name(self, safe: bool = None) -> str:
@@ -90,8 +107,20 @@ class Catalog(GrantsMixin):
 
     # ── cache management ──────────────────────────────────────────────────────
 
-    def _reset_cache(self) -> None:
-        """Evict the cached :class:`CatalogInfo`."""
+    def _reset_cache(self, invalidate_cache: bool = False) -> None:
+        """Evict the cached :class:`CatalogInfo`.
+
+        ``invalidate_cache=True`` also drops this catalog's tag list from
+        ``client.entity_tags`` — used on structural changes (delete / rename)
+        where the ``entity_name`` itself becomes stale.
+        """
+        if invalidate_cache:
+            try:
+                self.client.entity_tags.invalidate_cached_tags(
+                    "catalogs", self.catalog_name,
+                )
+            except Exception:  # cache invalidation is best-effort
+                pass
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
 
@@ -286,10 +315,20 @@ class Catalog(GrantsMixin):
         else:
             Job.make(uc.delete, self.catalog_name).fire_and_forget()
 
-        self._reset_cache()
+        # Structural change — drop both _infos and the entity-tag cache.
+        self._reset_cache(invalidate_cache=True)
         return self
 
     # ── tags ──────────────────────────────────────────────────────────────────
+
+    @property
+    def tags(self) -> tuple[Any, ...]:
+        """Catalog-level entity-tag assignments — served from ``client.entity_tags``."""
+        return tuple(
+            self.client.entity_tags.entity_tags(
+                "catalogs", self.catalog_name, default=()
+            ) or ()
+        )
 
     def set_tags_ddl(
         self,
@@ -297,7 +336,12 @@ class Catalog(GrantsMixin):
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
     ) -> str:
-        """Build an ``ALTER CATALOG … SET TAGS`` DDL statement."""
+        """Build an ``ALTER CATALOG … SET TAGS`` DDL statement.
+
+        Retained for dry-run / logging contexts; :meth:`set_tags` no longer
+        executes this DDL — it goes through the ``entity_tag_assignments``
+        REST API instead.
+        """
         pairs: list[str] = []
         for k, v in (tags or {}).items():
             key = str(k).strip() if k is not None else ""
@@ -316,10 +360,41 @@ class Catalog(GrantsMixin):
         tags: Mapping[str, str] | None,
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
+        mode: ModeLike | None = None,
     ) -> "Catalog":
-        """Execute ``ALTER CATALOG … SET TAGS`` for the given mapping."""
-        if tags:
-            self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
+        """Apply catalog-level tags via the UC ``entity_tag_assignments`` API.
+
+        ``tag_collation`` is accepted for API compatibility and ignored —
+        collations only matter for the legacy DDL literal form.
+
+        ``mode`` selects the write strategy (``"upsert"`` default, ``"overwrite"``
+        for strict replace, ``"append"`` / ``"ignore"`` / ``"error_if_exists"``).
+        """
+        del tag_collation
+        if not tags:
+            return self
+
+        self.client.entity_tags.update_entity_tags(
+            tags=tags,
+            entity_type="catalogs",
+            entity_name=self.catalog_name,
+            mode=mode,
+        )
+        return self
+
+    def unset_tags(
+        self,
+        tag_keys: Iterable[str],
+        *,
+        if_exists: bool = True,
+    ) -> "Catalog":
+        """Delete catalog-level tag assignments by key."""
+        self.client.entity_tags.delete_entity_tags(
+            entity_type="catalogs",
+            entity_name=self.catalog_name,
+            tag_keys=tag_keys,
+            if_exists=if_exists,
+        )
         return self
 
     # ── grants ────────────────────────────────────────────────────────────────
@@ -365,6 +440,15 @@ class Catalog(GrantsMixin):
         if new_name == self.catalog_name:
             return self
 
+        # Drop the old entity-tag cache key before the rename — the
+        # ``entity_name`` is the key, and after the rename it's dead.
+        try:
+            self.client.entity_tags.invalidate_cached_tags(
+                "catalogs", self.catalog_name,
+            )
+        except Exception:
+            pass
+
         info = self.client.workspace_client().catalogs.update(
             name=self.catalog_name, new_name=new_name,
         )
@@ -372,4 +456,3 @@ class Catalog(GrantsMixin):
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
-

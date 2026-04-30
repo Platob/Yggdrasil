@@ -58,6 +58,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class DictionaryType(PrimitiveType):
+
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * indent * level
+        return f"{pad}dictionary<{self.value_type.pretty_format(indent=indent, level=level + 1)}>"
+
     value_type: PrimitiveType = None  # defaulted to StringType() in __post_init__
     categories: tuple[Any, ...] = ()
     ordered: bool = False
@@ -143,8 +148,8 @@ class DictionaryType(PrimitiveType):
 
     # ------------------------------------------------------------------ core
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.DICTIONARY
 
     @property

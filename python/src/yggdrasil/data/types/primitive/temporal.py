@@ -497,6 +497,21 @@ class TemporalType(PrimitiveType, ABC):
         if self.tz and self.tz in UTC_ALIAS_TIMEZONES:
             object.__setattr__(self, "tz", "UTC")
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "DateType":
+        try:
+            return cls(
+                byte_size=value.get("byte_size", 8),
+                unit=value.get("unit", "d"),
+                tz=value.get("tz"),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(
+                    f"Cannot construct {cls.__name__} from {value!r}"
+                ) from e
+            return default
+
     # ------------------------------------------------------------------
     # Cast helpers — one-liners over the engine dispatchers.
     # ------------------------------------------------------------------
@@ -668,7 +683,7 @@ class TemporalType(PrimitiveType, ABC):
     def _merge_with_same_id(
         self,
         other: "DataType",
-        mode: "Mode",
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ) -> "TemporalType":
@@ -716,8 +731,8 @@ class DateType(TemporalType):
     def __post_init__(self):
         object.__setattr__(self, "byte_size", 4)
 
-    @property
-    def type_id(self) -> "DataTypeId":
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.DATE
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -761,14 +776,6 @@ class DateType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.DATE)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DateType":
-        return cls(
-            byte_size=value.get("byte_size", 4),
-            unit=value.get("unit", "d"),
-            tz=value.get("tz"),
-        )
 
     def to_arrow(self) -> "pa.DataType":
         return pa.date64() if self.unit == "ms" else pa.date32()
@@ -825,10 +832,10 @@ class TimeType(TemporalType):
     tz: str | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "byte_size", 8)
+        object.__setattr__(self, "byte_size", 4 if self.unit in {"s", "ms"} else 8)
 
-    @property
-    def type_id(self) -> "DataTypeId":
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.TIME
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -867,14 +874,6 @@ class TimeType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.TIME)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "TimeType":
-        return cls(
-            byte_size=value.get("byte_size", 8),
-            unit=value.get("unit", "us"),
-            tz=value.get("tz"),
-        )
 
     def to_arrow(self) -> "pa.DataType":
         if self.unit in {"s", "ms"}:
@@ -926,8 +925,8 @@ class TimestampType(TemporalType):
     def __post_init__(self):
         object.__setattr__(self, "byte_size", 8)
 
-    @property
-    def type_id(self) -> "DataTypeId":
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.TIMESTAMP
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -977,14 +976,6 @@ class TimestampType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.TIMESTAMP)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "TimestampType":
-        return cls(
-            byte_size=value.get("byte_size", 8),
-            unit=value.get("unit", "us"),
-            tz=value.get("tz"),
-        )
 
     def to_arrow(self) -> "pa.DataType":
         return pa.timestamp(unit=self.unit, tz=self.tz)
@@ -1067,8 +1058,8 @@ class DurationType(TemporalType):
     def __post_init__(self):
         object.__setattr__(self, "byte_size", 8)
 
-    @property
-    def type_id(self) -> "DataTypeId":
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.DURATION
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -1108,14 +1099,6 @@ class DurationType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.DURATION)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DurationType":
-        return cls(
-            byte_size=value.get("byte_size", 8),
-            unit=value.get("unit", "us"),
-            tz=value.get("tz"),
-        )
 
     def to_arrow(self) -> "pa.DataType":
         return pa.duration(self.unit)

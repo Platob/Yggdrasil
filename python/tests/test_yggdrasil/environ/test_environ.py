@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 import yggdrasil.environ.environment as mod
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.environ.environment import (
     PyEnv,
     SYSTEM_LIBS,
@@ -47,14 +48,6 @@ class DummyVersionInfo:
 
     def __str__(self) -> str:
         return f"{self.major}.{self.minor}.{self.patch}"
-
-
-class DummyWaitingConfig:
-    """Stand-in for :class:`WaitingConfig` — ``check_arg`` returns a bool."""
-
-    @staticmethod
-    def check_arg(value):
-        return bool(value)
 
 
 class DummyLazyResult:
@@ -125,7 +118,7 @@ def dummy_system_command(monkeypatch):
     """Patch SystemCommand and WaitingConfig with dummies."""
     fake = DummySystemCommandModule()
     monkeypatch.setattr(mod, "SystemCommand", fake)
-    monkeypatch.setattr(mod, "WaitingConfig", DummyWaitingConfig)
+    monkeypatch.setattr(mod, "WaitingConfig", WaitingConfig)
     monkeypatch.setattr(mod, "VersionInfo", DummyVersionInfo)
     return fake
 

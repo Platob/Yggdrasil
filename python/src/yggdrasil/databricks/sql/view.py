@@ -31,11 +31,11 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from yggdrasil.io.enums.mode import ModeLike, Mode
 from .column import Column
-from .grants import GrantsMixin
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
     _safe_str,
@@ -58,8 +58,7 @@ logger = logging.getLogger(__name__)
 INFOS_TTL: float = 300.0
 
 
-@dataclass
-class View(GrantsMixin):
+class View(DatabricksResource):
     """A single Unity Catalog view — DDL, schema, grants and tags."""
 
     catalog_name: str = "default"
@@ -75,6 +74,30 @@ class View(GrantsMixin):
     _columns: Optional[list[Column]] = field(
         default=None, init=False, repr=False, compare=False, hash=False,
     )
+
+    def __init__(
+        self,
+        service: "Views | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        view_name: str | None = None,
+        *,
+        infos: TableInfo | None = None,
+        infos_fetched_at: float | None = None,
+        columns: list[Column] | None = None,
+        **kwargs,
+    ):
+        if service is None:
+            from .views import Views
+            service = Views.current()
+
+        super().__init__(service=service)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.view_name = view_name
+        self._infos = infos
+        self._infos_fetched_at = infos_fetched_at
+        self._columns = columns
 
     # ── identity ──────────────────────────────────────────────────────────────
 

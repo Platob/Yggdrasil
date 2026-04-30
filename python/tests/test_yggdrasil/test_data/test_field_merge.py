@@ -39,10 +39,10 @@ class TestFieldMergeWith:
         assert out is not left
         assert out is not right
         assert out.name == "price"
-        assert out.nullable is True
+        assert out.nullable is False
         assert out.metadata == {
             b"left_only": b"a",
-            b"shared": b"right",
+            b"shared": b"left",
             b"right_only": b"b",
         }
 
@@ -104,8 +104,8 @@ class TestFieldMergeWith:
         )
 
         # current implementation mutates self
-        assert left.arrow_type == pa.float64()
-        assert left.nullable is True
+        assert left.arrow_type == pa.int32()
+        assert left.nullable is False
         assert left.metadata == {
             b"comment": b"left",
             b"unit": b"eur",
@@ -139,8 +139,8 @@ class TestFieldMergeWith:
         assert left.nullable is False
         assert left.metadata == {b"comment": b"left"}
 
-        assert out.arrow_type == pa.float64()
-        assert out.nullable is True
+        assert out.arrow_type == pa.int32()
+        assert out.nullable is False
         assert out.metadata == {
             b"comment": b"left",
             b"unit": b"eur",

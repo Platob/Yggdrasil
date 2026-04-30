@@ -105,10 +105,6 @@ class ArrowIPCIO(PrimitiveIO):
     batch index. Writes go through :class:`pa.ipc.RecordBatchFileWriter`.
     """
 
-    # Slots: just the cached reader. Path / buffer / lifecycle state
-    # come from the bases.
-    __slots__ = ("_reader",)
-
     # ==================================================================
     # Class-level config
     # ==================================================================
@@ -121,22 +117,6 @@ class ArrowIPCIO(PrimitiveIO):
     @classmethod
     def options_class(cls):
         return ArrowIPCOptions
-
-    # APPEND / UPSERT via the generic read-modify-write helpers on
-    # :class:`DataIO`. The IPC file format has one footer indexing
-    # all batches, so partial appends aren't possible at the format
-    # level — the rewrite helpers do "read existing → concat with
-    # incoming → OVERWRITE" transparently. Folder-oriented writers
-    # (FolderIO / NestedIO) avoid the read by writing fresh files
-    # alongside.
-    _APPEND_REJECTED_HINT: ClassVar[str] = (
-        "Arrow IPC file format has a single footer indexing all batches. "
-        "The generic ``_arrow_append_via_rewrite`` helper supports it "
-        "via read-modify-write; for higher throughput use a folder-"
-        "oriented writer (FolderIO / NestedIO) to add new files alongside."
-    )
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    _SUPPORTED_UPSERT: ClassVar[bool] = True
 
     # Class-level switch so subclasses (notably batch-view variants)
     # can opt out of native dispatch without overriding every method.

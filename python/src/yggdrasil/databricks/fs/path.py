@@ -527,7 +527,11 @@ class DatabricksPath(Path):
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
         """Whole-file download via :meth:`_remote_download`."""
         try:
-            return self._remote_download(allow_not_found=False).to_bytes()
+            content = self._remote_download(allow_not_found=False)
+
+            if isinstance(content, BytesIO):
+                return content.to_bytes()
+            return content
         except (OSError, ValueError):
             if raise_error:
                 raise

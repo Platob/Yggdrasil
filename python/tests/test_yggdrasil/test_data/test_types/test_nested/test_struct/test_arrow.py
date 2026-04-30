@@ -93,7 +93,6 @@ def test_cast_arrow_struct_array_rejects_non_struct_source() -> None:
         name="src",
         dtype=ArrayType.from_item(
             IntegerType(byte_size=8, signed=True).to_field(name="item"),
-            safe=True,
         ),
         nullable=True,
     )

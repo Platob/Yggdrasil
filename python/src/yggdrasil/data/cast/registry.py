@@ -582,16 +582,6 @@ def convert_to_python_iterable(
 
     elem_hint = args[0] if args else Any
 
-    # Arrow -> pylist (optionally cast through Arrow type hint)
-    if isinstance(value, (pa.Array, pa.ChunkedArray, pa.Table, pa.RecordBatch)):
-        from yggdrasil.arrow.python_arrow import arrow_field_from_hint
-
-        try:
-            value = convert(value, arrow_field_from_hint(elem_hint), options=options)
-        except TypeError:
-            pass
-        value = value.to_pylist()
-
     if _is_noop_hint(elem_hint):
         return origin(value)
 

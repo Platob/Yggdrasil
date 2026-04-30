@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Mapping
 
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
 from databricks.sdk.service.sql import ColumnInfo as SQLColumnInfo
-
 from yggdrasil.data import Field
 from yggdrasil.databricks.sql.sql_utils import (
     DEFAULT_TAG_COLLATION,
     databricks_tag_literal,
 )
+
 from .types import parse_databricks_field
 
 if TYPE_CHECKING:
@@ -19,11 +18,16 @@ if TYPE_CHECKING:
 __all__ = ["Column"]
 
 
-@dataclass
 class Column:
-    table: "Table"
-    name: str
-    field: Field = field(repr=False, compare=False, hash=False)
+    def __init__(
+        self,
+        table: "Table",
+        name: str,
+        field: Field,
+    ):
+        self.table = table
+        self.name = name
+        self.field = field
 
     @classmethod
     def from_api(
@@ -61,15 +65,19 @@ class Column:
     def _qcol(self) -> str:
         return f"`{self.name}`"
 
-    def _stable_constraint_name(
-        self,
-        constraint_name: str | None,
-        *parts: object,
-    ) -> str:
-        """Build a stable constraint name from structured parts."""
-        if constraint_name:
-            return _safe_constraint_name(constraint_name)
-        return _safe_constraint_name(*parts)
+    @property
+    def entity_name(self) -> str:
+        """Fully-qualified ``entity_name`` for the ``entity_tag_assignments`` API."""
+        return self.table.column_full_name(self.name)
+
+    @property
+    def tags(self) -> tuple:
+        """Column-level entity-tag assignments — served from ``client.entity_tags``."""
+        return tuple(
+            self.table.client.entity_tags.entity_tags(
+                "columns", self.entity_name, default=()
+            ) or ()
+        )
 
     def set_tags_ddl(
         self,
@@ -106,38 +114,26 @@ class Column:
         if not tags:
             return self
 
-        from .tags_api import apply_tags
-
-        apply_tags(
-            self.table.client,
-            entity_type="columns",
-            entity_name=f"{self.table.full_name()}.{self.name}",
+        self.table.client.entity_tags.update_entity_tags(
             tags=tags,
+            entity_type="columns",
+            entity_name=self.entity_name,
         )
-        # Invalidate the table-side column-tag cache so the next read sees
-        # the new assignments.
-        object.__setattr__(self.table, "_column_tags", None)
-        object.__setattr__(self.table, "_column_tags_fetched_at", None)
         return self
 
     def unset_tags(
         self,
-        tag_keys: "Iterable[str]",
+        tag_keys: Iterable[str],
         *,
         if_exists: bool = True,
     ):
         """Delete column-level tag assignments by key."""
-        from .tags_api import delete_tags
-
-        delete_tags(
-            self.table.client,
+        self.table.client.entity_tags.delete_entity_tags(
             entity_type="columns",
-            entity_name=f"{self.table.full_name()}.{self.name}",
+            entity_name=self.entity_name,
             tag_keys=tag_keys,
             if_exists=if_exists,
         )
-        object.__setattr__(self.table, "_column_tags", None)
-        object.__setattr__(self.table, "_column_tags_fetched_at", None)
         return self
 
     def rename(self, new_name: str) -> "Column":
@@ -152,9 +148,12 @@ class Column:
             f"ALTER TABLE {self.table.full_name(safe=True)} "
             f"RENAME COLUMN {self._qcol()} TO `{new_name}`"
         )
-        # Frozen dataclass — mutate via object.__setattr__.
+        # The old ``entity_name`` is now dead — drop its cache entry so a
+        # stale tag list can't survive the rename.
+        self.table.client.entity_tags.invalidate_cached_tags(
+            "columns", self.entity_name,
+        )
         object.__setattr__(self, "name", new_name)
-        # Invalidate the parent table's column cache so the next lookup refetches.
         if hasattr(self.table, "_reset_cache"):
             self.table._reset_cache(invalidate_cache=True)
         return self

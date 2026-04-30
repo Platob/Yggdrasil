@@ -721,9 +721,9 @@ class Response:
         *,
         media_type: Optional[MediaType] = None,
     ) -> Any:
-        del orient # TODO: implement orient
         return self.buffer.json_load(
             media_type=media_type or self.media_type,
+            orient=orient
         )
 
     # ------------------------------------------------------------------

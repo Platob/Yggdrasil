@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator as AbcIterator
+from collections.abc import Iterable, Iterator as AbcIterator, Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -59,17 +59,19 @@ from typing import (
 
 import pyarrow as pa
 import pyarrow.compute as pc
-
 from yggdrasil.arrow.cast import any_to_arrow_table, any_to_arrow_batch_iterator
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MediaType, MimeTypes, MimeType, MediaTypes, Mode
+from yggdrasil.io.fs import Path
 from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module, path_class,
 )
+
+from ..buffer import BytesIO
 
 if TYPE_CHECKING:
     import pandas
@@ -144,14 +146,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         return MimeTypes.OCTET_STREAM
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Auto-register concrete subclasses against their mime type.
-
-        Intermediate abstract subclasses return ``None`` from
-        :meth:`default_mime_type` and don't register. A duplicate
-        registration emits a warning rather than raising — picking
-        a winner is the right move when, say, a test module defines
-        a sub-handler that should override.
-        """
+        """Auto-register concrete subclasses against their mime type."""
         super().__init_subclass__(**kwargs)
         try:
             mime = cls.default_mime_type()
@@ -173,31 +168,25 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def __new__(cls, data=None, *args, copy=False, media_type=None, path=None,
                 spill_bytes=128 * 1024 * 1024, spill_ttl=86400, auto_open=True, **kwargs):
+        if cls._FINAL_TABULAR_IO:
+            return object.__new__(cls)
+
+        if data is not None:
+            if isinstance(data, BytesIO):
+                media_type = media_type or data._media_type
+                path = path or data.path
+
         if media_type is not None:
             media_type = MediaType.from_(media_type)
         elif path is not None:
             path = path_class().from_(path)
             media_type = path.url.infer_media_type(default=None)
 
-        # Bug: when media_type is still None here, target = cls.media_type_class(None)
-        # falls through to MediaType.from_(None, default=OCTET_STREAM) and may
-        # return BytesIO (not a TabularIO subclass). object.__new__(cls) on the
-        # outer cls then succeeds but skips dispatch entirely — fine — except the
-        # logic below ALSO calls media_type_class(None) a second time. Collapse it.
-
-        if cls._FINAL_TABULAR_IO:
-            return object.__new__(cls)
-
         if media_type is None:
-            # No media type, no path hint — caller wants this exact class.
-            # Don't probe the registry; that would either route to BytesIO
-            # (not a TabularIO) or raise.
             return object.__new__(cls)
 
         target = cls.media_type_class(media_type, default=cls)
         if not issubclass(target, cls) and target is not cls:
-            # Registry returned an unrelated class (e.g. BytesIO fallback).
-            # Don't switch — keep cls.
             target = cls
         return object.__new__(target)
 
@@ -206,8 +195,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *args: Any,
         **kwargs: Any
     ) -> None:
-        # Cooperative super; concrete subclasses (DataIO) layer
-        # storage-aware __init__ on top of this.
         Disposable.__init__(self)
         self._arrow_table = None
         self._spark_frame = None
@@ -219,12 +206,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *,
         default: "type[TabularIO[CastOptions]] | EllipsisType" = ...,
     ) -> "type[TabularIO[CastOptions]]":
-        """Resolve a media-type-like value to the IO class that handles it.
-
-        Returns the registered TabularIO subclass for the given mime type.
-        On miss, returns `default` if provided, else raises RuntimeError.
-        No BytesIO fallback — BytesIO is not a TabularIO.
-        """
+        """Resolve a media-type-like value to the IO class that handles it."""
         if media_type is None:
             if default is ...:
                 raise RuntimeError("media_type_class called with None and no default")
@@ -310,13 +292,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
     # ==================================================================
 
     @classmethod
-    def options_class(cls) -> type[O]:
-        """The :class:`CastOptions` subclass this IO consumes.
+    def from_path(cls, path: Path, media_type: MediaType | None = None) -> "TabularIO[O]":
+        path = path_class().from_(path)
 
-        Default is :class:`CastOptions` itself; concrete subclasses
-        with format-specific options (``ParquetOptions``,
-        ``ArrowIPCOptions``) override.
-        """
+        return cls(path=path, media_type=media_type)
+
+    @classmethod
+    def options_class(cls) -> type[O]:
+        """The :class:`CastOptions` subclass this IO consumes."""
         return CastOptions  # type: ignore[return-value]
 
     @classmethod
@@ -326,21 +309,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         overrides: "dict | None" = None,
         **kwargs: Any,
     ) -> O:
-        """Validate and merge caller kwargs into a resolved options instance.
-
-        The standard pattern in the public surface is::
-
-            def read_arrow_table(self, options=None, **kwargs):
-                return self._read_arrow_table(
-                    self.check_options(options, overrides=locals())
-                )
-
-        ``overrides`` is the ``locals()`` of the caller — a mix of
-        ``options``, declared kwargs, and ``self``. We strip
-        ``self``, pop ``options`` (already passed), drop ``...``
-        sentinels, fold any ``**kwargs`` collected in the caller,
-        and hand the rest to :meth:`CastOptions.check`.
-        """
+        """Validate and merge caller kwargs into a resolved options instance."""
         if overrides:
             overrides = {k: v for k, v in overrides.items() if v is not ...}
             overrides.pop("self", None)
@@ -352,15 +321,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     @abstractmethod
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches from the underlying source.
-
-        The single hook every other read surface routes through.
-        Implementations should respect ``options.target_field`` for
-        per-batch casting, ``options.row_size`` / ``options.byte_size``
-        for batch sizing where the format permits, and
-        ``options.column_names`` for column projection where natively
-        supported.
-        """
+        """Yield Arrow record batches from the underlying source."""
 
     def _read_arrow_batches_from_cache(self, options: O) -> Iterator[pa.RecordBatch]:
         """Yield Arrow record batches from the cache."""
@@ -385,12 +346,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Consume Arrow record batches and persist them.
-
-        The single hook every other write surface routes through.
-        Implementations should resolve save semantics and respect
-        ``options.target_field`` for output schema control.
-        """
+        """Consume Arrow record batches and persist them."""
 
     # ==================================================================
     # Static helpers
@@ -398,13 +354,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     @staticmethod
     def _normalize_records(data: Iterable[dict]) -> list[dict]:
-        """Backfill every row to the union of keys seen across all rows.
-
-        :func:`pa.Table.from_pylist` infers the schema from the first
-        row only — sparse list-of-dicts inputs lose columns that
-        appear later. We pre-walk and rewrite so every row carries
-        every key (with ``None`` where missing) in first-seen order.
-        """
+        """Backfill every row to the union of keys seen across all rows."""
         rows = list(data) if not isinstance(data, list) else data
         if not rows:
             return []
@@ -444,11 +394,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> Schema:
-        """Return the yggdrasil :class:`Schema` of the source.
-
-        Reads the first batch's schema and (under ``options.safe``)
-        merges schemas across all batches to handle drift.
-        """
+        """Return the yggdrasil :class:`Schema` of the source."""
         return self._collect_schema(self.check_options(options, overrides=locals()))
 
     def _collect_schema(self, options: O) -> Schema:
@@ -740,8 +686,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> None:
         import pandas as pd
 
-        # Default RangeIndex with no name → don't preserve. Otherwise
-        # the user named the index for a reason — keep it.
         is_default_range = (
             isinstance(frame.index, pd.RangeIndex) and frame.index.name is None
         )
@@ -799,8 +743,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         frame: "SparkDataFrame",
         options: O,
     ) -> None:
-        # Spark 3.5+ has ``toArrow``; older versions need the
-        # toPandas() detour.
         to_arrow = getattr(frame, "toArrow", None)
         if to_arrow is not None:
             self._write_arrow_table(to_arrow(), options)
@@ -843,6 +785,45 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if not rows:
             return
         self._write_arrow_table(pa.Table.from_pylist(rows), options)
+
+    def to_record_iterator(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> Iterator[Mapping[str, Any]]:
+        """Alias for :meth:`read_record_iterator`."""
+        return self.read_record_iterator(options=options, **kwargs)
+
+    def read_record_iterator(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> Iterator[Mapping[str, Any]]:
+        """Stream rows as ``dict`` records, one per row.
+
+        True streaming: row N is yielded as soon as its batch is
+        decoded; the full table is never materialized. Useful for
+        large sources where :meth:`read_pylist` would blow memory.
+
+        Each yielded row is a fresh ``dict`` (no shared state with
+        the underlying batch — the caller is free to mutate it).
+        Nested types come out as ``list`` / ``dict`` per pyarrow's
+        :meth:`pyarrow.RecordBatch.to_pylist` conventions, preserving
+        type fidelity that hand-rolled per-column reconstruction
+        would lose.
+        """
+        return self._read_record_iterator(
+            self.check_options(options, overrides=locals())
+        )
+
+    def _read_record_iterator(self, options: O) -> Iterator[Mapping[str, Any]]:
+        for batch in self._read_arrow_batches(options):
+            # batch.to_pylist() does the column-major → row-major
+            # rotation in pyarrow C++ once per batch; per-row yield
+            # then costs only the dict reference. Cheaper than
+            # reconstructing rows in Python and keeps nested type
+            # fidelity for free.
+            yield from batch.to_pylist()
 
     def to_pydict(
         self,
@@ -899,12 +880,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> None:
-        """Write any supported tabular object.
-
-        Strict ordering (so polars/pandas/spark frames don't fall
-        into the iterable fallback): pyarrow → polars → pandas →
-        spark → list[dict] / dict[list] → iterable of batches.
-        """
+        """Write any supported tabular object."""
         self._write_table(obj, self.check_options(options, overrides=locals()))
 
     def _write_table(self, obj: Any, options: O) -> None:
@@ -915,10 +891,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
             self._write_arrow_table(pa.Table.from_batches([obj]), options)
             return
 
-        # Module-prefix routing for engines we don't want to import
-        # eagerly. ``polars.DataFrame.__class__.__module__`` is
-        # ``polars.dataframe.frame``; the head module check is
-        # robust against polars internal renames.
         module = (type(obj).__module__ or "").split(".", 1)[0]
         if module == "polars":
             self._write_polars_frame(obj, options)
@@ -946,7 +918,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
             return
 
         if isinstance(obj, AbcIterator) or hasattr(obj, "__iter__"):
-            # Last-resort: assume an iterable of pa.RecordBatch.
             self._write_arrow_batches(obj, options)
             return
 
@@ -969,22 +940,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *,
         match_by: Sequence[str],
     ) -> pa.Table:
-        """Outer-merge with incoming-wins-on-overlap.
-
-        See :meth:`_arrow_upsert_via_rewrite` for the user-facing
-        semantics. Pulled out so unit tests can exercise the merge
-        directly without setting up an IO instance.
-
-        :param existing: table currently on disk.
-        :param incoming: table being written.
-        :param match_by: columns whose values define row identity.
-            Must be present in *incoming* (raises if not). May be
-            absent in *existing* (treated as "no overlap").
-        :returns: merged table. Column order: existing's columns
-            first, then any incoming-only columns appended in
-            incoming's order. Row order: surviving existing rows
-            first, then incoming rows.
-        """
+        """Outer-merge with incoming-wins-on-overlap."""
         match_by = tuple(match_by)
         if not match_by:
             raise ValueError("match_by must contain at least one column name")
@@ -999,18 +955,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
                 f"{list(incoming.column_names)}."
             )
 
-        # Both empty → empty result with the union of schemas.
         if existing.num_rows == 0 and incoming.num_rows == 0:
             return self.concat_with_schema_union([existing, incoming])
 
-        # Only one side populated → no merge needed.
         if incoming.num_rows == 0:
             return existing
         if existing.num_rows == 0:
             return incoming
 
-        # Both populated — drop existing rows whose match-by tuple
-        # is in incoming, then schema-union concat.
         survivors = self._filter_out_matches(existing, incoming, match_by)
         return self.concat_with_schema_union([survivors, incoming])
 
@@ -1019,22 +971,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         tables: Sequence[pa.Table],
     ) -> pa.Table:
         """Concat tables with a column-union schema, filling missing
-        columns with nulls.
-
-        pyarrow's :func:`pa.concat_tables` requires identical schemas
-        by default and supports ``promote_options="default"`` for
-        some compatibility, but its handling of "left has columns
-        right doesn't and vice-versa" is fragile across versions.
-        This helper does the alignment explicitly:
-
-        1. Build the union of column names, preserving first-seen
-           order.
-        2. For each table, add missing columns as null arrays of
-           the union's inferred type.
-        3. Concat the aligned tables.
-
-        Skips empty tables (empty-schema and zero-row).
-        """
+        columns with nulls."""
         real_tables = [
             t for t in tables if t.num_columns > 0 or t.num_rows > 0
         ]
@@ -1044,7 +981,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if len(real_tables) == 1:
             return real_tables[0]
 
-        # Column union (first-seen order).
         union_names: list[str] = []
         union_types: dict[str, pa.DataType] = {}
         for t in real_tables:
@@ -1053,7 +989,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
                     union_names.append(name)
                     union_types[name] = t.schema.field(i).type
 
-        # Schema-align each table.
         aligned: list[pa.Table] = []
         for t in real_tables:
             if t.column_names == union_names:
@@ -1075,23 +1010,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         incoming: pa.Table,
         match_by: Sequence[str],
     ) -> pa.Table:
-        """Return *existing* with rows whose match-by key is in
-        *incoming* dropped.
-
-        Two paths:
-
-        - **Single-column match_by** → :func:`pyarrow.compute.is_in`
-          directly. The fast path; runs in pyarrow C++ over a flat
-          array.
-        - **Multi-column match_by** → build tuple sets in Python.
-          O(rows) in both tables but the constant is small; in
-          practice this beats the alternative pyarrow shapes
-          (struct-array is_in, hash join) for typical match-by
-          sizes.
-        """
-        # Existing missing one of the match-by columns → no rows
-        # can match (NULL vs anything in incoming is a non-match
-        # for equality). Return existing unchanged.
+        """Return *existing* with rows whose match-by key is in *incoming* dropped."""
         missing_in_existing = [
             c for c in match_by if c not in existing.column_names
         ]
@@ -1103,7 +1022,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
             mask = pc.invert(pc.is_in(existing[col], value_set=incoming[col]))
             return existing.filter(mask)
 
-        # Multi-column path.
         incoming_keys = set(
             zip(*[incoming[c].to_pylist() for c in match_by])
         )
@@ -1126,24 +1044,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         batches: Any,
         options: O,
     ) -> None:
-        """Read all existing batches, concat with *batches*, OVERWRITE.
-
-        Used by leaves whose format doesn't support partial appends.
-        ``self._read_arrow_batches`` is called BEFORE consuming the
-        incoming iterator, so the read sees the pre-write buffer
-        state.
-
-        Schema handling: incoming and existing schemas may differ.
-        They're unified column-wise via
-        :meth:`concat_with_schema_union` (left columns first,
-        right-only columns appended; missing columns filled with
-        nulls of the appropriate type).
-
-        The recursion-into-OVERWRITE is done via ``options.copy``
-        with ``mode=Mode.OVERWRITE``.
-        """
-        # Materialize existing first — the read MUST happen before
-        # we start writing or we'll feed the writer its own output.
+        """Read all existing batches, concat with *batches*, OVERWRITE."""
         persisted = self._read_arrow_table(options.copy(read_seek=0))
 
         options = options.copy(
@@ -1171,28 +1072,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: O,
     ) -> None:
         """Read existing, merge with incoming on
-        ``options.match_by_names``, OVERWRITE.
-
-        Merge semantics:
-
-        - Outer-join existing ⨝ incoming on match_by_names.
-        - For rows in both, incoming columns replace existing
-          columns (other than match_by, which is the join key).
-        - For rows only in existing, the row is kept verbatim.
-        - For rows only in incoming, the row is kept verbatim.
-        - Schema is the column union; columns missing in either
-          side are filled with nulls.
-
-        Implementation note: equivalent to "delete existing rows
-        whose match-by key is in incoming, then concat existing
-        survivors with incoming, with schema union." Cheaper than a
-        real full join because no key duplication and no per-column
-        coalesce.
-
-        Requires ``options.match_by_names`` to be a non-empty
-        sequence of column names. Raises :class:`ValueError`
-        otherwise — UPSERT without a key is ambiguous.
-        """
+        ``options.match_by_names``, OVERWRITE."""
         match_by = options.match_by_names
         if not match_by:
             raise ValueError(

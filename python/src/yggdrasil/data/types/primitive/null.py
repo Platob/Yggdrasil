@@ -21,8 +21,8 @@ __all__ = ["NullType"]
 class NullType(PrimitiveType):
     """All-null column. Identity under merge; no-op on cast."""
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.NULL
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -70,8 +70,13 @@ class NullType(PrimitiveType):
         return cls._matches_dict(value, DataTypeId.NULL)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "NullType":
-        return cls()
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "NullType":
+        try:
+            return cls.instance()
+        except Exception as e:
+            if default is ...:
+                raise e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters

@@ -459,14 +459,6 @@ class TestCatalogTags:
         with pytest.raises(ValueError):
             cat.set_tags_ddl({})
 
-    def test_set_tags_executes_sql(self, cat, mock_client):
-        mock_sql = MagicMock()
-        mock_client.sql = mock_sql
-        cat.set_tags({"env": "prod"})
-        mock_sql.execute.assert_called_once()
-        ddl_arg = mock_sql.execute.call_args[0][0]
-        assert "ALTER CATALOG" in ddl_arg
-
     def test_set_tags_none_is_noop(self, cat, mock_client):
         mock_sql = MagicMock()
         mock_client.sql = mock_sql

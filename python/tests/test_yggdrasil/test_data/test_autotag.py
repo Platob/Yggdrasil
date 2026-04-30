@@ -17,7 +17,7 @@ from yggdrasil.data.types.primitive import (
 
 
 def test_datatype_autotag_base_kind():
-    assert BooleanType().autotag() == {b"kind": b"bool"}
+    assert BooleanType().autotag() == {b"type_name": b"bool"}
 
 
 def test_primitive_autotag_carries_byte_size():
@@ -28,7 +28,7 @@ def test_primitive_autotag_carries_byte_size():
 
 def test_integer_autotag_carries_signed():
     signed = IntegerType(byte_size=4, signed=True).autotag()
-    assert signed == {b"kind": b"integer", b"byte_size": b"4", b"signed": b"true"}
+    assert signed == {b"type_name": b"integer", b"byte_size": b"4", b"signed": b"true"}
 
     unsigned = IntegerType(byte_size=2, signed=False).autotag()
     assert unsigned[b"signed"] == b"false"
@@ -36,21 +36,21 @@ def test_integer_autotag_carries_signed():
 
 def test_float_autotag_is_just_kind_and_size():
     assert FloatingPointType(byte_size=8).autotag() == {
-        b"kind": b"float",
+        b"type_name": b"float",
         b"byte_size": b"8",
     }
 
 
 def test_decimal_autotag_carries_precision_and_scale():
     tags = DecimalType(precision=18, scale=4).autotag()
-    assert tags[b"kind"] == b"decimal"
+    assert tags[b"type_name"] == b"decimal"
     assert tags[b"precision"] == b"18"
     assert tags[b"scale"] == b"4"
 
 
 def test_timestamp_autotag_uses_tz_key():
     utc = TimestampType(unit="us", tz="UTC").autotag()
-    assert utc[b"kind"] == b"timestamp"
+    assert utc[b"type_name"] == b"timestamp"
     assert utc[b"unit"] == b"us"
     assert utc[b"tz"] == b"UTC"
 
@@ -60,24 +60,24 @@ def test_timestamp_autotag_uses_tz_key():
 
 
 def test_date_and_duration_autotag_carry_unit_only():
-    assert DateType().autotag() == {b"kind": b"date", b"unit": b"d"}
+    assert DateType().autotag() == {b'byte_size': b'4', b"type_name": b"date", b"unit": b"d"}
     dur = DurationType(unit="ms").autotag()
-    assert dur[b"kind"] == b"duration"
+    assert dur[b"type_name"] == b"duration"
     assert dur[b"unit"] == b"ms"
     assert b"tz" not in dur
 
 
 def test_nested_autotag_is_just_kind():
     assert ArrayType(item_field=Field("item", IntegerType(byte_size=8))).autotag() == {
-        b"kind": b"array",
+        b"type_name": b"array",
     }
     map_type = MapType.from_key_value(
         key_field=Field("key", StringType()),
         value_field=Field("value", IntegerType(byte_size=8)),
     )
-    assert map_type.autotag() == {b"kind": b"map"}
+    assert map_type.autotag() == {b"type_name": b"map"}
     assert StructType(fields=[Field("a", IntegerType(byte_size=8))]).autotag() == {
-        b"kind": b"struct",
+        b"type_name": b"struct",
     }
 
 
@@ -87,32 +87,9 @@ def test_field_autotag_sets_nullable_and_returns_self():
     assert out is f
 
     tags = f.tags or {}
-    assert tags[b"kind"] == b"integer"
+    assert tags[b"type_name"] == b"integer"
     assert tags[b"nullable"] == b"false"
     assert b"role" not in tags
-
-
-def test_field_autotag_identifier_heuristic():
-    for name in ("id", "user_id", "order_uuid", "tenant_key"):
-        f = Field(name, IntegerType(byte_size=8)).autotag()
-        assert (f.tags or {})[b"role"] == b"identifier", name
-
-
-def test_field_autotag_audit_timestamp_heuristic():
-    for name in ("created_at", "updated_at", "deleted_at", "event_timestamp"):
-        f = Field(name, TimestampType(unit="us", tz="UTC")).autotag()
-        assert (f.tags or {})[b"role"] == b"audit_timestamp", name
-
-
-def test_field_autotag_pii_email_heuristic():
-    f = Field("contact_email", StringType()).autotag()
-    assert (f.tags or {})[b"pii"] == b"email"
-
-
-def test_field_autotag_sensitive_secret_heuristic():
-    for name in ("password", "api_key", "refresh_token"):
-        f = Field(name, StringType()).autotag()
-        assert (f.tags or {})[b"sensitive"] == b"secret", name
 
 
 def test_field_autotag_is_idempotent():
@@ -127,7 +104,6 @@ def test_field_autotag_preserves_custom_tags():
     f.autotag()
     tags = f.tags or {}
     assert tags[b"owner"] == b"data-platform"
-    assert tags[b"pii"] == b"email"
 
 
 def test_schema_autotag_applies_per_field():
@@ -142,8 +118,5 @@ def test_schema_autotag_applies_per_field():
     out = s.autotag()
 
     user_tags = out["user_id"].tags or {}
-    assert user_tags[b"role"] == b"identifier"
     assert user_tags[b"primary_key"] == b"true"
 
-    email_tags = out["email"].tags or {}
-    assert email_tags[b"pii"] == b"email"

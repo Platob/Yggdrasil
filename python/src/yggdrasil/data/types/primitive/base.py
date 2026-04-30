@@ -46,7 +46,7 @@ class PrimitiveType(DataType, ABC):
     def _merge_with_same_id(
         self,
         other: "DataType",
-        mode: Mode,
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ) -> "PrimitiveType":

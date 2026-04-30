@@ -27,14 +27,14 @@ if TYPE_CHECKING:
     from .sql.columns import Columns
     from .sql.catalogs import Catalogs
     from .sql.schemas import Schemas
-    from yggdrasil.databricks.warehouse.service import Warehouses
-    from .sql.grants import Grants
+    from .warehouse.service import Warehouses
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
     from .fs.service import FileSystem
     from .fs.path import DatabricksPath
     from .ai.genie import Genie
+    from .tags.service import EntityTags
 
 __all__ = [
     "DatabricksClient",
@@ -212,8 +212,6 @@ class DatabricksClient:
     def from_parsed_url(
         cls: Type[TC],
         url: URL,
-        *,
-        safe: bool = False
     ) -> TC:
         if not url.path:
             raise ValueError(f"Invalid path for {cls.__name__}: {url!r}")
@@ -748,6 +746,17 @@ class DatabricksClient:
         )
 
     @property
+    def entity_tags(self) -> "EntityTags":
+        from .tags.service import EntityTags
+
+        return self.lazy_property(
+            self,
+            cache_attr="_entity_tags",
+            factory=lambda: EntityTags(client=self),
+            use_cache=True,
+        )
+
+    @property
     def warehouses(self) -> "Warehouses":
         from yggdrasil.databricks.warehouse.service import Warehouses
 
@@ -876,18 +885,6 @@ class DatabricksClient:
             self,
             cache_attr="_genie",
             factory=lambda: Genie(client=self),
-            use_cache=True,
-        )
-
-    @property
-    def grants(self) -> "Grants":
-        """Collection-level Unity Catalog grant management service for this client."""
-        from .sql.grants import Grants
-
-        return self.lazy_property(
-            self,
-            cache_attr="_grants",
-            factory=lambda: Grants(client=self),
             use_cache=True,
         )
 
@@ -1064,11 +1061,6 @@ class DatabricksService(ABC):
         return self.client.schemas
 
     @property
-    def grants(self) -> "Grants":
-        """Collection-level Unity Catalog grant service (shorthand for ``client.grants``)."""
-        return self.client.grants
-
-    @property
     def genie(self) -> "Genie":
         """Genie service (shorthand for ``client.genie``)."""
         return self.client.genie
@@ -1084,15 +1076,20 @@ class DatabricksService(ABC):
         return self.client.fs
 
 
-@dataclass
 class DatabricksResource(ABC):
     service: DatabricksService = field(
         default_factory=DatabricksService.current,
         repr=False, compare=False, hash=False
     )
 
-    def __post_init__(self):
-        pass
+    def __init__(
+        self,
+        service=None,
+        *args,
+        **kwargs
+    ):
+        self.service = DatabricksService.current() if service is None else service
+        super().__init__(*args, **kwargs)
 
     @property
     def client(self) -> DatabricksClient:

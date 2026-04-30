@@ -76,8 +76,8 @@ class MediaType:
 
     def __repr__(self) -> str:
         if self.codec is None:
-            return f"MediaType({self.mime_type!r})"
-        return f"MediaType({self.mime_type!r} + {self.codec!r})"
+            return self.mime_type.value
+        return f"{self.mime_type.value!r} + {self.codec.mime_type.value!r}"
 
     @classmethod
     def from_(

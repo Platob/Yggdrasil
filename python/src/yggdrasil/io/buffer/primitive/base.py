@@ -67,7 +67,7 @@ from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.enums import MimeType, Mode
+from yggdrasil.io.enums import MimeType, Mode, MediaType
 from yggdrasil.io.fragment import Fragment
 from yggdrasil.io.tabular import TabularIO
 from yggdrasil.lazy_imports import fragment_class, fragment_infos_class
@@ -85,8 +85,6 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
     implement the two abstract Arrow hooks (``_read_arrow_batches``
     / ``_write_arrow_batches``) and inherit everything else.
     """
-
-    __slots__ = ("_arrow_table", "_spark_frame")
 
     # ------------------------------------------------------------------
     # Registry hook
@@ -137,6 +135,12 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
         # directly (matches the docstring contract).
         self._arrow_table = None
         self._spark_frame = None
+
+        if self._media_type is None:
+            mt = self.default_mime_type()
+
+            if not mt.is_any_bytes:
+                self._media_type = MediaType(mt)
 
     # ------------------------------------------------------------------
     # Lifecycle — chain both parents' _release
@@ -411,7 +415,7 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
                 stack.callback(self.seek, self.tell())
 
             try:
-                if options.truncate_before_write:
+                if options.mode is Mode.OVERWRITE:
                     self.truncate(0)
 
                 if options.write_seek is not None and self.seekable():

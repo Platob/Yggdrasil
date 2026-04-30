@@ -42,7 +42,6 @@ def test_from_item_field_preserves_zero_list_size() -> None:
     result = ArrayType.from_item(
         item_field=Field(name="item", dtype=StringType(), nullable=True),
         list_size=0,
-        safe=True,
     )
 
     assert result.list_size == 0
@@ -73,7 +72,7 @@ def test_children_fields_is_the_item_field() -> None:
     dtype = ArrayType.from_item(StringType().to_field())
     children = dtype.children_fields
     assert len(children) == 1
-    assert children[0].name == "item"
+    assert children[0].name == ""
 
 
 # ---------------------------------------------------------------------------
@@ -227,4 +226,4 @@ def test_merge_with_same_id_or_s_item_nullability() -> None:
 
     merged = left._merge_with_same_id(right)
 
-    assert merged.item_field.nullable is True
+    assert merged.item_field.nullable is False

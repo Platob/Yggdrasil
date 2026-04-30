@@ -16,7 +16,7 @@ be used standalone — open-source Spark, local PySpark, or composed into
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional, Any
 
 from yggdrasil.data.executor import StatementExecutor
 from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatementBatch
@@ -155,3 +155,41 @@ class SparkStatementExecutor(
             row_limit=row_limit,
         )
         return self.execute(stmt, wait=False, raise_error=True)
+
+    def scoped_spark_conf(
+        self,
+        session: "SparkSession | None" = None,
+        conf: dict[str, str] | None = None,
+    ):
+        session = self.resolve_session() if session is None else session
+        conf = dict(conf or {})
+        return _scoped_spark_conf(session, conf)
+
+
+class _scoped_spark_conf:
+    """Context manager: stash & set Spark session conf keys; restore on exit."""
+
+    def __init__(self, session: Any, conf: dict[str, str]):
+        self._session = session
+        self._conf = conf
+        self._saved: dict[str, Optional[str]] = {}
+
+    def __enter__(self):
+        for k, v in self._conf.items():
+            try:
+                self._saved[k] = self._session.conf.get(k)
+            except Exception:
+                self._saved[k] = None
+            self._session.conf.set(k, v)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for k, prev in self._saved.items():
+            try:
+                if prev is None:
+                    self._session.conf.unset(k)
+                else:
+                    self._session.conf.set(k, prev)
+            except Exception:
+                logger.debug("Failed to restore Spark conf %r; continuing.", k, exc_info=True)
+        return False

@@ -58,8 +58,8 @@ class MapType(NestedType):
     item_field: "Field"
     keys_sorted: bool = False
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.MAP
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -252,14 +252,16 @@ class MapType(NestedType):
         return cls._matches_dict(value, DataTypeId.MAP)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "MapType":
-        return cls(
-            item_field=cached_from_import(
-                "yggdrasil.data.data_field",
-                "Field",
-            ).from_dict(value["item_field"]),
-            keys_sorted=bool(value.get("keys_sorted", False)),
-        )
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "ArrayType":
+        try:
+            return cls(
+                item_field=field_class().from_dict(value["item_field"]),
+                keys_sorted=bool(value.get("keys_sorted", False)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Could not parse {cls.__name__} from dict: {value!r}") from e
+            return default
 
     def to_arrow(self) -> pa.DataType:
         return pa.map_(

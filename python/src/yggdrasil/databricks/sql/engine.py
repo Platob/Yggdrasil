@@ -96,7 +96,7 @@ from yggdrasil.databricks.warehouse import (
     WarehousePreparedStatement,
     WarehouseStatementResult,
 )
-from yggdrasil.databricks.warehouse.service import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+from yggdrasil.databricks.warehouse._utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer.primitive import ParquetIO
@@ -104,12 +104,10 @@ from yggdrasil.io.enums import Mode
 from yggdrasil.spark.executor import SparkStatementExecutor
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
 from .catalogs import Catalogs
-from .grants import Grants
 from .schemas import Schemas
 from .table import Table
 from .tables import Tables
 from ..client import DatabricksService
-from ..fs.path import DatabricksPath
 
 logger = logging.getLogger(__name__)
 
@@ -379,10 +377,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             schema_name=self.schema_name,
         )
 
-    @property
-    def grants(self) -> Grants:
-        return Grants(client=self.client)
-
     def __call__(
         self,
         *,
@@ -628,6 +622,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
+        prune_values: dict[str, tuple[Any]] | None = None
     ) -> None:
         """Insert data into a Delta table using the most appropriate backend.
 
@@ -647,7 +642,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            table=table, where=where, prune_by=prune_by,
+            table=table, where=where, prune_by=prune_by, prune_values=prune_values
         )
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -702,6 +697,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
+        prune_values: Mapping[str, list[Any]] | None = None,
     ) -> None:
         """Insert through the warehouse SQL path with staged Parquet."""
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -744,13 +740,15 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
         # Stage Parquet to a Volume; harvest prune values in the same pass.
         staging = VolumePath.staging_path(
+            client=self.client,
             catalog_name=target.catalog_name,
             schema_name=target.schema_name,
+            resource_name=target.table_name,
             max_lifetime=3600,
             temporary=bool(wait_cfg),
         )
 
-        prune_values: dict[str, tuple[Any, ...]] = {}
+        prune_values = prune_values or {}
         with ParquetIO() as buffer:
             buffer.write_table(data, cast_options)
             buffer.seek(0)
@@ -840,6 +838,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
+        prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
     ) -> None:
         """Insert into a Delta table using Spark.
@@ -900,7 +899,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by = _resolve_prune_by(prune_by, existing_schema.partition_fields)
 
         # Collect prune values from the DataFrame in a single distinct() pass.
-        prune_values: dict[str, tuple[Any, ...]] = {}
+        prune_values = prune_values or {}
         if prune_by:
             prune_values = _collect_prune_values_spark(data_df, prune_by)
             logger.debug(
@@ -945,8 +944,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         applied_conf = _delta_conf_for(overwrite_schema, spark_options)
 
         try:
-            with _scoped_spark_conf(session, applied_conf):
-                self.execute_many(prepared, wait=wait, raise_error=raise_error, engine="spark")
+            with self.spark.scoped_spark_conf(session, applied_conf):
+                return self.execute_many(prepared, wait=wait, raise_error=raise_error, engine="spark")
         finally:
             try:
                 session.catalog.dropTempView(view_name)
@@ -977,6 +976,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
+        prune_values: dict[str, tuple[Any]] | None = None
     ) -> None:
         """Insert into a Delta table from a SQL source query.
 
@@ -1002,7 +1002,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            table=table, where=where, prune_by=prune_by,
+            table=table, where=where, prune_by=prune_by, prune_values=prune_values
         )
 
         # ---- Fast path 1: cached StatementResult ----
@@ -1045,6 +1045,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table],
         where: Predicate | None,
         prune_by: list[str] | str | None,
+        prune_values: dict[str, tuple[Any]] | None = None
     ) -> None:
         """Warehouse path of :meth:`sql_insert_into`.
 
@@ -1198,32 +1199,3 @@ def _delta_conf_for(
     if overwrite_schema or (spark_options and spark_options.get("overwriteSchema")):
         out["spark.databricks.delta.schema.autoMerge.enabled"] = "true"
     return out
-
-
-class _scoped_spark_conf:
-    """Context manager: stash & set Spark session conf keys; restore on exit."""
-
-    def __init__(self, session: Any, conf: dict[str, str]):
-        self._session = session
-        self._conf = conf
-        self._saved: dict[str, Optional[str]] = {}
-
-    def __enter__(self):
-        for k, v in self._conf.items():
-            try:
-                self._saved[k] = self._session.conf.get(k)
-            except Exception:
-                self._saved[k] = None
-            self._session.conf.set(k, v)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        for k, prev in self._saved.items():
-            try:
-                if prev is None:
-                    self._session.conf.unset(k)
-                else:
-                    self._session.conf.set(k, prev)
-            except Exception:
-                logger.debug("Failed to restore Spark conf %r; continuing.", k, exc_info=True)
-        return False

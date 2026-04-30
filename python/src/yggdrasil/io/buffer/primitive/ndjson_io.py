@@ -143,18 +143,11 @@ class NDJsonIO(PrimitiveIO):
 
     @classmethod
     def default_mime_type(cls):
-        return MimeTypes.JSON
+        return MimeTypes.NDJSON
 
     @classmethod
     def options_class(cls):
         return NDJsonOptions
-
-    # NDJSON's line-per-record shape supports honest append.
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    # UPSERT via the generic read-modify-write helper.
-    _SUPPORTED_UPSERT: ClassVar[bool] = True
-
-    _NATIVE_SCANNER_OK: ClassVar[bool] = True
 
     # ==================================================================
     # Schema — read the first batch
@@ -202,11 +195,17 @@ class NDJsonIO(PrimitiveIO):
 
         with self._reading_context(options) as io:
             source = io.arrow_io(mode="rb")
-            reader = pa_json.open_json(
-                source,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
+
+            try:
+                reader = pa_json.open_json(
+                    source,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to open JSON reader for NDJSON source: {io}\n{io.head(100).decode()}"
+                ) from e
             try:
                 for batch in reader:
                     yield options.cast_arrow_tabular(batch)

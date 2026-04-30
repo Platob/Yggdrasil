@@ -30,7 +30,6 @@ import inspect
 import logging
 import re
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
 
 from databricks.sdk import ClustersAPI
@@ -48,7 +47,6 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
-
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
@@ -133,7 +131,6 @@ def _normalize_pip_pkg_name(spec: str) -> str:
     return name.replace("_", "-")
 
 
-@dataclass
 class Cluster(DatabricksResource):
     """
     High-level Databricks cluster helper.
@@ -165,11 +162,23 @@ class Cluster(DatabricksResource):
     _details_refresh_time: float = dataclasses.field(default=0.0, repr=False, hash=False, compare=False)
     _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
-    # ------------------------------------------------------------------ #
-    # Construction and identity
-    # ------------------------------------------------------------------ #
-    def __post_init__(self) -> None:
-        super().__post_init__()
+    def __init__(
+        self,
+        service: Clusters | None = None,
+        cluster_id: str | None = None,
+        cluster_name: str | None = None,
+        *,
+        details: Optional[ClusterDetails] = None,
+        details_refresh_time: float = 0.0,
+        contexts: dict[str, ExecutionContext] = None,
+    ):
+        super().__init__()
+        self.service = service or Clusters.current()
+        self.cluster_id = cluster_id
+        self.cluster_name = cluster_name
+        self._details = details
+        self._details_refresh_time = details_refresh_time
+        self._contexts = contexts or {}
 
         if self.cluster_name and not self.cluster_id:
             found = self.service.find_cluster(
@@ -184,6 +193,12 @@ class Cluster(DatabricksResource):
 
     def __str__(self) -> str:
         return self.url().to_string()
+
+    def __hash__(self):
+        return hash(self.url())
+
+    def __eq__(self, other):
+        return isinstance(other, Cluster) and self.url() == other.url()
 
     def url(self) -> URL:
         """Return the Databricks workspace URL for this cluster."""

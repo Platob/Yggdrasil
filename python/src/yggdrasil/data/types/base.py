@@ -20,7 +20,7 @@ from typing import (
     Optional,
     Union,
     get_args,
-    get_origin, )
+    get_origin, AnyStr, )
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -150,6 +150,9 @@ def _literal_values_to_hint(values: tuple[object, ...]) -> object:
     return Union[tuple(types_seen)]
 
 
+DATA_TYPE_CLASSES: dict[int, type["DataType"]] = {}
+
+
 @dataclass(frozen=True, repr=False)
 class DataType(BaseChildrenFields, ABC):
     _singleton_instance: ClassVar["DataType | None"] = None
@@ -169,6 +172,17 @@ class DataType(BaseChildrenFields, ABC):
             return self
         raise ValueError(f"Cannot call {self.__class__} with args or kwargs")
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        if not cls.__subclasses__():
+            try:
+                type_id = cls.class_type_id()
+                if type_id is not None:
+                    DATA_TYPE_CLASSES[type_id.value] = cls
+            except TypeError:
+                pass
+
     def equals(
         self,
         other: "DataType",
@@ -178,9 +192,13 @@ class DataType(BaseChildrenFields, ABC):
     ) -> bool:
         return self == other
 
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        ...
+
     @property
-    @abstractmethod
-    def type_id(self) -> DataTypeId: ...
+    def type_id(self) -> DataTypeId:
+        return self.class_type_id()
 
     @classmethod
     def instance(cls) -> "DataType":
@@ -253,7 +271,7 @@ class DataType(BaseChildrenFields, ABC):
     def _merge_with_same_id(
         self,
         other: "DataType",
-        mode: Mode,
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ):
@@ -262,7 +280,7 @@ class DataType(BaseChildrenFields, ABC):
     def _merge_with_different_id(
         self,
         other: "DataType",
-        mode: Mode,
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ):
@@ -335,6 +353,11 @@ class DataType(BaseChildrenFields, ABC):
         for subclass in cls.__subclasses__():
             if subclass.handles_dict(value):
                 return True
+
+            if subclass.__subclasses__():
+                for sc in subclass.__subclasses__():
+                    if sc.handles_dict(value):
+                        return True
         return False
 
     # ==================================================================
@@ -346,6 +369,12 @@ class DataType(BaseChildrenFields, ABC):
             "id": self.type_id.value,
             "name": self.type_id.name,
         }
+
+    def to_json(self, to_bytes: bool = False) -> AnyStr:
+        dumped = json.dumps(self.to_dict())
+        if to_bytes:
+            return dumped.encode("utf-8")
+        return dumped
 
     @abstractmethod
     def to_arrow(self) -> pa.DataType:
@@ -398,7 +427,9 @@ class DataType(BaseChildrenFields, ABC):
         Keys are bare (no ``t:`` prefix) — prefixing is handled by
         ``BaseMetadata.update_tags`` when these land on a Field.
         """
-        return {b"kind": self.type_id.name.lower().encode("utf-8")}
+        return {
+            b"type_name": self.type_id.name.lower().encode("utf-8")
+        }
 
     # ==================================================================
     # Scalar conversion — Python / Arrow value coercion
@@ -624,60 +655,52 @@ class DataType(BaseChildrenFields, ABC):
         raise TypeError(f"Unsupported parsed data type: {parsed!r}")
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DataType":
-        if not value:
-            raise ValueError(
-                f"Cannot build {cls.__name__} from empty dictionary {value!r}"
-            )
+    def from_json(cls, obj: AnyStr, default: Any = ...) -> "DataType":
+        try:
+            if isinstance(obj, (str, bytes)):
+                obj = json.loads(obj)
+
+            return cls.from_dict(obj)
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Cannot parse JSON string: {obj!r}") from e
+            return default
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "DataType":
+        type_id = value.get("id") or value.get(b"id")
+
+        if type_id is not None:
+            target_class = DATA_TYPE_CLASSES.get(type_id)
+            if target_class is not None:
+                return target_class.from_dict(value)
+
+            from .primitive import PrimitiveType
+            from .nested import NestedType
+
+            target_class = DATA_TYPE_CLASSES.get(type_id)
+            if target_class is not None:
+                return target_class.from_dict(value)
+
+            raise ValueError(f"Unsupported data type ID: {type_id}")
 
         if "id" in value.keys() or b"id" in value.keys():
             if cls.__subclasses__():
                 for subclass in cls.__subclasses__():
+                    if subclass.__subclasses__():
+                        for sc in subclass.__subclasses__():
+                            if sc.handles_dict(value):
+                                return sc.from_dict(value)
+
                     if subclass.handles_dict(value):
                         return subclass.from_dict(value)
-            raise ValueError(f"Unknown DataType payload: {value!r}")
 
-        for key in ("dtype", "type_text", "type_json", "type"):
-            dtype_payload = value.get(key)
-            if dtype_payload:
-                break
-
-        if dtype_payload is None:
+        if default is ...:
             raise ValueError(
-                f"Cannot find a valid 'dtype' key in the provided dictionary: {value}"
+                f"Cannot find a valid {cls.__name__} in: {value}"
             )
 
-        base = cls.from_any(dtype_payload)
-
-        if base.type_id == DataTypeId.STRUCT:
-            inner_fields = value.get("fields", base.children_fields)
-            return base.to_struct().with_fields(inner_fields)
-        elif base.type_id == DataTypeId.ARRAY:
-            element_type = value.get("elementType")
-            if element_type is not None:
-                base.item_field.with_dtype(element_type, inplace=True)
-
-            contains_null = value.get("containsNull")
-            if contains_null is not None:
-                base.item_field.with_nullable(contains_null, inplace=True)
-        elif base.type_id == DataTypeId.MAP:
-            key_type = value.get("keyType")
-            if key_type is not None:
-                base.key_field.with_dtype(key_type, inplace=True).with_name(
-                    "key", inplace=True
-                )
-
-            value_type = value.get("valueType")
-            if value_type is not None:
-                base.value_field.with_dtype(value_type, inplace=True).with_name(
-                    "value", inplace=True
-                )
-
-            value_contains_null = value.get("valueContainsNull")
-            if value_contains_null is not None:
-                base.value_field.with_nullable(value_contains_null, inplace=True)
-
-        return base
+        return default
 
     # ==================================================================
     # Constructors — Python types, dataclasses

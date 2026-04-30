@@ -41,8 +41,8 @@ class ObjectType(DataType):
     # Does not inherit PrimitiveType because it has no ``byte_size``
     # concept and doesn't participate in the primitive merge matrix.
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.OBJECT
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -103,8 +103,13 @@ class ObjectType(DataType):
         return name == "OBJECT"
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "ObjectType":
-        return cls()
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "ObjectType":
+        try:
+            return cls()
+        except Exception as e:
+            if default is ...:
+                raise e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters

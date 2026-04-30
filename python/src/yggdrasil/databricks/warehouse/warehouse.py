@@ -28,11 +28,10 @@ in the companion :mod:`~yggdrasil.databricks.sql.service` module.
 
 from __future__ import annotations
 
-import dataclasses as dc
 import logging
 import time
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, List, Mapping, Optional, Union
+from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
 from databricks.sdk.errors import DeadlineExceeded
 from databricks.sdk.service.sql import (
@@ -42,19 +41,12 @@ from databricks.sdk.service.sql import (
     State,
     WarehouseAccessControlRequest,
 )
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
+from yggdrasil.databricks.warehouse._utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
-from .service import (
-    DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
-    DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
-    Warehouses,
-    _EDIT_ARG_NAMES,
-    _jitter_sleep_seconds,
-    safeEndpointInfo,
-)
+
 from .statement import (
     WarehousePreparedStatement,
     WarehouseStatementResult,
@@ -63,11 +55,12 @@ from .statement import (
 from ..client import DatabricksResource
 from ..fs import VolumePath
 
+if TYPE_CHECKING:
+    from .service import Warehouses
+
 __all__ = [
     "SQLWarehouse",
     "DatabricksExecutionOptions",
-    "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
-    "DEFAULT_ALL_PURPOSE_CLASSIC_NAME",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -143,7 +136,6 @@ class DatabricksExecutionOptions(ExecutionOptions):
 # ---------------------------------------------------------------------------
 
 
-@dc.dataclass(init=False, repr=False)
 class SQLWarehouse(
     DatabricksResource,
     StatementExecutor[
@@ -176,34 +168,24 @@ class SQLWarehouse(
     _STATEMENT_RESULT_CLASS: ClassVar[type[WarehouseStatementResult]] = WarehouseStatementResult
     _STATEMENT_BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
 
-    service: Warehouses = dc.field(
-        default_factory=Warehouses.current,
-        repr=False,
-        compare=False,
-    )
-    warehouse_id: str | None = None
-    warehouse_name: str | None = None
-
-    _details: Optional[EndpointInfo] = dc.field(default=None, repr=False, hash=False, compare=False)
-
     def __init__(
         self,
-        service: Warehouses | None = None,
+        service: "Warehouses | None" = None,
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
-        **kwargs,
+        *,
+        details: Optional[EndpointInfo] = None,
     ):
-        self.service = Warehouses.current() if service is None else service
+        if service is None:
+            from .service import Warehouses
+            service = Warehouses.current()
+
+        super().__init__(service=service)
+        self.service = service
         self.warehouse_id = warehouse_id
         self.warehouse_name = warehouse_name
-        super().__init__()
+        self._details = details
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
         if self.warehouse_name and not self.warehouse_id:
             found = self.service.find_warehouse(warehouse_name=self.warehouse_name)
             self.warehouse_id = found.warehouse_id

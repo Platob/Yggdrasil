@@ -215,8 +215,8 @@ class IntegerType(NumericType):
         prefix = "int" if self.signed else "uint"
         return f"{pad}{prefix}{bits}"
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.INTEGER
 
     def _cast_arrow_array(
@@ -389,11 +389,18 @@ class IntegerType(NumericType):
         return cls._matches_dict(value, DataTypeId.INTEGER)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "IntegerType":
-        return cls(
-            byte_size=value.get("byte_size", 8),
-            signed=bool(value.get("signed", True)),
-        )
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "IntegerType":
+        try:
+            return cls(
+                byte_size=value.get("byte_size", 8),
+                signed=bool(value.get("signed", True)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(
+                    f"Could not parse IntegerType from dict: {value!r}."
+                ) from e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters
@@ -516,8 +523,8 @@ class FloatingPointType(NumericType):
         bits = (self.byte_size or 8) * 8
         return f"{pad}float{bits}"
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.FLOAT
 
     def _merge_with_same_id(
@@ -590,8 +597,15 @@ class FloatingPointType(NumericType):
         return cls._matches_dict(value, DataTypeId.FLOAT)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "FloatingPointType":
-        return cls(byte_size=value.get("byte_size", 8))
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "FloatingPointType":
+        try:
+            return cls(byte_size=value.get("byte_size", 8))
+        except Exception as e:
+            if default is ...:
+                raise ValueError(
+                    f"Could not parse FloatingPointType from dict: {value!r}."
+                ) from e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters
@@ -676,8 +690,8 @@ class DecimalType(NumericType):
             else:
                 object.__setattr__(self, "byte_size", 32)
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.DECIMAL
 
     def _merge_with_same_id(
@@ -757,12 +771,19 @@ class DecimalType(NumericType):
         return cls._matches_dict(value, DataTypeId.DECIMAL)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "DecimalType":
-        return cls(
-            byte_size=value.get("byte_size"),
-            precision=value.get("precision", 38),
-            scale=value.get("scale", 18),
-        )
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "DecimalType":
+        try:
+            return cls(
+                byte_size=value.get("byte_size"),
+                precision=int(value.get("precision", 38)),
+                scale=int(value.get("scale", 18)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(
+                    f"Could not parse DecimalType from dict: {value!r}."
+                ) from e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters

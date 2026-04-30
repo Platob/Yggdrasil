@@ -22,8 +22,8 @@ __all__ = ["BooleanType"]
 @dataclass(frozen=True, repr=False)
 class BooleanType(PrimitiveType):
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.BOOL
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -71,8 +71,13 @@ class BooleanType(PrimitiveType):
         return cls._matches_dict(value, DataTypeId.BOOL, "BOOLEAN")
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "BooleanType":
-        return cls(byte_size=value.get("byte_size", 1))
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "BooleanType":
+        try:
+            return cls(byte_size=value.get("byte_size", 1))
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Could not parse {cls.__name__} from dict: {value!r}") from e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters

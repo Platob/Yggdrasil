@@ -22,8 +22,8 @@ class BinaryType(PrimitiveType):
     large: bool = False
     view: bool = False
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.BINARY
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -84,12 +84,17 @@ class BinaryType(PrimitiveType):
         return cls._matches_dict(value, DataTypeId.BINARY)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "BinaryType":
-        return cls(
-            byte_size=value.get("byte_size"),
-            large=bool(value.get("large", False)),
-            view=bool(value.get("view", False)),
-        )
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "BinaryType":
+        try:
+            return cls(
+                byte_size=value.get("byte_size"),
+                large=bool(value.get("large", False)),
+                view=bool(value.get("view", False)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise e
+            return default
 
     # ------------------------------------------------------------------
     # Exporters

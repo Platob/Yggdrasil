@@ -255,12 +255,16 @@ class CacheConfig(_ConfigBase):
         return cls.parse_mapping(overrides) if overrides else cls.default()
 
     @property
+    def cache_enabled(self):
+        return self.mode in (Mode.APPEND, Mode.AUTO)
+
+    @property
     def local_cache_enabled(self):
-        return self.received_from is not None or self.received_to is not None
+        return self.cache_enabled and self.received_from is not None or self.received_to is not None
 
     @property
     def remote_cache_enabled(self):
-        return self.table is not None
+        return self.cache_enabled and self.table is not None
 
     @property
     def match_by(self) -> list[str]:
@@ -542,6 +546,21 @@ class CacheConfig(_ConfigBase):
             )
 
         return base_query
+
+    def copy(
+        self,
+        **overrides
+    ):
+        clean = {
+            k: v
+            for k, v in overrides.items()
+            if v is not ...
+        }
+
+        if not clean:
+            return self
+
+        return dataclasses.replace(self, **overrides)
 
 
 DEFAULT_CACHE_CONFIG = CacheConfig()

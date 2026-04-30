@@ -117,6 +117,9 @@ class CommandExecution:
         default=False, init=False, repr=False, compare=False, hash=False,
     )
 
+    def __hash__(self):
+        return hash((self.context.context_id, self.command_id))
+
     def __post_init__(self):
         if self.environ and not isinstance(self.environ, Mapping):
             try:

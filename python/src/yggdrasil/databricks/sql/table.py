@@ -7,13 +7,14 @@ instance-level methods only.  Collection operations (``find_table``,
 
 Caching strategy
 ----------------
-Expensive Unity Catalog lookups (basic ``TableInfo``, entity-tag
-assignments on the table and on each column) are cached on the instance
+``TableInfo`` (and the derived columns list) is cached on the instance
 with a shared TTL and loaded lazily on first access.
 
-    1. **Local** — return the cached value immediately when fresh.
-    2. **Remote** — hit the Databricks API only on miss / expiry.
-    3. **Update** — store the fetched value so the next access is free.
+Entity-tag assignments — both table-level and per-column — are *not*
+cached on the instance.  They route through
+:attr:`DatabricksClient.entity_tags`, whose module-level
+:class:`ExpiringDict` is host-scoped and authoritative; surgical patches
+on write keep the cache fresh without fan-out invalidation.
 """
 
 from __future__ import annotations
@@ -22,33 +23,33 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union, TYPE_CHECKING, Mapping, Iterable
+from typing import Any, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal
 
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
     DataSourceFormat,
-    Privilege,
-    SecurableType,
     TableInfo,
     TableOperation,
-    TableType,
+    TableType, EntityTagAssignment,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
+from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
+from yggdrasil.data.statement import PreparedStatement
+from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.databricks.iam import IAMUser, IAMGroup
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums.mode import ModeLike, Mode
+from yggdrasil.io.tabular import TabularIO
+
 from .column import Column
-from .grants import GrantsMixin
 from .sql_utils import (
-    DEFAULT_TAG_COLLATION,
     quote_ident,
     quote_principal,
     quote_qualified_ident,
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.tables import Tables
     from yggdrasil.databricks.sql.catalog import Catalog
     from yggdrasil.databricks.sql.columns import Columns
-    from yggdrasil.databricks.sql.schema import Schema as UCSchema, Schema
+    from yggdrasil.databricks.sql.schema import Schema as UCSchema
 
 __all__ = ["Table"]
 
@@ -75,41 +76,6 @@ def _needs_column_mapping(col_name: str) -> bool:
     return any(ch in _INVALID_COL_CHARS for ch in col_name)
 
 
-GRANTS_METADATA_KEY: bytes = b"grants"
-
-
-def parse_grants_principals(value: bytes | str | Iterable[Any] | None) -> list[str]:
-    """Parse a ``b"grants"`` metadata value into a list of principal names.
-
-    Accepts a bytes/str payload (JSON array of strings or comma-separated)
-    or any iterable of principal-like values.  Whitespace is stripped and
-    empty entries are skipped while preserving original order.
-    """
-    if value is None:
-        return []
-
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
-
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return []
-        if text.startswith("["):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, list):
-                return [str(p).strip() for p in parsed if str(p).strip()]
-        return [p.strip() for p in text.split(",") if p.strip()]
-
-    if isinstance(value, Iterable):
-        return [str(p).strip() for p in value if str(p).strip()]
-
-    raise TypeError(f"Unsupported grants metadata value: {value!r}")
-
-
 INFOS_TTL: float = 300.0
 
 
@@ -117,39 +83,80 @@ INFOS_TTL: float = 300.0
 # Table — per-table resource
 # ===========================================================================
 
-@dataclass
-class Table(GrantsMixin):
+class Table(DatabricksResource, TabularIO):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
-    catalog_name: str = "default"
-    schema_name: str = "default"
-    table_name: str = "default"
+    def __init__(
+        self,
+        service: "Tables | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        *,
+        infos: TableInfo | None = None,
+        infos_fetched_at: float | None = None,
+        columns: list[Column] | None = None,
+    ):
+        if service is None:
+            from .tables import Tables
+            service = Tables.current()
 
+        super().__init__(service=service)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.table_name = table_name
+        self._infos = infos
+        self._infos_fetched_at = infos_fetched_at
+        self._columns = columns
+    
+    # ------------------------------------
+    # TabularIO
+    # ------------------------------------
+
+    @property
+    def cached(self) -> bool:
+        return True
+
+    def unpersist(self) -> None:
+        pass
+
+    def persist(self, engine: Literal["arrow", "polars", "spark", "auto"] = "auto", *,
+                data: Any | None = None) -> "TabularIO":
+        return self
+
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        options = options.with_source(source=self.collect_schema())
+        safe_char = "`"
+        names = ",".join(
+            safe_char + name + safe_char
+            for name in options.column_names or [c.name for c in self.columns]
+        )
+        query = f"SELECT {names}"
+        if options.where:
+            query += f" WHERE {options.where.with_flavor("databricks")}"
+            
+        for batch in self.execute(query).read_arrow_batches(options=options):
+            yield batch
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: CastOptions
+    ) -> None:
+        options = options.with_target(self.collect_schema(options))
+
+        return self.insert(
+            batches,
+            mode=options.mode,
+            match_by=options.match_by_names,
+            wait=options.wait
+        )
+    
+    # Properties
+    
     @property
     def name(self):
         return self.table_name
-
-    _infos: Optional[TableInfo] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _infos_fetched_at: float | None = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _columns: Optional[list[Column]] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _tags: Optional[tuple[Any, ...]] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _tags_fetched_at: float | None = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _column_tags: Optional[dict[str, tuple[Any, ...]]] = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _column_tags_fetched_at: float | None = field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
 
     @property
     def url(self) -> URL:
@@ -213,7 +220,19 @@ class Table(GrantsMixin):
             catalog_name=self.catalog_name,
             schema_name=self.schema_name
         )
-
+    
+    def execute(
+        self,
+        statement: str | PreparedStatement,
+        *args,
+        **kwargs
+    ):
+        return self.sql.execute(
+            statement=statement,
+            *args,
+            **kwargs
+        )
+    
     @property
     def catalog(self) -> "Catalog":
         from .catalog import Catalog as _Catalog
@@ -250,6 +269,10 @@ class Table(GrantsMixin):
             )
         return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
 
+    def column_full_name(self, column_name: str) -> str:
+        """Fully-qualified column name suitable for ``entity_tag_assignments``."""
+        return f"{self.full_name()}.{column_name}"
+
     def __repr__(self) -> str:
         return f"Table({self.url.to_string()!r})"
 
@@ -274,14 +297,23 @@ class Table(GrantsMixin):
     def _reset_cache(self, invalidate_cache: bool = False) -> None:
         if invalidate_cache:
             self.sql.tables.invalidate_cached_table(table=self)
+            # Also drop entity-tag entries for this table and its columns —
+            # a structural change (rename / drop / recreate) means the
+            # ``entity_name`` keys themselves are stale.
+            self._invalidate_entity_tag_cache()
 
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
-        object.__setattr__(self, "_tags", None)
-        object.__setattr__(self, "_tags_fetched_at", None)
-        object.__setattr__(self, "_column_tags", None)
-        object.__setattr__(self, "_column_tags_fetched_at", None)
+
+    def _invalidate_entity_tag_cache(self) -> None:
+        """Drop cached tag lists for this table and every cached column."""
+        tags = self.client.entity_tags
+        tags.invalidate_cached_tags("tables", self.full_name())
+        # Use the still-cached columns list (if any) — refusing to refetch
+        # ``infos`` here keeps invalidation cheap and safe inside teardown.
+        for col in (self._columns or ()):
+            tags.invalidate_cached_tags("columns", self.column_full_name(col.name))
 
     def clear(self) -> "Table":
         self._reset_cache()
@@ -310,26 +342,13 @@ class Table(GrantsMixin):
         return (time.time() - fetched_at) < INFOS_TTL
 
     def _store_infos(self, infos: TableInfo) -> TableInfo:
-        """Populate the lightweight infos + columns caches.
-
-        ``_infos_fetched_at`` is the single TTL marker for every cached
-        view derived from this fetch (table tags, column tags, and
-        ``table_constraints``). The tag caches remain lazy so we don't
-        pay an N+1 round-trip tax on every ``infos`` refresh — they
-        populate on first access and share the same freshness horizon.
-        """
-        object.__setattr__(self, "_infos", infos)
-        object.__setattr__(self, "_infos_fetched_at", time.time())
-        object.__setattr__(self, "_columns", [
+        """Populate the ``infos`` + ``columns`` caches."""
+        self._infos_fetched_at = time.time()
+        self._infos = infos
+        self._columns = [
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
-        ])
-        # Tags were invalidated when infos expired — a fresh ``infos``
-        # means they need to be (re)loaded on next access.
-        object.__setattr__(self, "_tags", None)
-        object.__setattr__(self, "_tags_fetched_at", None)
-        object.__setattr__(self, "_column_tags", None)
-        object.__setattr__(self, "_column_tags_fetched_at", None)
+        ]
         return infos
 
     @property
@@ -347,76 +366,46 @@ class Table(GrantsMixin):
         return info
 
     # =========================================================================
-    # Entity-tag assignments — lazy, share the ``infos`` TTL
+    # Entity-tag assignments — delegated to client.entity_tags
     # =========================================================================
 
-    def _list_tag_assignments(
-        self,
-        entity_type: str,
-        entity_name: str,
-    ) -> tuple[Any, ...]:
-        """Return entity-tag assignments for ``entity_name``.
-
-        Missing SDK API, permission errors, or disabled workspace features
-        are logged and produce an empty tuple; the caller can treat the
-        absence of tags as "none known".
-        """
-        from .tags_api import list_tag_assignments
-
-        return list_tag_assignments(
-            self.client,
-            entity_type=entity_type,
-            entity_name=entity_name,
+    @property
+    def tags(self) -> tuple[EntityTagAssignment, ...]:
+        """Table-level entity-tag assignments — served from ``client.entity_tags``."""
+        return tuple(
+            self.client.entity_tags.entity_tags(
+                "tables", self.full_name(), default=()
+            ) or ()
         )
 
     @property
-    def tags(self) -> tuple[Any, ...]:
-        """Table-level entity-tag assignments — TTL-cached, lazy-loaded."""
-        if self._tags is not None and self._is_fresh(self._tags_fetched_at):
-            return self._tags
+    def column_tags(self) -> Mapping[str, tuple[EntityTagAssignment, ...]]:
+        """Per-column entity-tag assignments.
 
-        assignments = self._list_tag_assignments("tables", self.full_name())
-        object.__setattr__(self, "_tags", assignments)
-        object.__setattr__(self, "_tags_fetched_at", time.time())
-        return assignments
-
-    @property
-    def column_tags(self) -> Mapping[str, tuple[Any, ...]]:
-        """Per-column entity-tag assignments — TTL-cached, lazy-loaded.
-
-        Only columns that have at least one tag assignment appear in the
-        returned mapping. Fetches are parallelised so wide tables pay
-        one aggregate wall-clock round trip rather than N sequential ones.
+        Fan-out is parallelised so wide tables pay one aggregate wall-clock
+        round trip rather than N sequential ones; cache hits inside
+        ``client.entity_tags`` short-circuit each leg.
         """
-        if self._column_tags is not None and self._is_fresh(self._column_tags_fetched_at):
-            return self._column_tags
-
-        full_name = self.full_name()
+        tags = self.client.entity_tags
+        full = self.full_name()
         jobs: dict[str, Any] = {}
         for col_info in (self.infos.columns or []):
             col_name = col_info.name
             if not col_name:
                 continue
             jobs[col_name] = Job.make(
-                self._list_tag_assignments,
+                tags.entity_tags,
                 "columns",
-                f"{full_name}.{col_name}",
+                f"{full}.{col_name}",
+                default=(),
             ).fire_and_forget()
 
-        assignments: dict[str, tuple[Any, ...]] = {}
+        result: dict[str, tuple[Any, ...]] = {}
         for col_name, job in jobs.items():
-            col_assignments = tuple(job.wait() or ())
-            if col_assignments:
-                assignments[col_name] = col_assignments
-
-        object.__setattr__(self, "_column_tags", assignments)
-        object.__setattr__(self, "_column_tags_fetched_at", time.time())
-        return assignments
-
-    @property
-    def table_constraints(self) -> tuple[Any, ...]:
-        """Table constraints (PK / FK / named) from ``TableInfo``."""
-        return tuple(getattr(self.infos, "table_constraints", None) or ())
+            assignments = tuple(job.wait() or ())
+            if assignments:
+                result[col_name] = assignments
+        return result
 
     # =========================================================================
     # Arrow schema introspection
@@ -425,8 +414,7 @@ class Table(GrantsMixin):
     @property
     def columns(self) -> list[Column]:
         if self._columns is None:
-            # Refresh the cache if needed to ensure we have the latest column infos.
-            _ = self.infos
+            _ = self.infos  # populates _columns as a side effect
         return self._columns
 
     def column(
@@ -451,30 +439,8 @@ class Table(GrantsMixin):
             raise ValueError(f"Column {name!r} not found in {self!r}")
         return None
 
-    def collect_schema(self, safe: bool = True) -> DataSchema:
-        """Return the field schema, optionally enriched with UC metadata.
-
-        ``full=False`` (default) is the cheap, round-trip-free path: only
-        the cached column infos are consulted, and the resulting schema
-        carries the table-level identity metadata (``name``, ``engine``,
-        ``catalog_name``, ``schema_name``, ``table_name``).
-
-        ``full=True`` triggers the enriched view used for governance and
-        merge planning — it pulls ``TableInfo.table_constraints`` and the
-        lazy tag caches (fetching them on demand) to stamp each column:
-
-        - ``primary_key`` — ``b"true"`` when the field is part of the
-          table's PRIMARY KEY constraint.
-        - ``foreign_key`` — ``b"<catalog>.<schema>.<ref_table>.<ref_col>"``
-          for any column that is the child of a FOREIGN KEY constraint.
-        - any user-assigned ``EntityTagAssignment`` (one ``tag_key`` →
-          one field tag).
-
-        Schema-level metadata also picks up ``tag:<key>`` entries for
-        each table-level tag and ``primary_key`` / ``foreign_key``
-        summaries so downstream consumers can rebuild the full
-        constraint graph without extra round trips.
-        """
+    def _collect_schema(self, options: CastOptions) -> DataSchema:
+        """Return the field schema, optionally enriched with UC metadata."""
         metadata: dict[bytes, bytes] = {
             b"name": self.table_name.encode(),
             b"engine": b"databricks",
@@ -483,26 +449,12 @@ class Table(GrantsMixin):
             b"table_name": self.table_name.encode(),
         }
 
-        if not safe:
-            return DataSchema.from_any_fields(
-                [c.field for c in self.columns],
-                metadata=metadata,
-            )
-
-        pk_columns, fk_refs = self._constraint_summary()
         col_tags = self.column_tags
 
         fields: list[Field] = []
         for column in self.columns:
             base = column.field
             extra_tags: dict[bytes, bytes] = {}
-
-            if column.name in pk_columns:
-                extra_tags[b"primary_key"] = b"true"
-
-            fk_ref = fk_refs.get(column.name)
-            if fk_ref:
-                extra_tags[b"foreign_key"] = fk_ref.encode("utf-8")
 
             for assignment in col_tags.get(column.name, ()):
                 key = getattr(assignment, "tag_key", None)
@@ -521,14 +473,6 @@ class Table(GrantsMixin):
             else:
                 fields.append(base)
 
-        if pk_columns:
-            metadata[b"primary_key"] = ",".join(pk_columns).encode("utf-8")
-        if fk_refs:
-            # Dot-joined ``col=ref`` pairs keep the format parseable by
-            # ``ForeignKeySpec.from_any`` without a JSON round trip.
-            metadata[b"foreign_key"] = ",".join(
-                f"{col}={ref}" for col, ref in fk_refs.items()
-            ).encode("utf-8")
         for assignment in self.tags:
             key = getattr(assignment, "tag_key", None)
             if not key:
@@ -539,46 +483,7 @@ class Table(GrantsMixin):
         return DataSchema.from_any_fields(fields, metadata=metadata)
 
     def collect_data_field(self, safe: bool = False) -> Field:
-        """Return the struct :class:`Field` rollup of :meth:`collect_schema`."""
         return self.collect_schema(safe=safe).to_field()
-
-    def _constraint_summary(
-        self,
-    ) -> tuple[tuple[str, ...], dict[str, str]]:
-        """Flatten ``TableInfo.table_constraints`` into ``(pk_cols, fk_refs)``.
-
-        ``fk_refs`` maps child column → ``parent_table.parent_column`` (the
-        first parent column when the FK is multi-column — this matches the
-        single-column ``foreign_key`` metadata convention used by
-        :class:`~yggdrasil.data.Field`).
-        """
-        pk_columns: tuple[str, ...] = ()
-        fk_refs: dict[str, str] = {}
-        for constraint in self.table_constraints:
-            pk = getattr(constraint, "primary_key_constraint", None)
-            if pk is not None:
-                cols = getattr(pk, "child_columns", None) or ()
-                if cols:
-                    pk_columns = tuple(cols)
-                continue
-
-            fk = getattr(constraint, "foreign_key_constraint", None)
-            if fk is not None:
-                child_cols = getattr(fk, "child_columns", None) or ()
-                parent_table = getattr(fk, "parent_table", None) or ""
-                parent_cols = getattr(fk, "parent_columns", None) or ()
-                if not (child_cols and parent_table and parent_cols):
-                    continue
-                # Zip child→parent column-wise; pad parent_cols with the
-                # last element if the API ever returns mismatched lengths.
-                for idx, child in enumerate(child_cols):
-                    parent = (
-                        parent_cols[idx]
-                        if idx < len(parent_cols)
-                        else parent_cols[-1]
-                    )
-                    fk_refs[child] = f"{parent_table}.{parent}"
-        return pk_columns, fk_refs
 
     @property
     def arrow_fields(self) -> list[pa.Field]:
@@ -595,31 +500,20 @@ class Table(GrantsMixin):
     def set_tags(
         self,
         tags: Mapping[str, str] | None,
-        *,
-        tag_collation: str | None = DEFAULT_TAG_COLLATION,
     ) -> "Table":
         """Apply table-level tags via the UC ``entity_tag_assignments`` API.
 
-        The legacy ``ALTER TABLE ... SET TAGS (...)`` DDL is no longer
-        executed; ``set_tags_ddl`` is retained for dry-run / logging only.
-        ``tag_collation`` is accepted for API compatibility and ignored.
+        ``tag_collation`` is accepted for API compatibility and ignored —
+        collations only matter for the legacy DDL literal form.
         """
-        del tag_collation  # tag collations are a SQL-literal concern only.
         if not tags:
             return self
 
-        from .tags_api import apply_tags
-
-        apply_tags(
-            self.client,
+        self.client.entity_tags.update_entity_tags(
+            tags=tags,
             entity_type="tables",
             entity_name=self.full_name(),
-            tags=tags,
         )
-        # Tags were mutated — drop the per-entity tag cache so the next
-        # accessor pulls the fresh assignments from the server.
-        object.__setattr__(self, "_tags", None)
-        object.__setattr__(self, "_tags_fetched_at", None)
         return self
 
     def unset_tags(
@@ -629,22 +523,13 @@ class Table(GrantsMixin):
         if_exists: bool = True,
     ) -> "Table":
         """Delete table-level tag assignments by key."""
-        from .tags_api import delete_tags
-
-        delete_tags(
-            self.client,
+        self.client.entity_tags.delete_entity_tags(
             entity_type="tables",
             entity_name=self.full_name(),
             tag_keys=tag_keys,
             if_exists=if_exists,
         )
-        object.__setattr__(self, "_tags", None)
-        object.__setattr__(self, "_tags_fetched_at", None)
         return self
-
-    # =========================================================================
-    # Constraint helpers — inline CREATE TABLE constraint rendering
-    # =========================================================================
 
     # =========================================================================
     # Lifecycle — create / ensure / delete
@@ -680,10 +565,7 @@ class Table(GrantsMixin):
         *,
         mode: Mode | str | None = None,
     ):
-        return self.with_columns(
-            [column],
-            mode=mode,
-        )
+        return self.with_columns([column], mode=mode)
 
     def with_columns(
         self,
@@ -691,24 +573,6 @@ class Table(GrantsMixin):
         *,
         mode: Mode | str | None = None,
     ):
-        """Evolve this table's schema to match *columns*.
-
-        Matching is case-insensitive: an input field whose name differs only
-        in case from an existing column is treated as the same column and
-        renamed to the supplied casing.
-
-        Mode semantics
-        --------------
-        ``UPSERT`` (and ``AUTO``)
-            Rename case-insensitive matches, add new columns, update the data
-            type of existing columns whose dtype no longer matches the input.
-        ``OVERWRITE``
-            Everything ``UPSERT`` does, plus drop columns that do not appear
-            in *columns* so the resulting schema matches the input exactly.
-        Any other mode
-            Only adds new columns and renames case-insensitive matches, so
-            the call remains non-destructive.
-        """
         mode = Mode.from_(mode, default=Mode.AUTO)
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
         update_dtype = mode in (Mode.UPSERT, Mode.OVERWRITE)
@@ -721,7 +585,6 @@ class Table(GrantsMixin):
 
         for column in columns:
             data_field = Field.from_any(column)
-
             existing = self.column(name=data_field.name, safe=False, raise_error=False)
 
             if existing is None:
@@ -762,8 +625,6 @@ class Table(GrantsMixin):
                 f"{alter_table} ADD COLUMNS ({', '.join(add_columns)})"
             )
 
-        # Renames must complete before we reference the new names in ALTER
-        # COLUMN TYPE; split those into an earlier phase when both exist.
         needs_phase_split = bool(rename_statements and type_statements)
 
         first_phase: list[str] = []
@@ -809,15 +670,6 @@ class Table(GrantsMixin):
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True,
     ) -> "Table":
-        """Create the table, routing to SQL DDL or the Unity Catalog REST API.
-
-        SQL path:
-            - inlines PK/FK constraints directly in CREATE TABLE
-
-        API path:
-            - creates the table first
-            - then applies PK/FK via ALTER TABLE fallback
-        """
         mode = Mode.from_(mode, default=Mode.AUTO)
         schema = DataSchema.from_(definition)
 
@@ -826,10 +678,7 @@ class Table(GrantsMixin):
                 raise ValueError(f"Table {self!r} already exists")
             elif mode == Mode.IGNORE:
                 return self
-            return self.with_columns(
-                schema.fields,
-                mode=mode,
-            )
+            return self.with_columns(schema.fields, mode=mode)
 
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
@@ -838,7 +687,6 @@ class Table(GrantsMixin):
             result = self.sql_create(
                 definition,
                 comment=comment,
-                partition_by=partition_by,
                 if_not_exists=if_not_exists,
             )
         else:
@@ -857,52 +705,13 @@ class Table(GrantsMixin):
                 if_not_exists=if_not_exists,
             )
 
-        self._apply_grants_from_metadata(schema.metadata)
         return result
-
-    def _apply_grants_from_metadata(
-        self,
-        metadata: Mapping[bytes | str, Any] | None,
-    ) -> None:
-        """Grant the principals listed under ``b"grants"`` access to this table.
-
-        Each principal receives the default privilege chain required to read
-        the table: ``USE_CATALOG`` on the catalog, ``USE_SCHEMA`` on the
-        schema, and ``SELECT`` on the table itself.  Failures are logged and
-        do not abort table creation.
-        """
-        if not metadata:
-            return
-
-        raw = metadata.get(GRANTS_METADATA_KEY) or metadata.get(
-            GRANTS_METADATA_KEY.decode("utf-8")
-        )
-        principals = parse_grants_principals(raw)
-        if not principals:
-            return
-
-        catalog = self.catalog
-        schema = self.schema
-
-        for principal in principals:
-            try:
-                catalog.grant(principal, [Privilege.USE_CATALOG])
-                schema.grant(principal, [Privilege.USE_SCHEMA])
-                self.grant(principal, [Privilege.SELECT])
-            except Exception:
-                logger.warning(
-                    "Failed to apply default grants for principal %r on %s",
-                    principal, self.full_name(),
-                    exc_info=True,
-                )
 
     def sql_create(
         self,
-        description: Union[pa.Field, pa.Schema, Any],
+        description: DataSchema,
         *,
         storage_location: str | None = None,
-        partition_by: Optional[list[str]] = None,
-        cluster_by: Optional[list[str]] = None,
         comment: str | None = None,
         properties: Optional[dict[str, Any]] = None,
         if_not_exists: bool = True,
@@ -917,14 +726,6 @@ class Table(GrantsMixin):
         wait_result: bool = True,
         auto_tag: bool = True,
     ) -> "Table":
-        """Generate and execute a CREATE TABLE DDL statement.
-
-        PK columns are forced to NOT NULL in the column definition to match
-        Databricks requirements for primary keys. The PK/FK constraints
-        themselves are applied after the table exists, via the Unity Catalog
-        ``TableConstraintsAPI`` — see
-        https://docs.databricks.com/api/gcp/workspace/tableconstraints.
-        """
         schema_info = DataSchema.from_any(description).autotag()
         comment = comment or schema_info.comment
         effective_fields: list[Field] = []
@@ -1073,10 +874,6 @@ class Table(GrantsMixin):
     # =========================================================================
 
     def rename(self, new_name: str) -> "Table":
-        """Rename this table in-place (``ALTER TABLE … RENAME TO …``).
-
-        The catalog/schema parent is unchanged; *new_name* is the unqualified name.
-        """
         new_name = (new_name or "").strip().strip("`")
         if not new_name:
             raise ValueError("Cannot rename table to an empty name")
@@ -1106,12 +903,6 @@ class Table(GrantsMixin):
         )
         return DeltaTable.forName(sparkSession=session, tableOrViewName=self.full_name(safe=True))
 
-    def to_spark(
-        self,
-        spark_session: Optional["SparkSession"] = None,
-    ) -> "SparkDataFrame":
-        return self.delta_spark(spark_session=spark_session).toDF()
-
     # =========================================================================
     # Data I/O
     # =========================================================================
@@ -1121,7 +912,6 @@ class Table(GrantsMixin):
         *,
         filters: Optional[list[tuple[str, str, str]]] = None,
         wait: WaitingConfigArg = True,
-        cache_for: WaitingConfigArg = None,
     ):
         statement = f"SELECT * FROM {self.full_name(safe=True)}"
         if filters:
@@ -1131,7 +921,6 @@ class Table(GrantsMixin):
         result = self.sql.execute(
             statement,
             wait=wait,
-            cache_for=cache_for,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
         )
@@ -1231,16 +1020,6 @@ class Table(GrantsMixin):
         )
 
     # =========================================================================
-    # Grants — Unity Catalog REST API helpers
-    # =========================================================================
-
-    def _grants_securable_type(self) -> SecurableType:
-        return SecurableType.TABLE
-
-    def _grants_full_name(self) -> str:
-        return self.full_name()
-
-    # =========================================================================
     # Permissions — SQL DDL helpers
     # =========================================================================
 
@@ -1273,7 +1052,6 @@ class Table(GrantsMixin):
     def _normalize_table_privileges(
         privileges: str | Iterable[str] | None,
     ) -> tuple[str, ...]:
-        """Normalize table privilege names to Databricks SQL GRANT syntax."""
         if privileges is None:
             privileges = ("SELECT",)
         elif isinstance(privileges, str):
@@ -1325,7 +1103,6 @@ class Table(GrantsMixin):
         groups: Iterable[IAMGroup | str] | None,
         group: Iterable[IAMGroup | str] | None,
     ) -> tuple[str, ...]:
-        """Collect principals from supported user/group inputs preserving order."""
         seen: set[str] = set()
         out: list[str] = []
 
@@ -1357,7 +1134,6 @@ class Table(GrantsMixin):
         principal: str,
         privileges: str | Iterable[str],
     ) -> str:
-        """Build a ``GRANT`` DDL statement for one principal on this table."""
         grant_privileges = self._normalize_table_privileges(privileges)
         return (
             f"GRANT {', '.join(grant_privileges)} "

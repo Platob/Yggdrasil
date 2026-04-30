@@ -156,12 +156,6 @@ def test_iterable_conversion_rejects_str_and_bytes_sources() -> None:
         convert(b"123", set[int])
 
 
-def test_arrow_array_to_list_recursively_casts_elements() -> None:
-    arr = pa.array(["1", "2", "3"])
-    out = convert(arr, list[int])
-    assert out == [1, 2, 3]
-
-
 def test_options_object_is_accepted() -> None:
     # Don’t assume specific fields exist; just ensure the arg path works.
     opts = CastOptions.check()

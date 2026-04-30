@@ -5,84 +5,44 @@ This module provides the :class:`Warehouses` service, a thin layer around the
 Databricks SDK ``WarehousesAPI`` that handles:
 
 - listing / finding warehouses by name or id
-- creating, updating and deleting warehouses with sensible defaults
+- creating, updating, and deleting warehouses with sensible defaults
 - managing warehouse permissions
 - maintaining a short-lived in-process cache to avoid redundant API calls
 """
 
 import dataclasses as dc
-import inspect
 import logging
-import random
-from typing import Optional, Sequence, Any, Type, TypeVar, Union, List, Iterator, TYPE_CHECKING
+from typing import Optional, Sequence, Union, List, Iterator
 
-from databricks.sdk import WarehousesAPI
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import (
     State, EndpointInfo,
     EndpointTags, EndpointTagPair, EndpointInfoWarehouseType,
-    GetWarehouseResponse, GetWarehouseResponseWarehouseType,
     WarehouseAccessControlRequest, WarehousePermissionLevel,
 )
-
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.databricks.client import DatabricksService, DatabricksClient
+from yggdrasil.databricks.warehouse._utils import DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME, \
+    safeEndpointInfo, _CREATE_ARG_NAMES
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.databricks.client import DatabricksService, DatabricksClient
 
-if TYPE_CHECKING:
-    from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
+from .warehouse import SQLWarehouse
 
 __all__ = [
     "Warehouses",
-    "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
-    "DEFAULT_ALL_PURPOSE_CLASSIC_NAME",
-    "safeGetWarehouseResponse",
-    "safeEndpointInfo",
     "set_cached_warehouse",
     "get_cached_warehouse",
 ]
 
 LOGGER = logging.getLogger(__name__)
 
-_CREATE_ARG_NAMES: set[str] = {_ for _ in inspect.signature(WarehousesAPI.create).parameters.keys()}
-_EDIT_ARG_NAMES: set[str] = {_ for _ in inspect.signature(WarehousesAPI.edit).parameters.keys()}
-
 # host -> ExpiringDict(warehouse_name -> SQLWarehouse)
 CACHE_MAP: dict[str, ExpiringDict[str, "SQLWarehouse"]] = {}
-
-T = TypeVar("T")
-
-DEFAULT_ALL_PURPOSE_CLASSIC_NAME = "Yggdrasil All Purpose"
-DEFAULT_ALL_PURPOSE_SERVERLESS_NAME = DEFAULT_ALL_PURPOSE_CLASSIC_NAME + " Serverless"
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def safeGetWarehouseResponse(src: Union[GetWarehouseResponse, EndpointInfo]) -> GetWarehouseResponse:
-    if isinstance(src, GetWarehouseResponse):
-        return src
-
-    payload = _copy_common_fields(src, GetWarehouseResponse, skip={"warehouse_type"})
-    payload["warehouse_type"] = _safe_map_enum(
-        GetWarehouseResponseWarehouseType,
-        getattr(src, "warehouse_type", None),
-    )
-    return GetWarehouseResponse(**payload)
-
-
-def safeEndpointInfo(src: Union[GetWarehouseResponse, EndpointInfo]) -> EndpointInfo:
-    if isinstance(src, EndpointInfo):
-        return src
-
-    payload = _copy_common_fields(src, EndpointInfo, skip={"warehouse_type"})
-    payload["warehouse_type"] = _safe_map_enum(
-        EndpointInfoWarehouseType,
-        getattr(src, "warehouse_type", None),
-    )
-    return EndpointInfo(**payload)
 
 
 def set_cached_warehouse(
@@ -103,57 +63,6 @@ def get_cached_warehouse(
     host = client.base_url.to_string()
     existing = CACHE_MAP.get(host)
     return existing.get(warehouse_name) if existing else None
-
-
-def _safe_map_enum(dst_enum: Type[T], src_val: Any) -> Optional[T]:
-    """Best-effort enum mapping between two SDK enum types."""
-    if src_val is None:
-        return None
-    if isinstance(src_val, dst_enum):
-        return src_val
-    try:
-        return dst_enum(src_val)  # type: ignore[misc]
-    except Exception:
-        pass
-    try:
-        return dst_enum(src_val.value)  # type: ignore[misc]
-    except Exception:
-        pass
-    try:
-        return dst_enum[src_val.name]  # type: ignore[index]
-    except Exception:
-        pass
-    try:
-        return dst_enum(str(src_val))  # type: ignore[misc]
-    except Exception:
-        return None
-
-
-def _copy_common_fields(src: Any, dst_cls: Type[T], *, skip: set[str] = frozenset()) -> dict:
-    dst_field_names = {f.name for f in dc.fields(dst_cls)}
-    return {
-        name: getattr(src, name, None)
-        for name in dst_field_names
-        if name not in skip
-    }
-
-
-def _jitter_sleep_seconds(
-    wait: WaitingConfig,
-    *,
-    iteration: int,
-    remaining: Optional[float],
-) -> float:
-    """Exponential backoff with full jitter, capped by remaining deadline."""
-    base = float(wait.interval or 1.0)
-    backoff = max(float(wait.backoff or 1.0), 1.0)
-    delay = base * (backoff ** iteration)
-    if wait.max_interval:
-        delay = min(delay, float(wait.max_interval))
-    delay = random.uniform(0.0, delay)
-    if remaining is not None:
-        delay = min(delay, max(0.0, remaining))
-    return max(0.0, delay)
 
 
 # ---------------------------------------------------------------------------
@@ -177,16 +86,14 @@ class Warehouses(DatabricksService):
 
     def list_warehouses(self) -> Iterator["SQLWarehouse"]:
         """Yield all SQL warehouses visible to the current principal."""
-        from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
-
         client = self.client.workspace_client().warehouses
         for info in client.list():
             warehouse = SQLWarehouse(
                 service=self,
                 warehouse_id=info.id,
                 warehouse_name=info.name,
+                details=safeEndpointInfo(info)
             )
-            object.__setattr__(warehouse, "_details", safeEndpointInfo(info))
             yield warehouse
 
     def find_warehouse(
@@ -202,7 +109,7 @@ class Warehouses(DatabricksService):
         Parameters
         ----------
         warehouse_id:
-            Exact warehouse id to resolve (fastest path).
+            Exact warehouse id to resolve (the fastest path).
         warehouse_name:
             Warehouse name to resolve.  Uses an in-process cache first,
             then falls back to listing all warehouses.
@@ -217,8 +124,6 @@ class Warehouses(DatabricksService):
         A :class:`~yggdrasil.databricks.sql.warehouse.SQLWarehouse` resource,
         or ``None`` when *raise_error* is False and the warehouse is not found.
         """
-        from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
-
         if warehouse_id:
             LOGGER.debug("find_warehouse: resolving by id=%s", warehouse_id)
             return SQLWarehouse(
@@ -295,9 +200,10 @@ class Warehouses(DatabricksService):
                 classic = warehouse
                 set_cached_warehouse(client=self.client, warehouse=classic)
 
-                if classic._details.state == State.RUNNING:
+                state = classic.state
+                if state == State.RUNNING:
                     return classic
-                elif classic._details.state != State.STARTING:
+                elif state != State.STARTING:
                     classic.start(wait=False, raise_error=False)
 
                 if serverless is not None:
@@ -392,8 +298,6 @@ class Warehouses(DatabricksService):
         **warehouse_specs,
     ) -> "SQLWarehouse":
         """Create a new SQL warehouse and return a resource handle."""
-        from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
-
         client = self.client.workspace_client().warehouses
         wait = WaitingConfig.from_(wait)
 
@@ -429,7 +333,7 @@ class Warehouses(DatabricksService):
             service=self,
             warehouse_id=info.id,
             warehouse_name=info.name,
-            _details=info,
+            details=info,
         )
 
         if permissions:

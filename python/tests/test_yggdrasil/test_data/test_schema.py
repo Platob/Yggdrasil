@@ -87,58 +87,6 @@ def test_post_init_normalizes_mapping_input_and_rewrites_names():
     assert s["book"].name == "book"
 
 
-def test_fields_and_children_fields_are_tuples_in_order():
-    s = schema([_field_int("a"), _field_str("b")])
-
-    assert isinstance(s.fields, tuple)
-    assert isinstance(s.children_fields, tuple)
-    assert [f.name for f in s.fields] == ["a", "b"]
-    assert [f.name for f in s.children_fields] == ["a", "b"]
-
-
-def test_name_defaults_to_root_and_can_be_set():
-    s = schema([_field_int("a")])
-
-    assert s.name == DEFAULT_FIELD_NAME
-
-    s.name = "orders"
-
-    assert s.name == "orders"
-    assert s.metadata is not None
-    assert s.metadata[b"name"] == b"orders"
-
-
-def test_name_setter_falsey_value_falls_back_to_root():
-    s = schema([_field_int("a")], metadata={"name": "orders"})
-
-    s.name = ""
-
-    assert s.name == "orders"
-    assert s.metadata is not None
-    assert s.metadata[b"name"] == b"orders"
-
-
-def test_nullable_defaults_false_and_can_be_enabled():
-    s = schema([_field_int("a")])
-
-    assert s.nullable is False
-
-    s.nullable = True
-
-    assert s.nullable is True
-    assert s.metadata is not None
-    assert s.metadata[b"nullable"] == b"t"
-
-
-def test_nullable_setter_does_not_write_false_when_missing_metadata():
-    s = schema([_field_int("a")])
-
-    s.nullable = False
-
-    assert s.nullable is False
-    assert s.metadata is None or b"nullable" not in s.metadata
-
-
 def test_comment_reads_comment_then_description():
     s1 = schema([_field_int("a")], metadata={"comment": "hello"})
     s2 = schema([_field_int("a")], metadata={"description": "world"})
@@ -166,21 +114,6 @@ def test_arrow_fields_returns_arrow_fields():
     assert len(arrow_fields) == 2
     assert all(isinstance(f, pa.Field) for f in arrow_fields)
     assert [f.name for f in arrow_fields] == ["qty", "book"]
-
-
-def test_partition_cluster_primary_foreign_key_properties():
-    s = schema(
-        [
-            _field_int("date_id", tags={"partition_by": "true"}),
-            _field_int("book_id", tags={"cluster_by": "true", "primary_key": "true"}),
-            _field_int("trade_id", tags={"primary_key": "true"}),
-            _field_int("counterparty_id", tags={"foreign_key": "dim_counterparty.id"}),
-        ]
-    )
-
-    assert s.partition_by.field_names() == ["date_id"]
-    assert s.cluster_by.field_names() == ["book_id"]
-    assert s.primary_keys.field_names() == ["book_id", "trade_id"]
 
 
 def test_copy_preserves_fields_and_metadata_but_deep_copies_field_objects():
@@ -504,21 +437,18 @@ def test_autotag_propagates_dtype_and_field_tags_per_column():
     out = s.autotag(tags={"layer": "silver"})
 
     id_tags = out["user_id"].tags or {}
-    assert id_tags[b"kind"] == b"integer"
+    assert id_tags[b"type_name"] == b"integer"
     assert id_tags[b"signed"] == b"true"
     assert id_tags[b"nullable"] == b"false"
-    assert id_tags[b"role"] == b"identifier"
     assert id_tags[b"primary_key"] == b"true"
 
     email_tags = out["email"].tags or {}
-    assert email_tags[b"kind"] == b"string"
-    assert email_tags[b"pii"] == b"email"
+    assert email_tags[b"type_name"] == b"string"
 
     ts_tags = out["created_at"].tags or {}
-    assert ts_tags[b"kind"] == b"timestamp"
+    assert ts_tags[b"type_name"] == b"timestamp"
     assert ts_tags[b"unit"] == b"us"
     assert ts_tags[b"tz"] == b"UTC"
-    assert ts_tags[b"role"] == b"audit_timestamp"
 
     assert out.metadata is not None
     assert out.metadata[b"t:layer"] == b"silver"

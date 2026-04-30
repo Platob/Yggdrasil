@@ -1,17 +1,14 @@
 import base64
+import datetime as dt
 import io
 import logging
-
-from databricks.sdk.errors import NotFound
-
-from yggdrasil.data.cast import any_to_datetime
-
-import yggdrasil.pickle.json as json_module
 from dataclasses import dataclass, field
 from typing import Optional, Any, Mapping
-import datetime as dt
 
+import yggdrasil.pickle.json as json_module
+from databricks.sdk.errors import NotFound
 from databricks.sdk.service.workspace import GetSecretResponse, AclPermission
+from yggdrasil.data.cast import any_to_datetime
 
 from .service import Secrets
 from ..client import DatabricksResource
@@ -53,7 +50,6 @@ class Permission:
         return cls(principal=value, acl=AclPermission.MANAGE)
 
 
-@dataclass
 class Scope(DatabricksResource):
     service: Secrets = field(
         default_factory=Secrets.current,
@@ -62,6 +58,16 @@ class Scope(DatabricksResource):
         repr=False
     )
     key: Optional[str] = field(default=None)
+
+    def __init__(
+        self,
+        service: Secrets | None = None,
+        key: Optional[str] = None,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.service = Secrets.current() if service is None else service
+        self.key = key
 
     def __bool__(self):
         return bool(self.key)
@@ -171,7 +177,6 @@ class Scope(DatabricksResource):
         return self
 
 
-@dataclass
 class Secret(DatabricksResource):
     service: Secrets = field(
         default_factory=Secrets,
@@ -183,6 +188,22 @@ class Secret(DatabricksResource):
     key: Optional[str] = field(default=None)
     b64: Optional[str] = field(default=None, repr=False, compare=False)
     update_timestamp: Optional[dt.datetime] = None
+
+    def __init__(
+        self,
+        service: Secrets | None = None,
+        scope: Scope | None = None,
+        key: Optional[str] = None,
+        b64: Optional[str] = None,
+        update_timestamp: Optional[dt.datetime] = None,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.service = Secrets.current() if service is None else service
+        self.scope = scope
+        self.key = key
+        self.b64 = b64
+        self.update_timestamp = update_timestamp
 
     def __post_init__(self):
         self.scope = Scope.parse(self.scope, service=self.service)

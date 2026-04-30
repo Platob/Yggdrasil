@@ -14,12 +14,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Opt
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.compute import Language
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import (
     WaitingConfigArg,
 )
-from yggdrasil.environ import shutdown as yg_shutdown
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
 from yggdrasil.io.url import URL
 from yggdrasil.pickle.ser import Serialized, dumps
@@ -33,7 +31,6 @@ __all__ = [
     "RemoteMetadata",
     "ContextPoolKey",
     "exclude_env_key",
-    "close_all_pooled_contexts",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -174,17 +171,6 @@ class ContextPoolKey:
 
 _CONTEXT_POOL: dict[ContextPoolKey, "ExecutionContext"] = {}
 _CONTEXT_POOL_LOCK = threading.RLock()
-
-# Strong-reference keepalive for non-pooled temporary contexts.
-#
-# The shutdown registry holds bound methods via weakref.WeakMethod, which
-# means a temporary context that nobody keeps a reference to would see its
-# shutdown hook silently pruned before atexit fires — leaking a live remote
-# context on the cluster. Pooled contexts are already pinned by _CONTEXT_POOL,
-# but directly-constructed temporary contexts are not. This set closes that
-# gap.
-_LIVE_TEMP_CONTEXTS: set["ExecutionContext"] = set()
-_LIVE_TEMP_CONTEXTS_LOCK = threading.RLock()
 
 
 # ============================================================================
@@ -511,48 +497,6 @@ class ExecutionContext:
             return ctx
 
     # ------------------------------------------------------------------
-    # Shutdown-hook integration
-    # ------------------------------------------------------------------
-
-    def _register_shutdown_close(self) -> None:
-        """Register a process-exit hook that closes this temporary context."""
-        if self._shutdown_registered or not self.temporary:
-            return
-        try:
-            yg_shutdown.register(self._unsafe_close)
-        except Exception:
-            LOGGER.debug(
-                "Failed to register shutdown handler for context %s",
-                self.context_id,
-                exc_info=True,
-            )
-            return
-
-        with _LIVE_TEMP_CONTEXTS_LOCK:
-            _LIVE_TEMP_CONTEXTS.add(self)
-        self._shutdown_registered = True
-
-    def _unregister_shutdown_close(self) -> None:
-        """Remove the process-exit hook. Idempotent."""
-        if not self._shutdown_registered:
-            with _LIVE_TEMP_CONTEXTS_LOCK:
-                _LIVE_TEMP_CONTEXTS.discard(self)
-            return
-
-        self._shutdown_registered = False
-        try:
-            yg_shutdown.unregister(self._unsafe_close)
-        except Exception:
-            LOGGER.debug(
-                "Failed to unregister shutdown handler for context %s",
-                self.context_id,
-                exc_info=True,
-            )
-        finally:
-            with _LIVE_TEMP_CONTEXTS_LOCK:
-                _LIVE_TEMP_CONTEXTS.discard(self)
-
-    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -618,9 +562,6 @@ class ExecutionContext:
 
             LOGGER.info("Context created: id=%s on %s", self.context_id, self.cluster)
 
-            if self.temporary:
-                self._register_shutdown_close()
-
             return self
 
     def connect(
@@ -667,14 +608,9 @@ class ExecutionContext:
         """
         with self._lock:
             if not self.context_id:
-                # Still drop any stale shutdown registration.
-                self._unregister_shutdown_close()
                 return
 
             closing_id = self.context_id
-            # Unregister the shutdown hook BEFORE dispatching the destroy, so
-            # atexit can't race with a fire-and-forget destroy thread.
-            self._unregister_shutdown_close()
 
             LOGGER.info(
                 "Closing context %s on %s (wait=%s)",
@@ -956,56 +892,3 @@ print({tag!r} + _r, flush=True)
     def is_in_databricks_environment(self) -> bool:
         """Return whether the current client is running inside Databricks."""
         return self.cluster.client.is_in_databricks_environment()
-
-
-# ============================================================================
-# Pool shutdown helpers
-# ============================================================================
-
-def close_all_pooled_contexts() -> None:
-    """
-    Close and remove every context currently registered in the global pool.
-
-    Stops the reaper thread first so it cannot race with this function or
-    try to dispatch more closes against a half-torn-down client stack.
-
-    Uses ``wait=True`` for every context: synchronous closes so shutdown is
-    deterministic and does not rely on background threads that might be
-    killed by interpreter teardown.
-    """
-    # 1) Stop the reaper first so it can't dispatch new closes concurrently.
-    _stop_reaper(join_timeout=2.0)
-
-    # 2) Drain the pool atomically.
-    with _CONTEXT_POOL_LOCK:
-        contexts = list(_CONTEXT_POOL.values())
-        _CONTEXT_POOL.clear()
-
-    # 3) Also drain any non-pooled temporary contexts still alive. Some of
-    #    them may already be in `contexts` (if they were pooled); the set
-    #    difference handles the overlap cheaply.
-    with _LIVE_TEMP_CONTEXTS_LOCK:
-        temps = list(_LIVE_TEMP_CONTEXTS)
-        _LIVE_TEMP_CONTEXTS.clear()
-
-    seen: set[int] = set()
-    all_contexts = []
-    for c in contexts + temps:
-        if id(c) not in seen:
-            seen.add(id(c))
-            all_contexts.append(c)
-
-    for ctx in all_contexts:
-        try:
-            ctx.close(wait=True, raise_error=False)
-        except BaseException:  # noqa: BLE001 — shutdown must never escape
-            try:
-                LOGGER.debug("Failed closing pooled context %s", ctx, exc_info=True)
-            except Exception:
-                pass
-
-
-# Register at high priority so contexts close before lower-priority hooks
-# (e.g. client-level HTTP session teardown) take effect. LIFO-by-import is
-# not a reliable ordering mechanism across a large codebase.
-yg_shutdown.register(close_all_pooled_contexts, priority=100)

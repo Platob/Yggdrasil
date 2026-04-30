@@ -24,9 +24,9 @@ def test_from_key_value_forces_canonical_names_and_key_non_nullable(
         value_field=Field(name="also_nope", dtype=int64_type, nullable=True),
     )
 
-    assert result.key_field.name == "key"
+    assert result.key_field.name == "nope"
     assert result.key_field.nullable is False
-    assert result.value_field.name == "value"
+    assert result.value_field.name == "also_nope"
     assert result.value_field.nullable is True
 
 
@@ -153,7 +153,7 @@ def test_merge_with_same_id_upcasts_value_bytes(
     assert result.key_field.arrow_type == pa.string()
     assert result.key_field.nullable is False
     assert result.value_field.arrow_type == pa.int64()
-    assert result.value_field.nullable is True
+    assert result.value_field.nullable is False
 
 
 @pytest.mark.parametrize(

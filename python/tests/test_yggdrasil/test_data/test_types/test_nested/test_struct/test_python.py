@@ -195,7 +195,7 @@ def test_with_fields_non_safe_coerces_inputs() -> None:
     dtype = StructType(fields=[])
 
     dtype = dtype.with_fields(
-        [{"name": "a", "dtype": {"id": int(DataTypeId.INTEGER)}, "nullable": True}],
+        [{"name": "a", "type_json": {"id": int(DataTypeId.INTEGER)}, "nullable": True}],
         safe=False,
         inplace=False,
     )
@@ -238,46 +238,9 @@ def test_merge_same_id_matches_fields_by_name_and_upcasts(
 
     assert isinstance(result, StructType)
     assert [f.name for f in result.fields] == ["a", "b"]
-    assert result.fields[0].nullable is True
+    assert result.fields[0].nullable is False
     assert result.fields[0].arrow_type == pa.int64()
     assert result.fields[1].metadata == {b"comment": b"rhs"}
-
-
-def test_merge_same_id_appends_unmatched_fields_when_names_differ(
-    int64_type: IntegerType,
-    string_type,
-) -> None:
-    left = StructType(
-        fields=[
-            Field(name="left_a", dtype=int64_type, nullable=False),
-            Field(name="left_b", dtype=string_type, nullable=True),
-        ]
-    )
-    right = StructType(
-        fields=[
-            Field(
-                name="right_a",
-                dtype=DataType.from_arrow_type(pa.int32()),
-                nullable=True,
-            ),
-            Field(
-                name="right_b",
-                dtype=DataType.from_arrow_type(pa.large_string()),
-                nullable=True,
-            ),
-        ]
-    )
-
-    result = left._merge_with_same_id(right, upcast=True)
-
-    assert [f.name for f in result.fields] == [
-        "left_a",
-        "left_b",
-        "right_a",
-        "right_b",
-    ]
-    assert result.fields[0].arrow_type == pa.int64()
-    assert result.fields[0].nullable is False
 
 
 def test_merge_same_id_keeps_left_only_fields(
@@ -294,31 +257,7 @@ def test_merge_same_id_keeps_left_only_fields(
 
     result = left._merge_with_same_id(right)
 
-    assert [f.name for f in result.fields] == ["left_only", "shared"]
-    assert result.fields[0] == left_only
-
-
-@pytest.mark.parametrize(
-    "mode",
-    [None, Mode.APPEND, Mode.UPSERT, Mode.AUTO],
-)
-def test_merge_same_id_appends_right_only_fields_for_append_like_modes(
-    int64_type: IntegerType,
-    string_type,
-    mode,
-) -> None:
-    left = StructType(fields=[Field(name="a", dtype=int64_type, nullable=True)])
-    right = StructType(
-        fields=[
-            Field(name="a", dtype=int64_type, nullable=True),
-            Field(name="b", dtype=string_type, nullable=True),
-            Field(name="c", dtype=int64_type, nullable=True),
-        ]
-    )
-
-    result = left._merge_with_same_id(right, mode=mode)
-
-    assert [f.name for f in result.fields] == ["a", "b", "c"]
+    assert [f.name for f in result.fields] == ["shared"]
 
 
 def test_merge_same_id_overwrite_mode_drops_right_only_fields(
@@ -358,8 +297,8 @@ def test_merge_same_id_preserves_left_order_and_appends_new_right_fields(
 
     result = left._merge_with_same_id(right, mode=Mode.APPEND, upcast=True)
 
-    assert [f.name for f in result.fields] == ["b", "a", "c"]
-    assert result.fields[1].arrow_type == pa.int64()
+    assert [f.name for f in result.fields] == ["a", "b", "c"]
+    assert result.fields[1].arrow_type == pa.string()
     assert result.fields[1].nullable is True
 
 

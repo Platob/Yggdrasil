@@ -16,7 +16,7 @@ def test_to_arrow_field_attaches_internal_json_metadata():
     assert out.nullable is False
     assert out.metadata is not None
     assert b"comment" in out.metadata
-    assert b"ytpe_json" in out.metadata
+    assert b"type_json" in out.metadata
 
 
 def test_from_arrow_field_strips_internal_metadata():
@@ -26,7 +26,7 @@ def test_from_arrow_field_strips_internal_metadata():
         nullable=True,
         metadata={
             b"comment": b"hello",
-            b"ytpe_json": b'{"id":3}',
+            b"type_json": b'{"id":3}',
         },
     )
 

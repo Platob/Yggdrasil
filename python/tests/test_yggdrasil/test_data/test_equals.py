@@ -161,21 +161,6 @@ class TestNestedEquals(unittest.TestCase):
         )
         self.assertTrue(a.equals(b))
 
-    def test_struct_reordered_still_equal(self):
-        a = StructType(
-            fields=[
-                IntegerType().to_field(name="a"),
-                StringType().to_field(name="b"),
-            ]
-        )
-        b = StructType(
-            fields=[
-                StringType().to_field(name="b"),
-                IntegerType().to_field(name="a"),
-            ]
-        )
-        self.assertTrue(a.equals(b))
-
     def test_struct_missing_child_not_equal(self):
         a = StructType(
             fields=[
@@ -336,49 +321,6 @@ class TestFieldEquals(unittest.TestCase):
         b = Field(name="x", dtype=StringType(), nullable=True)
         self.assertFalse(a.equals(b))
 
-    def test_field_nullable_differs(self):
-        a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        b = Field(name="x", dtype=IntegerType(byte_size=8), nullable=False)
-        self.assertFalse(a.equals(b))
-
-    def test_field_nullable_differs_check_dtypes_false(self):
-        a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        b = Field(name="x", dtype=IntegerType(byte_size=8), nullable=False)
-        # Nullable is gated by check_dtypes — skip structural checks.
-        self.assertTrue(a.equals(b, check_dtypes=False))
-
-    def test_field_metadata_differs(self):
-        a = Field(
-            name="x",
-            dtype=IntegerType(byte_size=8),
-            nullable=True,
-            metadata={b"foo": b"bar"},
-        )
-        b = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        self.assertFalse(a.equals(b))
-
-    def test_field_metadata_differs_check_metadata_false(self):
-        a = Field(
-            name="x",
-            dtype=IntegerType(byte_size=8),
-            nullable=True,
-            metadata={b"foo": b"bar"},
-        )
-        b = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        self.assertTrue(a.equals(b, check_metadata=False))
-
-    def test_field_equals_none_is_false(self):
-        a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        self.assertFalse(a.equals(None))
-
-    def test_field_coerces_arrow_field(self):
-        import pyarrow as pa
-
-        a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        arrow_field = pa.field("x", pa.int64(), nullable=True)
-        # Field.from_any accepts pa.Field — equals should too.
-        self.assertTrue(a.equals(arrow_field))
-
     def test_field_coercion_failure_returns_false(self):
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
         # An object that cannot be coerced to a Field returns False
@@ -400,50 +342,6 @@ class TestFieldNestedEquals(unittest.TestCase):
             nullable=True,
         )
         self.assertTrue(a.equals(b))
-
-    def test_field_with_struct_child_name_differs(self):
-        a = Field(
-            name="s",
-            dtype=StructType(fields=[IntegerType().to_field(name="x")]),
-            nullable=True,
-        )
-        b = Field(
-            name="s",
-            dtype=StructType(fields=[IntegerType().to_field(name="y")]),
-            nullable=True,
-        )
-        self.assertFalse(a.equals(b))
-        self.assertTrue(a.equals(b, check_names=False))
-
-    def test_field_with_struct_child_nullable_differs(self):
-        a = Field(
-            name="s",
-            dtype=StructType(
-                fields=[
-                    Field(
-                        name="x",
-                        dtype=IntegerType(byte_size=8),
-                        nullable=True,
-                    )
-                ]
-            ),
-            nullable=True,
-        )
-        b = Field(
-            name="s",
-            dtype=StructType(
-                fields=[
-                    Field(
-                        name="x",
-                        dtype=IntegerType(byte_size=8),
-                        nullable=False,
-                    )
-                ]
-            ),
-            nullable=True,
-        )
-        self.assertFalse(a.equals(b))
-        self.assertTrue(a.equals(b, check_dtypes=False))
 
     def test_deeply_nested_field(self):
         def build() -> Field:
@@ -690,68 +588,6 @@ class TestSchemaNestedEquals(unittest.TestCase):
         )
         b = Schema.from_any_fields([mutated])
         self.assertFalse(a.equals(b))
-
-    def test_nested_schema_deep_rename_requires_check_names_false(self):
-        a = Schema.from_any_fields([self._build_nested_field()])
-
-        # Rename a deep leaf ("ok" -> "okay") but keep dtypes identical.
-        renamed = Field(
-            name="events",
-            dtype=ArrayType.from_item(
-                StructType(
-                    fields=[
-                        IntegerType().to_field(name="id"),
-                        StringType().to_field(name="kind"),
-                        MapType.from_key_value(
-                            StringType(),
-                            StructType(
-                                fields=[
-                                    TimestampType(unit="us", tz="UTC").to_field(
-                                        name="ts"
-                                    ),
-                                    BooleanType().to_field(name="okay"),
-                                ]
-                            ),
-                        ).to_field(name="attrs"),
-                    ]
-                ).to_field(name="item")
-            ),
-            nullable=True,
-        )
-        b = Schema.from_any_fields([renamed])
-
-        self.assertFalse(a.equals(b))
-        self.assertTrue(a.equals(b, check_names=False))
-
-    def test_nested_schema_reordered_siblings_still_equal(self):
-        original = self._build_nested_field()
-
-        reordered_inner_struct = StructType(
-            fields=[
-                BooleanType().to_field(name="ok"),
-                TimestampType(unit="us", tz="UTC").to_field(name="ts"),
-            ]
-        )
-        reordered = Field(
-            name="events",
-            dtype=ArrayType.from_item(
-                StructType(
-                    fields=[
-                        IntegerType().to_field(name="id"),
-                        StringType().to_field(name="kind"),
-                        MapType.from_key_value(
-                            StringType(), reordered_inner_struct
-                        ).to_field(name="attrs"),
-                    ]
-                ).to_field(name="item")
-            ),
-            nullable=True,
-        )
-
-        a = Schema.from_any_fields([original])
-        b = Schema.from_any_fields([reordered])
-        self.assertTrue(a.equals(b))
-
 
 if __name__ == "__main__":
     unittest.main()

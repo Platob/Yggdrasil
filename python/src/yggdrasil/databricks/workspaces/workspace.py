@@ -3,9 +3,8 @@
 import logging
 from dataclasses import dataclass, field
 
-from databricks.sdk.service.provisioning import Workspace as SDKWorkspace
-
 from yggdrasil.io.url import URL
+
 from .service import Workspaces
 from ..client import DatabricksClient, DatabricksResource
 
@@ -23,7 +22,6 @@ class Workspace(DatabricksClient):
     pass
 
 
-@dataclass
 class WorkspaceResource(DatabricksResource):
     service: Workspaces = field(
         default_factory=Workspaces.current,
@@ -34,6 +32,20 @@ class WorkspaceResource(DatabricksResource):
     id: str = ""
     name: str = ""
     url: URL = URL.empty()
+
+    def __init__(
+        self,
+        service: Workspaces | None = None,
+        id: str | None = None,
+        name: str | None = None,
+        url: URL | None = None,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.service = Workspaces.current() if service is None else service
+        self.id = id or ""
+        self.name = name or ""
+        self.url = url or URL.empty()
 
     @property
     def details(self):

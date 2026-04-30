@@ -46,7 +46,6 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
-@dataclass
 class IAMUser(DatabricksResource):
     """
     Lightweight user wrapper around Databricks IAM user payloads.
@@ -67,6 +66,26 @@ class IAMUser(DatabricksResource):
     external_id: str | None = None
     active: bool = True
     client_type: ClientType = ClientType.ACCOUNT
+
+    def __init__(
+        self,
+        service: IAMUsers | None = None,
+        id: str | None = None,
+        name: str | None = None,
+        username: str | None = None,
+        emails: Optional[list[str]] = None,
+        external_id: str | None = None,
+        active: bool = True,
+        client_type: ClientType = ClientType.ACCOUNT,
+        **kwargs: Any,
+    ):
+        super().__init__(service=service, id=id, **kwargs)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "username", username)
+        object.__setattr__(self, "emails", emails)
+        object.__setattr__(self, "external_id", external_id)
+        object.__setattr__(self, "active", active)
+        object.__setattr__(self, "client_type", client_type)
 
     @property
     def email(self) -> Optional[str]:
@@ -281,7 +300,6 @@ class IAMUser(DatabricksResource):
         )
 
 
-@dataclass
 class IAMGroup(DatabricksResource):
     """
     Lightweight group wrapper around Databricks IAM group payloads.
@@ -299,10 +317,26 @@ class IAMGroup(DatabricksResource):
     entitlements: Optional[list[str]] = None
     members: Optional[list[IAMUser]] = None
 
-    def __post_init__(self) -> None:
-        if self.service is None:
-            object.__setattr__(self, "service", IAMGroups.current())
-        super().__post_init__()
+    def __init__(
+        self,
+        service: IAMGroups | None = None,
+        id: str | None = None,
+        name: str | None = None,
+        account_id: str | None = None,
+        external_id: str | None = None,
+        client_type: Optional[ClientType] = None,
+        entitlements: Optional[list[str]] = None,
+        members: Optional[list[IAMUser]] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(service=IAMGroups.current() if service is None else service)
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "account_id", account_id)
+        object.__setattr__(self, "external_id", external_id)
+        object.__setattr__(self, "client_type", client_type)
+        object.__setattr__(self, "entitlements", entitlements)
+        object.__setattr__(self, "members", members)
 
     def __str__(self) -> str:
         return self.name or self.id or "unknown-group"

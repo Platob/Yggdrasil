@@ -49,8 +49,8 @@ class ArrayType(NestedType):
     large: bool = False
     view: bool = False
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.ARRAY
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -95,7 +95,7 @@ class ArrayType(NestedType):
     def _merge_with_same_id(
         self,
         other: "ArrayType",
-        mode: Mode,
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ):
@@ -110,7 +110,7 @@ class ArrayType(NestedType):
             else:
                 list_size = max(self.list_size, other.list_size)
         else:
-            list_size = self.list_size
+            list_size = self.list_size or other.list_size
 
         if self.large and other.large:
             large = True
@@ -270,15 +270,21 @@ class ArrayType(NestedType):
         return cls._matches_dict(value, DataTypeId.ARRAY)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "ArrayType":
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "ArrayType":
         _f = field_class()
 
-        return cls(
-            item_field=_f.from_any(value["item_field"]),
-            list_size=value.get("list_size"),
-            large=bool(value.get("large", False)),
-            view=bool(value.get("view", False)),
-        )
+        try:
+            return cls(
+                item_field=_f.from_any(value["item_field"]),
+                list_size=value.get("list_size"),
+                large=bool(value.get("large", False)),
+                view=bool(value.get("view", False)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Could not parse {cls.__name__} from dict: {value!r}") from e
+            return default
+
 
     def to_arrow(self) -> pa.DataType:
         value_field = self.item_field.to_arrow_field()

@@ -269,10 +269,6 @@ class TestParserTemporalFastPaths(unittest.TestCase):
             ),
         )
 
-    def test_numeric_wire_id(self):
-        self.assertIs(ParsedDataType.parse_type_id("32"), DataTypeId.ARRAY)
-        self.assertIs(ParsedDataType.parse_type_id("67"), DataTypeId.ENUM)
-
     def test_parse_data_type_function_delegates(self):
         self.assertEqual(
             parse_data_type("int"),

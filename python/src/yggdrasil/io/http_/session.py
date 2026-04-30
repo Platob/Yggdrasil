@@ -6,14 +6,17 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import urllib3
-
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
-from yggdrasil.io import BytesIO, MediaType, MimeTypes
+from yggdrasil.io import BytesIO
+from yggdrasil.io.enums import MediaType, MimeTypes, MediaTypes
+
 from .response import HTTPResponse
+from ..buffer.primitive import ArrowIPCIO
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session
+from ..tabular import TabularIO
 
 if TYPE_CHECKING:
     from .browser import BrowserHTTPSession
@@ -270,11 +273,15 @@ class HTTPSession(Session):
 
         result.buffer.truncate(size=0)
 
-        arr = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
-        mt = MediaType(MimeTypes.ARROW_IPC)
-        mio = result.buffer.media_io(mt)
-        mio.write_arrow_table(arr)
-        result.set_media_type(mt, safe=False)
+        with ArrowIPCIO() as b:
+            b.write_arrow_table(
+                final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
+                compression="zstd"
+            )
+
+        b.seek(0)
+        result.buffer.replace_with_payload(b)
+        result.set_media_type(MediaTypes.ARROW_IPC)
 
         result.update_tags({
             "page_start": str(current_page),

@@ -67,8 +67,8 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
     def __repr__(self):
         fields = ""
         for f in self.inner_fields.values():
-            fields += f"\n    {f.name!r} -> {f.dtype!r} nullable={f.nullable!r} metadata={f.metadata!r}"
-        return f"Schema: {self.name!r} metadata={self.metadata!r}{fields}"
+            fields += f"\n{f.pretty_format(level=1)}"
+        return f"Schema: {self.name!r} {self.comment!r}{fields}"
 
     def __bool__(self):
         return bool(self.inner_fields)
@@ -606,6 +606,18 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         path: Any,
     ) -> "Schema":
         return path_class().from_(path).as_media().collect_schema()
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any], default: Any = ...) -> "Schema":
+        f = Field.from_dict(d, default=None)
+        if f is None:
+            if default is ...:
+                raise ValueError("Schema.from_dict requires a Field default for new keys")
+            return default
+        return cls.from_field(f)
+
+    def to_dict(self):
+        return self.to_field().to_dict()
 
     def to_field(self) -> Field:
         return Field(

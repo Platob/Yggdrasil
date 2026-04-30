@@ -104,7 +104,7 @@ class MimeType:
         return self.value
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.name!r} -> {self.value!r})"
+        return self.value
 
     @classmethod
     def get(cls, value: object) -> "MimeType | None":

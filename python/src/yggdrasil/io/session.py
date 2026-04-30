@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
-
 import yggdrasil.pickle.ser as pickle
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
@@ -21,6 +20,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfigArg,
 )
 from yggdrasil.io.enums import Mode
+
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
@@ -400,15 +400,304 @@ class Session(ABC):
 
         return self._send_many(requests, config=cfg)
 
+    # ------------------------------------------------------------------ #
+    # send_many — staged pipeline                                         #
+    #                                                                    #
+    # The flow per batch is:                                             #
+    #   1. Local cache: yield hits, evict UPSERT entries, collect misses #
+    #   2. Remote cache: group misses by effective table, run one SQL    #
+    #      lookup per table, yield hits, collect misses                  #
+    #   3. Network: fan out misses through the job pool                  #
+    #   4. Bulk remote writeback: group successful responses by          #
+    #      (table, mode, match_by, wait, anonymize) so per-request       #
+    #      cache configs are honoured exactly                            #
+    # ------------------------------------------------------------------ #
+
+    def _effective_local_cfg(
+        self,
+        request: PreparedRequest,
+        session_cfg: CacheConfig,
+    ) -> CacheConfig:
+        return request.local_cache_config or session_cfg
+
+    def _effective_remote_cfg(
+        self,
+        request: PreparedRequest,
+        session_cfg: CacheConfig,
+    ) -> CacheConfig:
+        return request.remote_cache_config or session_cfg
+
+    @staticmethod
+    def _remote_write_group_key(cfg: CacheConfig) -> tuple:
+        """Identity used to group responses for a single bulk remote insert.
+
+        Two responses can share an insert iff every config dimension that
+        affects the write call is identical: target table, mode, match-by
+        columns, wait flag, and anonymize mode. Without all five, distinct
+        per-request configs get silently collapsed onto whichever config
+        landed in the bucket first.
+        """
+        return (
+            cfg.table.full_name(safe=True),
+            cfg.mode,
+            tuple(cfg.match_by) if cfg.match_by else (),
+            bool(cfg.wait),
+            cfg.anonymize,
+        )
+
+    def _split_local_cache(
+        self,
+        batch: list[PreparedRequest],
+        session_local_cfg: CacheConfig,
+    ) -> tuple[list[Response], list[PreparedRequest]]:
+        """Stage 1: scan the local cache.
+
+        Returns (hits, misses). UPSERT entries are evicted on the way through
+        so the eventual fresh response can be written in their place.
+        Each request is evaluated against its own effective local cache
+        config (per-request override or session-level fallback).
+        """
+        hits: list[Response] = []
+        misses: list[PreparedRequest] = []
+
+        if not session_local_cfg.local_cache_enabled and not any(
+            r.local_cache_config for r in batch
+        ):
+            # Cheap path: no local cache anywhere in this batch.
+            return hits, list(batch)
+
+        for req in batch:
+            eff = self._effective_local_cfg(req, session_local_cfg)
+            if not eff.local_cache_enabled:
+                misses.append(req)
+                continue
+
+            if eff.mode == Mode.UPSERT:
+                evict_path = eff.local_cache_file(req, suffix=".ypkl", force=True)
+                if evict_path is not None and evict_path.exists():
+                    evict_path.unlink(missing_ok=True)
+                    LOGGER.debug(
+                        "UPSERT: evicted local cache for %s %s",
+                        req.method, req.url,
+                    )
+                misses.append(req)
+                continue
+
+            local_response, _ = self._load_local_cached_response(req, eff)
+            if local_response is not None:
+                hits.append(local_response)
+            else:
+                misses.append(req)
+
+        if hits:
+            LOGGER.debug(
+                "Batch local cache: %s/%s hits", len(hits), len(batch),
+            )
+        return hits, misses
+
+    def _split_remote_cache(
+        self,
+        requests: list[PreparedRequest],
+        session_remote_cfg: CacheConfig,
+        *,
+        spark_session: Optional["SparkSession"] = None,
+    ) -> tuple[list[Response], list[PreparedRequest]]:
+        """Stage 2: scan the remote cache.
+
+        UPSERT requests bypass the read entirely (always misses, refetch).
+        Non-UPSERT requests are grouped by their effective cache table so we
+        execute exactly one batch SQL lookup per table.
+        """
+        hits: list[Response] = []
+        # UPSERT is unconditional miss.
+        upsert_reqs = [
+            r for r in requests
+            if self._effective_remote_cfg(r, session_remote_cfg).mode == Mode.UPSERT
+        ]
+        misses: list[PreparedRequest] = list(upsert_reqs)
+
+        # Group APPEND-mode requests by effective table.
+        table_to_cfg: dict[str, CacheConfig] = {}
+        table_to_reqs: dict[str, list[PreparedRequest]] = {}
+        for req in requests:
+            if req in upsert_reqs:
+                continue
+            t_cfg = self._effective_remote_cfg(req, session_remote_cfg)
+            if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
+                misses.append(req)
+                continue
+            tkey = t_cfg.table.full_name(safe=True)
+            if tkey not in table_to_cfg:
+                table_to_cfg[tkey] = t_cfg
+                table_to_reqs[tkey] = []
+            table_to_reqs[tkey].append(req)
+
+        for tkey, t_reqs in table_to_reqs.items():
+            t_cfg = table_to_cfg[tkey]
+            t_hits, t_misses = self._lookup_remote_table(
+                t_cfg, t_reqs, spark_session=spark_session,
+            )
+            hits.extend(t_hits)
+            misses.extend(t_misses)
+
+        if hits:
+            LOGGER.debug(
+                "Batch remote cache: %s/%s hits across %s table(s)",
+                len(hits), len(requests), len(table_to_cfg),
+            )
+        return hits, misses
+
+    def _lookup_remote_table(
+        self,
+        cfg: CacheConfig,
+        requests: list[PreparedRequest],
+        *,
+        spark_session: Optional["SparkSession"] = None,
+    ) -> tuple[list[Response], list[PreparedRequest]]:
+        """Execute one batch SQL lookup against a single cache table."""
+        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        query = cfg.make_batch_lookup_sql(
+            table_name=cfg.table.full_name(safe=True),
+            requests=anonymized_batch,
+        )
+        try:
+            cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+        except Exception as exc:
+            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+            else:
+                raise
+
+        result_map: dict[tuple, Response] = {}
+        for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
+            result_map[cfg.request_tuple(response.request)] = response
+
+        hits: list[Response] = []
+        misses: list[PreparedRequest] = []
+        for req, anon in zip(requests, anonymized_batch):
+            candidate = result_map.get(cfg.request_tuple(anon))
+            if candidate is not None and cfg.filter_response(candidate, request=req):
+                hits.append(candidate)
+            else:
+                misses.append(req)
+        return hits, misses
+
+    def _fetch_misses(
+        self,
+        misses: list[PreparedRequest],
+        config: SendManyConfig,
+    ) -> Iterator[Response]:
+        """Stage 3: send misses through the job pool.
+
+        Returns the raw `Response` stream — caller decides what to do with
+        ok/error responses (yield them, persist them, raise).
+        """
+        # Local cache writes happen here; remote writes are mutualised in
+        # `_persist_remote` so we strip per-request remote configs from the
+        # copies handed to the workers.
+        miss_send_config = config.to_send_config(
+            with_remote_cache=False,
+            with_local_cache=True,
+            with_spark=False,
+            raise_error=False,
+        )
+
+        pool = self.job_pool
+        for result in pool.as_completed(
+            (
+                Job.make(
+                    self._send,
+                    r.copy(remote_cache_config=None),
+                    miss_send_config,
+                )
+                for r in misses
+            ),
+            ordered=config.ordered,
+            max_in_flight=config.max_in_flight or self.pool_maxsize,
+            cancel_on_exit=False,
+            shutdown_on_exit=False,
+            raise_error=True,
+        ):
+            yield result.result
+
+    def _backfill_local_cache(
+        self,
+        responses: list[Response],
+        url_to_local_cfg: Mapping[str, CacheConfig],
+        session_local_cfg: CacheConfig,
+    ) -> None:
+        """Write remote-cache hits back to the local cache.
+
+        Each response is stored against its originating request's effective
+        local config (looked up by URL) — using the session-level config for
+        every response would be wrong whenever a request carries a custom
+        per-request local cache.
+        """
+        for response in responses:
+            url_key = str(response.request.url) if response.request else None
+            eff = url_to_local_cfg.get(url_key) if url_key else None
+            if eff is None:
+                eff = session_local_cfg
+            if eff.local_cache_enabled:
+                self._store_local_cached_response(response, eff)
+
+    def _persist_remote(
+        self,
+        responses: list[Response],
+        url_to_remote_cfg: Mapping[str, CacheConfig],
+        session_remote_cfg: CacheConfig,
+    ) -> None:
+        """Stage 4: bulk-insert successful responses into the remote cache.
+
+        Responses are bucketed by the full write-group key
+        (table, mode, match_by, wait, anonymize) so that distinct per-request
+        configs targeting the same table never get collapsed onto a single
+        insert with the wrong parameters.
+        """
+        groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
+        for response in responses:
+            anonymized = response.anonymize(mode="remove")
+            url_key = str(anonymized.request.url) if anonymized.request else None
+            eff = url_to_remote_cfg.get(url_key) if url_key else None
+            if eff is None:
+                eff = session_remote_cfg
+            if not eff.remote_cache_enabled:
+                continue
+            gkey = self._remote_write_group_key(eff)
+            if gkey not in groups:
+                groups[gkey] = (eff, [])
+            groups[gkey][1].append(anonymized)
+
+        for (_, mode, _, _, _), (cfg, group_responses) in groups.items():
+            LOGGER.debug(
+                "%s %s response(s) in remote cache %s",
+                "Upserting" if mode == Mode.UPSERT else "Persisting",
+                len(group_responses),
+                cfg.table,
+            )
+            batches = pa.Table.from_batches([
+                r.to_arrow_batch(parse=False)
+                for r in group_responses
+            ]).combine_chunks()
+
+            cfg.table.insert(
+                batches,
+                mode=mode,
+                match_by=cfg.match_by or None,
+                wait=cfg.wait,
+                prune_values={"request_url_path": batches["request_url_path"]},
+            )
+
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
     ) -> Iterator[Response]:
         pool = self.job_pool
-        remote_cfg = config.remote_cache
-        local_cfg = config.local_cache
-        batch_size = config.batch_size or pool.max_workers * 100
+        session_remote_cfg = config.remote_cache
+        session_local_cfg = config.local_cache
+        batch_size = config.batch_size or pool.max_workers * 2
 
         def _batched(it: Iterator[PreparedRequest], n: int) -> Iterator[list[PreparedRequest]]:
             iterator = iter(it)
@@ -419,201 +708,58 @@ class Session(ABC):
                 yield b
 
         for batch in _batched(requests, batch_size):
-            # --- 1. Check local cache first for each request in the batch ---
-            after_local: list[PreparedRequest] = []
-            if local_cfg.local_cache_enabled:
-                for req in batch:
-                    effective_local = req.local_cache_config or local_cfg
-                    if effective_local.mode == Mode.UPSERT:
-                        # Evict any stale local entry; the fresh response will
-                        # be stored after the fetch.
-                        evict_path = effective_local.local_cache_file(
-                            req, suffix=".ypkl", force=True
-                        )
-                        if evict_path is not None and evict_path.exists():
-                            evict_path.unlink(missing_ok=True)
-                            LOGGER.debug(
-                                "UPSERT: evicted local cache for %s %s",
-                                req.method, req.url,
-                            )
-                        after_local.append(req)
-                    else:
-                        local_response, _ = self._load_local_cached_response(req, effective_local)
-                        if local_response is not None:
-                            yield local_response
-                        else:
-                            after_local.append(req)
-                local_hits = len(batch) - len(after_local)
-                if local_hits:
-                    LOGGER.debug(
-                        "Batch local cache: %s/%s hits",
-                        local_hits,
-                        len(batch),
-                    )
-            else:
-                after_local = batch
+            # --- Stage 1: local cache ---
+            local_hits, after_local = self._split_local_cache(batch, session_local_cfg)
+            for hit in local_hits:
+                yield hit
 
             if not after_local:
                 continue
 
-            # UPSERT requests must bypass the remote cache read entirely —
-            # split them out before building any SQL lookup.
-            upsert_reqs = [
-                r for r in after_local
-                if (r.remote_cache_config or remote_cfg).mode == Mode.UPSERT
-            ]
-            lookup_reqs = [
-                r for r in after_local
-                if (r.remote_cache_config or remote_cfg).mode != Mode.UPSERT
-            ]
-
-            # Group non-UPSERT requests by their effective remote cache table so
-            # we execute exactly one batch SQL query per table.
-            table_to_cfg: dict[str, CacheConfig] = {}
-            table_to_reqs: dict[str, list[PreparedRequest]] = {}
-            remote_hits: list[Response] = []
-            # UPSERT requests are unconditional misses — always refetch.
-            remote_misses: list[PreparedRequest] = list(upsert_reqs)
-
-            for req in lookup_reqs:
-                t_cfg = req.remote_cache_config or remote_cfg
-                if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
-                    remote_misses.append(req)
-                    continue
-                tkey = t_cfg.table.full_name(safe=True)
-                if tkey not in table_to_cfg:
-                    table_to_cfg[tkey] = t_cfg
-                    table_to_reqs[tkey] = []
-                table_to_reqs[tkey].append(req)
-
-            for tkey, t_reqs in table_to_reqs.items():
-                t_cfg = table_to_cfg[tkey]
-                anonymized_batch = [req.anonymize(mode=t_cfg.anonymize) for req in t_reqs]
-                query = t_cfg.make_batch_lookup_sql(
-                    table_name=tkey, requests=anonymized_batch
-                )
-                try:
-                    cache_result = t_cfg.table.sql.execute(query)
-                except Exception as exc:
-                    if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                        t_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                        cache_result = t_cfg.table.sql.execute(query)
-                    else:
-                        raise
-
-                result_map: dict[tuple, Response] = {}
-                for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
-                    result_map[t_cfg.request_tuple(response.request)] = response
-
-                for req in t_reqs:
-                    rkey = t_cfg.request_tuple(req.anonymize(mode=t_cfg.anonymize))
-                    candidate = result_map.get(rkey)
-                    if candidate is not None:
-                        remote_hits.append(candidate)
-                    else:
-                        remote_misses.append(req)
-
-            # --- 3. Yield remote hits and backfill local cache ---
-            if remote_hits:
-                LOGGER.debug(
-                    "Batch remote cache: %s/%s hits (table=%s)",
-                    len(remote_hits),
-                    len(after_local),
-                    remote_cfg.table,
-                )
-            for remote_hit in remote_hits:
-                if local_cfg.local_cache_enabled:
-                    self._store_local_cached_response(remote_hit, local_cfg)
-                yield remote_hit
-
-            if not remote_misses:
-                continue
-
-            # --- 4. Send misses (local cache only; remote written in batch below) ---
-            miss_send_config = config.to_send_config(
-                with_remote_cache=False,
-                with_local_cache=True,
-                with_spark=False,
-                raise_error=False
-            )
-
-            # Snapshot each miss's effective remote config BEFORE we strip
-            # remote_cache_config from the copies sent to the thread pool.
-            # Keyed by URL string — the natural cache identity for a request.
-            # Without this, r.request.remote_cache_config is always None on
-            # the response side and every miss falls back to remote_cfg.
-            miss_url_to_remote_cfg: dict[str, CacheConfig] = {
-                str(r.url): (r.remote_cache_config or remote_cfg)
-                for r in remote_misses
-                if (r.remote_cache_config or remote_cfg).remote_cache_enabled
+            # Snapshot per-request effective configs BEFORE we mutate copies
+            # for the worker pool. Keyed by URL string — the natural identity
+            # for matching a response back to its originating request.
+            url_to_remote_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
+                for r in after_local
+            }
+            url_to_local_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
+                for r in after_local
             }
 
+            # --- Stage 2: remote cache ---
+            remote_hits, after_remote = self._split_remote_cache(
+                after_local,
+                session_remote_cfg,
+                spark_session=config.spark_session,
+            )
+            # Backfill local cache with remote hits using each request's
+            # effective local config — not the session-level fallback.
+            self._backfill_local_cache(
+                remote_hits, url_to_local_cfg, session_local_cfg,
+            )
+            for hit in remote_hits:
+                yield hit
+
+            if not after_remote:
+                continue
+
+            # --- Stage 3: fetch misses ---
             to_insert: list[Response] = []
             failed: list[Response] = []
-
-            for result in pool.as_completed(
-                (
-                    # Disable request-level remote cache while sending misses;
-                    # remote writes are mutualized in the bulk insert block below.
-                    Job.make(
-                        self._send,
-                        r.copy(remote_cache_config=None),
-                        miss_send_config
-                    )
-                    for r in remote_misses
-                ),
-                ordered=config.ordered,
-                max_in_flight=config.max_in_flight or self.pool_maxsize,
-                cancel_on_exit=False,
-                shutdown_on_exit=False,
-                raise_error=True,
-            ):
-                response: Response = result.result
+            for response in self._fetch_misses(after_remote, config):
                 if response.ok:
                     to_insert.append(response)
                     yield response
                 elif config.raise_error:
                     failed.append(response)
 
+            # --- Stage 4: bulk remote writeback ---
             if to_insert:
-                # Group responses by (effective table full name, effective mode)
-                # so each unique (table, mode) combination gets one bulk insert.
-                # Use the pre-snapshotted URL → cfg map to recover the correct
-                # per-request config now that the copies no longer carry it.
-                table_write_groups: dict[
-                    tuple[str, Mode], tuple[CacheConfig, list[Response]]
-                ] = {}
-                for r in to_insert:
-                    req = r.request
-                    url_key = str(req.url) if req else None
-                    t_cfg = (
-                        miss_url_to_remote_cfg.get(url_key)
-                        if url_key else None
-                    ) or remote_cfg
-                    if not t_cfg.remote_cache_enabled:
-                        continue
-                    gkey = (t_cfg.table.full_name(safe=True), t_cfg.mode)
-                    if gkey not in table_write_groups:
-                        table_write_groups[gkey] = (t_cfg, [])
-                    table_write_groups[gkey][1].append(r)
-
-                for (_, mode), (t_cfg, t_responses) in table_write_groups.items():
-                    LOGGER.debug(
-                        "%s %s responses in remote cache %s",
-                        "Upserting" if mode == Mode.UPSERT else "Persisting",
-                        len(t_responses),
-                        t_cfg.table,
-                    )
-                    batches = [
-                        r.anonymize(mode=t_cfg.anonymize).to_arrow_batch(parse=False)
-                        for r in t_responses
-                    ]
-                    t_cfg.table.insert(
-                        pa.Table.from_batches(batches).combine_chunks(),
-                        mode=mode,
-                        match_by=t_cfg.match_by or None,
-                        wait=t_cfg.wait,
-                    )
+                self._persist_remote(
+                    to_insert, url_to_remote_cfg, session_remote_cfg,
+                )
 
             if config.raise_error and failed:
                 failed[-1].raise_for_status()

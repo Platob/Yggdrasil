@@ -5,7 +5,7 @@ import itertools
 import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin, Iterator, Generator
+from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
 
 import pyarrow as pa
 
@@ -21,7 +21,7 @@ from yggdrasil.data.constants import DEFAULT_VALUE_KEY, DEFAULT_FIELD_NAME
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.io.enums import Mode
-from yggdrasil.lazy_imports import path_class, schema_class
+from yggdrasil.lazy_imports import path_class, schema_class, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter
 from .data_utils import get_cast_options_class, safe_constraint_name
@@ -52,38 +52,8 @@ __all__ = [
 # Module-level constants & private helpers
 # ======================================================================
 
-_TYPE_JSON_METADATA_KEY = b"ytpe_json"
+_TYPE_JSON_METADATA_KEY = b"type_json"
 _NONE_TYPE = type(None)
-
-
-# Name-based heuristics for Field.autotag(). These are intentionally
-# conservative: they fire on common, unambiguous column-name patterns that
-# downstream Unity Catalog governance (tag-based policies, masking rules,
-# lineage dashboards) can key off without touching column values.
-#
-# Each entry is (tag_key, predicate). The first matching predicate per key
-# wins; later entries for the same key are ignored so more specific patterns
-# take precedence over generic ones.
-_FIELD_NAME_HEURISTICS: tuple[tuple[bytes, bytes, tuple[str, ...], tuple[str, ...]], ...] = (
-    # (tag_key, tag_value, suffix_matches, substring_matches)
-    (b"pii", b"email",   ("_email", "email_"),   ("email",)),
-    (b"pii", b"phone",   ("_phone", "phone_"),   ("phone_number", "phonenumber")),
-    (b"pii", b"ssn",     ("_ssn",),              ("ssn", "social_security")),
-    (b"pii", b"address", ("_address",),          ("street_address", "mailing_address")),
-    (b"pii", b"name",    ("_first_name", "_last_name", "_full_name"), ("first_name", "last_name", "full_name")),
-    (b"sensitive", b"secret", ("_secret", "_token", "_api_key"), ("password", "secret", "api_key", "access_token", "refresh_token", "private_key")),
-)
-
-# Exact matches / suffixes that stamp the field as an identifier column.
-_IDENTIFIER_SUFFIXES: tuple[str, ...] = ("_id", "_uuid", "_key")
-_IDENTIFIER_EXACT: frozenset[str] = frozenset({"id", "uuid", "pk", "rowid", "row_id"})
-
-# Common audit-timestamp name patterns.
-_AUDIT_TIMESTAMP_EXACT: frozenset[str] = frozenset({
-    "created_at", "updated_at", "deleted_at", "modified_at",
-    "inserted_at", "event_time", "event_timestamp", "ingested_at",
-})
-_AUDIT_TIMESTAMP_SUFFIXES: tuple[str, ...] = ("_at", "_timestamp")
 
 
 def _attach_type_json_metadata(
@@ -299,14 +269,14 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         Examples::
 
-            >>> print(field("id", "int64", nullable=False).format())
+            >>> print(field("id", "int64", nullable=False).pretty_format())
             'id' not null
               int64
 
             >>> print(field("user", StructType.from_fields([
             ...     field("id", "int64"),
             ...     field("email", "string"),
-            ... ])).format())
+            ... ])).pretty_format())
             'user'
               struct
                 'id'
@@ -318,13 +288,20 @@ class Field(BaseMetadata, BaseChildrenFields):
         pad = " " * (indent * level)
 
         header = f"{pad}field: {self.name!r}"
+        suffix = ""
         if not self.nullable:
-            header += " not null"
-        if self.metadata:
-            header += f" {self.metadata!r}"
+            suffix += " not null"
 
-        dtype_str = self.dtype.pretty_format(indent=indent, level=level + 1)
-        return f"{header}\n{dtype_str}"
+        comment = self.comment
+        if comment:
+            suffix += f" {comment!r}"
+
+        if self.type_id.is_nested:
+            dtype_str = self.dtype.pretty_format(indent=indent, level=level + 1)
+            return f"{header}{suffix}\n{dtype_str}"
+        else:
+            dtype_str = self.dtype.pretty_format()
+            return f"{header} {dtype_str}{suffix}"
 
     # ==================================================================
     # Dunder / identity
@@ -343,19 +320,6 @@ class Field(BaseMetadata, BaseChildrenFields):
         object.__setattr__(self, "dtype", DataType.from_any(dtype))
         object.__setattr__(self, "nullable", bool(nullable))
         object.__setattr__(self, "metadata", _normalize_metadata(metadata, tags=tags, default_value=default))
-
-    def __str__(self) -> str:
-        suffix = " not null" if not self.nullable else ""
-
-        if self.metadata:
-            suffix += f" {self.metadata!r}"
-
-        if self.has_default:
-            return f"{self.name!r}: {self.dtype!r}{suffix}"
-        return f"{self.name!r}: {self.dtype!r}{suffix}"
-
-    def __repr__(self) -> str:
-        return f"Field({self.__str__()})"
 
     def equals(
         self,
@@ -465,30 +429,6 @@ class Field(BaseMetadata, BaseChildrenFields):
     # ==================================================================
     # Tag flags — partition_by / cluster_by / primary_key / foreign_key
     # ==================================================================
-
-    @property
-    def partition_by(self) -> bool:
-        return self._tag_flag(b"partition_by")
-
-    @property
-    def cluster_by(self) -> bool:
-        return self._tag_flag(b"cluster_by")
-
-    @property
-    def primary_key(self) -> bool:
-        return self._tag_flag(b"primary_key")
-
-    @property
-    def foreign_key(self) -> bool:
-        return self._tag_flag(b"foreign_key")
-
-    @property
-    def constraint_key(self) -> bool:
-        return self._tag_flag(b"constraint_key")
-
-    @property
-    def sorted(self) -> bool:
-        return self._tag_flag(b"sorted")
 
     def _with_tag_flag(self, key: bytes, value: bool, inplace: bool) -> "Field":
         if inplace:
@@ -717,25 +657,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         are unchanged.
         """
         tags: dict[bytes, bytes] = dict(self.dtype.autotag())
-        tags[b"nullable"] = b"true" if self.nullable else b"false"
-
-        name = (self.name or "").strip().lower()
-        if name and name != DEFAULT_FIELD_NAME:
-            if name in _IDENTIFIER_EXACT or name.endswith(_IDENTIFIER_SUFFIXES):
-                tags[b"role"] = b"identifier"
-            elif (
-                name in _AUDIT_TIMESTAMP_EXACT
-                or name.endswith(_AUDIT_TIMESTAMP_SUFFIXES)
-            ):
-                tags[b"role"] = b"audit_timestamp"
-
-            for key, value, suffixes, substrings in _FIELD_NAME_HEURISTICS:
-                if key in tags:
-                    continue
-                if any(s in name for s in substrings) or (
-                    suffixes and name.endswith(suffixes)
-                ):
-                    tags[key] = value
+        if not self.nullable:
+            tags[b"nullable"] = b"false"
 
         self.update_tags(tags)
         return self
@@ -1075,36 +998,51 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "Field":
-        if not value:
-            raise ValueError(
-                f"Cannot build {cls.__name__} from empty dictionary {value!r}"
+    def from_dict(cls, value: Mapping[str, Any], default: Any = ...) -> "Field":
+        try:
+            if not value:
+                raise ValueError(
+                    f"Cannot build {cls.__name__} from empty dictionary {value!r}"
+                )
+
+            name = value.get("name") or ""
+            nullable = bool(value.get("nullable", True))
+            dtype = (
+                value.get(b"dtype")
+                or value.get("dtype")
+                or value.get(_TYPE_JSON_METADATA_KEY)
+                or value.get(_TYPE_JSON_METADATA_KEY.decode())
             )
+            if dtype:
+                dtype = DataType.from_json(dtype)
 
-        for key in (
-            "dtype", "type_json", "type_text", "type_name", "type",
-            "ytpe_json"
-        ):
-            dtype_payload = value.get(key)
-            if dtype_payload:
-                break
+            if dtype is None:
+                for key in ("type_text", "type_json", "type"):
+                    found = value.get(key)
+                    if found is not None:
+                        try:
+                            dtype = DataType.from_any(found)
+                            break
+                        except Exception:
+                            pass
 
-        if dtype_payload is None:
-            raise ValueError(
-                f"Cannot find a valid 'dtype' key in the provided dictionary: {value}"
+                if dtype is None:
+                    raise ValueError(
+                        f"Cannot build {cls.__name__} from dictionary without type: {value!r}"
+                    )
+
+            metadata = _normalize_metadata(value.get("metadata", {}), tags=None)
+
+            return cls(
+                name=name,
+                dtype=dtype,
+                nullable=nullable,
+                metadata=metadata,
             )
-
-        metadata = _normalize_metadata(value.get("metadata"), tags=None)
-        parsed = DataType.from_(dtype_payload)
-        nullable = bool(value.get("nullable", True))
-
-        return cls(
-            name=value["name"].strip(),
-            dtype=parsed,
-            nullable=nullable,
-            metadata=metadata,
-            default=None,
-        )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Cannot build {cls.__name__} from dictionary: {e}") from e
+            return default
 
     @classmethod
     def from_json(cls, value: Any) -> "Field":
@@ -1138,15 +1076,17 @@ class Field(BaseMetadata, BaseChildrenFields):
     def from_arrow(
         cls,
         value: pa.Field | pa.Schema | pa.DataType | Any,
+        from_metadata: bool = True,
     ) -> "Field":
         if not isinstance(value, pa.Field):
             if isinstance(value, pa.Field):
-                return cls.from_arrow_field(value)
+                return cls.from_arrow_field(value, from_metadata=from_metadata)
             if isinstance(value, pa.Schema):
-                return cls.from_arrow_schema(value)
+                return cls.from_arrow_schema(value, from_metadata=from_metadata)
             if isinstance(value, pa.DataType):
                 return cls.from_arrow_field(
-                    pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None)
+                    pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None),
+                    from_metadata=from_metadata
                 )
             if isinstance(value, (pa.Array, pa.ChunkedArray)):
                 nullable = value.null_count > 0 or len(value) == 0
@@ -1156,7 +1096,8 @@ class Field(BaseMetadata, BaseChildrenFields):
                         DEFAULT_FIELD_NAME, value.type,
                         nullable=nullable,
                         metadata=None
-                    )
+                    ),
+                    from_metadata=from_metadata
                 )
 
             if hasattr(value, "schema"):
@@ -1170,12 +1111,13 @@ class Field(BaseMetadata, BaseChildrenFields):
                 value = value()
 
             if isinstance(value, pa.Field):
-                return cls.from_arrow_field(value)
+                return cls.from_arrow_field(value, from_metadata=from_metadata)
             if isinstance(value, pa.Schema):
-                return cls.from_arrow_schema(value)
+                return cls.from_arrow_schema(value, from_metadata=from_metadata)
             if isinstance(value, pa.DataType):
                 return cls.from_arrow_field(
-                    pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None)
+                    pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None),
+                    from_metadata=from_metadata
                 )
             raise TypeError(f"Cannot build Field from {type(value).__name__}")
 
@@ -1187,7 +1129,12 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     @classmethod
-    def from_arrow_schema(cls, value: pa.Schema):
+    def from_arrow_schema(cls, value: pa.Schema, from_metadata: bool = True):
+        if from_metadata and value.metadata:
+            found = value.metadata.get(_TYPE_JSON_METADATA_KEY)
+            if found:
+                return cls.from_json(found)
+
         name = DEFAULT_FIELD_NAME
         if value.metadata:
             name = value.metadata.get(b"name", DEFAULT_FIELD_NAME.encode()).decode("utf-8")
@@ -1200,10 +1147,19 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     @classmethod
-    def from_arrow_field(cls, value: pa.Field) -> "Field":
+    def from_arrow_field(cls, value: pa.Field, from_metadata: bool = True) -> "Field":
+        if from_metadata and value.metadata:
+            dtype = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
+            if dtype is None:
+                dtype = DataType.from_arrow_type(value.type)
+            else:
+                dtype = DataType.from_json(dtype)
+        else:
+            dtype = DataType.from_arrow_type(value.type)
+
         return cls(
             name=value.name or DEFAULT_FIELD_NAME,
-            dtype=DataType.from_arrow_type(value.type),
+            dtype=dtype,
             nullable=value.nullable,
             metadata=_strip_internal_metadata(value.metadata),
         )
@@ -1312,7 +1268,7 @@ class Field(BaseMetadata, BaseChildrenFields):
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_spark(cls, obj: Any = None) -> "Field":
+    def from_spark(cls, obj: Any = None, from_metadata: bool = True) -> "Field":
         _psql = get_spark_sql()
 
         if not isinstance(obj, _psql.types.StructField):
@@ -1323,7 +1279,7 @@ class Field(BaseMetadata, BaseChildrenFields):
                     nullable=False,
                     metadata=None,
                 )
-            elif isinstance(obj, _psql.types.StructType):
+            elif isinstance(obj, _psql.types.DataType):
                 obj = _psql.types.StructField(
                     DEFAULT_FIELD_NAME,
                     obj,
@@ -1333,13 +1289,22 @@ class Field(BaseMetadata, BaseChildrenFields):
             else:
                 raise TypeError(f"Cannot build {cls.__name__} from {type(obj).__name__}")
 
-        return cls.from_spark_field(obj)
+        return cls.from_spark_field(obj, from_metadata=from_metadata)
 
     @classmethod
-    def from_spark_field(cls, value: "pst.StructField") -> "Field":
+    def from_spark_field(cls, value: "pst.StructField", from_metadata: bool = True) -> "Field":
+        if from_metadata and value.metadata:
+            dtype = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
+            if dtype is None:
+                dtype = DataType.from_spark(value.dataType)
+            else:
+                dtype = cls.from_json(dtype)
+        else:
+            dtype = DataType.from_spark(value.dataType)
+
         return cls(
             name=value.name,
-            dtype=DataType.from_spark(value.dataType),
+            dtype=dtype,
             nullable=value.nullable,
             metadata=_normalize_metadata(value.metadata, tags=None),
         )
@@ -1355,12 +1320,17 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=self.name,
             dtype=dtype,
             nullable=self.nullable,
-            metadata=self.metadata,
         )
+
+        if self.metadata:
+            out["metadata"] = {
+                k.decode(): v.decode()
+                for k, v in self.metadata.items()
+            }
 
         return out
 
-    def to_json(self, to_bytes: bool = False) -> str:
+    def to_json(self, to_bytes: bool = False) -> AnyStr:
         payload = self.to_dict()
 
         return json_module.dumps(
@@ -1377,12 +1347,11 @@ class Field(BaseMetadata, BaseChildrenFields):
     def to_arrow_type(self):
         return self.arrow_type
 
-    def to_arrow_field(self) -> pa.Field:
-        metadata = self.metadata
-        if metadata is None:
-            metadata = _attach_type_json_metadata(self.arrow_type, None)
-        else:
-            metadata = _attach_type_json_metadata(self.arrow_type, metadata)
+    def to_arrow_field(self, dump_json: bool = True) -> pa.Field:
+        metadata = self.metadata.copy() if self.metadata else {}
+
+        if dump_json:
+            metadata[_TYPE_JSON_METADATA_KEY] = self.dtype.to_json(to_bytes=True)
 
         return pa.field(
             name=self.name,
@@ -2236,7 +2205,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         Series → fill + rename.
         DataFrame → identity.
         """
-        pd = get_pandas()
+        pd = pandas_module()
         if isinstance(obj, pd.Series):
             return self.finalize_pandas_series(obj, default_scalar=default_scalar)
         if isinstance(obj, pd.DataFrame):

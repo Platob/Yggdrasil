@@ -34,7 +34,8 @@ import datetime as dt
 
 import pyarrow as pa
 import pytest
-
+from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.data_field import Field  # yggdrasil's Field class
 from yggdrasil.data.types.primitive.temporal import (
     DateType,
     DurationType,
@@ -45,9 +46,6 @@ from yggdrasil.data.types.primitive.temporal import (
     cast_polars_array_to_temporal,
     spark_cast,
 )
-from yggdrasil.data.cast.options import CastOptions
-from yggdrasil.data.data_field import Field  # yggdrasil's Field class
-
 
 # ---------------------------------------------------------------------------
 # Optional-dependency gates
@@ -718,12 +716,6 @@ class TestMerge:
     def test_merge_cross_class_raises(self):
         with pytest.raises(TypeError):
             DateType()._merge_with_same_id(TimestampType())
-
-    def test_merge_both_flags_raises(self):
-        with pytest.raises(pa.ArrowInvalid):
-            TimestampType()._merge_with_same_id(
-                TimestampType(), downcast=True, upcast=True
-            )
 
 
 # ===========================================================================

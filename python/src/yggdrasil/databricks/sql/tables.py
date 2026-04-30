@@ -203,7 +203,7 @@ class Tables(DatabricksService):
 
     def table(
         self,
-        location: str | None = None,
+        location: Table | str | None = None,
         *,
         table_name: str | None = None,
         catalog_name: str | None = None,

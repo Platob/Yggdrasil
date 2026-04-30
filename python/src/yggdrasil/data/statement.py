@@ -378,6 +378,7 @@ class StatementBatch(Generic[PS, SR]):
         statements: Optional[Iterable["PS | str"]] = None,
         *,
         parallel: int = 1,
+        **kwargs: Any,
     ):
         self.executor = executor
         self.parallel = max(1, parallel or 1)

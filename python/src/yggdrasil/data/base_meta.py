@@ -7,7 +7,7 @@ from difflib import get_close_matches
 from typing import Any, AnyStr, Mapping, TYPE_CHECKING, Union, Iterable
 
 import yggdrasil.pickle.json as json_module
-from yggdrasil.data.constants import DBX_META_PREFIX, TAG_PREFIX, DEFAULT_VALUE_KEY
+from yggdrasil.data.constants import TAG_PREFIX, DEFAULT_VALUE_KEY
 
 if TYPE_CHECKING:
     from .data_field import Field
@@ -174,15 +174,39 @@ class BaseMetadata(ABC):
         self._update_prefixed_metadata(TAG_PREFIX, value)
 
     @property
-    def databricks_metadata(self) -> dict[bytes, bytes]:
-        return self._prefixed_metadata(DBX_META_PREFIX)
+    def partition_by(self) -> bool:
+        return self._tag_flag(b"partition_by")
 
-    @databricks_metadata.setter
-    def databricks_metadata(
-        self,
-        values: Mapping[bytes | str, bytes | str | object] | None,
-    ) -> None:
-        self._update_prefixed_metadata(DBX_META_PREFIX, values)
+    @property
+    def cluster_by(self) -> bool:
+        return self._tag_flag(b"cluster_by")
+
+    @property
+    def primary_key(self) -> bool:
+        return self._tag_flag(b"primary_key")
+
+    @property
+    def foreign_key(self) -> bool:
+        return self._tag_flag(b"foreign_key")
+
+    @property
+    def constraint_key(self) -> bool:
+        return self._tag_flag(b"constraint_key")
+
+    @property
+    def sorted(self) -> bool:
+        return self._tag_flag(b"sorted")
+
+    @property
+    def comment(self):
+        if not self.metadata:
+            return None
+
+        comment = self.metadata.get(b"comment", None)
+
+        if comment:
+            return comment.decode('utf-8')
+        return None
 
 
 class BaseChildrenFields(ABC):

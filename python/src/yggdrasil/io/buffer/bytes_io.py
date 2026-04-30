@@ -102,7 +102,7 @@ import pathlib
 import struct
 import tempfile
 import time
-from typing import IO, TYPE_CHECKING, Any, Optional, Union
+from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 
 import pyarrow as pa
 
@@ -1235,8 +1235,15 @@ class BytesIO(Disposable, IO[bytes]):
             mode=0,
         )
 
-    def as_media(self, media_type: MediaType | None = None) -> "TabularIO":
-        return tabular_io_class()(self, media_type=media_type, copy=False)
+    def as_media(
+        self,
+        media_type: MediaType | None = None
+    ) -> "TabularIO":
+        return tabular_io_class()(
+            self,
+            media_type=media_type,
+            copy=False
+        )
 
     # ------------------------------------------------------------------
     # Dunder
@@ -1262,18 +1269,19 @@ class BytesIO(Disposable, IO[bytes]):
 
     def __repr__(self) -> str:
         owned = "owned" if self._owns_spill_path else "external"
+        mt = f" media={self._media_type.__repr__()}" if self._media_type else ""
         if self._spill_path is not None:
             handle = "open" if self._spill_fd is not None else "closed"
             return (
                 f"<{type(self).__name__} [spilled/{owned}/{handle}] "
                 f"size={self._size} pos={self._pos} "
-                f"mode={self._mode!r} path={self._spill_path!r}>"
+                f"mode={self._mode!r} path={self._spill_path!r}{mt}>"
             )
         if self._buf is None:
-            return f"<{type(self).__name__} [empty] size=0 pos=0>"
+            return f"<{type(self).__name__} [empty] size=0 pos=0{mt}>"
         return (
             f"<{type(self).__name__} [memory] size={self._size} "
-            f"pos={self._pos}>"
+            f"pos={self._pos}{mt}>"
         )
 
     def __getstate__(self):
@@ -1437,6 +1445,29 @@ class BytesIO(Disposable, IO[bytes]):
         if n <= 0 or self.size == 0:
             return b""
         return self._slice(0, min(n, self.size))
+
+    def tail(self, n: int = _HEAD_DEFAULT) -> bytes:
+        if n <= 0 or self.size == 0:
+            return b""
+        return self._slice(max(0, self.size - n), self.size)
+
+    def synthetic_content(
+        self,
+        n: int = _HEAD_DEFAULT,
+        encoding: str | None = "utf-8",
+        errors: str | None = "replace",
+    ) -> bytes | str:
+        size = self.size
+        if size == 0:
+            return b"" if encoding is None else ""
+
+        if size <= n:
+            content = self.head(size)
+        else:
+            mid = max(1, n // 2)
+            content = self.head(mid) + b"..." + self.tail(mid)
+
+        return content if encoding is None else content.decode(encoding, errors=errors)
 
     def tell(self) -> int:
         return int(self._pos)
@@ -1915,13 +1946,24 @@ class BytesIO(Disposable, IO[bytes]):
     # JSON
     # ------------------------------------------------------------------
 
-    def json_load(self, *, media_type: Optional[MediaType] = None):
+    def json_load(
+        self,
+        orient: Optional[Literal["records", "split", "index", "columns", "values"]] = None,
+        *,
+        media_type: Optional[MediaType] = None
+    ):
         media_type = media_type or self.media_type
-        if media_type is not None and media_type.codec is not None:
-            with self.decompress(codec=media_type.codec, copy=True) as decompressed:
-                return decompressed.json_load(media_type=media_type.with_codec(None))
-        with self.view(pos=0) as v:
-            return json_module.load(v)
+
+        if media_type.mime_type is MimeTypes.JSON:
+            if media_type is not None and media_type.codec is not None:
+                with self.decompress(codec=media_type.codec, copy=True) as decompressed:
+                    return decompressed.json_load(media_type=media_type.with_codec(None))
+
+            with self.view(pos=0) as v:
+                return json_module.load(v)
+        else:
+            with self.as_media(media_type) as reader:
+                return reader.read_pylist(reset_seek=True)
 
     def arrow_io(self, mode: str = "rb", size: int | None = None):
         if self._transaction_buffer is not None:

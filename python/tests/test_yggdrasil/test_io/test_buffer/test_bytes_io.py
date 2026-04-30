@@ -33,7 +33,8 @@ import pickle
 import tempfile
 import unittest
 
-from yggdrasil.io import BytesIO, MediaType
+from yggdrasil.io import BytesIO
+from yggdrasil.io.enums import MediaType
 
 
 # --------------------------------------------------------------------------

@@ -70,12 +70,14 @@ import functools
 from typing import Any, Mapping, TypeVar, Union, TYPE_CHECKING
 
 import pyarrow as pa
+from yggdrasil.data.expr import Predicate
 
 from yggdrasil.data.schema import Field, Schema
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.enums import Mode
 
 if TYPE_CHECKING:
-    pass
+    from pyspark.sql import SparkSession
 
 
 __all__ = [
@@ -141,12 +143,15 @@ class CastOptions:
     recursive: bool = False
     match_by_names: list[str] | None = None
     with_io: bool = True
-    truncate_before_write: bool = True
     seek_source: bool = False
     reset_seek: bool = False
     read_seek: int | None = None
     write_seek: int | None = None
     mark_dirty_on_write: bool = True
+    where: Predicate | None = None
+    read_write_upsert: bool = False
+    wait: WaitingConfig = WaitingConfig.default()
+    spark_session: "SparkSession | None" = None
     arrow_memory_pool: pa.MemoryPool | None = None
 
     # ==================================================================
@@ -281,7 +286,7 @@ class CastOptions:
         # given, otherwise passthrough. Typed check with ``cls`` so a
         # subclass CastOptions stays on its subclass.
         if isinstance(options, cls):
-            if not overrides and source is ... and target is ...:
+            if not overrides and source is ... and target is ... and not overrides:
                 return options
             return options.copy(source=source, target=target, **overrides)
         if isinstance(options, CastOptions):
@@ -298,7 +303,7 @@ class CastOptions:
             merged = {**options, **overrides}
             return cls._build(merged, source=source, target=target)
 
-        # 4. Schema-shaped → promote to target_field hint.
+        # 4. Schema-shaped → promote to a target_field hint.
         if isinstance(options, (pa.DataType, pa.Field, pa.Schema, Field, Schema)):
             overrides.setdefault("target_field", options)
             return cls._build(overrides, source=source, target=target)
@@ -333,12 +338,13 @@ class CastOptions:
         source: Any = ...,
         target: Any = ...,
     ) -> T:
+        overrides = overrides or {}
+        options = overrides.pop("options", None)
         clean = {
             k: v
             for k, v in overrides.items()
             if v is not ... and k in cls.field_names()
         }
-        options = clean.pop("options", None)
         # Drop foreign keys — DataIO public methods pass mixed kwargs
         # through .check(), and only CastOptions fields are valid for
         # construction. Foreign keys are the caller's concern (filter

@@ -104,23 +104,6 @@ print([r.status for r in responses])
 
 ---
 
-## 5) Cache-aware requests (`SendConfig`)
-
-```python
-from yggdrasil.io.http_ import HTTPSession
-from yggdrasil.io import SendConfig
-
-http = HTTPSession()
-cache_cfg = SendConfig(cache_for="15m")
-
-r1 = http.get("https://httpbin.org/get", params={"q": "cache"}, send_config=cache_cfg)
-r2 = http.get("https://httpbin.org/get", params={"q": "cache"}, send_config=cache_cfg)
-
-print(r1.status, r2.status)
-```
-
----
-
 ## 6) Response handling and conversions
 
 ```python

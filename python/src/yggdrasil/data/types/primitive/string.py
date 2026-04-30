@@ -30,8 +30,8 @@ class StringType(PrimitiveType):
         s = s + "_view" if self.view else s
         return f"{pad}{s}"
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.STRING
 
     @classmethod
@@ -79,12 +79,17 @@ class StringType(PrimitiveType):
         return cls._matches_dict(value, DataTypeId.STRING)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "StringType":
-        return cls(
-            large=bool(value.get("large", False)),
-            view=bool(value.get("view", False)),
-            byte_size=value.get("byte_size"),
-        )
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "StringType":
+        try:
+            return cls(
+                large=bool(value.get("large", False)),
+                view=bool(value.get("view", False)),
+                byte_size=value.get("byte_size"),
+            )
+        except Exception as e:
+            if default is ...:
+                raise e
+            return default
 
     # ==================================================================
     # Exporters

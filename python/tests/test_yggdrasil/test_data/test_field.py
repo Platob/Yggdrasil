@@ -143,7 +143,7 @@ def test_to_arrow_field_includes_type_json_metadata():
     assert out.nullable is False
     assert out.metadata is not None
     assert b"comment" in out.metadata
-    assert b"ytpe_json" in out.metadata
+    assert b"type_json" in out.metadata
 
 
 def test_from_str_nullable_suffix():

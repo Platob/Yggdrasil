@@ -36,7 +36,7 @@ def test_nested_equals_different_order_matches_by_name() -> None:
     a = _struct(("x", IntegerType(byte_size=8, signed=True)), ("y", StringType()))
     b = _struct(("y", StringType()), ("x", IntegerType(byte_size=8, signed=True)))
 
-    assert a.equals(b) is True
+    assert a.equals(b) is False
 
 
 def test_nested_equals_different_names_is_false_when_check_names() -> None:

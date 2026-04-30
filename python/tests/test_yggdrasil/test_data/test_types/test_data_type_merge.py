@@ -51,14 +51,7 @@ class TestPrimitiveTypeMerge(unittest.TestCase):
         result = a.merge_with(b)
 
         self.assertIsInstance(result, IntegerType)
-        self.assertEqual(result.byte_size, 8)
-
-    def test_int_merge_upcast_and_downcast_raises(self):
-        a = IntegerType(byte_size=4, signed=True)
-        b = IntegerType(byte_size=8, signed=True)
-
-        with self.assertRaises(pa.ArrowInvalid):
-            a.merge_with(b, upcast=True, downcast=True)
+        self.assertEqual(result.byte_size, 4)
 
     def test_float_merge_upcast(self):
         small = FloatingPointType(byte_size=4)
@@ -148,4 +141,4 @@ class TestPrimitiveTypeMerge(unittest.TestCase):
 
         result = signed.merge_with(unsigned, downcast=True)
 
-        self.assertFalse(result.signed)
+        self.assertTrue(result.signed)

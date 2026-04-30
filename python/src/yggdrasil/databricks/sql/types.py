@@ -63,6 +63,12 @@ COLUMN_INFO_TYPE_MAP = {
     ColumnInfoTypeName.USER_DEFINED_TYPE: ObjectType(),
 }
 
+COLUMN_STRING_TYPE_MAP = {
+    **{ci.name.upper(): t for ci, t in COLUMN_TYPE_MAP.items()},
+    **{ci.name.upper(): t for ci, t in COLUMN_INFO_TYPE_MAP.items()}
+}
+COLUMN_STRING_TYPE_MAP["INTEGER"] = IntegerType(byte_size=4)
+
 
 REPLACE_TIMEZONES = {
     "Etc/UTC": "UTC",
@@ -88,17 +94,14 @@ def parse_databricks_field(obj: Any) -> Field:
         if obj.startswith("{") and obj.endswith("}"):
             return parse_field_dict(json.loads(obj))
 
-        try:
-            dtype = ColumnTypeName[obj.upper()]
-            mapping = COLUMN_TYPE_MAP
-        except KeyError:
-            dtype = ColumnInfoTypeName[obj.upper()]
-            mapping = COLUMN_INFO_TYPE_MAP
+        dtype = COLUMN_STRING_TYPE_MAP.get(obj)
+        if dtype is None:
+            dtype = COLUMN_STRING_TYPE_MAP.get(obj.upper())
 
-        return Field(
-            name="",
-            dtype=mapping.get(dtype, ObjectType.instance()),
-        )
+            if dtype is None:
+                dtype = ObjectType()
+
+        return Field(name="", dtype=dtype)
 
     raise TypeError(f"Cannot parse field from {obj!r}")
 
@@ -120,7 +123,7 @@ def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
                 dtype = TimestampType(unit=dtype.unit, tz=tz)
 
     if dtype.type_id.is_nested:
-        dtype = dtype.merge_with(DataType.from_str(obj.type_text))
+        dtype = DataType.from_str(obj.type_text)
 
     metadata = {}
     if obj.position:

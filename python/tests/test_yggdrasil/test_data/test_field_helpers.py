@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import pyarrow as pa
 from yggdrasil.data.data_field import (
     _TYPE_JSON_METADATA_KEY,
-    _attach_type_json_metadata,
     _parse_field_name_token,
     _safe_issubclass,
     _split_field_shorthand,
@@ -43,16 +41,6 @@ def test_safe_issubclass_handles_non_types():
     assert _safe_issubclass(int, int) is True
     assert _safe_issubclass("int", int) is False
     assert _safe_issubclass(123, int) is False
-
-
-def test_attach_type_json_metadata_adds_internal_key():
-    metadata = {b"comment": b"hello"}
-
-    out = _attach_type_json_metadata(pa.int64(), metadata)
-
-    assert out[b"comment"] == b"hello"
-    assert _TYPE_JSON_METADATA_KEY in out
-    assert isinstance(out[_TYPE_JSON_METADATA_KEY], (bytes, bytearray))
 
 
 def test_strip_internal_metadata_removes_internal_key_only():

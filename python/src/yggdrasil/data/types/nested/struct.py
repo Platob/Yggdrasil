@@ -92,14 +92,14 @@ class StructType(NestedType):
     def children_fields(self) -> tuple["Field"]:
         return self.fields
 
-    @property
-    def type_id(self) -> DataTypeId:
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
         return DataTypeId.STRUCT
 
     def _merge_with_same_id(
         self,
         other: "StructType",
-        mode: Mode,
+        mode: "Mode" = Mode.AUTO,
         downcast: bool = False,
         upcast: bool = False,
     ) -> "StructType":
@@ -113,6 +113,7 @@ class StructType(NestedType):
 
         merged_fields: list[Field] = []
         missing_fields: list[Field] = []
+        seen = set()
 
         if not self.fields:
             source_type, target_type = self, other
@@ -123,17 +124,23 @@ class StructType(NestedType):
 
         for i, f in enumerate(target_type.fields):
             found = source_type.field_by(name=f.name, index=i, raise_error=False)
+            seen.add(f.name)
             if found is None:
                 if mode is Mode.APPEND:
                     missing_fields.append(f)
                 elif mode is Mode.UPSERT:
                     merged_fields.append(f)
             else:
+                seen.add(found.name)
                 mf = f.merge_with(found, mode=mode, downcast=downcast, upcast=upcast)
                 merged_fields.append(mf)
 
-        for miss in missing_fields:
-            merged_fields.append(miss)
+        if mode is Mode.APPEND:
+            for f in source_type.fields:
+                if f.name not in seen:
+                    missing_fields.append(f)
+
+        merged_fields.extend(missing_fields)
 
         return self.__class__(fields=tuple(merged_fields))
 
@@ -187,11 +194,15 @@ class StructType(NestedType):
         return cls(fields=tuple(values))
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "StructType":
-        return cls(fields=[
-            cached_from_import("yggdrasil.data.data_field", "Field").from_any(f)
-            for f in value.get("fields", [])
-        ])
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "StructType":
+        fields = value.get("fields", [])
+
+        try:
+            return cls(fields=[field_class().from_dict(f) for f in fields])
+        except (TypeError, ValueError):
+            if default is ...:
+                raise
+            return default
 
     def to_arrow(self) -> pa.DataType:
         return pa.struct([f.to_arrow_field() for f in self.fields])
