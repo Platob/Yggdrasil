@@ -504,7 +504,6 @@ from .struct_arrow import (  # noqa: E402
     cast_arrow_list_array,
     cast_arrow_tabular,
     cast_arrow_batch_iterator,
-    rechunk_arrow_batches_by_byte_size,
 )
 from .struct_polars import (  # noqa: E402
     cast_polars_struct_expr,

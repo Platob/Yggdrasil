@@ -46,7 +46,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.enums import MimeTypes, MimeType
 from yggdrasil.io.enums.mode import ModeLike, Mode
-from yggdrasil.io.tabular import TabularIO
+from yggdrasil.io.buffer.base import TabularIO
 from .column import Column
 from .sql_utils import (
     quote_ident,

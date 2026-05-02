@@ -85,7 +85,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MimeType, Mode
 from yggdrasil.io.fs import Path
-from yggdrasil.io.tabular import TabularIO
+from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:

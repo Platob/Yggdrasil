@@ -95,6 +95,7 @@ reporting but otherwise treat all modes alike.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import io
 import mmap
@@ -107,18 +108,15 @@ from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 
 import pyarrow as pa
 
-import contextlib
-
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.options import CastOptions
-from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
-from yggdrasil.io.tabular.base import TabularIO
+from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.types import BytesLike
 from yggdrasil.io.url import URL
-from yggdrasil.lazy_imports import tabular_io_class, local_path_class, path_class
+from yggdrasil.lazy_imports import local_path_class, path_class
 
 if TYPE_CHECKING:
     import blake3

@@ -65,7 +65,6 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MediaType, MimeTypes, MimeType, MediaTypes, Mode
-from yggdrasil.io.fs import Path
 from yggdrasil.lazy_imports import (
     bytes_io_class,
     polars_module,
@@ -78,6 +77,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.io.buffer.bytes_io import BytesIO
+    from yggdrasil.io.fs import Path
 
 
 __all__ = ["TabularIO"]
@@ -437,7 +437,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     @classmethod
     def from_path(
         cls,
-        path: Path,
+        path: "Path",
         media_type: MediaType | None = None
     ) -> "TabularIO[O]":
         path = path_class().from_(path)

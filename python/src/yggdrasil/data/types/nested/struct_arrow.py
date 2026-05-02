@@ -30,12 +30,11 @@ level dispatch. The iterator helper threads through
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Iterator, Iterable
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.data.types.id import DataTypeId
 
 if TYPE_CHECKING:
@@ -52,7 +51,6 @@ __all__ = [
     "cast_arrow_list_array",
     "cast_arrow_tabular",
     "cast_arrow_batch_iterator",
-    "rechunk_arrow_batches_by_byte_size",
 ]
 
 
@@ -253,6 +251,8 @@ def cast_arrow_batch_iterator(
 
     :raises TypeError: if any item is not a :class:`pa.RecordBatch`.
     """
+    from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+
     iterator = iter(batches)
 
     try:

@@ -514,7 +514,7 @@ def _read_checkpoint_parquet(path: Path) -> pa.Table:
     Routes through our :class:`ParquetIO` so the read benefits
     from our local-fast-path and codec discipline.
     """
-    from yggdrasil.io.tabular import TabularIO
+    from yggdrasil.io.buffer.base import TabularIO
 
     cp_io = TabularIO.from_path(path, media_type=MediaTypes.PARQUET)
     with cp_io:

@@ -105,7 +105,7 @@ def spark_sql_module():
 
 @lru_cache(maxsize=1)
 def tabular_io_class():
-    from yggdrasil.io.tabular import TabularIO
+    from yggdrasil.io.buffer.base import TabularIO
     return TabularIO
 
 

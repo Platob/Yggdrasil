@@ -477,3 +477,4 @@ class MediaTypes:
     PARQUET = MediaType(mime_type=MimeTypes.PARQUET, codec=None)
     JSON = MediaType(mime_type=MimeTypes.JSON, codec=None)
     ARROW_IPC = MediaType(mime_type=MimeTypes.ARROW_IPC, codec=None)
+    ZIP_ENTRY = MediaType(mime_type=MimeTypes.ZIP_ENTRY, codec=None)

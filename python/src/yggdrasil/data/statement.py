@@ -45,7 +45,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import MimeType, MimeTypes
-from yggdrasil.io.tabular import TabularIO
+from yggdrasil.io.buffer.base import TabularIO
 
 if TYPE_CHECKING:
     from yggdrasil.data.executor import StatementExecutor

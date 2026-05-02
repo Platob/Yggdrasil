@@ -62,7 +62,7 @@ from yggdrasil.data.schema import Field, Schema
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaTypes, Mode, MimeType, MimeTypes
 from yggdrasil.io.fs import Path
-from yggdrasil.io.tabular import TabularIO
+from yggdrasil.io.buffer.base import TabularIO
 from .actions import (
     AddFile,
     CommitInfo,

@@ -21,4 +21,4 @@ pytest.importorskip("yggdrasil")
 # downstream test module.
 from yggdrasil.io.buffer.bytes_io import BytesIO  # noqa: E402,F401
 from yggdrasil.io.fs import Path, LocalPath  # noqa: E402,F401
-from yggdrasil.io.tabular.base import TabularIO  # noqa: E402,F401
+from yggdrasil.io.buffer.base import TabularIO  # noqa: E402,F401
