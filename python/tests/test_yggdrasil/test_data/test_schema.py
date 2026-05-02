@@ -554,8 +554,8 @@ class TestAutotag:
 
         out = s.autotag()
 
-        assert [f.name for f in out.partition_by] == ["trade_date"]
-        assert [f.name for f in out.cluster_by] == ["book_id", "trade_id"]
+        assert [f.name for f in out.partition_fields] == ["trade_date"]
+        assert [f.name for f in out.cluster_fields] == ["book_id", "trade_id"]
 
         assert (out["trade_date"].tags or {})[b"partition_by"] == b"true"
         assert (out["book_id"].tags or {})[b"cluster_by"] == b"true"

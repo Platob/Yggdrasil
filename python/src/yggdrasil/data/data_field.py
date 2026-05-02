@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import os
+import pathlib
 import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
@@ -759,12 +761,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         elif ns.startswith("pyspark"):
             return cls.from_spark(obj)
 
-        pc = path_class()
-        if pc.is_pathish(obj):
-            try:
-                return pc.from_(obj).as_media().collect_schema().to_field()
-            except Exception:
-                pass
+        # Path-like check — only for inputs that could *plausibly* be paths.
+        # Resolving ``path_class()`` pulls in the io.fs subtree, so we don't
+        # want unrelated objects (random user classes) reaching it.
+        if isinstance(obj, (str, pathlib.PurePath, os.PathLike)):
+            pc = path_class()
+            if pc.is_pathish(obj):
+                try:
+                    return pc.from_(obj).as_media().collect_schema().to_field()
+                except Exception:
+                    pass
 
         if isinstance(obj, type):
             return cls.from_pytype(obj)
