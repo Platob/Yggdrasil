@@ -1,17 +1,24 @@
-"""Arrow integration tests for ArrayType casts.
+"""Arrow-side casts for :class:`ArrayType`.
 
-These exercise cast_arrow_list_array and cast_arrow_map_array_to_list
-across every list flavor (regular, large, fixed-size, chunked, view)
-and validate the rejection paths that guard against incompatible
-target shapes.
+Two cast surfaces under test:
+
+* :func:`cast_arrow_list_array` — list / large_list / fixed_size_list
+  / chunked_list source → list / large_list / fixed_size_list target.
+* :func:`cast_arrow_map_array_to_list` — map<k,v> →
+  list<struct<key,value>>; the inverse direction lives in
+  ``test_map``.
+
+Plus the rejection paths: bad target shape (list_view target),
+mismatched source kind, struct items that don't fit the (key, value)
+2-ary contract.
 """
 from __future__ import annotations
 
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested.array import (
     cast_arrow_list_array,
     cast_arrow_map_array_to_list,
@@ -19,289 +26,333 @@ from yggdrasil.data.types.nested.array import (
 
 
 # ---------------------------------------------------------------------------
-# list -> list cast
+# list → list
 # ---------------------------------------------------------------------------
 
 
-def test_cast_list_to_list_changes_item_dtype(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    array = pa.array(
-        [[1, 2], [3, None], None],
-        type=pa.list_(pa.int64()),
-    )
+class TestListToList:
 
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
-
-    result = cast_arrow_list_array(array, options)
-
-    assert isinstance(result, pa.ListArray)
-    assert result.type == pa.list_(pa.string())
-    assert result.to_pylist() == [["1", "2"], ["3", None], None]
-
-
-def test_cast_list_to_large_list_preserves_values(
-    source_array_field: Field,
-    target_large_array_field: Field,
-) -> None:
-    array = pa.array([[1, 2], [3, None], None], type=pa.list_(pa.int64()))
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_large_array_field,
-    )
-
-    result = cast_arrow_list_array(array, options)
-
-    assert isinstance(result, pa.LargeListArray)
-    assert result.type == pa.large_list(pa.string())
-    assert result.to_pylist() == [["1", "2"], ["3", None], None]
-
-
-def test_cast_list_to_fixed_size_list_drops_null_rows(
-    source_array_field: Field,
-    target_fixed_array_field: Field,
-) -> None:
-    array = pa.array([[1, 2], [3, None], None], type=pa.list_(pa.int64()))
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_fixed_array_field,
-    )
-
-    result = cast_arrow_list_array(array, options)
-
-    assert isinstance(result, pa.FixedSizeListArray)
-    assert result.type == pa.list_(pa.string(), 2)
-    # FixedSizeListArray.from_arrays with a mask materialises null rows as
-    # absent rather than as Python None, so we get 2 visible rows.
-    assert result.to_pylist() == [["1", "2"], ["3", None]]
-
-
-def test_cast_chunked_list_to_list_preserves_chunks(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    chunk_1 = pa.array([[1, 2], None], type=pa.list_(pa.int64()))
-    chunk_2 = pa.array([[3]], type=pa.list_(pa.int64()))
-    array = pa.chunked_array([chunk_1, chunk_2], type=pa.list_(pa.int64()))
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
-
-    result = cast_arrow_list_array(array, options)
-
-    assert isinstance(result, pa.ChunkedArray)
-    assert result.type == pa.list_(pa.string())
-    assert result.to_pylist() == [["1", "2"], None, ["3"]]
-
-
-def test_cast_preserves_null_mask_for_null_and_nested_null(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    array = pa.array(
-        [None, [], [1, None, 3]],
-        type=pa.list_(pa.int64()),
-    )
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
-
-    result = cast_arrow_list_array(array, options)
-
-    assert result.to_pylist() == [None, [], ["1", None, "3"]]
-    assert result.is_null().to_pylist() == [True, False, False]
-
-
-def test_cast_list_returns_input_when_target_is_none(
-    source_array_field: Field,
-) -> None:
-    array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
-    options = CastOptions(source_field=source_array_field, target_field=None)
-
-    assert cast_arrow_list_array(array, options) is array
-
-
-def test_cast_list_raises_for_non_array_source(
-    source_map_field: Field,
-    target_array_field: Field,
-) -> None:
-    array = pa.array([[("a", 1)]], type=pa.map_(pa.string(), pa.int64()))
-
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=target_array_field,
-    )
-
-    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
-        cast_arrow_list_array(array, options)
-
-
-def test_cast_list_raises_when_target_is_list_view(
-    source_array_field: Field,
-    target_view_array_field: Field,
-) -> None:
-    array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_view_array_field,
-    )
-
-    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
-        cast_arrow_list_array(array, options)
-
-
-# ---------------------------------------------------------------------------
-# map -> list<struct<key,value>> cast
-# ---------------------------------------------------------------------------
-
-
-def test_cast_map_to_list_of_entries_materialises_key_value_struct(
-    source_map_field: Field,
-    target_entries_array_field: Field,
-) -> None:
-    array = pa.array(
-        [
-            [("a", 1), ("b", 2)],
-            [("c", None)],
-            None,
-        ],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
-
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=target_entries_array_field,
-    )
-
-    result = cast_arrow_map_array_to_list(array, options)
-
-    assert isinstance(result, pa.ListArray)
-    assert result.type == pa.list_(
-        pa.struct(
-            [
-                pa.field("key", pa.string(), nullable=False),
-                pa.field("value", pa.string()),
-            ]
+    def test_changes_item_dtype(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [[1, 2], [3, None], None],
+            type=pa.list_(pa.int64()),
         )
-    )
-    assert result.to_pylist() == [
-        [{"key": "a", "value": "1"}, {"key": "b", "value": "2"}],
-        [{"key": "c", "value": None}],
-        None,
-    ]
+
+        result = cast_arrow_list_array(
+            array,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.ListArray)
+        assert result.type == pa.list_(pa.string())
+        assert result.to_pylist() == [["1", "2"], ["3", None], None]
+
+    def test_widens_to_large_list(
+        self,
+        source_array_field: Field,
+        target_large_array_field: Field,
+    ) -> None:
+        array = pa.array([[1, 2], [3, None], None], type=pa.list_(pa.int64()))
+
+        result = cast_arrow_list_array(
+            array,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_large_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.LargeListArray)
+        assert result.type == pa.large_list(pa.string())
+        assert result.to_pylist() == [["1", "2"], ["3", None], None]
+
+    def test_narrows_to_fixed_size_list(
+        self,
+        source_array_field: Field,
+        target_fixed_array_field: Field,
+    ) -> None:
+        array = pa.array([[1, 2], [3, None], None], type=pa.list_(pa.int64()))
+
+        result = cast_arrow_list_array(
+            array,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_fixed_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.FixedSizeListArray)
+        assert result.type == pa.list_(pa.string(), 2)
+        # FixedSizeListArray with a mask collapses null rows out — visible
+        # rows match what made it through the cast.
+        assert result.to_pylist() == [["1", "2"], ["3", None]]
+
+    def test_chunked_input_keeps_chunked_shape(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        chunk_1 = pa.array([[1, 2], None], type=pa.list_(pa.int64()))
+        chunk_2 = pa.array([[3]], type=pa.list_(pa.int64()))
+        array = pa.chunked_array([chunk_1, chunk_2], type=pa.list_(pa.int64()))
+
+        result = cast_arrow_list_array(
+            array,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.ChunkedArray)
+        assert result.type == pa.list_(pa.string())
+        assert result.to_pylist() == [["1", "2"], None, ["3"]]
+
+    def test_preserves_null_mask_for_outer_null_and_empty_list(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [None, [], [1, None, 3]],
+            type=pa.list_(pa.int64()),
+        )
+
+        result = cast_arrow_list_array(
+            array,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
+
+        assert result.to_pylist() == [None, [], ["1", None, "3"]]
+        assert result.is_null().to_pylist() == [True, False, False]
 
 
-def test_cast_map_to_large_list_of_entries(
-    source_map_field: Field,
-    target_entries_large_array_field: Field,
-) -> None:
-    array = pa.array(
-        [[("a", 1), ("b", 2)], [("c", None)], None],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
+class TestListShortCircuits:
 
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=target_entries_large_array_field,
-    )
+    def test_target_none_returns_input_identity(
+        self, source_array_field: Field
+    ) -> None:
+        array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
 
-    result = cast_arrow_map_array_to_list(array, options)
+        out = cast_arrow_list_array(
+            array,
+            CastOptions(source_field=source_array_field, target_field=None),
+        )
 
-    assert isinstance(result, pa.LargeListArray)
+        assert out is array
 
 
-def test_cast_chunked_map_to_list_of_entries(
-    source_map_field: Field,
-    target_entries_array_field: Field,
-) -> None:
-    chunk_1 = pa.array(
-        [[("a", 1)], None],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
-    chunk_2 = pa.array(
-        [[("b", 2), ("c", 3)]],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
-    array = pa.chunked_array(
-        [chunk_1, chunk_2],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
+class TestListRejections:
 
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=target_entries_array_field,
-    )
+    def test_non_array_source_raises(
+        self,
+        source_map_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [[("a", 1)]], type=pa.map_(pa.string(), pa.int64())
+        )
 
-    result = cast_arrow_map_array_to_list(array, options)
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_list_array(
+                array,
+                CastOptions(
+                    source_field=source_map_field,
+                    target_field=target_array_field,
+                ),
+            )
 
-    assert isinstance(result, pa.ChunkedArray)
-    assert result.to_pylist() == [
-        [{"key": "a", "value": "1"}],
-        None,
-        [{"key": "b", "value": "2"}, {"key": "c", "value": "3"}],
-    ]
+    def test_list_view_target_rejected(
+        self,
+        source_array_field: Field,
+        target_view_array_field: Field,
+    ) -> None:
+        array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
 
-
-def test_cast_map_returns_input_when_target_is_none(
-    source_map_field: Field,
-) -> None:
-    array = pa.array([[("a", 1)]], type=pa.map_(pa.string(), pa.int64()))
-    options = CastOptions(source_field=source_map_field, target_field=None)
-
-    assert cast_arrow_map_array_to_list(array, options) is array
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_list_array(
+                array,
+                CastOptions(
+                    source_field=source_array_field,
+                    target_field=target_view_array_field,
+                ),
+            )
 
 
-def test_cast_map_raises_for_non_map_source(
-    source_array_field: Field,
-    target_entries_array_field: Field,
-) -> None:
-    array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_entries_array_field,
-    )
-
-    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
-        cast_arrow_map_array_to_list(array, options)
+# ---------------------------------------------------------------------------
+# map → list<struct<key, value>>
+# ---------------------------------------------------------------------------
 
 
-def test_cast_map_raises_when_target_item_is_not_a_struct(
-    source_map_field: Field,
-    invalid_target_entries_scalar_array_field: Field,
-) -> None:
-    array = pa.array([[("a", 1)]], type=pa.map_(pa.string(), pa.int64()))
+class TestMapToListEntries:
 
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=invalid_target_entries_scalar_array_field,
-    )
+    def test_materialises_each_entry_as_struct(
+        self,
+        source_map_field: Field,
+        target_entries_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [
+                [("a", 1), ("b", 2)],
+                [("c", None)],
+                None,
+            ],
+            type=pa.map_(pa.string(), pa.int64()),
+        )
 
-    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
-        cast_arrow_map_array_to_list(array, options)
+        result = cast_arrow_map_array_to_list(
+            array,
+            CastOptions(
+                source_field=source_map_field,
+                target_field=target_entries_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.ListArray)
+        assert result.type == pa.list_(
+            pa.struct(
+                [
+                    pa.field("key", pa.string(), nullable=False),
+                    pa.field("value", pa.string()),
+                ]
+            )
+        )
+        assert result.to_pylist() == [
+            [{"key": "a", "value": "1"}, {"key": "b", "value": "2"}],
+            [{"key": "c", "value": None}],
+            None,
+        ]
+
+    def test_widens_to_large_list(
+        self,
+        source_map_field: Field,
+        target_entries_large_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [[("a", 1), ("b", 2)], [("c", None)], None],
+            type=pa.map_(pa.string(), pa.int64()),
+        )
+
+        result = cast_arrow_map_array_to_list(
+            array,
+            CastOptions(
+                source_field=source_map_field,
+                target_field=target_entries_large_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.LargeListArray)
+
+    def test_chunked_input_kept_chunked(
+        self,
+        source_map_field: Field,
+        target_entries_array_field: Field,
+    ) -> None:
+        chunk_1 = pa.array(
+            [[("a", 1)], None],
+            type=pa.map_(pa.string(), pa.int64()),
+        )
+        chunk_2 = pa.array(
+            [[("b", 2), ("c", 3)]],
+            type=pa.map_(pa.string(), pa.int64()),
+        )
+        array = pa.chunked_array(
+            [chunk_1, chunk_2], type=pa.map_(pa.string(), pa.int64())
+        )
+
+        result = cast_arrow_map_array_to_list(
+            array,
+            CastOptions(
+                source_field=source_map_field,
+                target_field=target_entries_array_field,
+            ),
+        )
+
+        assert isinstance(result, pa.ChunkedArray)
+        assert result.to_pylist() == [
+            [{"key": "a", "value": "1"}],
+            None,
+            [{"key": "b", "value": "2"}, {"key": "c", "value": "3"}],
+        ]
 
 
-def test_cast_map_raises_when_target_struct_has_wrong_arity(
-    source_map_field: Field,
-    invalid_target_entries_struct_one_field_array_field: Field,
-) -> None:
-    array = pa.array([[("a", 1)]], type=pa.map_(pa.string(), pa.int64()))
+class TestMapToListShortCircuits:
 
-    options = CastOptions(
-        source_field=source_map_field,
-        target_field=invalid_target_entries_struct_one_field_array_field,
-    )
+    def test_target_none_returns_input_identity(
+        self, source_map_field: Field
+    ) -> None:
+        array = pa.array(
+            [[("a", 1)]], type=pa.map_(pa.string(), pa.int64())
+        )
 
-    with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
-        cast_arrow_map_array_to_list(array, options)
+        out = cast_arrow_map_array_to_list(
+            array,
+            CastOptions(source_field=source_map_field, target_field=None),
+        )
+
+        assert out is array
+
+
+class TestMapToListRejections:
+
+    def test_non_map_source_raises(
+        self,
+        source_array_field: Field,
+        target_entries_array_field: Field,
+    ) -> None:
+        array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
+
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_map_array_to_list(
+                array,
+                CastOptions(
+                    source_field=source_array_field,
+                    target_field=target_entries_array_field,
+                ),
+            )
+
+    def test_target_item_must_be_struct(
+        self,
+        source_map_field: Field,
+        invalid_target_entries_scalar_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [[("a", 1)]], type=pa.map_(pa.string(), pa.int64())
+        )
+
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_map_array_to_list(
+                array,
+                CastOptions(
+                    source_field=source_map_field,
+                    target_field=invalid_target_entries_scalar_array_field,
+                ),
+            )
+
+    def test_target_struct_must_be_two_ary(
+        self,
+        source_map_field: Field,
+        invalid_target_entries_struct_one_field_array_field: Field,
+    ) -> None:
+        array = pa.array(
+            [[("a", 1)]], type=pa.map_(pa.string(), pa.int64())
+        )
+
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_map_array_to_list(
+                array,
+                CastOptions(
+                    source_field=source_map_field,
+                    target_field=invalid_target_entries_struct_one_field_array_field,
+                ),
+            )

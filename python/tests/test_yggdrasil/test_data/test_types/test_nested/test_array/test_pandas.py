@@ -1,93 +1,102 @@
-"""Pandas integration tests for ArrayType.
+"""Pandas-side casts for :class:`ArrayType`.
 
-Pandas' object dtype has no first-class list type, so these tests
-route through pyarrow under the hood (``cast_pandas_list_series`` and
-``_cast_pandas_via_arrow``).
+Pandas has no first-class list dtype, so list-shaped values flow
+through pyarrow under the hood (``cast_pandas_list_series`` →
+``_cast_pandas_via_arrow`` → cast_arrow_list_array). The tests here
+lock in the surface contract: name + index preservation, the
+all-null-rows fast path, and the :meth:`ArrayType.default_pandas_series`
+shape.
 """
 from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested.array import (
     ArrayType,
     cast_pandas_list_series,
 )
-from yggdrasil.lazy_imports import field_class
+from yggdrasil.data.types.primitive import StringType
 
 pd = pytest.importorskip("pandas")
 
 
-def test_cast_pandas_list_series_changes_item_dtype(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    series = pd.Series(
-        [[1, 2], [3, None], None],
-        name="source_array",
-        dtype="object",
-    )
+class TestCastPandasListSeries:
 
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
+    def test_changes_item_dtype(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        series = pd.Series(
+            [[1, 2], [3, None], None],
+            name="source_array",
+            dtype="object",
+        )
 
-    result = cast_pandas_list_series(series, options)
+        out = cast_pandas_list_series(
+            series,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
 
-    assert result.name == "target_array"
-    assert result.tolist() == [["1", "2"], ["3", None], None]
+        assert out.name == "target_array"
+        assert out.tolist() == [["1", "2"], ["3", None], None]
+
+    def test_preserves_index_and_index_name(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        series = pd.Series(
+            [[1], [2], None],
+            name="source_array",
+            dtype="object",
+            index=pd.Index([10, 20, 30], name="idx"),
+        )
+
+        out = cast_pandas_list_series(
+            series,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
+
+        assert list(out.index) == [10, 20, 30]
+        assert out.index.name == "idx"
+
+    def test_all_null_rows_pass_through(
+        self,
+        source_array_field: Field,
+        target_array_field: Field,
+    ) -> None:
+        series = pd.Series(
+            [None, None, None], name="source_array", dtype="object"
+        )
+
+        out = cast_pandas_list_series(
+            series,
+            CastOptions(
+                source_field=source_array_field,
+                target_field=target_array_field,
+            ),
+        )
+
+        assert out.tolist() == [None, None, None]
 
 
-def test_cast_pandas_list_series_preserves_index(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    series = pd.Series(
-        [[1], [2], None],
-        name="source_array",
-        dtype="object",
-        index=pd.Index([10, 20, 30], name="idx"),
-    )
+class TestDefaultPandasSeries:
 
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
+    def test_nullable_size_returns_all_null_series(self) -> None:
+        dtype = ArrayType(
+            item_field=Field(name="item", dtype=StringType(), nullable=True),
+        )
 
-    result = cast_pandas_list_series(series, options)
+        series = dtype.default_pandas_series(size=3, nullable=True)
 
-    assert list(result.index) == [10, 20, 30]
-    assert result.index.name == "idx"
-
-
-def test_cast_pandas_list_series_handles_all_null_rows(
-    source_array_field: Field,
-    target_array_field: Field,
-) -> None:
-    series = pd.Series([None, None, None], name="source_array", dtype="object")
-
-    options = CastOptions(
-        source_field=source_array_field,
-        target_field=target_array_field,
-    )
-
-    result = cast_pandas_list_series(series, options)
-
-    assert result.tolist() == [None, None, None]
-
-
-def test_array_type_default_pandas_series_respects_nullable() -> None:
-    dtype = ArrayType(
-        item_field=Field(
-            name="item",
-            dtype=field_class().from_any("string").dtype,
-            nullable=True,
-        ),
-    )
-
-    series = dtype.default_pandas_series(size=3, nullable=True)
-
-    assert len(series) == 3
-    assert series.isna().all()
+        assert len(series) == 3
+        assert series.isna().all()
