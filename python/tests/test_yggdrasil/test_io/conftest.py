@@ -1,111 +1,24 @@
-# tests/io/conftest.py
-"""Shared fixtures for yggdrasil.io tests.
+"""Shared fixtures for the rewritten yggdrasil.io test suite.
 
-Factories / constants live in `_helpers.py` so tests can import them
-directly (conftest modules are pytest plugins, not importable modules).
+The previous test tree had grown a deep set of fixtures pinned to
+implementation-internal behavior. The rewrite favors plain test
+classes that build their own state. This conftest only declares the
+things multiple files genuinely share, and skips the whole tree if
+yggdrasil itself isn't importable.
 """
 
 from __future__ import annotations
 
-import bz2
-import gzip
-import lzma
-from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
-# Skip everything if yggdrasil itself isn't importable.
 pytest.importorskip("yggdrasil")
 
-from yggdrasil.io.buffer.bytes_io import BytesIO       # noqa: E402
-from yggdrasil.io.request import PreparedRequest       # noqa: E402
-from yggdrasil.io.response import Response             # noqa: E402
-
-from ._helpers import (                                # noqa: E402
-    MockSession,
-    make_request,
-    make_response,
-    make_table_mock,
-)
-
-# ---------------------------------------------------------------------------
-# Shared payload constants
-# ---------------------------------------------------------------------------
-
-#: ~6 KB of repetitive data — compresses well, large enough to trigger spills.
-PAYLOAD = b"Brent ICE front-month daily close " * 200
-
-#: A handful of bytes — always stays in memory under any reasonable threshold.
-SMALL = b"Henry Hub prompt settle"
-
-
-# ---------------------------------------------------------------------------
-# Compression helpers — skip gracefully when optional deps are absent
-# ---------------------------------------------------------------------------
-
-def compress_gzip(data: bytes) -> bytes:
-    return gzip.compress(data)
-
-
-def compress_bz2(data: bytes) -> bytes:
-    return bz2.compress(data)
-
-
-def compress_xz(data: bytes) -> bytes:
-    return lzma.compress(data)
-
-
-def compress_zstd(data: bytes) -> bytes:
-    zstd = pytest.importorskip("zstandard")
-    return zstd.ZstdCompressor().compress(data)
-
-
-def compress_lz4(data: bytes) -> bytes:
-    lz4 = pytest.importorskip("lz4.frame")
-    return lz4.compress(data)
-
-
-def compress_snappy(data: bytes) -> bytes:
-    cramjam = pytest.importorskip("cramjam")
-    return bytes(cramjam.snappy.compress(data))
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def small_buf() -> BytesIO:
-    """In-memory BytesIO seeded with SMALL."""
-    return BytesIO(SMALL)
-
-
-@pytest.fixture
-def empty_buf() -> BytesIO:
-    """Freshly created empty BytesIO."""
-    return BytesIO()
-
-
-@pytest.fixture
-def req() -> PreparedRequest:
-    """A fresh GET request with deterministic `sent_at`."""
-    return make_request()
-
-
-@pytest.fixture
-def resp(req: PreparedRequest) -> Response:
-    """A fresh 200 response anchored to `req`."""
-    return make_response(request=req)
-
-
-@pytest.fixture
-def mock_session() -> MockSession:
-    """A MockSession with an empty response queue."""
-    return MockSession()
-
-
-@pytest.fixture
-def mock_table() -> MagicMock:
-    """A MagicMock table whose SQL execute returns zero hits."""
-    return make_table_mock()
+# Preheat the io.buffer / io.fs / io.tabular triangle before any test
+# touches the package piecemeal. The trio sits in a circular-import
+# triangle if a test starts at io.tabular (or any of its consumers)
+# before yggdrasil.io.fs has finished loading. Importing the heavy
+# leaves here once, in dependency order, breaks the cycle for every
+# downstream test module.
+from yggdrasil.io.buffer.bytes_io import BytesIO  # noqa: E402,F401
+from yggdrasil.io.fs import Path, LocalPath  # noqa: E402,F401
+from yggdrasil.io.tabular.base import TabularIO  # noqa: E402,F401

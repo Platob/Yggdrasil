@@ -49,7 +49,7 @@ construction, so ``buffer._claimers`` reflects live handle count.
 
 from __future__ import annotations
 
-from typing import IO, Any, ClassVar, Iterator, List, Optional
+from typing import IO, Any, ClassVar, Iterator, List, Optional, Union
 
 from yggdrasil.dataclasses.expiring import ExpiringDict, now_utc_ns
 from yggdrasil.disposable import Disposable
@@ -274,6 +274,11 @@ class MemoryIO(Disposable, IO[bytes]):
     # ------------------------------------------------------------------
 
     def _acquire(self) -> None:
+        # The wrapped BytesIO is registry-shared and may not have been
+        # opened yet (the registry mints buffers lazily). Make sure
+        # the underlying ops will succeed by opening it.
+        if not self._buffer.opened:
+            self._buffer.open()
         # Apply mode-driven content reset on the underlying buffer.
         # Truncate-on-open is shared across all handles by design:
         # POSIX ``open(O_TRUNC)`` on a path drops bytes even with
@@ -700,6 +705,40 @@ class MemoryPath(Path):
             buf = existing
 
         return MemoryIO(self, buf, mode=mode, auto_open=auto_open)
+
+    # ------------------------------------------------------------------
+    # Random-access primitives — Path declares pread/pwrite abstract;
+    # delegate to the registry buffer directly so the abstraction is
+    # satisfied without re-routing through the IO layer.
+    # ------------------------------------------------------------------
+
+    def pread(self, n: int, pos: int, *, default: Any = ...) -> bytes:
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        existing = REGISTRY.get(self.url, None)
+        if existing is None or existing.closed:
+            if default is ...:
+                raise FileNotFoundError(self.full_path())
+            return default
+        if n < 0:
+            n = max(0, existing.size - pos)
+        return existing.pread(n, pos)
+
+    def pwrite(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+        *,
+        parents: bool = True,
+    ) -> int:
+        del parents  # No directories to materialize in memory.
+        if pos < 0:
+            raise ValueError("pwrite position must be >= 0")
+        buf = REGISTRY.get(self.url, None)
+        if buf is None or buf.closed:
+            buf = BytesIO()
+            REGISTRY[self.url] = buf
+        return buf.pwrite(data, pos)
 
 
 # Defensive registration — `__init_subclass__` already does this,

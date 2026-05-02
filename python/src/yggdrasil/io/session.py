@@ -36,6 +36,59 @@ __all__ = ["Session", "CacheConfig", "SendConfig", "SendManyConfig"]
 LOGGER = logging.getLogger(__name__)
 
 
+# Cap on per-batch byte size when emitting responses from a Spark
+# `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
+# preference and keeps a single oversized response from inflating the
+# whole partition's output. A response that is itself larger than the
+# cap is emitted alone in its own batch — chunking the row would
+# require splitting binary columns, which is not meaningful here.
+_SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
+
+
+def _rechunk_to_byte_limit(
+    batches: "Iterator[pa.RecordBatch]",
+    *,
+    byte_limit: int = _SPARK_RESPONSE_BATCH_BYTE_LIMIT,
+) -> "Iterator[pa.RecordBatch]":
+    """Group single-row record batches so each emitted batch stays under
+    *byte_limit* bytes.
+
+    A row whose own size exceeds *byte_limit* is emitted alone — the
+    rechunker preserves rows, never splits them across batches.
+    Empty input yields nothing.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_bytes = 0
+
+    def _flush() -> "pa.RecordBatch":
+        # `combine_chunks` collapses the buffered rows into a single
+        # contiguous batch; `to_batches()[0]` is the resulting batch.
+        return pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
+
+    for rb in batches:
+        size = int(rb.nbytes)
+        if size > byte_limit:
+            # Oversized single row — flush whatever's queued first so
+            # ordering is preserved, then emit the giant alone.
+            if pending:
+                yield _flush()
+                pending = []
+                pending_bytes = 0
+            yield rb
+            continue
+
+        if pending and pending_bytes + size > byte_limit:
+            yield _flush()
+            pending = [rb]
+            pending_bytes = size
+        else:
+            pending.append(rb)
+            pending_bytes += size
+
+    if pending:
+        yield _flush()
+
+
 @dataclass
 class Session(ABC):
     base_url: Optional[URL] = None
@@ -301,14 +354,18 @@ class Session(ABC):
         effective_remote_cfg = request.remote_cache_config or remote_cfg
 
         # --- 1. Check local cache first (fast, disk-based) ---
+        # Pin the filepath BEFORE any session-level mutation of the request
+        # (`_local_send` calls `prepare_to_send` which adds outgoing headers
+        # and changes the cache key). Without this, load and store hash
+        # different shapes of the same request and the cache never hits.
         local_filepath = None
         if effective_local_cfg.local_cache_enabled:
+            local_filepath = effective_local_cfg.local_cache_file(
+                request=request, suffix=".ypkl", force=True
+            )
             if effective_local_cfg.mode == Mode.UPSERT:
                 # Force-evict any stale local entry so the fresh response
                 # can be written in its place after the actual fetch.
-                local_filepath = effective_local_cfg.local_cache_file(
-                    request=request, suffix=".ypkl", force=True
-                )
                 if local_filepath is not None and local_filepath.exists():
                     local_filepath.unlink(missing_ok=True)
                     LOGGER.debug(
@@ -316,7 +373,7 @@ class Session(ABC):
                         request.method, request.url,
                     )
             else:
-                local_response, local_filepath = self._load_local_cached_response(
+                local_response, _ = self._load_local_cached_response(
                     request, effective_local_cfg
                 )
                 if local_response is not None:
@@ -412,6 +469,9 @@ class Session(ABC):
             spark_session=spark_session,
             **options,
         )
+
+        if cfg.spark_session is not None:
+            return self._spark_send_many(requests, config=cfg)
 
         return self._send_many(requests, config=cfg)
 
@@ -983,10 +1043,17 @@ class Session(ABC):
             return None
         batches = [r.to_arrow_batch(parse=False) for r in responses]
         table = pa.Table.from_batches(batches).combine_chunks()
-        # Spark accepts pandas DataFrames natively; a direct Arrow path
-        # exists in newer PySpark via `spark.createDataFrame(table)` but
-        # availability varies — pandas is the safe lowest common denominator.
-        return spark.createDataFrame(table.to_pandas())
+        # PySpark 3.4+ accepts a pyarrow.Table directly. Fall back to a
+        # schema-typed pandas conversion for older releases — the bare
+        # ``to_pandas()`` path drops type info and Spark fails to infer
+        # nested map / binary columns.
+        try:
+            return spark.createDataFrame(table)
+        except (TypeError, AttributeError):
+            return spark.createDataFrame(
+                table.to_pandas(),
+                schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
 
     def _spark_fetch_misses(
         self,
@@ -1008,7 +1075,20 @@ class Session(ABC):
             r.to_arrow_batch(parse=False) for r in misses
         ]
         request_table = pa.Table.from_batches(request_batches)
-        request_df = spark.createDataFrame(request_table.toArrow())
+        # PySpark 3.4+ accepts a pyarrow.Table directly and preserves the
+        # full schema (maps, nullable bytes). The pandas fallback drops
+        # type information for object-typed columns and fails on empty
+        # maps, which `request_headers` and `request_tags` produce
+        # whenever the request carries no extras.
+        try:
+            request_df = spark.createDataFrame(request_table)
+        except (TypeError, AttributeError):
+            from .request import REQUEST_SCHEMA
+
+            request_df = spark.createDataFrame(
+                request_table.to_pandas(),
+                schema=REQUEST_SCHEMA.to_spark_schema(),
+            )
 
         # Per-executor send config: remote cache disabled (driver-only),
         # local cache passthrough, no spark session, raise_error=False so
@@ -1044,15 +1124,16 @@ class Session(ABC):
                 local_only_iter = (
                     r.copy(remote_cache_config=None) for r in partition_requests
                 )
-                responses = list(session.send_many(local_only_iter, send_config))
 
-                if not responses:
-                    continue
+                # Stream each Response → 1-row Arrow batch → rechunker.
+                # The rechunker groups consecutive small responses so each
+                # emitted batch stays below the byte cap, and emits any
+                # single oversized response on its own.
+                def _row_batches() -> Iterator[pa.RecordBatch]:
+                    for resp in session.send_many(local_only_iter, send_config):
+                        yield resp.to_arrow_batch(parse=False)
 
-                # Re-emit as Arrow batches matching the response schema.
-                # Combine within the partition to amortise per-batch overhead.
-                resp_batches = [r.to_arrow_batch(parse=False) for r in responses]
-                yield pa.Table.from_batches(resp_batches).combine_chunks().to_batches()[0]
+                yield from _rechunk_to_byte_limit(_row_batches())
 
         return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
     

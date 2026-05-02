@@ -235,6 +235,13 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
+        # `path` and `table` are intentionally excluded from __getstate__
+        # (paths don't survive process boundaries; tables hold a live
+        # Databricks client). Initialize the slots to None so attribute
+        # access on the deserialized side doesn't AttributeError.
+        object.__setattr__(self, "path", state.get("path"))
+        object.__setattr__(self, "table", state.get("table"))
+        object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
 
     @classmethod
     def check_arg(
