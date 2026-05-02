@@ -149,6 +149,9 @@ class TestVerbShortcuts:
 
 class TestLocalCacheReadback:
     def test_send_writes_response_to_local_cache_file(self, tmp_path):
+        # The local cache filename is built from xxh3_b64 of the
+        # anonymized request — needs the optional ``xxhash`` package.
+        pytest.importorskip("xxhash")
         # APPEND mode + a received-from cutoff makes the local cache
         # path active. A successful send drops a pickled response file
         # under the cache root; the file is named after the anonymized

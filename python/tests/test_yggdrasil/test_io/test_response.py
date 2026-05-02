@@ -186,20 +186,28 @@ class TestAnonymize:
 # ---------------------------------------------------------------------------
 
 
+# ``Response.arrow_values`` hashes the body via xxh3 to produce the
+# stable ``body_hash`` column; that hash is also what ``match_value``
+# uses behind the scenes. The whole surface therefore depends on
+# the optional ``xxhash`` package — skip these classes on a base
+# install that hasn't pulled the ``pickle`` extra in.
 class TestArrow:
     def test_to_arrow_batch_no_parse(self):
+        pytest.importorskip("xxhash")
         resp = make_response()
         batch = resp.to_arrow_batch(parse=False)
         assert isinstance(batch, pa.RecordBatch)
         assert batch.schema == RESPONSE_ARROW_SCHEMA
 
     def test_to_arrow_table_no_parse(self):
+        pytest.importorskip("xxhash")
         resp = make_response()
         table = resp.to_arrow_table(parse=False)
         assert isinstance(table, pa.Table)
         assert table.num_rows == 1
 
     def test_from_arrow_tabular_round_trip(self):
+        pytest.importorskip("xxhash")
         resp = make_response()
         table = resp.to_arrow_table(parse=False)
         rebuilt = list(Response.from_arrow_tabular(table))
@@ -214,14 +222,17 @@ class TestArrow:
 
 class TestMatchValue:
     def test_response_keys(self):
+        pytest.importorskip("xxhash")
         resp = make_response(status_code=200)
         assert resp.match_value("response_status_code") == 200
 
     def test_request_keys_delegated(self):
+        pytest.importorskip("xxhash")
         resp = make_response()
         assert resp.match_value("request_method") == "GET"
 
     def test_unsupported_key_raises(self):
+        pytest.importorskip("xxhash")
         resp = make_response()
         with pytest.raises(ValueError):
             resp.match_value("not_a_real_key")
