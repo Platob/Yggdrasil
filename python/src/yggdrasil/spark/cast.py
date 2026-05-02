@@ -43,7 +43,10 @@ import pyarrow as pa
 import pyspark.sql as pyspark_sql
 import pyspark.sql.types as T
 
-from yggdrasil.arrow.cast import any_to_arrow_table
+from yggdrasil.arrow.cast import (
+    any_to_arrow_table,
+    rechunk_arrow_batches_by_byte_size,
+)
 from yggdrasil.data.cast import register_converter
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
@@ -55,6 +58,11 @@ __all__ = [
     "cast_spark_column",
     "cast_spark_dataframe",
 ]
+
+#: Cap on per-batch Arrow size handed to ``createDataFrame``. 128 MiB matches
+#: Spark's preferred Arrow batch size and keeps a single oversized chunk from
+#: pinning a partition's working memory.
+_SPARK_ARROW_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 @register_converter(Any, T.StructField)
@@ -109,5 +117,11 @@ def any_to_spark_dataframe(
         return spark.createDataFrame([], schema=opts.merged_schema.to_spark_schema())
 
     arrow_table = any_to_arrow_table(obj, options=opts)
+    rechunked = list(rechunk_arrow_batches_by_byte_size(
+        arrow_table.to_batches(),
+        byte_size=_SPARK_ARROW_BATCH_BYTE_LIMIT,
+        memory_pool=opts.arrow_memory_pool,
+    ))
+    arrow_table = pa.Table.from_batches(rechunked, schema=arrow_table.schema)
     df = spark.createDataFrame(arrow_table, schema=opts.merged_schema.to_spark_schema())
     return opts.cast_spark(df)

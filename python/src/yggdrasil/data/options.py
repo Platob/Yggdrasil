@@ -644,7 +644,7 @@ class CastOptions:
         if self.target_field is None:
             if not self.byte_size and not self.row_size:
                 return batches
-            from yggdrasil.data.types.nested.struct_arrow import (
+            from yggdrasil.arrow.cast import (
                 rechunk_arrow_batches_by_byte_size,
             )
             return rechunk_arrow_batches_by_byte_size(

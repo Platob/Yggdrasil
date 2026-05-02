@@ -48,7 +48,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import is_dataclass
 from typing import Optional, Union, Any, Generator
 
@@ -80,6 +80,7 @@ __all__ = [
     "cast_arrow_tabular",
     "cast_arrow_record_batch_reader",
     "default_arrow_scalar",
+    "rechunk_arrow_batches_by_byte_size",
 ]
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,126 @@ def _is_arrow_dataset(obj: Any) -> bool:
     except Exception:
         return False
     return isinstance(obj, ds.Dataset)
+
+
+# ---------------------------------------------------------------------------
+# Streaming rechunker — pure pyarrow, used by every engine entry point that
+# needs ``byte_size`` / ``row_size`` sizing on the way out.
+# ---------------------------------------------------------------------------
+
+
+def rechunk_arrow_batches_by_byte_size(
+    batches: Iterable[pa.RecordBatch],
+    *,
+    byte_size: int | None = None,
+    row_size: int | None = None,
+    memory_pool: pa.MemoryPool | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Stream-coalesce/slice batches to ~``byte_size`` bytes / ``row_size`` rows.
+
+    Both knobs are optional:
+
+    * Neither set → passthrough.
+    * ``row_size`` only → emit fixed-size chunks of at most
+      ``row_size`` rows; no buffering, zero-copy slices.
+    * ``byte_size`` only → emit ~``byte_size``-byte chunks using the
+      per-segment bytes/row ratio to derive a row target.
+    * Both set → ``byte_size`` drives the row target; ``row_size``
+      caps it (final ``target_rows = min(row_size, derived)``).
+
+    Algorithm (byte_size path):
+
+    * Empty incoming batch → drop (no schema gymnastics on zero-row
+      flushes — the consumer already saw a schema in an earlier batch
+      or will get one from the upstream reader).
+    * Buffer empty + incoming batch already at/over target → slice it
+      directly into target-sized chunks (zero-copy).
+    * Otherwise accumulate; once buffered ``nbytes`` crosses the
+      target, concat + slice the buffer to target-sized chunks. Yield
+      everything except a possibly-undersized tail; carry the tail
+      forward.
+    * On exhaustion → flush whatever is left as a single concat'd
+      batch (may be smaller than ``byte_size``).
+    """
+    has_byte = bool(byte_size and byte_size > 0)
+    has_row = bool(row_size and row_size > 0)
+
+    if not has_byte and not has_row:
+        yield from batches
+        return
+
+    if not has_byte:
+        for batch in batches:
+            if batch.num_rows == 0:
+                continue
+            if batch.num_rows <= row_size:
+                yield batch
+                continue
+            for offset in range(0, batch.num_rows, row_size):
+                yield batch.slice(offset, row_size)
+        return
+
+    def _target_rows(batch: pa.RecordBatch) -> int:
+        bytes_per_row = max(1, batch.nbytes // max(1, batch.num_rows))
+        derived = max(1, byte_size // bytes_per_row)
+        return min(row_size, derived) if has_row else derived
+
+    def _slice_to_target(batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+        target = _target_rows(batch)
+        if batch.num_rows <= target:
+            yield batch
+            return
+        for offset in range(0, batch.num_rows, target):
+            yield batch.slice(offset, target)
+
+    buffer: list[pa.RecordBatch] = []
+    buffered_bytes = 0
+
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+
+        if not buffer and batch.nbytes >= byte_size:
+            yield from _slice_to_target(batch)
+            continue
+
+        buffer.append(batch)
+        buffered_bytes += batch.nbytes
+
+        if buffered_bytes < byte_size:
+            continue
+
+        combined = pa.concat_batches(buffer, memory_pool=memory_pool)
+        target = _target_rows(combined)
+
+        if combined.num_rows <= target:
+            # Estimator pushed the row-cap above the combined batch
+            # (under-estimate of bytes/row from skewed inputs). Emit as
+            # one batch and reset.
+            yield combined
+            buffer = []
+            buffered_bytes = 0
+            continue
+
+        sliced = list(_slice_to_target(combined))
+        for chunk in sliced[:-1]:
+            yield chunk
+
+        tail = sliced[-1]
+        if tail.nbytes >= byte_size:
+            yield tail
+            buffer = []
+            buffered_bytes = 0
+        else:
+            buffer = [tail]
+            buffered_bytes = tail.nbytes
+
+    if buffer:
+        combined = pa.concat_batches(buffer, memory_pool=memory_pool)
+        if has_row and combined.num_rows > row_size:
+            yield from _slice_to_target(combined)
+        else:
+            yield combined
 
 
 # ---------------------------------------------------------------------------
