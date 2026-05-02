@@ -61,9 +61,7 @@ class ParquetOptions(CastOptions):
 
 
 class ParquetIO(BytesIO):
-    """:class:`PrimitiveIO` for Parquet files."""
-
-    __slots__ = ("_parquet_metadata",)
+    """A :class:`BytesIO` for Parquet files."""
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 

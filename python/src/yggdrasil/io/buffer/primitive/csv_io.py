@@ -110,8 +110,6 @@ class CsvIO(BytesIO):
     """:class:`PrimitiveIO` for CSV files."""
 
     # No cached reader — CSV has no footer to amortize.
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod

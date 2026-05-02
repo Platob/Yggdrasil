@@ -193,11 +193,77 @@ class TabularIO(Disposable, ABC, Generic[O]):
     def __init__(
         self,
         *args: Any,
-        **kwargs: Any
+        media_type: Any = None,
+        **kwargs: Any,
     ) -> None:
+        """Initialize the state every :class:`TabularIO` carries.
+
+        Sets up:
+
+        * Disposable lifecycle (``opened`` / ``closed`` flags).
+        * ``_media_type`` — the format identity. ``None`` for opaque
+          buffers; concrete leaves (ParquetIO, CsvIO, …) fill it from
+          their ``default_mime_type`` on construction.
+        * Persist cache slots — ``_arrow_table`` / ``_spark_frame``
+          set by :meth:`persist`, cleared by :meth:`unpersist`.
+        * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
+          used by :class:`BytesIO` (and any byte-buffer-backed
+          subclass) to track durable storage. They live on
+          :class:`TabularIO` so non-buffer subclasses inherit
+          consistent ``None`` defaults without each writing the
+          same boilerplate.
+
+        Subclasses with extra state extend via ``super().__init__()``
+        rather than re-zeroing the same slots; ``__init_subclass__``
+        is reserved for the registry hook.
+        """
         Disposable.__init__(self)
+        # Format identity
+        if media_type is None:
+            cls_mime = type(self).default_mime_type()
+            if cls_mime is not None and not getattr(cls_mime, "is_any_bytes", False):
+                self._media_type = MediaType(cls_mime)
+            else:
+                self._media_type = None
+        else:
+            self._media_type = MediaType.from_(media_type)
+        # Persist cache slots
         self._arrow_table = None
         self._spark_frame = None
+        # Buffer-backing slots — concrete byte buffers fill these in;
+        # non-byte TabularIOs (StatementResult, NestedIO trees, …)
+        # leave them at None.
+        self._spill_path = None
+        self._owns_spill_path = True
+
+    # ==================================================================
+    # Tabular view shortcut — at TabularIO so every subclass shares it
+    # ==================================================================
+
+    def as_media(self, media_type: "Any | None" = None) -> "TabularIO":
+        """Return a tabular view of self for the requested *media_type*.
+
+        For a final-leaf instance (ParquetIO, CsvIO, ZipIO, …)
+        carrying its own format, ``as_media()`` returns ``self`` —
+        the leaf is already the cheapest view. Any other call builds
+        a fresh registered leaf wrapping this object's underlying
+        bytes / path / state.
+        """
+        if media_type is not None:
+            media_type = MediaType.from_(media_type)
+
+        if self._FINAL_TABULAR_IO:
+            if media_type is None:
+                return self
+            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
+                return self
+            target = self.media_type_class(media_type=media_type)
+            return target(self, media_type=media_type)
+
+        target = self.media_type_class(media_type=media_type, default=type(self))
+        if target is type(self):
+            return self
+        return target(self, media_type=media_type)
 
     @classmethod
     def media_type_class(

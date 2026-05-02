@@ -59,8 +59,6 @@ class XmlOptions(CastOptions):
 class XmlIO(BytesIO):
     """:class:`PrimitiveIO` for flat row-shaped XML documents."""
 
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod

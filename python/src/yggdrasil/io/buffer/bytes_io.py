@@ -286,23 +286,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     registered concrete leaf (Parquet, IPC, CSV, …) which knows.
     """
 
-    __slots__ = (
-        "_buf",
-        "_size",
-        "_mtime",
-        "_pos",
-        "_spill_path",
-        "_spill_fd",
-        "_transaction_buffer",
-        "_media_type",
-        "_spill_bytes",
-        "_spill_ttl",
-        "_owns_spill_path",
-        "_mode",
-        "_metadata",
-        "_arrow_table",
-        "_spark_frame",
-    )
+    # No __slots__ — concrete subclasses (and per-instance back-pointers
+    # like ZipEntryIO.parent) need free attribute setting. The class
+    # tree is small enough that the per-instance dict overhead is not
+    # a real cost.
 
     @classmethod
     def default_mime_type(cls) -> "MimeType | None":
@@ -408,9 +395,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         metadata: dict | None = None,
         **kwargs
     ) -> None:
-        Disposable.__init__(self)
+        # Funnel cache slots, _media_type, and the spill-path
+        # placeholders through the TabularIO base. We then refine
+        # the spill bindings below for the buffer-specific cases.
+        TabularIO.__init__(self, media_type=media_type)
 
-        # Per-instance state, all initialized before any helper runs.
+        # Buffer-specific per-instance state.
         self._buf: bytearray | None = bytearray()
         self._size: int = 0
         self._mtime: float = 0
@@ -423,25 +413,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._mode: str = mode or "rb+"
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
-        self._media_type: MediaType | None = (
-            None if media_type is None else MediaType.from_(media_type)
-        )
-        # Concrete leaves (ParquetIO, CsvIO, ZipIO, …) override
-        # ``default_mime_type`` to claim a format. When the caller
-        # doesn't pass an explicit ``media_type``, fall back to that
-        # class default so the buffer carries its format identity
-        # immediately on construction.
-        if self._media_type is None:
-            cls_mime = type(self).default_mime_type()
-            if cls_mime is not None and not cls_mime.is_any_bytes:
-                self._media_type = MediaType(cls_mime)
         self._metadata = metadata or {}
-        # TabularIO cache slots — populated by persist(), cleared by
-        # unpersist(). A buffer with no tabular media type can't
-        # actually use them, but the slots have to exist for the
-        # contract.
-        self._arrow_table = None
-        self._spark_frame = None
 
         if path is not None:
             # Path-bound. Caller owns the path; we don't unlink on close.
@@ -450,9 +422,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             # Path-bound buffers don't keep an in-memory bytearray —
             # everything goes through the fd.
             self._buf = None
-        else:
-            self._spill_path = None
-            self._owns_spill_path = True  # default for any spill we mint
+        # ``_spill_path = None`` / ``_owns_spill_path = True`` were
+        # already set by TabularIO.__init__ for the autonomous case.
 
         if data is not None:
             self._init_from(data, copy=copy)
@@ -1397,29 +1368,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             mode=0,
         )
 
-    def as_media(self, media_type: "MediaType | None" = None) -> "TabularIO":
-        """Return a tabular view of this buffer.
-
-        For a final-leaf instance (ParquetIO, CsvIO, …) carrying its
-        own format, ``as_media()`` returns ``self`` — there's no
-        cheaper view than the leaf already in hand. Any other call
-        builds a fresh registered leaf wrapping this buffer's bytes.
-        """
-        if media_type is not None:
-            media_type = MediaType.from_(media_type)
-
-        if self._FINAL_TABULAR_IO:
-            if media_type is None:
-                return self
-            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
-                return self
-            target = self.media_type_class(media_type=media_type)
-            return target(self, media_type=media_type)
-
-        target = self.media_type_class(media_type=media_type, default=type(self))
-        if target is type(self):
-            return self
-        return target(self, media_type=media_type)
+    # ``as_media`` lives on :class:`TabularIO` — it's the same logic
+    # for every TabularIO subclass (final-leaf short-circuit, fall
+    # through to the registered media class otherwise).
 
     # ==================================================================
     # TabularIO contract — cache, default hooks

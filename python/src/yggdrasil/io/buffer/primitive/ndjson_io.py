@@ -133,8 +133,6 @@ class NDJsonIO(BytesIO):
     """
 
     # No cached reader — NDJSON has no footer to amortize, same as CSV.
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     # ==================================================================

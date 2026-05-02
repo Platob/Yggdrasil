@@ -45,8 +45,6 @@ class XlsxOptions(CastOptions):
 class XlsxIO(BytesIO):
     """:class:`PrimitiveIO` for single-sheet xlsx workbooks."""
 
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod

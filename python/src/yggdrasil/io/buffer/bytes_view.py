@@ -86,14 +86,9 @@ class BytesIOView(io.RawIOBase):
     if that pattern is used.
     """
 
-    __slots__ = (
-        "parent",
-        "start",
-        "size",
-        "pos",
-        "max_size",
-        "_closed",
-    )
+    # No __slots__ — keep the class extensible. Adding back-pointers
+    # or per-view metadata in subclasses shouldn't require touching
+    # the base.
 
     def __init__(
         self,

@@ -205,9 +205,10 @@ class NestedIO(TabularIO[O], ABC):
         the no-surprises rule callers rely on: building a handle
         should not start probing storage.
         """
-        Disposable.__init__(self)
-        self._arrow_table = None
-        self._spark_frame = None
+        # Common TabularIO state (cache slots, _media_type, spill
+        # placeholders) — NestedIO subclasses don't use _spill_path
+        # but the consistent default is harmless.
+        TabularIO.__init__(self, media_type=media_type)
         self.parent: "NestedIO | None" = parent
 
         raw = path if path is not None else data

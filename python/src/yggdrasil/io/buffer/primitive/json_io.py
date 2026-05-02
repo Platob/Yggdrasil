@@ -72,8 +72,6 @@ class JsonOptions(CastOptions):
 class JsonIO(BytesIO):
     """:class:`PrimitiveIO` for newline-delimited JSON."""
 
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
