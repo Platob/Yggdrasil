@@ -787,6 +787,13 @@ class MimeTypes:
         )
     )
 
+    YGG_FOLDER = MimeType.define(
+        MimeType(
+            "YGG_FOLDER",
+            "inode/directory+ygg",
+        )
+    )
+
     STATEMENT_RESULT = MimeType.define(
         MimeType(
             "STATEMENT_RESULT",
