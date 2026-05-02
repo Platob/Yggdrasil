@@ -36,6 +36,59 @@ __all__ = ["Session", "CacheConfig", "SendConfig", "SendManyConfig"]
 LOGGER = logging.getLogger(__name__)
 
 
+# Cap on per-batch byte size when emitting responses from a Spark
+# `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
+# preference and keeps a single oversized response from inflating the
+# whole partition's output. A response that is itself larger than the
+# cap is emitted alone in its own batch — chunking the row would
+# require splitting binary columns, which is not meaningful here.
+_SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
+
+
+def _rechunk_to_byte_limit(
+    batches: "Iterator[pa.RecordBatch]",
+    *,
+    byte_limit: int = _SPARK_RESPONSE_BATCH_BYTE_LIMIT,
+) -> "Iterator[pa.RecordBatch]":
+    """Group single-row record batches so each emitted batch stays under
+    *byte_limit* bytes.
+
+    A row whose own size exceeds *byte_limit* is emitted alone — the
+    rechunker preserves rows, never splits them across batches.
+    Empty input yields nothing.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_bytes = 0
+
+    def _flush() -> "pa.RecordBatch":
+        # `combine_chunks` collapses the buffered rows into a single
+        # contiguous batch; `to_batches()[0]` is the resulting batch.
+        return pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
+
+    for rb in batches:
+        size = int(rb.nbytes)
+        if size > byte_limit:
+            # Oversized single row — flush whatever's queued first so
+            # ordering is preserved, then emit the giant alone.
+            if pending:
+                yield _flush()
+                pending = []
+                pending_bytes = 0
+            yield rb
+            continue
+
+        if pending and pending_bytes + size > byte_limit:
+            yield _flush()
+            pending = [rb]
+            pending_bytes = size
+        else:
+            pending.append(rb)
+            pending_bytes += size
+
+    if pending:
+        yield _flush()
+
+
 @dataclass
 class Session(ABC):
     base_url: Optional[URL] = None
@@ -1071,15 +1124,16 @@ class Session(ABC):
                 local_only_iter = (
                     r.copy(remote_cache_config=None) for r in partition_requests
                 )
-                responses = list(session.send_many(local_only_iter, send_config))
 
-                if not responses:
-                    continue
+                # Stream each Response → 1-row Arrow batch → rechunker.
+                # The rechunker groups consecutive small responses so each
+                # emitted batch stays below the byte cap, and emits any
+                # single oversized response on its own.
+                def _row_batches() -> Iterator[pa.RecordBatch]:
+                    for resp in session.send_many(local_only_iter, send_config):
+                        yield resp.to_arrow_batch(parse=False)
 
-                # Re-emit as Arrow batches matching the response schema.
-                # Combine within the partition to amortise per-batch overhead.
-                resp_batches = [r.to_arrow_batch(parse=False) for r in responses]
-                yield pa.Table.from_batches(resp_batches).combine_chunks().to_batches()[0]
+                yield from _rechunk_to_byte_limit(_row_batches())
 
         return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
     
