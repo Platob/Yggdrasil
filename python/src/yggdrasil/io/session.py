@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 import pyarrow as pa
 
 import yggdrasil.pickle.ser as pickle
+from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
@@ -40,53 +41,9 @@ LOGGER = logging.getLogger(__name__)
 # `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
 # preference and keeps a single oversized response from inflating the
 # whole partition's output. A response that is itself larger than the
-# cap is emitted alone in its own batch — chunking the row would
-# require splitting binary columns, which is not meaningful here.
+# cap is sliced row-wise by the shared rechunker, which never splits a
+# single row across batches.
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
-
-
-def _rechunk_to_byte_limit(
-    batches: "Iterator[pa.RecordBatch]",
-    *,
-    byte_limit: int = _SPARK_RESPONSE_BATCH_BYTE_LIMIT,
-) -> "Iterator[pa.RecordBatch]":
-    """Group single-row record batches so each emitted batch stays under
-    *byte_limit* bytes.
-
-    A row whose own size exceeds *byte_limit* is emitted alone — the
-    rechunker preserves rows, never splits them across batches.
-    Empty input yields nothing.
-    """
-    pending: list[pa.RecordBatch] = []
-    pending_bytes = 0
-
-    def _flush() -> "pa.RecordBatch":
-        # `combine_chunks` collapses the buffered rows into a single
-        # contiguous batch; `to_batches()[0]` is the resulting batch.
-        return pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
-
-    for rb in batches:
-        size = int(rb.nbytes)
-        if size > byte_limit:
-            # Oversized single row — flush whatever's queued first so
-            # ordering is preserved, then emit the giant alone.
-            if pending:
-                yield _flush()
-                pending = []
-                pending_bytes = 0
-            yield rb
-            continue
-
-        if pending and pending_bytes + size > byte_limit:
-            yield _flush()
-            pending = [rb]
-            pending_bytes = size
-        else:
-            pending.append(rb)
-            pending_bytes += size
-
-    if pending:
-        yield _flush()
 
 
 @dataclass
@@ -1092,13 +1049,16 @@ class Session(ABC):
 
                 # Stream each Response → 1-row Arrow batch → rechunker.
                 # The rechunker groups consecutive small responses so each
-                # emitted batch stays below the byte cap, and emits any
-                # single oversized response on its own.
+                # emitted batch stays below the byte cap; an oversized row
+                # is emitted alone (slice degenerates to a 1-row chunk).
                 def _row_batches() -> Iterator[pa.RecordBatch]:
                     for resp in session.send_many(local_only_iter, send_config):
                         yield resp.to_arrow_batch(parse=False)
 
-                yield from _rechunk_to_byte_limit(_row_batches())
+                yield from rechunk_arrow_batches_by_byte_size(
+                    _row_batches(),
+                    byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
+                )
 
         return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
     
