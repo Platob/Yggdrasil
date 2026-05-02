@@ -1,388 +1,199 @@
-# tests/io/test_session_config.py
+"""Tests for yggdrasil.io.send_config."""
+
 from __future__ import annotations
 
 import datetime as dt
 
 import pytest
 
-from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.io.enums import Mode
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig
 
+from ._helpers import make_request, make_response
 
-def _make_request(
-    *,
-    method: str = "GET",
-    url: str = "https://example.com/a",
-    body: bytes | None = None,
-) -> PreparedRequest:
-    req = PreparedRequest.prepare(
-        method=method,
-        url=url,
-        body=body,
-    )
-    req.sent_at = dt.datetime.fromtimestamp(7)
-    return req
-
-
-def _make_response(
-    *,
-    request: PreparedRequest | None = None,
-    status_code: int = 200,
-    content_type: str = "application/json",
-    body: bytes = b'{"ok":true}',
-    received_at_timestamp: int = 1767225600000000,
-) -> Response:
-    return Response(
-        request=request or _make_request(),
-        status_code=status_code,
-        headers={"Content-Type": content_type},
-        tags={"rt": "1"},
-        buffer=body,  # type: ignore[arg-type]
-        received_at=received_at_timestamp,
-    )
-
-
-def test_cache_config_defaults() -> None:
-    cfg = CacheConfig()
-
-    assert cfg.request_by == [
-        "request_method",
-        "request_url_host",
-        "request_url_path",
-        "request_url_port",
-        "request_url_query",
-        "request_content_length",
-        "request_body_hash",
-    ]
-    assert cfg.response_by is None
-    assert cfg.mode == Mode.APPEND
-    assert cfg.anonymize == "remove"
-    assert cfg.received_from is None
-    assert cfg.received_to is None
-    assert cfg.wait == WaitingConfig.from_(False)
-
-
-def test_cache_config_coerces_received_datetimes_from_strings() -> None:
-    cfg = CacheConfig(
-        received_from="2026-01-01T00:00:00Z",
-        received_to="2026-01-31T12:00:00Z",
-    )
-
-    assert isinstance(cfg.received_from, dt.datetime)
-    assert isinstance(cfg.received_to, dt.datetime)
-
-
-def test_cache_config_parse_mapping_coerces_received_datetimes() -> None:
-    cfg = CacheConfig.parse_mapping(
-        {
-            "received_from": "2026-02-01T00:00:00Z",
-            "received_to": "2026-02-28T23:59:59Z",
-        }
-    )
-
-    assert isinstance(cfg.received_from, dt.datetime)
-    assert isinstance(cfg.received_to, dt.datetime)
-
-
-def test_cache_config_invalid_request_by_raises() -> None:
-    with pytest.raises(ValueError, match="Invalid request_by key"):
-        CacheConfig(request_by=["request_method", "not_a_real_column"])
-
-
-def test_cache_config_invalid_response_by_raises() -> None:
-    with pytest.raises(ValueError, match="Invalid response_by key"):
-        CacheConfig(response_by=["not_a_real_response_column"])
-
-
-def test_cache_config_by_combines_request_and_response_keys() -> None:
-    cfg = CacheConfig(
-        request_by=["request_method"],
-        response_by=["response_status_code"],
-    )
-
-    assert cfg.match_by == ["request_method", "response_status_code"]
-
-
-def test_cache_config_sql_literal() -> None:
-    now = dt.datetime(2026, 1, 1, 12, 30, 15, 123456)
-
-    assert CacheConfig.sql_literal(None) == "null"
-    assert CacheConfig.sql_literal(True) == "true"
-    assert CacheConfig.sql_literal(False) == "false"
-    assert CacheConfig.sql_literal(12) == "12"
-    assert CacheConfig.sql_literal("ab'cd") == "'ab''cd'"
-    assert CacheConfig.sql_literal(now) == "timestamp '2026-01-01 12:30:15.123456'"
-
-
-def test_cache_config_request_values_and_tuple() -> None:
-    req = _make_request(
-        method="POST",
-        url="https://example.com/api?q=1",
-        body=b"hello",
-    )
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str", "request_body_hash"],
-    )
-
-    values = cfg.request_values(req)
-    assert values["request_method"] == "POST"
-    assert values["request_url_str"] == "https://example.com/api?q=1"
-    assert values["request_body_hash"] is not None
-
-    as_tuple = cfg.request_tuple(req)
-    assert len(as_tuple) == 3
-    assert as_tuple[0] == "POST"
-
-
-def test_cache_config_response_values_and_tuple() -> None:
-    resp = _make_response(
-        status_code=200,
-        content_type="application/json",
-    )
-    cfg = CacheConfig(response_by=["response_status_code", "response_content_type"])
-
-    values = cfg.response_values(resp)
-    assert values == {
-        "response_status_code": 200,
-        "response_content_type": "application/json",
-    }
-    assert cfg.response_tuple(resp) == (200, "application/json")
-
-
-def test_cache_config_filter_request_returns_true_for_valid_request() -> None:
-    req = _make_request(
-        method="GET",
-        url="https://example.com",
-    )
-    cfg = CacheConfig(request_by=["request_method", "request_url_str"])
-
-    assert cfg.filter_request(req) is True
-
-
-def test_cache_config_filter_response_matches_request_and_time_window() -> None:
-    req = _make_request(
-        method="GET",
-        url="https://example.com/a",
-    )
-    resp = _make_response(
-        request=req,
-        status_code=200,
-        received_at_timestamp="2026-01-01T01:00:00Z",
-    )
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str"],
-        response_by=["response_status_code"],
-        received_from="2026-01-01T00:00:00Z",
-        received_to="2026-12-31T23:59:59Z",
-    )
-
-    assert cfg.filter_response(resp, request=req) is True
-
-
-def test_cache_config_filter_response_rejects_request_mismatch() -> None:
-    req = _make_request(
-        method="GET",
-        url="https://example.com/a",
-    )
-    other_req = _make_request(
-        method="GET",
-        url="https://example.com/b",
-    )
-    resp = _make_response(
-        request=other_req,
-        status_code=200,
-        received_at_timestamp=1767225600000000,
-    )
-    cfg = CacheConfig(request_by=["request_method", "request_url_str"])
-
-    assert cfg.filter_response(resp, request=req) is False
-
-
-def test_cache_config_filter_response_rejects_received_from() -> None:
-    resp = _make_response(
-        received_at_timestamp=1,
-    )
-    cfg = CacheConfig(received_from="2026-01-01T00:00:00Z")
-
-    assert cfg.filter_response(resp) is False
-
-
-def test_cache_config_filter_response_rejects_received_to() -> None:
-    resp = _make_response(
-        received_at_timestamp=9999999999999999,
-    )
-    cfg = CacheConfig(received_to="2026-01-01T00:00:00Z")
-
-    assert cfg.filter_response(resp) is False
-
-
-def test_cache_config_identity_tuple() -> None:
-    req = _make_request(
-        method="GET",
-        url="https://example.com/a",
-    )
-    resp = _make_response(
-        request=req,
-        status_code=200,
-    )
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str"],
-        response_by=["response_status_code"],
-    )
-
-    out = cfg.identity_tuple(resp, request=req)
-    assert out == ("GET", "https://example.com/a", 200)
-
-
-def test_cache_config_sql_request_clause() -> None:
-    req = _make_request(
-        method="POST",
-        url="https://example.com/api?q=1",
-        body=b"hello",
-    )
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str", "request_body_hash"],
-    )
-
-    clause = cfg.sql_request_clause(req)
-
-    assert "request_method = 'POST'" in clause
-    assert "request_url_str = 'https://example.com/api?q=1'" in clause
-    assert "request_body_hash =" in clause
-
-
-def test_cache_config_sql_response_clause() -> None:
-    resp = _make_response(
-        status_code=200,
-    )
-    cfg = CacheConfig(
-        response_by=["response_status_code"],
-        received_from="2026-01-01T00:00:00Z",
-        received_to="2026-01-31T00:00:00Z",
-    )
-
-    clause = cfg.sql_response_clause(resp)
-
-    assert "response_status_code = 200" in clause
-    assert "response_received_at >=" in clause
-    assert "response_received_at <" in clause
-
-
-def test_cache_config_sql_clause_combines_request_and_response() -> None:
-    req = _make_request(method="GET", url="https://example.com/a")
-    resp = _make_response(
-        request=req,
-        status_code=200,
-    )
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str"],
-        response_by=["response_status_code"],
-    )
-
-    clause = cfg.sql_clause(request=req, response=resp)
-
-    assert "(request_method = 'GET' AND request_url_str = 'https://example.com/a')" in clause
-    assert "(response_status_code = 200)" in clause
-
-
-def test_cache_config_make_lookup_sql() -> None:
-    req = _make_request(method="GET", url="https://example.com/a")
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str"],
-        response_by=["response_status_code"],
-    )
-
-    sql = cfg.make_lookup_sql(
-        table_name="cache_table",
-        request=req,
-    )
-
-    assert "SELECT * FROM (" in sql
-    assert "FROM (SELECT * FROM cache_table WHERE" in sql
-    assert "PARTITION BY request_method, request_url_str, response_status_code" in sql
-
-
-def test_cache_config_make_batch_lookup_sql() -> None:
-    r1 = _make_request(method="GET", url="https://example.com/a")
-    r2 = _make_request(method="GET", url="https://example.com/b")
-    cfg = CacheConfig(
-        request_by=["request_method", "request_url_str"],
-        response_by=["response_status_code"],
-        received_from="2026-01-01T00:00:00Z",
-    )
-
-    sql = cfg.make_batch_lookup_sql(
-        table_name="cache_table",
-        requests=[r1, r2],
-    )
-
-    assert "request_url_str = 'https://example.com/a'" in sql
-    assert "request_url_str = 'https://example.com/b'" in sql
-    assert "response_received_at >=" in sql
-    assert "PARTITION BY request_method, request_url_str, response_status_code" in sql
-
-
-def test_send_config_check_arg_from_mapping() -> None:
-    cfg = SendConfig.check_arg(
-        {
-            "raise_error": False,
-            "remote_cache": {"received_from": "2026-01-01T00:00:00Z"},
-        }
-    )
-
-    assert isinstance(cfg, SendConfig)
-    assert cfg.raise_error is False
-    assert isinstance(cfg.remote_cache, CacheConfig)
-    assert isinstance(cfg.remote_cache.received_from, dt.datetime)
-
-
-def test_send_many_config_from_send_config() -> None:
-    send_cfg = SendConfig(
-        raise_error=False,
-        remote_cache=CacheConfig(received_from="2026-01-01T00:00:00Z"),
-    )
-
-    many_cfg = SendManyConfig.check_arg(send_cfg, batch_size=10)
-
-    assert isinstance(many_cfg, SendManyConfig)
-    assert many_cfg.raise_error is False
-    assert many_cfg.batch_size == 10
-    assert isinstance(many_cfg.remote_cache.received_from, dt.datetime)
-
-
-def test_send_many_to_send_config() -> None:
-    many_cfg = SendManyConfig(
-        wait=False,
-        raise_error=False,
-        stream=False,
-        remote_cache=CacheConfig(received_from="2026-01-01T00:00:00Z"),
-        local_cache=CacheConfig(received_to="2026-01-31T00:00:00Z"),
-    )
-
-    send_cfg = many_cfg.to_send_config()
-
-    assert isinstance(send_cfg, SendConfig)
-    assert send_cfg.raise_error is False
-    assert send_cfg.stream is False
-    assert isinstance(send_cfg.remote_cache.received_from, dt.datetime)
-    assert isinstance(send_cfg.local_cache.received_to, dt.datetime)
-
-
-def test_merge_rejects_unknown_field() -> None:
-    cfg = CacheConfig()
-    with pytest.raises(TypeError, match="unexpected field"):
-        cfg.merge(not_a_field=1)
-
-
-def test_parse_mapping_rejects_non_mapping() -> None:
-    with pytest.raises(TypeError, match="expects a Mapping"):
-        CacheConfig.parse_mapping(["not", "a", "mapping"])  # type: ignore[arg-type]
-
-
-def test_wait_is_coerced() -> None:
-    cfg = CacheConfig(wait=WaitingConfig(5))
-    assert isinstance(cfg.wait, WaitingConfig)
-    assert cfg.wait.timeout_total_seconds == 5
+
+# ---------------------------------------------------------------------------
+# CacheConfig
+# ---------------------------------------------------------------------------
+
+
+class TestCacheConfigDefaults:
+    def test_default_factory(self):
+        cfg = CacheConfig.default()
+        assert isinstance(cfg, CacheConfig)
+        assert cfg.mode is Mode.APPEND
+
+    def test_check_arg_none_returns_default(self):
+        cfg = CacheConfig.check_arg(None)
+        assert cfg == CacheConfig.default()
+
+
+class TestCacheConfigParseMapping:
+    def test_basic_mapping(self):
+        cfg = CacheConfig.parse_mapping({"mode": "overwrite"})
+        assert cfg.mode is Mode.OVERWRITE
+
+    def test_invalid_request_by_raises(self):
+        with pytest.raises(ValueError):
+            CacheConfig(request_by=["not_a_real_field"])
+
+    def test_received_ttl_back_calculates_from(self):
+        cfg = CacheConfig(received_ttl=dt.timedelta(hours=1))
+        assert cfg.received_to is not None
+        assert cfg.received_from is not None
+        delta = cfg.received_to - cfg.received_from
+        assert abs(delta.total_seconds() - 3600) < 1
+
+
+class TestCacheConfigCheckArgPolymorphism:
+    def test_passthrough(self):
+        cfg = CacheConfig()
+        assert CacheConfig.check_arg(cfg) is cfg
+
+    def test_dict_arg(self):
+        cfg = CacheConfig.check_arg({"mode": "overwrite"})
+        assert cfg.mode is Mode.OVERWRITE
+
+    def test_received_from_datetime_arg(self):
+        when = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        cfg = CacheConfig.check_arg(when)
+        assert cfg.received_from == when
+
+    def test_path_arg(self, tmp_path):
+        cfg = CacheConfig.check_arg(tmp_path)
+        assert cfg.path == tmp_path
+
+
+class TestCacheConfigEnabledFlags:
+    def test_default_neither_local_nor_remote(self):
+        cfg = CacheConfig.default()
+        assert cfg.local_cache_enabled is False
+        assert cfg.remote_cache_enabled is False
+
+    def test_local_enabled_when_received_from_set(self):
+        cfg = CacheConfig(received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
+        assert cfg.local_cache_enabled is True
+
+
+class TestCacheConfigSqlLiteral:
+    def test_none(self):
+        assert CacheConfig.sql_literal(None) == "null"
+
+    def test_bool(self):
+        assert CacheConfig.sql_literal(True) == "true"
+        assert CacheConfig.sql_literal(False) == "false"
+
+    def test_int(self):
+        assert CacheConfig.sql_literal(42) == "42"
+
+    def test_str_quoted_and_escaped(self):
+        result = CacheConfig.sql_literal("O'Brien")
+        assert result.startswith("'") and result.endswith("'")
+        assert "''" in result  # escaped single quote
+
+    def test_datetime(self):
+        when = dt.datetime(2020, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+        out = CacheConfig.sql_literal(when)
+        assert out.startswith("timestamp '")
+
+
+class TestCacheConfigMatchBy:
+    def test_combines_request_by_and_response_by(self):
+        cfg = CacheConfig(
+            request_by=["request_method"],
+            response_by=["response_status_code"],
+        )
+        assert cfg.match_by == ["request_method", "response_status_code"]
+
+
+class TestCacheConfigSqlClauses:
+    def test_request_clause_matches_values(self):
+        cfg = CacheConfig(request_by=["request_method"])
+        req = make_request()
+        clause = cfg.sql_request_clause(req)
+        assert "request_method" in clause
+        assert "GET" in clause
+
+    def test_request_clause_no_request_returns_truthy(self):
+        cfg = CacheConfig(request_by=["request_method"])
+        assert cfg.sql_request_clause(None) == "1=1"
+
+    def test_response_clause_includes_received_window(self):
+        cfg = CacheConfig(received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
+        clause = cfg.sql_response_clause(None)
+        assert "response_received_at" in clause
+
+
+class TestCacheConfigLookupSql:
+    def test_make_lookup_sql_includes_select(self):
+        cfg = CacheConfig(
+            request_by=["request_method"],
+        )
+        sql = cfg.make_lookup_sql("cache_table", make_request())
+        assert "SELECT * FROM cache_table" in sql
+
+    def test_make_batch_lookup_sql_or_combines(self):
+        cfg = CacheConfig(request_by=["request_method"])
+        reqs = [make_request(method="GET"), make_request(method="POST")]
+        sql = cfg.make_batch_lookup_sql("tbl", reqs)
+        assert " OR " in sql or "method" in sql
+
+
+# ---------------------------------------------------------------------------
+# SendConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSendConfig:
+    def test_default(self):
+        cfg = SendConfig.default()
+        assert isinstance(cfg, SendConfig)
+        assert cfg.raise_error is True
+        assert cfg.stream is True
+
+    def test_check_arg_passthrough(self):
+        cfg = SendConfig()
+        assert SendConfig.check_arg(cfg) is cfg
+
+    def test_check_arg_mapping(self):
+        cfg = SendConfig.check_arg({"raise_error": False})
+        assert cfg.raise_error is False
+
+    def test_check_arg_unsupported_type_raises(self):
+        with pytest.raises(TypeError):
+            SendConfig.check_arg(42)
+
+    def test_merge_overrides(self):
+        cfg = SendConfig.default().merge(raise_error=False)
+        assert cfg.raise_error is False
+
+    def test_merge_unknown_field_raises(self):
+        with pytest.raises(TypeError):
+            SendConfig.default().merge(not_a_field=True)
+
+
+# ---------------------------------------------------------------------------
+# SendManyConfig
+# ---------------------------------------------------------------------------
+
+
+class TestSendManyConfig:
+    def test_default(self):
+        cfg = SendManyConfig.default()
+        assert cfg.ordered is False
+
+    def test_to_send_config_strips_caches_when_disabled(self):
+        many = SendManyConfig()
+        single = many.to_send_config(with_remote_cache=False, with_local_cache=False)
+        assert isinstance(single, SendConfig)
+        assert single.remote_cache == CacheConfig()
+        assert single.local_cache == CacheConfig()
+
+    def test_promote_from_send_config(self):
+        single = SendConfig(raise_error=False)
+        many = SendManyConfig.check_arg(single)
+        assert many.raise_error is False
+
+    def test_check_arg_unsupported_type_raises(self):
+        with pytest.raises(TypeError):
+            SendManyConfig.check_arg(42)

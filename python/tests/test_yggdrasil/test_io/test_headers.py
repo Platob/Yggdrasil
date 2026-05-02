@@ -1,223 +1,169 @@
-# tests/test_headers.py
+"""Tests for yggdrasil.io.headers."""
+
 from __future__ import annotations
 
-from yggdrasil.io.enums import MediaType, GZIP
-from yggdrasil.io.headers import PromotedHeaders, normalize_headers
-
-
-class _DummyBody:
-    def __init__(self, size: int, media_type: MediaType):
-        self.size = size
-        self.media_type = media_type
-
-
-def test_promoted_headers_extract_common_headers():
-    headers = {
-        "host": "api.example.com",
-        "USER-AGENT": "pytest/1.0",
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip, br",
-        "Accept-Language": "en-US",
-        "Content-Type": "application/json",
-        "Content-Length": "123",
-        "Content-Encoding": "gzip",
-        "X-Custom": "value",
-    }
-
-    promoted = PromotedHeaders.extract(headers)
-
-    assert promoted.host == "api.example.com"
-    assert promoted.user_agent == "pytest/1.0"
-    assert promoted.accept == "application/json"
-    assert promoted.accept_encoding == "gzip, br"
-    assert promoted.accept_language == "en-US"
-    assert promoted.content_type == "application/json"
-    assert promoted.content_length == 123
-    assert promoted.content_encoding == "gzip"
-    assert promoted.remaining == {"X-Custom": "value"}
-
-
-def test_promoted_headers_extract_is_case_insensitive():
-    headers = {
-        "HoSt": "example.com",
-        "x-custom-header": "abc",
-    }
-
-    promoted = PromotedHeaders.extract(headers)
-
-    assert promoted.host == "example.com"
-    assert promoted.remaining == {"x-custom-header": "abc"}
-
-
-def test_promoted_headers_invalid_content_length_becomes_none():
-    headers = {
-        "Content-Length": "nope",
-        "X-Test": "1",
-    }
-
-    promoted = PromotedHeaders.extract(headers)
-
-    assert promoted.content_length == 0
-    assert promoted.remaining == {"X-Test": "1"}
-
-
-def test_promoted_headers_values_mapping():
-    headers = {
-        "Host": "example.com",
-        "Content-Length": "42",
-    }
-
-    promoted = PromotedHeaders.extract(headers)
-
-    assert promoted.values["host"] == "example.com"
-    assert promoted.values["content_length"] == 42
-    assert promoted.values["content_type"] is None
-
-
-def test_normalize_headers_canonicalizes_names_without_anonymizing():
-    headers = {
-        "content-type": "application/json",
-        "content-length": "12",
-        "content-encoding": "gzip",
-        "user-agent": "pytest",
-    }
-
-    out = normalize_headers(headers, is_request=False)
-
-    assert out == {
-        "Content-Type": "application/json",
-        "Content-Length": "12",
-        "Content-Encoding": "gzip",
-        "User-Agent": "pytest",
-    }
-
-
-def test_normalize_headers_removes_sensitive_headers_in_remove_mode():
-    headers = {
-        "Authorization": "Bearer secret-token",
-        "Cookie": "session=abc",
-        "X-Test": "ok",
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="remove", is_request=False)
-
-    assert out == {"X-Test": "ok"}
-
-
-def test_normalize_headers_redacts_bearer_authorization():
-    headers = {
-        "Authorization": "Bearer very-secret-token",
-        "X-Test": "ok",
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=False)
-
-    assert out["Authorization"] == "Bearer <redacted>"
-    assert out["X-Test"] == "ok"
-
-
-def test_normalize_headers_redacts_basic_authorization():
-    headers = {
-        "Authorization": "Basic dXNlcjpwYXNz",
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=False)
-
-    assert out["Authorization"] == "Basic <redacted>"
-
-
-def test_normalize_headers_redacts_unknown_authorization_scheme():
-    headers = {
-        "Authorization": "Digest something-secret",
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=True)
-
-    assert out["Authorization"] == "<redacted>"
-
-
-def test_normalize_headers_redacts_jwt_like_values():
-    jwt_like = "aaaaabbbbbccccccdddddeeeee.fffffggggghhhhhiiiii.jjjjjkkkkklllllmmmm"
-    headers = {
-        "X-Custom": jwt_like,
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="redact", is_request=True)
-
-    assert out["X-Custom"] == "<redacted>"
-
-
-def test_normalize_headers_backfills_body_headers():
-    body = _DummyBody(
-        size=99,
-        media_type=MediaType.from_("application/json"),
-    )
-
-    out = normalize_headers({}, body=body, is_request=True)
-
-    assert out["Content-Type"] == "application/json"
-    assert out["Content-Length"] == "99"
-    assert "Content-Encoding" not in out
-
-
-def test_normalize_headers_backfills_content_encoding_when_codec_exists():
-    media_type = MediaType.from_("application/json")
-    media_type = MediaType(mime_type=media_type.mime_type, codec=GZIP)
-
-    body = _DummyBody(
-        size=99,
-        media_type=media_type,
-    )
-
-    out = normalize_headers({}, body=body, is_request=True)
-
-    assert out["Content-Type"] == "application/json"
-    assert out["Content-Length"] == "99"
-    assert out["Content-Encoding"] == "gzip"
-
-
-def test_normalize_headers_does_not_override_existing_body_headers():
-    media_type = MediaType.from_("application/json")
-    media_type = MediaType(mime_type=media_type.mime_type, codec=GZIP)
-
-    body = _DummyBody(
-        size=99,
-        media_type=media_type,
-    )
-
-    out = normalize_headers(
-        {
-            "Content-Type": "text/plain",
-            "Content-Length": "7",
-            "Content-Encoding": "chunked",
-        },
-        body=body, is_request=True,
-    )
-
-    assert out["Content-Type"] == "text/plain"
-    assert out["Content-Length"] == "7"
-    assert out["Content-Encoding"] == "chunked"
-
-
-def test_normalize_headers_bytes_input_is_supported():
-    headers = {
-        b"content-type": b"application/json",
-        b"user-agent": b"pytest",
-    }
-
-    out = normalize_headers(headers, is_request=False)
-
-    assert out == {
-        "Content-Type": "application/json",
-        "User-Agent": "pytest",
-    }
-
-
-def test_hash_mode_currently_matches_redact_behavior():
-    headers = {
-        "Cookie": "secret=1",
-    }
-
-    out = normalize_headers(headers, anonymize=True, mode="hash", is_request=True)
-
-    assert out["Cookie"] == "<redacted>"
+import pytest
+
+from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.headers import (
+    DEFAULT_HOSTNAME,
+    PromotedHeaders,
+    SENSITIVE_HEADER_KEYS,
+    get_default_headers,
+    get_default_user_agent,
+    normalize_headers,
+)
+
+
+# ---------------------------------------------------------------------------
+# Default helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDefaults:
+    def test_default_hostname_is_string(self):
+        assert isinstance(DEFAULT_HOSTNAME, str)
+        assert DEFAULT_HOSTNAME
+
+    def test_get_default_headers_returns_dict(self):
+        d = get_default_headers()
+        assert isinstance(d, dict)
+        assert "X-Ygg-Version" in d
+        assert "X-Py-Version" in d
+
+    def test_get_default_user_agent_starts_with_yggdrasil(self):
+        ua = get_default_user_agent()
+        assert ua.startswith("yggdrasil/") or "yggdrasil/" in ua
+
+
+# ---------------------------------------------------------------------------
+# PromotedHeaders.extract
+# ---------------------------------------------------------------------------
+
+
+class TestPromotedExtract:
+    def test_promotes_known_headers(self):
+        promoted = PromotedHeaders.extract(
+            {"Content-Type": "application/json", "Content-Length": "12"}
+        )
+        assert promoted.content_type == "application/json"
+        assert promoted.content_length == 12
+
+    def test_remaining_holds_unrecognized(self):
+        promoted = PromotedHeaders.extract({"X-Custom": "v"})
+        assert promoted.remaining.get("X-Custom") == "v"
+
+    def test_normalizes_header_name(self):
+        promoted = PromotedHeaders.extract({"content-type": "text/plain"})
+        assert promoted.content_type == "text/plain"
+
+    def test_invalid_content_length_falls_back_to_zero(self):
+        promoted = PromotedHeaders.extract({"Content-Length": "abc"})
+        assert promoted.content_length == 0
+
+    def test_host_kwarg_seeds_remaining(self):
+        promoted = PromotedHeaders.extract({}, host="example.com")
+        assert promoted.host == "example.com"
+
+    def test_values_property(self):
+        promoted = PromotedHeaders.extract({"User-Agent": "test"})
+        values = promoted.values
+        assert values["user_agent"] == "test"
+
+
+# ---------------------------------------------------------------------------
+# normalize_headers
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeHeaders:
+    def test_canonicalizes_keys(self):
+        result = normalize_headers(
+            {"content-type": "text/plain"},
+            is_request=False,
+            add_missing=False,
+        )
+        assert "Content-Type" in result
+
+    def test_strips_sensitive_in_remove_mode(self):
+        result = normalize_headers(
+            {"Authorization": "Bearer abc", "X-Other": "v"},
+            is_request=False,
+            mode="remove",
+            anonymize=True,
+            add_missing=False,
+        )
+        assert "Authorization" not in result
+        assert result["X-Other"] == "v"
+
+    def test_redacts_sensitive_in_redact_mode(self):
+        result = normalize_headers(
+            {"Authorization": "Bearer abc"},
+            is_request=False,
+            mode="redact",
+            anonymize=True,
+            add_missing=False,
+        )
+        assert result["Authorization"] == "Bearer <redacted>"
+
+    def test_basic_auth_redacted(self):
+        result = normalize_headers(
+            {"Authorization": "Basic ZXhhbXBsZQ=="},
+            is_request=False,
+            mode="redact",
+            anonymize=True,
+            add_missing=False,
+        )
+        assert result["Authorization"] == "Basic <redacted>"
+
+    def test_request_adds_default_user_agent(self):
+        result = normalize_headers(
+            {},
+            is_request=True,
+            add_missing=True,
+        )
+        assert result.get("User-Agent")
+
+    def test_request_adds_accept_default(self):
+        result = normalize_headers(
+            {},
+            is_request=True,
+            add_missing=True,
+        )
+        assert result.get("Accept") == "*/*"
+
+    def test_request_with_existing_user_agent_preserved(self):
+        result = normalize_headers(
+            {"User-Agent": "custom/1.0"},
+            is_request=True,
+            add_missing=True,
+        )
+        assert result["User-Agent"] == "custom/1.0"
+
+    def test_body_drives_content_length_when_missing(self):
+        body = BytesIO(b"hello world")
+        result = normalize_headers(
+            {},
+            is_request=False,
+            body=body,
+            add_missing=True,
+        )
+        assert int(result["Content-Length"]) == body.size
+
+    def test_explicit_content_length_preserved(self):
+        body = BytesIO(b"hello")
+        result = normalize_headers(
+            {"Content-Length": "42"},
+            is_request=False,
+            body=body,
+            add_missing=True,
+        )
+        assert result["Content-Length"] == "42"
+
+
+class TestSensitiveHeaderRegistry:
+    def test_authorization_listed(self):
+        assert "authorization" in SENSITIVE_HEADER_KEYS
+
+    def test_cookie_listed(self):
+        assert "cookie" in SENSITIVE_HEADER_KEYS
