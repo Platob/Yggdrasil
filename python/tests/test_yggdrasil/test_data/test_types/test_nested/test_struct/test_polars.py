@@ -19,6 +19,7 @@ from yggdrasil.data.types.nested.struct import (
     cast_polars_struct_expr,
     cast_polars_struct_series,
     cast_polars_tabular,
+    cast_polars_list_series
 )
 
 polars = pytest.importorskip("polars")
