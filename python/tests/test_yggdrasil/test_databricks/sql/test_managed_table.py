@@ -464,22 +464,23 @@ class ManagedTableIntegrationCase(DatabricksCase):
         )
         self._assert_log_min_version(0)
 
-    def test_delta_iter_fragments(self):
-        """DeltaIO.iter_fragments yields fragments for live AddFiles."""
+    def test_delta_iter_children(self):
+        """DeltaIO.iter_children yields one child IO per live AddFile."""
         self._truncate()
         self.table.insert([{"a": 1, "s": "frag"}])
 
         delta = self._delta_io()
-        fragments = list(delta.iter_fragments())
-        self.assertGreater(len(fragments), 0)
+        children = list(delta.iter_children())
+        self.assertGreater(len(children), 0)
 
         on_disk = {f.url.path for f in self._list_data_files()}
 
-        for frag in fragments:
-            self.assertTrue(frag.infos.url)
+        for child in children:
+            self.assertTrue(child.path)
+            self.assertIs(child.parent, delta)
             self.assertIn(
-                frag.infos.url.path, on_disk,
-                f"Fragment URL {frag.infos.url!r} not in on-disk set "
+                child.path.url.path, on_disk,
+                f"Child path {child.path!r} not in on-disk set "
                 f"{on_disk!r}",
             )
 

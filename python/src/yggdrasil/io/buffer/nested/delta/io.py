@@ -59,8 +59,8 @@ import pyarrow as pa
 
 from yggdrasil.arrow.cast import any_to_arrow_table
 from yggdrasil.data.schema import Field, Schema
+from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaTypes, Mode, MimeType, MimeTypes
-from yggdrasil.io.fragment import Fragment, FragmentInfos
 from yggdrasil.io.fs import Path
 from yggdrasil.io.tabular import TabularIO
 from .actions import (
@@ -91,6 +91,10 @@ from .deletion_vector import (
     make_inline_descriptor,
 )
 from .replay import ReplayResult, replay_log
+from ..folder_io import (
+    FolderOptions,
+    _inject_partition_columns,
+)
 from ..partitioned_io import (
     PartitionedFolderIO,
     PartitionedOptions,
@@ -142,10 +146,10 @@ class DeltaIO(PartitionedFolderIO):
     Construction:
 
         >>> io = DeltaIO(path="/tables/trades/")
-        >>> for frag in io.iter_fragments():
-        ...     print(frag.infos.url, frag.infos.partition_values)
+        >>> for child in io.iter_children():
+        ...     print(child.path, child.partition_values)
 
-    Reads replay ``_delta_log/`` and yield fragments per live
+    Reads replay ``_delta_log/`` and yield one child IO per live
     AddFile, applying any DV at batch time. Writes go through
     ``_write_arrow_batches`` and produce a single transaction.
     """
@@ -263,15 +267,26 @@ class DeltaIO(PartitionedFolderIO):
         return len(replay.live_files) == 0
 
     # ==================================================================
-    # Fragment enumeration — driven by the replay
+    # Children enumeration — driven by the replay
     # ==================================================================
 
-    def iter_fragments(
+    def iter_children(
         self,
         options: "DeltaOptions | None" = None,
         **kwargs: Any,
-    ) -> Iterator[Fragment]:
-        opts = self.check_options(options, overrides=locals())
+    ) -> "Iterator[TabularIO | BytesIO]":
+        """Yield one child :class:`PrimitiveIO` per live AddFile.
+
+        Each child has:
+
+        - ``parent`` set to ``self``;
+        - ``partition_values`` populated from the AddFile's
+          declared partition mapping;
+        - ``deletion_vector`` set to the AddFile's DV descriptor
+          (or ``None``) so :meth:`_read_child_batches` can apply
+          the row filter at read time.
+        """
+        self.check_options(options, overrides=locals())
 
         try:
             replay = self._replay()
@@ -280,33 +295,20 @@ class DeltaIO(PartitionedFolderIO):
         if replay.metadata is None:
             return
 
-        populate = bool(opts.populate_metadata)
-
         for add in replay.live_files:
             child_path = self.path.joinpath(*add.path.split("/"))
             if not child_path.exists():
                 continue
 
-            child_io = self._open_child_for_read(child_path)
+            child_io = self._open_file_child(child_path)
             if child_io is None:
                 continue
 
-            schema: Schema | None = None
-            if populate:
-                try:
-                    schema = child_io.collect_schema()
-                except Exception:
-                    schema = None
-
-            yield Fragment(
-                infos=FragmentInfos(
-                    url=child_path.url,
-                    mtime=add.modification_time / 1000.0,
-                    schema=schema,
-                    partition_values=dict(add.partition_values),
-                ),
-                io=child_io,
-            )
+            self._attach(child_io)
+            child_io.partition_values = dict(add.partition_values)
+            child_io.deletion_vector = add.deletion_vector
+            child_io.delta_add_file = add
+            yield child_io
 
     # ==================================================================
     # Read derivation — chain children, apply DV per file
@@ -318,54 +320,43 @@ class DeltaIO(PartitionedFolderIO):
     ) -> Iterator[pa.RecordBatch]:
         """Stream batches, filtering rows whose ordinal is in the DV.
 
-        Per AddFile:
+        Per child (AddFile):
 
         - No DV: stream batches as-is, then inject partition columns
-          (handled by the partitioned base read path).
+          using the per-child ``partition_values`` mapping populated
+          by :meth:`iter_children`.
         - With DV: decode the bitmap once, track row ordinals
           across batches, mask each batch with ``~bitmap.contains``.
 
-        We don't go through ``super()._read_arrow_batches`` because
-        the DV filter must be applied *before* partition-column
-        injection — partition columns get appended row-for-row
-        and a row-count change in between would desync.
+        DV filtering must run *before* partition-column injection —
+        partition columns get appended row-for-row and a row-count
+        change in between would desync.
         """
         if self.cached:
             yield from self._read_arrow_batches_from_cache(options)
             return
 
-        try:
-            replay = self._replay()
-        except FileNotFoundError:
-            return
-        if replay.metadata is None:
-            return
-
         partition_cols = self._resolve_partition_columns(options)
-        partition_by_name: Mapping[str, Field] = {c.name: c for c in partition_cols}
+        partition_by_name: Mapping[str, Field] = {
+            c.name: c for c in partition_cols
+        }
 
-        for add in replay.live_files:
-            child_path = self.path.joinpath(*add.path.split("/"))
-            if not child_path.exists():
+        for child_io in self.iter_children(options):
+            if not isinstance(child_io, TabularIO):
                 continue
 
-            child_io = self._open_child_for_read(child_path)
-            if child_io is None:
-                continue
-
-            dv_bitmap = self._load_dv_bitmap(add)
-            partition_values = dict(add.partition_values)
+            dv = getattr(child_io, "deletion_vector", None)
+            dv_bitmap = (
+                self._load_dv_bitmap_from_descriptor(dv)
+                if dv is not None else None
+            )
+            partition_values = getattr(child_io, "partition_values", {}) or {}
 
             with child_io:
                 row_offset = 0
                 for batch in child_io.read_arrow_batches(options=options):
                     n = batch.num_rows
                     if dv_bitmap is not None and len(dv_bitmap) > 0:
-                        # Build a boolean mask: True keeps the row,
-                        # False drops it. ``contains`` on BitMap64
-                        # accepts a single ordinal; we materialize
-                        # the mask in Python because pyroaring
-                        # doesn't expose vectorized contains.
                         mask_values = [
                             (row_offset + i) not in dv_bitmap
                             for i in range(n)
@@ -380,8 +371,8 @@ class DeltaIO(PartitionedFolderIO):
 
                     if batch.num_rows == 0:
                         continue
-                    if partition_by_name:
-                        batch = self._inject_partition_columns(
+                    if partition_by_name and partition_values:
+                        batch = _inject_partition_columns(
                             batch, partition_values, partition_by_name,
                         )
                     yield batch
@@ -392,7 +383,13 @@ class DeltaIO(PartitionedFolderIO):
 
     def _load_dv_bitmap(self, add: AddFile) -> "BitMap64 | None":
         """Decode the AddFile's DV to a bitmap, or return None for no DV."""
-        descriptor = add.deletion_vector
+        return self._load_dv_bitmap_from_descriptor(add.deletion_vector)
+
+    def _load_dv_bitmap_from_descriptor(
+        self,
+        descriptor: "DeletionVectorDescriptor | None",
+    ) -> "BitMap64 | None":
+        """Decode a DV descriptor to a bitmap, or return None for no DV."""
         if descriptor is None:
             return None
         if descriptor.is_empty:
@@ -837,8 +834,8 @@ class DeltaIO(PartitionedFolderIO):
         if existing_dv is not None:
             new_bitmap |= existing_dv
 
-        child_io = self._open_child_for_read(child_path)
-        if child_io is None:
+        child_io = self._open_file_child(child_path)
+        if not isinstance(child_io, TabularIO):
             return None
 
         # We need the *full* file row count for the dead-file check

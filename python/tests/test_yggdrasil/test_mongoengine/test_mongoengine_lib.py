@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+mongoengine = pytest.importorskip("mongoengine")
 import yggdrasil.mongoengine.lib as mod
 
 
