@@ -147,7 +147,6 @@ class CastOptions:
     reset_seek: bool = False
     read_seek: int | None = None
     write_seek: int | None = None
-    mark_dirty_on_write: bool = True
     where: Predicate | None = None
     read_write_upsert: bool = False
     wait: WaitingConfig = WaitingConfig.default()

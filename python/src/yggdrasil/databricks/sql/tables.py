@@ -94,6 +94,17 @@ class Tables(DatabricksService):
             table_name=table_name
         )
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["catalog_name"] = self.catalog_name
+        state["schema_name"] = self.schema_name
+        return state
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "catalog_name", state["catalog_name"])
+        object.__setattr__(self, "schema_name", state["schema_name"])
+        super().__setstate__(state)
+
     # -------------------------------------------------------------------------
     # Dict-like navigation — uses catalog/schema defaults on the service
     # -------------------------------------------------------------------------

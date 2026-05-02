@@ -773,6 +773,20 @@ class MimeTypes:
         )
     )
 
+    PARTITIONED_FOLDER = MimeType.define(
+        MimeType(
+            "PARTITIONED_FOLDER",
+            "inode/directory+partitioned",
+        )
+    )
+
+    DELTA_FOLDER = MimeType.define(
+        MimeType(
+            "DELTA_FOLDER",
+            "inode/directory+delta",
+        )
+    )
+
     STATEMENT_RESULT = MimeType.define(
         MimeType(
             "STATEMENT_RESULT",
@@ -780,7 +794,7 @@ class MimeTypes:
         )
     )
 
-    DATABRICKS_STATEMENT = MimeType.define(
+    DATABRICKS_STATEMENT_RESULT = MimeType.define(
         MimeType(
             "DATABRICKS_STATEMENT",
             "application/vnd.databricks.statement",

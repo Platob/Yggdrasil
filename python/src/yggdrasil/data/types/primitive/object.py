@@ -131,8 +131,8 @@ class ObjectType(DataType):
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": int(DataTypeId.OBJECT),
-            "name": DataTypeId.OBJECT.name,
+            "id": self.type_id.value,
+            "name": self.type_id.name,
         }
 
     # ------------------------------------------------------------------

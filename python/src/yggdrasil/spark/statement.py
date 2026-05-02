@@ -57,6 +57,15 @@ class SparkPreparedStatement(PreparedStatement):
     :class:`yggdrasil.environ.PyEnv`.
 
     ``row_limit`` is applied via ``df.limit(...)`` after ``session.sql``.
+
+    Inherits ``retry`` (a :class:`WaitingConfig`) from
+    :class:`PreparedStatement`.  Default is ``None`` (not retryable).
+    Spark errors raised inside ``session.sql`` get captured on the
+    result; if they match
+    :attr:`SparkStatementResult._TRANSIENT_ERROR_PATTERNS`, the statement
+    is auto-promoted (``self.statement.retry`` is filled in by
+    :meth:`SparkStatementResult.default_retry`) so
+    :meth:`StatementResult.retry` will re-run it.
     """
 
     spark_session: Optional["SparkSession"] = None
@@ -67,11 +76,12 @@ class SparkPreparedStatement(PreparedStatement):
         text: str = "",
         *,
         key: Optional[str] = None,
+        retry: Optional[WaitingConfigArg] = None,
         spark_session: Optional["SparkSession"] = None,
         row_limit: Optional[int] = None,
         **kwargs: Any,
     ):
-        super().__init__(text=text, key=key)
+        super().__init__(text=text, key=key, retry=retry)
         self.spark_session = spark_session
         self.row_limit = row_limit
 
@@ -124,8 +134,66 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         return MimeTypes.SPARK_SQL_STATEMENT
 
     # -------------------------------------------------------------------------
+    # Transient-error patterns (Spark-specific)
+    # -------------------------------------------------------------------------
+    #
+    # Spark surfaces Delta concurrent-append etc. as
+    # ``pyspark.sql.utils.AnalysisException`` (or
+    # ``pyspark.errors.exceptions.captured.AnalysisException`` on newer
+    # PySpark) whose ``str(exc)`` carries the same DELTA_* error codes
+    # the warehouse path sees.  We also include ``Py4JJavaError`` markers
+    # since Spark wraps Java-side exceptions through Py4J.
+
+    _TRANSIENT_ERROR_PATTERNS = (
+        # Delta concurrency family — same codes as the warehouse path.
+        r"DELTA_CONCURRENT_APPEND",
+        r"ConcurrentAppendException",
+        r"DELTA_CONCURRENT_DELETE_READ",
+        r"DELTA_CONCURRENT_DELETE_DELETE",
+        r"DELTA_CONCURRENT_WRITE",
+        r"DELTA_METADATA_CHANGED",
+        # Py4J-wrapped Java-side exception classes for the same family.
+        r"ConcurrentDeleteReadException",
+        r"ConcurrentDeleteDeleteException",
+        r"ConcurrentWriteException",
+        r"MetadataChangedException",
+        # Sentinel string Databricks/Delta append to several transient errors.
+        r"Please retry the operation",
+    )
+
+    def _failure_message(self) -> str:
+        """Stringify ``self._failure`` for transient-pattern matching.
+
+        Walks the cause chain (``__cause__`` + ``__context__``) so a
+        Py4JJavaError wrapping a Spark exception still surfaces the
+        underlying message.  Returns ``""`` when no failure is recorded.
+        """
+        if self._failure is None:
+            return ""
+        parts: list[str] = []
+        seen: set[int] = set()
+        exc: Optional[BaseException] = self._failure
+        while exc is not None and id(exc) not in seen:
+            seen.add(id(exc))
+            parts.append(f"{type(exc).__name__}: {exc}")
+            # Some PySpark wrappers expose .desc / .stackTrace via Py4J
+            # gateway that aren't surfaced by str(exc); try a couple of
+            # common attributes defensively.
+            for attr in ("desc", "java_message", "errorClass"):
+                v = getattr(exc, attr, None)
+                if v:
+                    parts.append(str(v))
+            exc = exc.__cause__ or exc.__context__
+        return " | ".join(parts)
+
+    # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
+
+    @property
+    def started(self) -> bool:
+        """True once :meth:`start` has run (terminal in either direction)."""
+        return self._started
 
     @property
     def done(self) -> bool:
@@ -143,6 +211,8 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         return self._failure is not None
 
     def _raise_for_status(self) -> None:
+        # Auto-promote happens in the base raise_for_status() before this
+        # hook fires; we just re-raise the captured exception.
         if self._failure is not None:
             raise self._failure
 
@@ -176,7 +246,8 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
-            self._persisted_data = data
+            from yggdrasil.spark.cast import any_to_spark_dataframe
+            self._persisted_data = any_to_spark_dataframe(data)
         return self
 
     def unpersist(self) -> None:
@@ -208,6 +279,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
 
     def start(
         self,
+        reset: bool = False,
         *,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
@@ -216,14 +288,29 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     ) -> "SparkStatementResult":
         """Run ``session.sql(text)`` and stash the resulting DataFrame.
 
-        Idempotent: a started result returns ``self`` without re-running.
+        Idempotent on already-started results: returns ``self`` without
+        re-running unless ``reset=True``, in which case the prior
+        DataFrame and failure state are cleared and the statement re-runs.
+        ``reset=True`` is the path :meth:`StatementResult.retry` drives.
+
         ``wait`` is accepted for signature compatibility but is irrelevant —
         Spark is already synchronous.
         """
-        if self._started:
+        if self._started and not reset:
             if raise_error:
                 self.raise_for_status()
             return self
+
+        if reset:
+            # Clear prior submission state before re-running.  Note: we
+            # don't drop a *successful* DataFrame from a prior attempt
+            # because retry() only reaches here on failure (the loop
+            # short-circuits when done and not failed), but the
+            # invariant of reset=True is "as if start was never called".
+            self._failure = None
+            self._persisted_data = None
+            self._cached_schema = None
+            self._started = False
 
         session = spark_session or self.statement.spark_session
         if session is None:

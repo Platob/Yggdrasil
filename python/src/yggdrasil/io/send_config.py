@@ -216,6 +216,26 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
+    def __getstate__(self):
+        return {
+            "mode": self.mode,
+            "wait": self.wait,
+            "request_by": self.request_by,
+            "response_by": self.response_by,
+            "received_from": self.received_from,
+            "received_to": self.received_to,
+            "received_ttl": self.received_ttl,
+        }
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "mode", state["mode"])
+        object.__setattr__(self, "wait", state["wait"])
+        object.__setattr__(self, "request_by", state["request_by"])
+        object.__setattr__(self, "response_by", state["response_by"])
+        object.__setattr__(self, "received_from", state["received_from"])
+        object.__setattr__(self, "received_to", state["received_to"])
+        object.__setattr__(self, "received_ttl", state["received_ttl"])
+
     @classmethod
     def check_arg(
         cls,
@@ -587,6 +607,24 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
 
+    def __getstate__(self):
+        return {
+            "raise_error": self.raise_error,
+            "stream": self.stream,
+            "wait": self.wait,
+            "remote_cache": self.remote_cache,
+            "local_cache": self.local_cache,
+            "spark_session": None,
+        }
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "raise_error", state["raise_error"])
+        object.__setattr__(self, "stream", state["stream"])
+        object.__setattr__(self, "wait", state["wait"])
+        object.__setattr__(self, "remote_cache", state["remote_cache"])
+        object.__setattr__(self, "local_cache", state["local_cache"])
+        object.__setattr__(self, "spark_session", None)
+
     @classmethod
     def check_arg(
         cls,
@@ -631,6 +669,32 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
+
+    def __getstate__(self):
+        return {
+            "wait": self.wait,
+            "raise_error": self.raise_error,
+            "stream": self.stream,
+            "remote_cache": self.remote_cache,
+            "local_cache": self.local_cache,
+            "normalize": self.normalize,
+            "batch_size": self.batch_size,
+            "ordered": self.ordered,
+            "max_in_flight": self.max_in_flight,
+            "spark_session": None,
+        }
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "wait", state["wait"])
+        object.__setattr__(self, "raise_error", state["raise_error"])
+        object.__setattr__(self, "stream", state["stream"])
+        object.__setattr__(self, "remote_cache", state["remote_cache"])
+        object.__setattr__(self, "local_cache", state["local_cache"])
+        object.__setattr__(self, "normalize", state["normalize"])
+        object.__setattr__(self, "batch_size", state["batch_size"])
+        object.__setattr__(self, "ordered", state["ordered"])
+        object.__setattr__(self, "max_in_flight", state["max_in_flight"])
+        object.__setattr__(self, "spark_session", state["spark_session"])
 
     @classmethod
     def check_arg(

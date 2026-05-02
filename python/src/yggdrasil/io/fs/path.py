@@ -70,10 +70,12 @@ provide their own factory that builds the parent path, then call
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import pathlib
 import re
+import shutil
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -85,8 +87,7 @@ from typing import (
     List,
     Optional,
     Tuple,
-    Union, TYPE_CHECKING,
-)
+    Union, )
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
@@ -94,8 +95,7 @@ from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
-from yggdrasil.lazy_imports import local_path_class, tabular_io_class, databricks_path_class
-
+from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
 
 __all__ = ["Path", "register_path_class"]
 
@@ -134,14 +134,11 @@ def _select_path_class(obj: Any, default: type = ...) -> type:
         except Exception:
             continue
 
-    databricks_path_class()
-
-    for candidate in _PATH_REGISTRY:
-        try:
-            if candidate.handles(obj):
-                return candidate
-        except Exception:
-            continue
+    if hasattr(obj, "scheme"):
+        scheme = obj.scheme
+        factory = PATH_SCHEME_FACTORY.get(scheme)
+        if factory is not None:
+            return factory()
 
     default = local_path_class() if default is ... else default
     return default
@@ -267,8 +264,7 @@ class Path(Disposable, os.PathLike, ABC):
     def _acquire(self) -> None:
         return
 
-    def _release(self, committed: bool) -> None:
-        del committed
+    def _release(self) -> None:
         if not self.temporary:
             return
         try:
@@ -518,6 +514,7 @@ class Path(Disposable, os.PathLike, ABC):
         default: Any = ...,
         *,
         temporary: bool = False,
+        **kwargs
     ) -> "Path":
         if isinstance(obj, Path):
             same_type = type(obj) is cls or cls is Path
@@ -525,7 +522,7 @@ class Path(Disposable, os.PathLike, ABC):
                 if temporary:
                     obj.temporary = True
                 return obj
-            return cls.from_url(obj.url, default=default, temporary=temporary)
+            return cls.from_url(obj.url, default=default, temporary=temporary, **kwargs)
 
         try:
             url = URL.from_(obj)
@@ -534,7 +531,7 @@ class Path(Disposable, os.PathLike, ABC):
                 raise
             return default
 
-        return cls.from_url(url, default=default, temporary=temporary)
+        return cls.from_url(url, default=default, temporary=temporary, **kwargs)
 
     @classmethod
     def from_url(
@@ -543,6 +540,7 @@ class Path(Disposable, os.PathLike, ABC):
         default: Any = ...,
         *,
         temporary: bool = False,
+        **kwargs
     ) -> "Path":
         try:
             resolved = URL.from_(url)
@@ -552,7 +550,7 @@ class Path(Disposable, os.PathLike, ABC):
             return default
 
         target = _select_path_class(resolved) if cls is Path else cls
-        return target(url=resolved, temporary=temporary)
+        return target(url=resolved, temporary=temporary, **kwargs)
 
     @classmethod
     def from_pathlib(
@@ -639,9 +637,6 @@ class Path(Disposable, os.PathLike, ABC):
             auto_open=auto_open,
             touch=touch,
         )
-
-        if self.temporary:
-            self.manage_object(io)
 
         return io
 
@@ -792,7 +787,7 @@ class Path(Disposable, os.PathLike, ABC):
         return self.is_dir()
 
     @property
-    def content_length(self) -> int:
+    def size(self) -> int:
         return int(self._stat().size)
 
     @property
@@ -1130,6 +1125,64 @@ class Path(Disposable, os.PathLike, ABC):
         self.write_bytes(encoded, parents=parents)
         return len(encoded)
 
+    def write_bytes_io(
+        self,
+        buffer: BytesIO,
+        *,
+        batch_size: int = 1024 * 1024,
+        parents: bool = True
+    ):
+        buffer = BytesIO.from_(buffer)
+        return self._write_bytes_io(buffer, batch_size=batch_size, parents=parents)
+
+    def _write_bytes_io(
+        self,
+        buffer: BytesIO,
+        *,
+        batch_size: int = 1024 * 1024,
+        parents: bool = True
+    ):
+        buffer = BytesIO.from_(buffer)
+        if not buffer.opened:
+            buffer.open()
+
+            try:
+                return self.write_bytes_io(
+                    buffer, batch_size=batch_size, parents=parents
+                )
+            finally:
+                buffer.close()
+
+        # src local-spilled + self local → kernel copy.
+        if (
+            buffer.spilled
+            and buffer.is_local
+            and self.is_local
+            and buffer.path is not None
+        ):
+            if parents:
+                self.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(buffer.path.full_path(), self.full_path())
+            except shutil.SameFileError:
+                pass
+            return buffer.size
+
+        if buffer.spilled and buffer.is_local:
+            mv = buffer.memoryview()
+            try:
+                self.write_bytes(mv, parents=parents)
+                return len(mv)
+            finally:
+                del mv
+
+        if not buffer.spilled:
+            with self.open_io("wb", auto_open=False) as fh:
+                fh.write_bytes_io(buffer, batch_size=batch_size)
+
+        return 0
+
+
     # ==================================================================
     # Streaming copy / write_from_stream
     # ==================================================================
@@ -1141,15 +1194,94 @@ class Path(Disposable, os.PathLike, ABC):
         batch_size: int = 4 * 1024 * 1024,
         parents: bool = True,
     ) -> int:
+        """Copy self to *dest*. Path-to-Path; chooses the fastest available shape.
+
+        Fast paths, in priority order:
+
+        1. **Local → local** — :func:`shutil.copyfile`, which uses
+           ``os.sendfile`` (Linux), ``fcopyfile`` (macOS), or
+           ``CopyFileEx`` (Windows) under the hood. Kernel-side
+           zero-copy on supported platforms; no userspace bytes touched.
+        2. **Same-type non-local → same-type non-local** — left to
+           subclasses to override (e.g. S3 server-side copy). Falls
+           through to the stream loop here.
+        3. **Streaming loop** — read the source via ``open_io("rb")``,
+           write the dest via ``open_io("wb")``, ``batch_size`` chunks.
+           Always correct, memory-bounded by ``batch_size``.
+
+        For mid-size cross-backend copies (one local, one remote)
+        where the buffered ``BytesIO`` already holds the whole payload
+        in memory or in a single mmap-able file, the dest's
+        ``write_bytes`` path is one round-trip vs. N for the loop.
+        That's handled implicitly: ``write_stream`` from the source's
+        ``open_io`` falls back to the loop, which is fine — backends
+        that benefit from single-shot uploads (Databricks, S3) already
+        aggregate the loop's chunks into one PUT in their ``BytesIO``
+        subclass's ``flush``.
+        """
         dest_path = Path.from_(dest)
         if dest_path == self:
-            return self.content_length
+            return self.size
 
         if parents:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # --- Fast path 1: local → local via shutil.copyfile ---------------
+        # Both ends are local files on the same kernel — let the OS do
+        # the copy. shutil.copyfile picks sendfile/fcopyfile/CopyFileEx
+        # based on platform and falls back to its own optimized loop
+        # if those aren't available.
+        if self.is_local and dest_path.is_local:
+            src_full = self.full_path()
+            dst_full = dest_path.full_path()
+            # Confirm source is a regular file before handing to shutil.
+            # shutil.copyfile would raise SameFileError on os.path.samefile;
+            # we already short-circuited equal paths above, but the local
+            # paths could differ textually while pointing to the same
+            # inode (symlinks, bind mounts). Let shutil's own check handle
+            # that — it raises SameFileError, which is the right behavior.
+            try:
+                shutil.copyfile(src_full, dst_full)
+            except shutil.SameFileError:
+                return self.size
+            # shutil.copyfile doesn't return bytes copied; stat the
+            # destination. Avoids a second open just to len() the source.
+            try:
+                return int(dest_path._stat().size)
+            except Exception:
+                return self.size
+
+        # --- Fallback: streaming loop -------------------------------------
+        return self._copy_to_via_stream(dest_path, batch_size=batch_size)
+
+    def _copy_to_via_stream(
+        self,
+        dest_path: "Path",
+        *,
+        batch_size: int,
+    ) -> int:
+        """Fallback path-to-path copy via paired open_io streams."""
         total = 0
         with self.open_io("rb") as src, dest_path.open_io("wb") as dst:
+            # If the source BytesIO is local-spilled, hand its mmap
+            # memoryview to write() in one shot — saves N chunked
+            # syscalls for medium files, and the dst's write() handles
+            # buffer-protocol inputs without an extra copy in the
+            # bytes-fast path.
+            if (
+                isinstance(src, BytesIO)
+                and src.spilled
+                and src.is_local
+            ):
+                mv = src.memoryview()
+                try:
+                    n = dst.write(mv)
+                    return int(n) if n is not None else len(mv)
+                finally:
+                    # Release the mmap before src closes — some platforms
+                    # are strict about closing a file with live maps.
+                    del mv
+
             while True:
                 chunk = src.read(batch_size)
                 if not chunk:
@@ -1165,6 +1297,38 @@ class Path(Disposable, os.PathLike, ABC):
         batch_size: int = 4 * 1024 * 1024,
         parents: bool = True,
     ) -> int:
+        """Stream *src* into self.
+
+        Fast paths when *src* is a yggdrasil :class:`BytesIO`:
+
+        - **src local-spilled, self local** → :func:`shutil.copyfile`
+          between the two backing files. Kernel-side on supported
+          platforms; bypasses the open/loop/close cycle entirely.
+        - **src local-spilled, self non-local** → hand the source's
+          mmap :meth:`memoryview` to ``self.write_bytes`` in one
+          shot. One upload round-trip instead of N chunked writes.
+        - **src memory-mode** → ``self.write_bytes(src.to_bytes())``
+          directly. The source's bytes are already contiguous; the
+          stream loop would just chunk them back up.
+
+        Stdlib :class:`io.BytesIO` is also single-shotted via
+        :meth:`getvalue`. Anything else (HTTP response, pipe, named
+        pipe, stdin) falls through to the streaming loop.
+        """
+        # Fast paths for yggdrasil BytesIO sources -------------------------
+        if isinstance(src, BytesIO):
+            return self.write_bytes_io(src)
+
+        # Stdlib io.BytesIO — single-shot getvalue() also wins here.
+        if isinstance(src, io.BytesIO):
+            # tell() so we respect any pre-positioned cursor, the same
+            # way the loop would.
+            start = src.tell()
+            payload = src.getvalue()[start:]
+            self.write_bytes(payload, parents=parents)
+            return len(payload)
+
+        # --- Fallback: streaming loop -------------------------------------
         total = 0
         with self.open_io("wb") as dst:
             while True:

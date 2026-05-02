@@ -242,13 +242,6 @@ class MemoryIO(Disposable, IO[bytes]):
         # shared with any other handles, and we maintain our own.
         self._pos = buffer.size if "a" in mode else 0
 
-        # Wire the buffer + path into the Disposable graph. The
-        # buffer claim is what the registry's eviction logic sees;
-        # the path claim mirrors the LocalIO contract so closing
-        # the handle drops a claim on the path too.
-        self.manage_object(buffer)
-        self.manage_object(path)
-
         if auto_open:
             self.open()
 
@@ -288,13 +281,6 @@ class MemoryIO(Disposable, IO[bytes]):
         if "w" in self._mode:
             self._buffer.truncate(0)
             self._pos = 0
-
-    def _release(self, committed: bool) -> None:
-        # Nothing to flush — the wrapped :class:`BytesIO` holds the
-        # bytes and is released by its own lifecycle when the
-        # registry evicts it. Our claim drop happens automatically
-        # via Disposable's owned-children unwinding.
-        del committed
 
     # ------------------------------------------------------------------
     # IO[bytes] protocol — delegate to buffer with our own cursor

@@ -59,7 +59,7 @@ from yggdrasil.data import Schema, schema
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
 from yggdrasil.databricks.sql.exceptions import SQLError
-from yggdrasil.dataclasses import WaitingConfigArg
+from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.enums import MimeType, MimeTypes, MediaTypes
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
@@ -127,6 +127,14 @@ class WarehousePreparedStatement(PreparedStatement):
     text aliases to staged :class:`VolumePath` instances; :meth:`prepare`
     auto-stages tabular ``external_data`` into Parquet on a fresh
     :class:`VolumePath`.
+
+    Retry
+    -----
+    Inherits ``retry`` (a :class:`WaitingConfig`) from
+    :class:`PreparedStatement`.  Default is ``None`` (not retryable).
+    Pass ``retry=WaitingConfig(...)``, ``retry=True`` for the standard
+    default policy, or ``retry={"timeout": 60, "retries": 3}`` for a
+    dict-shaped config; see :meth:`WaitingConfig.from_`.
     """
 
     # ---- Routing ----
@@ -158,6 +166,7 @@ class WarehousePreparedStatement(PreparedStatement):
         text: str = "",
         *,
         key: Optional[str] = None,
+        retry: Optional[WaitingConfigArg] = None,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
@@ -172,7 +181,7 @@ class WarehousePreparedStatement(PreparedStatement):
         external_volume_paths: Optional[dict[str, VolumePath]] = None,
         **kwargs: Any,
     ):
-        super().__init__(text, key=key)
+        super().__init__(text, key=key, retry=retry)
         self.warehouse_id = warehouse_id
         self.warehouse_name = warehouse_name
         self.catalog_name = catalog_name
@@ -325,12 +334,18 @@ class WarehousePreparedStatement(PreparedStatement):
         disposition: Optional[Disposition] = None,
         format: Optional[Format] = None,
         temporary: bool = True,
+        retry: Optional[WaitingConfigArg] = None,
         **kwargs: Any,
     ) -> "WarehousePreparedStatement":
         """Coerce + bind parameters + stage external data.
 
         Merge precedence on alias collisions:
         existing volumes < caller-supplied < just-staged.
+
+        ``retry`` is applied only when non-None — preserves whatever was
+        already on the statement when ``prepare`` is given an existing
+        :class:`WarehousePreparedStatement`.  Pass ``retry=False`` to
+        explicitly clear an existing retry policy.
         """
         prepared = cls.from_(statement)
 
@@ -368,6 +383,15 @@ class WarehousePreparedStatement(PreparedStatement):
         else:
             # CSV / ARROW_STREAM only support EXTERNAL_LINKS.
             prepared.disposition = Disposition.EXTERNAL_LINKS
+
+        # ---- Retry config: only override when caller asked.
+        # ``False`` explicitly disables; any other non-None value passes
+        # through WaitingConfig.from_.
+        if retry is not None:
+            if retry is False:
+                prepared.retry = None
+            else:
+                prepared.retry = WaitingConfig.from_(retry)
 
         # Apply any extra typed-field kwargs in one shot.
         if catalog_name is not None:
@@ -486,6 +510,13 @@ class WarehouseStatementResult(StatementResult):
     The ``warehouse_id`` field is the *resolved* warehouse the statement
     actually ran on (set after submission); ``self.statement.warehouse_id``
     is the *requested* routing hint (set by the caller before submission).
+
+    Retry semantics are inherited from :class:`StatementResult`: the
+    looping ``retry()`` method drives ``start(reset=True)`` per attempt,
+    sleeping per ``self.statement.retry`` (a :class:`WaitingConfig`)
+    between tries.  ``retryable`` is a derived property — non-retryable
+    when ``self.statement.retry is None`` or the attempt budget is
+    exhausted.
     """
 
     _PREPARED_STATEMENT_CLASS = WarehousePreparedStatement
@@ -493,7 +524,7 @@ class WarehouseStatementResult(StatementResult):
 
     @classmethod
     def default_mime_type(cls) -> "MimeType | None":
-        return MimeTypes.DATABRICKS_STATEMENT
+        return MimeTypes.DATABRICKS_STATEMENT_RESULT
 
     executor: "SQLWarehouse"
     statement: WarehousePreparedStatement
@@ -551,6 +582,7 @@ class WarehouseStatementResult(StatementResult):
 
     def start(
         self,
+        reset: bool = False,
         *,
         warehouse: "Optional[SQLWarehouse]" = None,
         warehouse_id: Optional[str] = None,
@@ -566,11 +598,31 @@ class WarehouseStatementResult(StatementResult):
     ) -> "WarehouseStatementResult":
         """Submit the statement.  Idempotent on already-started results.
 
+        ``reset=True`` cancels the existing submission (when not already
+        terminal) and clears local state before resubmitting — this is
+        the path :meth:`StatementResult.retry` drives.
+
         Caller kwargs override anything carried on ``self.statement`` for
         this submission only — the underlying statement's hints stay put.
         """
         if self.started:
-            return self
+            if not reset:
+                return self
+
+            # On retry-after-failure the prior submission is already in a
+            # terminal state, so cancel() short-circuits.  But guard anyway
+            # so a hung-PENDING resubmit also drops the prior server-side
+            # state cleanly.
+            try:
+                self.cancel()
+            except Exception:
+                logger.exception(
+                    "cancel() during start(reset=True) failed for %r; continuing.",
+                    self.key,
+                )
+            self.statement_id = None
+            self._response = None
+            self._cached_schema = None
 
         from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
@@ -583,7 +635,7 @@ class WarehouseStatementResult(StatementResult):
                 warehouse_name=eff_wh_name,
             )
 
-        warehouse.execute(
+        submitted = warehouse.execute(
             statement=self,
             warehouse_id=eff_wh_id,
             warehouse_name=eff_wh_name,
@@ -595,6 +647,13 @@ class WarehouseStatementResult(StatementResult):
             wait=wait,
             raise_error=raise_error,
         )
+
+        # Adopt server-resolved state.  Retry config rides on
+        # ``self.statement.retry`` and is preserved by
+        # ``self.statement = submitted.statement`` below.
+        self.statement = submitted.statement
+        self.statement_id = submitted.statement_id
+        self.executor = submitted.executor
 
         return self
 
@@ -679,7 +738,61 @@ class WarehouseStatementResult(StatementResult):
     def failed(self) -> bool:
         return self.state in FAILED_STATES
 
+    # ------------------------------------------------------------------
+    # Transient-failure detection (overrides base)
+    # ------------------------------------------------------------------
+    #
+    # The auto-promote machinery lives on :class:`StatementResult`; this
+    # subclass only declares Databricks-specific patterns and tells the
+    # base how to read the failure message off a StatementResponse.
+    #
+    # Most entries are Delta concurrency error codes — they're write-
+    # races, idempotent retries always make sense.  ``Please retry the
+    # operation`` is the catch-all sentinel Databricks adds to several
+    # transient conditions.
+
+    _TRANSIENT_ERROR_PATTERNS: ClassVar[tuple[str, ...]] = (
+        # Delta concurrent-append conflicts (partitioned tables w/o RLC,
+        # MERGE on overlapping partitions, etc.)
+        r"DELTA_CONCURRENT_APPEND",
+        r"ConcurrentAppendException",
+        # Generic Delta concurrency family — any of these are retry-safe
+        # for idempotent writers.
+        r"DELTA_CONCURRENT_DELETE_READ",
+        r"DELTA_CONCURRENT_DELETE_DELETE",
+        r"DELTA_CONCURRENT_WRITE",
+        r"DELTA_METADATA_CHANGED",
+        # Plain "please retry the operation" — Databricks emits this on
+        # several transient conditions and it's a clear signal.
+        r"Please retry the operation",
+    )
+
+    def _failure_message(self) -> str:
+        """Read the backend failure off the cached StatementResponse.
+
+        Pulls ``error_code`` and ``message`` off ``response.status.error``
+        (SDK-typed) and falls back to the bare state name.  Returns ``""``
+        when nothing is available — base ``_is_transient_failure`` then
+        skips the regex search.
+        """
+        if self._response is None:
+            return ""
+        status = getattr(self._response, "status", None)
+        if status is None:
+            return ""
+        error = getattr(status, "error", None)
+        if error is None:
+            return status.state.value if status.state else ""
+        # SDK ServiceError carries error_code + message; either may match.
+        parts = [
+            getattr(error, "error_code", None),
+            getattr(error, "message", None),
+        ]
+        return " ".join(str(p) for p in parts if p)
+
     def _raise_for_status(self) -> None:
+        # Auto-promote happens in the base raise_for_status() before this
+        # hook fires; we just raise the backend-specific exception.
         if self.failed:
             raise SQLError.from_statement(self)
 
@@ -863,6 +976,11 @@ class WarehouseStatementBatch(StatementBatch):
     set of aliases applied on top of any per-statement registry — useful
     for shared scratch volumes that every statement in the batch reads.
     Per-statement entries take precedence on alias collisions.
+
+    :meth:`retry` is inherited from :class:`StatementBatch` — it walks
+    the result map, picks every entry that is both ``failed`` and
+    ``retryable``, and reissues each via :meth:`StatementResult.retry`
+    on the configured ``parallel`` thread pool.
     """
 
     external_volume_paths: dict[str, VolumePath]

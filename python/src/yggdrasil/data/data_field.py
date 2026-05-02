@@ -787,6 +787,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         if hasattr(obj, "value"):
             return cls.from_any(obj.value)
 
+        if isinstance(obj, (list, tuple)):
+            return cls.from_list(obj)
+
         raise TypeError(f"Cannot build Field from {type(obj).__name__}")
 
     @classmethod
@@ -1050,6 +1053,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             value = bytes(value).decode("utf-8")
 
         if not isinstance(value, str):
+            if isinstance(value, Mapping):
+                return cls.from_dict(value)
+            elif isinstance(value, (list, tuple)):
+                return cls.from_list(value)
             raise TypeError(
                 f"Field.from_json expects str or bytes-like input; got {type(value).__name__}"
             )
@@ -1248,11 +1255,23 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @classmethod
     def from_polars_field(cls, value: "polars.Field") -> "Field":
+        try:
+            nullable = getattr(value, "nullable", True)
+        except Exception:
+            nullable = True
+
+        try:
+            metadata = getattr(value, "metadata", None)
+            if metadata is not None:
+                metadata = _normalize_metadata(metadata, tags=None)
+        except Exception:
+            metadata = None
+
         return cls(
             name=value.name,
             dtype=DataType.from_polars_type(value.dtype),
-            nullable=True,
-            metadata={},
+            nullable=nullable,
+            metadata=metadata,
         )
 
     @classmethod

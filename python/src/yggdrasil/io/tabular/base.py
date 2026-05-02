@@ -247,7 +247,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     def cached(self) -> bool:
         return self._arrow_table is not None or self._spark_frame is not None
 
-    def _release(self, committed: bool) -> None:
+    def _release(self) -> None:
         self.unpersist()
 
     @abstractmethod

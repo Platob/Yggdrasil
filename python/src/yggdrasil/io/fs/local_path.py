@@ -319,7 +319,7 @@ class LocalPath(Path):
 
         if n < 0:
             try:
-                size = self.content_length
+                size = self.size
             except OSError:
                 if default is ...:
                     raise
@@ -543,7 +543,7 @@ class LocalPath(Path):
             raise ValueError("memoryview offset must be >= 0")
 
         try:
-            total = self.content_length
+            total = self.size
         except OSError:
             if raise_error:
                 raise
@@ -578,7 +578,7 @@ class LocalPath(Path):
 
     def open_mmap(self, mode: str = "r"):
         """Real :class:`mmap.mmap` over this file, or ``None`` if empty."""
-        size = self.content_length
+        size = self.size
         if size == 0:
             return None
 
@@ -605,7 +605,7 @@ class LocalPath(Path):
         # Same-path guard inherited from the base via comparison.
         dest_path = Path.from_(dest)
         if dest_path == self:
-            return self.content_length
+            return self.size
 
         if not isinstance(dest_path, LocalPath):
             # Cross-backend copy goes through the base streaming loop.
@@ -618,7 +618,7 @@ class LocalPath(Path):
         # 3.8+ and falls back to a read/write loop elsewhere.
         shutil.copyfile(self.full_path(), dest_path.full_path())
         try:
-            return self.content_length
+            return self.size
         except OSError:
             return 0
 

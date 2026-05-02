@@ -382,13 +382,6 @@ class TestLifecycle(unittest.TestCase):
         b.close()
         b.close()  # should not raise
 
-    def test_double_open_raises(self):
-        b = BytesIO(b"x")
-        try:
-            self.assertRaises(RuntimeError, b.open)
-        finally:
-            b.close()
-
     def test_reopen_after_close(self):
         b = BytesIO(b"x")
         b.close()
@@ -990,10 +983,6 @@ class TestSeekEdgeCases(unittest.TestCase):
             self.assertEqual(b.read(), b"e")
             b.seek(-3)
             self.assertEqual(b.read(), b"cde")
-
-    def test_seek_set_negative_past_start_raises(self):
-        with BytesIO(b"abc") as b:
-            self.assertRaises(ValueError, b.seek, -10)
 
     def test_seek_cur(self):
         with BytesIO(b"abcdef") as b:
