@@ -1,3 +1,11 @@
+"""``DataType.to_dict`` ↔ :meth:`DataType.from_dict` round-trips.
+
+Each primitive type renders to a dict that ``DataType.from_dict``
+should resolve back to the same concrete subclass with the same
+parameters. Carrying parameters through the dict is what lets schemas
+travel through JSON / Databricks tables / cache files without the
+yggdrasil objects being importable on the consumer side.
+"""
 from __future__ import annotations
 
 import unittest
@@ -19,104 +27,77 @@ from yggdrasil.data.types.primitive import (
 )
 
 
-class TestDataTypeDictRoundTrip(unittest.TestCase):
+class TestPrimitiveDictRoundTrip(unittest.TestCase):
 
-    def test_integer_round_trip(self):
+    def test_integer_carries_byte_size_and_signed(self) -> None:
         original = IntegerType(byte_size=8, signed=True)
         d = original.to_dict()
         restored = DataType.from_dict(d)
 
+        self.assertEqual(d["id"], int(DataTypeId.INTEGER))
         self.assertIsInstance(restored, IntegerType)
         self.assertEqual(restored.byte_size, 8)
         self.assertTrue(restored.signed)
-        self.assertEqual(d["id"], int(DataTypeId.INTEGER))
 
-    def test_string_round_trip(self):
-        original = StringType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
-
-        self.assertIsInstance(restored, StringType)
+    def test_string_round_trip(self) -> None:
+        d = StringType().to_dict()
         self.assertEqual(d["id"], int(DataTypeId.STRING))
+        self.assertIsInstance(DataType.from_dict(d), StringType)
 
-    def test_boolean_round_trip(self):
-        original = BooleanType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_boolean_round_trip(self) -> None:
+        self.assertIsInstance(DataType.from_dict(BooleanType().to_dict()), BooleanType)
 
-        self.assertIsInstance(restored, BooleanType)
+    def test_null_round_trip(self) -> None:
+        self.assertIsInstance(DataType.from_dict(NullType().to_dict()), NullType)
 
-    def test_null_round_trip(self):
-        original = NullType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_binary_round_trip(self) -> None:
+        self.assertIsInstance(DataType.from_dict(BinaryType().to_dict()), BinaryType)
 
-        self.assertIsInstance(restored, NullType)
-
-    def test_binary_round_trip(self):
-        original = BinaryType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
-
-        self.assertIsInstance(restored, BinaryType)
-
-    def test_decimal_round_trip(self):
+    def test_decimal_carries_precision_and_scale(self) -> None:
         original = DecimalType(precision=10, scale=2)
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+        restored = DataType.from_dict(original.to_dict())
 
         self.assertIsInstance(restored, DecimalType)
         self.assertEqual(restored.precision, 10)
         self.assertEqual(restored.scale, 2)
 
-    def test_float_round_trip(self):
-        original = FloatingPointType(byte_size=8)
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_float_carries_byte_size(self) -> None:
+        restored = DataType.from_dict(FloatingPointType(byte_size=8).to_dict())
 
         self.assertIsInstance(restored, FloatingPointType)
         self.assertEqual(restored.byte_size, 8)
 
-    def test_date_round_trip(self):
-        original = DateType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_date_round_trip(self) -> None:
+        self.assertIsInstance(DataType.from_dict(DateType().to_dict()), DateType)
 
-        self.assertIsInstance(restored, DateType)
+    def test_time_round_trip(self) -> None:
+        self.assertIsInstance(DataType.from_dict(TimeType().to_dict()), TimeType)
 
-    def test_time_round_trip(self):
-        original = TimeType()
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
-
-        self.assertIsInstance(restored, TimeType)
-
-    def test_timestamp_round_trip(self):
+    def test_timestamp_carries_unit_and_tz(self) -> None:
         original = TimestampType(tz="UTC", unit="us")
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+        restored = DataType.from_dict(original.to_dict())
 
         self.assertIsInstance(restored, TimestampType)
         self.assertEqual(restored.tz, "UTC")
         self.assertEqual(restored.unit, "us")
 
-    def test_timestamp_ntz_round_trip(self):
-        original = TimestampType(tz=None, unit="us")
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_timestamp_naive_preserves_none_tz(self) -> None:
+        restored = DataType.from_dict(TimestampType(tz=None, unit="us").to_dict())
 
         self.assertIsInstance(restored, TimestampType)
         self.assertIsNone(restored.tz)
 
-    def test_duration_round_trip(self):
-        original = DurationType(unit="us")
-        d = original.to_dict()
-        restored = DataType.from_dict(d)
+    def test_duration_carries_unit(self) -> None:
+        restored = DataType.from_dict(DurationType(unit="us").to_dict())
 
         self.assertIsInstance(restored, DurationType)
         self.assertEqual(restored.unit, "us")
 
-    def test_all_primitive_round_trips(self):
+
+class TestRoundTripMatrix(unittest.TestCase):
+    """One subTest per primitive — exact subclass survives the round-trip."""
+
+    def test_all_primitive_round_trips(self) -> None:
         primitives = [
             NullType(),
             BinaryType(),
@@ -141,6 +122,5 @@ class TestDataTypeDictRoundTrip(unittest.TestCase):
         ]
         for original in primitives:
             with self.subTest(dtype=str(original)):
-                d = original.to_dict()
-                restored = DataType.from_dict(d)
+                restored = DataType.from_dict(original.to_dict())
                 self.assertEqual(type(restored), type(original))

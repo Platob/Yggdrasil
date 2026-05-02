@@ -1,3 +1,12 @@
+"""Subclass-level type-system safety on primitive ``from_arrow_type``.
+
+Each primitive subclass owns ``handles_arrow_type`` and
+``from_arrow_type``; the latter must raise on inputs the former
+rejects, instead of producing nonsense via attribute access. These
+tests pin that contract for the temporal subclasses (which have the
+richest unit/tz handling) and lock in the integer ``__str__`` form
+that callers grep for in error messages.
+"""
 from __future__ import annotations
 
 import pyarrow as pa
@@ -6,60 +15,70 @@ import pytest
 from yggdrasil.data.types.primitive import (
     DurationType,
     IntegerType,
-    TimestampType,
     TimeType,
+    TimestampType,
 )
 
 
-def test_time_type_from_arrow_type_rejects_non_time() -> None:
-    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
-        TimeType.from_arrow_type(pa.int64())
+class TestTimeTypeArrowSafety:
+
+    def test_rejects_non_time_type(self) -> None:
+        with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+            TimeType.from_arrow_type(pa.int64())
+
+    def test_accepts_time32_with_unit(self) -> None:
+        out = TimeType.from_arrow_type(pa.time32("ms"))
+
+        assert out.byte_size == 4
+        assert out.unit == "ms"
+
+    def test_accepts_time64_with_unit(self) -> None:
+        out = TimeType.from_arrow_type(pa.time64("us"))
+
+        assert out.byte_size == 8
+        assert out.unit == "us"
 
 
-def test_time_type_from_arrow_type_accepts_time32_and_time64() -> None:
-    t32 = TimeType.from_arrow_type(pa.time32("ms"))
-    t64 = TimeType.from_arrow_type(pa.time64("us"))
+class TestTimestampTypeArrowSafety:
 
-    assert t32.byte_size == 4
-    assert t32.unit == "ms"
+    def test_rejects_non_timestamp_type(self) -> None:
+        with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+            TimestampType.from_arrow_type(pa.int64())
 
-    assert t64.byte_size == 8
-    assert t64.unit == "us"
+    def test_preserves_tz_and_unit(self) -> None:
+        out = TimestampType.from_arrow_type(pa.timestamp("us", tz="UTC"))
 
-
-def test_timestamp_type_from_arrow_type_rejects_non_timestamp() -> None:
-    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
-        TimestampType.from_arrow_type(pa.int64())
+        assert out.unit == "us"
+        assert out.tz == "UTC"
 
 
-def test_timestamp_type_from_arrow_type_preserves_tz() -> None:
-    ts = TimestampType.from_arrow_type(pa.timestamp("us", tz="UTC"))
+class TestDurationTypeArrowSafety:
 
-    assert ts.unit == "us"
-    assert ts.tz == "UTC"
+    def test_rejects_non_duration_type(self) -> None:
+        with pytest.raises(TypeError, match="Unsupported Arrow data type"):
+            DurationType.from_arrow_type(pa.int64())
 
+    @pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+    def test_accepts_every_arrow_unit(self, unit: str) -> None:
+        out = DurationType.from_arrow_type(pa.duration(unit))
 
-def test_duration_type_from_arrow_type_rejects_non_duration() -> None:
-    with pytest.raises(TypeError, match="Unsupported Arrow data type"):
-        DurationType.from_arrow_type(pa.int64())
-
-
-def test_duration_type_from_arrow_type_accepts_all_units() -> None:
-    for unit in ("s", "ms", "us", "ns"):
-        result = DurationType.from_arrow_type(pa.duration(unit))
-        assert result.unit == unit
-        assert result.byte_size == 8
+        assert out.unit == unit
+        assert out.byte_size == 8
 
 
-def test_integer_type_str_signed() -> None:
-    assert str(IntegerType(byte_size=1, signed=True)) == "int8"
-    assert str(IntegerType(byte_size=2, signed=True)) == "int16"
-    assert str(IntegerType(byte_size=4, signed=True)) == "int32"
-    assert str(IntegerType(byte_size=8, signed=True)) == "int64"
+class TestIntegerTypeStr:
+    """``str(IntegerType(...))`` is grepped by error messages — pin it."""
 
+    @pytest.mark.parametrize(
+        "byte_size,expected",
+        [(1, "int8"), (2, "int16"), (4, "int32"), (8, "int64")],
+    )
+    def test_signed(self, byte_size: int, expected: str) -> None:
+        assert str(IntegerType(byte_size=byte_size, signed=True)) == expected
 
-def test_integer_type_str_unsigned() -> None:
-    assert str(IntegerType(byte_size=1, signed=False)) == "uint8"
-    assert str(IntegerType(byte_size=2, signed=False)) == "uint16"
-    assert str(IntegerType(byte_size=4, signed=False)) == "uint32"
-    assert str(IntegerType(byte_size=8, signed=False)) == "uint64"
+    @pytest.mark.parametrize(
+        "byte_size,expected",
+        [(1, "uint8"), (2, "uint16"), (4, "uint32"), (8, "uint64")],
+    )
+    def test_unsigned(self, byte_size: int, expected: str) -> None:
+        assert str(IntegerType(byte_size=byte_size, signed=False)) == expected

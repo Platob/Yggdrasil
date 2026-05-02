@@ -1,9 +1,23 @@
+"""``DataType.from_pytype`` and ``DataType.from_dataclass``.
+
+Two entry points; one shared design rule: take whatever Python annotation
+the caller actually has (a builtin, a typing form, an enum, a dataclass)
+and resolve it to the most-specific :class:`DataType` we can.
+
+* Scalars hit a direct mapping.
+* Optionals unwrap; literals collapse to their value type.
+* Mixed unions degrade to ``StringType``.
+* Containers map to nested types: ``list[T]`` → array, ``tuple[T, ...]``
+  → array, fixed ``tuple[A, B]`` → struct, ``dict[K, V]`` and TypedDict
+  → map.
+* Plain annotated classes (``class Foo: a: int``) and dataclasses both
+  promote to a struct.
+"""
 from __future__ import annotations
 
 import datetime as dt
 import decimal
 import enum
-import unittest
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -27,36 +41,46 @@ from yggdrasil.data.types.primitive import (
 )
 
 
-class TotalUserPayload(TypedDict):
+# ---------------------------------------------------------------------------
+# Fixture types — annotated/typed classes used by the tests.
+# ---------------------------------------------------------------------------
+
+
+class _TotalUserPayload(TypedDict):
     id: int
     name: str
 
 
-class PartialUserPayload(TypedDict, total=False):
+class _PartialUserPayload(TypedDict, total=False):
     id: int
     name: str
 
 
 @dataclass
-class TradeRow:
+class _TradeRow:
     ts: dt.datetime
     price: float
     volume: int
 
 
-class PlainAnnotatedClass:
+class _PlainAnnotatedClass:
     a: int
     b: str
 
 
-class Side(enum.Enum):
+class _Side(enum.Enum):
     BUY = "buy"
     SELL = "sell"
 
 
-class TestFromPytypeScalars(ArrowTestCase):
+# ---------------------------------------------------------------------------
+# Scalar hints
+# ---------------------------------------------------------------------------
 
-    def test_from_pytype_scalar_types(self):
+
+class TestScalarHints(ArrowTestCase):
+
+    def test_scalar_matrix(self) -> None:
         pa = self.pa
         cases = [
             (None, NullType, pa.null()),
@@ -82,44 +106,57 @@ class TestFromPytypeScalars(ArrowTestCase):
                 self.assertEqual(dtype.to_arrow(), expected_arrow)
 
 
-class TestFromPytypeComplex(ArrowTestCase):
+# ---------------------------------------------------------------------------
+# Optionals, Literals, Unions
+# ---------------------------------------------------------------------------
 
-    def test_from_pytype_optional_unwraps_to_inner_type(self):
+
+class TestComplexHints(ArrowTestCase):
+
+    def test_optional_unwraps_to_inner(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(Optional[int])
 
         self.assertIsInstance(dtype, IntegerType)
         self.assertEqual(dtype.to_arrow(), pa.int64())
 
-    def test_from_pytype_literal_single_concrete_type(self):
+    def test_literal_with_homogeneous_values(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(Literal[1, 2, 3])
 
         self.assertIsInstance(dtype, IntegerType)
         self.assertEqual(dtype.to_arrow(), pa.int64())
 
-    def test_from_pytype_literal_optional_collapses_to_inner_type(self):
+    def test_literal_with_none_collapses_to_inner(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(Literal[1, None])
 
         self.assertIsInstance(dtype, IntegerType)
         self.assertEqual(dtype.to_arrow(), pa.int64())
 
-    def test_from_pytype_union_mixed_types_falls_back_to_string(self):
+    def test_mixed_union_falls_back_to_string(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(int | str)
 
         self.assertIsInstance(dtype, StringType)
         self.assertEqual(dtype.to_arrow(), pa.string())
 
-    def test_from_pytype_enum_uses_member_value_type(self):
+    def test_enum_uses_member_value_type(self) -> None:
         pa = self.pa
-        dtype = DataType.from_pytype(Side)
+        dtype = DataType.from_pytype(_Side)
 
         self.assertIsInstance(dtype, StringType)
         self.assertEqual(dtype.to_arrow(), pa.string())
 
-    def test_from_pytype_list_of_int_becomes_array(self):
+
+# ---------------------------------------------------------------------------
+# Containers — list / tuple / dict / TypedDict
+# ---------------------------------------------------------------------------
+
+
+class TestContainerHints(ArrowTestCase):
+
+    def test_list_of_int_becomes_array(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(list[int])
 
@@ -129,7 +166,7 @@ class TestFromPytypeComplex(ArrowTestCase):
             pa.list_(pa.field("item", pa.int64(), nullable=True)),
         )
 
-    def test_from_pytype_plain_list_uses_any_item_fallback(self):
+    def test_plain_list_uses_string_item_fallback(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(list)
 
@@ -139,7 +176,7 @@ class TestFromPytypeComplex(ArrowTestCase):
             pa.list_(pa.field("item", pa.string(), nullable=True)),
         )
 
-    def test_from_pytype_tuple_variadic_becomes_array(self):
+    def test_variadic_tuple_becomes_array(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(tuple[int, ...])
 
@@ -149,7 +186,7 @@ class TestFromPytypeComplex(ArrowTestCase):
             pa.list_(pa.field("item", pa.int64(), nullable=True)),
         )
 
-    def test_from_pytype_tuple_fixed_becomes_struct(self):
+    def test_fixed_tuple_becomes_struct_with_positional_names(self) -> None:
         pa = self.pa
         dtype = DataType.from_pytype(tuple[int, str])
 
@@ -164,33 +201,41 @@ class TestFromPytypeComplex(ArrowTestCase):
             ),
         )
 
-    def test_from_pytype_dict_becomes_map(self):
+    def test_plain_dict_becomes_unsorted_map(self) -> None:
         dtype = DataType.from_pytype(dict[str, int])
 
         self.assertIsInstance(dtype, MapType)
         self.assertFalse(dtype.keys_sorted)
 
-    def test_from_pytype_ordered_dict_becomes_sorted_map(self):
+    def test_ordered_dict_becomes_sorted_map(self) -> None:
         dtype = DataType.from_pytype(OrderedDict[str, int])
 
         self.assertIsInstance(dtype, MapType)
         self.assertTrue(dtype.keys_sorted)
 
-    def test_from_pytype_typed_dict_currently_resolves_as_map(self):
-        dtype = DataType.from_pytype(TotalUserPayload)
+    def test_total_typed_dict_resolves_as_map(self) -> None:
+        dtype = DataType.from_pytype(_TotalUserPayload)
 
         self.assertIsInstance(dtype, MapType)
         self.assertFalse(dtype.keys_sorted)
 
-    def test_from_pytype_partial_typed_dict_currently_resolves_as_map(self):
-        dtype = DataType.from_pytype(PartialUserPayload)
+    def test_partial_typed_dict_resolves_as_map(self) -> None:
+        dtype = DataType.from_pytype(_PartialUserPayload)
 
         self.assertIsInstance(dtype, MapType)
         self.assertFalse(dtype.keys_sorted)
 
-    def test_from_dataclass_with_future_annotations_uses_string_for_datetime_field(self):
+
+# ---------------------------------------------------------------------------
+# Annotated classes / dataclasses
+# ---------------------------------------------------------------------------
+
+
+class TestAnnotatedClasses(ArrowTestCase):
+
+    def test_dataclass_with_future_annotations_promotes_to_struct(self) -> None:
         pa = self.pa
-        dtype = DataType.from_dataclass(TradeRow)
+        dtype = DataType.from_dataclass(_TradeRow)
 
         self.assertIsInstance(dtype, StructType)
         self.assertEqual(
@@ -204,9 +249,9 @@ class TestFromPytypeComplex(ArrowTestCase):
             ),
         )
 
-    def test_from_pytype_plain_annotated_class_builds_struct(self):
+    def test_plain_annotated_class_promotes_to_struct(self) -> None:
         pa = self.pa
-        dtype = DataType.from_pytype(PlainAnnotatedClass)
+        dtype = DataType.from_pytype(_PlainAnnotatedClass)
 
         self.assertIsInstance(dtype, StructType)
         self.assertEqual(
