@@ -13,7 +13,7 @@ __all__ = [
 ]
 
 COLUMN_TYPE_MAP = {
-    ColumnTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
+    # ColumnTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
     ColumnTypeName.BINARY: BinaryType(),
     ColumnTypeName.BOOLEAN: BooleanType(),
     ColumnTypeName.BYTE: IntegerType(byte_size=1),
@@ -22,17 +22,17 @@ COLUMN_TYPE_MAP = {
     ColumnTypeName.DECIMAL: DecimalType(),
     ColumnTypeName.DOUBLE: FloatingPointType(byte_size=8),
     ColumnTypeName.FLOAT: FloatingPointType(byte_size=4),
-    ColumnTypeName.GEOGRAPHY: ObjectType(),
-    ColumnTypeName.GEOMETRY: ObjectType(),
+    ColumnTypeName.GEOGRAPHY: StringType(),
+    ColumnTypeName.GEOMETRY: StringType(),
     ColumnTypeName.INT: IntegerType(byte_size=4),
     ColumnTypeName.INTERVAL: DurationType(),
     ColumnTypeName.LONG: IntegerType(byte_size=8),
-    ColumnTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
+    # ColumnTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
     ColumnTypeName.NULL: NullType(),
     ColumnTypeName.SHORT: FloatingPointType(byte_size=2),
     ColumnTypeName.STRING: StringType(),
     ColumnTypeName.STRUCT: StructType.empty(),
-    ColumnTypeName.TABLE_TYPE: StructType.empty(),
+    # ColumnTypeName.TABLE_TYPE: StructType.empty(),
     ColumnTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
     ColumnTypeName.TIMESTAMP_NTZ: TimestampType(unit="us"),
     ColumnTypeName.USER_DEFINED_TYPE: ObjectType(),
@@ -40,7 +40,7 @@ COLUMN_TYPE_MAP = {
 }
 
 COLUMN_INFO_TYPE_MAP = {
-    ColumnInfoTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
+    # ColumnInfoTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
     ColumnInfoTypeName.BINARY: BinaryType(),
     ColumnInfoTypeName.BOOLEAN: BooleanType(),
     ColumnInfoTypeName.BYTE: IntegerType(byte_size=1),
@@ -52,21 +52,23 @@ COLUMN_INFO_TYPE_MAP = {
     ColumnInfoTypeName.INT: IntegerType(byte_size=4),
     ColumnInfoTypeName.INTERVAL: DurationType(),
     ColumnInfoTypeName.LONG: IntegerType(byte_size=8),
-    ColumnInfoTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
+    # ColumnInfoTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
     ColumnInfoTypeName.NULL: NullType(),
     ColumnInfoTypeName.SHORT: FloatingPointType(byte_size=2),
     ColumnInfoTypeName.STRING: StringType(),
-    ColumnInfoTypeName.STRUCT: StructType.empty(),
+    # ColumnInfoTypeName.STRUCT: StructType.empty(),
     ColumnInfoTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
     ColumnInfoTypeName.USER_DEFINED_TYPE: ObjectType(),
 }
 
 COLUMN_STRING_TYPE_MAP = {
     **{ci.name.upper(): t for ci, t in COLUMN_TYPE_MAP.items()},
-    **{ci.name.upper(): t for ci, t in COLUMN_INFO_TYPE_MAP.items()}
+    **{ci.name.upper(): t for ci, t in COLUMN_INFO_TYPE_MAP.items()},
+    **{
+        "INTEGER": IntegerType(byte_size=4),
+        "TIMESTAMP_NTZ": TimestampType(unit="us")
+    }
 }
-COLUMN_STRING_TYPE_MAP["INTEGER"] = IntegerType(byte_size=4)
-COLUMN_STRING_TYPE_MAP["TIMESTAMP_NTZ"] = TimestampType(unit="us")
 
 REPLACE_TIMEZONES = {
     "Etc/UTC": "UTC",
@@ -109,6 +111,17 @@ def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
     dtype = COLUMN_INFO_TYPE_MAP.get(obj.type_name, None)
     if dtype is None:
         dtype = DataType.from_str(obj.type_text)
+    else:
+        if dtype.type_id.is_scalar:
+            if obj.type_precision or obj.type_scale:
+                prec = int(obj.type_precision) if obj.type_precision is not None else obj.type_precision
+                scale = int(obj.type_scale) if obj.type_scale is not None else obj.type_scale
+
+                if isinstance(dtype, DecimalType):
+                    dtype = dtype.with_precision(prec, copy=False) if prec is not None else dtype
+                    dtype = dtype.with_scale(scale, copy=False) if scale is not None else dtype
+        else:
+            dtype = DataType.from_str(obj.type_text)
 
     if isinstance(dtype, DecimalType):
         precision = 38 if obj.type_precision is None else obj.type_precision
