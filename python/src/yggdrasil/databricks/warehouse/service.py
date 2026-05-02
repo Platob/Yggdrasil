@@ -22,7 +22,7 @@ from databricks.sdk.service.sql import (
 )
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksService, DatabricksClient
-from yggdrasil.databricks.warehouse._utils import DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME, \
+from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME, \
     safeEndpointInfo, _CREATE_ARG_NAMES
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg

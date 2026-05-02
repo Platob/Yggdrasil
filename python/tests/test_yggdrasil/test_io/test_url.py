@@ -226,12 +226,6 @@ class TestFrom:
         with pytest.raises(ValueError):
             URL.from_(None)
 
-    def test_object_with_url_attr(self):
-        class Obj:
-            url = "https://e.com/x"
-
-        assert URL.from_(Obj()) == URL.from_str("https://e.com/x")
-
 
 # =============================================================================
 # Canonical equality

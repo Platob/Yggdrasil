@@ -10,7 +10,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.types.nested.array import (
     cast_arrow_list_array,

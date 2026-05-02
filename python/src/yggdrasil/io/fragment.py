@@ -20,36 +20,26 @@ The current shape:
   (URL fragment if present, else basename), :attr:`ancestors`
   (iterator up the parent chain), :attr:`depth` (count of
   ancestors).
-* **Metadata**: :attr:`schema`, :attr:`mtime` as before.
+* **Metadata**: :attr:`schema`, :attr:`mtime`, :attr:`partition_values`
+  as before plus partition values for Hive-style children.
 * **Lifecycle**: :attr:`io` — optional live :class:`DataIO` attached
   when the caller wants a read-ready handle. ``None`` when the
   fragment is a pure location descriptor.
 
 Draining a fragment's data is just ``frag.io.read_arrow_batches()``
 once :attr:`io` is attached.
-
-Fragment iteration options
---------------------------
-
-:class:`FragmentOptions` carries the knobs that govern enumeration
-(``recursive``, ``key`` filter) and IO attachment (``open_io``).
-Kept separate from :class:`CastOptions` because fragment-level
-concerns are orthogonal to cast / read / write knobs — a single
-``read_fragments`` call resolves both options objects, each from
-its own kwarg subset.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import fnmatch
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, TypeVar, Union
+from typing import TYPE_CHECKING, Iterator, Mapping
 
 from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
-    from yggdrasil.io.data import PrimitiveIO
+    from yggdrasil.io.buffer.primitive import PrimitiveIO
 
 __all__ = [
     "Fragment",
@@ -64,10 +54,30 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FragmentInfos:
-    """Container for fragment information."""
+    """Container for fragment information.
+
+    :param url: canonical location of the fragment.
+    :param mtime: source modification time in seconds since epoch.
+        ``0.0`` when the source can't report a useful mtime.
+    :param schema: :class:`Schema` of the fragment's rows. ``None``
+        when the schema isn't known yet (cheap-enumeration mode).
+    :param partition_values: Hive-style partition key/value pairs
+        parsed from the path between the table root and the file —
+        e.g. ``{"year": "2025", "month": "04"}`` for
+        ``…/year=2025/month=04/part-0.parquet``. Always strings on
+        the wire; partition-aware readers cast to the declared
+        partition-column dtypes when injecting at read time.
+        Empty mapping for non-partitioned children. ``None`` when
+        partition discovery hasn't run (e.g. flat :class:`FolderIO`
+        which doesn't model partitions at all). Distinguishing
+        ``None`` from empty matters because Delta's ``AddFile``
+        always carries a ``partitionValues`` map (possibly empty
+        for unpartitioned tables) and round-trip identity matters.
+    """
     url: URL
     mtime: float
-    schema: Schema | None
+    schema: "Schema | None"
+    partition_values: "Mapping[str, str | None] | None" = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -87,26 +97,6 @@ class Fragment:
     yields fragments with ``parent`` set to the descended-into
     fragment, and so on. Use :attr:`ancestors` / :attr:`depth` for
     ergonomic traversal up the chain.
-
-    :param url: canonical location of the fragment. ``#N``-style URL
-        fragments identify sub-locations within a parent file.
-    :param schema: the :class:`Schema` of the fragment's rows.
-        :class:`None` for fragments built before a schema is known;
-        consumers that require a schema call
-        :meth:`DataIO.collect_schema` on the attached :attr:`io`.
-    :param mtime: source modification time in seconds since epoch,
-        inherited from the parent object for sub-fragments. ``0.0``
-        when the source can't report a useful mtime (in-memory,
-        freshly-minted, transport-only path).
-    :param io: live :class:`DataIO` bound to the fragment's location,
-        or ``None`` when the fragment is a pure location descriptor.
-        When attached, callers drain data via
-        ``frag.io.read_arrow_batches()`` (or any other
-        :class:`DataIO` surface).
-    :param parent: the fragment from which this one was enumerated,
-        or ``None`` for roots. Excluded from equality / repr to
-        avoid surprising parent-chain comparisons in tests; copy
-        helpers preserve it.
     """
     infos: FragmentInfos
     io: "PrimitiveIO"
@@ -114,17 +104,10 @@ class Fragment:
 
     # ==================================================================
     # Derived views
-    # ==========
+    # ==================================================================
 
     @property
     def depth(self) -> int:
-        """Number of ancestors above this fragment.
-
-        ``0`` for roots (fragments yielded directly from a top-level
-        :meth:`DataIO.read_fragments`), ``1`` for one-level-deep
-        descents, etc. Counts edges to the root, not the root
-        itself.
-        """
         n = 0
         node = self.parent
         while node is not None:
@@ -134,17 +117,6 @@ class Fragment:
 
     @property
     def ancestors(self) -> Iterator["Fragment"]:
-        """Walk up the parent chain, yielding each ancestor in turn.
-
-        Yields nearest ancestor first (``self.parent``), then
-        grandparent, etc., stopping at the first ``None``-parent
-        (a root fragment). ``self`` is NOT yielded — use
-        ``itertools.chain((self,), self.ancestors)`` if you want it.
-
-        Cycles are impossible by construction: :attr:`parent` is
-        frozen, so a fragment can't reference itself via lineage —
-        the parent has to exist before this fragment is built.
-        """
         node = self.parent
         while node is not None:
             yield node
@@ -152,11 +124,6 @@ class Fragment:
 
     @property
     def root(self) -> "Fragment":
-        """The top-most ancestor — ``self`` if this is already a root.
-
-        Convenience for "give me the file this row group came from"
-        when consumers descended through several layers of nesting.
-        """
         node: Fragment = self
         while node.parent is not None:
             node = node.parent
@@ -167,33 +134,10 @@ class Fragment:
     # ==================================================================
 
     def with_io(self, io: "PrimitiveIO | None") -> "Fragment":
-        """Return a copy of this fragment with a different attached IO.
-
-        Used for lifecycle handover — a consumer done with the
-        fragment's data can call ``frag.without_io()`` to drop the
-        reference; a producer assembling fragments can attach a live
-        IO after building the location.
-
-        Preserves :attr:`parent` — the lineage isn't owned by the
-        IO, so swapping the IO doesn't change which tree node this
-        fragment is.
-        """
         return dataclasses.replace(self, io=io)
 
     def without_io(self) -> "Fragment":
-        """Return a copy of this fragment with :attr:`io` set to ``None``."""
         return self.with_io(None)
 
     def with_parent(self, parent: "Fragment | None") -> "Fragment":
-        """Return a copy of this fragment with a different parent link.
-
-        Used by :meth:`DataIO.read_fragments` during recursive
-        descent — each child fragment gets its parent stamped on
-        as it's yielded out.
-
-        Doesn't validate non-cyclicity (would require walking up
-        *parent*'s chain to check ``self`` doesn't appear). The
-        recursive walker only ever passes ancestors as parents, so
-        cycles aren't reachable through normal use.
-        """
         return dataclasses.replace(self, parent=parent)

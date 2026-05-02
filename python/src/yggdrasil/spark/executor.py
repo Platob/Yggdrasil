@@ -16,10 +16,11 @@ be used standalone — open-source Spark, local PySpark, or composed into
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Optional, Any
+from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable, Iterator
 
 from yggdrasil.data.executor import StatementExecutor
 from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatementBatch
+from ..data.cast.options import CastOptions
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "SparkStatementExecutor",
 ]
+
+
+IN = TypeVar("IN", bound=Any)
+OUT = TypeVar("OUT", bound=Any)
 
 
 class SparkStatementExecutor(
@@ -164,7 +169,28 @@ class SparkStatementExecutor(
         session = self.resolve_session() if session is None else session
         conf = dict(conf or {})
         return _scoped_spark_conf(session, conf)
+    
+    def parallelize(
+        self,
+        inputs: Any,
+        *,
+        options: CastOptions | None = None,
+        transformer: Callable[[IN], OUT] | None = None,
+    ):
+        from .cast import any_to_spark_dataframe
 
+        options = CastOptions.check(options)
+        df = any_to_spark_dataframe(
+            inputs,
+            options.with_target(options.source_field).with_source(None)
+        )
+
+        def within_partitions(iterator: Iterator[IN]):
+            for item in iterator:
+                yield transformer(item) if transformer is not None else item
+
+        # TODO: complete
+        raise NotImplementedError
 
 class _scoped_spark_conf:
     """Context manager: stash & set Spark session conf keys; restore on exit."""

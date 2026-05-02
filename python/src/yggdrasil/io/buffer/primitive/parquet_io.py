@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import (
@@ -136,7 +136,19 @@ class ParquetIO(PrimitiveIO):
         batches: Iterable[pa.RecordBatch],
         options: ParquetOptions,
     ) -> None:
-        """Persist Arrow record batches as a Parquet file."""
+        """Persist Arrow record batches as a Parquet file.
+
+        Pre-reserves buffer capacity per batch using ``batch.nbytes`` as
+        an upper bound on output size. This forces the spill decision
+        upfront on sizable writes so the ParquetWriter sink is the
+        fast :class:`pa.OSFile` path (real fd) rather than the Python
+        shim, and avoids mid-write bytearray reallocation churn.
+
+        ``batch.nbytes`` over-estimates final Parquet size after
+        compression / dictionary encoding, which is the safe direction:
+        we may spill slightly earlier than strictly necessary, but we
+        never under-reserve.
+        """
         action = self._resolve_save_mode(options.mode)
         if action is Mode.IGNORE:
             return
@@ -170,9 +182,17 @@ class ParquetIO(PrimitiveIO):
 
         lifecycle = options.copy(truncate_before_write=True)
 
+        # Cap reserve target at one byte past spill threshold. Past that
+        # point the buffer will be local-spilled and further reserves
+        # are no-ops; pre-growing the bytearray to gigabytes would just
+        # delay the spill we already know is coming.
+        spill_cap = self._spill_bytes + 1
+        cumulative = first.nbytes
+        self.reserve(min(cumulative, spill_cap))
+
         with self._writing_context(lifecycle) as io:
+            sink = io.arrow_io(mode="wb")
             with contextlib.ExitStack() as stack:
-                sink = io.arrow_io(mode="wb")
                 stack.callback(sink.close)
                 writer = pq.ParquetWriter(
                     sink,
@@ -182,16 +202,23 @@ class ParquetIO(PrimitiveIO):
                     use_dictionary=options.use_dictionary,
                     write_statistics=options.write_statistics,
                 )
-                stack.callback(writer.close)
 
-                if first.num_rows > 0:
-                    writer.write_batch(first)
+                try:
+                    if first.num_rows > 0:
+                        writer.write_batch(first)
 
-                for batch in iterator:
-                    casting = options.check_source(batch)
-                    batch = casting.cast_arrow_tabular(batch)
-                    if batch.num_rows > 0:
+                    for batch in iterator:
+                        casting = options.check_source(batch)
+                        batch = casting.cast_arrow_tabular(batch)
+                        if batch.num_rows == 0:
+                            continue
+                        cumulative += batch.nbytes
+                        # Idempotent for n <= current capacity, so the
+                        # cost past the first crossing is ~free.
+                        self.reserve(min(cumulative, spill_cap))
                         writer.write_batch(batch)
+                finally:
+                    writer.close()
         return None
 
     # ==================================================================

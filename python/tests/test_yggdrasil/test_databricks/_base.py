@@ -27,10 +27,10 @@ Subclass pattern::
 
 from __future__ import annotations
 
-import os
 import unittest
 
 __all__ = ["DatabricksCase"]
+
 
 _SKIP_MSG = (
     "Integration tests require DATABRICKS_HOST to be set. "
@@ -39,34 +39,25 @@ _SKIP_MSG = (
 
 
 class DatabricksCase(unittest.TestCase):
-    """
-    Base ``TestCase`` for Databricks integration tests.
-
-    Attributes
-    ----------
-    workspace : Workspace
-        A connected :class:`~yggdrasil.databricks.workspaces.Workspace` instance.
-        Because ``Workspace`` inherits from ``DatabricksClient`` it exposes the
-        full client API (``iam``, ``secrets``, ``sql``, ``workspaces``, …).
-    """
-
-    workspace: "Workspace"  # type: ignore[name-defined]
 
     @classmethod
     def setUpClass(cls) -> None:
         # if not os.environ.get("DATABRICKS_HOST"):
         #     raise unittest.SkipTest(_SKIP_MSG)
-
-        from yggdrasil.databricks.workspaces.workspace import Workspace
+        from yggdrasil.databricks import DatabricksClient
 
         try:
-            cls.workspace = Workspace().connect()
-            # Lightweight auth probe — fails fast when token / profile is wrong
-            cls.workspace.workspace_client().current_user.me()
+            cls.client = DatabricksClient().connect()
+            # Lightweight auth probe — fails fast when the token / profile is wrong
+            cls.client.workspace_client().current_user.me()
         except unittest.SkipTest:
             raise
         except Exception as exc:
             raise unittest.SkipTest(f"Databricks workspace not reachable: {exc}")
+
+    @property
+    def workspace(self):
+        return self.client.workspace
 
     @classmethod
     def tearDownClass(cls) -> None:

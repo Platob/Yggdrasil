@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import (

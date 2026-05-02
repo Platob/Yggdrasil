@@ -19,7 +19,6 @@ on write keep the cache fresh without fan-out invalidation.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -34,13 +33,13 @@ from databricks.sdk.service.catalog import (
     TableType, EntityTagAssignment,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement
 from yggdrasil.databricks.client import DatabricksResource
-from yggdrasil.databricks.iam import IAMUser, IAMGroup
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
@@ -48,14 +47,13 @@ from yggdrasil.io import URL
 from yggdrasil.io.enums import MimeTypes, MimeType
 from yggdrasil.io.enums.mode import ModeLike, Mode
 from yggdrasil.io.tabular import TabularIO
-
 from .column import Column
 from .sql_utils import (
     quote_ident,
-    quote_principal,
     quote_qualified_ident,
     sql_literal, escape_sql_string,
 )
+from ...lazy_imports import aws_config_class
 
 if TYPE_CHECKING:
     import delta
@@ -65,6 +63,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.catalog import Catalog
     from yggdrasil.databricks.sql.columns import Columns
     from yggdrasil.databricks.sql.schema import Schema as UCSchema
+    from yggdrasil.aws.client import AWSClient
 
 __all__ = ["Table"]
 
@@ -109,7 +108,27 @@ class Table(DatabricksResource, TabularIO):
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
-    
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["catalog_name"] = self.catalog_name
+        state["schema_name"] = self.schema_name
+        state["table_name"] = self.table_name
+        state["_infos"] = self._infos
+        state["_infos_fetched_at"] = self._infos_fetched_at
+        state["_columns"] = self._columns
+
+        return state
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "catalog_name", state["catalog_name"])
+        object.__setattr__(self, "schema_name", state["schema_name"])
+        object.__setattr__(self, "table_name", state["table_name"])
+        object.__setattr__(self, "_infos", state["_infos"])
+        object.__setattr__(self, "_infos_fetched_at", state["_infos_fetched_at"])
+        object.__setattr__(self, "_columns", state["_columns"])
+        super().__setstate__(state)
+
     # ------------------------------------
     # TabularIO
     # ------------------------------------
@@ -979,11 +998,24 @@ class Table(DatabricksResource, TabularIO):
 
         return infos.storage_location
 
-    @property
-    def storage_location(self) -> str:
-        return self.infos.storage_location
+    def storage_location(self, operation: TableOperation = TableOperation.READ) -> str:
+        if operation == TableOperation.READ_WRITE and self.infos.table_type == TableType.MANAGED:
+            operation = TableOperation.READ
 
-    def credentials(self, operation: TableOperation = TableOperation.READ):
+        return self.aws(
+            operation=operation
+        ).s3.path(self.infos.storage_location)
+
+    def aws(self, operation: TableOperation = TableOperation.READ) -> "AWSClient":
+        credentials = self.temporary_credentials(operation=operation)
+        return aws_config_class()(
+            access_key_id=credentials.aws_temp_credentials.access_key_id,
+            secret_access_key=credentials.aws_temp_credentials.secret_access_key,
+            session_token=credentials.aws_temp_credentials.session_token,
+            region="eu-central-1",
+        ).to_client()
+
+    def temporary_credentials(self, operation: TableOperation = TableOperation.READ):
         return (
             self.client.workspace_client()
             .temporary_table_credentials
@@ -1000,7 +1032,7 @@ class Table(DatabricksResource, TabularIO):
         expiring: bool = False,
     ) -> Union[FileSystem, "TableFilesystem"]:
         created_at = time.time_ns()
-        creds = self.credentials(operation=operation)
+        creds = self.temporary_credentials(operation=operation)
         assert creds.aws_temp_credentials, "Cannot get AWS credentials"
         aws = creds.aws_temp_credentials
 
@@ -1022,128 +1054,6 @@ class Table(DatabricksResource, TabularIO):
             expires_at=created_at + ttl_ns,
             table=self,
             operation=operation,
-        )
-
-    # =========================================================================
-    # Permissions — SQL DDL helpers
-    # =========================================================================
-
-    def add_permissions(
-        self,
-        iam_id: str | list[str] | None = None,
-        *,
-        users: Iterable[IAMUser | str] | None = None,
-        groups: Iterable[IAMGroup | str] | None = None,
-        group: Iterable[IAMGroup | str] | None = None,
-        privileges: str | Iterable[str] | None = None,
-    ) -> "Table":
-        principals = self._normalize_permission_principals(
-            iam_id=iam_id,
-            users=users,
-            groups=groups,
-            group=group,
-        )
-        grant_privileges = self._normalize_table_privileges(privileges)
-
-        if not principals:
-            raise ValueError("add_permissions requires at least one user, group, or iam_id")
-
-        for principal in principals:
-            self.sql.execute(self.grant_permissions_ddl(principal, grant_privileges))
-
-        return self
-
-    @staticmethod
-    def _normalize_table_privileges(
-        privileges: str | Iterable[str] | None,
-    ) -> tuple[str, ...]:
-        if privileges is None:
-            privileges = ("SELECT",)
-        elif isinstance(privileges, str):
-            privileges = (privileges,)
-
-        normalized: list[str] = []
-        for privilege in privileges:
-            value = str(privilege).strip()
-            if not value:
-                continue
-            value = " ".join(value.replace("_", " ").replace("-", " ").upper().split())
-            if value not in normalized:
-                normalized.append(value)
-
-        if not normalized:
-            raise ValueError("add_permissions requires at least one privilege")
-
-        return tuple(normalized)
-
-    @staticmethod
-    def _principal_from_user(user: IAMUser | str) -> str:
-        if isinstance(user, str):
-            principal = user.strip()
-        else:
-            principal = user.username or user.email or user.name or user.id or ""
-
-        if not principal:
-            raise ValueError("User principal must have a username, email, name, or id")
-
-        return principal
-
-    @staticmethod
-    def _principal_from_group(group: IAMGroup | str) -> str:
-        if isinstance(group, str):
-            principal = group.strip()
-        else:
-            principal = group.name or group.id or ""
-
-        if not principal:
-            raise ValueError("Group principal must have a name or id")
-
-        return principal
-
-    def _normalize_permission_principals(
-        self,
-        *,
-        iam_id: str | list[str] | None,
-        users: Iterable[IAMUser | str] | None,
-        groups: Iterable[IAMGroup | str] | None,
-        group: Iterable[IAMGroup | str] | None,
-    ) -> tuple[str, ...]:
-        seen: set[str] = set()
-        out: list[str] = []
-
-        def add(v: str) -> None:
-            principal = v.strip()
-            if principal and principal not in seen:
-                seen.add(principal)
-                out.append(principal)
-
-        if isinstance(iam_id, str):
-            add(iam_id)
-        elif iam_id:
-            for value in iam_id:
-                add(str(value))
-
-        for user in users or ():
-            add(self._principal_from_user(user))
-
-        for entry in groups or ():
-            add(self._principal_from_group(entry))
-
-        for entry in group or ():
-            add(self._principal_from_group(entry))
-
-        return tuple(out)
-
-    def grant_permissions_ddl(
-        self,
-        principal: str,
-        privileges: str | Iterable[str],
-    ) -> str:
-        grant_privileges = self._normalize_table_privileges(privileges)
-        return (
-            f"GRANT {', '.join(grant_privileges)} "
-            f"ON TABLE {self.full_name(safe=True)} "
-            f"TO {quote_principal(principal)}"
         )
 
 

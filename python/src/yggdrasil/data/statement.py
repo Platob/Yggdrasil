@@ -30,6 +30,7 @@ A few design rules the cleanup pass enforces:
 
 from __future__ import annotations
 
+import copy as copy_mod
 import logging
 import os
 import re
@@ -39,7 +40,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterable, Iterator, Literal, Optional, TypeVar
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
@@ -91,18 +92,47 @@ class PreparedStatement(Disposable):
 
     Mutators (``with_text``, ``clear``) return a new instance unless
     ``inplace=True`` is passed.
+
+    Retry config (read by :meth:`StatementResult.retry`):
+
+    - ``retry`` — :class:`WaitingConfig` controlling the result-level
+      retry loop.  ``None`` (the default) means *not retryable*.  When
+      set, ``retry.retries + 1`` total attempts are made, with sleep
+      between attempts driven by :meth:`WaitingConfig.sleep` (exponential
+      backoff capped at ``max_interval``, terminated by ``timeout``).
+
+    Subclasses set their own retry default by passing a
+    :class:`WaitingConfig` to ``super().__init__(retry=...)`` from their
+    own ``__init__`` defaults.  The base default is ``None`` — caller
+    must opt in.
     """
 
     text: str = ""
+    retry: Optional[WaitingConfig] = None
 
     def __init__(
         self,
         text: str = "",
         key: Optional[str] = None,
+        retry: Optional[WaitingConfigArg] = None,
     ):
         Disposable.__init__(self)
         self.text = str(text) if text else ""
         self.key = key or _new_key()
+        # WaitingConfig.from_ accepts WaitingConfig | dict | int | float |
+        # timedelta | datetime | bool, but we want None to stay None
+        # (= not retryable) and only run from_ when the caller actually
+        # passed something.
+        self.retry = WaitingConfig.from_(retry) if retry is not None else None
+
+    @property
+    def retryable(self) -> bool:
+        """Whether a non-None retry policy has been configured.
+
+        Convenience for the lifecycle code; ``self.retry is not None``
+        works equivalently.
+        """
+        return self.retry is not None
 
     def with_text(self, value: str, inplace: bool = False) -> "PreparedStatement":
         """Return a copy with ``text`` replaced (or mutate in place)."""
@@ -114,6 +144,21 @@ class PreparedStatement(Disposable):
         copied.__dict__.update(self.__dict__)
         copied.text = new_text
         return copied
+
+    def with_retry(
+        self,
+        retry: Optional[WaitingConfigArg],
+        *,
+        inplace: bool = False,
+    ) -> "PreparedStatement":
+        """Return (or update in place) a copy with ``retry`` set.
+
+        ``retry=None`` clears the policy (statement becomes non-retryable);
+        anything else is normalized through :meth:`WaitingConfig.from_`.
+        """
+        target = self if inplace else copy_mod.copy(self)
+        target.retry = WaitingConfig.from_(retry) if retry is not None else None
+        return target
 
     @staticmethod
     def looks_like_query(text: Any) -> bool:
@@ -208,12 +253,36 @@ class StatementResult(TabularIO, Generic[PS]):
     def default_mime_type(cls) -> MimeType:
         return MimeTypes.STATEMENT_RESULT
 
+    # ------------------------------------------------------------------
+    # Transient-failure auto-promote
+    # ------------------------------------------------------------------
+    #
+    # Some failures are *known* to be retry-friendly even when the
+    # caller didn't think to mark the statement retryable.  The
+    # canonical example is a Delta concurrent-append conflict, which is
+    # just a write race — retrying always makes sense.
+    #
+    # When ``raise_for_status`` sees one of these patterns in the
+    # backend failure message, it flips ``statement.retryable=True`` on
+    # the fly so the caller's ``StatementResult.retry()`` loop will pick
+    # the failure up.  The promotion is sticky for the lifetime of this
+    # result (won't double-promote on subsequent retry attempts that
+    # re-fail the same way).
+    #
+    # Subclasses override ``_TRANSIENT_ERROR_PATTERNS`` with their own
+    # list of regex fragments.  Empty by default — no auto-promote.
+
+    _TRANSIENT_ERROR_PATTERNS: ClassVar[tuple[str, ...]] = ()
+    _transient_pattern_re: ClassVar[Optional["re.Pattern[str]"]] = None
+    _auto_retry_promoted: bool = False
+
     def __init__(
         self,
         statement: PS,
         *,
         key: Optional[str] = None,
         executor: Optional["StatementExecutor"] = None,
+        num_try: int = 0,
         **kwargs: Any,
     ):
         self.executor = executor
@@ -221,11 +290,18 @@ class StatementResult(TabularIO, Generic[PS]):
         self.key = key or self.statement.key
         self._cached_schema: Optional[Schema] = None
         self._persisted_data: Any = None
+        self.num_try = num_try or 0
+        self._auto_retry_promoted = False
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------
     # Execution lifecycle contract
     # -------------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def started(self) -> bool:
+        """Whether the statement has been started."""
 
     @property
     @abstractmethod
@@ -244,6 +320,7 @@ class StatementResult(TabularIO, Generic[PS]):
     @abstractmethod
     def start(
         self,
+        reset: bool = False,
         *,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
@@ -259,7 +336,10 @@ class StatementResult(TabularIO, Generic[PS]):
         """Raise an exception if the statement failed or was canceled.
 
         Releases any per-statement scratch on failure (so the caller doesn't
-        leak temp volumes when handling the exception).
+        leak temp volumes when handling the exception).  Auto-promotes
+        the underlying statement to ``retryable=True`` once if the
+        failure matches a known-transient pattern declared by the
+        subclass — the caller's :meth:`retry` will then pick it up.
         """
         if not self.failed:
             return
@@ -267,11 +347,68 @@ class StatementResult(TabularIO, Generic[PS]):
             self.statement.clear_temporary_resources()
         except Exception:
             logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
+
+        # Auto-promote known-transient failures: install a retry
+        # WaitingConfig on the underlying statement, once per result.
+        # When the caller never calls retry() the behavior is unchanged
+        # (they just get the exception); when they do, the promoted
+        # config means retry() will actually run.
+        if not self._auto_retry_promoted and self._is_transient_failure():
+            self._auto_retry_promoted = True
+            if self.statement.retry is None:
+                cfg = self.default_retry() or WaitingConfig.default()
+                logger.info(
+                    "Auto-promoting statement %r to retryable: transient "
+                    "failure detected (%s).",
+                    self.key, self._failure_message()[:200],
+                )
+                self.statement.retry = cfg
+
         return self._raise_for_status()
 
     @abstractmethod
     def _raise_for_status(self) -> None:
         """Subclass hook: raise the backend-specific failure."""
+
+    # -- transient-detection helpers (subclasses override _failure_message
+    # and optionally _TRANSIENT_ERROR_PATTERNS) ----------------------------
+
+    @classmethod
+    def _transient_re(cls) -> Optional["re.Pattern[str]"]:
+        """Compiled alternation of :attr:`_TRANSIENT_ERROR_PATTERNS`.
+
+        Returns ``None`` when the subclass declares no patterns (skips
+        the regex search entirely).  Cached per-class via the
+        ``_transient_pattern_re`` ClassVar.
+        """
+        if not cls._TRANSIENT_ERROR_PATTERNS:
+            return None
+        if cls._transient_pattern_re is None:
+            cls._transient_pattern_re = re.compile(
+                "|".join(f"(?:{p})" for p in cls._TRANSIENT_ERROR_PATTERNS),
+                re.IGNORECASE | re.DOTALL,
+            )
+        return cls._transient_pattern_re
+
+    def _failure_message(self) -> str:
+        """Best-effort string of the backend failure for pattern matching.
+
+        Default returns ``""`` — base class doesn't know how to extract
+        backend-specific error details.  Subclasses override.
+        """
+        return ""
+
+    def _is_transient_failure(self) -> bool:
+        """Whether the current failure matches a known-transient pattern."""
+        if not self.failed:
+            return False
+        rx = self._transient_re()
+        if rx is None:
+            return False
+        message = self._failure_message()
+        if not message:
+            return False
+        return bool(rx.search(message))
 
     def clear_temporary_resources(self) -> None:
         """Sweep per-statement scratch — does NOT touch result-level state.
@@ -280,6 +417,122 @@ class StatementResult(TabularIO, Generic[PS]):
         files, ...) override and call ``super()``.
         """
         self.statement.clear_temporary_resources()
+
+    # -------------------------------------------------------------------------
+    # Retry
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def default_retry(cls) -> Optional[WaitingConfig]:
+        """Auto-promote default :class:`WaitingConfig` for transient failures.
+
+        Returned by :meth:`raise_for_status` when a transient pattern
+        matches and the statement isn't already retryable.  Subclasses
+        override to tune the policy for their backend; ``None`` disables
+        auto-promote entirely.
+
+        Default returns :meth:`WaitingConfig.default` — modest backoff,
+        20-minute deadline, 8 retries.
+        """
+        return WaitingConfig.default()
+
+    @property
+    def retryable(self) -> bool:
+        """Whether another retry attempt is allowed.
+
+        Two gates: the statement must opt in by setting ``statement.retry``
+        to a :class:`WaitingConfig`, and we must not have exhausted
+        ``retry.total_try_count``.  The ``num_try`` counter records
+        *completed* attempts, so the original ``start()`` counts as
+        attempt 1.
+        """
+        cfg = self.statement.retry
+        if cfg is None:
+            return False
+        return self.num_try < cfg.total_try_count
+
+    def retry(
+        self,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs: Any,
+    ) -> "StatementResult":
+        """Retry the statement until success or attempts are exhausted.
+
+        Loops internally driven by ``self.statement.retry``
+        (a :class:`WaitingConfig`).  Each iteration calls :meth:`start`
+        with ``reset=True`` and waits for terminal state; on success it
+        returns immediately, on failure it sleeps via
+        :meth:`WaitingConfig.sleep` and tries again.  When attempts are
+        exhausted (or the WaitingConfig timeout elapses), behaves like
+        :meth:`raise_for_status` if ``raise_error`` is True.
+
+        Preconditions:
+
+        - ``self.statement.retry`` must be a :class:`WaitingConfig`, else
+          ``RuntimeError``.
+        - ``self.failed`` must be True (otherwise nothing to retry —
+          returns ``self``).
+
+        ``num_try`` is incremented *before* each attempt so a crash inside
+        ``start()`` still counts toward the budget.  Extra ``**kwargs``
+        are forwarded to ``start()``.
+        """
+        cfg = self.statement.retry
+        if cfg is None:
+            raise RuntimeError(f"Statement {self.key!r} is not retryable.")
+
+        # Make sure we have an up-to-date terminal verdict before deciding.
+        if not self.done:
+            self.refresh_status()
+
+        if self.done and not self.failed:
+            return self
+
+        total_tries = max(1, cfg.total_try_count)
+        loop_started = time.time()
+
+        while self.num_try < total_tries:
+            attempt_index = self.num_try  # 0-based for sleep calc
+            if attempt_index > 0:
+                # WaitingConfig.sleep raises TimeoutError when the deadline
+                # has elapsed.  We treat that as "budget exhausted" and
+                # fall through to raise_for_status — same outcome as
+                # running out of attempts.
+                try:
+                    cfg.sleep(iteration=attempt_index - 1, start=loop_started)
+                except TimeoutError:
+                    logger.debug(
+                        "Retry deadline elapsed for %r after %d attempt(s).",
+                        self.key, self.num_try,
+                    )
+                    break
+
+            self.num_try += 1
+            try:
+                self.start(reset=True, wait=wait, raise_error=False, **kwargs)
+            except Exception:
+                logger.exception(
+                    "start() raised on retry attempt %d/%d for %r; continuing.",
+                    self.num_try, total_tries, self.key,
+                )
+                # Force a status refresh so the loop can decide based on
+                # backend state rather than just the exception.
+                try:
+                    self.refresh_status()
+                except Exception:
+                    logger.exception(
+                        "refresh_status failed after start() raised; will retry if budget remains.",
+                    )
+
+            if self.done and not self.failed:
+                return self
+
+        # Exhausted budget.  Surface the latest failure if asked.
+        if raise_error:
+            self.raise_for_status()
+        return self
 
     # -------------------------------------------------------------------------
     # Convenience
@@ -573,19 +826,70 @@ class StatementBatch(Generic[PS, SR]):
             for result in self.results.values():
                 result.wait(wait=wait, raise_error=False)
         else:
-            workers = min(self.parallel, len(self.results))
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stmt-batch") as pool:
-                futures = {
-                    pool.submit(result.wait, wait, False): key
-                    for key, result in self.results.items()
-                }
-                for fut in as_completed(futures):
-                    key = futures[fut]
-                    exc = fut.exception()
-                    if exc is not None:
-                        # wait() itself blew up — log; failed-status will be picked
-                        # up by raise_for_status if requested.
-                        logger.exception("wait() raised for batch item %r: %s", key, exc)
+            self._run_parallel(
+                {key: (result.wait, (wait, False), {}) for key, result in self.results.items()},
+                op_label="wait",
+            )
+
+        if raise_error:
+            self.raise_for_status()
+
+        self.clear_temporary_resources()
+        return self
+
+    def retry(
+        self,
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs: Any,
+    ) -> "StatementBatch":
+        """Retry every failed result whose statement is retryable.
+
+        Walks ``self.results`` once, picks the entries that are both
+        ``failed`` and ``retryable``, and calls :meth:`StatementResult.retry`
+        on each.  Honors ``self.parallel`` exactly like :meth:`wait`.
+
+        Non-retryable failures are left alone — they'll surface through
+        ``raise_for_status`` at the end if ``raise_error=True``.  Pending
+        statements (never submitted) are submitted first, same as
+        :meth:`wait`.
+        """
+        if self.statements:
+            self.submit(wait=False, raise_error=False)
+
+        # Refresh once so .failed reflects backend reality before we pick targets.
+        for key, result in self.results.items():
+            try:
+                result.refresh_status()
+            except Exception:
+                logger.exception("refresh_status failed for %r before retry; continuing.", key)
+
+        targets = {
+            key: result
+            for key, result in self.results.items()
+            if result.failed and result.retryable
+        }
+
+        if not targets:
+            if raise_error:
+                self.raise_for_status()
+            return self
+
+        if self.parallel <= 1 or len(targets) <= 1:
+            for key, result in targets.items():
+                try:
+                    result.retry(wait=wait, raise_error=False, **kwargs)
+                except Exception:
+                    logger.exception("retry() raised for batch item %r; continuing.", key)
+        else:
+            self._run_parallel(
+                {
+                    key: (result.retry, (), {"wait": wait, "raise_error": False, **kwargs})
+                    for key, result in targets.items()
+                },
+                op_label="retry",
+            )
 
         if raise_error:
             self.raise_for_status()
@@ -630,6 +934,35 @@ class StatementBatch(Generic[PS, SR]):
             except Exception as exc:
                 raise RuntimeError(f"Batch item {key!r} failed.") from exc
         return self
+
+    # -------------------------------------------------------------------------
+    # Internals
+    # -------------------------------------------------------------------------
+
+    def _run_parallel(
+        self,
+        jobs: dict[str, tuple[Any, tuple, dict]],
+        *,
+        op_label: str,
+    ) -> None:
+        """Run ``jobs`` (key → (callable, args, kwargs)) on a bounded pool.
+
+        Exceptions are caught and logged per-key; the caller decides what
+        to do with the resulting state (typically :meth:`raise_for_status`).
+        """
+        workers = min(self.parallel, len(jobs))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stmt-batch") as pool:
+            futures = {
+                pool.submit(fn, *args, **kwargs): key
+                for key, (fn, args, kwargs) in jobs.items()
+            }
+            for fut in as_completed(futures):
+                key = futures[fut]
+                exc = fut.exception()
+                if exc is not None:
+                    logger.exception(
+                        "%s() raised for batch item %r: %s", op_label, key, exc,
+                    )
 
 
 # ---------------------------------------------------------------------------

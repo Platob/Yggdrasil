@@ -124,7 +124,7 @@ class TestCastPandasBypass(PandasTestCase):
         s = pd.Series([None, None, None], name="x", dtype="object")
         # Force the cast options to treat the source as NullType — this is
         # what happens when upstream metadata declares a null-typed source.
-        from yggdrasil.data.cast.options import CastOptions
+        from yggdrasil.data.options import CastOptions
 
         src = Field(name="x", dtype=NullType(), nullable=True)
         opts = CastOptions(source_field=src)

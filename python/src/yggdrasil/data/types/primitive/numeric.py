@@ -867,3 +867,23 @@ class DecimalType(NumericType):
         tags[b"precision"] = str(self.precision).encode("utf-8")
         tags[b"scale"] = str(self.scale).encode("utf-8")
         return tags
+
+    def with_precision(self, precision: int, copy: bool = True):
+        if precision is None or precision == self.precision:
+            return self
+
+        if copy:
+            return DecimalType(precision=precision, scale=self.scale)
+
+        object.__setattr__(self, "precision", precision)
+        return self
+
+    def with_scale(self, scale: int, copy: bool = True):
+        if scale is None or scale == self.scale:
+            return self
+
+        if copy:
+            return DecimalType(precision=self.precision, scale=scale)
+
+        object.__setattr__(self, "scale", scale)
+        return self

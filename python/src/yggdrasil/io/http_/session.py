@@ -98,6 +98,20 @@ class HTTPSession(Session):
 
     _http_pool: urllib3.PoolManager = field(default=None, init=False, repr=False, compare=False)
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_http_pool"] = True
+
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+        self._http_pool = state.get("_http_pool", None)
+        if self._http_pool:
+            self._http_pool = self._build_http_pool()
+
+
     def _build_retry(self) -> urllib3.Retry:
         """Build the :class:`urllib3.Retry` policy used by the connection pool.
 

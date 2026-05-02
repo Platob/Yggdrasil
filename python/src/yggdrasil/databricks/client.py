@@ -148,6 +148,21 @@ class DatabricksClient:
             normalized = self.host.split("://")[-1].split("/")[0]
             object.__setattr__(self, "host", f"https://{normalized}")
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_workspace_client", None)
+        state.pop("_account_client", None)
+        state.pop("_workspace_config", None)
+        state.pop("_account_config", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._workspace_client = None
+        self._account_client = None
+        self._workspace_config = None
+        self._account_config = None
+
     # -------------------------------------------------------------------------
     # URLResource
     # -------------------------------------------------------------------------
@@ -953,6 +968,14 @@ class DatabricksService(ABC):
     def __post_init__(self):
         pass
 
+    def __getstate__(self):
+        return {
+            "client": self.client,
+        }
+
+    def __setstate__(self, state):
+        self.client = state["client"]
+
     @staticmethod
     def check_client(
         client: Optional[DatabricksClient] = None,
@@ -1081,6 +1104,16 @@ class DatabricksResource(ABC):
         default_factory=DatabricksService.current,
         repr=False, compare=False, hash=False
     )
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["service"] = self.service
+
+        return state
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "service", state["service"])
+        super().__setstate__(state)
 
     def __init__(
         self,

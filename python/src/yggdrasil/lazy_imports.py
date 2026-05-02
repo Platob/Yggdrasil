@@ -1,29 +1,5 @@
 from functools import lru_cache
 
-__all__ = [
-    "fragment_class",
-    "fragment_infos_class",
-    "path_class",
-    "local_path_class",
-    "databricks_path_class",
-    "databricks_client_class",
-    "pyarrow_dataset_module",
-    "bytes_io_class",
-    "media_type_class",
-    "media_types_class",
-    "mime_type_class",
-    "mime_types_class",
-    "polars_module",
-    "pandas_module",
-    "spark_sql_module",
-    "pyarrow_compute_module",
-    "field_class",
-    "struct_type_class",
-    "schema_class",
-    "tabular_io_class",
-    "primitive_io_class"
-]
-
 
 @lru_cache(maxsize=1)
 def bytes_io_class():
@@ -149,3 +125,66 @@ def fragment_class():
 def fragment_infos_class():
     from yggdrasil.io.fragment import FragmentInfos
     return FragmentInfos
+
+
+@lru_cache(maxsize=1)
+def boto3_module():
+    try:
+        import boto3
+        return boto3
+    except ImportError:
+        from yggdrasil.environ import runtime_import_module
+        return runtime_import_module("boto3", install=True)
+
+
+@lru_cache(maxsize=1)
+def botocore_module():
+    """Lazy-import botocore.
+
+    We want the top-level ``botocore`` module so callers can reach
+    ``botocore.exceptions``, ``botocore.config``, ``botocore.credentials``,
+    and ``botocore.session`` without triggering separate imports.
+    """
+    try:
+        import botocore
+        # Touch submodules we use so they're in sys.modules — this
+        # makes ``botocore.exceptions.ClientError`` etc. resolve
+        # without each call paying its own import.
+        import botocore.exceptions  # noqa: F401
+        import botocore.config  # noqa: F401
+        import botocore.credentials  # noqa: F401
+        import botocore.session  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "yggdrasil.aws requires 'botocore' (a transitive dep of boto3). "
+            "Install boto3 with `pip install boto3` to get it."
+        ) from exc
+    return botocore
+
+
+@lru_cache(maxsize=1)
+def aws_client_class():
+    from yggdrasil.aws.client import AWSClient
+    return AWSClient
+
+
+@lru_cache(maxsize=1)
+def aws_config_class():
+    from yggdrasil.aws.config import AWSConfig
+    return AWSConfig
+
+
+@lru_cache(maxsize=1)
+def aws_s3_path_class():
+    """Lazy-import AWS S3 path class."""
+    from yggdrasil.aws.fs.path import S3Path
+    return S3Path
+
+
+PATH_SCHEME_FACTORY = {
+    "file": local_path_class,
+    "s3": aws_s3_path_class,
+    "s3a": aws_s3_path_class,
+    "s3n": aws_s3_path_class,
+    "dbfs": databricks_path_class,
+}

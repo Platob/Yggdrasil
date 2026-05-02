@@ -63,12 +63,23 @@ Per-statement ``external_volume_paths`` carries the staged source
 reference; the warehouse statement-batch coercer rewrites ``{alias}``
 tokens against that map at submit time.  No batch-wide registry lives on
 the engine itself.
+
+Retry semantics for DML
+-----------------------
+Insert paths apply caller-supplied ``retry`` config (a
+:class:`WaitingConfig` arg) only to DML statements (INSERT / MERGE /
+DELETE).  TRUNCATE, OPTIMIZE, and VACUUM stay non-retryable —
+re-running TRUNCATE is dangerous after an INSERT has succeeded in the
+same batch, OPTIMIZE/VACUUM are best-effort maintenance and a re-run
+on transient failure costs more than it saves.  See
+:func:`_classify_dml` for the classification.
 """
 
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -85,7 +96,7 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.data.expr import Expr, Predicate
 from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
@@ -96,7 +107,7 @@ from yggdrasil.databricks.warehouse import (
     WarehousePreparedStatement,
     WarehouseStatementResult,
 )
-from yggdrasil.databricks.warehouse._utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer.primitive import ParquetIO
@@ -122,6 +133,50 @@ __all__ = ["SQLEngine"]
 
 _ALIAS_TMPSRC = "__tmpsrc__"
 _DEFAULT_WAREHOUSE_RECHECK_S = 30
+
+
+# Statement leading keyword classifier — strips comments/whitespace then
+# pulls the first word.  Used by :func:`_classify_dml` to decide whether
+# to apply caller-supplied retry config.
+_DML_HEAD_RE = re.compile(
+    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)*"
+    r"(?P<kw>[A-Za-z]+)",
+    re.DOTALL,
+)
+_DML_KEYWORDS: frozenset[str] = frozenset({"INSERT", "MERGE", "DELETE", "UPDATE"})
+
+
+def _classify_dml(sql: str) -> bool:
+    """Return True when ``sql`` looks like an INSERT/MERGE/DELETE/UPDATE.
+
+    Used to decide whether to broadcast retry config onto a generated
+    statement.  TRUNCATE / OPTIMIZE / VACUUM / CREATE / ALTER all fall
+    through as False.
+    """
+    if not sql:
+        return False
+    m = _DML_HEAD_RE.match(sql)
+    if not m:
+        return False
+    return m.group("kw").upper() in _DML_KEYWORDS
+
+
+def _apply_retry_to_warehouse_statement(
+    stmt: WarehousePreparedStatement,
+    retry: Optional[WaitingConfigArg],
+) -> None:
+    """Install ``retry`` (a :class:`WaitingConfig` arg) on a warehouse
+    statement, in place.
+
+    ``None`` is a no-op (don't override).  ``False`` clears any existing
+    policy.  Anything else is normalized via :meth:`WaitingConfig.from_`.
+    """
+    if retry is None:
+        return
+    if retry is False:
+        stmt.retry = None
+        return
+    stmt.retry = WaitingConfig.from_(retry)
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +553,18 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_session: Optional["SparkSession"] = None,
         external_tables: Mapping[str, "VolumePath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
+        # Result-level retry policy — forwarded to
+        # WarehousePreparedStatement.prepare on the warehouse path.
+        # Ignored on the Spark path (Spark statements don't go through
+        # the WarehouseStatementResult.retry loop in the engine layer).
+        retry: Optional[WaitingConfigArg] = None,
     ) -> StatementResult:
-        """Execute a SQL statement through Spark or the Databricks SQL API."""
+        """Execute a SQL statement through Spark or the Databricks SQL API.
+
+        ``retry`` controls *result-level* retry on the warehouse path
+        (what :meth:`StatementResult.retry` does after a terminal
+        failure).  Has no effect on the Spark path here.
+        """
         # Already-started result with no rebinding requested → just wait.
         if isinstance(statement, StatementResult):
             already_running = (
@@ -522,6 +587,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 spark_session=session,
                 row_limit=row_limit,
             )
+            if retry is not None:
+                logger.debug(
+                    "Ignoring retry on Spark execution path — Spark statements "
+                    "use driver-side retry, not StatementResult.retry()."
+                )
         else:
             prepared = WarehousePreparedStatement.prepare(
                 statement,
@@ -533,6 +603,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 warehouse_name=warehouse_name,
                 byte_limit=byte_limit,
                 row_limit=row_limit,
+                retry=retry,
             )
 
         return super().execute(prepared, wait=wait, raise_error=raise_error)
@@ -548,6 +619,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
         spark_session: Optional["SparkSession"] = None,
+        # Result-level retry policy.  On the warehouse path, broadcast
+        # onto each WarehousePreparedStatement before submission.
+        # Ignored on the Spark path.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> StatementBatch:
         """Run a collection of statements; return per-statement results in order.
 
@@ -555,19 +630,69 @@ class SQLEngine(DatabricksService, StatementExecutor):
         ``external_volume_paths`` get their ``{alias}`` substitution from
         the warehouse-batch coercer at submit time — the engine doesn't
         manage a parallel registry.
+
+        ``retry`` is broadcast onto each warehouse statement before
+        submission (Spark statements pass through untouched).  ``None``
+        leaves whatever the statement already says intact; ``False``
+        explicitly clears any existing policy.
         """
         engine_choice = self._pick_engine(engine, spark_session)
 
         if engine_choice == "spark":
+            if retry is not None:
+                logger.debug(
+                    "Ignoring retry on Spark execution path — Spark statements "
+                    "use driver-side retry, not StatementResult.retry()."
+                )
             return self.spark.execute_many(
                 statements, wait=wait, raise_error=raise_error, parallel=parallel,
             )
+
+        # Warehouse path — broadcast retry config onto warehouse statements.
+        if retry is not None:
+            statements = self._broadcast_retry(statements, retry)
 
         return self.warehouse(
             warehouse_id=warehouse_id, warehouse_name=warehouse_name,
         ).execute_many(
             statements, wait=wait, raise_error=raise_error, parallel=parallel,
         )
+
+    @staticmethod
+    def _broadcast_retry(
+        statements: Iterable[str | PreparedStatement | StatementResult] | Mapping[str, Any],
+        retry: Optional[WaitingConfigArg],
+    ) -> Iterable[Any]:
+        """Apply ``retry`` to every warehouse statement in ``statements``.
+
+        Strings get coerced to :class:`WarehousePreparedStatement` so the
+        config sticks; non-warehouse statements (Spark, etc.) pass through
+        untouched.  Returns a list to preserve the input cardinality
+        (matters for mappings — keys must align with statements).
+        """
+        if isinstance(statements, Mapping):
+            out: dict[str, Any] = {}
+            for key, stmt in statements.items():
+                out[key] = SQLEngine._broadcast_retry_one(stmt, retry)
+            return out
+
+        return [SQLEngine._broadcast_retry_one(s, retry) for s in statements]
+
+    @staticmethod
+    def _broadcast_retry_one(
+        stmt: Any,
+        retry: Optional[WaitingConfigArg],
+    ) -> Any:
+        """Best-effort: apply ``retry`` when ``stmt`` is warehouse-typed."""
+        if isinstance(stmt, str):
+            stmt = WarehousePreparedStatement(text=stmt)
+        elif isinstance(stmt, StatementResult):
+            stmt = stmt.statement
+        # Only mutate warehouse statements — Spark statements have their
+        # own retry semantics and shouldn't get a warehouse-style policy.
+        if isinstance(stmt, WarehousePreparedStatement):
+            _apply_retry_to_warehouse_statement(stmt, retry)
+        return stmt
 
     # ------------------------------------------------------------------
     # Tables
@@ -622,7 +747,12 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None
+        prune_values: dict[str, tuple[Any]] | None = None,
+        # Result-level retry config.  Applied only to DML statements
+        # (INSERT/MERGE/DELETE/UPDATE) on the warehouse path.  TRUNCATE,
+        # OPTIMIZE, VACUUM stay non-retryable to avoid double-applying
+        # destructive ops or wasting time on best-effort maintenance.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Insert data into a Delta table using the most appropriate backend.
 
@@ -634,6 +764,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
           → :meth:`spark_insert_into`
         - Otherwise → :meth:`arrow_insert_into` (warehouse path with
           Volume staging)
+
+        ``retry`` is forwarded to whichever path handles the source.
+        Only DML statements get the retry config; maintenance statements
+        (TRUNCATE/OPTIMIZE/VACUUM) stay non-retryable.
         """
         common = dict(
             mode=mode, location=location,
@@ -642,7 +776,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            table=table, where=where, prune_by=prune_by, prune_values=prune_values
+            table=table, where=where, prune_by=prune_by, prune_values=prune_values,
+            retry=retry,
         )
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -698,6 +833,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
         prune_values: Mapping[str, list[Any]] | None = None,
+        # Retry config — applied only to DML statements.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Insert through the warehouse SQL path with staged Parquet."""
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -710,6 +847,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 table=table, where=where, prune_by=prune_by,
+                retry=retry,
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
@@ -786,6 +924,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         # Per-statement external_volume_paths: only the statements that
         # reference {__tmpsrc__} carry the alias mapping.  The warehouse
         # batch coercer rewrites those references at submit time.
+        retry_active = retry is not None
         prepared: list[WarehousePreparedStatement] = []
         for sql in sql_texts:
             external_data = (
@@ -793,18 +932,22 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 if (f"{{{_ALIAS_TMPSRC}}}" in sql)
                 else None
             )
-            prepared.append(
-                WarehousePreparedStatement.prepare(
-                    sql,
-                    external_data=external_data,
-                    catalog_name=target.catalog_name,
-                    schema_name=target.schema_name,
-                )
+            stmt = WarehousePreparedStatement.prepare(
+                sql,
+                external_data=external_data,
+                catalog_name=target.catalog_name,
+                schema_name=target.schema_name,
             )
+            # Apply retry config only to DML — TRUNCATE/OPTIMIZE/VACUUM
+            # stay non-retryable on purpose.
+            if retry_active and _classify_dml(sql):
+                _apply_retry_to_warehouse_statement(stmt, retry)
+            prepared.append(stmt)
 
         logger.debug(
-            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d",
+            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s",
             target_location, mode_enum, match_by, prune_by, len(prepared),
+            retry_active,
         )
 
         # Force the warehouse path: arrow_insert_into is *the* warehouse
@@ -840,6 +983,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
+        # Accepted for API symmetry with arrow_insert_into; ignored here
+        # because Spark uses driver-side retry, not the
+        # StatementResult.retry() loop.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Insert into a Delta table using Spark.
 
@@ -851,6 +998,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
         maintenance semantics as the warehouse path; the only environmental
         difference is the source reference (a temp view name vs. an
         external-table parameter).
+
+        ``retry`` is accepted for API symmetry with the other insert
+        paths but ignored — Spark already retries Delta concurrent-append
+        internally on the driver.  If you need the warehouse-style result
+        retry, route through :meth:`arrow_insert_into` instead.
         """
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert_into(
@@ -863,6 +1015,13 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 vacuum_hours=vacuum_hours,
                 table=table, where=where, prune_by=prune_by,
                 spark_session=spark_session,
+                retry=retry,
+            )
+
+        if retry is not None:
+            logger.debug(
+                "Ignoring retry on spark_insert_into — Spark statements use "
+                "driver-side retry."
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -976,7 +1135,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         where: Predicate | None = None,
         prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None
+        prune_values: dict[str, tuple[Any]] | None = None,
+        # Retry config — applied to DML on the warehouse fallback;
+        # forwarded along on the cached / Spark fast paths.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Insert into a Delta table from a SQL source query.
 
@@ -1002,7 +1164,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            table=table, where=where, prune_by=prune_by, prune_values=prune_values
+            table=table, where=where, prune_by=prune_by, prune_values=prune_values,
+            retry=retry,
         )
 
         # ---- Fast path 1: cached StatementResult ----
@@ -1045,7 +1208,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table],
         where: Predicate | None,
         prune_by: list[str] | str | None,
-        prune_values: dict[str, tuple[Any]] | None = None
+        prune_values: dict[str, tuple[Any]] | None = None,
+        retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Warehouse path of :meth:`sql_insert_into`.
 
@@ -1053,6 +1217,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune-value harvesting (would require re-executing the query).
         Each generated SQL statement keeps the source statement's
         parameters / external_volume_paths so binding still works.
+
+        Retry config is applied only to DML statements
+        (INSERT/MERGE/DELETE/UPDATE); maintenance statements
+        (TRUNCATE/OPTIMIZE/VACUUM) stay non-retryable.
         """
         # Carry parameters / external volumes from the source statement onto
         # every generated statement (OPTIMIZE/VACUUM don't strictly need them
@@ -1121,23 +1289,27 @@ class SQLEngine(DatabricksService, StatementExecutor):
             vacuum_hours=vacuum_hours,
         )
 
+        retry_active = retry is not None
+
         # Each generated statement inherits the source statement's parameters
         # and external_volume_paths so any bindings in the user's query
         # carry through to the rewritten INSERT/MERGE/DELETE.
-        prepared = [
-            WarehousePreparedStatement.prepare(
+        prepared: list[WarehousePreparedStatement] = []
+        for sql in sql_texts:
+            stmt = WarehousePreparedStatement.prepare(
                 sql,
                 parameters=source_prepared.parameters,
                 external_volume_paths=source_prepared.external_volume_paths,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
             )
-            for sql in sql_texts
-        ]
+            if retry_active and _classify_dml(sql):
+                _apply_retry_to_warehouse_statement(stmt, retry)
+            prepared.append(stmt)
 
         logger.info(
-            "SQL insert -> %s | mode=%s match_by=%s statements=%d",
-            target_location, mode_enum, match_by, len(prepared),
+            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s",
+            target_location, mode_enum, match_by, len(prepared), retry_active,
         )
 
         if prepared:

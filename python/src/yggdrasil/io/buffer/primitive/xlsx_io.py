@@ -15,7 +15,7 @@ import dataclasses
 from typing import ClassVar, Iterable, Iterator
 
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
 

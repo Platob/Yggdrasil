@@ -10,7 +10,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.arrow.python_defaults import default_scalar
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import convert, register_converter
 
 

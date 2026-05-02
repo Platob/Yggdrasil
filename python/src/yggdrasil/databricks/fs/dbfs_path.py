@@ -245,7 +245,7 @@ class DBFSPath(DatabricksPath):
         reached (if known) or when a short page signals EOF.
         """
         try:
-            size = self.content_length
+            size = self.size
         except Exception:
             size = 0
 
@@ -294,7 +294,7 @@ class DBFSPath(DatabricksPath):
         short-page detection).
         """
         try:
-            total_size = self.content_length
+            total_size = self.size
         except Exception:
             total_size = 0
 

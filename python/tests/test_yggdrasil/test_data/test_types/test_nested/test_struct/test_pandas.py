@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from yggdrasil.data import Field, Schema
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested.struct import (
     cast_pandas_list_series,
     cast_pandas_struct_series,

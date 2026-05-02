@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql as ps
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.schema import Schema
 
 
@@ -787,6 +787,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         if hasattr(obj, "value"):
             return cls.from_any(obj.value)
 
+        if isinstance(obj, (list, tuple)):
+            return cls.from_list(obj)
+
         raise TypeError(f"Cannot build Field from {type(obj).__name__}")
 
     @classmethod
@@ -1050,6 +1053,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             value = bytes(value).decode("utf-8")
 
         if not isinstance(value, str):
+            if isinstance(value, Mapping):
+                return cls.from_dict(value)
+            elif isinstance(value, (list, tuple)):
+                return cls.from_list(value)
             raise TypeError(
                 f"Field.from_json expects str or bytes-like input; got {type(value).__name__}"
             )
@@ -1248,11 +1255,23 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @classmethod
     def from_polars_field(cls, value: "polars.Field") -> "Field":
+        try:
+            nullable = getattr(value, "nullable", True)
+        except Exception:
+            nullable = True
+
+        try:
+            metadata = getattr(value, "metadata", None)
+            if metadata is not None:
+                metadata = _normalize_metadata(metadata, tags=None)
+        except Exception:
+            metadata = None
+
         return cls(
             name=value.name,
             dtype=DataType.from_polars_type(value.dtype),
-            nullable=True,
-            metadata={},
+            nullable=nullable,
+            metadata=metadata,
         )
 
     @classmethod
@@ -1693,6 +1712,26 @@ class Field(BaseMetadata, BaseChildrenFields):
         # Tabular finalize is identity — per-column finalize already
         # ran inside the struct walk. Kept for shape symmetry.
         return self.finalize_arrow(casted)
+
+    def cast_arrow_batch_iterator(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: "CastOptions | None" = None,
+        **more,
+    ) -> "Iterator[pa.RecordBatch]":
+        """Cast a stream of :class:`pa.RecordBatch` against this field.
+
+        Object targets passthrough (variant). Otherwise the dtype's
+        struct view owns the per-batch tabular cast and ``byte_size``
+        rechunk — same shape contract as :meth:`cast_arrow_tabular`,
+        just lazy.
+        """
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return iter(batches)
+        options = get_cast_options_class().check(options=options, **more)
+        return self.to_struct().dtype.cast_arrow_batch_iterator(
+            batches, options=options.with_target(self)
+        )
 
     def cast_polars_series(
         self,

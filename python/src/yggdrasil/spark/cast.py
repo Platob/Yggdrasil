@@ -45,7 +45,7 @@ import pyspark.sql.types as T
 
 from yggdrasil.arrow.cast import any_to_arrow_table
 from yggdrasil.data.cast import register_converter
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
 
 __all__ = [

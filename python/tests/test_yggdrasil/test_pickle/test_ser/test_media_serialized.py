@@ -219,7 +219,7 @@ class TestErrorHandling:
             tag=Tags.CODEC,
             data=b"nonexistent_codec",
         )
-        with pytest.raises(ValueError, match="Unknown Codec"):
+        with pytest.raises(ValueError, match="Cannot resolve Codec"):
             ser.as_python()
 
     def test_unknown_media_mime_raises(self):
@@ -235,6 +235,6 @@ class TestErrorHandling:
             tag=Tags.MEDIA_TYPE,
             data=b"JSON+nonexistent",
         )
-        with pytest.raises(ValueError, match="Unknown Codec"):
+        with pytest.raises(ValueError, match="Cannot resolve Codec"):
             ser.as_python()
 

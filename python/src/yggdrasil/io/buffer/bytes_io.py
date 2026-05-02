@@ -95,6 +95,7 @@ reporting but otherwise treat all modes alike.
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import mmap
 import os
@@ -148,6 +149,53 @@ def _as_contiguous_mv(mv: memoryview) -> memoryview:
     fast path stays zero-copy.
     """
     return mv if mv.c_contiguous else memoryview(mv.tobytes())
+
+
+def check_transaction():
+    """Decorator: short-circuit a method to the transaction buffer.
+
+    For non-local path-bound BytesIOs, all working bytes live in
+    ``self._transaction_buffer`` (itself a BytesIO). Many methods
+    are pure pass-throughs in that case. This decorator factors
+    out the boilerplate::
+
+        if self._transaction_buffer is not None:
+            return self._transaction_buffer.same_method(*args, **kwargs)
+
+    Use it like::
+
+        @check_transaction()
+        def some_method(self, ...): ...
+
+        @property
+        @check_transaction()
+        def some_prop(self): ...
+
+    The wrapped function only runs when ``self._transaction_buffer``
+    is ``None`` (memory-mode or local-spilled). When a transaction
+    buffer exists, the call is forwarded by name via
+    ``getattr(self._transaction_buffer, func.__name__)`` so that
+    subclass overrides on the inner buffer are respected.
+
+    **Do NOT decorate methods that mirror outer state after the
+    inner call** (e.g. ``_write_at`` updating ``self._size``,
+    ``_set_size`` clamping ``self._pos``). Those need the inline
+    pattern so the post-delegation bookkeeping isn't skipped.
+    """
+
+    def decorator(func):
+        method_name = func.__name__
+
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            tb = self._transaction_buffer
+            if tb is not None:
+                return getattr(tb, method_name)(*args, **kwargs)
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +307,53 @@ class BytesIO(Disposable, IO[bytes]):
             return True
         return False
 
+    def __new__(
+        cls,
+        data: Union[
+            IO[bytes],
+            bytes,
+            bytearray,
+            memoryview,
+            "BytesIO",
+            io.BytesIO,
+            None,
+        ] = None,
+        *,
+        copy: bool = False,
+        media_type: Optional["MediaType"] = None,
+        path: "Path | None" = None,
+        spill_bytes: int = 128 * 1024 * 1024,
+        spill_ttl: int = 86400,
+        auto_open: bool | None = None,
+        mode: str = "rb+",
+        metadata: dict | None = None,
+        **kwargs
+    ) -> None:
+        if data is None and media_type is None and path is None:
+            return object.__new__(cls)
+
+        if media_type is None:
+            P = path_class()
+
+            if data is not None:
+                if isinstance(data, P):
+                    path = path if path is not None else data
+                elif isinstance(data, BytesIO):
+                    media_type = data._media_type
+
+            if media_type and path is not None:
+                path = P.from_(path)
+                media_type = path.media_type
+
+        if media_type is not None:
+            media_type = MediaType.from_(media_type)
+
+            if not media_type.is_octet:
+                from .primitive import PrimitiveIO
+                return PrimitiveIO.__new__(PrimitiveIO, data, media_type=media_type)
+
+        return super().__new__(cls)
+
     def __init__(
         self,
         data: Union[
@@ -276,9 +371,10 @@ class BytesIO(Disposable, IO[bytes]):
         path: "Path | None" = None,
         spill_bytes: int = 128 * 1024 * 1024,
         spill_ttl: int = 86400,
-        auto_open: bool = True,
+        auto_open: bool | None = None,
         mode: str = "rb+",
-        metadata: dict | None = None
+        metadata: dict | None = None,
+        **kwargs
     ) -> None:
         Disposable.__init__(self)
 
@@ -313,6 +409,9 @@ class BytesIO(Disposable, IO[bytes]):
 
         if data is not None:
             self._init_from(data, copy=copy)
+
+        if auto_open is None:
+            auto_open = self._spill_path is not None and not self._owns_spill_path
 
         if auto_open:
             self.open()
@@ -372,13 +471,28 @@ class BytesIO(Disposable, IO[bytes]):
             self._size = n
         self._pos = 0
 
-    def _init_from_bytesio(self, src: "BytesIO", *, copy: bool) -> None:
+    def _init_from_bytesio(
+        self,
+        src: "BytesIO",
+        *,
+        copy: bool
+    ) -> None:
         """Accept another BytesIO as the source. Always deep-copies."""
-        del copy
-        self._init_from_bytes(memoryview(src.to_bytes()))
-        if self._media_type is None:
-            self._media_type = src._media_type
-        self._pos = 0
+        if copy:
+            src = src.copy()
+
+        super()._init_from_disposable(src)
+        self._buf = src._buf
+        self._size = src._size
+        self._spill_path = src._spill_path
+        self._owns_spill_path = src._owns_spill_path
+        self._pos = src._pos
+        self._media_type = src._media_type
+        self._metadata = src._metadata
+        self._transaction_buffer = src._transaction_buffer
+        self._mode = src._mode
+        self._spill_bytes = src._spill_bytes
+        self._spill_ttl = src._spill_ttl
 
     def _init_from_filelike(self, src: Any) -> None:
         """Drain a file-like from current cursor to end."""
@@ -492,6 +606,10 @@ class BytesIO(Disposable, IO[bytes]):
         return self._spill_path is not None
 
     @property
+    def transaction_buffer(self):
+        return self._transaction_buffer
+
+    @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
@@ -586,6 +704,7 @@ class BytesIO(Disposable, IO[bytes]):
             spill_bytes=self._spill_bytes,
             spill_ttl=self._spill_ttl,
             mode="rb+",  # Internal scratch: needs r/w regardless of outer mode.
+            auto_open=True
         )
 
         if wants_truncate or wants_excl:
@@ -617,7 +736,7 @@ class BytesIO(Disposable, IO[bytes]):
         else:
             self._pos = 0
 
-    def _release(self, committed: bool) -> None:
+    def _release(self) -> None:
         """Flush transaction buffer, close the spill fd, unlink owned files.
 
         Order matters:
@@ -636,17 +755,6 @@ class BytesIO(Disposable, IO[bytes]):
         flush dirty buffers on close." If finer-grained commit
         semantics ever ship, this is the hook.
         """
-        del committed
-
-        # Flush first, before tearing anything down. A flush failure
-        # shouldn't prevent us from closing — but we surface it after
-        # teardown so the caller sees the error.
-        flush_error: BaseException | None = None
-        try:
-            self.flush()
-        except BaseException as e:
-            flush_error = e
-
         # Close the transaction buffer if we have one. It owns its
         # own spill machinery; closing it releases that.
         if self._transaction_buffer is not None:
@@ -674,9 +782,6 @@ class BytesIO(Disposable, IO[bytes]):
             except OSError:
                 pass
             self._spill_path = None
-
-        if flush_error is not None:
-            raise flush_error
 
     def _ensure_spill_fd(self) -> int:
         """Open the spill fd lazily; return it.
@@ -706,7 +811,6 @@ class BytesIO(Disposable, IO[bytes]):
     # ------------------------------------------------------------------
     # Three core primitives — only branch sites for memory vs spilled
     # ------------------------------------------------------------------
-
     def _slice(self, pos: int, n: int) -> bytes:
         """Read *n* bytes at *pos*. Handles all three backings.
 
@@ -913,6 +1017,9 @@ class BytesIO(Disposable, IO[bytes]):
         For "what's on the remote right now", use :meth:`stat`,
         which is always live.
         """
+        if self._transaction_buffer is not None:
+            return self._transaction_buffer.size
+
         if (
             self._spill_path is not None
             and self._spill_path.is_local
@@ -923,10 +1030,12 @@ class BytesIO(Disposable, IO[bytes]):
             except OSError:
                 pass
         return self._size
-    
+
+    @check_transaction()
     def is_empty(self):
         return self.size == 0
 
+    @check_transaction()
     def remaining_bytes(self):
         return self.size - self.tell()
 
@@ -939,6 +1048,9 @@ class BytesIO(Disposable, IO[bytes]):
         remote file's mtime is exposed via :meth:`stat` if the
         caller wants it).
         """
+        if self._transaction_buffer is not None:
+            return self._transaction_buffer.mtime
+
         if (
             self._spill_path is not None
             and self._spill_path.is_local
@@ -981,7 +1093,7 @@ class BytesIO(Disposable, IO[bytes]):
 
     @property
     def is_remote(self) -> bool:
-        return False
+        return not self.is_local
 
     def need_spill(self, size: int) -> bool:
         """Predicate: would *size* trigger a spill at current threshold?"""
@@ -1245,6 +1357,112 @@ class BytesIO(Disposable, IO[bytes]):
             copy=False
         )
 
+    def copy(
+        self,
+        target_class: type[BytesIO] | None = None
+    ) -> "BytesIO":
+        """Return an independent copy with the same bytes and media type.
+
+        Backing-aware behaviour:
+
+        - **External path binding** (``_owns_spill_path=False``) — pass
+          the path through to the new instance. Neither side owns the
+          file, so sharing the binding is safe; both will pread/pwrite
+          against the same durable backing, which is exactly the
+          semantic of an external path.
+        - **Memory mode** — clone ``_buf`` into a fresh bytearray
+          (spilling to a new owned temp file if the payload crosses
+          threshold).
+        - **Owned spilled** — copy the spill file into a freshly minted
+          owned spill via chunked pread→pwrite. The new instance opens
+          its own fd lazily.
+        - **Non-local owned** — would only happen via a stale transaction
+          buffer; pull bytes through and produce an autonomous copy.
+
+        Cursor, media_type, and metadata are preserved; spill_bytes /
+        spill_ttl carry over.
+        """
+        # External path binding — share the binding. Neither instance
+        # owns the file, so both can point at it without lifecycle
+        # conflicts. The new instance will acquire its own fd / its own
+        # transaction buffer on open.
+        if target_class is None:
+            target_class = type(self)
+
+        if self._spill_path is not None and not self._owns_spill_path:
+            return target_class(
+                path=self._spill_path,
+                mode=self._mode,
+                media_type=self._media_type,
+                spill_bytes=self._spill_bytes,
+                spill_ttl=self._spill_ttl,
+                metadata=dict(self._metadata) if self._metadata else None,
+            )
+
+        new_instance = target_class(
+            spill_bytes=self._spill_bytes,
+            spill_ttl=self._spill_ttl,
+            mode=self._mode,
+            media_type=self._media_type,
+            metadata=dict(self._metadata) if self._metadata else None,
+            auto_open=False,
+        )
+
+        size = self.size
+        if size == 0:
+            new_instance._pos = 0
+            return new_instance
+
+        # Memory mode: clone the bytearray. Spill if it crosses the new
+        # instance's threshold.
+        if self._buf is not None:
+            if size > new_instance._spill_bytes:
+                path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
+                with open(path.full_path(), "wb") as fh:
+                    fh.write(memoryview(self._buf)[:size])
+                new_instance._buf = None
+                new_instance._spill_path = path
+                new_instance._owns_spill_path = True
+                new_instance._size = size
+            else:
+                new_instance._buf = bytearray(memoryview(self._buf)[:size])
+                new_instance._size = size
+            new_instance._pos = self._pos
+            return new_instance
+
+        # Owned non-local (rare — transaction buffer present on an owned
+        # spill path). Drain through and produce an autonomous copy.
+        if self._transaction_buffer is not None:
+            new_instance._init_from(self._transaction_buffer, copy=True)
+            new_instance._pos = min(self._pos, new_instance._size)
+            return new_instance
+
+        # Owned local-spilled: copy the spill file via chunked pread→pwrite.
+        src_fd = self._ensure_spill_fd()
+        new_path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
+        flags = _flags_for_mode("wb+")
+        dst_fd = os.open(new_path.full_path(), flags, 0o644)
+        try:
+            pos = 0
+            while pos < size:
+                want = min(_COPY_CHUNK_SIZE, size - pos)
+                chunk = _pread_bounded(src_fd, want, pos)
+                if not chunk:
+                    break
+                written = _pwrite_bounded(dst_fd, chunk, pos)
+                if written == 0:
+                    break
+                pos += written
+        finally:
+            os.close(dst_fd)
+
+        new_instance._buf = None
+        new_instance._spill_path = new_path
+        new_instance._owns_spill_path = True
+        new_instance._size = size
+        new_instance._pos = self._pos
+        return new_instance
+
     # ------------------------------------------------------------------
     # Dunder
     # ------------------------------------------------------------------
@@ -1268,20 +1486,20 @@ class BytesIO(Disposable, IO[bytes]):
         return self.size
 
     def __repr__(self) -> str:
-        owned = "owned" if self._owns_spill_path else "external"
+        target_class = type(self)
+        opened = "opened" if self.opened else "closed"
+        internal = "internal" if self._owns_spill_path else "external"
+        spilled = "spilled" if self.spilled else "memory"
         mt = f" media={self._media_type.__repr__()}" if self._media_type else ""
-        if self._spill_path is not None:
-            handle = "open" if self._spill_fd is not None else "closed"
-            return (
-                f"<{type(self).__name__} [spilled/{owned}/{handle}] "
-                f"size={self._size} pos={self._pos} "
-                f"mode={self._mode!r} path={self._spill_path!r}{mt}>"
-            )
-        if self._buf is None:
-            return f"<{type(self).__name__} [empty] size=0 pos=0{mt}>"
+        if self._buf is not None:
+            owner = str(id(self._buf))
+        elif self._spill_path is not None:
+            owner = self._spill_path.url.to_string(encode=False)
+        else:
+            owner = "<not allocated>"
         return (
-            f"<{type(self).__name__} [memory] size={self._size} "
-            f"pos={self._pos}{mt}>"
+            f"<{target_class.__name__} [{spilled}/{internal}/{opened}] {owner}"
+            f"size={self.size}, pos={self.tell()}, mode={self._mode}{mt}>"
         )
 
     def __getstate__(self):
@@ -1293,6 +1511,7 @@ class BytesIO(Disposable, IO[bytes]):
           data; snapshotting bytes would diverge from the file the
           moment any other writer touched it.
         """
+        self.flush()
         if not self._owns_spill_path and self._spill_path is not None:
             # Pickle the path as a STRING, not the Path object. Path
             # subclasses inherit from Disposable, which holds a
@@ -1302,7 +1521,7 @@ class BytesIO(Disposable, IO[bytes]):
             # via path_class().from_().
             return {
                 "kind": "path",
-                "path": self._spill_path.full_path(),
+                "path": self._spill_path.url.to_string(),
                 "mode": self._mode,
                 "media_type": self._media_type,
             }
@@ -1354,6 +1573,32 @@ class BytesIO(Disposable, IO[bytes]):
     def seekable(self) -> bool:
         return True
 
+    def _commit(self):
+        if self._spill_path is None:
+            return  # Memory-mode — nothing durable to flush to.
+
+        if self._spill_path.is_local:
+            return  # Local fd ops bypass any user-space buffer.
+
+        # Non-local path. Flush the transaction buffer if writable.
+        if not self.is_writing:
+            return
+
+        if self._transaction_buffer is None:
+            # Defensive — non-local acquire always sets the buffer.
+            return
+
+        pos = self._transaction_buffer.tell()
+        self._transaction_buffer.seek(0)
+        self._spill_path.write_stream(self._transaction_buffer)
+        self._transaction_buffer.seek(pos)
+
+        # sync metadata
+        self.seek(pos)
+        self._size = self._transaction_buffer.size
+        self._mtime = self._transaction_buffer.mtime
+        self.clear_dirty()
+
     def flush(self) -> None:
         """Push buffered writes to the backing.
 
@@ -1374,22 +1619,7 @@ class BytesIO(Disposable, IO[bytes]):
         and matches the "the entire transaction buffer is the new
         file content" semantic that's actually being expressed.
         """
-        if self._spill_path is None:
-            return  # Memory-mode — nothing durable to flush to.
-
-        if self._spill_path.is_local:
-            return  # Local fd ops bypass any user-space buffer.
-
-        # Non-local path. Flush the transaction buffer if writable.
-        if not self.is_writing:
-            return
-
-        if self._transaction_buffer is None:
-            # Defensive — non-local acquire always sets the buffer.
-            return
-
-        payload = self._transaction_buffer.to_bytes()
-        self._spill_path.write_bytes(payload)
+        return self.commit()
 
     def isatty(self) -> bool:
         return False
@@ -1468,10 +1698,12 @@ class BytesIO(Disposable, IO[bytes]):
             content = self.head(mid) + b"..." + self.tail(mid)
 
         return content if encoding is None else content.decode(encoding, errors=errors)
-
+    
+    @check_transaction()
     def tell(self) -> int:
         return int(self._pos)
-
+    
+    @check_transaction()
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         """Seek. Yggdrasil extension: SEEK_SET with negative offset
         counts from end."""
@@ -1534,7 +1766,11 @@ class BytesIO(Disposable, IO[bytes]):
                     break
                 total += self.write_bytes(chunk)
             return total
-        return self.write_bytes(bytes(b))
+        return self.write_stream(b)
+
+    def write_stream(self, buffer: BytesIO):
+        buffer = BytesIO.from_(buffer)
+        return self._write_bytes_io(buffer)
 
     def write_bytes(self, b: bytes | bytearray | memoryview) -> int:
         mv = memoryview(b)
@@ -1543,6 +1779,14 @@ class BytesIO(Disposable, IO[bytes]):
         n = self._write_at(mv, self._pos)
         self._pos += n
         return n
+
+    def write_bytes_io(
+        self,
+        buffer: "BytesIO",
+        batch_size: int = 1024 * 1024,
+    ) -> int:
+        buffer = BytesIO.from_(buffer)
+        return self._write_bytes_io(buffer, batch_size)
 
     def _write_bytes_io(
         self,
@@ -1792,6 +2036,7 @@ class BytesIO(Disposable, IO[bytes]):
     # Hashing
     # ------------------------------------------------------------------
 
+    @check_transaction()
     def xxh3_64(self) -> "xxhash.xxh3_64":
         import xxhash
         h = xxhash.xxh3_64()
@@ -1802,6 +2047,7 @@ class BytesIO(Disposable, IO[bytes]):
         u = self.xxh3_64().intdigest()
         return u if u < 2**63 else u - 2**64
 
+    @check_transaction()
     def blake3(self) -> "blake3.blake3":
         from blake3 import blake3
         h = blake3(max_threads=blake3.AUTO)
@@ -1861,6 +2107,7 @@ class BytesIO(Disposable, IO[bytes]):
                 raise ValueError("view length must be >= 0")
         return BytesIOView(parent=self, start=pos, size=size, pos=0, max_size=max_size)
 
+    @check_transaction()
     def memoryview(self):
         """Return a ``memoryview`` over this buffer's bytes.
 
@@ -1965,10 +2212,73 @@ class BytesIO(Disposable, IO[bytes]):
             with self.as_media(media_type) as reader:
                 return reader.read_pylist(reset_seek=True)
 
-    def arrow_io(self, mode: str = "rb", size: int | None = None):
-        if self._transaction_buffer is not None:
-            return self._transaction_buffer.arrow_io(mode, size)
+    @check_transaction()
+    def reserve(self, n: int) -> "BytesIO":
+        """Reserve capacity for a total size of *n* bytes.
 
+        Capacity-reservation only — does NOT change ``_size`` or
+        ``_pos``. Use :meth:`truncate` if you want the visible size
+        to change. Idempotent: if ``self.size >= n`` already, this
+        is a no-op.
+
+        Per-backing behaviour:
+
+        - **Memory mode** — if ``n > _spill_bytes``, spill first and
+          fall through to the local-spilled branch. Otherwise grow
+          the underlying ``bytearray`` to length ``n`` using the
+          same 1.5× amortized pattern as :meth:`_write_at`, leaving
+          ``_size`` untouched. Subsequent writes up to *n* bytes
+          incur no further reallocation.
+        - **Local-spilled** — no-op. The fd grows lazily on
+          ``os.pwrite``; ``posix_fallocate`` isn't portably exposed
+          and the kernel handles sparse allocation cheaply.
+        - **Non-local (transaction buffer)** — delegate. The inner
+          buffer makes its own spill decision against its own
+          threshold.
+
+        Returns ``self`` for chaining.
+        """
+        if n < 0:
+            raise ValueError(f"allocate size must be >= 0, got {n}")
+        if n == 0:
+            return self
+        if n <= self.size:
+            return self  # Already have at least n bytes of capacity.
+
+        # Non-local: delegate. The outer _size mirrors the inner's
+        # working size; the transaction buffer owns the actual bytes.
+        if self._transaction_buffer is not None:
+            self._transaction_buffer.reserve(n)
+            return self
+
+        # Local-spilled: nothing to pre-grow. fd backing grows lazily
+        # on positional write, and there's no portable fallocate.
+        if self._spill_path is not None and self._spill_path.is_local:
+            return self
+
+        # Memory mode. If the target capacity crosses the spill
+        # threshold, spill first and bail — the spilled fd needs no
+        # pre-growth.
+        if n > self._spill_bytes:
+            self._spill()
+            return self
+
+        # Pre-grow the bytearray to length n with the same 1.5×
+        # amortization _write_at uses, so back-to-back allocate +
+        # streaming writes don't fight each other.
+        if self._buf is None:
+            # Defensive — autonomous memory-mode buffer with no _buf
+            # shouldn't happen post-init, but synthesize one rather
+            # than raise.
+            self._buf = bytearray()
+        cur = len(self._buf)
+        if n > cur:
+            new_cap = max(n, int(cur * 1.5) + 1)
+            self._buf.extend(b"\x00" * (new_cap - cur))
+        return self
+
+    @check_transaction()
+    def arrow_io(self, mode: str = "rb", size: int | None = None):
         if (
             self.spilled
             and self._spill_path is not None

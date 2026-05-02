@@ -60,7 +60,7 @@ from typing import (
 import pyarrow as pa
 import pyarrow.compute as pc
 from yggdrasil.arrow.cast import any_to_arrow_table, any_to_arrow_batch_iterator
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
@@ -247,7 +247,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     def cached(self) -> bool:
         return self._arrow_table is not None or self._spark_frame is not None
 
-    def _release(self, committed: bool) -> None:
+    def _release(self) -> None:
         self.unpersist()
 
     @abstractmethod

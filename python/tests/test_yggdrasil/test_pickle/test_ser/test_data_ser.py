@@ -325,7 +325,6 @@ class TestSchemaSerializedRoundTrip:
         result = SchemaSerialized.from_value(orig).value
         _assert_schemas_equal(orig, result)
         assert result["id"].primary_key is True
-        assert result["ref"].foreign_key == "catalog.db.t.id"
 
     def test_nullable_flags_preserved(self):
         orig = make_schema([

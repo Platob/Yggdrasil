@@ -63,7 +63,7 @@ from abc import ABC
 from typing import Any, Iterator, Literal
 
 from yggdrasil.arrow.cast import any_to_arrow_table
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer import BytesIO
@@ -146,7 +146,7 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
     # Lifecycle — chain both parents' _release
     # ------------------------------------------------------------------
 
-    def _release(self, committed: bool) -> None:
+    def _release(self) -> None:
         """Tear down both halves on close.
 
         MRO would otherwise silently drop ``TabularIO._release``
@@ -156,11 +156,11 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
         its fd-close / spill-unlink dance, which is the part that
         can raise and must run regardless.
         """
-        super()._release(committed=committed)
+        TabularIO._release(self)
 
         # BytesIO side: flush transaction buffer, close fd, unlink
         # owned spill. May raise; caller wants that error.
-        BytesIO._release(self, committed)
+        BytesIO._release(self)
 
     @property
     def cached(self) -> bool:
@@ -422,7 +422,7 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
             was_opened = self.opened
             if not was_opened:
                 self.open()
-                stack.callback(self.close)
+                stack.callback(self.close, force=True)
             elif options.reset_seek and self.seekable():
                 stack.callback(self.seek, self.tell())
 
@@ -433,10 +433,9 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
                 if options.write_seek is not None and self.seekable():
                     self.seek(options.write_seek)
 
-                if options.mark_dirty_on_write:
-                    self.mark_dirty()
-
                 yield self
+
+                self.flush()
             finally:
                 if was_opened and self.closed:
                     self.open()

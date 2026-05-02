@@ -22,6 +22,27 @@ Execution policy travels through :class:`DatabricksExecutionOptions`
 subclass overrides it to stage external data first and merge volume
 paths onto the statement.
 
+Two retry layers — keep them straight
+-------------------------------------
+This module participates in two distinct retry mechanisms.  They cover
+different failure modes and are configured independently:
+
+1. **Submission-level retry** — :meth:`_submit_with_retry`.  Always on.
+   Wraps the SDK ``execute_statement`` call in a backoff loop that retries
+   :class:`DeadlineExceeded` errors (cold/busy warehouses) until
+   ``submit_wait.timeout`` elapses.  Configured via
+   :attr:`DatabricksExecutionOptions.submit_wait` (or the ``submit_wait``
+   kwarg on :meth:`execute`).  This isn't tied to ``statement.retry`` —
+   even a non-retryable statement gets submission-level retries because
+   "warehouse was busy when I knocked" is not a statement failure.
+
+2. **Result-level retry** — :meth:`StatementResult.retry`.  Opt-in by
+   setting ``statement.retry`` to a :class:`WaitingConfig`.  After a
+   *terminal-failure* result (statement_id was issued, query ran,
+   query failed), drives :meth:`StatementResult.start` ``reset=True``
+   per attempt with backoff driven by the WaitingConfig.  Used for
+   genuinely flaky queries, not for warehouse availability.
+
 Collection-level operations (listing, finding, creating warehouses) live
 in the companion :mod:`~yggdrasil.databricks.sql.service` module.
 """
@@ -43,7 +64,7 @@ from databricks.sdk.service.sql import (
 )
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
-from yggdrasil.databricks.warehouse._utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds
+from yggdrasil.databricks.warehouse.wh_utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 
@@ -94,7 +115,9 @@ class DatabricksExecutionOptions(ExecutionOptions):
     submit_wait
         Retry policy for the SDK ``execute_statement`` call itself
         (covers cold/busy warehouses returning ``DeadlineExceeded``).
-        Distinct from ``wait``, which controls *result-level* polling.
+        Distinct from ``wait``, which controls *result-level* polling,
+        and from per-statement ``retry``, which drives
+        :meth:`StatementResult.retry` after a terminal failure.
     external_data
         ``{alias: tabular-or-VolumePath}``.  Tabular values are staged to
         Parquet on a fresh :class:`VolumePath`; existing volumes pass
@@ -497,9 +520,13 @@ class SQLWarehouse(
         """Submit ``statement`` via the SDK, with busy-warehouse retry.
 
         Reads typed routing fields directly off the statement.  The
-        ``submit_wait`` policy (if any) is picked up from
-        :attr:`_submit_wait_for_call`, set by :meth:`_execute` from
+        ``submit_wait`` policy (if any) is picked up from the statement's
+        own field, set by :meth:`_apply_databricks_options` from
         :class:`DatabricksExecutionOptions.submit_wait`.
+
+        This is the *submission-level* retry layer (cold/busy warehouse,
+        ``DeadlineExceeded``).  Result-level retry (statement ran and
+        failed) is driven separately by :meth:`StatementResult.retry`.
 
         Defaults applied in-line:
 
@@ -570,7 +597,8 @@ class SQLWarehouse(
 
         Retries on :class:`DeadlineExceeded` (warehouse busy/cold) until
         the deadline is exhausted.  Distinct from result-level polling,
-        which the base ``wait()`` handles.
+        which the base ``wait()`` handles, and from :meth:`StatementResult.retry`,
+        which retries *terminal-failure* results rather than failed submissions.
         """
         iteration = 0
         started_at = time.monotonic()
@@ -642,14 +670,21 @@ class SQLWarehouse(
         wait: WaitingConfigArg = True,
         submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
+        # Result-level retry policy.  ``None`` means "leave whatever the
+        # statement already says alone" — important when the caller
+        # passes a pre-built WarehousePreparedStatement with retry
+        # configured and expects execute() not to clobber it.
+        # Pass ``False`` to explicitly clear an existing retry policy,
+        # or any :class:`WaitingConfigArg` to install one.
+        retry: Optional[WaitingConfigArg] = None,
     ) -> WarehouseStatementResult:
         """Execute a SQL statement on this (or another) warehouse.
 
         Three ways to control execution policy:
 
         1. Per-call kwargs (``wait``, ``raise_error``, ``submit_wait``,
-           ``external_data``, ``external_volume_paths``) — ergonomic, the
-           default API.
+           ``external_data``, ``external_volume_paths``, ``retry``) —
+           ergonomic, the default API.
         2. ``options=DatabricksExecutionOptions(...)`` — when the same
            policy is reused across many calls.
         3. Both — kwargs override fields they explicitly set.
@@ -660,6 +695,12 @@ class SQLWarehouse(
         ``warehouse_id`` / ``warehouse_name`` redirect submission to a
         different warehouse — kept for back-compat with callers that use
         one warehouse handle as a dispatcher.
+
+        ``retry`` configures the *result-level* retry — what
+        :meth:`StatementResult.retry` will do if the caller invokes it
+        after a terminal failure.  Has no effect on submission-level
+        retry (cold/busy warehouse), which is always on and configured
+        via ``submit_wait``.
         """
         # Cross-warehouse redirect: resolve and delegate.
         if (warehouse_id and warehouse_id != self.warehouse_id) or (
@@ -683,6 +724,7 @@ class SQLWarehouse(
                 wait=wait,
                 submit_wait=submit_wait,
                 raise_error=raise_error,
+                retry=retry,
             )
 
         # Already-started result: just wait.
@@ -691,7 +733,8 @@ class SQLWarehouse(
 
         # Coerce + bind onto a typed PreparedStatement.  prepare() handles
         # parameters, format/disposition defaults, and the staging+merge
-        # of external_data / external_volume_paths in one shot.
+        # of external_data / external_volume_paths in one shot.  ``retry``
+        # is forwarded — None means "don't override" inside prepare().
         prepared = WarehousePreparedStatement.prepare(
             statement if statement is not None else "",
             parameters=parameters,
@@ -703,6 +746,7 @@ class SQLWarehouse(
             format=format,
             byte_limit=byte_limit,
             row_limit=row_limit,
+            retry=retry,
         )
 
         opts = self._build_options(

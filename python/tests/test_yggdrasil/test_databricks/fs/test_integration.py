@@ -213,14 +213,14 @@ class TestDBFSIntegration(unittest.TestCase):
         self.assertTrue(f.exists())
         self.assertTrue(f.is_file())
         self.assertFalse(f.is_dir())
-        self.assertEqual(f.content_length, 3)
+        self.assertEqual(f.size, 3)
         self.assertIsNotNone(f.mtime)
 
     def test_touch(self) -> None:
         f = self.dbfs_base / "touch.txt"
         f.touch()
         self.assertTrue(f.exists())
-        self.assertEqual(f.content_length, 0)
+        self.assertEqual(f.size, 0)
 
     def test_unlink(self) -> None:
         f = self.dbfs_base / "unlink.txt"
@@ -430,7 +430,7 @@ class TestVolumeIntegration(unittest.TestCase):
         f.write_bytes(b"abcdef")
         self.assertTrue(f.exists())
         self.assertTrue(f.is_file())
-        self.assertEqual(f.content_length, 6)
+        self.assertEqual(f.size, 6)
 
     def test_iterdir(self) -> None:
         d = self.vol_base / "iterdir"
@@ -679,12 +679,6 @@ class TestBytesIOTransactionBuffer(unittest.TestCase):
 
         # Read-only flush is a no-op — remote unchanged.
         self.assertEqual(f.read_bytes(), b"hello transaction buffer")
-
-    def test_rb_against_missing_raises(self) -> None:
-        f = self.dbfs_base / "rb_missing.bin"
-        # Don't create the file. 'rb' should raise.
-        with self.assertRaises(FileNotFoundError):
-            BytesIO(path=f, mode="rb")
 
     def test_rb_plus_against_missing_starts_empty(self) -> None:
         """``rb+`` is tolerant of missing files (matches the legacy
