@@ -221,6 +221,10 @@ class TestHttpSessionRealRequest:
         assert "hello" in body["echo"]
 
 
+# Local-cache filenames are derived via xxh3_b64 of the anonymized
+# request, so the whole local-cache surface depends on the optional
+# ``xxhash`` package. Skip the cache classes when the extra isn't
+# installed.
 class TestHttpSessionLocalCache:
     def _cache(self, tmp_path) -> CacheConfig:
         return CacheConfig(
@@ -231,6 +235,7 @@ class TestHttpSessionLocalCache:
     def test_first_call_hits_network_second_serves_from_cache(
         self, http_server: _Server, tmp_path
     ):
+        pytest.importorskip("xxhash")
         cache = self._cache(tmp_path)
         url = f"{http_server.base_url}/cache/first"
         with HTTPSession(verify=False) as session:
@@ -249,6 +254,7 @@ class TestHttpSessionLocalCache:
     def test_cache_files_are_written_under_configured_root(
         self, http_server: _Server, tmp_path
     ):
+        pytest.importorskip("xxhash")
         cache = self._cache(tmp_path)
         with HTTPSession(verify=False) as session:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
@@ -259,6 +265,7 @@ class TestHttpSessionLocalCache:
     def test_distinct_urls_cache_independently(
         self, http_server: _Server, tmp_path
     ):
+        pytest.importorskip("xxhash")
         cache = self._cache(tmp_path)
         with HTTPSession(verify=False) as session:
             session.get(f"{http_server.base_url}/cache/a", local_cache=cache)
@@ -284,6 +291,7 @@ class TestHttpSessionSendManyLocalCache:
     def test_send_many_first_pass_hits_each_url_once(
         self, http_server: _Server, tmp_path
     ):
+        pytest.importorskip("xxhash")
         cache = self._cache(tmp_path)
         reqs = self._build_requests(http_server.base_url, 4)
         with HTTPSession(verify=False) as session:
@@ -296,6 +304,7 @@ class TestHttpSessionSendManyLocalCache:
     def test_send_many_second_pass_reads_from_cache(
         self, http_server: _Server, tmp_path
     ):
+        pytest.importorskip("xxhash")
         cache = self._cache(tmp_path)
         reqs = self._build_requests(http_server.base_url, 3)
         with HTTPSession(verify=False) as session:

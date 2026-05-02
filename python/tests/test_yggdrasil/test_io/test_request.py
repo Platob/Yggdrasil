@@ -178,11 +178,13 @@ class TestUpdates:
 
 class TestHashing:
     def test_xxh3_64_deterministic(self):
+        pytest.importorskip("xxhash")
         a = PreparedRequest.prepare(method="GET", url="https://example.com/")
         b = PreparedRequest.prepare(method="GET", url="https://example.com/")
         assert a.xxh3_64().intdigest() == b.xxh3_64().intdigest()
 
     def test_xxh3_b64_returns_str(self):
+        pytest.importorskip("xxhash")
         req = PreparedRequest.prepare(method="GET", url="https://example.com/")
         assert isinstance(req.xxh3_b64(), str)
 
