@@ -111,31 +111,21 @@ def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
     dtype = COLUMN_INFO_TYPE_MAP.get(obj.type_name, None)
     if dtype is None:
         dtype = DataType.from_str(obj.type_text)
-    else:
-        if dtype.type_id.is_scalar:
-            if obj.type_precision or obj.type_scale:
-                prec = int(obj.type_precision) if obj.type_precision is not None else obj.type_precision
-                scale = int(obj.type_scale) if obj.type_scale is not None else obj.type_scale
 
-                if isinstance(dtype, DecimalType):
-                    dtype = dtype.with_precision(prec, copy=False) if prec is not None else dtype
-                    dtype = dtype.with_scale(scale, copy=False) if scale is not None else dtype
-        else:
-            dtype = DataType.from_str(obj.type_text)
+    if dtype.type_id.is_scalar:
+        if isinstance(dtype, DecimalType):
+            precision = 38 if obj.type_precision is None else obj.type_precision
+            scale = 18 if obj.type_scale is None else obj.type_scale
+            if precision is not None and scale is not None:
+                dtype = DecimalType(precision=precision, scale=scale)
 
-    if isinstance(dtype, DecimalType):
-        precision = 38 if obj.type_precision is None else obj.type_precision
-        scale = 18 if obj.type_scale is None else obj.type_scale
-        if precision is not None and scale is not None:
-            dtype = DecimalType(precision=precision, scale=scale)
+        elif isinstance(dtype, TimestampType):
+            if dtype.tz:
+                if dtype.tz in REPLACE_TIMEZONES.keys():
+                    tz = REPLACE_TIMEZONES.get(dtype.tz, dtype.tz)
+                    dtype = TimestampType(unit=dtype.unit, tz=tz)
 
-    if isinstance(dtype, TimestampType):
-        if dtype.tz:
-            if dtype.tz in REPLACE_TIMEZONES.keys():
-                tz = REPLACE_TIMEZONES.get(dtype.tz, dtype.tz)
-                dtype = TimestampType(unit=dtype.unit, tz=tz)
-
-    if dtype.type_id.is_nested:
+    elif dtype.type_id.is_nested:
         dtype = DataType.from_str(obj.type_text)
 
     metadata = {}
