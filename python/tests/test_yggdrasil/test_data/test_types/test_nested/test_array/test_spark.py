@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested.array import (

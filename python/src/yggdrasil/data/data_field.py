@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql as ps
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.schema import Schema
 
 
@@ -1712,6 +1712,26 @@ class Field(BaseMetadata, BaseChildrenFields):
         # Tabular finalize is identity — per-column finalize already
         # ran inside the struct walk. Kept for shape symmetry.
         return self.finalize_arrow(casted)
+
+    def cast_arrow_batch_iterator(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: "CastOptions | None" = None,
+        **more,
+    ) -> "Iterator[pa.RecordBatch]":
+        """Cast a stream of :class:`pa.RecordBatch` against this field.
+
+        Object targets passthrough (variant). Otherwise the dtype's
+        struct view owns the per-batch tabular cast and ``byte_size``
+        rechunk — same shape contract as :meth:`cast_arrow_tabular`,
+        just lazy.
+        """
+        if self.dtype.type_id == DataTypeId.OBJECT:
+            return iter(batches)
+        options = get_cast_options_class().check(options=options, **more)
+        return self.to_struct().dtype.cast_arrow_batch_iterator(
+            batches, options=options.with_target(self)
+        )
 
     def cast_polars_series(
         self,

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql as psql
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
     from .struct import StructType
 

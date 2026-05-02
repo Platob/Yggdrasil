@@ -47,7 +47,7 @@ from typing import Optional, Union, Any, Generator
 
 import pyarrow as pa
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.data.schema import Schema, Field
 from yggdrasil.lazy_imports import (

@@ -25,7 +25,7 @@ import pyarrow as pa
 import pyarrow.json as pa_json
 import yggdrasil.pickle.json as json_module
 from yggdrasil.arrow.cast import any_to_arrow_batch_iterator
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import (

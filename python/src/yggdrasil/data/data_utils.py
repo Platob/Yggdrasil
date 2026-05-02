@@ -2,7 +2,7 @@ import hashlib
 import re
 
 try:
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
 except ImportError:
     CastOptions = None
 
@@ -20,7 +20,7 @@ _MULTI_UNDERSCORE = re.compile(r"_+")
 def get_cast_options_class():
     global CastOptions
     if CastOptions is None:
-        from yggdrasil.data.cast.options import CastOptions as _CastOptions
+        from yggdrasil.data.options import CastOptions as _CastOptions
         CastOptions = _CastOptions
     return CastOptions
 

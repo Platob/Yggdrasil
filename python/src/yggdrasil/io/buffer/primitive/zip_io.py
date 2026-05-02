@@ -57,7 +57,7 @@ from weakref import WeakValueDictionary
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode, MediaType, MediaTypes
 from yggdrasil.io.fragment import Fragment, FragmentInfos

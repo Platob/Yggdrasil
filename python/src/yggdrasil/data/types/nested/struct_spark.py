@@ -27,7 +27,7 @@ from yggdrasil.data.types.support import get_spark_sql
 
 if TYPE_CHECKING:
     import pyspark.sql as psql
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
     from .map import MapType
     from .struct import StructType

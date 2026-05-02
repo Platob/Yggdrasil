@@ -36,7 +36,7 @@ from pyarrow.fs import FileSystem, S3FileSystem
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement
 from yggdrasil.databricks.client import DatabricksResource

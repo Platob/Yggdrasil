@@ -19,7 +19,7 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.support import get_polars, get_spark_sql
 
 if TYPE_CHECKING:
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
 
 
 __all__ = [

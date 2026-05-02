@@ -34,7 +34,7 @@ import datetime as dt
 
 import pyarrow as pa
 import pytest
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field  # yggdrasil's Field class
 from yggdrasil.data.types.primitive.temporal import (
     DateType,

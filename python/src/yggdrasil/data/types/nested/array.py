@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
     from .map import MapType
 

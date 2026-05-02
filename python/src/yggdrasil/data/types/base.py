@@ -16,6 +16,8 @@ from typing import (
     Annotated,
     Any,
     ClassVar,
+    Iterable,
+    Iterator,
     Literal,
     Optional,
     Union,
@@ -44,7 +46,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql as ps
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
 
 
@@ -1322,6 +1324,20 @@ class DataType(BaseChildrenFields, ABC):
         opts = get_cast_options_class().check(options, **more_options)
         return self._cast_arrow_tabular(table, opts)
 
+    def cast_arrow_batch_iterator(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: "CastOptions | None" = None,
+        **more_options,
+    ) -> "Iterator[pa.RecordBatch]":
+        """Cast a stream of :class:`pa.RecordBatch` against this dtype.
+
+        Non-struct dtypes promote to a single-column struct via
+        :meth:`to_struct` and reuse the struct's iterator helper.
+        """
+        opts = get_cast_options_class().check(options, **more_options)
+        return self._cast_arrow_batch_iterator(batches, opts)
+
     # ==================================================================
     # Cast — arrow internals
     # ==================================================================
@@ -1381,6 +1397,17 @@ class DataType(BaseChildrenFields, ABC):
                 "Need struct implementation for cast_arrow_tabular"
             )
         return self.to_struct()._cast_arrow_tabular(table, options)
+
+    def _cast_arrow_batch_iterator(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: "CastOptions",
+    ) -> "Iterator[pa.RecordBatch]":
+        if self.type_id == DataTypeId.STRUCT:
+            raise NotImplementedError(
+                "Need struct implementation for cast_arrow_batch_iterator"
+            )
+        return self.to_struct()._cast_arrow_batch_iterator(batches, options)
 
     # ==================================================================
     # Cast — public polars dispatchers

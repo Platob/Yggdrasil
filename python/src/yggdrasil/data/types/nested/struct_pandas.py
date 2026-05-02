@@ -21,7 +21,7 @@ from yggdrasil.data.types.support import get_pandas
 
 if TYPE_CHECKING:
     import pandas as pd
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
     from .array import ArrayType
     from .struct import StructType

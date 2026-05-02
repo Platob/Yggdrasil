@@ -56,7 +56,7 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema, schema
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg

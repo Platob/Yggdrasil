@@ -31,7 +31,7 @@ from yggdrasil.lazy_imports import polars_module
 
 if TYPE_CHECKING:
     import polars
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
     from .array import ArrayType
     from .map import MapType

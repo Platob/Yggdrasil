@@ -95,7 +95,7 @@ from typing import (
 import pyarrow as pa
 
 from yggdrasil.arrow.cast import any_to_arrow_table
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv

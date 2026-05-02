@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Optional
 import pyarrow as pa
 
 from yggdrasil.data import Schema
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementResult,

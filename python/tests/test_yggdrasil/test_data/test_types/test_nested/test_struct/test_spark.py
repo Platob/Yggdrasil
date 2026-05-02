@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from yggdrasil.data import Field
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested.struct import (
     cast_spark_list_column,
     cast_spark_map_column,

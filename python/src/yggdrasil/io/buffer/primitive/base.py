@@ -63,7 +63,7 @@ from abc import ABC
 from typing import Any, Iterator, Literal
 
 from yggdrasil.arrow.cast import any_to_arrow_table
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer import BytesIO

@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 import pyarrow as pa
 
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     import polars
     import pyspark.sql as psql
     import pyspark.sql.types as pst
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
 
 
@@ -360,6 +360,21 @@ class StructType(NestedType):
     ):
         return cast_arrow_tabular(table, options.check_source(table).check_target(self))
 
+    def _cast_arrow_batch_iterator(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: "CastOptions",
+    ) -> Iterator[pa.RecordBatch]:
+        """Cast a stream of :class:`pa.RecordBatch` against this struct.
+
+        Per-batch goes through :meth:`_cast_arrow_tabular`; when
+        ``options.byte_size`` is set, the output stream is repacked to
+        approximately that many bytes per batch. See
+        :func:`struct_arrow.cast_arrow_batch_iterator` for the full
+        algorithm.
+        """
+        return cast_arrow_batch_iterator(batches, options.check_target(self))
+
     def _cast_polars_series(
         self,
         series: "polars.Series",
@@ -488,6 +503,8 @@ from .struct_arrow import (  # noqa: E402
     cast_arrow_map_array,
     cast_arrow_list_array,
     cast_arrow_tabular,
+    cast_arrow_batch_iterator,
+    rechunk_arrow_batches_by_byte_size,
 )
 from .struct_polars import (  # noqa: E402
     cast_polars_struct_expr,

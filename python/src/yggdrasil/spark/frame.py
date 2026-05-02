@@ -6,7 +6,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import BinaryType, StructField, StructType
 
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
-from yggdrasil.data.cast.options import CastOptions, convert
+from yggdrasil.data.options import CastOptions, convert
 from yggdrasil.environ import PyEnv
 from yggdrasil.pickle.ser.serde import loads, dumps
 

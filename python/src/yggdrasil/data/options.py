@@ -72,12 +72,22 @@ from typing import Any, Mapping, TypeVar, Union, TYPE_CHECKING
 import pyarrow as pa
 from yggdrasil.data.expr import Predicate
 
-from yggdrasil.data.schema import Field, Schema
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.enums import Mode
+from yggdrasil.lazy_imports import field_class, schema_class
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+    from yggdrasil.data.data_field import Field
+    from yggdrasil.data.schema import Schema
+
+# ``Field`` / ``Schema`` are imported lazily — top-level imports here
+# would form a cycle through ``yggdrasil.data.schema`` ↔
+# ``yggdrasil.data.data_field`` during ``yggdrasil.data`` bootstrap
+# (this module is reached transitively from ``data_field`` via the
+# ``io`` chain). The deferred ``field_class()`` / ``schema_class()``
+# helpers from :mod:`yggdrasil.lazy_imports` keep the runtime contract
+# without anchoring the cycle.
 
 
 __all__ = [
@@ -169,6 +179,7 @@ class CastOptions:
         # Field normalization — accept pa.Schema/Field/DataType, dict,
         # yggdrasil Field/Schema, or None. Field.from_(None) returns
         # None so the no-cast case passes through cleanly.
+        Field = field_class()
         if self.source_field is not None and not isinstance(self.source_field, Field):
             object.__setattr__(self, "source_field", Field.from_(self.source_field))
         if self.target_field is not None and not isinstance(self.target_field, Field):
@@ -303,7 +314,7 @@ class CastOptions:
             return cls._build(merged, source=source, target=target)
 
         # 4. Schema-shaped → promote to a target_field hint.
-        if isinstance(options, (pa.DataType, pa.Field, pa.Schema, Field, Schema)):
+        if isinstance(options, (pa.DataType, pa.Field, pa.Schema, field_class(), schema_class())):
             overrides.setdefault("target_field", options)
             return cls._build(overrides, source=source, target=target)
 
@@ -416,7 +427,7 @@ class CastOptions:
         """
         if self.source_field is None and obj is not None:
             return self.with_source(
-                obj() if callable(obj) else Field.from_(obj),
+                obj() if callable(obj) else field_class().from_(obj),
                 copy=copy
             )
         return self
@@ -434,12 +445,12 @@ class CastOptions:
         """
         if self.target_field is None and obj is not None:
             return self.with_target(
-                obj() if callable(obj) else Field.from_(obj),
+                obj() if callable(obj) else field_class().from_(obj),
                 copy=copy
             )
         return self
 
-    def with_source(self: T, source: Field, copy: bool = False) -> T:
+    def with_source(self: T, source: "Field", copy: bool = False) -> T:
         """Return a copy with *field* as the new source field.
 
         Accepts the same shapes :meth:`Field.from_` does (pa schema,
@@ -449,7 +460,7 @@ class CastOptions:
         don't bypass it here because going through ``replace`` gets
         the normalization for free.
         """
-        source = Field.from_(source)
+        source = field_class().from_(source)
 
         if source == self.source_field:
             return self
@@ -459,9 +470,9 @@ class CastOptions:
         object.__setattr__(self, "source_field", source)
         return self
 
-    def with_target(self: T, target: Field, copy: bool = True) -> T:
+    def with_target(self: T, target: "Field", copy: bool = True) -> T:
         """Return a copy with *field* as the new target field."""
-        target = Field.from_(target)
+        target = field_class().from_(target)
 
         if target == self.target_field:
             return self
@@ -618,6 +629,18 @@ class CastOptions:
         if self.target_field is None:
             return table
         return self.merged_field.cast_arrow_tabular(table, options=self)
+
+    def cast_arrow_batch_iterator(self, batches: Any) -> Any:
+        """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size``.
+
+        Passthrough when ``target_field`` is unbound. Otherwise delegates
+        to :meth:`Field.cast_arrow_batch_iterator`, which routes through
+        the struct-side helper for per-batch tabular cast and streamed
+        ``byte_size`` coalescing.
+        """
+        if self.target_field is None:
+            return batches
+        return self.merged_field.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level null fill — delegates to :meth:`Field.fill_arrow`."""

@@ -6,7 +6,7 @@ import polars as pl
 import pyarrow as pa
 
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.pickle.serde import ObjectSerde
 

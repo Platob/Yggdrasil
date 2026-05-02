@@ -96,7 +96,7 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.data.expr import Expr, Predicate
 from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
