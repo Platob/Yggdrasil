@@ -59,6 +59,7 @@ from .sql_utils import (
     quote_qualified_ident,
     sql_literal, escape_sql_string,
 )
+from .table_options import TableOptions
 from ...lazy_imports import aws_config_class
 
 if TYPE_CHECKING:
@@ -75,7 +76,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
-__all__ = ["Table"]
+__all__ = ["Table", "TableOptions"]
 
 logger = logging.getLogger(__name__)
 
@@ -376,8 +377,12 @@ def _column_type_name_from_ddl(ddl: str) -> ColumnTypeName:
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, TabularIO):
+class Table(DatabricksResource, TabularIO[TableOptions]):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
+
+    @classmethod
+    def options_class(cls) -> type[TableOptions]:
+        return TableOptions
 
     def __init__(
         self,
@@ -441,7 +446,7 @@ class Table(DatabricksResource, TabularIO):
                 data: Any | None = None) -> "TabularIO":
         return self
 
-    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+    def _read_arrow_batches(self, options: TableOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
         safe_char = "`"
         names = ",".join(
@@ -451,14 +456,14 @@ class Table(DatabricksResource, TabularIO):
         query = f"SELECT {names}"
         if options.where:
             query += f" WHERE {options.where.with_flavor("databricks")}"
-            
+
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
 
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
-        options: CastOptions
+        options: TableOptions
     ) -> None:
         options = options.with_target(self.collect_schema(options))
 
@@ -466,7 +471,15 @@ class Table(DatabricksResource, TabularIO):
             batches,
             mode=options.mode,
             match_by=options.match_by_names,
-            wait=options.wait
+            update_cols=options.update_cols,
+            wait=options.wait,
+            zorder_by=options.zorder_by,
+            optimize_after_merge=options.optimize_after_merge,
+            vacuum_hours=options.vacuum_hours,
+            where=options.where,
+            prune_by=options.prune_by,
+            prune_values=options.prune_values,
+            retry=options.retry,
         )
     
     # Properties
