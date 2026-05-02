@@ -1,5 +1,4 @@
-"""Marker subclass of :class:`PrimitiveIO` for single-buffer tabular
-formats.
+"""Marker subclass of :class:`BytesIO` for single-buffer tabular formats.
 
 All mode resolution, codec round-tripping, append/upsert via
 rewrite, and lifecycle context management live on :class:`PrimitiveIO`
@@ -17,43 +16,18 @@ Why keep the layer at all?
    to nested writers — having the hook point in the hierarchy
    means we don't need to refactor again to add it.
 
-Multiple inheritance contract
------------------------------
+Inheritance shape
+-----------------
 
-:class:`PrimitiveIO` is the multi-inheritance fold point of
-:class:`BytesIO` (the byte buffer + path-bound storage) and
-:class:`TabularIO` (the engine-agnostic Arrow protocol). The
-two share :class:`Disposable` as their common base. For the
-slot layout to compose, exactly one of them may add slots
-beyond Disposable — :class:`TabularIO` is therefore declared
-with ``__slots__ = ()`` and its two cache fields
-(``_arrow_table`` / ``_spark_frame``) are carried here on
-:class:`PrimitiveIO` instead. The conflicts that DO need
-resolution beyond layout:
-
-- ``__new__``  — :class:`BytesIO` doesn't override it; ``TabularIO``
-  does media-type dispatch through its registry. We funnel
-  ``PrimitiveIO(...)`` calls through ``TabularIO.__new__`` so the
-  registry lookup picks the right leaf (ParquetIO, ArrowIPCIO,
-  …); calls already specialized to a leaf class skip dispatch.
-
-- ``__init__`` — :class:`BytesIO.__init__` accepts the buffer's
-  kwarg signature; :class:`TabularIO.__init__` only zeroes the
-  cache slots. We call ``BytesIO.__init__`` (which forwards
-  ``auto_open`` and friends) and then poke the two cache slots
-  directly, side-stepping a redundant ``Disposable.__init__``.
-
-- ``_release`` — both parents define it. Python MRO would silently
-  drop ``TabularIO._release`` (the cache flush). We override here
-  to call both, in the right order: clear caches first (cheap,
-  pure Python state), then let ``BytesIO`` do its fd/spill
-  teardown.
-
-- ``default_mime_type`` — :class:`TabularIO`'s default returns
-  :data:`MimeTypes.OCTET_STREAM`, which would auto-register
-  :class:`PrimitiveIO` itself and shadow the BytesIO fallback in
-  :meth:`TabularIO.media_type_class`. Override to return ``None``
-  so the registry skips this layer.
+:class:`BytesIO` is now itself a :class:`TabularIO` (its tabular
+hooks redirect to a media-typed view, or fail if the buffer is
+opaque). :class:`PrimitiveIO` therefore single-inherits from
+:class:`BytesIO`: the cache slots, ``cached`` / ``unpersist``,
+the ``__init_subclass__`` registry, and the lifecycle ``_release``
+all come from up the chain. Concrete leaves (ParquetIO, ArrowIPCIO,
+CsvIO, …) implement the two abstract Arrow hooks
+(``_read_arrow_batches`` / ``_write_arrow_batches``) and override
+``default_mime_type`` to register; everything else is inherited.
 """
 
 from __future__ import annotations
@@ -75,15 +49,16 @@ from yggdrasil.lazy_imports import fragment_class, fragment_infos_class
 __all__ = ["PrimitiveIO"]
 
 
-class PrimitiveIO(BytesIO, TabularIO, ABC):
+class PrimitiveIO(BytesIO, ABC):
     """Marker base for single-buffer tabular formats.
 
     The IO *is* the buffer: a :class:`PrimitiveIO` instance behaves
     as both a :class:`BytesIO` (positional read/write, spill,
     path binding) and a :class:`TabularIO` (engine-agnostic Arrow
-    protocol). Concrete leaves (ParquetIO, ArrowIPCIO, CsvIO, …)
-    implement the two abstract Arrow hooks (``_read_arrow_batches``
-    / ``_write_arrow_batches``) and inherit everything else.
+    protocol — inherited via :class:`BytesIO`). Concrete leaves
+    (ParquetIO, ArrowIPCIO, CsvIO, …) implement the two abstract
+    Arrow hooks (``_read_arrow_batches`` / ``_write_arrow_batches``)
+    and inherit everything else.
     """
 
     # ------------------------------------------------------------------
@@ -95,9 +70,8 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
         """Don't claim any mime type — only concrete leaves register.
 
         Without this override, :meth:`TabularIO.__init_subclass__`
-        would register :class:`PrimitiveIO` itself against
-        :data:`MimeTypes.OCTET_STREAM` (inherited default), shadowing
-        :class:`BytesIO` as the fallback in
+        would register :class:`PrimitiveIO` itself against the
+        inherited default and shadow the fallback in
         :meth:`TabularIO.media_type_class`.
         """
         return None
@@ -120,55 +94,26 @@ class PrimitiveIO(BytesIO, TabularIO, ABC):
           ``TabularIO.__new__``).
         - ``ParquetIO(path=...)`` — already a concrete leaf;
           ``TabularIO.__new__`` short-circuits via the
-          ``_FINAL_TABULAR_IO`` flag or the ``target is cls`` check
-          and returns ``object.__new__(cls)``.
-
-        The data positional is forwarded so the dispatch sees both
-        kwarg-supplied media_type and any path-ish data positional.
+          ``_FINAL_TABULAR_IO`` flag and returns
+          ``object.__new__(cls)``.
         """
         return TabularIO.__new__(cls, data, *args, **kwargs)
 
     def __init__(self, data: Any = None, *args: Any, **kwargs: Any) -> None:
+        # BytesIO.__init__ now owns the cache-slot initialization
+        # (TabularIO contract), so we just delegate.
         BytesIO.__init__(self, data, *args, **kwargs)
-        # Don't call TabularIO.__init__ — it would re-run Disposable.__init__
-        # and stomp BytesIO's already-initialized state. Set the cache slots
-        # directly (matches the docstring contract).
-        self._arrow_table = None
-        self._spark_frame = None
 
         if self._media_type is None:
             mt = self.default_mime_type()
-
-            if not mt.is_any_bytes:
+            if mt is not None and not mt.is_any_bytes:
                 self._media_type = MediaType(mt)
 
     # ------------------------------------------------------------------
-    # Lifecycle — chain both parents' _release
+    # TabularIO contract — concrete leaves can persist directly through
+    # their own _read_arrow_batches without going via _tabular_view (which
+    # for a final leaf returns None).
     # ------------------------------------------------------------------
-
-    def _release(self) -> None:
-        """Tear down both halves on close.
-
-        MRO would otherwise silently drop ``TabularIO._release``
-        (which clears the Arrow / Spark caches). Order matters:
-        clear the in-process caches first — they're pure Python
-        state, can't fail meaningfully — then let ``BytesIO`` do
-        its fd-close / spill-unlink dance, which is the part that
-        can raise and must run regardless.
-        """
-        TabularIO._release(self)
-
-        # BytesIO side: flush transaction buffer, close fd, unlink
-        # owned spill. May raise; caller wants that error.
-        BytesIO._release(self)
-
-    @property
-    def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
-
-    def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
 
     def persist(
         self,

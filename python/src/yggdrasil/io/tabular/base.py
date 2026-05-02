@@ -67,17 +67,17 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MediaType, MimeTypes, MimeType, MediaTypes, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.lazy_imports import (
+    bytes_io_class,
     polars_module,
     pyarrow_dataset_module, path_class,
 )
-
-from ..buffer import BytesIO
 
 if TYPE_CHECKING:
     import pandas
     import polars as pl
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
+    from yggdrasil.io.buffer.bytes_io import BytesIO
 
 
 __all__ = ["TabularIO"]
@@ -172,7 +172,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
             return object.__new__(cls)
 
         if data is not None:
-            if isinstance(data, BytesIO):
+            if isinstance(data, bytes_io_class()):
                 media_type = media_type or data._media_type
                 path = path or data.path
 
@@ -301,7 +301,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if cls._FINAL_TABULAR_IO and isinstance(obj, cls):
             return obj
 
-        buffer = BytesIO.from_(obj, media_type=media_type, default=None)
+        buffer = bytes_io_class().from_(obj, media_type=media_type, default=None)
         
         if buffer is None:
             if default is ...:
@@ -315,11 +315,11 @@ class TabularIO(Disposable, ABC, Generic[O]):
     @classmethod
     def from_bytes_io(
         cls,
-        buffer: BytesIO,
+        buffer: "BytesIO",
         media_type: MediaType | None = None,
         default: Any = ...
     ):
-        buffer = BytesIO.from_(buffer)
+        buffer = bytes_io_class().from_(buffer)
         if media_type is None:
             media_type = buffer.media_type
         else:
@@ -395,6 +395,37 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: O,
     ) -> None:
         """Consume Arrow record batches and persist them."""
+
+    def _iter_children(self, options: O) -> "Iterator[TabularIO]":
+        """Yield this IO's direct children, each as a :class:`TabularIO`.
+
+        Single-buffer leaves (``PrimitiveIO``, ``BytesIO`` without a
+        tabular media type, ``StatementResult``, …) yield nothing —
+        they ARE the leaf and have no sub-IO surface. Folder/archive
+        aggregations (:class:`NestedIO` subclasses, :class:`ZipIO`)
+        override to yield one IO per data unit (file, entry,
+        partition leaf), each itself a :class:`TabularIO` openable
+        on its own.
+
+        :class:`Fragment` indirection is intentionally absent —
+        children are real IOs with their own ``parent`` back-pointer,
+        so callers can walk the tree and drain Arrow batches
+        uniformly.
+
+        Default: yields nothing — the right answer for any
+        single-source TabularIO. :class:`NestedIO` re-declares this
+        abstract so folder-shaped subclasses can't accidentally
+        inherit the empty default.
+        """
+        return iter(())
+
+    def iter_children(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO]":
+        """Public wrapper around :meth:`_iter_children`."""
+        return self._iter_children(self.check_options(options, overrides=locals()))
 
     # ==================================================================
     # Static helpers

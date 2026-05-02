@@ -151,10 +151,9 @@ class ZipIO(NestedIO[ZipOptions]):
     # Children — enumerate the archive's central directory
     # ==================================================================
 
-    def iter_children(
+    def _iter_children(
         self,
-        options: "ZipOptions | None" = None,
-        **kwargs: Any,
+        options: ZipOptions,
     ) -> "Iterator[ZipEntryIO]":
         """Yield one :class:`ZipEntryIO` per entry in the archive.
 
@@ -200,7 +199,7 @@ class ZipIO(NestedIO[ZipOptions]):
         return self.make_child(name)
 
     def __iter__(self) -> "Iterator[ZipEntryIO]":
-        return self.iter_children()
+        return self._iter_children(self._default_options())
 
     def __contains__(self, name: object) -> bool:
         if not isinstance(name, str):

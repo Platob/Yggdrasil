@@ -288,10 +288,9 @@ class NestedIO(TabularIO[O], ABC):
     # ==================================================================
 
     @abstractmethod
-    def iter_children(
+    def _iter_children(
         self,
-        options: "O | None" = None,
-        **kwargs: Any,
+        options: O,
     ) -> "Iterator[TabularIO | BytesIO]":
         """Yield this folder's direct children, each as an autonomous IO.
 
@@ -310,6 +309,10 @@ class NestedIO(TabularIO[O], ABC):
         chain. Children are returned closed; the caller (or the
         derived ``_read_arrow_batches`` loop) opens them inside a
         ``with`` block.
+
+        Public callers should use :meth:`iter_children` (inherited
+        from :class:`TabularIO`) which runs :meth:`check_options`
+        first.
         """
 
     # ==================================================================
@@ -360,9 +363,13 @@ class NestedIO(TabularIO[O], ABC):
     def is_empty(self) -> bool:
         """True when the folder has no non-ignored children."""
         try:
-            return next(iter(self.iter_children()), None) is None
+            return next(iter(self._iter_children(self._default_options())), None) is None
         except FileNotFoundError:
             return True
+
+    def _default_options(self) -> O:
+        """Build a default options instance for internal-only enumeration."""
+        return self.options_class()()
 
     def _resolve_save_mode(self, mode: Any) -> Mode:
         """Resolve any :class:`Mode` to one a folder writer can branch on."""
@@ -439,7 +446,7 @@ class NestedIO(TabularIO[O], ABC):
             yield from self._read_arrow_batches_from_cache(options)
             return
 
-        for child in self.iter_children(options):
+        for child in self._iter_children(options):
             yield from self._read_child_batches(child, options)
 
     def _read_child_batches(
@@ -471,7 +478,7 @@ class NestedIO(TabularIO[O], ABC):
         """Merge per-child schemas into a single folder schema."""
         merged: Schema | None = None
 
-        for child in self.iter_children(options):
+        for child in self._iter_children(options):
             schema: Schema | None = None
             if isinstance(child, NestedIO):
                 with child:

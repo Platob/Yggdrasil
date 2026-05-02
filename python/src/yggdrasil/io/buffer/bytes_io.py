@@ -108,9 +108,11 @@ from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
+from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
+from yggdrasil.io.tabular.base import TabularIO
 from yggdrasil.io.types import BytesLike
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import tabular_io_class, local_path_class, path_class
@@ -118,8 +120,8 @@ from yggdrasil.lazy_imports import tabular_io_class, local_path_class, path_clas
 if TYPE_CHECKING:
     import blake3
     import xxhash
+    from collections.abc import Iterable, Iterator
     from yggdrasil.io.fs import Path
-    from yggdrasil.io.tabular import TabularIO
 
 
 __all__ = ["BytesIO", "BufferLike"]
@@ -256,7 +258,7 @@ def _flags_for_mode(mode: str) -> int:
 # ===========================================================================
 
 
-class BytesIO(Disposable, IO[bytes]):
+class BytesIO(TabularIO[CastOptions], IO[bytes]):
     """Spill-to-disk byte buffer with optional caller-owned path.
 
     Two construction shapes:
@@ -272,6 +274,13 @@ class BytesIO(Disposable, IO[bytes]):
     same primitive set. The only behavioural difference is the
     cleanup decision in :meth:`_release`, gated on
     :attr:`_owns_spill_path`.
+
+    A :class:`BytesIO` IS-A :class:`TabularIO`. Without a tabular
+    media type set, the tabular hooks (``_read_arrow_batches`` /
+    ``_write_arrow_batches`` / ``_iter_children``) raise — the buffer
+    on its own has no idea what format the bytes are in. Setting a
+    media type (or calling :meth:`as_media`) routes through the
+    registered concrete leaf (Parquet, IPC, CSV, …) which knows.
     """
 
     __slots__ = (
@@ -287,8 +296,23 @@ class BytesIO(Disposable, IO[bytes]):
         "_spill_ttl",
         "_owns_spill_path",
         "_mode",
-        "_metadata"
+        "_metadata",
+        "_arrow_table",
+        "_spark_frame",
     )
+
+    @classmethod
+    def default_mime_type(cls) -> "MimeType | None":
+        """Don't auto-register against any mime type.
+
+        :class:`TabularIO.__init_subclass__` registers concrete
+        subclasses against their mime type. :class:`BytesIO` is the
+        opaque-bytes layer — there's no single mime it owns, and
+        registering against ``OCTET_STREAM`` would shadow the
+        fallback resolution in :meth:`TabularIO.media_type_class`.
+        Returning ``None`` opts out cleanly.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Construction
@@ -352,7 +376,9 @@ class BytesIO(Disposable, IO[bytes]):
                 from .primitive import PrimitiveIO
                 return PrimitiveIO.__new__(PrimitiveIO, data, media_type=media_type)
 
-        return super().__new__(cls)
+        # Bypass TabularIO.__new__'s dispatch — the BytesIO layer has
+        # already resolved any media-type-driven redirection above.
+        return object.__new__(cls)
 
     def __init__(
         self,
@@ -395,6 +421,12 @@ class BytesIO(Disposable, IO[bytes]):
             None if media_type is None else MediaType.from_(media_type)
         )
         self._metadata = metadata or {}
+        # TabularIO cache slots — populated by persist(), cleared by
+        # unpersist(). A buffer with no tabular media type can't
+        # actually use them, but the slots have to exist for the
+        # contract.
+        self._arrow_table = None
+        self._spark_frame = None
 
         if path is not None:
             # Path-bound. Caller owns the path; we don't unlink on close.
@@ -741,20 +773,23 @@ class BytesIO(Disposable, IO[bytes]):
 
         Order matters:
 
-        1. **Flush first.** For non-local-path backings, commit the
+        1. **Drop tabular caches first** — pure Python state, can't
+           fail meaningfully, want them out before any byte ops.
+        2. **Flush.** For non-local-path backings, commit the
            transaction buffer back via ``path.pwrite`` +
            ``path.truncate``. Skipped if the buffer was opened
            read-only.
-        2. **Close the transaction buffer**, releasing any local
+        3. **Close the transaction buffer**, releasing any local
            spill it acquired.
-        3. **Close the local fd** (if any).
-        4. **Unlink the spill file** if owned. Caller-owned paths
+        4. **Close the local fd** (if any).
+        5. **Unlink the spill file** if owned. Caller-owned paths
            are left alone.
-
-        ``committed`` is currently unused — the contract is "always
-        flush dirty buffers on close." If finer-grained commit
-        semantics ever ship, this is the hook.
         """
+        # Tabular cache: clear first so a re-open after close starts
+        # cold. Pure-Python state — no failure modes worth handling.
+        self._arrow_table = None
+        self._spark_frame = None
+
         # Close the transaction buffer if we have one. It owns its
         # own spill machinery; closing it releases that.
         if self._transaction_buffer is not None:
@@ -1356,6 +1391,91 @@ class BytesIO(Disposable, IO[bytes]):
             media_type=media_type,
             copy=False
         )
+
+    # ==================================================================
+    # TabularIO contract — redirect to a media-typed view, or fail
+    # ==================================================================
+
+    @property
+    def cached(self) -> bool:
+        return self._arrow_table is not None or self._spark_frame is not None
+
+    def unpersist(self) -> None:
+        self._arrow_table = None
+        self._spark_frame = None
+
+    def persist(
+        self,
+        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
+        *,
+        data: Any | None = None,
+    ) -> "TabularIO":
+        """Cache an Arrow / Spark view of the buffer's tabular content.
+
+        Requires a tabular media type — without one, the buffer has
+        no idea what format the bytes are in. Routes through
+        :meth:`_tabular_view` to do the engine-side persist.
+        """
+        view = self._tabular_view()
+        if view is None:
+            raise NotImplementedError(
+                f"{type(self).__name__}.persist requires a tabular media "
+                "type. Set media_type on the buffer (or call as_media(...)) "
+                "before persisting."
+            )
+        view.persist(engine, data=data)
+        # Mirror the cache state up so cached/unpersist match.
+        self._arrow_table = view._arrow_table
+        self._spark_frame = view._spark_frame
+        return self
+
+    def _tabular_view(self) -> "TabularIO | None":
+        """Return a media-typed view of self, or ``None`` if opaque.
+
+        Used by the tabular contract methods to redirect to the
+        registered concrete leaf (Parquet, IPC, CSV, …) when the
+        buffer carries a tabular media type. Returns ``None`` when
+        there's no media type or the media type is octet-stream —
+        the buffer can't pretend to be tabular without a format.
+        """
+        if self._media_type is None or self._media_type.is_octet:
+            return None
+        view = self.as_media(self._media_type)
+        return view if view is not self else None
+
+    def _read_arrow_batches(self, options: CastOptions) -> "Iterator[pa.RecordBatch]":
+        view = self._tabular_view()
+        if view is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no tabular media type. "
+                "Set media_type or call as_media(...) before reading "
+                "Arrow batches."
+            )
+        with view:
+            yield from view._read_arrow_batches(options)
+
+    def _write_arrow_batches(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: CastOptions,
+    ) -> None:
+        view = self._tabular_view()
+        if view is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no tabular media type. "
+                "Set media_type or call as_media(...) before writing "
+                "Arrow batches."
+            )
+        with view:
+            view._write_arrow_batches(batches, options)
+
+    def _iter_children(self, options: CastOptions) -> "Iterator[TabularIO]":
+        """Single-buffer leaves have no children — yields nothing.
+
+        Folder-shaped IOs override this; for a raw byte buffer the
+        answer is always "this IS the leaf, walk no further."
+        """
+        return iter(())
 
     def copy(
         self,

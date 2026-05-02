@@ -190,10 +190,9 @@ class FolderIO(NestedIO[FolderOptions]):
     # Children — direct enumeration with transparent recursion
     # ==================================================================
 
-    def iter_children(
+    def _iter_children(
         self,
-        options: "FolderOptions | None" = None,
-        **kwargs: Any,
+        options: FolderOptions,
     ) -> "Iterator[TabularIO | BytesIO]":
         """Yield one IO per direct child of :attr:`path`.
 
@@ -214,8 +213,6 @@ class FolderIO(NestedIO[FolderOptions]):
         no error raised. Hidden entries (name starting with ``.``)
         are filtered out by :meth:`_is_ignored_path`.
         """
-        self.check_options(options, overrides=locals())
-
         if not self.path.exists():
             return
 
@@ -440,7 +437,7 @@ class FolderIO(NestedIO[FolderOptions]):
         )
         strict = bool(options.partition_strict)
 
-        for child in self.iter_children(options):
+        for child in self._iter_children(options):
             if isinstance(child, NestedIO):
                 with child:
                     yield from child._read_arrow_batches(options)
