@@ -32,7 +32,7 @@ class DataTypeId(IntEnum):
 
 
     @property
-    def is_primitive(self) -> bool:
+    def is_scalar(self) -> bool:
         return 0 < self.value < 32
 
     @property
