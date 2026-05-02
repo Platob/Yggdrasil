@@ -1,25 +1,27 @@
-"""Full equals-protocol tests for DataType / Field / Schema.
+"""Equals protocol across :class:`DataType` / :class:`Field` / :class:`Schema`.
 
-Covers:
+The protocol — pinned here — is the structural-comparison backbone the
+rest of the library leans on for cache invalidation, schema drift
+detection, and "do these two upstream sources agree?" checks.
 
-- Primitive dtypes: identity, distinct type_id, parameterized differences
-  (byte_size / signed / unit / timezone / precision / scale), and the
+* DataType: identity, distinct ``type_id``, parameterized differences
+  (byte_size / signed / unit / tz / precision / scale), and the
   ``check_dtypes`` / ``check_metadata`` / ``check_names`` toggles.
-- Field: coercion of non-Field inputs, name / nullable / metadata, and
-  delegation to dtype.equals.
-- Nested dtypes (ArrayType, MapType, StructType): pairwise child
-  comparison, reorder tolerance, missing / renamed / extra children,
-  and deep recursion.
-- Schema: coercion, reorder tolerance, metadata scope, and recursive
-  comparison through several layers of struct/array/map nesting.
+* Field: name + nullable + dtype delegation, plus the coercion-failure
+  path that quietly returns False instead of raising.
+* Nested types: pairwise child comparison, missing / renamed / extra
+  children, deep recursion through array-of-map-of-struct.
+* Schema: name-keyed equality (so reorder is tolerated), missing/extra
+  field detection, metadata gating, and recursion through several
+  layers of nesting.
 
-The tests don't depend on any engine (polars/pandas/spark) — they only
-exercise the pure-Python equality protocol.
+No engine dependency — pure-Python equality only.
 """
-
 from __future__ import annotations
 
 import unittest
+
+import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema
@@ -40,113 +42,128 @@ from yggdrasil.data.types.primitive import (
 
 
 # ---------------------------------------------------------------------------
-# DataType.equals - primitive types
+# DataType — primitives
 # ---------------------------------------------------------------------------
 
 
 class TestPrimitiveEquals(unittest.TestCase):
 
-    def test_same_integer_equal(self):
-        a = IntegerType(byte_size=8, signed=True)
-        b = IntegerType(byte_size=8, signed=True)
-        self.assertTrue(a.equals(b))
+    def test_same_integer_equal(self) -> None:
+        self.assertTrue(
+            IntegerType(byte_size=8, signed=True).equals(
+                IntegerType(byte_size=8, signed=True)
+            )
+        )
 
-    def test_integer_different_byte_size_not_equal(self):
-        a = IntegerType(byte_size=4, signed=True)
-        b = IntegerType(byte_size=8, signed=True)
-        self.assertFalse(a.equals(b))
+    def test_integer_byte_size_differs(self) -> None:
+        self.assertFalse(
+            IntegerType(byte_size=4, signed=True).equals(
+                IntegerType(byte_size=8, signed=True)
+            )
+        )
 
-    def test_integer_different_signed_not_equal(self):
-        a = IntegerType(byte_size=8, signed=True)
-        b = IntegerType(byte_size=8, signed=False)
-        self.assertFalse(a.equals(b))
+    def test_integer_signed_differs(self) -> None:
+        self.assertFalse(
+            IntegerType(byte_size=8, signed=True).equals(
+                IntegerType(byte_size=8, signed=False)
+            )
+        )
 
-    def test_different_type_id_not_equal(self):
+    def test_different_type_ids_unequal(self) -> None:
         self.assertFalse(IntegerType().equals(FloatingPointType()))
         self.assertFalse(StringType().equals(BinaryType()))
         self.assertFalse(BooleanType().equals(IntegerType(byte_size=1)))
 
-    def test_null_equals_null(self):
+    def test_null_equals_null(self) -> None:
         self.assertTrue(NullType().equals(NullType()))
 
-    def test_object_equals_object(self):
+    def test_object_equals_object(self) -> None:
         self.assertTrue(ObjectType().equals(ObjectType()))
 
-    def test_object_not_equal_primitive(self):
+    def test_object_unequal_to_primitive(self) -> None:
         self.assertFalse(ObjectType().equals(StringType()))
 
-    def test_timestamp_unit_differs(self):
-        a = TimestampType(unit="us", tz=None)
-        b = TimestampType(unit="ns", tz=None)
-        self.assertFalse(a.equals(b))
+    def test_timestamp_unit_differs(self) -> None:
+        self.assertFalse(
+            TimestampType(unit="us", tz=None).equals(
+                TimestampType(unit="ns", tz=None)
+            )
+        )
 
-    def test_timestamp_tz_differs(self):
-        a = TimestampType(unit="us", tz=None)
-        b = TimestampType(unit="us", tz="UTC")
-        self.assertFalse(a.equals(b))
+    def test_timestamp_tz_differs(self) -> None:
+        self.assertFalse(
+            TimestampType(unit="us", tz=None).equals(
+                TimestampType(unit="us", tz="UTC")
+            )
+        )
 
-    def test_timestamp_same_tz_equal(self):
-        a = TimestampType(unit="us", tz="UTC")
-        b = TimestampType(unit="us", tz="UTC")
-        self.assertTrue(a.equals(b))
+    def test_timestamp_same_tz_equal(self) -> None:
+        self.assertTrue(
+            TimestampType(unit="us", tz="UTC").equals(
+                TimestampType(unit="us", tz="UTC")
+            )
+        )
 
-    def test_decimal_precision_scale(self):
+    def test_decimal_equality_carries_precision_and_scale(self) -> None:
         a = DecimalType(precision=10, scale=2)
-        b = DecimalType(precision=10, scale=2)
-        self.assertTrue(a.equals(b))
 
+        self.assertTrue(a.equals(DecimalType(precision=10, scale=2)))
         self.assertFalse(a.equals(DecimalType(precision=10, scale=3)))
         self.assertFalse(a.equals(DecimalType(precision=12, scale=2)))
 
-    def test_string_equals_string(self):
+    def test_string_and_date_default_equal_to_self(self) -> None:
         self.assertTrue(StringType().equals(StringType()))
-
-    def test_date_equals_date(self):
         self.assertTrue(DateType().equals(DateType()))
 
-    def test_duration_unit_differs(self):
+    def test_duration_unit_differs(self) -> None:
         self.assertFalse(
             DurationType(unit="ms").equals(DurationType(unit="us"))
         )
 
 
 # ---------------------------------------------------------------------------
-# DataType.equals - nested types
+# DataType — nested
 # ---------------------------------------------------------------------------
 
 
 class TestNestedEquals(unittest.TestCase):
 
-    def test_array_of_same_inner_equal(self):
+    def test_array_of_same_inner_equal(self) -> None:
         a = ArrayType.from_item(IntegerType().to_field(name="item"))
         b = ArrayType.from_item(IntegerType().to_field(name="item"))
+
         self.assertTrue(a.equals(b))
 
-    def test_array_different_inner_not_equal(self):
+    def test_array_inner_dtype_differs(self) -> None:
         a = ArrayType.from_item(IntegerType().to_field(name="item"))
         b = ArrayType.from_item(StringType().to_field(name="item"))
+
         self.assertFalse(a.equals(b))
 
-    def test_array_not_equal_to_struct(self):
+    def test_array_unequal_to_struct(self) -> None:
         arr = ArrayType.from_item(IntegerType().to_field(name="item"))
         st = StructType(fields=[IntegerType().to_field(name="x")])
+
         self.assertFalse(arr.equals(st))
 
-    def test_array_not_equal_to_primitive(self):
+    def test_array_unequal_to_primitive(self) -> None:
         arr = ArrayType.from_item(IntegerType().to_field(name="item"))
+
         self.assertFalse(arr.equals(IntegerType()))
 
-    def test_map_same_equal(self):
+    def test_map_equal_when_kv_match(self) -> None:
         a = MapType.from_key_value(StringType(), IntegerType())
         b = MapType.from_key_value(StringType(), IntegerType())
+
         self.assertTrue(a.equals(b))
 
-    def test_map_different_value_not_equal(self):
+    def test_map_value_differs(self) -> None:
         a = MapType.from_key_value(StringType(), IntegerType())
         b = MapType.from_key_value(StringType(), StringType())
+
         self.assertFalse(a.equals(b))
 
-    def test_struct_same_equal(self):
+    def test_struct_pairwise_equal(self) -> None:
         a = StructType(
             fields=[
                 IntegerType().to_field(name="a"),
@@ -159,9 +176,10 @@ class TestNestedEquals(unittest.TestCase):
                 StringType().to_field(name="b"),
             ]
         )
+
         self.assertTrue(a.equals(b))
 
-    def test_struct_missing_child_not_equal(self):
+    def test_struct_missing_child_unequal(self) -> None:
         a = StructType(
             fields=[
                 IntegerType().to_field(name="a"),
@@ -169,27 +187,28 @@ class TestNestedEquals(unittest.TestCase):
             ]
         )
         b = StructType(fields=[IntegerType().to_field(name="a")])
+
         self.assertFalse(a.equals(b))
 
-    def test_struct_renamed_child_not_equal(self):
+    def test_struct_renamed_child_unequal(self) -> None:
         a = StructType(fields=[IntegerType().to_field(name="a")])
         b = StructType(fields=[IntegerType().to_field(name="x")])
+
         self.assertFalse(a.equals(b))
 
-    def test_struct_check_names_false_ignores_names(self):
+    def test_struct_check_names_false_ignores_names(self) -> None:
         a = StructType(fields=[IntegerType().to_field(name="a")])
         b = StructType(fields=[IntegerType().to_field(name="x")])
+
         self.assertTrue(a.equals(b, check_names=False))
 
-    def test_struct_check_names_false_compares_positionally(self):
+    def test_struct_check_names_false_compares_positionally(self) -> None:
         a = StructType(
             fields=[
                 IntegerType().to_field(name="a"),
                 StringType().to_field(name="b"),
             ]
         )
-        # Same dtypes in same positions, different names — equal when
-        # check_names=False.
         b = StructType(
             fields=[
                 IntegerType().to_field(name="x"),
@@ -198,7 +217,7 @@ class TestNestedEquals(unittest.TestCase):
         )
         self.assertTrue(a.equals(b, check_names=False))
 
-        # Swapped dtypes positionally → not equal even with check_names=False.
+        # Swap the dtypes positionally → unequal even with names off.
         c = StructType(
             fields=[
                 StringType().to_field(name="a"),
@@ -208,9 +227,9 @@ class TestNestedEquals(unittest.TestCase):
         self.assertFalse(a.equals(c, check_names=False))
 
 
-class TestNestedRecurse(unittest.TestCase):
+class TestNestedRecursion(unittest.TestCase):
 
-    def test_array_of_struct_equal(self):
+    def test_array_of_struct_equal(self) -> None:
         a = ArrayType.from_item(
             StructType(
                 fields=[
@@ -227,52 +246,40 @@ class TestNestedRecurse(unittest.TestCase):
                 ]
             ).to_field(name="item")
         )
+
         self.assertTrue(a.equals(b))
 
-    def test_array_of_struct_diff_child(self):
+    def test_array_of_struct_inner_dtype_differs(self) -> None:
         a = ArrayType.from_item(
             StructType(fields=[IntegerType().to_field(name="x")]).to_field(name="item")
         )
         b = ArrayType.from_item(
             StructType(fields=[StringType().to_field(name="x")]).to_field(name="item")
         )
+
         self.assertFalse(a.equals(b))
 
-    def test_deep_struct_in_map_in_array(self):
-        # Array<Map<String, Struct<a: Array<Int>, b: Struct<c: String>>>>
-        deep_struct = StructType(
-            fields=[
-                ArrayType.from_item(
-                    IntegerType().to_field(name="item")
-                ).to_field(name="a"),
-                StructType(
-                    fields=[StringType().to_field(name="c")]
-                ).to_field(name="b"),
-            ]
-        )
-        map_type = MapType.from_key_value(StringType(), deep_struct)
-        outer = ArrayType.from_item(map_type.to_field(name="item"))
-
-        deep_struct_clone = StructType(
-            fields=[
-                ArrayType.from_item(
-                    IntegerType().to_field(name="item")
-                ).to_field(name="a"),
-                StructType(
-                    fields=[StringType().to_field(name="c")]
-                ).to_field(name="b"),
-            ]
-        )
-        outer_clone = ArrayType.from_item(
-            MapType.from_key_value(StringType(), deep_struct_clone).to_field(
-                name="item"
+    def test_deep_array_of_map_of_struct(self) -> None:
+        def build() -> ArrayType:
+            deep_struct = StructType(
+                fields=[
+                    ArrayType.from_item(
+                        IntegerType().to_field(name="item")
+                    ).to_field(name="a"),
+                    StructType(
+                        fields=[StringType().to_field(name="c")]
+                    ).to_field(name="b"),
+                ]
             )
-        )
+            return ArrayType.from_item(
+                MapType.from_key_value(StringType(), deep_struct).to_field(
+                    name="item"
+                )
+            )
 
-        self.assertTrue(outer.equals(outer_clone))
+        self.assertTrue(build().equals(build()))
 
-    def test_deep_difference_at_leaf(self):
-        # Same structure but with IntegerType vs FloatingPointType at a leaf.
+    def test_deep_difference_at_leaf(self) -> None:
         left = StructType(
             fields=[
                 ArrayType.from_item(
@@ -291,46 +298,50 @@ class TestNestedRecurse(unittest.TestCase):
                 ).to_field(name="arr"),
             ]
         )
+
         self.assertFalse(left.equals(right))
 
 
 # ---------------------------------------------------------------------------
-# Field.equals
+# Field
 # ---------------------------------------------------------------------------
 
 
 class TestFieldEquals(unittest.TestCase):
 
-    def test_same_field_equal(self):
+    def test_same_field_equal(self) -> None:
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
         b = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
+
         self.assertTrue(a.equals(b))
 
-    def test_field_name_differs(self):
+    def test_field_name_differs(self) -> None:
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
         b = Field(name="y", dtype=IntegerType(byte_size=8), nullable=True)
+
         self.assertFalse(a.equals(b))
 
-    def test_field_name_differs_check_names_false(self):
+    def test_field_check_names_false_ignores_name(self) -> None:
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
         b = Field(name="y", dtype=IntegerType(byte_size=8), nullable=True)
+
         self.assertTrue(a.equals(b, check_names=False))
 
-    def test_field_dtype_differs(self):
+    def test_field_dtype_differs(self) -> None:
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
         b = Field(name="x", dtype=StringType(), nullable=True)
+
         self.assertFalse(a.equals(b))
 
-    def test_field_coercion_failure_returns_false(self):
+    def test_uncoercible_input_returns_false_without_raising(self) -> None:
         a = Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)
-        # An object that cannot be coerced to a Field returns False
-        # instead of raising.
+
         self.assertFalse(a.equals("completely unparseable 😵"))
 
 
 class TestFieldNestedEquals(unittest.TestCase):
 
-    def test_field_with_struct_dtype(self):
+    def test_field_with_struct_dtype(self) -> None:
         a = Field(
             name="s",
             dtype=StructType(fields=[IntegerType().to_field(name="x")]),
@@ -341,9 +352,10 @@ class TestFieldNestedEquals(unittest.TestCase):
             dtype=StructType(fields=[IntegerType().to_field(name="x")]),
             nullable=True,
         )
+
         self.assertTrue(a.equals(b))
 
-    def test_deeply_nested_field(self):
+    def test_deep_field_equal(self) -> None:
         def build() -> Field:
             return Field(
                 name="root",
@@ -366,7 +378,7 @@ class TestFieldNestedEquals(unittest.TestCase):
 
         self.assertTrue(build().equals(build()))
 
-    def test_deeply_nested_field_inequal_at_leaf(self):
+    def test_deep_field_leaf_differs(self) -> None:
         left = Field(
             name="root",
             dtype=StructType(
@@ -393,76 +405,61 @@ class TestFieldNestedEquals(unittest.TestCase):
             ),
             nullable=True,
         )
+
         self.assertFalse(left.equals(right))
 
 
 # ---------------------------------------------------------------------------
-# Schema.equals
+# Schema
 # ---------------------------------------------------------------------------
 
 
 class TestSchemaEquals(unittest.TestCase):
 
-    def test_same_schema_equal(self):
-        a = Schema.from_any_fields(
+    @staticmethod
+    def _xy_schema() -> Schema:
+        return Schema.from_any_fields(
             [
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
                 Field(name="y", dtype=StringType(), nullable=True),
             ]
         )
+
+    def test_same_schema_equal(self) -> None:
+        self.assertTrue(self._xy_schema().equals(self._xy_schema()))
+
+    def test_reorder_tolerated_by_default(self) -> None:
+        a = self._xy_schema()
         b = Schema.from_any_fields(
             [
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
                 Field(name="y", dtype=StringType(), nullable=True),
+                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
             ]
         )
+
         self.assertTrue(a.equals(b))
 
-    def test_reordered_schema_equal_by_default(self):
-        a = Schema.from_any_fields(
-            [
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
-                Field(name="y", dtype=StringType(), nullable=True),
-            ]
-        )
+    def test_reorder_inequal_when_check_names_false(self) -> None:
+        a = self._xy_schema()
         b = Schema.from_any_fields(
             [
                 Field(name="y", dtype=StringType(), nullable=True),
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
             ]
         )
-        self.assertTrue(a.equals(b))
 
-    def test_reordered_schema_inequal_when_check_names_false(self):
-        a = Schema.from_any_fields(
-            [
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
-                Field(name="y", dtype=StringType(), nullable=True),
-            ]
-        )
-        b = Schema.from_any_fields(
-            [
-                Field(name="y", dtype=StringType(), nullable=True),
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
-            ]
-        )
-        # Without name matching, positional dtypes don't line up.
         self.assertFalse(a.equals(b, check_names=False))
 
-    def test_missing_field_not_equal(self):
-        a = Schema.from_any_fields(
-            [
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
-                Field(name="y", dtype=StringType(), nullable=True),
-            ]
-        )
+    def test_missing_field_in_either_direction(self) -> None:
+        a = self._xy_schema()
         b = Schema.from_any_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
+
         self.assertFalse(a.equals(b))
         self.assertFalse(b.equals(a))
 
-    def test_extra_field_not_equal(self):
+    def test_extra_field_unequal(self) -> None:
         a = Schema.from_any_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
@@ -472,19 +469,21 @@ class TestSchemaEquals(unittest.TestCase):
                 Field(name="z", dtype=StringType(), nullable=True),
             ]
         )
+
         self.assertFalse(a.equals(b))
 
-    def test_renamed_field_not_equal(self):
+    def test_renamed_field_unequal_unless_check_names_false(self) -> None:
         a = Schema.from_any_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
         b = Schema.from_any_fields(
             [Field(name="z", dtype=IntegerType(byte_size=8), nullable=True)]
         )
+
         self.assertFalse(a.equals(b))
         self.assertTrue(a.equals(b, check_names=False))
 
-    def test_metadata_differs(self):
+    def test_metadata_difference_gated_by_check_metadata(self) -> None:
         a = Schema.from_any_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)],
             metadata={"origin": "A"},
@@ -493,42 +492,32 @@ class TestSchemaEquals(unittest.TestCase):
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)],
             metadata={"origin": "B"},
         )
+
         self.assertFalse(a.equals(b))
         self.assertTrue(a.equals(b, check_metadata=False))
 
-    def test_equals_none_is_false(self):
-        a = Schema.from_any_fields(
-            [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
-        )
-        self.assertFalse(a.equals(None))
+    def test_equals_none_is_false(self) -> None:
+        self.assertFalse(self._xy_schema().equals(None))
 
-    def test_coerces_arrow_schema(self):
-        import pyarrow as pa
-
-        a = Schema.from_any_fields(
-            [
-                Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
-                Field(name="y", dtype=StringType(), nullable=True),
-            ]
-        )
+    def test_coerces_arrow_schema_input(self) -> None:
+        a = self._xy_schema()
         arrow_schema = pa.schema(
             [
                 pa.field("x", pa.int64(), nullable=True),
                 pa.field("y", pa.string(), nullable=True),
             ]
         )
+
         self.assertTrue(a.equals(arrow_schema))
 
-    def test_coercion_failure_returns_false(self):
-        a = Schema.from_any_fields(
-            [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
-        )
-        self.assertFalse(a.equals("not-a-schema-literal"))
+    def test_uncoercible_input_returns_false(self) -> None:
+        self.assertFalse(self._xy_schema().equals("not-a-schema-literal"))
 
 
 class TestSchemaNestedEquals(unittest.TestCase):
 
-    def _build_nested_field(self) -> Field:
+    @staticmethod
+    def _build_nested(tz: str | None = "UTC") -> Field:
         return Field(
             name="events",
             dtype=ArrayType.from_item(
@@ -540,9 +529,9 @@ class TestSchemaNestedEquals(unittest.TestCase):
                             StringType(),
                             StructType(
                                 fields=[
-                                    TimestampType(unit="us", tz="UTC").to_field(
-                                        name="ts"
-                                    ),
+                                    TimestampType(
+                                        unit="us", tz=tz
+                                    ).to_field(name="ts"),
                                     BooleanType().to_field(name="ok"),
                                 ]
                             ),
@@ -553,41 +542,18 @@ class TestSchemaNestedEquals(unittest.TestCase):
             nullable=True,
         )
 
-    def test_nested_schema_equals_clone(self):
-        a = Schema.from_any_fields([self._build_nested_field()])
-        b = Schema.from_any_fields([self._build_nested_field()])
+    def test_nested_clone_is_equal(self) -> None:
+        a = Schema.from_any_fields([self._build_nested()])
+        b = Schema.from_any_fields([self._build_nested()])
+
         self.assertTrue(a.equals(b))
 
-    def test_nested_schema_leaf_type_differs(self):
-        a = Schema.from_any_fields([self._build_nested_field()])
+    def test_nested_leaf_tz_change_breaks_equality(self) -> None:
+        a = Schema.from_any_fields([self._build_nested(tz="UTC")])
+        b = Schema.from_any_fields([self._build_nested(tz=None)])
 
-        mutated = Field(
-            name="events",
-            dtype=ArrayType.from_item(
-                StructType(
-                    fields=[
-                        IntegerType().to_field(name="id"),
-                        StringType().to_field(name="kind"),
-                        MapType.from_key_value(
-                            StringType(),
-                            StructType(
-                                fields=[
-                                    # unit changed ns -> us path covered above;
-                                    # here we change timezone to None.
-                                    TimestampType(unit="us", tz=None).to_field(
-                                        name="ts"
-                                    ),
-                                    BooleanType().to_field(name="ok"),
-                                ]
-                            ),
-                        ).to_field(name="attrs"),
-                    ]
-                ).to_field(name="item")
-            ),
-            nullable=True,
-        )
-        b = Schema.from_any_fields([mutated])
         self.assertFalse(a.equals(b))
+
 
 if __name__ == "__main__":
     unittest.main()

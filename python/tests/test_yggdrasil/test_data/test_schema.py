@@ -1,11 +1,34 @@
+"""``Schema`` — the OrderedDict-shaped, name-keyed schema container.
+
+Schema is intentionally Mutable + Mapping-like: it owns an
+:class:`OrderedDict` of fields, supports ``__getitem__`` / ``__setitem__``
+/ ``pop`` / ``popitem`` / ``setdefault``, and overloads the four set
+operators (``+`` / ``-`` / ``&`` / ``|`` and their in-place variants)
+to make schema reconciliation read like set algebra.
+
+Tests grouped by surface:
+
+* construction — factory, init normalization, ``schema()`` helper.
+* metadata — ``name`` / ``comment`` / ``description``.
+* shape — ``dtype`` / ``arrow_fields`` / ``copy``.
+* mutation — append / extend / setitem / delitem / clear /
+  setdefault / pop / popitem.
+* set operators — add, sub, and, or, plus in-place variants.
+* autotag — schema-level + per-field propagation, partition_by /
+  cluster_by consumption.
+* exporters — to_arrow_schema, to_field, polars / spark flavors.
+* constructors — from_field, from_any_fields, from_any, from_,
+  _coerce_other, _merge_metadata, from_path.
+"""
 from __future__ import annotations
 
 from collections import OrderedDict
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 
+from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema, schema
 from yggdrasil.data.types.nested import StructType
@@ -14,15 +37,20 @@ from yggdrasil.polars.tests import PolarsTestCase
 from yggdrasil.spark.tests import SparkTestCase
 
 
-def _field_int(
+# ---------------------------------------------------------------------------
+# Helpers — every test that builds a field ends up calling one of these.
+# ---------------------------------------------------------------------------
+
+
+def _int_field(
     name: str,
     *,
     nullable: bool = True,
-    metadata: dict[bytes | str, bytes | str | object] | None = None,
-    tags: dict[bytes | str, bytes | str | object] | None = None,
+    metadata: dict | None = None,
+    tags: dict | None = None,
     default=...,
 ) -> Field:
-    kwargs: dict[str, object] = {
+    kwargs: dict = {
         "name": name,
         "dtype": IntegerType(byte_size=8, signed=True),
         "nullable": nullable,
@@ -34,15 +62,15 @@ def _field_int(
     return Field(**kwargs)
 
 
-def _field_str(
+def _str_field(
     name: str,
     *,
     nullable: bool = True,
-    metadata: dict[bytes | str, bytes | str | object] | None = None,
-    tags: dict[bytes | str, bytes | str | object] | None = None,
+    metadata: dict | None = None,
+    tags: dict | None = None,
     default=...,
 ) -> Field:
-    kwargs: dict[str, object] = {
+    kwargs: dict = {
         "name": name,
         "dtype": StringType(),
         "nullable": nullable,
@@ -54,517 +82,529 @@ def _field_str(
     return Field(**kwargs)
 
 
-def test_schema_helper_accepts_iterable_and_varargs():
-    s = schema(
-        [_field_int("a"), _field_str("b")],
-        _field_int("c"),
-        metadata={"name": "trade_row", "comment": "schema comment"},
-    )
+# ---------------------------------------------------------------------------
+# Construction — schema() factory + init normalization
+# ---------------------------------------------------------------------------
 
-    assert list(s.keys()) == ["a", "b", "c"]
-    assert s.name == "trade_row"
-    assert s.comment == "schema comment"
 
+class TestConstruction:
 
-def test_schema_helper_accepts_single_non_iterable_field():
-    s = schema(_field_int("a"))
+    def test_schema_factory_accepts_iterable_and_varargs(self) -> None:
+        s = schema(
+            [_int_field("a"), _str_field("b")],
+            _int_field("c"),
+            metadata={"name": "trade_row", "comment": "schema comment"},
+        )
 
-    assert list(s.keys()) == ["a"]
-    assert isinstance(s["a"], Field)
+        assert list(s.keys()) == ["a", "b", "c"]
+        assert s.name == "trade_row"
+        assert s.comment == "schema comment"
 
+    def test_schema_factory_accepts_single_field(self) -> None:
+        s = schema(_int_field("a"))
 
-def test_post_init_normalizes_mapping_input_and_rewrites_names():
-    s = Schema(
-        inner_fields={
-            "qty": _field_int("wrong_name"),
-            "book": _field_str("book"),
-        },
-        metadata=None,
-    )
+        assert list(s.keys()) == ["a"]
+        assert isinstance(s["a"], Field)
 
-    assert list(s.keys()) == ["qty", "book"]
-    assert s["qty"].name == "qty"
-    assert s["book"].name == "book"
+    def test_init_with_mapping_rewrites_field_names_to_keys(self) -> None:
+        s = Schema(
+            inner_fields={
+                "qty": _int_field("wrong_name"),
+                "book": _str_field("book"),
+            },
+            metadata=None,
+        )
 
+        assert list(s.keys()) == ["qty", "book"]
+        assert s["qty"].name == "qty"
+        assert s["book"].name == "book"
 
-def test_comment_reads_comment_then_description():
-    s1 = schema([_field_int("a")], metadata={"comment": "hello"})
-    s2 = schema([_field_int("a")], metadata={"description": "world"})
-    s3 = schema([_field_int("a")])
+    def test_ordered_dict_input_preserves_insertion_order(self) -> None:
+        inner = OrderedDict(
+            [
+                ("a", _int_field("a")),
+                ("b", _str_field("b")),
+                ("c", _int_field("c")),
+            ]
+        )
+        s = Schema(inner_fields=inner)
 
-    assert s1.comment == "hello"
-    assert s2.comment == "world"
-    assert s3.comment is None
+        assert list(s.keys()) == ["a", "b", "c"]
 
 
-def test_dtype_returns_struct_type():
-    s = schema([_field_int("qty"), _field_str("book")])
+# ---------------------------------------------------------------------------
+# Metadata — comment / description / name aliasing
+# ---------------------------------------------------------------------------
 
-    dtype = s.dtype
 
-    assert isinstance(dtype, StructType)
-    assert [f.name for f in dtype.fields] == ["qty", "book"]
+class TestMetadata:
 
+    def test_comment_falls_back_through_description(self) -> None:
+        s_comment = schema([_int_field("a")], metadata={"comment": "hello"})
+        s_desc = schema([_int_field("a")], metadata={"description": "world"})
+        s_none = schema([_int_field("a")])
 
-def test_arrow_fields_returns_arrow_fields():
-    s = schema([_field_int("qty"), _field_str("book")])
+        assert s_comment.comment == "hello"
+        assert s_desc.comment == "world"
+        assert s_none.comment is None
 
-    arrow_fields = s.arrow_fields
 
-    assert len(arrow_fields) == 2
-    assert all(isinstance(f, pa.Field) for f in arrow_fields)
-    assert [f.name for f in arrow_fields] == ["qty", "book"]
+# ---------------------------------------------------------------------------
+# Shape — dtype / arrow_fields / copy
+# ---------------------------------------------------------------------------
 
 
-def test_copy_preserves_fields_and_metadata_but_deep_copies_field_objects():
-    s1 = schema(
-        [_field_int("a"), _field_str("b")],
-        metadata={"name": "x", "comment": "y"},
-    )
+class TestShape:
 
-    s2 = s1.copy()
+    def test_dtype_is_struct_with_field_order(self) -> None:
+        s = schema([_int_field("qty"), _str_field("book")])
 
-    assert s2 is not s1
-    assert list(s2.keys()) == ["a", "b"]
-    assert s2.metadata == s1.metadata
-    assert s2["a"] is not s1["a"]
-    assert s2["b"] is not s1["b"]
+        dtype = s.dtype
 
+        assert isinstance(dtype, StructType)
+        assert [f.name for f in dtype.fields] == ["qty", "book"]
 
-def test_copy_can_replace_fields_and_metadata():
-    s1 = schema([_field_int("a")], metadata={"name": "old"})
-    s2 = s1.copy(
-        fields=[_field_str("b")],
-        metadata={"name": "new", "comment": "desc"},
-    )
+    def test_arrow_fields_returns_arrow_field_list(self) -> None:
+        s = schema([_int_field("qty"), _str_field("book")])
 
-    assert list(s2.keys()) == ["b"]
-    assert s2.name == "new"
-    assert s2.comment == "desc"
+        out = s.arrow_fields
 
+        assert len(out) == 2
+        assert all(isinstance(f, pa.Field) for f in out)
+        assert [f.name for f in out] == ["qty", "book"]
 
-def test_append_returns_new_schema():
-    s1 = schema([_field_int("a")])
-    s2 = s1.append(_field_str("b"))
+    def test_copy_deep_copies_fields_and_keeps_metadata(self) -> None:
+        s = schema(
+            [_int_field("a"), _str_field("b")],
+            metadata={"name": "x", "comment": "y"},
+        )
 
-    assert list(s1.keys()) == ["a"]
-    assert list(s2.keys()) == ["a", "b"]
+        out = s.copy()
 
+        assert out is not s
+        assert list(out.keys()) == ["a", "b"]
+        assert out.metadata == s.metadata
+        assert out["a"] is not s["a"]
+        assert out["b"] is not s["b"]
 
-def test_extend_returns_new_schema():
-    s1 = schema([_field_int("a")])
-    s2 = s1.extend([_field_str("b"), _field_int("c")])
+    def test_copy_can_replace_fields_and_metadata(self) -> None:
+        s = schema([_int_field("a")], metadata={"name": "old"})
 
-    assert list(s1.keys()) == ["a"]
-    assert list(s2.keys()) == ["a", "b", "c"]
+        out = s.copy(
+            fields=[_str_field("b")],
+            metadata={"name": "new", "comment": "desc"},
+        )
 
+        assert list(out.keys()) == ["b"]
+        assert out.name == "new"
+        assert out.comment == "desc"
 
-def test_getitem_by_name():
-    s = schema([_field_int("a"), _field_str("b")])
 
-    assert s["a"].name == "a"
-    assert s["b"].name == "b"
+# ---------------------------------------------------------------------------
+# Mutation — Mapping-shaped surface
+# ---------------------------------------------------------------------------
 
 
-def test_getitem_by_index():
-    s = schema([_field_int("a"), _field_str("b")])
+class TestAppendExtend:
 
-    assert s[0].name == "a"
-    assert s[1].name == "b"
+    def test_append_returns_new_schema(self) -> None:
+        s1 = schema([_int_field("a")])
+        s2 = s1.append(_str_field("b"))
 
+        assert list(s1.keys()) == ["a"]
+        assert list(s2.keys()) == ["a", "b"]
 
-def test_setitem_rewrites_field_name_to_key():
-    s = schema([_field_int("a")])
+    def test_extend_returns_new_schema(self) -> None:
+        s1 = schema([_int_field("a")])
+        s2 = s1.extend([_str_field("b"), _int_field("c")])
 
-    s["b"] = _field_str("wrong")
+        assert list(s1.keys()) == ["a"]
+        assert list(s2.keys()) == ["a", "b", "c"]
 
-    assert list(s.keys()) == ["a", "b"]
-    assert s["b"].name == "b"
 
+class TestGetItem:
 
-def test_setitem_rejects_non_string_key():
-    s = schema([_field_int("a")])
+    def test_by_name(self) -> None:
+        s = schema([_int_field("a"), _str_field("b")])
 
-    with pytest.raises(TypeError):
-        s[1] = _field_int("b")  # type: ignore[index]
+        assert s["a"].name == "a"
+        assert s["b"].name == "b"
 
+    def test_by_index(self) -> None:
+        s = schema([_int_field("a"), _str_field("b")])
 
-def test_delitem_by_name_and_index():
-    s = schema([_field_int("a"), _field_str("b"), _field_int("c")])
+        assert s[0].name == "a"
+        assert s[1].name == "b"
 
-    del s["b"]
-    assert list(s.keys()) == ["a", "c"]
+    def test_get_returns_default_for_missing(self) -> None:
+        s = schema([_int_field("a")])
 
-    del s[0]
-    assert list(s.keys()) == ["c"]
+        assert s.get("a").name == "a"
+        assert s.get("missing") is None
+        assert s.get("missing", "fallback") == "fallback"
 
+    def test_iter_len_contains(self) -> None:
+        s = schema([_int_field("a"), _str_field("b")])
 
-def test_iter_len_contains():
-    s = schema([_field_int("a"), _field_str("b")])
+        assert list(iter(s)) == ["a", "b"]
+        assert len(s) == 2
+        assert "a" in s
+        assert "b" in s
+        assert "c" not in s
+        assert 0 in s
+        assert 1 in s
+        assert 2 not in s
 
-    assert list(iter(s)) == ["a", "b"]
-    assert len(s) == 2
-    assert "a" in s
-    assert "b" in s
-    assert "c" not in s
-    assert 0 in s
-    assert 1 in s
-    assert 2 not in s
 
+class TestSetItem:
 
-def test_get_returns_default_for_missing():
-    s = schema([_field_int("a")])
+    def test_setitem_rewrites_field_name_to_key(self) -> None:
+        s = schema([_int_field("a")])
 
-    assert s.get("a").name == "a"
-    assert s.get("missing") is None
-    assert s.get("missing", "fallback") == "fallback"
+        s["b"] = _str_field("wrong")
 
+        assert list(s.keys()) == ["a", "b"]
+        assert s["b"].name == "b"
 
-def test_pop_by_name_and_index_and_default():
-    s = schema([_field_int("a"), _field_str("b")])
+    def test_setitem_rejects_non_string_key(self) -> None:
+        s = schema([_int_field("a")])
 
-    popped_a = s.pop("a")
-    assert popped_a.name == "a"
-    assert list(s.keys()) == ["b"]
+        with pytest.raises(TypeError):
+            s[1] = _int_field("b")  # type: ignore[index]
 
-    popped_b = s.pop(0)
-    assert popped_b.name == "b"
-    assert list(s.keys()) == []
 
-    assert s.pop("missing", "fallback") == "fallback"
+class TestDelItem:
 
+    def test_delete_by_name_then_index(self) -> None:
+        s = schema([_int_field("a"), _str_field("b"), _int_field("c")])
 
-def test_pop_raises_for_missing_without_default():
-    s = schema([_field_int("a")])
+        del s["b"]
+        assert list(s.keys()) == ["a", "c"]
 
-    with pytest.raises(KeyError):
-        s.pop("missing")
+        del s[0]
+        assert list(s.keys()) == ["c"]
 
-    with pytest.raises(IndexError):
-        s.pop(10)
 
+class TestPopAndSetDefault:
 
-def test_setdefault_existing_returns_existing():
-    s = schema([_field_int("a")])
+    def test_pop_by_name_index_and_default(self) -> None:
+        s = schema([_int_field("a"), _str_field("b")])
 
-    out = s.setdefault("a", _field_str("other"))
+        assert s.pop("a").name == "a"
+        assert list(s.keys()) == ["b"]
 
-    assert out.name == "a"
-    assert isinstance(out.dtype, IntegerType)
-    assert list(s.keys()) == ["a"]
+        assert s.pop(0).name == "b"
+        assert list(s.keys()) == []
 
+        assert s.pop("missing", "fallback") == "fallback"
 
-def test_setdefault_new_inserts_and_rewrites_name():
-    s = schema([_field_int("a")])
+    def test_pop_missing_raises(self) -> None:
+        s = schema([_int_field("a")])
 
-    out = s.setdefault("b", _field_str("wrong"))
+        with pytest.raises(KeyError):
+            s.pop("missing")
 
-    assert out.name == "b"
-    assert list(s.keys()) == ["a", "b"]
-    assert s["b"].name == "b"
+        with pytest.raises(IndexError):
+            s.pop(10)
 
+    def test_setdefault_existing_returns_existing_field(self) -> None:
+        s = schema([_int_field("a")])
 
-def test_setdefault_rejects_non_string_key():
-    s = schema([_field_int("a")])
+        out = s.setdefault("a", _str_field("other"))
 
-    with pytest.raises(TypeError):
-        s.setdefault(1, _field_int("x"))  # type: ignore[arg-type]
+        assert out.name == "a"
+        assert isinstance(out.dtype, IntegerType)
+        assert list(s.keys()) == ["a"]
 
+    def test_setdefault_new_inserts_and_rewrites_name(self) -> None:
+        s = schema([_int_field("a")])
 
-def test_setdefault_requires_default_for_new_key():
-    s = schema([_field_int("a")])
+        out = s.setdefault("b", _str_field("wrong"))
 
-    with pytest.raises(ValueError):
-        s.setdefault("b")
+        assert out.name == "b"
+        assert list(s.keys()) == ["a", "b"]
+        assert s["b"].name == "b"
 
+    def test_setdefault_rejects_non_string_key(self) -> None:
+        s = schema([_int_field("a")])
 
-def test_popitem_last_and_first():
-    s = schema([_field_int("a"), _field_str("b"), _field_int("c")])
+        with pytest.raises(TypeError):
+            s.setdefault(1, _int_field("x"))  # type: ignore[arg-type]
 
-    key_last, field_last = s.popitem()
-    assert key_last == "c"
-    assert field_last.name == "c"
+    def test_setdefault_requires_default_for_new_key(self) -> None:
+        s = schema([_int_field("a")])
 
-    key_first, field_first = s.popitem(last=False)
-    assert key_first == "a"
-    assert field_first.name == "a"
+        with pytest.raises(ValueError):
+            s.setdefault("b")
 
-    assert list(s.keys()) == ["b"]
+    def test_popitem_last_and_first(self) -> None:
+        s = schema([_int_field("a"), _str_field("b"), _int_field("c")])
 
+        key_last, field_last = s.popitem()
+        assert key_last == "c"
+        assert field_last.name == "c"
 
-def test_clear_removes_all_fields():
-    s = schema([_field_int("a"), _field_str("b")])
+        key_first, field_first = s.popitem(last=False)
+        assert key_first == "a"
+        assert field_first.name == "a"
 
-    s.clear()
+        assert list(s.keys()) == ["b"]
 
-    assert len(s) == 0
-    assert list(s.keys()) == []
+    def test_clear(self) -> None:
+        s = schema([_int_field("a"), _str_field("b")])
 
+        s.clear()
 
-def test_add_merges_and_rhs_overrides_duplicate_names():
-    s1 = schema(
-        [_field_int("a"), _field_str("b")],
-        metadata={"comment": "left", "name": "left_name"},
-    )
-    s2 = schema(
-        [_field_int("b", nullable=False), _field_int("c")],
-        metadata={"description": "right_desc", "name": "right_name"},
-    )
+        assert len(s) == 0
+        assert list(s.keys()) == []
 
-    out = s1 + s2
 
-    assert list(out.keys()) == ["a", "b", "c"]
-    assert out["b"].nullable is False
-    assert out.metadata is not None
-    assert out.metadata[b"name"] == b"right_name"
-    assert out.metadata[b"comment"] == b"left"
-    assert out.metadata[b"description"] == b"right_desc"
+# ---------------------------------------------------------------------------
+# Set operators — +, -, &, |
+# ---------------------------------------------------------------------------
 
 
-def test_radd_with_zero_returns_copy():
-    s = schema([_field_int("a")], metadata={"name": "x"})
+class TestAdd:
 
-    out = 0 + s
+    def test_add_unions_with_rhs_overriding_duplicate_names(self) -> None:
+        s1 = schema(
+            [_int_field("a"), _str_field("b")],
+            metadata={"comment": "left", "name": "left_name"},
+        )
+        s2 = schema(
+            [_int_field("b", nullable=False), _int_field("c")],
+            metadata={"description": "right_desc", "name": "right_name"},
+        )
 
-    assert out is not s
-    assert list(out.keys()) == ["a"]
-    assert out.metadata == s.metadata
+        out = s1 + s2
 
+        assert list(out.keys()) == ["a", "b", "c"]
+        assert out["b"].nullable is False
+        assert out.metadata is not None
+        assert out.metadata[b"name"] == b"right_name"
+        assert out.metadata[b"comment"] == b"left"
+        assert out.metadata[b"description"] == b"right_desc"
 
-def test_iadd_mutates_in_place():
-    s1 = schema([_field_int("a")], metadata={"comment": "left"})
-    s2 = schema([_field_str("b")], metadata={"name": "right"})
+    def test_radd_with_zero_returns_copy(self) -> None:
+        s = schema([_int_field("a")], metadata={"name": "x"})
 
-    original_id = id(s1)
-    s1 += s2
+        out = 0 + s
 
-    assert id(s1) == original_id
-    assert list(s1.keys()) == ["a", "b"]
-    assert s1.metadata is not None
-    assert s1.metadata[b"comment"] == b"left"
-    assert s1.metadata[b"name"] == b"right"
+        assert out is not s
+        assert list(out.keys()) == ["a"]
+        assert out.metadata == s.metadata
 
+    def test_iadd_mutates_in_place(self) -> None:
+        s1 = schema([_int_field("a")], metadata={"comment": "left"})
+        s2 = schema([_str_field("b")], metadata={"name": "right"})
 
-def test_sub_returns_difference():
-    s1 = schema([_field_int("a"), _field_str("b"), _field_int("c")], metadata={"name": "x"})
-    s2 = schema([_field_str("b")])
+        original_id = id(s1)
+        s1 += s2
 
-    out = s1 - s2
+        assert id(s1) == original_id
+        assert list(s1.keys()) == ["a", "b"]
+        assert s1.metadata is not None
+        assert s1.metadata[b"comment"] == b"left"
+        assert s1.metadata[b"name"] == b"right"
 
-    assert list(out.keys()) == ["a", "c"]
-    assert out.metadata == s1.metadata
 
+class TestSub:
 
-def test_isub_mutates_in_place():
-    s1 = schema([_field_int("a"), _field_str("b"), _field_int("c")])
-    s2 = schema([_field_str("b"), _field_int("x")])
+    def test_sub_returns_difference(self) -> None:
+        s1 = schema(
+            [_int_field("a"), _str_field("b"), _int_field("c")],
+            metadata={"name": "x"},
+        )
+        s2 = schema([_str_field("b")])
 
-    s1 -= s2
+        out = s1 - s2
 
-    assert list(s1.keys()) == ["a", "c"]
+        assert list(out.keys()) == ["a", "c"]
+        assert out.metadata == s1.metadata
 
+    def test_isub_mutates_in_place(self) -> None:
+        s1 = schema([_int_field("a"), _str_field("b"), _int_field("c")])
+        s2 = schema([_str_field("b"), _int_field("x")])
 
-def test_and_returns_intersection_in_left_order():
-    s1 = schema(
-        [_field_int("a"), _field_str("b"), _field_int("c")],
-        metadata={"comment": "left"},
-    )
-    s2 = schema(
-        [_field_int("c"), _field_int("a")],
-        metadata={"name": "right"},
-    )
+        s1 -= s2
 
-    out = s1 & s2
+        assert list(s1.keys()) == ["a", "c"]
 
-    assert list(out.keys()) == ["a", "c"]
-    assert out.metadata is not None
-    assert out.metadata[b"comment"] == b"left"
-    assert out.metadata[b"name"] == b"right"
 
+class TestAnd:
 
-def test_iand_mutates_to_intersection():
-    s1 = schema([_field_int("a"), _field_str("b"), _field_int("c")], metadata={"comment": "left"})
-    s2 = schema([_field_int("c"), _field_int("a")], metadata={"name": "right"})
+    def test_and_intersection_in_left_order(self) -> None:
+        s1 = schema(
+            [_int_field("a"), _str_field("b"), _int_field("c")],
+            metadata={"comment": "left"},
+        )
+        s2 = schema(
+            [_int_field("c"), _int_field("a")],
+            metadata={"name": "right"},
+        )
 
-    s1 &= s2
+        out = s1 & s2
 
-    assert list(s1.keys()) == ["a", "c"]
-    assert s1.metadata is not None
-    assert s1.metadata[b"comment"] == b"left"
-    assert s1.metadata[b"name"] == b"right"
+        assert list(out.keys()) == ["a", "c"]
+        assert out.metadata is not None
+        assert out.metadata[b"comment"] == b"left"
+        assert out.metadata[b"name"] == b"right"
 
+    def test_iand_mutates_to_intersection(self) -> None:
+        s1 = schema(
+            [_int_field("a"), _str_field("b"), _int_field("c")],
+            metadata={"comment": "left"},
+        )
+        s2 = schema(
+            [_int_field("c"), _int_field("a")],
+            metadata={"name": "right"},
+        )
 
-def test_or_and_ior_delegate_to_add():
-    s1 = schema([_field_int("a")], metadata={"comment": "left"})
-    s2 = schema([_field_str("b")], metadata={"name": "right"})
+        s1 &= s2
 
-    out = s1 | s2
-    assert list(out.keys()) == ["a", "b"]
-    assert out.metadata is not None
-    assert out.metadata[b"comment"] == b"left"
-    assert out.metadata[b"name"] == b"right"
+        assert list(s1.keys()) == ["a", "c"]
+        assert s1.metadata is not None
+        assert s1.metadata[b"comment"] == b"left"
+        assert s1.metadata[b"name"] == b"right"
 
-    s1 |= s2
-    assert list(s1.keys()) == ["a", "b"]
-    assert s1.metadata is not None
-    assert s1.metadata[b"comment"] == b"left"
-    assert s1.metadata[b"name"] == b"right"
 
+class TestOr:
 
-def test_autotag_returns_new_schema_and_updates_metadata_tags():
-    s = schema([_field_int("a")], metadata={"name": DEFAULT_FIELD_NAME})
-    out = s.autotag(tags={"semantic_type": "fact"})
+    def test_or_and_ior_delegate_to_add(self) -> None:
+        s1 = schema([_int_field("a")], metadata={"comment": "left"})
+        s2 = schema([_str_field("b")], metadata={"name": "right"})
 
-    assert list(out.keys()) == ["a"]
-    assert out.metadata is not None
-    assert out.metadata != s.metadata or out.metadata is s.metadata
+        out = s1 | s2
+        assert list(out.keys()) == ["a", "b"]
+        assert out.metadata is not None
+        assert out.metadata[b"comment"] == b"left"
+        assert out.metadata[b"name"] == b"right"
 
+        s1 |= s2
+        assert list(s1.keys()) == ["a", "b"]
+        assert s1.metadata is not None
+        assert s1.metadata[b"comment"] == b"left"
+        assert s1.metadata[b"name"] == b"right"
 
-def test_autotag_propagates_dtype_and_field_tags_per_column():
-    s = schema(
-        [
-            _field_int("user_id", nullable=False),
-            _field_str("email"),
-            Field(
-                "created_at",
-                TimestampType(unit="us", tz="UTC"),
-                nullable=False,
-            ),
-        ],
-        metadata={"primary_key": "user_id"},
-    )
 
-    out = s.autotag(tags={"layer": "silver"})
+# ---------------------------------------------------------------------------
+# Autotag — propagates per-field, lifts partition / cluster metadata
+# ---------------------------------------------------------------------------
 
-    id_tags = out["user_id"].tags or {}
-    assert id_tags[b"type_name"] == b"integer"
-    assert id_tags[b"signed"] == b"true"
-    assert id_tags[b"nullable"] == b"false"
-    assert id_tags[b"primary_key"] == b"true"
 
-    email_tags = out["email"].tags or {}
-    assert email_tags[b"type_name"] == b"string"
+class TestAutotag:
 
-    ts_tags = out["created_at"].tags or {}
-    assert ts_tags[b"type_name"] == b"timestamp"
-    assert ts_tags[b"unit"] == b"us"
-    assert ts_tags[b"tz"] == b"UTC"
+    def test_returns_new_schema_with_updated_metadata(self) -> None:
+        s = schema([_int_field("a")], metadata={"name": DEFAULT_FIELD_NAME})
 
-    assert out.metadata is not None
-    assert out.metadata[b"t:layer"] == b"silver"
+        out = s.autotag(tags={"semantic_type": "fact"})
 
+        assert list(out.keys()) == ["a"]
+        # Metadata is either replaced or kept-by-identity (autotag is
+        # allowed to short-circuit when nothing changes); both are
+        # acceptable signals that the call ran.
+        assert out.metadata is not None
+        assert out.metadata != s.metadata or out.metadata is s.metadata
 
-def test_autotag_pops_partition_by_and_cluster_by_metadata():
-    s = schema(
-        [
-            _field_int("trade_date"),
-            _field_int("book_id"),
-            _field_int("trade_id"),
-        ],
-        metadata={
-            "partition_by": "trade_date",
-            "cluster_by": '["book_id", "trade_id"]',
-        },
-    )
+    def test_propagates_dtype_and_field_tags(self) -> None:
+        s = schema(
+            [
+                _int_field("user_id", nullable=False),
+                _str_field("email"),
+                Field(
+                    "created_at",
+                    TimestampType(unit="us", tz="UTC"),
+                    nullable=False,
+                ),
+            ],
+            metadata={"primary_key": "user_id"},
+        )
 
-    out = s.autotag()
+        out = s.autotag(tags={"layer": "silver"})
 
-    assert [f.name for f in out.partition_by] == ["trade_date"]
-    assert [f.name for f in out.cluster_by] == ["book_id", "trade_id"]
+        id_tags = out["user_id"].tags or {}
+        assert id_tags[b"type_name"] == b"integer"
+        assert id_tags[b"signed"] == b"true"
+        assert id_tags[b"nullable"] == b"false"
+        assert id_tags[b"primary_key"] == b"true"
 
-    date_tags = out["trade_date"].tags or {}
-    assert date_tags[b"partition_by"] == b"true"
+        email_tags = out["email"].tags or {}
+        assert email_tags[b"type_name"] == b"string"
 
-    book_tags = out["book_id"].tags or {}
-    assert book_tags[b"cluster_by"] == b"true"
+        ts_tags = out["created_at"].tags or {}
+        assert ts_tags[b"type_name"] == b"timestamp"
+        assert ts_tags[b"unit"] == b"us"
+        assert ts_tags[b"tz"] == b"UTC"
 
-    # Keys popped off the schema-level metadata so they don't leak to Arrow/Delta.
-    assert out.metadata is not None
-    assert b"partition_by" not in out.metadata
-    assert b"cluster_by" not in out.metadata
+        assert out.metadata is not None
+        assert out.metadata[b"t:layer"] == b"silver"
 
+    def test_partition_and_cluster_metadata_consumed_into_field_tags(self) -> None:
+        s = schema(
+            [
+                _int_field("trade_date"),
+                _int_field("book_id"),
+                _int_field("trade_id"),
+            ],
+            metadata={
+                "partition_by": "trade_date",
+                "cluster_by": '["book_id", "trade_id"]',
+            },
+        )
 
-def test_to_arrow_schema():
-    s = schema(
-        [_field_int("qty", nullable=False), _field_str("book")],
-        metadata={"name": "trade_row"},
-    )
+        out = s.autotag()
 
-    out = s.to_arrow_schema()
+        assert [f.name for f in out.partition_by] == ["trade_date"]
+        assert [f.name for f in out.cluster_by] == ["book_id", "trade_id"]
 
-    assert isinstance(out, pa.Schema)
-    assert out.names == ["qty", "book"]
-    assert out.field("qty").nullable is False
-    assert out.metadata is not None
-    assert out.metadata[b"name"] == b"trade_row"
+        assert (out["trade_date"].tags or {})[b"partition_by"] == b"true"
+        assert (out["book_id"].tags or {})[b"cluster_by"] == b"true"
 
+        assert out.metadata is not None
+        assert b"partition_by" not in out.metadata
+        assert b"cluster_by" not in out.metadata
 
-def test_to_field_round_trip_shape():
-    s = schema(
-        [_field_int("qty"), _field_str("book")],
-        metadata={"name": "trade_row", "nullable": "t"},
-    )
 
-    f = s.to_field()
+# ---------------------------------------------------------------------------
+# Exporters
+# ---------------------------------------------------------------------------
 
-    assert isinstance(f, Field)
-    assert f.name == "trade_row"
-    assert isinstance(f.dtype, StructType)
-    assert f.nullable is True
-    assert [child.name for child in f.dtype.fields] == ["qty", "book"]
 
+class TestExporters:
 
-def test_from_field():
-    f = Field.from_str("trade_row: struct<qty:int64, book:string>")
+    def test_to_arrow_schema_carries_field_order_and_metadata(self) -> None:
+        s = schema(
+            [_int_field("qty", nullable=False), _str_field("book")],
+            metadata={"name": "trade_row"},
+        )
 
-    s = Schema.from_field(f)
+        out = s.to_arrow_schema()
 
-    assert isinstance(s, Schema)
-    assert list(s.keys()) == ["qty", "book"]
+        assert isinstance(out, pa.Schema)
+        assert out.names == ["qty", "book"]
+        assert out.field("qty").nullable is False
+        assert out.metadata is not None
+        assert out.metadata[b"name"] == b"trade_row"
 
+    def test_to_field_lifts_to_struct_field(self) -> None:
+        s = schema(
+            [_int_field("qty"), _str_field("book")],
+            metadata={"name": "trade_row", "nullable": "t"},
+        )
 
-def test_from_any_fields_preserves_order():
-    s = Schema.from_any_fields(
-        [_field_int("a"), _field_str("b"), _field_int("c")],
-        metadata={"name": "ordered"},
-    )
+        f = s.to_field()
 
-    assert list(s.keys()) == ["a", "b", "c"]
-    assert s.name == "ordered"
+        assert isinstance(f, Field)
+        assert f.name == "trade_row"
+        assert isinstance(f.dtype, StructType)
+        assert f.nullable is True
+        assert [child.name for child in f.dtype.fields] == ["qty", "book"]
 
 
-def test_from_any_and_from__with_field():
-    f = _field_int("qty")
+class TestPolarsExport(PolarsTestCase):
 
-    s1 = Schema.from_any(f)
-    s2 = Schema.from_(f)
-
-    assert list(s1.keys()) == ["qty"]
-    assert list(s2.keys()) == ["qty"]
-
-
-def test_merge_metadata_staticmethod():
-    left = {b"a": b"1", b"b": b"2"}
-    right = {b"b": b"x", b"c": b"3"}
-
-    out = Schema._merge_metadata(left, right)
-
-    assert out == {b"a": b"1", b"b": b"x", b"c": b"3"}
-
-
-def test_coerce_other_from_field():
-    f = _field_int("qty")
-
-    out = Schema._coerce_other(f)
-
-    assert isinstance(out, Schema)
-    assert list(out.keys()) == ["qty"]
-
-
-class TestSchemaPolars(PolarsTestCase):
-
-    def test_to_polars_schema(self):
-        s = schema([_field_int("qty"), _field_str("book")])
+    def test_to_polars_schema(self) -> None:
+        s = schema([_int_field("qty"), _str_field("book")])
 
         out = s.to_polars_schema()
 
@@ -572,10 +612,10 @@ class TestSchemaPolars(PolarsTestCase):
         self.assertEqual(list(out.names()), ["qty", "book"])
 
 
-class TestSchemaSpark(SparkTestCase):
+class TestSparkExport(SparkTestCase):
 
-    def test_to_spark_schema(self):
-        s = schema([_field_int("qty", nullable=False), _field_str("book")])
+    def test_to_spark_schema(self) -> None:
+        s = schema([_int_field("qty", nullable=False), _str_field("book")])
 
         out = s.to_spark_schema()
 
@@ -584,75 +624,106 @@ class TestSchemaSpark(SparkTestCase):
         self.assertFalse(out["qty"].nullable)
 
 
-def test_ordered_dict_input_is_preserved():
-    inner = OrderedDict(
-        [
-            ("a", _field_int("a")),
-            ("b", _field_str("b")),
-            ("c", _field_int("c")),
-        ]
-    )
-
-    s = Schema(inner_fields=inner)
-
-    assert list(s.keys()) == ["a", "b", "c"]
+# ---------------------------------------------------------------------------
+# Constructors
+# ---------------------------------------------------------------------------
 
 
-def test_schema_from_path_discovers_fields_and_metadata(tmp_path):
-    import pyarrow.parquet as pq
+class TestConstructors:
 
-    arrow_schema = pa.schema(
-        [
-            pa.field("x", pa.int64(), metadata={b"comment": b"the x"}),
-            pa.field("s", pa.string()),
-        ],
-        metadata={b"author": b"ygg"},
-    )
-    table = pa.table({"x": [1, 2, 3], "s": ["a", "b", "c"]}, schema=arrow_schema)
-    path = tmp_path / "data.parquet"
-    pq.write_table(table, path)
+    def test_from_field_unwraps_struct_into_schema(self) -> None:
+        f = Field.from_str("trade_row: struct<qty:int64, book:string>")
 
-    out = Schema.from_path(path)
+        s = Schema.from_field(f)
 
-    assert [f.name for f in out.fields] == ["x", "s"]
-    assert out["x"].arrow_type == pa.int64()
-    assert out["s"].arrow_type == pa.string()
-    assert out.metadata == {b"author": b"ygg"}
-    assert out["x"].metadata == {b"comment": b"the x"}
+        assert isinstance(s, Schema)
+        assert list(s.keys()) == ["qty", "book"]
 
+    def test_from_any_fields_preserves_input_order(self) -> None:
+        s = Schema.from_any_fields(
+            [_int_field("a"), _str_field("b"), _int_field("c")],
+            metadata={"name": "ordered"},
+        )
 
-def test_schema_from_path_accepts_path_io_instance(tmp_path):
-    import pyarrow.parquet as pq
+        assert list(s.keys()) == ["a", "b", "c"]
+        assert s.name == "ordered"
 
-    path = tmp_path / "data.parquet"
-    pq.write_table(pa.table({"x": [1, 2]}), path)
+    def test_from_any_and_from_with_field(self) -> None:
+        f = _int_field("qty")
 
-    out = Schema.from_path(path)
+        s1 = Schema.from_any(f)
+        s2 = Schema.from_(f)
 
-    assert [f.name for f in out.fields] == ["x"]
+        assert list(s1.keys()) == ["qty"]
+        assert list(s2.keys()) == ["qty"]
 
 
-def test_schema_from_path_accepts_path_io_factory(tmp_path):
-    import pyarrow.parquet as pq
-
-    path = tmp_path / "data.parquet"
-    pq.write_table(pa.table({"x": [1, 2]}), path)
-
-    out = Schema.from_path(path)
-
-    assert [f.name for f in out.fields] == ["x"]
+# ---------------------------------------------------------------------------
+# Internal helpers — _merge_metadata, _coerce_other
+# ---------------------------------------------------------------------------
 
 
-def test_field_from_path_returns_struct_field(tmp_path):
-    import pyarrow.parquet as pq
+class TestInternalHelpers:
 
-    path = tmp_path / "data.parquet"
-    pq.write_table(
-        pa.table({"x": [1, 2], "s": ["a", "b"]}),
-        path,
-    )
+    def test_merge_metadata_right_wins_on_overlap(self) -> None:
+        left = {b"a": b"1", b"b": b"2"}
+        right = {b"b": b"x", b"c": b"3"}
 
-    out = Field.from_path(path)
+        assert Schema._merge_metadata(left, right) == {
+            b"a": b"1",
+            b"b": b"x",
+            b"c": b"3",
+        }
 
-    assert isinstance(out.dtype, StructType)
-    assert [f.name for f in out.dtype.fields] == ["x", "s"]
+    def test_coerce_other_lifts_field_to_schema(self) -> None:
+        f = _int_field("qty")
+
+        out = Schema._coerce_other(f)
+
+        assert isinstance(out, Schema)
+        assert list(out.keys()) == ["qty"]
+
+
+# ---------------------------------------------------------------------------
+# from_path — load schema from a parquet file
+# ---------------------------------------------------------------------------
+
+
+class TestFromPath:
+
+    def test_discovers_field_and_table_metadata(self, tmp_path) -> None:
+        arrow_schema = pa.schema(
+            [
+                pa.field("x", pa.int64(), metadata={b"comment": b"the x"}),
+                pa.field("s", pa.string()),
+            ],
+            metadata={b"author": b"ygg"},
+        )
+        table = pa.table(
+            {"x": [1, 2, 3], "s": ["a", "b", "c"]}, schema=arrow_schema
+        )
+        path = tmp_path / "data.parquet"
+        pq.write_table(table, path)
+
+        out = Schema.from_path(path)
+
+        assert [f.name for f in out.fields] == ["x", "s"]
+        assert out["x"].arrow_type == pa.int64()
+        assert out["s"].arrow_type == pa.string()
+        assert out.metadata == {b"author": b"ygg"}
+        assert out["x"].metadata == {b"comment": b"the x"}
+
+    def test_minimal_parquet_round_trip(self, tmp_path) -> None:
+        path = tmp_path / "data.parquet"
+        pq.write_table(pa.table({"x": [1, 2]}), path)
+
+        assert [f.name for f in Schema.from_path(path).fields] == ["x"]
+
+    def test_field_from_path_returns_struct_field(self, tmp_path) -> None:
+        path = tmp_path / "data.parquet"
+        pq.write_table(pa.table({"x": [1, 2], "s": ["a", "b"]}), path)
+
+        out = Field.from_path(path)
+
+        assert isinstance(out.dtype, StructType)
+        assert [f.name for f in out.dtype.fields] == ["x", "s"]
