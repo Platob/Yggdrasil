@@ -300,12 +300,21 @@ class CastOptions:
                 return options
             return options.copy(source=source, target=target, **overrides)
         if isinstance(options, CastOptions):
-            # Different CastOptions subclass → re-home onto cls.
-            # Preserves the override contract: later wins.
+            # Different CastOptions subclass → re-home onto cls. Only
+            # carry over fields shared with cls (base CastOptions
+            # always; format-specific fields stay on their owner). A
+            # name like ``compression`` lives on both ZipOptions and
+            # ArrowIPCOptions but means different things; keeping the
+            # source value would corrupt the target's writer config.
+            target_fields = cls.field_names()
+            base_fields = CastOptions.field_names()
+            carry = base_fields & target_fields
             merged = {
-                **{f.name: getattr(options, f.name) for f in dataclasses.fields(options)},
-                **overrides,
+                f.name: getattr(options, f.name)
+                for f in dataclasses.fields(options)
+                if f.name in carry
             }
+            merged.update(overrides)
             return cls._build(merged, source=source, target=target)
 
         # 3. Mapping → merge into overrides (explicit kwargs win).

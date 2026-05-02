@@ -135,6 +135,11 @@ class NDJsonIO(BytesIO):
     # No cached reader — NDJSON has no footer to amortize, same as CSV.
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
+    # Polars / pyarrow-dataset have native NDJSON scanners we can
+    # push projection / predicate into when the buffer is bound to
+    # a local path; ``_can_use_native_scanner`` gates the dispatch.
+    _NATIVE_SCANNER_OK: ClassVar[bool] = True
+
     # ==================================================================
     # Class-level config
     # ==================================================================

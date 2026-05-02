@@ -603,6 +603,18 @@ class ZipEntryIO(BytesIO):
             self._dirty = True
         return result
 
+    def _write_arrow_batches(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: CastOptions,
+    ) -> None:
+        # BytesIO routes the actual write through a registered leaf
+        # (ArrowIPCIO, ParquetIO, …) wrapping our shared backing
+        # buffer. The leaf's _write_at doesn't run through ours, so
+        # mark dirty explicitly here so the entry commits on close.
+        super()._write_arrow_batches(batches, options)
+        self._dirty = True
+
     # ------------------------------------------------------------------
     # Lifecycle — bridge buffer <-> parent entry
     # ------------------------------------------------------------------
@@ -619,22 +631,26 @@ class ZipEntryIO(BytesIO):
             self.replace_with_payload(payload)
         self._dirty = False
 
+    def _commit(self) -> None:
+        # Disposable.close() runs commit() before _release(), and
+        # commit() clears _dirty after _commit succeeds. Routing the
+        # payload-write here (rather than _release) keeps that
+        # contract intact; otherwise _release would observe an
+        # already-cleared dirty flag and silently skip the commit.
+        with self.memoryview() as mv:
+            payload = bytes(mv)
+        self.parent._commit_entry_payload(
+            self._entry_name,
+            payload,
+            compression=self.compression,
+            compresslevel=self.compresslevel,
+        )
+        # Refresh zip_info so a re-open on this same instance sees
+        # the just-committed metadata.
+        self._zip_info = self.parent._entry_info(self._entry_name)
+
     def _release(self) -> None:
         try:
-            if self._dirty:
-                with self.memoryview() as mv:
-                    payload = bytes(mv)
-                self.parent._commit_entry_payload(
-                    self._entry_name,
-                    payload,
-                    compression=self.compression,
-                    compresslevel=self.compresslevel,
-                )
-                # Refresh zip_info so a re-open on this same instance
-                # sees the just-committed metadata.
-                self._zip_info = self.parent._entry_info(self._entry_name)
-                self._dirty = False
-        finally:
             # Drop ourselves from the parent's live map so a fresh
             # open returns a fresh handle.
             live = self.parent._live_entries
@@ -643,6 +659,7 @@ class ZipEntryIO(BytesIO):
                     del live[self._entry_name]
                 except KeyError:  # pragma: no cover - benign race
                     pass
+        finally:
             super()._release()
 
     # ------------------------------------------------------------------
