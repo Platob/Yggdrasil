@@ -236,16 +236,17 @@ def cast_arrow_batch_iterator(
     batches: Iterable[pa.RecordBatch],
     options: "CastOptions",
 ) -> Iterator[pa.RecordBatch]:
-    """Cast an iterable of ``pa.RecordBatch`` and stream-rechunk by byte_size.
+    """Cast an iterable of ``pa.RecordBatch`` and stream-rechunk to target size.
 
     Per-batch cast goes through :func:`cast_arrow_tabular` (which
-    already short-circuits on schema match). Source-field binding is
+    already short-circuits on schema match — also when
+    ``options.target_field`` is unbound). Source-field binding is
     deferred to the first batch so callers don't have to peek upstream;
     the bound options are reused for every subsequent batch.
 
-    When ``options.byte_size`` is set the casted stream is repacked so
-    each emitted batch holds approximately ``byte_size`` bytes; when
-    unset, casted batches pass through unchanged.
+    Sizing knobs ``options.row_size`` and ``options.byte_size`` drive
+    output rechunking via :func:`rechunk_arrow_batches_by_byte_size`.
+    When neither is set, casted batches pass through unchanged.
 
     :raises TypeError: if any item is not a :class:`pa.RecordBatch`.
     """
@@ -274,13 +275,14 @@ def cast_arrow_batch_iterator(
                 )
             yield bound.cast_arrow_tabular(batch)
 
-    if not bound.byte_size:
+    if not bound.byte_size and not bound.row_size:
         yield from _cast_stream()
         return
 
     yield from rechunk_arrow_batches_by_byte_size(
         _cast_stream(),
         byte_size=bound.byte_size,
+        row_size=bound.row_size,
         memory_pool=bound.arrow_memory_pool,
     )
 
@@ -288,14 +290,24 @@ def cast_arrow_batch_iterator(
 def rechunk_arrow_batches_by_byte_size(
     batches: Iterable[pa.RecordBatch],
     *,
-    byte_size: int,
+    byte_size: int | None = None,
+    row_size: int | None = None,
     memory_pool: pa.MemoryPool | None = None,
 ) -> Iterator[pa.RecordBatch]:
-    """Stream-coalesce/slice batches so each yielded batch is ~``byte_size`` bytes.
+    """Stream-coalesce/slice batches to ~``byte_size`` bytes / ``row_size`` rows.
 
-    Algorithm:
+    Both knobs are optional:
 
-    * Empty / non-positive ``byte_size`` → passthrough (no rechunk).
+    * Neither set → passthrough.
+    * ``row_size`` only → emit fixed-size chunks of at most
+      ``row_size`` rows; no buffering, zero-copy slices.
+    * ``byte_size`` only → emit ~``byte_size``-byte chunks using the
+      per-segment bytes/row ratio to derive a row target.
+    * Both set → ``byte_size`` drives the row target; ``row_size``
+      caps it (final ``target_rows = min(row_size, derived)``).
+
+    Algorithm (byte_size path):
+
     * Empty incoming batch → drop (no schema gymnastics on zero-row
       flushes — the consumer already saw a schema in an earlier batch
       or will get one from the upstream reader).
@@ -308,23 +320,39 @@ def rechunk_arrow_batches_by_byte_size(
     * On exhaustion → flush whatever is left as a single concat'd
       batch (may be smaller than ``byte_size``).
     """
-    if not byte_size or byte_size <= 0:
+    has_byte = bool(byte_size and byte_size > 0)
+    has_row = bool(row_size and row_size > 0)
+
+    if not has_byte and not has_row:
         yield from batches
         return
 
-    buffer: list[pa.RecordBatch] = []
-    buffered_bytes = 0
+    if not has_byte:
+        for batch in batches:
+            if batch.num_rows == 0:
+                continue
+            if batch.num_rows <= row_size:
+                yield batch
+                continue
+            for offset in range(0, batch.num_rows, row_size):
+                yield batch.slice(offset, row_size)
+        return
+
+    def _target_rows(batch: pa.RecordBatch) -> int:
+        bytes_per_row = max(1, batch.nbytes // max(1, batch.num_rows))
+        derived = max(1, byte_size // bytes_per_row)
+        return min(row_size, derived) if has_row else derived
 
     def _slice_to_target(batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
-        # Per-batch bytes/row — the running average can drift, but for a
-        # single oversized batch the local ratio is the best estimate.
-        bytes_per_row = max(1, batch.nbytes // max(1, batch.num_rows))
-        target_rows = max(1, byte_size // bytes_per_row)
-        if batch.num_rows <= target_rows:
+        target = _target_rows(batch)
+        if batch.num_rows <= target:
             yield batch
             return
-        for offset in range(0, batch.num_rows, target_rows):
-            yield batch.slice(offset, target_rows)
+        for offset in range(0, batch.num_rows, target):
+            yield batch.slice(offset, target)
+
+    buffer: list[pa.RecordBatch] = []
+    buffered_bytes = 0
 
     for batch in batches:
         if batch.num_rows == 0:
@@ -341,10 +369,9 @@ def rechunk_arrow_batches_by_byte_size(
             continue
 
         combined = pa.concat_batches(buffer, memory_pool=memory_pool)
-        bytes_per_row = max(1, combined.nbytes // max(1, combined.num_rows))
-        target_rows = max(1, byte_size // bytes_per_row)
+        target = _target_rows(combined)
 
-        if combined.num_rows <= target_rows:
+        if combined.num_rows <= target:
             # Estimator pushed the row-cap above the combined batch
             # (under-estimate of bytes/row from skewed inputs). Emit as
             # one batch and reset.
@@ -367,4 +394,8 @@ def rechunk_arrow_batches_by_byte_size(
             buffered_bytes = tail.nbytes
 
     if buffer:
-        yield pa.concat_batches(buffer, memory_pool=memory_pool)
+        combined = pa.concat_batches(buffer, memory_pool=memory_pool)
+        if has_row and combined.num_rows > row_size:
+            yield from _slice_to_target(combined)
+        else:
+            yield combined
