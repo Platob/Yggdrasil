@@ -3,24 +3,31 @@
 A ygg manifest is a single Arrow IPC file with:
 
 - **Schema-level ``metadata``** (Arrow's ``Schema.metadata`` /
-  ``custom_metadata``) holding the table-scoped fields: version,
-  timestamp, table id, partition columns, the data schema (as
-  serialized Arrow IPC schema bytes), and the engine that wrote
-  the snapshot.
-- **One row per live data file** in the body, with columns
-  describing the file (path, byte size, modification time, row
-  count, JSON-serialized partition values).
+  ``custom_metadata``) holding the table-scoped fields: timestamp,
+  table id, partition columns, primary key columns, and the
+  embedded data schema as serialized Arrow IPC schema bytes.
+- **One row per live data file** in the body, with strongly-typed
+  columns for path / size / mtime / num_rows + JSON-encoded
+  partition values + JSON-encoded per-column statistics
+  (min / max / null count) for the declared primary key columns.
 
 The "metadata in the schema, files in the body" split lets a reader
 fetch table-level info in one footer parse without paying for the
 file list, and conversely scan the file list in batches without
 re-parsing scalar metadata per row.
 
-This module is intentionally small: it defines the dataclasses that
-describe a manifest, the Arrow schema that backs the on-disk
-representation, and the serialize / deserialize round-trip. The
-write-then-rename and pointer-bump dance lives in
-:mod:`yggdrasil.io.buffer.nested.ygg.commit`.
+The per-file stats column is the input to the predicate
+prefilter (:mod:`.predicate`): walking N file rows, evaluating
+range overlaps, and pruning entries before any data file is
+opened. The body lives as JSON in a single string column rather
+than a struct of typed Arrow columns because:
+
+- Dynamic per-table column set: declare ``primary_key_columns =
+  ["id", "ts"]`` and the manifest carries stats for both; declare
+  no key columns and it carries none. A static struct schema can't
+  do that without rewriting the manifest schema per table.
+- Most tables track stats for ≤ 4 columns, so the JSON cost is a
+  rounding error against the per-file row.
 """
 
 from __future__ import annotations
@@ -28,7 +35,8 @@ from __future__ import annotations
 import dataclasses
 import io as _stdio
 import json
-from typing import Mapping, Sequence
+from datetime import date, datetime, time
+from typing import Any, Mapping, Sequence
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
@@ -40,14 +48,15 @@ from .constants import (
     META_KEY_DATA_SCHEMA,
     META_KEY_ENGINE_INFO,
     META_KEY_PARTITION_COLUMNS,
+    META_KEY_PRIMARY_KEY_COLUMNS,
     META_KEY_TABLE_ID,
     META_KEY_TIMESTAMP,
-    META_KEY_VERSION,
     PROTOCOL_VERSION,
 )
 
 
 __all__ = [
+    "ColumnStats",
     "ManifestEntry",
     "Manifest",
     "MANIFEST_BODY_SCHEMA",
@@ -63,11 +72,10 @@ __all__ = [
 
 #: Arrow schema for the manifest body — one row per live data file.
 #:
-#: ``partition_values`` is a JSON-encoded ``{column: value | null}`` map
-#: stored as a string. Could be a native Arrow ``map<string, string>``;
-#: JSON wins on two counts: it's lossless across writers that don't
-#: agree on Arrow map physical layout, and a JSON cell is dirt-cheap
-#: to inspect by humans tailing the file with hex tools.
+#: ``partition_values`` and ``stats`` are JSON-encoded strings; the
+#: rest are strongly typed. ``num_rows`` is nullable to accommodate
+#: writers that can't produce a row count cheaply (e.g. streaming
+#: codec leaves where the row count requires a full re-decode).
 MANIFEST_BODY_SCHEMA: pa.Schema = pa.schema(
     [
         pa.field("path", pa.string(), nullable=False),
@@ -75,6 +83,7 @@ MANIFEST_BODY_SCHEMA: pa.Schema = pa.schema(
         pa.field("modification_time", pa.int64(), nullable=False),
         pa.field("num_rows", pa.int64(), nullable=True),
         pa.field("partition_values", pa.string(), nullable=False),
+        pa.field("stats", pa.string(), nullable=False),
     ]
 )
 
@@ -85,23 +94,47 @@ MANIFEST_BODY_SCHEMA: pa.Schema = pa.schema(
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class ColumnStats:
+    """Per-column statistics for one file.
+
+    All three fields are best-effort: a writer that can't compute
+    a min/max (all-null column, unsupported dtype) leaves them
+    ``None`` and the predicate pruner falls back to "can't rule
+    out, must read."
+
+    :param min: smallest non-null value in the column. ``None``
+        when the column is all-null or stats weren't computed.
+    :param max: largest non-null value. Same null semantics.
+    :param null_count: number of NULL rows in the column. ``-1``
+        when the writer didn't compute one.
+    """
+
+    min: Any
+    max: Any
+    null_count: int = -1
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class ManifestEntry:
-    """One live data file in a snapshot.
+    """One live data file in the snapshot.
 
     Mirrors a Delta ``AddFile`` minus the parts we don't need
-    (stats, base_row_id, deletion vectors). All paths are
-    forward-slash separated and *relative* to the table root —
-    that's the only form that survives table relocation cleanly.
+    (deletion vectors, base_row_id). All paths are forward-slash
+    separated and *relative* to the table root — the only form
+    that survives table relocation cleanly.
 
     :param path: forward-slash path relative to the table root.
     :param size: file size in bytes at the time the manifest was
         written. Informational; readers don't validate.
     :param modification_time: unix epoch milliseconds. Set by the
         writer; used by external tooling for staleness checks.
-    :param num_rows: optional row count. ``None`` when the writer
-        couldn't compute one cheaply.
+    :param num_rows: row count. ``None`` when the writer couldn't
+        compute one cheaply.
     :param partition_values: ``{column: value | None}`` mapping.
         Empty dict for non-partitioned tables.
+    :param stats: ``{column: ColumnStats}`` for the table's
+        declared primary key columns. Empty dict when no key
+        columns are declared or stats weren't computed.
     """
 
     path: str
@@ -109,30 +142,31 @@ class ManifestEntry:
     modification_time: int
     num_rows: int | None
     partition_values: Mapping[str, str | None]
+    stats: Mapping[str, ColumnStats]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Manifest:
     """A complete snapshot — table metadata plus the live file list.
 
-    :param version: monotonic snapshot version, starting at 0.
     :param timestamp: write-time unix epoch milliseconds.
     :param table_id: stable UUID identifying the logical table.
-        Survives schema changes; carried forward by every commit.
     :param partition_columns: ordered list of partition column
         names. Order matches the on-disk directory layering.
-    :param data_schema: the table's data schema (i.e. the schema of
-        the data files, *not* the schema of this manifest body).
+    :param primary_key_columns: column names tracked in each
+        entry's ``stats``. Used by the predicate pruner.
+    :param data_schema: the table's data schema (i.e. the schema
+        of the data files, *not* the schema of this manifest body).
     :param engine_info: free-form string identifying the writer.
     :param entries: one :class:`ManifestEntry` per live data file.
     :param protocol_version: layout/format version. Readers refuse
         versions above what they implement.
     """
 
-    version: int
     timestamp: int
     table_id: str
     partition_columns: tuple[str, ...]
+    primary_key_columns: tuple[str, ...]
     data_schema: Schema
     engine_info: str
     entries: tuple[ManifestEntry, ...]
@@ -146,19 +180,19 @@ class Manifest:
     def empty(
         cls,
         *,
-        version: int,
         timestamp: int,
         table_id: str,
         partition_columns: Sequence[str] = (),
+        primary_key_columns: Sequence[str] = (),
         data_schema: Schema | None = None,
         engine_info: str = DEFAULT_ENGINE_INFO,
     ) -> "Manifest":
         """Build a manifest with no data files (i.e. an empty table)."""
         return cls(
-            version=version,
             timestamp=timestamp,
             table_id=table_id,
             partition_columns=tuple(partition_columns),
+            primary_key_columns=tuple(primary_key_columns),
             data_schema=data_schema if data_schema is not None else Schema.empty(),
             engine_info=engine_info,
             entries=(),
@@ -200,6 +234,84 @@ def _deserialize_data_schema(blob: bytes) -> Schema:
     return Schema.from_arrow(reader.schema)
 
 
+# ---------------------------------------------------------------------------
+# Stats / partition-value JSON helpers
+# ---------------------------------------------------------------------------
+
+
+def _coerce_scalar_for_json(v: Any) -> Any:
+    """Stringify a scalar so :func:`json.dumps` will accept it.
+
+    JSON natively handles ``int``, ``float``, ``bool``, ``str``, and
+    ``None``. Datetime / date / time / pyarrow scalars get their
+    ISO 8601 string form. Anything weirder falls back to ``str(v)``;
+    the predicate pruner can still compare strings against strings,
+    so we never break the prefilter contract — we just lose a bit
+    of precision.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float, str)):
+        return v
+    if isinstance(v, (datetime, date, time)):
+        return v.isoformat()
+    # pyarrow scalars: unwrap to Python.
+    if hasattr(v, "as_py"):
+        try:
+            return _coerce_scalar_for_json(v.as_py())
+        except Exception:
+            pass
+    return str(v)
+
+
+def _encode_stats(
+    stats: Mapping[str, ColumnStats],
+) -> str:
+    """JSON-encode the stats dict for a manifest row."""
+    if not stats:
+        return "{}"
+    out: dict[str, dict[str, Any]] = {}
+    for col, s in stats.items():
+        out[col] = {
+            "min": _coerce_scalar_for_json(s.min),
+            "max": _coerce_scalar_for_json(s.max),
+            "null_count": int(s.null_count),
+        }
+    return json.dumps(out, separators=(",", ":"), sort_keys=True)
+
+
+def _decode_stats(raw: str) -> dict[str, ColumnStats]:
+    """Inverse of :func:`_encode_stats`. Empty input ⇒ empty dict."""
+    if not raw or raw == "{}":
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Manifest entry has malformed stats JSON {raw!r}: {e}"
+        ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"Manifest entry stats must decode to an object; got "
+            f"{type(parsed).__name__} from {raw!r}."
+        )
+    out: dict[str, ColumnStats] = {}
+    for col, payload in parsed.items():
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Manifest entry stats[{col!r}] must be an object; got "
+                f"{type(payload).__name__}."
+            )
+        out[col] = ColumnStats(
+            min=payload.get("min"),
+            max=payload.get("max"),
+            null_count=int(payload.get("null_count", -1)),
+        )
+    return out
+
+
 def _entries_to_arrays(
     entries: Sequence[ManifestEntry],
 ) -> dict[str, list]:
@@ -209,12 +321,12 @@ def _entries_to_arrays(
     mtimes: list[int] = []
     rowcounts: list[int | None] = []
     pvalues: list[str] = []
+    stats_jsons: list[str] = []
     for e in entries:
         paths.append(e.path)
         sizes.append(int(e.size))
         mtimes.append(int(e.modification_time))
         rowcounts.append(None if e.num_rows is None else int(e.num_rows))
-        # Sort keys for stable diffs across writers.
         pvalues.append(
             json.dumps(
                 {k: e.partition_values[k] for k in sorted(e.partition_values)},
@@ -222,12 +334,14 @@ def _entries_to_arrays(
                 ensure_ascii=False,
             )
         )
+        stats_jsons.append(_encode_stats(e.stats or {}))
     return {
         "path": paths,
         "size": sizes,
         "modification_time": mtimes,
         "num_rows": rowcounts,
         "partition_values": pvalues,
+        "stats": stats_jsons,
     }
 
 
@@ -240,10 +354,14 @@ def _arrays_to_entries(table: pa.Table) -> tuple[ManifestEntry, ...]:
     mtimes = table.column("modification_time").to_pylist()
     rowcounts = table.column("num_rows").to_pylist()
     pvalues_raw = table.column("partition_values").to_pylist()
+    stats_raw = (
+        table.column("stats").to_pylist()
+        if "stats" in table.column_names else [""] * table.num_rows
+    )
 
     out: list[ManifestEntry] = []
-    for path, size, mtime, num_rows, pv_raw in zip(
-        paths, sizes, mtimes, rowcounts, pvalues_raw,
+    for path, size, mtime, num_rows, pv_raw, stats_str in zip(
+        paths, sizes, mtimes, rowcounts, pvalues_raw, stats_raw,
     ):
         pv: Mapping[str, str | None]
         if not pv_raw:
@@ -269,6 +387,7 @@ def _arrays_to_entries(table: pa.Table) -> tuple[ManifestEntry, ...]:
             modification_time=int(mtime) if mtime is not None else 0,
             num_rows=None if num_rows is None else int(num_rows),
             partition_values=pv,
+            stats=_decode_stats(stats_str or ""),
         ))
     return tuple(out)
 
@@ -290,11 +409,13 @@ def encode_manifest(manifest: Manifest) -> bytes:
     arrays = [pa.array(columns[f.name], type=f.type) for f in MANIFEST_BODY_SCHEMA]
 
     schema_md: dict[bytes, bytes] = {
-        META_KEY_VERSION.encode(): str(manifest.version).encode(),
         META_KEY_TIMESTAMP.encode(): str(manifest.timestamp).encode(),
         META_KEY_TABLE_ID.encode(): manifest.table_id.encode(),
         META_KEY_PARTITION_COLUMNS.encode(): json.dumps(
             list(manifest.partition_columns), separators=(",", ":"),
+        ).encode(),
+        META_KEY_PRIMARY_KEY_COLUMNS.encode(): json.dumps(
+            list(manifest.primary_key_columns), separators=(",", ":"),
         ).encode(),
         META_KEY_DATA_SCHEMA.encode(): _serialize_data_schema(manifest.data_schema),
         META_KEY_ENGINE_INFO.encode(): manifest.engine_info.encode(),
@@ -335,7 +456,6 @@ def decode_manifest(blob: bytes) -> Manifest:
             )
         return v
 
-    version = int(_get(META_KEY_VERSION).decode())
     timestamp = int(_get(META_KEY_TIMESTAMP).decode())
     table_id = _get(META_KEY_TABLE_ID).decode()
 
@@ -348,6 +468,15 @@ def decode_manifest(blob: bytes) -> Manifest:
             f"array of strings; got {partition_columns_raw!r}. {e}"
         ) from e
 
+    pk_raw = md.get(META_KEY_PRIMARY_KEY_COLUMNS.encode(), b"[]").decode()
+    try:
+        primary_key_columns = tuple(json.loads(pk_raw))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Manifest {META_KEY_PRIMARY_KEY_COLUMNS!r} must be a JSON "
+            f"array of strings; got {pk_raw!r}. {e}"
+        ) from e
+
     data_schema = _deserialize_data_schema(_get(META_KEY_DATA_SCHEMA))
     engine_info = _get(META_KEY_ENGINE_INFO).decode()
 
@@ -357,10 +486,10 @@ def decode_manifest(blob: bytes) -> Manifest:
     entries = _arrays_to_entries(body)
 
     return Manifest(
-        version=version,
         timestamp=timestamp,
         table_id=table_id,
         partition_columns=partition_columns,
+        primary_key_columns=primary_key_columns,
         data_schema=data_schema,
         engine_info=engine_info,
         entries=entries,
