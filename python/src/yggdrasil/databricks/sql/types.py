@@ -12,7 +12,6 @@ __all__ = [
     "parse_databricks_field",
 ]
 
-
 COLUMN_TYPE_MAP = {
     ColumnTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
     ColumnTypeName.BINARY: BinaryType(),
@@ -39,7 +38,6 @@ COLUMN_TYPE_MAP = {
     ColumnTypeName.USER_DEFINED_TYPE: ObjectType(),
     ColumnTypeName.VARIANT: ObjectType(),
 }
-
 
 COLUMN_INFO_TYPE_MAP = {
     ColumnInfoTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
@@ -68,7 +66,7 @@ COLUMN_STRING_TYPE_MAP = {
     **{ci.name.upper(): t for ci, t in COLUMN_INFO_TYPE_MAP.items()}
 }
 COLUMN_STRING_TYPE_MAP["INTEGER"] = IntegerType(byte_size=4)
-
+COLUMN_STRING_TYPE_MAP["TIMESTAMP_NTZ"] = TimestampType(unit="us")
 
 REPLACE_TIMEZONES = {
     "Etc/UTC": "UTC",
@@ -108,7 +106,9 @@ def parse_databricks_field(obj: Any) -> Field:
 
 def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
     name = obj.name or ""
-    dtype = COLUMN_INFO_TYPE_MAP.get(obj.type_name, ObjectType.instance())
+    dtype = COLUMN_INFO_TYPE_MAP.get(obj.type_name, None)
+    if dtype is None:
+        dtype = DataType.from_str(obj.type_text)
 
     if isinstance(dtype, DecimalType):
         precision = 38 if obj.type_precision is None else obj.type_precision
@@ -220,7 +220,8 @@ def parse_field_dict(obj: Any) -> Field:
         key_type = obj.get("keyType", None)
         key_field = parse_databricks_field(key_type).with_nullable(False) if key_type else dtype.key_field
         value_type = obj.get("valueType", None)
-        value_field = parse_databricks_field(value_type).with_nullable(value_contains_null) if value_type else dtype.value_field
+        value_field = parse_databricks_field(value_type).with_nullable(
+            value_contains_null) if value_type else dtype.value_field
 
         dtype = MapType.from_key_value(key_field, value_field)
 
