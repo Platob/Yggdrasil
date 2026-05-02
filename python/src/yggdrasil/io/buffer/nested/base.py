@@ -1,86 +1,70 @@
-"""Abstract base for folder-oriented tabular aggregations.
+"""Folder-oriented :class:`TabularIO` aggregations whose data is the
+union of their *children*.
 
-:class:`NestedIO` is the sibling abstraction to :class:`PrimitiveIO`:
-where ``PrimitiveIO`` is the multi-inheritance fold of
+Where :class:`PrimitiveIO` is the multi-inheritance fold of
 :class:`BytesIO + TabularIO` for single-buffer leaves (Parquet, IPC,
-CSV, ...), :class:`NestedIO` is the fold of :class:`Path` (a folder
-URL, no buffer) and :class:`TabularIO` for fragment-based
-aggregations (folders of homogeneous files, Delta tables, Hive
-partitions, multi-file IPC streams).
+CSV, ...), :class:`NestedIO` is the parent-side abstraction for
+folder-shaped sources whose data is composed of multiple autonomous
+sub-IOs.
 
-Why the split?
---------------
+What changed
+------------
 
-A primitive IO *is* the buffer — read/write a single sequence of
-bytes, dispatched through one Arrow codec. A nested IO has no
-buffer: its data is the union of its children's data. The two share
-the Arrow record-batch protocol from :class:`TabularIO` but
-nothing else — different storage model, different save-mode
-semantics, different write strategy.
+The previous version exposed a :class:`Fragment` indirection over its
+child files: ``iter_fragments()`` yielded location descriptors with an
+``io`` field stapled on. That layered an extra metadata object between
+the parent and the bytes that did very little work — every consumer
+went straight to ``frag.io`` anyway, and the parent had to keep two
+things in sync (the descriptor and the IO it wrapped).
 
-``isinstance(io, NestedIO)`` is the dual of
-``isinstance(io, PrimitiveIO)`` and is used by orchestration code
-(folder-of-folders writers, scan planners, fragment consumers) to
-decide whether the IO must be drained fragment-by-fragment or can
-be treated as a single byte stream.
+The current shape drops fragments. A :class:`NestedIO` is just a
+container of *children*, where every child is itself a fully formed
+:class:`TabularIO` (or pure :class:`BytesIO` for opaque files): an
+autonomous root IO, openable on its own, readable on its own, with
+its own path. Each child carries a ``parent`` back-pointer to the
+:class:`NestedIO` that yielded it so callers can walk back up the
+tree. The parent's read/write derivations chain children directly.
 
 The contract
 ------------
 
-A subclass implements three things:
+A subclass implements:
 
-- :meth:`options_class`        — :class:`NestedOptions` subtype it
-                                  consumes. Default :class:`NestedOptions`.
-- :meth:`iter_fragments`       — yield :class:`Fragment` instances,
-                                  one per child data unit. *Primary
-                                  read API.* All read-side machinery
-                                  (``_read_arrow_batches``,
-                                  ``_collect_schema``) derives from
-                                  this hook.
-- :meth:`_make_child_io`       — mint a fresh :class:`PrimitiveIO`
-                                  for a write target with a given
-                                  child name and media type. *Primary
-                                  write API.* :meth:`_write_arrow_batches`
-                                  derives from this.
+- :meth:`options_class`     — :class:`NestedOptions` subtype it
+                              consumes. Default :class:`NestedOptions`.
+- :meth:`iter_children`     — yield direct children. Each yielded
+                              child is a :class:`TabularIO`
+                              (typically :class:`PrimitiveIO` for
+                              files or another :class:`NestedIO` for
+                              sub-folders) or a :class:`BytesIO` for
+                              opaque blobs. The base setter stamps
+                              ``child.parent = self`` on the way out.
+- :meth:`make_child`        — mint a fresh child IO bound under
+                              :attr:`path` for a given name and
+                              media type. Used by the writer.
 
 Storage model
 -------------
 
-A :class:`NestedIO` holds a single :class:`Path` pointing at the
-folder root. Lifecycle (``open`` / ``close``) chains to the path —
-opening the IO opens the path, closing the IO releases it.
-``Disposable`` ownership ensures temp folders are unlinked when
-the IO closes.
-
-There is no buffer, no codec, no spill. Compression is the
-responsibility of the child format (e.g. parquet's internal
-codecs) — folder-level compression doesn't make sense when the
-folder *is* the unit of storage.
+A :class:`NestedIO` holds a single :class:`Path` (the folder root).
+There is no buffer, no codec, no spill — the unit of storage is the
+folder, and compression is the per-child format's responsibility.
 
 Save mode semantics
 -------------------
 
-Folder formats naturally support OVERWRITE and APPEND:
-
-- :attr:`Mode.OVERWRITE` — clear the folder of non-ignored
-  children, then write a fresh child (or children, per
-  ``options.child_row_size``). The folder itself is never deleted
-  (would race with concurrent readers); only its contents.
-- :attr:`Mode.APPEND` — mint a new child file alongside existing
-  ones. The next index is computed from existing non-ignored
-  children. Always native at the base.
-- :attr:`Mode.UPSERT` — not supported by default. Subclasses with
-  meaningful merge semantics (Delta, Iceberg) override.
-
-Write strategy is caller-controlled via
-:attr:`NestedOptions.child_row_size` and ``child_byte_size``: the
-default is "one child file per write call" (single batch
-iteration drained into a single staging file). Subclasses can
-override :meth:`_write_arrow_batches` if they need more control.
+- :attr:`Mode.OVERWRITE` — clear non-ignored children, then write
+  fresh. The folder itself is never deleted (would race with
+  concurrent readers); only its contents.
+- :attr:`Mode.APPEND`    — mint a new child alongside existing
+  ones. Always native at the base.
+- :attr:`Mode.UPSERT`    — generic read-existing/merge/overwrite
+  helper. Subclasses with cheaper merge semantics override.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -100,12 +84,12 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MimeType, Mode
-from yggdrasil.io.fragment import Fragment, FragmentInfos
 from yggdrasil.io.fs import Path
 from yggdrasil.io.tabular import TabularIO
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
+    from yggdrasil.io.buffer.bytes_io import BytesIO
     from yggdrasil.io.buffer.primitive import PrimitiveIO
 
 
@@ -117,21 +101,18 @@ __all__ = ["NestedIO", "NestedOptions"]
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
 class NestedOptions(CastOptions):
     """Cast options extended with folder-write knobs.
 
     Inherits everything from :class:`CastOptions` (mode, row_size,
-    byte_size, schema-cast hooks). The fragment-iteration knobs
-    (``recursive``, key-glob filter, ``open_io``) are still on
-    :class:`FragmentOptions` — they govern enumeration shape, not
-    cast behavior. ``NestedOptions`` carries only the knobs that
-    must reach the Arrow read/write hooks.
+    byte_size, schema-cast hooks, ``recursive``). ``NestedOptions``
+    adds only knobs the folder writer needs.
 
     :param child_media_type: the :class:`MediaType` to mint child
         files as on write. ``None`` (default) means "infer from the
         folder's child convention" — the concrete subclass decides
-        (e.g. :class:`FolderIO` looks at the first existing child
-        or falls back to a class-level default).
+        (e.g. :class:`FolderIO` falls back to a class-level default).
     :param child_row_size: row count per child file on write. ``0``
         or ``None`` means "one child file per write call" — the
         whole batch iterator is drained into a single staging
@@ -140,17 +121,11 @@ class NestedOptions(CastOptions):
     :param child_byte_size: same as ``child_row_size`` but in
         approximate bytes. Mutually exclusive with
         ``child_row_size`` (row threshold wins if both set).
-    :param populate_metadata: when iterating fragments, populate
-        each :class:`FragmentInfos` with a :class:`Schema` (one
-        ``collect_schema`` call per child) and ``mtime``. Default
-        ``False`` — keeps enumeration cheap; consumers that need
-        the schema can call ``frag.io.collect_schema()`` lazily.
     """
 
     child_media_type: Any = None
     child_row_size: int = 0
     child_byte_size: int = 0
-    populate_metadata: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -166,20 +141,18 @@ O = TypeVar("O", bound=NestedOptions)
 
 
 class NestedIO(TabularIO[O], ABC):
-    """Marker base for folder-oriented tabular aggregations.
+    """Folder-oriented :class:`TabularIO`. Children, not buffers.
 
     Pairs with :class:`PrimitiveIO` as the two storage flavors of
     :class:`TabularIO`. Holds a single :class:`Path` (the folder
-    root); reads enumerate fragments, writes mint child IOs.
+    root); reads enumerate :meth:`iter_children`, writes mint child
+    IOs via :meth:`make_child`.
 
-    Concrete leaves implement :meth:`iter_fragments` and
-    :meth:`_make_child_io`; everything else (Arrow batches, schema
-    inspection, save-mode handling, write loop) is derived here.
-
-    :class:`NestedIO` does NOT inherit from :class:`BytesIO`. It is
-    Disposable + TabularIO. The held :class:`Path` is owned via
-    :meth:`Disposable.add_owned` so its lifecycle (including
-    ``temporary=True`` unlinking) chains to the IO.
+    Each child yielded by :meth:`iter_children` is itself a complete
+    autonomous IO (a :class:`PrimitiveIO` for a file, another
+    :class:`NestedIO` for a sub-folder, or a :class:`BytesIO` for an
+    opaque blob). Children carry ``parent`` set to ``self`` so a
+    consumer can walk back up the tree.
     """
 
     # Used by :meth:`TabularIO.__new__` to short-circuit dispatch on
@@ -194,14 +167,7 @@ class NestedIO(TabularIO[O], ABC):
 
     @classmethod
     def default_mime_type(cls) -> "MimeType | None":
-        """Don't claim any mime type at the abstract layer.
-
-        Mirrors :meth:`PrimitiveIO.default_mime_type`: returning
-        ``None`` keeps :class:`NestedIO` itself out of the registry
-        so :meth:`TabularIO.media_type_class` doesn't accidentally
-        dispatch to the abstract base. Concrete subclasses
-        (:class:`FolderIO` against ``MimeTypes.FOLDER``) override.
-        """
+        """Don't claim any mime type at the abstract layer."""
         return None
 
     # ------------------------------------------------------------------
@@ -214,20 +180,6 @@ class NestedIO(TabularIO[O], ABC):
         *args: Any,
         **kwargs: Any,
     ):
-        """Route through :meth:`TabularIO.__new__` for media-type dispatch.
-
-        - ``NestedIO(path=...)`` — dispatch to the right concrete
-          leaf based on the path's inferred mime type. A directory
-          path resolves to ``MimeTypes.FOLDER`` via
-          ``Path.is_dir_sink``, landing on :class:`FolderIO` (or a
-          subclass).
-        - ``FolderIO(path=...)`` — already a concrete leaf;
-          ``TabularIO.__new__`` short-circuits via ``_FINAL_TABULAR_IO``
-          and returns ``object.__new__(cls)``.
-
-        The data positional is forwarded so the dispatch sees both
-        a kwarg ``media_type`` and any path-ish positional.
-        """
         return TabularIO.__new__(cls, data, *args, **kwargs)
 
     def __init__(
@@ -236,28 +188,29 @@ class NestedIO(TabularIO[O], ABC):
         *,
         path: Any = None,
         media_type: Any = None,
-        auto_open: bool = True,
+        parent: "NestedIO | None" = None,
+        auto_open: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize from a folder path.
 
-        ``data`` and ``path`` are accepted as the same thing — a
-        path-ish object pointing at the folder root. ``data`` is
-        the positional shape ``TabularIO.__new__`` already
-        normalized; ``path`` is the kwarg shape callers prefer.
-        Whichever is non-None wins; if both are supplied, ``path``
-        takes precedence.
+        ``data`` and ``path`` accept the same shape; ``path`` wins
+        when both are supplied. ``parent`` records this IO's
+        position in a folder-of-folders tree (set by the enclosing
+        :class:`NestedIO` when it yields this one); ``None`` for
+        the top-level handle.
 
-        ``media_type`` is captured by the registry but otherwise
-        unused at the base — concrete leaves with ``default_mime_type``
-        already know what they are.
+        ``auto_open`` defaults to ``False`` — a pure ``path=``
+        construction returns a closed IO. The lifecycle opens on
+        first ``with`` entry or explicit :meth:`open`. This matches
+        the no-surprises rule callers rely on: building a handle
+        should not start probing storage.
         """
         Disposable.__init__(self)
         self._arrow_table = None
         self._spark_frame = None
+        self.parent: "NestedIO | None" = parent
 
-        # Resolve the folder path. ``path`` kwarg wins over positional
-        # ``data`` so callers who pass both don't get a surprise.
         raw = path if path is not None else data
         if raw is None:
             raise ValueError(
@@ -277,23 +230,11 @@ class NestedIO(TabularIO[O], ABC):
     # ------------------------------------------------------------------
 
     def _acquire(self) -> None:
-        """Ensure the underlying path is open.
-
-        The path's own ``_acquire`` is a no-op (paths don't
-        materialize files just because something opens a reference),
-        but going through ``Disposable.open`` flips its acquired
-        flag so subsequent operations see a live handle.
-        """
         if not self.path.opened:
             self.path.open()
 
     def _release(self) -> None:
-        """Tear down: clear caches and let the owned path release."""
         self.unpersist()
-        # Owned-child release runs through the Disposable graph;
-        # we don't need to call self.path.close() explicitly.
-        # ``add_owned`` registered the path; the framework's
-        # close pass walks owned children.
 
     @property
     def cached(self) -> bool:
@@ -309,15 +250,6 @@ class NestedIO(TabularIO[O], ABC):
         *,
         data: Any | None = None,
     ) -> "NestedIO":
-        """Materialize the folder into an in-process cache.
-
-        Same shape as :meth:`PrimitiveIO.persist`. For folders,
-        materialization runs the full fragment iteration and Arrow
-        merge — useful when the same folder is read multiple times
-        in close succession (avoids re-listing + re-opening every
-        child). Engine ``auto`` resolves to spark on Databricks
-        (driver-side), arrow elsewhere.
-        """
         if self.cached:
             return self
 
@@ -352,137 +284,88 @@ class NestedIO(TabularIO[O], ABC):
         return NestedOptions  # type: ignore[return-value]
 
     # ==================================================================
-    # Fragment surface — the primary read API
+    # Children surface — primary read API
     # ==================================================================
 
     @abstractmethod
-    def iter_fragments(self, options: "O | None" = None, **kwargs: Any) -> Iterator[Fragment]:
-        """Yield :class:`Fragment` instances, one per child data unit.
+    def iter_children(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO | BytesIO]":
+        """Yield this folder's direct children, each as an autonomous IO.
 
-        *The* primary read API for nested IOs. All Arrow-batch
-        machinery on this class derives from this hook.
+        Implementations enumerate the folder (directory listing,
+        log replay for Delta, manifest scan for Iceberg) and build
+        one IO per data unit:
 
-        Subclasses implement enumeration (directory listing, log
-        replay for Delta, manifest scan for Iceberg) and yield
-        fragments with ``parent=None`` at the top level. Recursive
-        descent is the consumer's responsibility — they walk the
-        ``frag.io`` and re-call ``iter_fragments`` if it's another
-        :class:`NestedIO`.
+        - File leaves are yielded as :class:`PrimitiveIO` (or
+          :class:`BytesIO` for non-tabular blobs the caller may
+          want to inspect).
+        - Sub-folders are yielded as :class:`NestedIO` instances —
+          the read/write derivations descend into them transparently.
 
-        Each yielded fragment carries:
-
-        - ``infos.url`` — the child's location.
-        - ``infos.mtime`` — the child's modification time, or
-          ``0.0`` if not cheaply available (or
-          ``populate_metadata`` is False).
-        - ``infos.schema`` — the child's :class:`Schema`, or
-          ``None`` if ``populate_metadata`` is False (the default;
-          collect_schema costs a footer read per child).
-        - ``io`` — a fresh :class:`PrimitiveIO` bound to the child
-          path, ready for ``read_arrow_batches`` etc. The IO is
-          owned by the iterator's lifetime; consumers that need
-          to keep it past iteration call ``frag.with_io(...)`` to
-          re-bind.
-
-        :param options: a :class:`NestedOptions` (or subclass)
-            instance. ``populate_metadata`` controls whether
-            schema/mtime are filled in eagerly.
+        Each yielded child has its ``parent`` attribute set to
+        ``self`` so consumers can walk back up via the parent
+        chain. Children are returned closed; the caller (or the
+        derived ``_read_arrow_batches`` loop) opens them inside a
+        ``with`` block.
         """
-
-    def to_fragment_infos(self) -> FragmentInfos:
-        """Build a :class:`FragmentInfos` describing this folder.
-
-        Used when this IO is itself wrapped as a fragment in a
-        larger nested aggregation (folder-of-folders, Hive parent).
-        """
-        try:
-            schema = self.collect_schema()
-        except Exception:
-            # collect_schema goes through every child; if any one
-            # fails, prefer ``None`` over crashing the metadata
-            # build. Consumers that need a schema call
-            # ``collect_schema`` directly and handle the error.
-            schema = None
-
-        try:
-            mtime = self.path.mtime or 0.0
-        except Exception:
-            mtime = 0.0
-
-        return FragmentInfos(
-            url=self.path.url,
-            mtime=mtime,
-            schema=schema,
-        )
-
-    def to_fragment(self) -> Fragment:
-        return Fragment(
-            infos=self.to_fragment_infos(),
-            io=self,  # type: ignore[arg-type]
-        )
 
     # ==================================================================
-    # Child IO factory — the primary write API
+    # Child IO factory — primary write API
     # ==================================================================
 
     @abstractmethod
-    def _make_child_io(
+    def make_child(
         self,
         name: str,
+        *,
         media_type: Any = None,
     ) -> "PrimitiveIO":
-        """Mint a fresh :class:`PrimitiveIO` for a child write target.
+        """Mint a fresh :class:`PrimitiveIO` for a write target.
 
-        Returns a closed (un-acquired) IO bound to ``self.path / name``
-        with the given media type. The writer opens it inside the
-        write loop and closes it on success — the bound-path
-        write-back fires on close.
+        Returns a closed (un-acquired) IO bound to ``self.path / name``.
+        The writer opens it inside the write loop and closes on
+        success — the bound-path write-back fires on close. The
+        returned child has ``parent = self``.
 
         :param name: child filename (no path separators), already
             including the format extension. Subclasses that use
-            staging should accept the staging name from
+            staging accept the staging name from
             :meth:`Path.make_staging` here and rename on success.
         :param media_type: media type for the child. ``None`` lets
             the subclass infer from extension or class default.
         """
+
+    def _attach(self, child: Any) -> Any:
+        """Stamp ``child.parent = self`` and return the child.
+
+        Used by subclasses inside ``iter_children`` / ``make_child``
+        to keep parent linkage consistent without scattering the
+        same line across every implementation.
+        """
+        try:
+            child.parent = self
+        except (AttributeError, TypeError):
+            # Slotted subclass without a parent slot — best effort,
+            # callers that need the link must implement the slot.
+            pass
+        return child
 
     # ==================================================================
     # Mode resolution — folder-flavored counterpart of PrimitiveIO's
     # ==================================================================
 
     def is_empty(self) -> bool:
-        """True when the folder has no non-ignored children.
-
-        The base implementation defers to
-        :meth:`iter_fragments` with a fresh empty options instance,
-        peeks one fragment, and discards. Subclasses with a cheaper
-        existence check (``ls`` directly, manifest probe) should
-        override.
-        """
+        """True when the folder has no non-ignored children."""
         try:
-            return next(iter(self.iter_fragments()), None) is None
+            return next(iter(self.iter_children()), None) is None
         except FileNotFoundError:
-            # The folder doesn't exist yet — that's empty.
             return True
 
     def _resolve_save_mode(self, mode: Any) -> Mode:
-        """Resolve any :class:`Mode` to one a folder writer can branch on.
-
-        Folder-flavored counterpart of
-        :meth:`PrimitiveIO._resolve_save_mode`. Returns one of:
-
-        - :attr:`Mode.OVERWRITE` — clear non-ignored children and
-          write fresh.
-        - :attr:`Mode.APPEND` — mint a new sibling alongside
-          existing children (always native at the base).
-        - :attr:`Mode.IGNORE` — folder non-empty, caller wants to
-          skip.
-        - :attr:`Mode.UPSERT` — only when subclass advertises
-          ``_SUPPORTED_UPSERT``.
-
-        AUTO/TRUNCATE map to OVERWRITE; ERROR_IF_EXISTS raises
-        :class:`FileExistsError` when the folder is non-empty.
-        """
+        """Resolve any :class:`Mode` to one a folder writer can branch on."""
         m = Mode.from_(mode, default=Mode.AUTO)
 
         if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
@@ -503,25 +386,17 @@ class NestedIO(TabularIO[O], ABC):
                 )
             return Mode.OVERWRITE
 
-        # UPSERT and any subclass-defined modes pass through; the
-        # writer is responsible for raising if it doesn't support
-        # them.
         return m
 
     # ==================================================================
-    # Folder mutators — cheap helpers used by the write path
+    # Folder mutators — used by the write path
     # ==================================================================
 
     def _clear_children(self) -> None:
         """Remove every non-ignored child of the folder.
 
         Used by OVERWRITE. Does not remove the folder itself —
-        concurrent readers may hold the directory handle. Subclasses
-        with ignore rules (``_is_ignored_path``) should override or
-        feed the rule list through ``ls`` filters.
-
-        Default implementation: remove every child that
-        :meth:`_is_ignored_path` returns False for.
+        concurrent readers may hold the directory handle.
         """
         if not self.path.exists():
             return
@@ -547,63 +422,79 @@ class NestedIO(TabularIO[O], ABC):
         return child.name.startswith(".")
 
     # ==================================================================
-    # Read derivation — Arrow batches via fragment chaining
+    # Read derivation — chain children directly
     # ==================================================================
 
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
-        """Chain :meth:`iter_fragments` into a single Arrow batch stream.
+        """Chain :meth:`iter_children` into a single Arrow batch stream.
 
-        Each fragment's IO is opened, drained, and closed in turn.
-        The ``options`` are forwarded to each child read so cast /
-        projection / row-size knobs apply per-batch the same way
-        they would on a primitive.
+        Sub-folder children (other :class:`NestedIO`) recurse
+        through their own ``_read_arrow_batches``. Leaf children
+        are read in turn through :meth:`TabularIO.read_arrow_batches`.
+        Pure :class:`BytesIO` children with no tabular surface are
+        skipped — the caller can pull bytes from them via
+        :meth:`iter_children` directly.
         """
         if self.cached:
             yield from self._read_arrow_batches_from_cache(options)
             return
 
-        for frag in self.iter_fragments(options):
-            child_io = frag.io
-            if child_io is None:
-                # Pure location descriptor — skip, the caller asked
-                # for io-less iteration.
-                continue
-            # Opening through the context manager guarantees the
-            # child closes even if the consumer breaks out of the
-            # outer loop early.
-            with child_io:
-                yield from child_io.read_arrow_batches(options=options)
+        for child in self.iter_children(options):
+            yield from self._read_child_batches(child, options)
+
+    def _read_child_batches(
+        self,
+        child: Any,
+        options: O,
+    ) -> Iterator[pa.RecordBatch]:
+        """Drain one child's batches.
+
+        Pulled out so subclasses (PartitionedFolderIO, DeltaIO) can
+        wrap each child's batch stream (e.g. to inject partition
+        columns or apply a deletion vector) without re-implementing
+        the dispatch on child type.
+        """
+        if isinstance(child, NestedIO):
+            with child:
+                yield from child._read_arrow_batches(options)
+            return
+
+        if isinstance(child, TabularIO):
+            with child:
+                yield from child.read_arrow_batches(options=options)
+            return
+
+        # BytesIO without a tabular surface: not readable as arrow.
+        # Skip — the caller can still reach it via iter_children.
 
     def _collect_schema(self, options: O) -> Schema:
-        """Merge per-fragment schemas into a single folder schema.
-
-        Stays in :class:`Schema` space throughout — ``Schema.merge_with``
-        does the union with the same semantics ZIP uses. Empty
-        folders return :meth:`Schema.empty`.
-        """
+        """Merge per-child schemas into a single folder schema."""
         merged: Schema | None = None
 
-        for frag in self.iter_fragments(options):
-            # Prefer the fragment's pre-populated schema (when
-            # ``populate_metadata`` was on) over re-opening the
-            # child. Falls back to collect_schema on the IO.
-            child_schema = frag.infos.schema
-            if child_schema is None and frag.io is not None:
-                with frag.io:
-                    child_schema = frag.io.collect_schema(options=options)
+        for child in self.iter_children(options):
+            schema: Schema | None = None
+            if isinstance(child, NestedIO):
+                with child:
+                    schema = child._collect_schema(options)
+            elif isinstance(child, TabularIO):
+                with child:
+                    try:
+                        schema = child.collect_schema(options=options)
+                    except Exception:
+                        schema = None
 
-            if child_schema is None:
+            if schema is None:
                 continue
 
             if merged is None:
-                merged = child_schema
+                merged = schema
             else:
-                merged = merged.merge_with(child_schema, inplace=True)
+                merged = merged.merge_with(schema, inplace=True)
 
         return merged if merged is not None else Schema.empty()
 
     # ==================================================================
-    # Write derivation — fragment minting + dispatch on save mode
+    # Write derivation — child minting + dispatch on save mode
     # ==================================================================
 
     def _write_arrow_batches(
@@ -618,15 +509,6 @@ class NestedIO(TabularIO[O], ABC):
         per :attr:`NestedOptions.child_row_size` /
         ``child_byte_size``. On a successful drain, staging files
         are renamed to their final names.
-
-        Failure modes:
-
-        - Mid-stream exception: staging files remain (with their
-          TTL-encoded names). Subsequent calls clean them up via
-          ``Path.make_staging``'s sweep. Existing children are
-          untouched.
-        - Mode IGNORE on non-empty folder: no-op.
-        - Mode UPSERT without subclass support: ``ValueError``.
         """
         mode = self._resolve_save_mode(options.mode)
 
@@ -640,9 +522,6 @@ class NestedIO(TabularIO[O], ABC):
         if mode is Mode.OVERWRITE:
             self._clear_children()
 
-        # APPEND and OVERWRITE share the rest of the path: mint a
-        # staging child (or several, if rolling over) and drain
-        # batches into it.
         self._drain_into_children(batches, options)
 
     def _drain_into_children(
@@ -650,24 +529,10 @@ class NestedIO(TabularIO[O], ABC):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Drain *batches* into one or more child files.
-
-        Single-child fast path when ``child_row_size`` and
-        ``child_byte_size`` are both 0 (default): stream the whole
-        iterator into one child.
-
-        Roll-over path: every ``child_row_size`` rows (or
-        ``child_byte_size`` bytes), close the current child and
-        mint the next.
-        """
-        # Materialize the iterator once so we can probe whether
-        # there's anything to write before minting a child.
+        """Drain *batches* into one or more child files."""
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
-            # Nothing to write. APPEND with empty input is a no-op;
-            # OVERWRITE leaves the cleared folder empty (which is
-            # the correct OVERWRITE-of-nothing state).
             return
 
         media_type = options.child_media_type or self._default_child_media_type()
@@ -675,7 +540,6 @@ class NestedIO(TabularIO[O], ABC):
         byte_threshold = options.child_byte_size or 0
 
         if row_threshold <= 0 and byte_threshold <= 0:
-            # Single-child path. Re-prepend the peeked batch.
             self._write_one_child(
                 _chain_first(first, batch_iter),
                 media_type=media_type,
@@ -683,8 +547,6 @@ class NestedIO(TabularIO[O], ABC):
             )
             return
 
-        # Roll-over path: split the stream into chunks by row /
-        # byte threshold, write one child per chunk.
         for chunk in _split_batches(
             _chain_first(first, batch_iter),
             row_threshold=row_threshold,
@@ -703,38 +565,21 @@ class NestedIO(TabularIO[O], ABC):
         media_type: Any,
         options: O,
     ) -> None:
-        """Mint one staging child, drain *batches* into it, finalize.
-
-        Uses :meth:`Path.make_staging` for the staging name (TTL-
-        encoded so a failed write gets reaped automatically) and
-        renames to the final ``part-{N}.{ext}`` name on success.
-        Subclasses can override to skip the rename (e.g. Delta
-        writes the staging file directly into a commit-log entry).
-        """
+        """Mint one staging child, drain *batches* into it, finalize."""
         staging_path = self._make_staging_path(media_type)
         staging_name = staging_path.name
 
-        child = self._make_child_io(staging_name, media_type=media_type)
+        child = self.make_child(staging_name, media_type=media_type)
         try:
             with child:
-                # Forward the options unchanged — child format
-                # writers see the cast knobs, row_size, etc.
-                # ``mode`` is irrelevant for a fresh child but
-                # passing it through keeps the call signature
-                # consistent.
                 child.write_arrow_batches(batches, options=options)
         except Exception:
-            # Staging file's TTL ensures eventual cleanup; explicit
-            # remove here is best-effort.
             try:
                 staging_path.remove(allow_not_found=True)
             except Exception:
                 pass
             raise
 
-        # Rename into final position. Subclass override point:
-        # _finalize_child can leave staging in place (Delta) or
-        # rename to a transactional name (S3 multipart commit).
         self._finalize_child(staging_path, media_type=media_type)
 
     # ------------------------------------------------------------------
@@ -743,42 +588,16 @@ class NestedIO(TabularIO[O], ABC):
     # ------------------------------------------------------------------
 
     def _make_staging_path(self, media_type: Any) -> Path:
-        """Mint a staging :class:`Path` under :attr:`path`.
-
-        Default: ``self.path.make_staging(media_type=media_type)`` —
-        TTL-encoded name, parent-rate-limited sweep, ``temporary=True``
-        so a failed lifecycle unlinks it. Subclasses with their own
-        staging discipline (Delta puts staging files in the same
-        directory as final ones to avoid a cross-directory rename)
-        override.
-        """
         return self.path.make_staging(media_type=media_type)
 
     def _finalize_child(self, staging_path: Path, *, media_type: Any) -> None:
-        """Promote a staging file to its final name.
-
-        Default: rename to ``part-{N}.{ext}`` where N is one past
-        the largest existing ``part-`` index. Subclasses with their
-        own naming (Delta's UUID-based filenames, Hive's
-        partition-key-based) override.
-        """
+        """Promote a staging file to its final name."""
         final_name = self._next_child_name(media_type=media_type)
         final_path = self.path / final_name
-
-        # Path.rename copies + removes; on a same-filesystem local
-        # path the LocalPath fast path uses os.rename. Cross-backend
-        # rename falls through to streaming copy.
         staging_path.rename(final_path)
 
     def _next_child_name(self, *, media_type: Any) -> str:
-        """Compute the next ``part-{N}.{ext}`` name.
-
-        Walks existing children once. The default ``part-`` prefix
-        keeps APPEND counts monotonic across writers in the same
-        process; collisions across processes are resolved by
-        retrying with an incremented index (file-existence check
-        is the writer's responsibility).
-        """
+        """Compute the next ``part-{N}.{ext}`` name."""
         ext = self._extension_for(media_type)
         prefix = "part-"
         max_idx = -1
@@ -788,9 +607,6 @@ class NestedIO(TabularIO[O], ABC):
                 name = child.name
                 if not name.startswith(prefix):
                     continue
-                # Strip prefix and the extension to isolate the
-                # index part. Tolerant of extra dots in the
-                # extension (``part-3.parquet.gz``).
                 stem = name[len(prefix):]
                 idx_str = stem.split(".", 1)[0]
                 if not idx_str.isdigit():
@@ -804,21 +620,12 @@ class NestedIO(TabularIO[O], ABC):
         return f"{prefix}{next_idx:05d}{suffix}"
 
     def _extension_for(self, media_type: Any) -> str:
-        """Resolve a file extension for a child of the given media type.
-
-        Goes through the :class:`MediaType` enum's
-        ``full_extension`` if available, else empty string. Same
-        helper :meth:`Path._staging_extension` uses internally —
-        kept here as a method so subclasses can override
-        per-format (e.g. Delta always writes ``parquet`` regardless
-        of the configured child media type).
-        """
         return Path._staging_extension(media_type)
 
     def _default_child_media_type(self) -> Any:
-        """The media type to use for new children when not specified.
+        """Media type for new children when not specified.
 
-        Default ``None`` lets :meth:`_make_child_io` infer from the
+        Default ``None`` lets :meth:`make_child` infer from the
         child name (which is what staging gives us — extension
         baked into the staging name). Subclasses with a fixed
         format (Delta = parquet, IcebergV1 = avro) override.
@@ -830,18 +637,7 @@ class NestedIO(TabularIO[O], ABC):
     # ==================================================================
 
     def _arrow_upsert_via_rewrite(self, batches: Any, options: O) -> None:
-        """Read existing, merge, OVERWRITE.
-
-        Mirrors :meth:`TabularIO._arrow_upsert_via_rewrite` but at
-        the folder level: read every existing child into one Arrow
-        table, merge with incoming on ``options.match_by_names``,
-        clear the folder, write a single fresh child with the
-        merged result.
-
-        Subclasses with cheaper merge semantics (Delta's commit
-        log, Iceberg's manifest rewrite) override to avoid the
-        full read.
-        """
+        """Read existing, merge, OVERWRITE."""
         match_by = options.match_by_names
         if not match_by:
             raise ValueError(
@@ -858,9 +654,6 @@ class NestedIO(TabularIO[O], ABC):
             existing_table, incoming_table, match_by=match_by,
         )
 
-        # Clear and write the merged result as a single new child.
-        # Subclasses that need to preserve fine-grained child layout
-        # override this whole method.
         overwrite_options = options.copy(mode=Mode.OVERWRITE)
         row_size = getattr(overwrite_options, "row_size", None) or None
         self._write_arrow_batches(
@@ -878,11 +671,7 @@ def _chain_first(
     first: pa.RecordBatch,
     rest: Iterator[pa.RecordBatch],
 ) -> Iterator[pa.RecordBatch]:
-    """Yield *first*, then every batch from *rest*.
-
-    Lets the caller probe an iterator (peek the first batch to
-    detect emptiness) without losing the peeked element.
-    """
+    """Yield *first*, then every batch from *rest*."""
     yield first
     yield from rest
 
@@ -895,18 +684,8 @@ def _split_batches(
 ) -> Iterator[Iterator[pa.RecordBatch]]:
     """Split a batch iterator into chunks by row / byte threshold.
 
-    Each yielded inner iterator is one chunk; consumers should
-    drain it before pulling the next outer item, since the outer
-    loop drives the underlying ``batches`` cursor. ``row_threshold``
-    wins when both are set.
-
-    Edge cases:
-
-    - A single batch larger than the threshold goes into its own
-      chunk untouched (we don't slice batches — that's the caller
-      format's concern).
-    - Threshold of 0 is treated as "no threshold" by the caller;
-      this helper assumes at least one threshold is positive.
+    ``row_threshold`` wins when both are set. A single batch larger
+    than the threshold goes into its own chunk untouched.
     """
 
     def _size_bytes(batch: pa.RecordBatch) -> int:
