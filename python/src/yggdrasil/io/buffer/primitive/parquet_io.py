@@ -28,7 +28,7 @@ from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module,
 )
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -60,10 +60,8 @@ class ParquetOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class ParquetIO(PrimitiveIO):
-    """:class:`PrimitiveIO` for Parquet files."""
-
-    __slots__ = ("_parquet_metadata",)
+class ParquetIO(BytesIO):
+    """A :class:`BytesIO` for Parquet files."""
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 

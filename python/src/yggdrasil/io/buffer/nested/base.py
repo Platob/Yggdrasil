@@ -90,7 +90,6 @@ from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
     from yggdrasil.io.buffer.bytes_io import BytesIO
-    from yggdrasil.io.buffer.primitive import PrimitiveIO
 
 
 __all__ = ["NestedIO", "NestedOptions"]
@@ -206,9 +205,10 @@ class NestedIO(TabularIO[O], ABC):
         the no-surprises rule callers rely on: building a handle
         should not start probing storage.
         """
-        Disposable.__init__(self)
-        self._arrow_table = None
-        self._spark_frame = None
+        # Common TabularIO state (cache slots, _media_type, spill
+        # placeholders) — NestedIO subclasses don't use _spill_path
+        # but the consistent default is harmless.
+        TabularIO.__init__(self, media_type=media_type)
         self.parent: "NestedIO | None" = parent
 
         raw = path if path is not None else data
@@ -288,10 +288,9 @@ class NestedIO(TabularIO[O], ABC):
     # ==================================================================
 
     @abstractmethod
-    def iter_children(
+    def _iter_children(
         self,
-        options: "O | None" = None,
-        **kwargs: Any,
+        options: O,
     ) -> "Iterator[TabularIO | BytesIO]":
         """Yield this folder's direct children, each as an autonomous IO.
 
@@ -310,6 +309,10 @@ class NestedIO(TabularIO[O], ABC):
         chain. Children are returned closed; the caller (or the
         derived ``_read_arrow_batches`` loop) opens them inside a
         ``with`` block.
+
+        Public callers should use :meth:`iter_children` (inherited
+        from :class:`TabularIO`) which runs :meth:`check_options`
+        first.
         """
 
     # ==================================================================
@@ -322,13 +325,15 @@ class NestedIO(TabularIO[O], ABC):
         name: str,
         *,
         media_type: Any = None,
-    ) -> "PrimitiveIO":
-        """Mint a fresh :class:`PrimitiveIO` for a write target.
+    ) -> "BytesIO":
+        """Mint a fresh tabular leaf for a write target.
 
-        Returns a closed (un-acquired) IO bound to ``self.path / name``.
-        The writer opens it inside the write loop and closes on
-        success — the bound-path write-back fires on close. The
-        returned child has ``parent = self``.
+        Returns a closed (un-acquired) :class:`BytesIO` subclass
+        (concrete format leaf — ParquetIO, CsvIO, ZipEntryIO, …)
+        bound to ``self.path / name``. The writer opens it inside
+        the write loop and closes on success — the bound-path
+        write-back fires on close. The returned child has
+        ``parent = self``.
 
         :param name: child filename (no path separators), already
             including the format extension. Subclasses that use
@@ -360,9 +365,13 @@ class NestedIO(TabularIO[O], ABC):
     def is_empty(self) -> bool:
         """True when the folder has no non-ignored children."""
         try:
-            return next(iter(self.iter_children()), None) is None
+            return next(iter(self._iter_children(self._default_options())), None) is None
         except FileNotFoundError:
             return True
+
+    def _default_options(self) -> O:
+        """Build a default options instance for internal-only enumeration."""
+        return self.options_class()()
 
     def _resolve_save_mode(self, mode: Any) -> Mode:
         """Resolve any :class:`Mode` to one a folder writer can branch on."""
@@ -439,7 +448,7 @@ class NestedIO(TabularIO[O], ABC):
             yield from self._read_arrow_batches_from_cache(options)
             return
 
-        for child in self.iter_children(options):
+        for child in self._iter_children(options):
             yield from self._read_child_batches(child, options)
 
     def _read_child_batches(
@@ -471,7 +480,7 @@ class NestedIO(TabularIO[O], ABC):
         """Merge per-child schemas into a single folder schema."""
         merged: Schema | None = None
 
-        for child in self.iter_children(options):
+        for child in self._iter_children(options):
             schema: Schema | None = None
             if isinstance(child, NestedIO):
                 with child:

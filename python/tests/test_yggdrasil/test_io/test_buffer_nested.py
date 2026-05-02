@@ -32,7 +32,8 @@ from yggdrasil.io.buffer.nested.folder_io import (
     _parse_kv_segment,
     _partition_path_segment,
 )
-from yggdrasil.io.buffer.primitive import ParquetIO, CsvIO, PrimitiveIO
+from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.buffer.primitive import ParquetIO, CsvIO
 from yggdrasil.io.enums import MimeTypes, Mode
 
 
@@ -144,7 +145,9 @@ class TestFolderIOFlat:
 
         children = list(io.iter_children())
         assert children
-        assert all(isinstance(c, PrimitiveIO) for c in children)
+        # Concrete tabular leaves are BytesIO subclasses with a
+        # format-specific class (not raw BytesIO).
+        assert all(isinstance(c, BytesIO) and type(c) is not BytesIO for c in children)
         assert all(c.parent is io for c in children)
 
     def test_iter_children_empty_folder(self, tmp_path: Path):
@@ -466,7 +469,7 @@ class TestNestedOptions:
 
 
 # ---------------------------------------------------------------------------
-# Mixed children (PrimitiveIO + opaque BytesIO)
+# Mixed children (registered tabular leaves + opaque BytesIO)
 # ---------------------------------------------------------------------------
 
 

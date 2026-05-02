@@ -270,12 +270,11 @@ class DeltaIO(PartitionedFolderIO):
     # Children enumeration — driven by the replay
     # ==================================================================
 
-    def iter_children(
+    def _iter_children(
         self,
-        options: "DeltaOptions | None" = None,
-        **kwargs: Any,
+        options: "DeltaOptions",
     ) -> "Iterator[TabularIO | BytesIO]":
-        """Yield one child :class:`PrimitiveIO` per live AddFile.
+        """Yield one child :class:`BytesIO` (concrete tabular leaf) per live AddFile.
 
         Each child has:
 
@@ -286,8 +285,6 @@ class DeltaIO(PartitionedFolderIO):
           (or ``None``) so :meth:`_read_child_batches` can apply
           the row filter at read time.
         """
-        self.check_options(options, overrides=locals())
-
         try:
             replay = self._replay()
         except FileNotFoundError:
@@ -341,7 +338,7 @@ class DeltaIO(PartitionedFolderIO):
             c.name: c for c in partition_cols
         }
 
-        for child_io in self.iter_children(options):
+        for child_io in self._iter_children(options):
             if not isinstance(child_io, TabularIO):
                 continue
 

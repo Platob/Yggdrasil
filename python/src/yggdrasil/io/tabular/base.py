@@ -67,17 +67,17 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MediaType, MimeTypes, MimeType, MediaTypes, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.lazy_imports import (
+    bytes_io_class,
     polars_module,
     pyarrow_dataset_module, path_class,
 )
-
-from ..buffer import BytesIO
 
 if TYPE_CHECKING:
     import pandas
     import polars as pl
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
+    from yggdrasil.io.buffer.bytes_io import BytesIO
 
 
 __all__ = ["TabularIO"]
@@ -172,7 +172,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
             return object.__new__(cls)
 
         if data is not None:
-            if isinstance(data, BytesIO):
+            if isinstance(data, bytes_io_class()):
                 media_type = media_type or data._media_type
                 path = path or data.path
 
@@ -193,11 +193,77 @@ class TabularIO(Disposable, ABC, Generic[O]):
     def __init__(
         self,
         *args: Any,
-        **kwargs: Any
+        media_type: Any = None,
+        **kwargs: Any,
     ) -> None:
+        """Initialize the state every :class:`TabularIO` carries.
+
+        Sets up:
+
+        * Disposable lifecycle (``opened`` / ``closed`` flags).
+        * ``_media_type`` — the format identity. ``None`` for opaque
+          buffers; concrete leaves (ParquetIO, CsvIO, …) fill it from
+          their ``default_mime_type`` on construction.
+        * Persist cache slots — ``_arrow_table`` / ``_spark_frame``
+          set by :meth:`persist`, cleared by :meth:`unpersist`.
+        * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
+          used by :class:`BytesIO` (and any byte-buffer-backed
+          subclass) to track durable storage. They live on
+          :class:`TabularIO` so non-buffer subclasses inherit
+          consistent ``None`` defaults without each writing the
+          same boilerplate.
+
+        Subclasses with extra state extend via ``super().__init__()``
+        rather than re-zeroing the same slots; ``__init_subclass__``
+        is reserved for the registry hook.
+        """
         Disposable.__init__(self)
+        # Format identity
+        if media_type is None:
+            cls_mime = type(self).default_mime_type()
+            if cls_mime is not None and not getattr(cls_mime, "is_any_bytes", False):
+                self._media_type = MediaType(cls_mime)
+            else:
+                self._media_type = None
+        else:
+            self._media_type = MediaType.from_(media_type)
+        # Persist cache slots
         self._arrow_table = None
         self._spark_frame = None
+        # Buffer-backing slots — concrete byte buffers fill these in;
+        # non-byte TabularIOs (StatementResult, NestedIO trees, …)
+        # leave them at None.
+        self._spill_path = None
+        self._owns_spill_path = True
+
+    # ==================================================================
+    # Tabular view shortcut — at TabularIO so every subclass shares it
+    # ==================================================================
+
+    def as_media(self, media_type: "Any | None" = None) -> "TabularIO":
+        """Return a tabular view of self for the requested *media_type*.
+
+        For a final-leaf instance (ParquetIO, CsvIO, ZipIO, …)
+        carrying its own format, ``as_media()`` returns ``self`` —
+        the leaf is already the cheapest view. Any other call builds
+        a fresh registered leaf wrapping this object's underlying
+        bytes / path / state.
+        """
+        if media_type is not None:
+            media_type = MediaType.from_(media_type)
+
+        if self._FINAL_TABULAR_IO:
+            if media_type is None:
+                return self
+            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
+                return self
+            target = self.media_type_class(media_type=media_type)
+            return target(self, media_type=media_type)
+
+        target = self.media_type_class(media_type=media_type, default=type(self))
+        if target is type(self):
+            return self
+        return target(self, media_type=media_type)
 
     @classmethod
     def media_type_class(
@@ -206,7 +272,30 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *,
         default: "type[TabularIO[CastOptions]] | EllipsisType" = ...,
     ) -> "type[TabularIO[CastOptions]]":
-        """Resolve a media-type-like value to the IO class that handles it."""
+        """Resolve a media-type-like value to the IO class that handles it.
+
+        Lookup order:
+
+        1. Direct registry hit. Concrete leaves register themselves
+           in :data:`_DATAIO_REGISTRY` via :meth:`__init_subclass__`
+           when their module is imported.
+        2. Force-load the leaf packages that hold the most common
+           concrete formats — :mod:`yggdrasil.io.buffer.primitive`
+           (Parquet, Arrow IPC, CSV, JSON, NDJSON, XLSX) and
+           :mod:`yggdrasil.io.buffer.nested` (Folder, Zip, Delta).
+           If the caller started at a leaf module the registry is
+           already populated; this is the safety net for callers
+           that started elsewhere.
+        3. Re-check the registry after the import sweep.
+        4. Fall back to *default* (or raise when ``default`` is the
+           ``...`` sentinel).
+
+        Concrete tabular IO is always a :class:`BytesIO` subclass
+        (single-buffer leaf) or a :class:`NestedIO` subclass
+        (folder / archive aggregation). The registry contains both
+        kinds keyed by mime, so a single lookup suffices for any
+        registered format.
+        """
         if media_type is None:
             if default is ...:
                 raise RuntimeError("media_type_class called with None and no default")
@@ -227,14 +316,23 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if hit is not None:
             return hit
 
-        try:
-            import yggdrasil.io.buffer.primitive  # noqa: F401
-        except ImportError:
-            pass
-        else:
-            hit = _DATAIO_REGISTRY.get(key)
-            if hit is not None:
-                return hit
+        # Safety net — force-load the canonical leaf packages so
+        # their __init_subclass__ registry-population runs. Tolerate
+        # missing optional packages (the import itself may pull in
+        # extras like openpyxl); a partial load still populates the
+        # leaves that did import.
+        for module_path in (
+            "yggdrasil.io.buffer.primitive",
+            "yggdrasil.io.buffer.nested",
+        ):
+            try:
+                __import__(module_path)
+            except ImportError:
+                continue
+
+        hit = _DATAIO_REGISTRY.get(key)
+        if hit is not None:
+            return hit
 
         if default is ...:
             raise RuntimeError(
@@ -301,7 +399,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if cls._FINAL_TABULAR_IO and isinstance(obj, cls):
             return obj
 
-        buffer = BytesIO.from_(obj, media_type=media_type, default=None)
+        buffer = bytes_io_class().from_(obj, media_type=media_type, default=None)
         
         if buffer is None:
             if default is ...:
@@ -315,11 +413,11 @@ class TabularIO(Disposable, ABC, Generic[O]):
     @classmethod
     def from_bytes_io(
         cls,
-        buffer: BytesIO,
+        buffer: "BytesIO",
         media_type: MediaType | None = None,
         default: Any = ...
     ):
-        buffer = BytesIO.from_(buffer)
+        buffer = bytes_io_class().from_(buffer)
         if media_type is None:
             media_type = buffer.media_type
         else:
@@ -395,6 +493,37 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: O,
     ) -> None:
         """Consume Arrow record batches and persist them."""
+
+    def _iter_children(self, options: O) -> "Iterator[TabularIO]":
+        """Yield this IO's direct children, each as a :class:`TabularIO`.
+
+        Single-buffer leaves (``PrimitiveIO``, ``BytesIO`` without a
+        tabular media type, ``StatementResult``, …) yield nothing —
+        they ARE the leaf and have no sub-IO surface. Folder/archive
+        aggregations (:class:`NestedIO` subclasses, :class:`ZipIO`)
+        override to yield one IO per data unit (file, entry,
+        partition leaf), each itself a :class:`TabularIO` openable
+        on its own.
+
+        :class:`Fragment` indirection is intentionally absent —
+        children are real IOs with their own ``parent`` back-pointer,
+        so callers can walk the tree and drain Arrow batches
+        uniformly.
+
+        Default: yields nothing — the right answer for any
+        single-source TabularIO. :class:`NestedIO` re-declares this
+        abstract so folder-shaped subclasses can't accidentally
+        inherit the empty default.
+        """
+        return iter(())
+
+    def iter_children(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO]":
+        """Public wrapper around :meth:`_iter_children`."""
+        return self._iter_children(self.check_options(options, overrides=locals()))
 
     # ==================================================================
     # Static helpers

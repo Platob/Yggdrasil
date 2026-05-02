@@ -33,7 +33,7 @@ from yggdrasil.lazy_imports import (
     pyarrow_dataset_module,
 )
 
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -69,10 +69,8 @@ class JsonOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class JsonIO(PrimitiveIO):
+class JsonIO(BytesIO):
     """:class:`PrimitiveIO` for newline-delimited JSON."""
-
-    __slots__ = ()
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 

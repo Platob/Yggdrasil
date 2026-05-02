@@ -70,7 +70,7 @@ from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module,
 )
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -124,7 +124,7 @@ class NDJsonOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class NDJsonIO(PrimitiveIO):
+class NDJsonIO(BytesIO):
     """:class:`PrimitiveIO` for newline-delimited JSON.
 
     Reads stream via :func:`pa_json.open_json`, which yields record
@@ -133,8 +133,6 @@ class NDJsonIO(PrimitiveIO):
     """
 
     # No cached reader — NDJSON has no footer to amortize, same as CSV.
-    __slots__ = ()
-
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     # ==================================================================
