@@ -42,9 +42,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.enums import MimeType, Mode, MediaType
-from yggdrasil.io.fragment import Fragment
 from yggdrasil.io.tabular import TabularIO
-from yggdrasil.lazy_imports import fragment_class, fragment_infos_class
 
 __all__ = ["PrimitiveIO"]
 
@@ -174,28 +172,6 @@ class PrimitiveIO(BytesIO, ABC):
 
         target = self.media_type_class(media_type=media_type)
         return target(self)
-
-    # ------------------------------------------------------------------
-    # Fragment surface
-    # ------------------------------------------------------------------
-
-    def to_fragment_infos(self):
-        try:
-            schema = self.collect_schema()
-        except AttributeError:
-            schema = Schema.empty()
-
-        return fragment_infos_class()(
-            url=self.url,
-            mtime=self.stat().mtime,
-            schema=schema,
-        )
-
-    def to_fragment(self) -> "Fragment":
-        return fragment_class()(
-            infos=self.to_fragment_infos(),
-            io=self,
-        )
 
     # ==================================================================
     # Mode resolution

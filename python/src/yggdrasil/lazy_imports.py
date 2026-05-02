@@ -116,18 +116,6 @@ def primitive_io_class():
 
 
 @lru_cache(maxsize=1)
-def fragment_class():
-    from yggdrasil.io.fragment import Fragment
-    return Fragment
-
-
-@lru_cache(maxsize=1)
-def fragment_infos_class():
-    from yggdrasil.io.fragment import FragmentInfos
-    return FragmentInfos
-
-
-@lru_cache(maxsize=1)
 def boto3_module():
     try:
         import boto3

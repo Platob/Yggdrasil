@@ -6,8 +6,7 @@
 writes mint new entries by name. Unlike :class:`FolderIO` whose
 backing store is a directory tree, :class:`ZipIO`'s backing store is
 one zip file — the children-as-IOs surface matches :class:`NestedIO`'s
-contract, so the same read/write derivations flow through it without
-any :class:`Fragment` indirection.
+contract, so the same read/write derivations flow through it.
 
 The contract
 ------------
@@ -18,15 +17,30 @@ A :class:`ZipIO` holds a single :class:`Path` (the archive file).
 handle bound to a name. Each yielded child carries ``parent = self``
 so consumers can walk back up to the archive.
 
-Per-entry I/O
--------------
+Per-entry I/O — :class:`ZipEntryIO` IS-A :class:`BytesIO`
+---------------------------------------------------------
 
-A :class:`ZipEntryIO` IS-A :class:`PrimitiveIO` whose backing buffer
-is the entry's payload bytes — it supports the full :class:`BytesIO`
-surface (read, write, seek, truncate, spill, ``memoryview``). On
-commit, the parent rewrites the archive with the entry's new bytes
-substituted in. Multiple live handles to the same entry name share
-buffer state through a per-parent live map keyed by name.
+A :class:`ZipEntryIO` is a :class:`BytesIO` that knows how to read
+and write itself autonomously inside its parent archive. Its
+backing buffer is the entry's payload bytes — full
+:class:`BytesIO` surface (read, write, seek, truncate, spill,
+``memoryview``) plus a few extras:
+
+* ``parent`` — the :class:`ZipIO` archive this entry belongs to.
+* ``entry_name`` — the entry's filename inside the archive.
+* ``zip_info`` — the :class:`zipfile.ZipInfo` carrying compression,
+  CRC, mtime, size, etc., as recorded in the central directory.
+  Lazily populated on acquire; ``None`` until the entry exists.
+* ``compression`` / ``compresslevel`` — per-entry overrides, falling
+  back to the parent's :class:`ZipOptions` defaults on commit.
+
+Tabular reads/writes (Arrow IPC, Parquet, …) flow through the
+:class:`BytesIO` tabular contract: setting a tabular ``media_type``
+on the entry routes :meth:`read_arrow_batches` /
+:meth:`write_arrow_batches` to the registered concrete leaf
+(``ArrowIPCIO``, ``ParquetIO``, …) wrapping the entry's buffer. No
+PrimitiveIO inheritance needed — the entry is a byte buffer with
+parent-aware lifecycle and lets the format leaves do format work.
 
 Dirty tracking
 --------------
@@ -38,6 +52,20 @@ tracks ``_dirty`` itself by overriding the two write primitives
 (``_write_at`` and ``_set_size``). ``_acquire`` clears the flag after
 pulling the entry's bytes in (acquire is not a user-driven mutation);
 ``_release`` checks the flag and runs the commit only when it's True.
+
+Optimized commit path
+---------------------
+
+:meth:`ZipIO._commit_entry_payload` picks the cheapest write:
+
+* New entry, archive missing — create the archive with one entry.
+* New entry, archive non-empty — append to the central directory in
+  place (zip-native append), no rewrite.
+* Existing entry, payload unchanged — skipped via dirty tracking.
+* Existing entry, payload changed — stream all other entries through
+  a fresh archive with the swapped payload, then atomically replace
+  the file. Required because zip's central directory sits at EOF and
+  per-entry sizes change on rewrite.
 """
 
 from __future__ import annotations
@@ -51,12 +79,10 @@ from typing import Any, ClassVar, Iterable, Iterator
 from weakref import WeakValueDictionary
 
 import pyarrow as pa
-import pyarrow.ipc as ipc
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.schema import Schema
-from yggdrasil.io.buffer.primitive import PrimitiveIO
-from yggdrasil.io.enums import MediaType, MediaTypes, MimeTypes, Mode
+from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.enums import MediaType, MediaTypes, MimeTypes
 from .base import NestedIO, NestedOptions
 
 __all__ = ["ZipIO", "ZipOptions", "ZipEntryIO", "ZipEntryOptions"]
@@ -352,22 +378,38 @@ class ZipIO(NestedIO[ZipOptions]):
         payload: bytes | bytearray,
         *,
         options: "ZipOptions | None" = None,
+        compression: "int | None" = None,
+        compresslevel: "int | None" = None,
     ) -> None:
         """Persist ``payload`` as the contents of entry ``name``.
 
         Implements per-entry write-back from a :class:`ZipEntryIO`
-        commit. Because zip's central directory is at the end of the
-        file, replacing one entry requires rewriting the archive; we
-        do so by streaming all other entries through a fresh
-        :class:`zipfile.ZipFile` and substituting ``payload`` for
-        ``name``. If ``name`` does not yet exist, it is appended
-        (cheap) into the existing or fresh archive.
+        commit. Two paths:
+
+        * **Cheap append** — entry doesn't exist (or archive is
+          missing). Open the archive in ``"a"`` mode (or ``"w"`` if
+          missing) and append the entry to the central directory.
+          No rewrite.
+        * **Rewrite swap** — entry exists. Stream all other entries
+          through a fresh in-memory archive with ``payload``
+          substituted for ``name``, then atomically replace the
+          file. Required because zip's central directory sits at
+          EOF and per-entry sizes change on rewrite.
+
+        Per-entry ``compression`` / ``compresslevel`` overrides take
+        precedence over the parent's :class:`ZipOptions` defaults.
         """
         opts = options if options is not None else ZipOptions()
         payload_bytes = bytes(payload)
-        zf_kwargs: dict[str, Any] = {"compression": opts.compression}
-        if opts.compresslevel is not None:
-            zf_kwargs["compresslevel"] = opts.compresslevel
+        effective_compression = (
+            compression if compression is not None else opts.compression
+        )
+        effective_compresslevel = (
+            compresslevel if compresslevel is not None else opts.compresslevel
+        )
+        zf_kwargs: dict[str, Any] = {"compression": effective_compression}
+        if effective_compresslevel is not None:
+            zf_kwargs["compresslevel"] = effective_compresslevel
 
         if not self.path.exists() or not self._entry_exists(name):
             mode = "a" if self.path.exists() else "w"
@@ -421,51 +463,69 @@ class ZipIO(NestedIO[ZipOptions]):
 # ---------------------------------------------------------------------------
 
 
-class ZipEntryIO(PrimitiveIO):
-    """A :class:`PrimitiveIO` view of a single entry inside a :class:`ZipIO`.
+class ZipEntryIO(BytesIO):
+    """A :class:`BytesIO` view of a single entry inside a :class:`ZipIO`.
 
-    The entry's uncompressed payload IS this object's backing
-    :class:`BytesIO` — read/write/seek/truncate behave exactly as on
-    a free-standing buffer. Lifecycle:
+    The entry's uncompressed payload IS this object's backing buffer
+    — read/write/seek/truncate behave exactly as on a free-standing
+    :class:`BytesIO`. The "ZipEntry" half adds three things:
 
-    * ``_acquire`` pulls the entry's payload out of the parent and
-      installs it as this buffer's bytes (or starts empty if the
-      entry does not yet exist), then clears the dirty flag.
-    * Any user-driven mutation (write, truncate, etc.) flows through
-      ``_write_at`` / ``_set_size`` and flips ``_dirty`` to True.
-    * ``_release`` writes the buffer's payload back into the parent
-      via :meth:`ZipIO._commit_entry_payload` if ``_dirty`` is True.
+    * **Parent linkage** — :attr:`parent` is the enclosing
+      :class:`ZipIO`, :attr:`entry_name` is this entry's filename,
+      and :attr:`zip_info` carries the central-directory metadata
+      (compression / CRC / mtime / size) when the entry exists.
+    * **Per-entry overrides** — :attr:`compression` /
+      :attr:`compresslevel` let a caller pin an entry's framing
+      independently of the parent's defaults.
+    * **Parent-aware lifecycle** — ``_acquire`` pulls the entry's
+      bytes from the archive's central directory so the buffer
+      reads transparently; ``_release`` commits dirty bytes back
+      via the parent's optimized commit path.
 
-    Tabular reads/writes use Arrow IPC streaming format — one logical
-    stream per entry — so the entry can hold many record batches with
-    OVERWRITE and APPEND save modes for in-entry concatenation.
+    Tabular I/O (Arrow IPC, Parquet, …) flows through the normal
+    :class:`BytesIO` tabular contract: set a tabular ``media_type``
+    on the entry (the entry's filename extension is enough), call
+    :meth:`read_arrow_batches` / :meth:`write_arrow_batches`, and
+    the request is redirected via :meth:`as_media` to the registered
+    concrete leaf operating on this buffer.
 
     Notes
     -----
     Multiple :meth:`ZipIO.make_child` / :meth:`ZipIO.iter_children`
     calls for the same name on the same parent return the *same*
-    :class:`ZipEntryIO` instance (POSIX-shared-fd semantics): two
-    readers see each other's writes through one buffer. Independent
-    :class:`ZipIO` parents backed by the same path do not share
-    live-entry state.
+    :class:`ZipEntryIO` instance — two readers see each other's
+    writes through one buffer. Independent :class:`ZipIO` parents
+    backed by the same path do not share live-entry state.
     """
-
-    _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     def __init__(
         self,
         *,
         parent: ZipIO,
         name: str,
+        zip_info: "zipfile.ZipInfo | None" = None,
+        compression: "int | None" = None,
+        compresslevel: "int | None" = None,
         auto_open: bool = True,
+        media_type: Any = None,
         **kwargs: Any,
     ) -> None:
-        # Forward kwargs to BytesIO/PrimitiveIO so spill_bytes,
-        # spill_ttl, etc. flow through normally. Pass auto_open=False
-        # to super so our slots are in place before _acquire runs.
-        super().__init__(auto_open=False, **kwargs)
+        # Default the entry's media type to the one inferred from
+        # its filename extension — the common case (``batch-N.arrow``,
+        # ``manifest.json``, etc.). Callers can pass ``media_type=``
+        # to pin something else; ``MediaTypes.ZIP_ENTRY`` is used as
+        # the opaque fallback when no extension matches.
+        if media_type is None:
+            media_type = MediaType.from_(name, default=MediaTypes.ZIP_ENTRY)
+
+        # auto_open=False to super: we want our parent / dirty slots
+        # in place before _acquire pulls bytes from the archive.
+        super().__init__(auto_open=False, media_type=media_type, **kwargs)
         self.parent = parent
         self._entry_name = name
+        self._zip_info: "zipfile.ZipInfo | None" = zip_info
+        self.compression: "int | None" = compression
+        self.compresslevel: "int | None" = compresslevel
         self._dirty = False
         if auto_open:
             self.open()
@@ -478,20 +538,41 @@ class ZipEntryIO(PrimitiveIO):
     def entry_name(self) -> str:
         return self._entry_name
 
+    @property
+    def zip_info(self) -> "zipfile.ZipInfo | None":
+        """Central-directory metadata for the entry, or ``None``.
+
+        Populated lazily on :meth:`_acquire` from the parent's
+        archive. Stays ``None`` for entries that haven't been
+        committed yet (a fresh ``make_child(name)`` followed by no
+        write returns ``None`` here).
+        """
+        return self._zip_info
+
+    @property
+    def mtime(self) -> float:
+        """Entry mtime in seconds-since-epoch, or the parent's mtime.
+
+        Falls back to the parent's mtime when the central-directory
+        entry uses zip's ``(1980,1,1,0,0,0)`` "no useful timestamp"
+        sentinel.
+        """
+        parent_mtime = float(getattr(self.parent, "mtime", 0.0) or 0.0)
+        if self._zip_info is None:
+            return parent_mtime
+        return _zipinfo_mtime(self._zip_info, fallback=parent_mtime)
+
     # ------------------------------------------------------------------
-    # MimeType / options
+    # MimeType — opaque-by-default; format leaves take over via as_media
     # ------------------------------------------------------------------
 
     @classmethod
     def default_mime_type(cls):
-        # An entry is opaque-by-default; tabular paths use the per-entry
-        # ZipEntryOptions and Arrow IPC framing internally. Callers that
-        # want a richer mime can pass `with_media_type` after open.
+        # Per-instance default is overridden in __init__ from the
+        # entry's filename. The class-level default just claims the
+        # ZIP_ENTRY mime so the registry can hand back ZipEntryIO
+        # for path-based dispatch (rare but consistent).
         return MimeTypes.ZIP_ENTRY
-
-    @classmethod
-    def options_class(cls):
-        return ZipEntryOptions
 
     # ------------------------------------------------------------------
     # Dirty tracking — override the two write primitives
@@ -530,6 +611,9 @@ class ZipEntryIO(PrimitiveIO):
         # Pull current entry payload (if any) into self before any
         # BytesIO read/write sees the buffer.
         super()._acquire()
+        # Refresh metadata cache — the central-directory entry may
+        # have changed since the last open.
+        self._zip_info = self.parent._entry_info(self._entry_name)
         payload = self.parent._read_entry_bytes(self._entry_name)
         if payload:
             self.replace_with_payload(payload)
@@ -540,7 +624,15 @@ class ZipEntryIO(PrimitiveIO):
             if self._dirty:
                 with self.memoryview() as mv:
                     payload = bytes(mv)
-                self.parent._commit_entry_payload(self._entry_name, payload)
+                self.parent._commit_entry_payload(
+                    self._entry_name,
+                    payload,
+                    compression=self.compression,
+                    compresslevel=self.compresslevel,
+                )
+                # Refresh zip_info so a re-open on this same instance
+                # sees the just-committed metadata.
+                self._zip_info = self.parent._entry_info(self._entry_name)
                 self._dirty = False
         finally:
             # Drop ourselves from the parent's live map so a fresh
@@ -567,79 +659,8 @@ class ZipEntryIO(PrimitiveIO):
         """
         self.parent._delete_entry(self._entry_name)
         self.replace_with_payload(b"")
+        self._zip_info = None
         self._dirty = False
-
-    # ------------------------------------------------------------------
-    # Tabular I/O — Arrow IPC stream per entry
-    # ------------------------------------------------------------------
-
-    def _collect_schema(self, options: ZipEntryOptions) -> Schema:
-        if self.is_empty():
-            return Schema.empty()
-        first = next(iter(self._read_arrow_batches(options)), None)
-        if first is None:
-            return Schema.empty()
-        return Schema.from_arrow(first.schema)
-
-    def _read_arrow_batches(
-        self,
-        options: ZipEntryOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        if self.is_empty():
-            return
-
-        mt = MediaType.from_(self._entry_name, default=MediaTypes.OCTET_STREAM)
-        if mt.is_octet:
-            return
-
-        with self.as_media(media_type=mt) as media:
-            yield from media.read_arrow_batches(options)
-
-    def _write_arrow_batches(
-        self,
-        batches: Iterable[pa.RecordBatch],
-        options: ZipEntryOptions,
-    ) -> None:
-        action = self._resolve_save_mode(options.mode)
-        if action is Mode.IGNORE:
-            return
-        if action not in (Mode.OVERWRITE, Mode.APPEND):
-            raise NotImplementedError(
-                f"{type(self).__name__}._write_arrow_batches handles "
-                f"OVERWRITE and APPEND; got {action!r}."
-            )
-
-        iterator = iter(batches)
-        first = next(iterator, None)
-        if first is None:
-            return
-        if options.target_field is not None:
-            first = options.cast_arrow_tabular(first)
-
-        is_append = action is Mode.APPEND and not self.is_empty()
-
-        if is_append:
-            # Arrow IPC streams concat cleanly: open existing payload,
-            # seek to end, write more batches with the same schema.
-            lifecycle = options.copy(
-                truncate_before_write=False,
-                write_seek=-1,  # append at EOF
-            )
-        else:
-            lifecycle = options.copy(truncate_before_write=True)
-
-        with self._writing_context(lifecycle) as io:
-            writer = ipc.RecordBatchStreamWriter(io, first.schema)
-            try:
-                writer.write_batch(first)
-                for batch in iterator:
-                    if options.target_field is not None:
-                        batch = options.cast_arrow_tabular(batch)
-                    writer.write_batch(batch)
-            finally:
-                writer.close()
-        # The writer wrote bytes through io's BytesIO surface, which
-        # ultimately called our _write_at — so _dirty is already True.
 
     # ------------------------------------------------------------------
     # Repr
