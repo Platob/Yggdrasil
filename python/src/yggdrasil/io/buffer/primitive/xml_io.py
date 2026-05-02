@@ -30,7 +30,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 
 __all__ = ["XmlIO", "XmlOptions"]
@@ -56,7 +56,7 @@ class XmlOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class XmlIO(PrimitiveIO):
+class XmlIO(BytesIO):
     """:class:`PrimitiveIO` for flat row-shaped XML documents."""
 
     __slots__ = ()

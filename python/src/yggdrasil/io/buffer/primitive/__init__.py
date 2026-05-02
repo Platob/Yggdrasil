@@ -1,16 +1,20 @@
 """Single-buffer tabular-format IO handlers.
 
 Each concrete subclass under this package implements one file format
-(Parquet, CSV, JSON, …). They all share the :class:`PrimitiveIO`
-abstract base, which wraps a :class:`BytesIO` and exposes
-:meth:`PrimitiveIO._open_reader` / :meth:`PrimitiveIO._open_writer`
-hooks returning Arrow-native file-likes.
+(Parquet, CSV, JSON, …). They all single-inherit from
+:class:`yggdrasil.io.buffer.bytes_io.BytesIO`; the marker
+``PrimitiveIO`` layer is gone — every concrete leaf is just a
+:class:`BytesIO` with format-specific ``_read_arrow_batches`` /
+``_write_arrow_batches`` hooks and a registered
+``default_mime_type``.
 
-New format handlers go under this package as ``primitive/<name>.py``
-and register themselves via ``media_type`` at class-definition time.
+Importing this package as a whole forces every leaf module to load,
+which auto-registers them in :data:`TabularIO._DATAIO_REGISTRY` via
+``__init_subclass__``. :meth:`TabularIO.media_type_class` triggers
+this import lazily so registry hits stay correct even when callers
+start at a leaf module directly.
 """
 
-from .base import PrimitiveIO
 from .arrow_ipc_io import ArrowIPCIO
 from .parquet_io import ParquetIO
 from .csv_io import CsvIO
@@ -19,7 +23,6 @@ from .ndjson_io import NDJsonIO
 from .xlsx_io import XlsxIO
 
 __all__ = [
-    'PrimitiveIO',
     'ArrowIPCIO',
     'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO',
 ]

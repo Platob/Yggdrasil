@@ -1,8 +1,8 @@
 """Tests for ``yggdrasil.io.buffer.primitive``.
 
-Covers the :class:`PrimitiveIO` base contract (registry dispatch
-on a path's mime type, media type defaults, save-mode resolution)
-and the round-trip behaviour of every concrete leaf shipped in
+Covers the :class:`BytesIO` base contract (registry dispatch on a
+path's mime type, media type defaults, save-mode resolution) and
+the round-trip behaviour of every concrete leaf shipped in
 :mod:`yggdrasil.io.buffer.primitive`: Parquet, Arrow IPC, CSV,
 JSON, NDJSON, XLSX, ZIP.
 
@@ -25,7 +25,6 @@ from yggdrasil.io.buffer.primitive import (
     JsonIO,
     NDJsonIO,
     ParquetIO,
-    PrimitiveIO,
     XlsxIO,
 )
 from yggdrasil.io.buffer.nested import ZipIO, ZipOptions
@@ -59,7 +58,7 @@ def tmpdir_path(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# PrimitiveIO base contract
+# BytesIO / tabular registry contract
 # ---------------------------------------------------------------------------
 
 
@@ -67,7 +66,7 @@ class TestPrimitiveIOBase:
     def test_default_mime_type_is_none_on_base(self):
         # The base layer must not register against OCTET_STREAM or it
         # would shadow BytesIO as the fallback.
-        assert PrimitiveIO.default_mime_type() is None
+        assert BytesIO.default_mime_type() is None
 
     def test_concrete_leaves_have_mime_types(self):
         assert ParquetIO.default_mime_type() == MimeTypes.PARQUET
@@ -78,7 +77,7 @@ class TestPrimitiveIOBase:
             assert cls.default_mime_type() is not None
 
     def test_dispatch_via_path_extension(self, tmpdir_path: Path):
-        # PrimitiveIO(path=...) routes to the right leaf via the
+        # BytesIO(path=...) routes to the right leaf via the
         # registered mime types.
         for ext, expected in (
             (".parquet", ParquetIO),
@@ -89,7 +88,7 @@ class TestPrimitiveIOBase:
         ):
             p = tmpdir_path / f"a{ext}"
             p.touch()
-            io = PrimitiveIO(path=str(p))
+            io = BytesIO(path=str(p))
             assert isinstance(io, expected), (ext, type(io).__name__)
 
     def test_concrete_class_skips_dispatch(self, tmpdir_path: Path):
@@ -162,7 +161,7 @@ class TestSaveModeResolution:
 
 
 class _RoundTripBase:
-    cls: type[PrimitiveIO]
+    cls: type[BytesIO]
     suffix: str
 
     def _write_then_read(self, path: Path) -> pa.Table:
@@ -330,7 +329,7 @@ class TestInMemoryParquet:
 
 
 # ---------------------------------------------------------------------------
-# Codec siblings: PrimitiveIO._make_*_sibling
+# Codec siblings: BytesIO._make_*_sibling
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +354,7 @@ class TestCodecSiblings:
 
 
 # ---------------------------------------------------------------------------
-# as_media: a PrimitiveIO is its own tabular view.
+# as_media: a final-leaf BytesIO is its own tabular view.
 # ---------------------------------------------------------------------------
 
 

@@ -50,7 +50,7 @@ from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module,
 )
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -97,7 +97,7 @@ class ArrowIPCOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class ArrowIPCIO(PrimitiveIO):
+class ArrowIPCIO(BytesIO):
     """:class:`PrimitiveIO` for Arrow IPC **file** format.
 
     File-format reads use :class:`pa.ipc.RecordBatchFileReader`, which

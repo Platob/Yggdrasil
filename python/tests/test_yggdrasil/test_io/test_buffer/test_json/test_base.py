@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import JsonIO, PrimitiveIO
+from yggdrasil.io.buffer.primitive import JsonIO
+from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.primitive.json_io import JsonOptions
 from yggdrasil.io.enums import MimeTypes
 from .._helpers import sample_table
@@ -20,7 +21,7 @@ class TestJsonBase:
     def test_dispatch_via_path(self, tmp_path):
         p = tmp_path / "x.json"
         p.touch()
-        io = PrimitiveIO(path=str(p))
+        io = BytesIO(path=str(p))
         assert isinstance(io, JsonIO)
 
 

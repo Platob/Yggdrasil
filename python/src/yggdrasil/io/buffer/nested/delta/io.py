@@ -274,7 +274,7 @@ class DeltaIO(PartitionedFolderIO):
         self,
         options: "DeltaOptions",
     ) -> "Iterator[TabularIO | BytesIO]":
-        """Yield one child :class:`PrimitiveIO` per live AddFile.
+        """Yield one child :class:`BytesIO` (concrete tabular leaf) per live AddFile.
 
         Each child has:
 

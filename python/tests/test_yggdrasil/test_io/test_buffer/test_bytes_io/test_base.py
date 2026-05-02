@@ -90,8 +90,8 @@ class TestBytesIOReadWrite:
 
 class TestBytesIOMediaType:
     def test_set_media_type_via_kwarg(self):
-        # When the media is tabular, the constructor reroutes to a
-        # PrimitiveIO leaf — what the caller actually wants.
+        # When the media is tabular, the constructor reroutes
+        # through the registry to the registered leaf.
         from yggdrasil.io.buffer.primitive import ParquetIO
 
         io = BytesIO(media_type=MimeTypes.PARQUET)

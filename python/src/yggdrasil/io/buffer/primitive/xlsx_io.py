@@ -19,7 +19,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
 
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 __all__ = ["XlsxIO", "XlsxOptions"]
 
@@ -42,7 +42,7 @@ class XlsxOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class XlsxIO(PrimitiveIO):
+class XlsxIO(BytesIO):
     """:class:`PrimitiveIO` for single-sheet xlsx workbooks."""
 
     __slots__ = ()

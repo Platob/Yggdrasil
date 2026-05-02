@@ -41,7 +41,7 @@ from yggdrasil.lazy_imports import (
     polars_module,
     pyarrow_dataset_module,
 )
-from .base import PrimitiveIO
+from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -106,7 +106,7 @@ class CsvOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class CsvIO(PrimitiveIO):
+class CsvIO(BytesIO):
     """:class:`PrimitiveIO` for CSV files."""
 
     # No cached reader — CSV has no footer to amortize.

@@ -107,10 +107,13 @@ from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 
 import pyarrow as pa
 
+import contextlib
+
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
-from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, ZSTD
+from yggdrasil.environ import PyEnv
+from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
 from yggdrasil.io.tabular.base import TabularIO
 from yggdrasil.io.types import BytesLike
@@ -373,11 +376,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             media_type = MediaType.from_(media_type)
 
             if not media_type.is_octet:
-                from .primitive import PrimitiveIO
-                return PrimitiveIO.__new__(PrimitiveIO, data, media_type=media_type)
+                # Defer to TabularIO.__new__'s registry lookup so a
+                # tabular media_type lands on the registered leaf
+                # (ParquetIO, CsvIO, ZipIO, …) for the requested mime.
+                return TabularIO.__new__(
+                    cls, data, media_type=media_type, path=path
+                )
 
-        # Bypass TabularIO.__new__'s dispatch — the BytesIO layer has
-        # already resolved any media-type-driven redirection above.
+        # Opaque (or no) media type — stay a plain BytesIO.
         return object.__new__(cls)
 
     def __init__(
@@ -420,6 +426,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._media_type: MediaType | None = (
             None if media_type is None else MediaType.from_(media_type)
         )
+        # Concrete leaves (ParquetIO, CsvIO, ZipIO, …) override
+        # ``default_mime_type`` to claim a format. When the caller
+        # doesn't pass an explicit ``media_type``, fall back to that
+        # class default so the buffer carries its format identity
+        # immediately on construction.
+        if self._media_type is None:
+            cls_mime = type(self).default_mime_type()
+            if cls_mime is not None and not cls_mime.is_any_bytes:
+                self._media_type = MediaType(cls_mime)
         self._metadata = metadata or {}
         # TabularIO cache slots — populated by persist(), cleared by
         # unpersist(). A buffer with no tabular media type can't
@@ -1382,18 +1397,32 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             mode=0,
         )
 
-    def as_media(
-        self,
-        media_type: MediaType | None = None
-    ) -> "TabularIO":
-        return tabular_io_class()(
-            self,
-            media_type=media_type,
-            copy=False
-        )
+    def as_media(self, media_type: "MediaType | None" = None) -> "TabularIO":
+        """Return a tabular view of this buffer.
+
+        For a final-leaf instance (ParquetIO, CsvIO, …) carrying its
+        own format, ``as_media()`` returns ``self`` — there's no
+        cheaper view than the leaf already in hand. Any other call
+        builds a fresh registered leaf wrapping this buffer's bytes.
+        """
+        if media_type is not None:
+            media_type = MediaType.from_(media_type)
+
+        if self._FINAL_TABULAR_IO:
+            if media_type is None:
+                return self
+            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
+                return self
+            target = self.media_type_class(media_type=media_type)
+            return target(self, media_type=media_type)
+
+        target = self.media_type_class(media_type=media_type, default=type(self))
+        if target is type(self):
+            return self
+        return target(self, media_type=media_type)
 
     # ==================================================================
-    # TabularIO contract — redirect to a media-typed view, or fail
+    # TabularIO contract — cache, default hooks
     # ==================================================================
 
     @property
@@ -1412,62 +1441,67 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     ) -> "TabularIO":
         """Cache an Arrow / Spark view of the buffer's tabular content.
 
-        Requires a tabular media type — without one, the buffer has
-        no idea what format the bytes are in. Routes through
-        :meth:`_tabular_view` to do the engine-side persist.
+        Concrete leaves implement :meth:`_read_arrow_batches`
+        format-specifically; this driver just calls
+        :meth:`read_arrow_table` (or ``read_spark_frame``) and
+        stashes the result on the cache slots. A raw :class:`BytesIO`
+        with no tabular media type fails through ``read_arrow_table``
+        — there's no honest way to materialize tabular bytes without
+        a format.
         """
-        view = self._tabular_view()
-        if view is None:
-            raise NotImplementedError(
-                f"{type(self).__name__}.persist requires a tabular media "
-                "type. Set media_type on the buffer (or call as_media(...)) "
-                "before persisting."
-            )
-        view.persist(engine, data=data)
-        # Mirror the cache state up so cached/unpersist match.
-        self._arrow_table = view._arrow_table
-        self._spark_frame = view._spark_frame
+        if self.cached:
+            return self
+
+        if not engine or engine == "auto":
+            engine = "spark" if PyEnv.in_databricks() else "arrow"
+
+        if data is None:
+            if engine == "spark":
+                self._spark_frame = self.read_spark_frame()
+            elif engine == "arrow":
+                self._arrow_table = self.read_arrow_table()
+            else:
+                raise ValueError(f"Unsupported engine: {engine}")
+        else:
+            if engine == "spark":
+                from yggdrasil.spark.cast import any_to_spark_dataframe
+
+                self._spark_frame = any_to_spark_dataframe(data)
+            elif engine == "arrow":
+                from yggdrasil.arrow.cast import any_to_arrow_table
+
+                self._arrow_table = any_to_arrow_table(data)
+            else:
+                raise ValueError(f"Unsupported engine: {engine}")
         return self
 
-    def _tabular_view(self) -> "TabularIO | None":
-        """Return a media-typed view of self, or ``None`` if opaque.
-
-        Used by the tabular contract methods to redirect to the
-        registered concrete leaf (Parquet, IPC, CSV, …) when the
-        buffer carries a tabular media type. Returns ``None`` when
-        there's no media type or the media type is octet-stream —
-        the buffer can't pretend to be tabular without a format.
-        """
-        if self._media_type is None or self._media_type.is_octet:
-            return None
-        view = self.as_media(self._media_type)
-        return view if view is not self else None
-
     def _read_arrow_batches(self, options: CastOptions) -> "Iterator[pa.RecordBatch]":
-        view = self._tabular_view()
-        if view is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} has no tabular media type. "
-                "Set media_type or call as_media(...) before reading "
-                "Arrow batches."
-            )
-        with view:
-            yield from view._read_arrow_batches(options)
+        """Default — opaque buffer can't yield Arrow batches.
+
+        Concrete leaves (ParquetIO, CsvIO, …) override with format
+        decoding. Calling on an opaque buffer raises rather than
+        silently yielding nothing.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no tabular media type. "
+            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "or pass media_type= to dispatch through the registry."
+        )
 
     def _write_arrow_batches(
         self,
         batches: "Iterable[pa.RecordBatch]",
         options: CastOptions,
     ) -> None:
-        view = self._tabular_view()
-        if view is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} has no tabular media type. "
-                "Set media_type or call as_media(...) before writing "
-                "Arrow batches."
-            )
-        with view:
-            view._write_arrow_batches(batches, options)
+        """Default — opaque buffer can't accept Arrow batches.
+
+        Concrete leaves override format-specifically.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no tabular media type. "
+            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "or pass media_type= to dispatch through the registry."
+        )
 
     def _iter_children(self, options: CastOptions) -> "Iterator[TabularIO]":
         """Single-buffer leaves have no children — yields nothing.
@@ -1476,6 +1510,205 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         answer is always "this IS the leaf, walk no further."
         """
         return iter(())
+
+    # ==================================================================
+    # Mode resolution — used by every single-buffer write path
+    # ==================================================================
+
+    def _resolve_save_mode(self, mode: Any) -> Mode:
+        """Resolve any :class:`Mode` to one a writer can branch on.
+
+        Returns one of:
+
+        - :attr:`Mode.OVERWRITE` — truncate and write fresh.
+          Includes AUTO/TRUNCATE, IGNORE-with-empty-buffer,
+          ERROR_IF_EXISTS-with-empty-buffer.
+        - :attr:`Mode.APPEND` — only when ``_SUPPORTED_APPEND``.
+        - :attr:`Mode.IGNORE` — buffer non-empty, caller wants to
+          skip.
+        - :attr:`Mode.UPSERT` — only when ``_SUPPORTED_UPSERT``.
+
+        Raises :class:`ValueError` for unsupported APPEND/UPSERT
+        with a subclass-specific hint, :class:`FileExistsError` for
+        ERROR_IF_EXISTS on a non-empty buffer.
+        """
+        m = Mode.from_(mode, default=Mode.AUTO)
+
+        if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
+            return Mode.OVERWRITE
+
+        if m is Mode.IGNORE:
+            return Mode.IGNORE if not self.is_empty() else Mode.OVERWRITE
+
+        if m is Mode.ERROR_IF_EXISTS:
+            if not self.is_empty():
+                raise FileExistsError(
+                    f"{type(self).__name__} write with "
+                    f"Mode.ERROR_IF_EXISTS but buffer is non-empty "
+                    f"({self.size} bytes). Path: {self.path!r}"
+                )
+            return Mode.OVERWRITE
+
+        return m
+
+    # ==================================================================
+    # Codec siblings
+    # ==================================================================
+
+    def _make_uncompressed_sibling(self) -> "BytesIO":
+        """Build an uncompressed sibling carrying self's bytes decompressed.
+
+        Same concrete class as ``self`` with ``default_mime_type()``
+        (no codec) as media — a downstream lookup of ``codec`` on the
+        sibling returns ``None``, terminating recursion through the
+        codec branch.
+        """
+        codec = self.codec
+        if codec is None:
+            raise RuntimeError(
+                f"_make_uncompressed_sibling called on {type(self).__name__} "
+                "with no codec; this is a bug in the caller."
+            )
+
+        decompressed_buf = codec.decompress(self, copy=True)
+        return type(self)(
+            decompressed_buf,
+            media_type=type(self).default_mime_type(),
+        )
+
+    def _make_empty_sibling(self) -> "BytesIO":
+        """Empty sibling, no source bytes — same format minus the codec.
+
+        Used by the write codec branch: the body fills the sibling
+        with raw format bytes, then we compress on the way out.
+        Deliberately not via :meth:`_make_uncompressed_sibling` —
+        that decompresses self's current bytes, which for a write
+        target are either empty or the previous compressed version
+        we're about to overwrite.
+        """
+        return type(self)(media_type=type(self).default_mime_type())
+
+    # ==================================================================
+    # Lifecycle context managers — open/seek/codec
+    # ==================================================================
+
+    @contextlib.contextmanager
+    def _reading_context(self, options: CastOptions) -> "Iterator[BytesIO]":
+        """Open an IO for reading; yield the IO the body should read from.
+
+        Cursor-transparent: if ``self`` was already open on entry,
+        the cursor is restored on exit regardless of where the body
+        left it. This makes incidental reads (``collect_schema``,
+        footer probes) safe to call mid-stream without disturbing
+        an outer iteration.
+
+        With a codec, yields a transient decompressed sibling whose
+        lifetime is bounded by this context — the sibling is opened
+        on entry and closed (scratch buffer unlinked) on exit.
+
+        Driven by *options*:
+
+        - ``options.read_seek`` — cursor to seek to before the body
+          runs on the yielded IO. ``None`` leaves it untouched.
+        """
+        with contextlib.ExitStack() as stack:
+            was_opened = self.opened
+
+            try:
+                if self.codec is not None:
+                    target = stack.enter_context(self._make_uncompressed_sibling())
+                else:
+                    target = self
+                    if not target.opened:
+                        target.open()
+                        stack.callback(target.close)
+                    elif target.seekable():
+                        stack.callback(target.seek, target.tell())
+
+                if options.read_seek is not None and target.seekable():
+                    target.seek(options.read_seek)
+
+                yield target
+            finally:
+                if was_opened and self.closed:
+                    self.open()
+
+    @contextlib.contextmanager
+    def _writing_context(self, options: CastOptions) -> "Iterator[BytesIO]":
+        """Open an IO for writing; yield the IO the body should write to.
+
+        With no codec, yields ``self``. With a codec, yields a
+        transient uncompressed sibling — the body writes the raw
+        format bytes into the sibling, and on successful exit the
+        sibling's bytes are compressed back into ``self`` and ``self``
+        is marked dirty so the bound path's write-back fires on
+        close.
+
+        On exception inside the body during the codec branch,
+        ``self`` is left untouched (the sibling is discarded).
+
+        Driven by *options*:
+
+        - ``options.truncate_before_write`` — truncate the yielded
+          IO to zero before the body. Set by OVERWRITE; cleared by
+          APPEND.
+        - ``options.write_seek`` — cursor on the yielded IO before
+          the body. ``None`` leaves it untouched, ``0`` rewinds,
+          ``-1`` seeks to end (SEEK_END). APPEND sets ``-1``.
+        - ``options.reset_seek`` — restore the pre-entry cursor on
+          exit (only when the IO stays open).
+        """
+        if self.codec is not None:
+            yield from self._writing_context_compressed(options)
+            return
+
+        with contextlib.ExitStack() as stack:
+            was_opened = self.opened
+            if not was_opened:
+                self.open()
+                stack.callback(self.close, force=True)
+            elif options.reset_seek and self.seekable():
+                stack.callback(self.seek, self.tell())
+
+            try:
+                if options.mode is Mode.OVERWRITE:
+                    self.truncate(0)
+
+                if options.write_seek is not None and self.seekable():
+                    self.seek(options.write_seek)
+
+                yield self
+
+                self.flush()
+            finally:
+                if was_opened and self.closed:
+                    self.open()
+
+    def _writing_context_compressed(
+        self, options: CastOptions
+    ) -> "Iterator[BytesIO]":
+        """Codec branch of :meth:`_writing_context`."""
+        codec = self.codec
+        assert codec is not None
+
+        if options.mode is Mode.APPEND:
+            sibling = self.decompress(codec=codec, copy=True)
+        else:
+            sibling = self._make_empty_sibling()
+        with sibling:
+            if options.write_seek is not None and sibling.seekable():
+                sibling.seek(options.write_seek)
+
+            yield sibling
+
+            sibling.seek(0)
+            compressed = codec.compress(sibling)
+
+        # Sibling closed and scratch unlinked. Replace self's payload.
+        self.truncate(0)
+        self.seek(0)
+        self.replace_with_payload(compressed)
+        self.mark_dirty()
 
     def copy(
         self,

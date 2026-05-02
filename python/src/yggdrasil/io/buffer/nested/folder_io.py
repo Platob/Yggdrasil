@@ -72,7 +72,6 @@ import pyarrow.compute as pc
 
 from yggdrasil.data.schema import Field, Schema
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.buffer.primitive import PrimitiveIO
 from yggdrasil.io.enums import MimeType, MimeTypes, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.io.tabular import TabularIO
@@ -279,8 +278,11 @@ class FolderIO(NestedIO[FolderOptions]):
         except Exception:
             io = None
 
-        if isinstance(io, PrimitiveIO):
-            # Stamp partition values for downstream injection.
+        # A registered tabular leaf is a :class:`BytesIO` subclass
+        # with a format-specific class (so ``type(io) is BytesIO``
+        # would be false). Stamp partition values onto it for
+        # downstream injection by the read path.
+        if isinstance(io, BytesIO) and type(io) is not BytesIO:
             if self.partition_values:
                 io.partition_values = dict(self.partition_values)
             return io
@@ -325,7 +327,7 @@ class FolderIO(NestedIO[FolderOptions]):
         name: str,
         *,
         media_type: Any = None,
-    ) -> PrimitiveIO:
+    ) -> BytesIO:
         """Build a fresh write target under :attr:`path`.
 
         ``name`` may include forward-slash separators for nested
@@ -334,8 +336,9 @@ class FolderIO(NestedIO[FolderOptions]):
         (URL semantics) and ``..`` segments are rejected (path
         traversal).
 
-        Returns a closed (un-acquired) :class:`PrimitiveIO` with
-        ``parent`` set to ``self``.
+        Returns a closed (un-acquired) registered tabular leaf —
+        a :class:`BytesIO` subclass for the resolved mime type
+        (ParquetIO, CsvIO, …) — with ``parent`` set to ``self``.
         """
         if "\\" in name:
             raise ValueError(
@@ -357,10 +360,10 @@ class FolderIO(NestedIO[FolderOptions]):
 
         io = TabularIO.from_path(child_path, media_type=media_type)
 
-        if not isinstance(io, PrimitiveIO):
+        if not isinstance(io, BytesIO) or type(io) is BytesIO:
             raise TypeError(
-                f"FolderIO child factory expected a PrimitiveIO for "
-                f"name={name!r}, media_type={media_type!r}; got "
+                f"FolderIO child factory expected a registered tabular "
+                f"leaf for name={name!r}, media_type={media_type!r}; got "
                 f"{type(io).__name__}."
             )
         return self._attach(io)

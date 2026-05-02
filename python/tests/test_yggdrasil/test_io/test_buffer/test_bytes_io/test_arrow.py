@@ -39,8 +39,8 @@ class TestBytesIOTabularViaMedia:
         # the right leaf wrapping the same byte storage.
         path = tmp_path / "x.arrow"
         bio = BytesIO(path=str(path), media_type=MimeTypes.ARROW_IPC)
-        # Construction with a tabular mime redirects through PrimitiveIO,
-        # so the resulting `bio` is actually an ArrowIPCIO.
+        # Construction with a tabular mime dispatches through the
+        # registry, so the resulting `bio` is actually an ArrowIPCIO.
         bio.write_arrow_table(sample_table())
         bio.close()
 

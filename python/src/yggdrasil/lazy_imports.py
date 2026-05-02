@@ -110,12 +110,6 @@ def tabular_io_class():
 
 
 @lru_cache(maxsize=1)
-def primitive_io_class():
-    from yggdrasil.io.buffer.primitive import PrimitiveIO
-    return PrimitiveIO
-
-
-@lru_cache(maxsize=1)
 def boto3_module():
     try:
         import boto3

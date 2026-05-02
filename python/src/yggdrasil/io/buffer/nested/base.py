@@ -90,7 +90,6 @@ from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
     from yggdrasil.io.buffer.bytes_io import BytesIO
-    from yggdrasil.io.buffer.primitive import PrimitiveIO
 
 
 __all__ = ["NestedIO", "NestedOptions"]
@@ -325,13 +324,15 @@ class NestedIO(TabularIO[O], ABC):
         name: str,
         *,
         media_type: Any = None,
-    ) -> "PrimitiveIO":
-        """Mint a fresh :class:`PrimitiveIO` for a write target.
+    ) -> "BytesIO":
+        """Mint a fresh tabular leaf for a write target.
 
-        Returns a closed (un-acquired) IO bound to ``self.path / name``.
-        The writer opens it inside the write loop and closes on
-        success — the bound-path write-back fires on close. The
-        returned child has ``parent = self``.
+        Returns a closed (un-acquired) :class:`BytesIO` subclass
+        (concrete format leaf — ParquetIO, CsvIO, ZipEntryIO, …)
+        bound to ``self.path / name``. The writer opens it inside
+        the write loop and closes on success — the bound-path
+        write-back fires on close. The returned child has
+        ``parent = self``.
 
         :param name: child filename (no path separators), already
             including the format extension. Subclasses that use

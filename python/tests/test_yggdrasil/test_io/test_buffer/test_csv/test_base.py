@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import CsvIO, PrimitiveIO
+from yggdrasil.io.buffer.primitive import CsvIO
+from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.primitive.csv_io import CsvOptions
 from yggdrasil.io.enums import Mode, MimeTypes
 from .._helpers import sample_table
@@ -20,7 +21,7 @@ class TestCsvBase:
     def test_dispatch_via_path(self, tmp_path):
         p = tmp_path / "x.csv"
         p.touch()
-        io = PrimitiveIO(path=str(p))
+        io = BytesIO(path=str(p))
         assert isinstance(io, CsvIO)
 
     def test_supports_native_append(self):

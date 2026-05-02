@@ -77,7 +77,7 @@ from .constants import (
 )
 
 if TYPE_CHECKING:
-    from yggdrasil.io.buffer.primitive import PrimitiveIO
+    from yggdrasil.io.buffer.bytes_io import BytesIO
 
 
 __all__ = [
@@ -511,7 +511,7 @@ def _resolve_v2_manifest_path(
 def _read_checkpoint_parquet(path: Path) -> pa.Table:
     """Read a checkpoint or sidecar parquet file as a pyarrow Table.
 
-    Routes through our :class:`PrimitiveIO` so the read benefits
+    Routes through our :class:`ParquetIO` so the read benefits
     from our local-fast-path and codec discipline.
     """
     from yggdrasil.io.tabular import TabularIO

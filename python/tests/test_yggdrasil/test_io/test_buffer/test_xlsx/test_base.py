@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import PrimitiveIO, XlsxIO
+from yggdrasil.io.buffer.primitive import XlsxIO
+from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.primitive.xlsx_io import XlsxOptions
 from yggdrasil.io.enums import MimeTypes
 
@@ -20,5 +21,5 @@ class TestXlsxBase:
         pytest.importorskip("openpyxl")
         p = tmp_path / "x.xlsx"
         p.touch()
-        io = PrimitiveIO(path=str(p))
+        io = BytesIO(path=str(p))
         assert isinstance(io, XlsxIO)

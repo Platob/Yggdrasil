@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import ArrowIPCIO, PrimitiveIO
+from yggdrasil.io.buffer.primitive import ArrowIPCIO
+from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.primitive.arrow_ipc_io import ArrowIPCOptions
 from yggdrasil.io.enums import Mode, MimeTypes
 from .._helpers import sample_table
@@ -20,7 +21,7 @@ class TestArrowIPCIOBase:
     def test_dispatch_via_path(self, tmp_path):
         p = tmp_path / "x.arrow"
         p.touch()
-        io = PrimitiveIO(path=str(p))
+        io = BytesIO(path=str(p))
         assert isinstance(io, ArrowIPCIO)
 
 

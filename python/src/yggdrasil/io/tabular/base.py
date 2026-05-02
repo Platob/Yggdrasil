@@ -206,7 +206,30 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *,
         default: "type[TabularIO[CastOptions]] | EllipsisType" = ...,
     ) -> "type[TabularIO[CastOptions]]":
-        """Resolve a media-type-like value to the IO class that handles it."""
+        """Resolve a media-type-like value to the IO class that handles it.
+
+        Lookup order:
+
+        1. Direct registry hit. Concrete leaves register themselves
+           in :data:`_DATAIO_REGISTRY` via :meth:`__init_subclass__`
+           when their module is imported.
+        2. Force-load the leaf packages that hold the most common
+           concrete formats — :mod:`yggdrasil.io.buffer.primitive`
+           (Parquet, Arrow IPC, CSV, JSON, NDJSON, XLSX) and
+           :mod:`yggdrasil.io.buffer.nested` (Folder, Zip, Delta).
+           If the caller started at a leaf module the registry is
+           already populated; this is the safety net for callers
+           that started elsewhere.
+        3. Re-check the registry after the import sweep.
+        4. Fall back to *default* (or raise when ``default`` is the
+           ``...`` sentinel).
+
+        Concrete tabular IO is always a :class:`BytesIO` subclass
+        (single-buffer leaf) or a :class:`NestedIO` subclass
+        (folder / archive aggregation). The registry contains both
+        kinds keyed by mime, so a single lookup suffices for any
+        registered format.
+        """
         if media_type is None:
             if default is ...:
                 raise RuntimeError("media_type_class called with None and no default")
@@ -227,14 +250,23 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if hit is not None:
             return hit
 
-        try:
-            import yggdrasil.io.buffer.primitive  # noqa: F401
-        except ImportError:
-            pass
-        else:
-            hit = _DATAIO_REGISTRY.get(key)
-            if hit is not None:
-                return hit
+        # Safety net — force-load the canonical leaf packages so
+        # their __init_subclass__ registry-population runs. Tolerate
+        # missing optional packages (the import itself may pull in
+        # extras like openpyxl); a partial load still populates the
+        # leaves that did import.
+        for module_path in (
+            "yggdrasil.io.buffer.primitive",
+            "yggdrasil.io.buffer.nested",
+        ):
+            try:
+                __import__(module_path)
+            except ImportError:
+                continue
+
+        hit = _DATAIO_REGISTRY.get(key)
+        if hit is not None:
+            return hit
 
         if default is ...:
             raise RuntimeError(
